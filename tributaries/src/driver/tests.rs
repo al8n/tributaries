@@ -745,7 +745,7 @@ impl Harness {
       closes: close_rx,
       events: event_tx,
       #[cfg(debug_assertions)]
-      observed_handles: std::collections::HashSet::new(),
+      observed_handles: super::ObservedHandles::new(),
       _rt: PhantomData::<TokioRuntime>,
     };
     Self {
@@ -2160,14 +2160,14 @@ async fn failed_widen_restore_reusing_old_handle_trips_the_tripwire() {
   let _ = h.watch("/a", Interest::all()).await;
 }
 
-/// Regression (the exhaustive observed-handle tripwire — the POST-RETIREMENT reuse the
+/// Regression (the observed-handle tripwire — the POST-RETIREMENT reuse the
 /// per-site live-index checks MISSED): a handle removed from the live index by an `unwatch` (or a
 /// terminal retirement) that a later arm REUSES is still a generation-unique `Source::Handle`
 /// violation — a stale event still carrying it would route through the re-armed root in its new
 /// generation. The retired per-site checks only asserted `entry(handle).is_none()` against the
 /// CURRENT index, so a reused post-retirement handle (absent from the index) passed them silently;
-/// the owner-level observed-handle set catches it, because the handle was observed at its first arm
-/// and the set is never pruned.
+/// the owner-level observed-handle window catches it, because the handle was observed at its first
+/// arm and observations leave the window only by eviction — never by retirement.
 ///
 /// Fail-on-old: after the `unwatch`, handle 1 is gone from `by_handle` (`plan_unwatch` removes it on
 /// `RootEmptied`), so the reused-handle re-watch takes the `Disjoint` commit path whose retired
@@ -2184,7 +2184,7 @@ async fn rearm_reusing_a_retired_handle_trips_the_tripwire() {
 
   // Watch /a (handle 1), then unwatch it: the root is emptied, so `plan_unwatch` disarms handle 1
   // AND removes it from the live index (`by_handle`). Handle 1 is now retired — gone from every live
-  // structure, but permanently recorded in the owner's observed-handle set.
+  // structure, but still recorded in the owner's observed-handle window.
   let sa = h.watch("/a", Interest::all()).await.expect("watch /a"); // handle 1
   h.unwatch(sa).expect("unwatch /a");
 
@@ -2193,6 +2193,47 @@ async fn rearm_reusing_a_retired_handle_trips_the_tripwire() {
   // index after the unwatch), but the arm choke point's observed-handle debug_assert panics.
   h.owner.source.reuse_next_arm_handle(1);
   let _ = h.watch("/b", Interest::all()).await;
+}
+
+/// The observed-handle tripwire is a bounded WINDOW, not a lifetime ledger: ordinary
+/// watch/unwatch churn of disjoint roots must leave the debug build's history bounded by
+/// [`super::OBSERVED_HANDLE_HISTORY`], not by the number of arms the owner has ever performed.
+/// A debug or staging soak run to expose production leaks must not carry a historical-growth
+/// source of its own.
+///
+/// The second half is what keeps the bound from being free: the window still holds its capacity
+/// after the churn, so the most recent arms — where a handle-recycling source shows up — are all
+/// still covered.
+#[tokio::test]
+#[cfg_attr(
+  not(debug_assertions),
+  ignore = "the observed-handle window is compiled out in release builds"
+)]
+#[cfg(debug_assertions)]
+async fn observed_handle_history_is_bounded_by_its_window_not_by_lifetime_arms() {
+  let mut h = Harness::new();
+
+  // Churn disjoint roots: each watch arms a fresh handle, each unwatch empties its root and
+  // retires it. Every live root and delivery obligation is reclaimed correctly throughout — the
+  // only thing that could grow is the history itself.
+  let churn = super::OBSERVED_HANDLE_HISTORY + 64;
+  for i in 0..churn {
+    let sub = h
+      .watch(&format!("/r{i}"), Interest::all())
+      .await
+      .expect("watch a disjoint root");
+    h.unwatch(sub).expect("unwatch it again");
+  }
+  assert_eq!(
+    h.owner.source.arm_count(),
+    churn,
+    "every cycle armed a fresh handle, so the history saw every one of them"
+  );
+  assert_eq!(
+    h.owner.observed_handles.len(),
+    super::OBSERVED_HANDLE_HISTORY,
+    "the history is capped at its window — never the {churn} arms this owner performed"
+  );
 }
 
 /// The ARM-choke-point liveness close, widen path: a `Widen` whose **wider** arm is
@@ -5361,7 +5402,7 @@ impl OwnerU64 {
       closes: close_rx,
       events: event_tx,
       #[cfg(debug_assertions)]
-      observed_handles: std::collections::HashSet::new(),
+      observed_handles: super::ObservedHandles::new(),
       _rt: PhantomData::<TokioRuntime>,
     };
     Self {
@@ -5947,7 +5988,7 @@ async fn release_marks_handle_logically_dead_immediately_even_with_transport_pen
     closes: close_rx,
     events: event_tx,
     #[cfg(debug_assertions)]
-    observed_handles: std::collections::HashSet::new(),
+    observed_handles: super::ObservedHandles::new(),
     _rt: PhantomData::<TokioRuntime>,
   };
   let _commands = command_tx; // keep the command channel open (the dropped-handles teardown signal)
@@ -6114,7 +6155,7 @@ async fn unclaimed_orphans_parked_rescan_is_suppressed_by_state_in_the_run_loop(
     closes: close_rx,
     events: event_tx,
     #[cfg(debug_assertions)]
-    observed_handles: std::collections::HashSet::new(),
+    observed_handles: super::ObservedHandles::new(),
     _rt: PhantomData::<TokioRuntime>,
   };
   let run = tokio::spawn(super::run(owner));

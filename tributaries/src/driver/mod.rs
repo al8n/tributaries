@@ -582,7 +582,7 @@ where
       closes: close_rx,
       events: event_tx,
       #[cfg(debug_assertions)]
-      observed_handles: std::collections::HashSet::new(),
+      observed_handles: ObservedHandles::new(),
       _rt: PhantomData::<R>,
     };
     (
@@ -1196,15 +1196,17 @@ where
   /// ) — is bounded and never awaits.
   cleanup_rx: async_channel::Receiver<Cleanup>,
   events: async_channel::Sender<Event<C, V>>,
-  /// A **debug-only** exhaustive tripwire for the generation-unique [`Source::Handle`] contract:
-  /// every handle this owner has ever observed from a successful live [`arm`](Self::arm). The arm
-  /// choke point asserts each freshly-armed handle was **never** seen before, catching ANY reuse —
-  /// a still-recorded sibling, or one already removed from the live index by unwatch or terminal
-  /// retirement (the post-retirement reuse the per-site live-index checks missed). It is
-  /// only ever inserted into, never pruned, so a retired-then-reused handle is still caught;
-  /// `#[cfg(debug_assertions)]` so the field, its init, and its assert add zero release-build cost.
+  /// A **debug-only** tripwire for the generation-unique [`Source::Handle`] contract: the most
+  /// recent [`OBSERVED_HANDLE_HISTORY`] handles this owner observed from a successful live
+  /// [`arm`](Self::arm). The arm choke point asserts each freshly-armed handle is not in that
+  /// window, catching reuse of a still-recorded sibling and reuse of a handle already removed from
+  /// the live index by unwatch or terminal retirement (the post-retirement case the per-site
+  /// live-index checks missed). Observations leave only by eviction, so the window bounds the
+  /// debug build's memory by itself rather than by the owner's lifetime arm count — see
+  /// [`OBSERVED_HANDLE_HISTORY`] for what that costs the check. `#[cfg(debug_assertions)]` so the
+  /// field, its init, and its assert add zero release-build cost.
   #[cfg(debug_assertions)]
-  observed_handles: std::collections::HashSet<S::Handle>,
+  observed_handles: ObservedHandles<S::Handle>,
   _rt: PhantomData<R>,
 }
 
@@ -1781,6 +1783,73 @@ const COMMAND_FAIRNESS_BUDGET: u32 = 32;
 /// mailbox bounds requests waiting to be RECEIVED, this bounds requests already
 /// admitted and not yet finished.
 const MAX_PENDING_SYNCS: usize = 256;
+
+/// How many recently-armed [`Source::Handle`]s the debug-only generation-uniqueness
+/// tripwire remembers ([`ObservedHandles`]).
+///
+/// An all-time history makes the tripwire exhaustive but changes the debug build's
+/// resource model from "peak live roots plus bounded debt" to "every arm since the owner
+/// was constructed": a long-running debug or staging watcher that churns disjoint roots
+/// grows without bound even when every live root and delivery obligation is reclaimed
+/// correctly — a soak meant to expose leaks then contains a growth source of its own.
+///
+/// So the history is a bounded most-recent window. Chosen well above any plausible peak
+/// live-root population, because that is what makes the window's two guarantees hold:
+/// reuse of a **live** handle is caught whenever live roots stay under this many, and
+/// reuse **after** retirement is caught within this many intervening arms — the shape a
+/// handle-recycling source actually has. Beyond that window the check is silent; it is a
+/// debug tripwire for a contract violation, never a correctness mechanism.
+#[cfg(debug_assertions)]
+const OBSERVED_HANDLE_HISTORY: usize = 4096;
+
+/// The debug-only history behind the generation-unique [`Source::Handle`] tripwire: the
+/// most recent [`OBSERVED_HANDLE_HISTORY`] handles a successful live arm returned, in
+/// arrival order, with membership in O(1).
+///
+/// Bounded by construction — the oldest observation is evicted to make room — so the
+/// debug build's memory stays proportional to the window rather than to the number of
+/// arms the owner has ever performed.
+#[cfg(debug_assertions)]
+struct ObservedHandles<H> {
+  seen: std::collections::HashSet<H>,
+  order: std::collections::VecDeque<H>,
+}
+
+#[cfg(debug_assertions)]
+impl<H> ObservedHandles<H>
+where
+  H: Copy + Eq + core::hash::Hash,
+{
+  fn new() -> Self {
+    Self {
+      seen: std::collections::HashSet::new(),
+      order: std::collections::VecDeque::new(),
+    }
+  }
+
+  /// Records `handle` as observed, reporting `false` if it is **still in the window** —
+  /// the tripwire's verdict. Evicting the oldest observation keeps the window bounded;
+  /// eviction is the only way an observation ever leaves.
+  fn observe(&mut self, handle: H) -> bool {
+    if !self.seen.insert(handle) {
+      return false;
+    }
+    self.order.push_back(handle);
+    if self.order.len() > OBSERVED_HANDLE_HISTORY
+      && let Some(evicted) = self.order.pop_front()
+    {
+      self.seen.remove(&evicted);
+    }
+    true
+  }
+
+  /// How many observations the window currently holds — never more than
+  /// [`OBSERVED_HANDLE_HISTORY`].
+  #[cfg(test)]
+  fn len(&self) -> usize {
+    self.seen.len()
+  }
+}
 
 /// The earlier of two optional deadlines, treating [`None`] as infinitely far — the sleep
 /// target combining the coalescer's settle deadline with the parked-Rescan retry.
@@ -2686,18 +2755,18 @@ where
       self.source.disarm(handle);
       return Err(WatchError::DeadOnArrival.into());
     }
-    // The single exhaustive tripwire for the generation-unique `Source::Handle` contract (
-    // ): a freshly-armed, live handle must NEVER have been observed by this owner before. This
-    // one choke-point check subsumes the old per-site live-index `entry(handle).is_none()` asserts
-    // (Disjoint/Widen commit, restore rebind) AND additionally catches reuse of a handle already
-    // removed from the live index by unwatch or terminal retirement — which those per-site checks
-    // missed, because a stale event still carrying it could then route through the re-armed root.
-    // `HashSet::insert` returns `false` on any prior value, and the set is only added to (never
-    // pruned), so a retired-then-reused handle still trips. Debug-only: the field, this assert, and
-    // its cost all vanish in release builds.
+    // The single tripwire for the generation-unique `Source::Handle` contract: a freshly-armed,
+    // live handle must not be one this owner recently observed. This one choke-point check
+    // subsumes the old per-site live-index `entry(handle).is_none()` asserts (Disjoint/Widen
+    // commit, restore rebind) AND additionally catches reuse of a handle already removed from the
+    // live index by unwatch or terminal retirement — which those per-site checks missed, because a
+    // stale event still carrying it could then route through the re-armed root. `observe` reports
+    // `false` for any handle still in its bounded window, so a retired-then-reused handle still
+    // trips within that window (`OBSERVED_HANDLE_HISTORY` states the bound and what it costs).
+    // Debug-only: the field, this assert, and its cost all vanish in release builds.
     #[cfg(debug_assertions)]
     debug_assert!(
-      self.observed_handles.insert(handle),
+      self.observed_handles.observe(handle),
       "Source::arm returned a handle already observed by this owner (a reused handle, even after \
        retirement) — a generation-unique Source::Handle contract violation; see Source::Handle"
     );
