@@ -1164,10 +1164,10 @@ mod integration {
 }
 
 /// The reserved namespace is the binding's business: it renders a cookie's
-/// name from the owner's token and classifies EVERY leaf in that namespace as
-/// an artifact — ours, another instance's, or a crashed process's leftover —
-/// while an ordinary file (or a name merely containing the prefix deeper in
-/// the path) is never one.
+/// name from the owner's token and classifies EVERY leaf that matches the
+/// minted grammar as an artifact — ours, another instance's, or a crashed
+/// process's leftover — while an ordinary file (or a name merely containing the
+/// prefix deeper in the path) is never one.
 #[tokio::test]
 async fn the_reserved_namespace_classifies_every_cookie_and_only_cookies() {
   use std::ffi::OsString;
@@ -1185,7 +1185,7 @@ async fn the_reserved_namespace_classifies_every_cookie_and_only_cookies() {
   let name = super::cookie_name(SyncToken::new(7, 42, 3, 0xdead_beef));
   assert_eq!(name, ".tributaries-sync-7-42-3-00000000deadbeef");
   // The trailing nonce is what an external writer cannot predict — but
-  // classification keys on the reserved PREFIX alone, so a cookie is a cookie
+  // classification keys on the SHAPE, not on the value, so a cookie is a cookie
   // whatever its nonce.
   assert!(source.is_sync_artifact(&key(&[
     "/",
@@ -1195,13 +1195,75 @@ async fn the_reserved_namespace_classifies_every_cookie_and_only_cookies() {
   assert!(source.is_sync_artifact(&key(&["/", "r", &name])));
 
   // A FOREIGN instance's cookie, and a crashed process's leftover: both are
-  // suppressed too — the namespace is total, never own-pending-only.
-  assert!(source.is_sync_artifact(&key(&["/", "r", ".tributaries-sync-9-999-1"])));
-  assert!(source.is_sync_artifact(&key(&["/", "r", ".tributaries-sync-0-1-0"])));
+  // suppressed too — the namespace is total over the grammar, never
+  // own-pending-only. Every writer of a real cookie is this same minter.
+  assert!(source.is_sync_artifact(&key(&[
+    "/",
+    "r",
+    ".tributaries-sync-9-999-1-ffffffffffffffff"
+  ])));
+  assert!(source.is_sync_artifact(&key(&[
+    "/",
+    "r",
+    ".tributaries-sync-0-1-0-0000000000000000"
+  ])));
+
+  // The whole minted range round-trips: the extremes of every field are still
+  // recognized by the classifier that has to suppress them.
+  for token in [
+    SyncToken::new(0, 0, 0, 0),
+    SyncToken::new(u64::MAX, u32::MAX, u64::MAX, u64::MAX),
+    SyncToken::new(1, 1, 1, 1),
+  ] {
+    let minted = super::cookie_name(token);
+    assert!(
+      source.is_sync_artifact(&key(&["/", "r", &minted])),
+      "the minter and the classifier must agree on {minted}"
+    );
+  }
+
+  // The fs layer's cookie DIRECTORY is in the same namespace and is likewise not
+  // a user change — for any uid, since two users may watch one tree.
+  assert!(source.is_sync_artifact(&key(&["/", "r", ".tributaries-sync-cookies"])));
+  assert!(source.is_sync_artifact(&key(&["/", "r", ".tributaries-sync-cookies-501"])));
 
   // Ordinary files are not artifacts — including one whose PARENT directory
   // carries the prefix (the match is on the leaf, never an interior component).
   assert!(!source.is_sync_artifact(&key(&["/", "r", "a.txt"])));
-  assert!(!source.is_sync_artifact(&key(&["/", "r", ".tributaries-sync-7-42-3", "inner.txt"])));
+  assert!(!source.is_sync_artifact(&key(&[
+    "/",
+    "r",
+    ".tributaries-sync-7-42-3-00000000deadbeef",
+    "inner.txt"
+  ])));
   assert!(!source.is_sync_artifact(&key(&["/", "r", "not-a-.tributaries-sync-1"])));
+
+  // A USER file that merely opens with the reserved stem is a user change: the
+  // namespace is reserved, but only its minted grammar is suppressed. Each of
+  // these is a real name a caller could choose, and a bare prefix test would
+  // erase every one of them from the stream with no Rescan and no diagnostic.
+  for user_leaf in [
+    // No nonce field at all — the pre-grammar shape.
+    ".tributaries-sync-9-999-1",
+    // Prose, not fields.
+    ".tributaries-sync-notes.txt",
+    ".tributaries-sync-",
+    // The right field count, but a nonce that is not sixteen lowercase hex.
+    ".tributaries-sync-7-42-3-DEADBEEFDEADBEEF",
+    ".tributaries-sync-7-42-3-00000000deadbee",
+    ".tributaries-sync-7-42-3-00000000deadbeeff",
+    ".tributaries-sync-7-42-3-zzzzzzzzzzzzzzzz",
+    // Right shape, but a decimal field the minter cannot render.
+    ".tributaries-sync-07-42-3-00000000deadbeef",
+    ".tributaries-sync-7-4294967296-3-00000000deadbeef",
+    ".tributaries-sync--42-3-00000000deadbeef",
+    ".tributaries-sync-7-42-3-4-00000000deadbeef",
+    // The cookie directory's stem with a non-numeric qualifier.
+    ".tributaries-sync-cookies-mine",
+  ] {
+    assert!(
+      !source.is_sync_artifact(&key(&["/", "r", user_leaf])),
+      "{user_leaf} is not a minted artifact — suppressing it would erase a user file"
+    );
+  }
 }

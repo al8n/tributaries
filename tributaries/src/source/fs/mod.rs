@@ -729,18 +729,22 @@ impl<R> Source<OsString> for FsSource<R> {
   }
 
   fn is_sync_artifact(&self, key: &[OsString]) -> bool {
-    // The reserved namespace, matched on the LEAF component only (never a
-    // substring of an interior directory): every cookie of every instance,
-    // ours and foreign, live and crash-leftover — always suppressed, always.
+    // Matched on the LEAF component only (never a substring of an interior
+    // directory), and against the two GRAMMARS this workspace mints rather than
+    // against the shared stem: every cookie of every instance — ours and foreign,
+    // live and crash-leftover — is suppressed, because every one of them comes
+    // from the same minter, while a user file that merely begins with the stem is
+    // a user change and stays one.
     //
-    // The fs layer keeps its cookies in a DIRECTORY of this same namespace (it
-    // needs one nobody else may write). The leaf rule covers both ends of that:
-    // the directory's own create carries a leaf in the namespace, and so does
-    // every cookie inside it — so neither surfaces as a user change.
+    // The fs layer keeps its cookies in a DIRECTORY of the same namespace (it
+    // needs one nobody else may write), so the leaf rule has two shapes to cover:
+    // the directory's own create carries the directory's name, and every cookie
+    // inside it carries a cookie name. The directory's shape is classified by the
+    // layer that mints it, so the two cannot drift apart.
     key
       .last()
       .and_then(|leaf| leaf.to_str())
-      .is_some_and(|leaf| leaf.starts_with(COOKIE_PREFIX))
+      .is_some_and(|leaf| is_cookie_name(leaf) || tributary_fs::is_sync_cookie_dir_name(leaf))
   }
 
   fn root_key(&self, handle: RootHandle) -> Option<Vec<OsString>> {
@@ -885,29 +889,78 @@ fn replace_error_to_watch_error(err: ReplaceRootError, root: &std::path::Path) -
   WatchError::Source(SourceFault::new(kind))
 }
 
-/// The reserved sync-cookie namespace. A leaf component starting with this is
-/// an artifact of the barrier machinery — whoever wrote it — and is suppressed
-/// from every consumer stream, on every instance, always. (Watchman's
-/// `.watchman-cookie-` precedent.) A real user file whose leaf collides is
-/// suppressed too: that is the documented cost of a reserved namespace, and it
-/// beats leaking foreign instances' cookies as user events.
+/// The reserved sync-cookie namespace. (Watchman's `.watchman-cookie-`
+/// precedent.) A cookie's leaf begins with this — but the prefix alone does not
+/// make a leaf a cookie: see [`is_cookie_name`] for the grammar that does.
 const COOKIE_PREFIX: &str = ".tributaries-sync-";
+
+/// The nonce's rendered width: `{:016x}` on a `u64`, so exactly sixteen lowercase
+/// hex digits, zero-padded — never fewer, never more, whatever the value.
+const COOKIE_NONCE_DIGITS: usize = 16;
 
 /// Renders a cookie's file name from the owner's token. Unique across
 /// concurrent syncs (seq), watcher instances in one process (instance), and
 /// processes (pid) — so a crashed prior process's leftovers collide with
 /// nothing.
+///
+/// This is the only minter of the name [`is_cookie_name`] recognizes; the two must
+/// be changed together, and the round-trip cell pins that they are.
 fn cookie_name(token: SyncToken) -> String {
   // The trailing nonce (lowercase hex) is what makes the name unpredictable to
-  // any other writer — see `SyncToken::new`. `is_sync_artifact` still matches
-  // on the reserved prefix alone, so the whole namespace stays suppressed.
+  // any other writer — see `SyncToken::new`.
   format!(
-    "{COOKIE_PREFIX}{}-{}-{}-{:016x}",
+    "{COOKIE_PREFIX}{}-{}-{}-{:0width$x}",
     token.instance(),
     token.pid(),
     token.seq(),
-    token.nonce()
+    token.nonce(),
+    width = COOKIE_NONCE_DIGITS,
   )
+}
+
+/// Whether `leaf` is a sync cookie's file name — the reserved prefix followed by the
+/// **exact** four-field shape [`cookie_name`] mints: `instance-pid-seq-nonce`, the
+/// first three rendered decimal and the last as sixteen lowercase hex digits.
+///
+/// # Why the grammar is checked rather than the prefix alone
+///
+/// Suppression removes a change from every consumer stream, so whatever it matches
+/// vanishes. A bare prefix test therefore swallows any user file whose name happens to
+/// begin with the reserved stem — silently, with no `Rescan` and no diagnostic, for the
+/// life of the watch. The names are minted **by this crate**, so their shape is knowable
+/// exactly; checking it keeps the reserved namespace total over real cookies (ours,
+/// another live instance's, and a crashed process's leftovers all satisfy the same
+/// grammar, since they all come from this minter) while leaving every other name a user
+/// change.
+fn is_cookie_name(leaf: &str) -> bool {
+  let Some(rest) = leaf.strip_prefix(COOKIE_PREFIX) else {
+    return false;
+  };
+  let mut fields = rest.split('-');
+  let (Some(instance), Some(pid), Some(seq), Some(nonce), None) = (
+    fields.next(),
+    fields.next(),
+    fields.next(),
+    fields.next(),
+    fields.next(),
+  ) else {
+    return false;
+  };
+  is_minted_decimal(instance, u64::MAX)
+    && is_minted_decimal(pid, u64::from(u32::MAX))
+    && is_minted_decimal(seq, u64::MAX)
+    && nonce.len() == COOKIE_NONCE_DIGITS
+    && nonce
+      .bytes()
+      .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase() && b <= b'f')
+}
+
+/// Whether `field` is exactly what `format!("{n}")` renders for some `n <= max`: decimal
+/// digits, no sign, and no redundant leading zero (`0` itself is the one-digit case).
+fn is_minted_decimal(field: &str, max: u64) -> bool {
+  field.bytes().all(|b| b.is_ascii_digit())
+    && (field.len() == 1 || !field.starts_with('0'))
+    && field.parse::<u64>().is_ok_and(|value| value <= max)
 }
 
 /// Rebuilds a filesystem path from key components — the reverse of
