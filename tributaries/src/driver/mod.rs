@@ -1855,7 +1855,13 @@ where
 
   /// How many observations the window currently holds — never more than
   /// [`OBSERVED_HANDLE_HISTORY`].
-  #[cfg(test)]
+  ///
+  /// Gated on the SAME condition as `mod tests`, which holds its one consumer. A bare
+  /// `cfg(test)` here is wider than that module, so a `--features default` test build
+  /// (no `tokio`, so no `mod tests`) compiles the method with nothing calling it — and
+  /// under CI's `-Dwarnings` `dead_code` is a hard error, not a lint. Stating the
+  /// consumer's own condition is what keeps the two from drifting apart again.
+  #[cfg(all(test, feature = "tokio"))]
   fn len(&self) -> usize {
     self.seen.len()
   }
