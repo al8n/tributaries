@@ -51,6 +51,15 @@ pub(crate) const FAN_ONDIR: u64 = 0x4000_0000;
 /// libc. Errno-only, never a mask bit, hence its distance from the `FAN_*` set.
 pub(crate) const EOVERFLOW: i32 = 75;
 
+/// The `fanotify_event_metadata.vers` this decode was written against
+/// (`FANOTIFY_METADATA_VERSION`). fanotify(7) makes the field the reader's
+/// compile-time-vs-run-time ABI check and tells an application that sees a
+/// mismatch to abandon the fd: a different version means the fixed header this
+/// module indexes by is not the header on the wire, so every field offset below
+/// would name a different field. Restated locally so this pure module carries
+/// no libc dependency; the FFI layer cross-asserts it against libc.
+pub(crate) const FANOTIFY_METADATA_VERSION: u8 = 3;
+
 /// A record carrying a bare FID (the affected object's own handle, e.g. the
 /// child's `FAN_REPORT_TARGET_FID` on a create).
 pub(crate) const FAN_EVENT_INFO_TYPE_FID: u8 = 1;
@@ -287,12 +296,32 @@ pub(crate) fn decode_events(buf: &[u8]) -> DecodeOutcome {
       break;
     };
     let event_len = u32::from_ne_bytes(header[0..4].try_into().expect("4 bytes")) as usize;
+    let vers = header[4];
+    let metadata_len = u16::from_ne_bytes(header[6..8].try_into().expect("2 bytes")) as usize;
     let mask = u64::from_ne_bytes(header[8..16].try_into().expect("8 bytes"));
 
-    // `event_len` spans the whole event (header + every info record). A value
-    // below the header, or past the buffer, is structurally impossible: stop
-    // rather than walk off the record.
-    if event_len < METADATA_LEN || event_len > buf.len() - at {
+    // The three header contracts of `struct fanotify_event_metadata`
+    // (fanotify(7)), all settled before a single payload byte is read:
+    //   - `vers` is that struct's own ABI version; anything but the version
+    //     this build compiled against means the offsets just loaded name
+    //     different fields, and the man page's instruction is to abandon the
+    //     stream rather than parse it;
+    //   - `metadata_len` is the header's size ON THE WIRE, and the info records
+    //     begin exactly there — that is what the field is for ("optional
+    //     headers per event type"), so a fixed 24 would misparse a grown header
+    //     as an info record. Below the fixed struct it cannot even cover the
+    //     words already read;
+    //   - `event_len` spans the whole event (header + every info record), so a
+    //     value below the header, or past the buffer, is structurally
+    //     impossible.
+    // Each of the three stops the walk rather than letting it run off the
+    // record, and the caller degrades the batch to the ordered loss barrier —
+    // a refused record narrows the map's coverage nowhere.
+    if vers != FANOTIFY_METADATA_VERSION
+      || metadata_len < METADATA_LEN
+      || event_len < metadata_len
+      || event_len > buf.len() - at
+    {
       lossy = true;
       break;
     }
@@ -306,7 +335,7 @@ pub(crate) fn decode_events(buf: &[u8]) -> DecodeOutcome {
       continue;
     }
 
-    let info = &buf[at + METADATA_LEN..at + event_len];
+    let info = &buf[at + metadata_len..at + event_len];
     match decode_info(mask, info) {
       Some(event) => events.push(event),
       None => {

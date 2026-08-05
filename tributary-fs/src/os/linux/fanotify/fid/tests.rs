@@ -2,7 +2,7 @@ use super::{
   DecodeOutcome, FAN_ATTRIB, FAN_CREATE, FAN_DELETE, FAN_DELETE_SELF, FAN_EVENT_INFO_TYPE_DFID,
   FAN_EVENT_INFO_TYPE_DFID_NAME, FAN_EVENT_INFO_TYPE_FID, FAN_EVENT_INFO_TYPE_NEW_DFID_NAME,
   FAN_EVENT_INFO_TYPE_OLD_DFID_NAME, FAN_MODIFY, FAN_MOVE_SELF, FAN_ONDIR, FAN_Q_OVERFLOW,
-  FAN_RENAME, Fid, decode_events,
+  FAN_RENAME, FANOTIFY_METADATA_VERSION, Fid, METADATA_LEN, decode_events,
 };
 // Used only by `handle_attempt_decision_table`, itself unix-gated (libc errnos).
 #[cfg(unix)]
@@ -43,20 +43,42 @@ fn fid_payload(fsid: [u8; 8], handle_type: i32, opaque: &[u8], name: Option<&[u8
   out
 }
 
-/// One `fanotify_event_metadata` (24 bytes) followed by its info records.
-/// `event_len` is set to the total.
-fn event(mask: u64, info: &[u8]) -> Vec<u8> {
-  let event_len = (24 + info.len()) as u32;
+/// One `fanotify_event_metadata` with every header field spelled out, so a
+/// test can plant a `vers`, a `metadata_len`, or an `event_len` the ABI
+/// forbids. `header_slack` is inserted between the fixed struct and `info`,
+/// which is how a header longer than the fixed struct is spelled on the wire.
+fn event_with_header(
+  vers: u8,
+  metadata_len: u16,
+  event_len: u32,
+  mask: u64,
+  header_slack: &[u8],
+  info: &[u8],
+) -> Vec<u8> {
   let mut out = Vec::new();
   out.extend_from_slice(&event_len.to_ne_bytes()); // event_len
-  out.push(3); // vers
+  out.push(vers); // vers
   out.push(0); // reserved
-  out.extend_from_slice(&24u16.to_ne_bytes()); // metadata_len
+  out.extend_from_slice(&metadata_len.to_ne_bytes()); // metadata_len
   out.extend_from_slice(&mask.to_ne_bytes()); // mask
   out.extend_from_slice(&(-1i32).to_ne_bytes()); // fd = FAN_NOFD
   out.extend_from_slice(&0i32.to_ne_bytes()); // pid
+  out.extend_from_slice(header_slack);
   out.extend_from_slice(info);
   out
+}
+
+/// One `fanotify_event_metadata` (24 bytes) followed by its info records.
+/// `event_len` is set to the total.
+fn event(mask: u64, info: &[u8]) -> Vec<u8> {
+  event_with_header(
+    FANOTIFY_METADATA_VERSION,
+    METADATA_LEN as u16,
+    (METADATA_LEN + info.len()) as u32,
+    mask,
+    &[],
+    info,
+  )
 }
 
 const FSID_A: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
@@ -279,6 +301,154 @@ fn overlong_event_len_is_lossy() {
   let DecodeOutcome { events, lossy } = decode_events(&buf);
   assert!(lossy);
   assert!(events.is_empty());
+}
+
+/// One well-formed create's info region, reused by the header-contract suite
+/// below: only the metadata header ever varies there.
+fn one_create_info() -> Vec<u8> {
+  info_record(
+    FAN_EVENT_INFO_TYPE_DFID_NAME,
+    &fid_payload(FSID_A, 1, b"dir-handle", Some(b"child.txt")),
+  )
+}
+
+/// `vers` is the wire ABI version of `fanotify_event_metadata` itself, and
+/// fanotify(7) instructs a reader that sees a foreign one to abandon the
+/// stream: with the struct redefined, every offset the decode loads names a
+/// different field, so `mask`, `event_len` and the info region are all read out
+/// of the wrong bytes and reported as a valid event. Refused instead, which
+/// takes the ordered loss barrier.
+///
+/// MUTATION WITNESS: drop `vers` from the header condition and this FAILS at
+/// `a version this build did not compile against is refused` — the event
+/// decodes clean off a header that is not the one on the wire.
+#[test]
+fn a_foreign_metadata_version_is_lossy() {
+  let info = one_create_info();
+  let buf = event_with_header(
+    FANOTIFY_METADATA_VERSION + 1,
+    METADATA_LEN as u16,
+    (METADATA_LEN + info.len()) as u32,
+    FAN_CREATE,
+    &[],
+    &info,
+  );
+  let DecodeOutcome { events, lossy } = decode_events(&buf);
+  assert!(
+    lossy,
+    "a version this build did not compile against is refused"
+  );
+  assert!(events.is_empty(), "nothing is decoded off a foreign header");
+}
+
+/// `metadata_len` is the header's own size, so a value below the fixed struct
+/// claims the event ends inside words the decode has already loaded — the info
+/// region would start in the middle of the header and parse its `fd`/`pid` as
+/// an info record.
+///
+/// MUTATION WITNESS: drop `metadata_len < METADATA_LEN` and this FAILS on
+/// `lossy`.
+#[test]
+fn a_metadata_len_below_the_fixed_struct_is_lossy() {
+  let info = one_create_info();
+  let buf = event_with_header(
+    FANOTIFY_METADATA_VERSION,
+    (METADATA_LEN - 8) as u16,
+    (METADATA_LEN + info.len()) as u32,
+    FAN_CREATE,
+    &[],
+    &info,
+  );
+  let DecodeOutcome { events, lossy } = decode_events(&buf);
+  assert!(lossy);
+  assert!(events.is_empty());
+}
+
+/// A `metadata_len` past the event — and so past what the buffer holds — leaves
+/// the info region with no start the record can contain.
+///
+/// MUTATION WITNESS: drop `event_len < metadata_len` and this FAILS on
+/// `lossy`.
+#[test]
+fn a_metadata_len_past_the_event_is_lossy() {
+  let info = one_create_info();
+  let event_len = (METADATA_LEN + info.len()) as u32;
+  let buf = event_with_header(
+    FANOTIFY_METADATA_VERSION,
+    (event_len + 8) as u16,
+    event_len,
+    FAN_CREATE,
+    &[],
+    &info,
+  );
+  let DecodeOutcome { events, lossy } = decode_events(&buf);
+  assert!(lossy);
+  assert!(events.is_empty());
+}
+
+/// The point of `metadata_len`: the info records begin where the HEADER ends,
+/// not at a fixed 24. A header carrying the optional per-event-type bytes the
+/// field exists to allow still yields its info records intact — reading them
+/// from a hardcoded offset would parse the header's own tail as a record and
+/// desynchronize the walk.
+///
+/// MUTATION WITNESS: take the info region from a fixed `at + METADATA_LEN` and
+/// this FAILS at `a grown header is not a malformed event` — the header's own
+/// tail is read as an info record whose `len` escapes the event.
+#[test]
+fn info_records_start_where_metadata_len_says() {
+  let info = one_create_info();
+  // Eight bytes of header past the fixed struct, shaped so that mistaking them
+  // for an info record cannot be silent: `len` = 0xFFFF escapes the event.
+  let slack = [0xFFu8; 8];
+  let buf = event_with_header(
+    FANOTIFY_METADATA_VERSION,
+    (METADATA_LEN + slack.len()) as u16,
+    (METADATA_LEN + slack.len() + info.len()) as u32,
+    FAN_CREATE,
+    &slack,
+    &info,
+  );
+  let DecodeOutcome { events, lossy } = decode_events(&buf);
+  assert!(!lossy, "a grown header is not a malformed event");
+  assert_eq!(events.len(), 1);
+  assert_eq!(events[0].name.as_deref(), Some(b"child.txt".as_slice()));
+  assert!(events[0].dir_fid.is_some());
+}
+
+/// An info record whose `len` reaches past the event's own region is refused:
+/// the walk advances by that `len`, so believing it would step into the NEXT
+/// event's header (or off the buffer) and decode it as this event's payload.
+///
+/// MUTATION WITNESS: widen the bound to `record_len > info.len() + 16` and
+/// this FAILS with `range end index 48 out of range for slice of length 40`.
+#[test]
+fn an_info_record_escaping_the_event_is_lossy() {
+  let mut info = one_create_info();
+  // The record's `len` is the u16 at offset 2 of its header.
+  let escaping = (info.len() + 8) as u16;
+  info[2..4].copy_from_slice(&escaping.to_ne_bytes());
+  let buf = event(FAN_CREATE, &info);
+  let DecodeOutcome { events, lossy } = decode_events(&buf);
+  assert!(lossy);
+  assert!(events.is_empty());
+}
+
+/// An info record whose `len` is below its own header cannot advance the walk;
+/// believing a zero would spin on the same four bytes forever. Refused.
+///
+/// MUTATION WITNESS: loosen the bound to `record_len < 3` and this FAILS with
+/// `slice index starts at 4 but ends at 3`.
+#[test]
+fn an_info_record_shorter_than_its_header_is_lossy() {
+  for short in [0u16, 1, 3] {
+    let mut info = one_create_info();
+    info[2..4].copy_from_slice(&short.to_ne_bytes());
+    let buf = event(FAN_CREATE, &info);
+    let DecodeOutcome { events, lossy } = decode_events(&buf);
+    assert!(lossy, "len={short} must refuse");
+    assert!(events.is_empty());
+  }
 }
 
 /// A `handle_bytes` of `u32::MAX` on a short payload: `FILE_HANDLE_PREFIX +

@@ -3,10 +3,12 @@
 //! One completion delivers a chain of `FILE_NOTIFY_INFORMATION` (basic) or
 //! `FILE_NOTIFY_EXTENDED_INFORMATION` (extended) records linked by
 //! `NextEntryOffset`. The chain is kernel-produced but decoded defensively:
-//! every offset is validated (in-bounds, DWORD-aligned, forward-progress) and
-//! every multi-byte field is an explicit little-endian load from `&[u8]`, so a
-//! malformed or truncated chain refuses the REMAINDER as decode loss — never
-//! UB, never a panic — and the whole module runs under miri on every host.
+//! every offset is validated (in-bounds, DWORD-aligned, forward-progress)
+//! BEFORE the record it strides is read, so a `FileNameLength` can never reach
+//! past its own record into the next one's header, and every multi-byte field
+//! is an explicit little-endian load from `&[u8]`, so a malformed or truncated
+//! chain refuses the REMAINDER as decode loss — never UB, never a panic — and
+//! the whole module runs under miri on every host.
 
 /// The typed `FILE_ACTION_*` word of one record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -296,14 +298,43 @@ pub(crate) fn decode_records(buf: &[u8], extended: bool) -> DecodedBuffer {
       (None, None, None, None, at + 8)
     };
 
+    // A NONZERO NextEntryOffset IS this record's stride — MS-FSCC 2.7.1 places
+    // the next entry exactly that many bytes from THIS one — so the link is
+    // validated BEFORE anything is decoded off the record: it must be
+    // DWORD-aligned, clear this record's own fixed prefix (forward progress),
+    // and land inside the buffer. A record whose link fails any of those has no
+    // trustworthy extent at all, and bounding its name by the whole buffer
+    // instead would let the name consume the NEXT record's header and publish
+    // that as a real location. A zero link ends the chain, and the terminal
+    // record's extent is the rest of the completion — the pump hands the decode
+    // exactly the transferred bytes, so there is nothing narrower to know.
+    let next_at = if next_offset == 0 {
+      None
+    } else {
+      let Some(next_at) = at.checked_add(next_offset) else {
+        return DecodedBuffer {
+          records,
+          lossy: true,
+        };
+      };
+      if !next_offset.is_multiple_of(4) || next_offset < header || next_at >= buf.len() {
+        return DecodedBuffer {
+          records,
+          lossy: true,
+        };
+      }
+      Some(next_at)
+    };
+    let extent = next_at.unwrap_or(buf.len());
+
     // The name is FileNameLength BYTES of UTF-16LE: an odd length is a
-    // malformed record, and the payload must fit the buffer.
+    // malformed record, and the payload must fit inside THIS record's extent.
     let name_len = load_u32(buf, name_len_at) as usize;
     let name_at = end_of_header;
     let name_fits = name_len.is_multiple_of(2)
       && name_at
         .checked_add(name_len)
-        .is_some_and(|end| end <= buf.len());
+        .is_some_and(|end| end <= extent);
     if !name_fits {
       return DecodedBuffer {
         records,
@@ -328,27 +359,12 @@ pub(crate) fn decode_records(buf: &[u8], extended: bool) -> DecodedBuffer {
       reparse_tag,
     });
 
-    if next_offset == 0 {
+    let Some(next_at) = next_at else {
       return DecodedBuffer {
         records,
         lossy: false,
       };
-    }
-    // A link must be DWORD-aligned and make forward progress past this
-    // record's fixed prefix, inside the buffer.
-    let aligned = next_offset.is_multiple_of(4);
-    let Some(next_at) = at.checked_add(next_offset) else {
-      return DecodedBuffer {
-        records,
-        lossy: true,
-      };
     };
-    if !aligned || next_offset < header || next_at >= buf.len() {
-      return DecodedBuffer {
-        records,
-        lossy: true,
-      };
-    }
     at = next_at;
   }
 }
@@ -508,6 +524,8 @@ mod tests {
     assert!(decoded.lossy);
   }
 
+  /// MUTATION WITNESS: move the link validation back below the push and this
+  /// FAILS at `next=2 publishes nothing`.
   #[test]
   fn misaligned_or_backward_links_refuse_lossy() {
     for bad_next in [2u32, 6, 10] {
@@ -516,8 +534,110 @@ mod tests {
       buf.extend_from_slice(&[0u8; 64]);
       let decoded = decode_records(&buf, false);
       assert!(decoded.lossy, "next={bad_next} must refuse");
-      assert_eq!(decoded.records.len(), 1);
+      // The link is this record's own extent, so a bad one is refused BEFORE
+      // the record is decoded: nothing bounds its name once the stride is
+      // untrustworthy, and the loss signal covers the whole refusal anyway.
+      assert!(
+        decoded.records.is_empty(),
+        "next={bad_next} publishes nothing"
+      );
     }
+  }
+
+  /// The name of a NONTERMINAL record lives inside that record's own stride.
+  /// A `FileNameLength` reaching past `NextEntryOffset` walks into the next
+  /// record's header, and bounding it by the whole completion instead would
+  /// publish those header bytes as a real location under a clean (non-lossy)
+  /// decode — a name no enumeration would ever produce, delivered as authority.
+  ///
+  /// MUTATION WITNESS: bound the name by `buf.len()` instead of the record's
+  /// extent and both legs FAIL at `must refuse` — the decode returns
+  /// `lossy: false` with two records, the first named out of the second's
+  /// header bytes.
+  #[test]
+  fn a_name_may_not_reach_past_its_own_stride() {
+    for extended in [false, true] {
+      let header = if extended {
+        EXTENDED_HEADER
+      } else {
+        BASIC_HEADER
+      };
+      let name_len_at = header - 4;
+      let mut buf = Vec::new();
+      push_record(&mut buf, extended, 0, 1, &utf16("one"));
+      while buf.len() % 4 != 0 {
+        buf.push(0);
+      }
+      let second_at = buf.len();
+      push_record(&mut buf, extended, 0, 2, &utf16("two"));
+      buf[0..4].copy_from_slice(&(second_at as u32).to_le_bytes());
+      // A name that overruns the stride by 16 bytes: still inside the
+      // completion, so only the stride bound can refuse it.
+      let overrun = (second_at - header + 16) as u32;
+      buf[name_len_at..name_len_at + 4].copy_from_slice(&overrun.to_le_bytes());
+
+      let decoded = decode_records(&buf, extended);
+      assert!(decoded.lossy, "extended={extended} must refuse");
+      assert!(
+        decoded.records.is_empty(),
+        "extended={extended}: an over-long name is never published"
+      );
+    }
+  }
+
+  /// A zero `NextEntryOffset` is the chain's end marker, not a stride: the
+  /// walk stops at that record and never reads the bytes behind it as another.
+  /// Its own name is bounded by what is left of the completion, which is the
+  /// only extent the terminal record has.
+  ///
+  /// A CONTRACT PIN, not a regression witness: zero is a well-formed value, so
+  /// no weakening of the stride bound changes what this asserts. It exists so
+  /// the terminal case stays pinned while the nonterminal one is tightened
+  /// around it.
+  #[test]
+  fn a_zero_link_ends_the_chain_where_it_sits() {
+    let mut buf = Vec::new();
+    push_record(&mut buf, false, 0, 1, &utf16("only"));
+    // Bytes shaped exactly like a second record. A zero link means the chain
+    // ended, so they are trailing slack — never a record.
+    push_record(&mut buf, false, 0, 2, &utf16("never"));
+
+    let decoded = decode_records(&buf, false);
+    assert!(!decoded.lossy, "a terminal record is well-formed");
+    assert_eq!(decoded.records.len(), 1);
+    assert_eq!(decoded.records[0].name, RdcwName::Utf8(vec!["only".into()]));
+  }
+
+  /// A link that does not clear the record's own fixed prefix cannot be a
+  /// stride (the next header would overlap this one's), so the record is
+  /// refused before it is decoded rather than published and then disowned.
+  ///
+  /// MUTATION WITNESS: move the link validation back below the push and this
+  /// FAILS on `records.is_empty()` — the record is published first and the
+  /// chain disowned only afterwards.
+  #[test]
+  fn a_link_inside_the_fixed_header_refuses_before_the_record() {
+    let mut buf = Vec::new();
+    push_record(&mut buf, false, 8, 1, &utf16("x"));
+    buf.extend_from_slice(&[0u8; 64]);
+    let decoded = decode_records(&buf, false);
+    assert!(decoded.lossy);
+    assert!(decoded.records.is_empty());
+  }
+
+  /// A link past the completion is the shape that made the whole-buffer name
+  /// bound worst: the record claims an extent nothing in the buffer can
+  /// contradict. It is refused before the name is read.
+  ///
+  /// MUTATION WITNESS: move the link validation back below the push and this
+  /// FAILS on `records.is_empty()`.
+  #[test]
+  fn a_link_past_the_buffer_refuses_before_the_record() {
+    let mut buf = Vec::new();
+    push_record(&mut buf, false, 4096, 1, &utf16("x"));
+    let decoded = decode_records(&buf, false);
+    assert!(decoded.lossy);
+    assert!(decoded.records.is_empty());
   }
 
   #[test]

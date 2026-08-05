@@ -79,12 +79,32 @@ pub(crate) fn decode_page(buf: &[u8]) -> DecodedPage {
     let name_len = load_u32(buf, at + 60) as usize;
     let frn = load_u128(buf, at + 72);
 
+    // The name must fit BOTH the page and — for a nonterminal record — this
+    // record's own stride: `NextEntryOffset` is where the next record's header
+    // begins, so a name reaching past it would decode that header as name text.
+    // The link is a kernel u32 added to a cursor, and `at + next_offset` can
+    // wrap `usize` on a 32-bit target before any bound is tested; resolving it
+    // through checked arithmetic makes an unrepresentable stride a refusal
+    // rather than a debug-build panic. A zero link ends the chain, and the
+    // terminal record's extent is the rest of the page — the enumeration
+    // reports no byte count, so there is nothing narrower to know.
+    let extent = match next_offset {
+      0 => buf.len(),
+      _ => match at.checked_add(next_offset) {
+        Some(end_of_record) => end_of_record.min(buf.len()),
+        None => {
+          return DecodedPage {
+            children,
+            lossy: true,
+          };
+        }
+      },
+    };
     let name_at = at + HEADER;
     let name_fits = name_len.is_multiple_of(2)
       && name_at
         .checked_add(name_len)
-        .is_some_and(|end| end <= buf.len())
-      && (next_offset == 0 || name_at + name_len <= at + next_offset);
+        .is_some_and(|end| end <= extent);
     if !name_fits {
       return DecodedPage {
         children,
@@ -229,6 +249,33 @@ mod tests {
     let decoded = decode_page(&buf);
     assert!(decoded.lossy);
     assert!(decoded.children.is_empty());
+  }
+
+  /// A `NextEntryOffset` of nearly `u32::MAX`: on a 32-bit target (i686)
+  /// `at + next_offset` overflows `usize`, and the old bound computed that sum
+  /// unchecked — a panic on the add, before any bound was ever tested. Resolved
+  /// through checked arithmetic it is a refusal at every pointer width, which
+  /// is what the page's fail-closed contract wants.
+  ///
+  /// MUTATION WITNESS (32-bit only): revert the bound to the unchecked
+  /// `at + next_offset` and this FAILS under
+  /// `cargo miri test --target i686-unknown-linux-gnu` with `attempt to add
+  /// with overflow`. At 64-bit pointer width the sum is representable, so the
+  /// mutation is invisible there and only the refusal itself stays pinned.
+  #[test]
+  fn an_absurd_stride_refuses_rather_than_overflowing() {
+    let mut buf = Vec::new();
+    push_record(&mut buf, stride(&utf16("ok")), 0x10, 7, &utf16("ok"));
+    let second_at = buf.len();
+    push_record(&mut buf, 0, 0x10, 8, &utf16("absurd"));
+    // Patched in rather than passed to the helper, which pads the page out to
+    // whatever stride it is given.
+    buf[second_at..second_at + 4].copy_from_slice(&(u32::MAX - 7).to_le_bytes());
+    let decoded = decode_page(&buf);
+    assert!(
+      decoded.lossy,
+      "a stride nothing can contain refuses the page"
+    );
   }
 
   #[test]
