@@ -1723,6 +1723,420 @@ async fn widen_over_unmount_rebind_is_never_silently_certified() {
   );
 }
 
+/// How many times one release pass re-runs `umount` before it stops retrying.
+/// The count is for the transient `EBUSY` alone (see
+/// [`TmpfsMount::release_once`]); what bounds the WAIT is the per-call and
+/// aggregate wall-clock bounds beside it, because a single invocation that never
+/// returns outlives any count.
+const UNMOUNT_ATTEMPTS: usize = 50;
+
+/// A tmpfs mounted for the duration of one cell, unmounted on EVERY exit path —
+/// including the unwind out of a failing assertion, which is exactly the path a
+/// cell takes the moment it finds a real defect. A leaked mount shadows its
+/// directory for every later cell in the binary, and after a local `sudo` run it
+/// outlives the process entirely.
+///
+/// Every utility it runs — the setup `mount` as much as the release's `umount` —
+/// goes through [`cleanup_within`], and the whole release additionally runs under
+/// the one aggregate bound [`cleanup_budget`] sizes. `status()` waits FOREVER,
+/// and this release runs from [`Drop`]: an `umount` the kernel will not complete
+/// would otherwise block the unwind out of the very assertion this fixture exists
+/// to let a cell report, and reach the CI job's outer timeout with the mount
+/// still there and nothing said about why.
+struct TmpfsMount {
+  at: PathBuf,
+  /// A VERIFIED release: the kernel's own table says nothing is mounted at
+  /// [`Self::at`] any more. Set only once the residue check comes back empty, so
+  /// a pass that could not take the mount apart leaves [`Drop`] a real second
+  /// attempt.
+  released: bool,
+  /// The `umount` had to be KILLED for exceeding its bound (or could not be run
+  /// at all), carrying the line that says so. Sticky, and consulted before every
+  /// later spawn: the retries below exist for an `EBUSY` that clears in
+  /// milliseconds, and a wedged utility is not that — so spending another bound
+  /// on it would only stretch an unwind that is already carrying a failure
+  /// report.
+  wedged: Option<String>,
+  /// When the ONE aggregate cleanup bound ([`cleanup_budget`]) expires. Armed on
+  /// the FIRST release pass and never re-armed, so it spans every retry AND every
+  /// outer [`Drop`] pass rather than restarting with each of them; deliberately
+  /// not armed at construction, because a bound already spent by the time cleanup
+  /// starts would skip the release altogether and leak the mount it exists to
+  /// return.
+  deadline: Option<std::time::Instant>,
+  /// That aggregate bound was exhausted. Sticky for the same reason
+  /// [`Self::wedged`] is: it is what the NEXT pass reads, so no pass can hand
+  /// itself a fresh budget.
+  overran: bool,
+}
+
+/// What one attempt to stage [`TmpfsMount::at`]'s tmpfs ENDED as.
+///
+/// Three genuinely different endings, told apart rather than folded into one
+/// absence, because only ONE of them may become a skip and a cell that skips
+/// still PASSES. Reporting a wedged setup utility — or a kernel table that would
+/// not answer — as "the environment has no tmpfs" makes the privileged cell green
+/// without running an assertion, which is the same false certification the bounds
+/// around this fixture exist to remove, moved from "hangs until the job's outer
+/// timeout fires" to "skips and reports success".
+enum TmpfsSetup {
+  /// Mounted, and the kernel's own table says so: the cell proceeds.
+  Mounted(TmpfsMount),
+  /// The utility completed inside its bound and the table AGREES nothing is
+  /// mounted at the path — this environment refuses tmpfs here. The one ending a
+  /// skip is honest for: nothing was staged, and nothing was left behind.
+  Refused,
+  /// The SETUP itself failed: the utility had to be killed at its bound, could
+  /// not be run at all, or left a state the kernel's table would not confirm
+  /// either way. The cell FAILS carrying `residue`.
+  Failed {
+    /// What failed, and then whatever the release below could not clear.
+    residue: Vec<String>,
+    /// Carried to the caller instead of dropped with the verdict, because both
+    /// failing endings can leave a mount that is LIVE — a `mount` killed the
+    /// instruction after its mount landed, and an unreadable table that has
+    /// disproved nothing — and this is the only thing that owns it. Its bounded
+    /// [`Drop`] is then one more pass over ground the release in
+    /// [`TmpfsMount::at`] already tried once.
+    fixture: TmpfsMount,
+  },
+}
+
+impl TmpfsMount {
+  /// Mounts a fresh, private tmpfs at `dir` — a NEW superblock, which is what
+  /// makes its unmount a real `IN_UNMOUNT`/`IN_IGNORED` teardown rather than a
+  /// namespace detach. What the attempt ENDED as is [`TmpfsSetup`], and only its
+  /// verified refusal is a cell's to skip on.
+  ///
+  /// The setup utility carries the same wall-clock bound as the release's: a
+  /// `mount` that never returns wedges the cell before it has staged anything at
+  /// all, and there is then no assertion left for anyone to read when the job's
+  /// outer timeout finally fires.
+  ///
+  /// What decides the outcome is the kernel's own table and never the utility's
+  /// exit status ([`cleanup_within`] discards it deliberately) — a `mount` killed
+  /// just after its mount landed still leaves this fixture owning a mount it must
+  /// release.
+  fn at(dir: &Path) -> TmpfsSetup {
+    // The owner is minted BEFORE there is anything to own. Every step below can
+    // end with a live tmpfs at `dir`, including the steps that report failure,
+    // and a fixture built only once the setup is known to have SUCCEEDED is
+    // precisely the fixture those endings never get.
+    let mut fixture = Self {
+      at: dir.to_path_buf(),
+      released: false,
+      wedged: None,
+      deadline: None,
+      overran: false,
+    };
+    let budget = StopBudget::current();
+    let mut residue = Vec::new();
+    if let Err(err) = std::fs::create_dir_all(dir) {
+      residue.push(format!(
+        "the mountpoint {} could not be created: {err}",
+        dir.display()
+      ));
+    } else if let Err(failed) = cleanup_within(
+      &format!("mount -t tmpfs {}", dir.display()),
+      std::process::Command::new("mount")
+        .args(["-t", "tmpfs", "-o", "size=4m", "tributary-submount"])
+        .arg(dir),
+      &budget,
+    ) {
+      // Kept as a fact of its own: "the mount utility had to be killed" and
+      // "this environment refuses tmpfs" are different facts, and only the first
+      // one says the harness itself is the thing that wedged. It travels into
+      // the cell's FAILURE rather than a line printed beside a skip, because a
+      // cell that skips still PASSES — and a fact whose whole job is to say the
+      // harness never ran the experiment is worth nothing on a green run, wherever
+      // it is printed.
+      residue.push(failed);
+    }
+    match mount_state(dir) {
+      Some(true) if residue.is_empty() => TmpfsSetup::Mounted(fixture),
+      Some(false) if residue.is_empty() => TmpfsSetup::Refused,
+      // Every remaining ending is the setup failing over ground that may still
+      // be mounted: the table would not answer, or the killed utility was killed
+      // the instruction after its mount landed. So the fixture takes itself apart
+      // HERE, under the bounds it already carries, and what it could not clear
+      // joins the report the cell fails with — a guard dropped on this path
+      // instead is how a live mount ends up with nobody left to release it.
+      _ => {
+        residue.extend(fixture.release_once());
+        TmpfsSetup::Failed { residue, fixture }
+      }
+    }
+  }
+
+  /// Unmounts and reports what is STILL there — an empty residue is the kernel's
+  /// own table agreeing that nothing is mounted at [`Self::at`] any more.
+  ///
+  /// Retried briefly: an arm-time `O_PATH` anchor still in flight is exactly
+  /// `umount`'s `EBUSY`, and it is transient. The retry COUNT bounds none of
+  /// that, which is the whole point — so every invocation carries its own
+  /// wall-clock bound ([`cleanup_within`]) and all of them together carry one
+  /// more ([`cleanup_budget`]), read BEFORE each spawn because what the next call
+  /// would spend is what an unwind carrying a failure report pays.
+  ///
+  /// Re-entry is safe and expected: unmounting what is not mounted fails
+  /// harmlessly, and `released` stays clear until a pass verifiably left nothing.
+  fn release_once(&mut self) -> Vec<String> {
+    use std::process::Command;
+    if self.released {
+      return Vec::new();
+    }
+    let budget = StopBudget::current();
+    let aggregate = cleanup_budget(&budget);
+    // Armed on the FIRST pass only: every later pass inherits this same instant,
+    // which is what makes the bound aggregate rather than per-pass.
+    if self.deadline.is_none() {
+      self.deadline = Some(std::time::Instant::now() + aggregate);
+    }
+    for _ in 0..UNMOUNT_ATTEMPTS {
+      // Only the kernel's own AGREEMENT that nothing is mounted ends the
+      // release. A table that could not be read has disproved nothing (see
+      // [`mount_state`]), so an unverifiable state is presumed to be holding the
+      // mount this fixture owes back and still gets its bounded `umount` —
+      // walking away from it because the answer was unreadable is how a live
+      // mount outlives the cell that made it.
+      if mount_state(&self.at) == Some(false) {
+        break;
+      }
+      // A utility already known wedged, or a budget already spent, ends the loop
+      // where it stands: the release goes straight to verifying and REPORTING
+      // what it is leaving behind instead of buying another bound it cannot
+      // afford.
+      self.overran |= self
+        .deadline
+        .is_some_and(|deadline| std::time::Instant::now() >= deadline);
+      if self.wedged.is_some() || self.overran {
+        break;
+      }
+      if let Err(failed) = cleanup_within(
+        &format!("umount {}", self.at.display()),
+        Command::new("umount").arg(&self.at),
+        &budget,
+      ) {
+        self.wedged = Some(failed);
+        break;
+      }
+      match mount_state(&self.at) {
+        // Still mounted is the transient `EBUSY` this retry exists for: nap and
+        // go again.
+        Some(true) => std::thread::sleep(Duration::from_millis(20)),
+        // Gone, or unknowable. A table that cannot be read offers the retry no
+        // progress to wait on, so the mount has had the one bounded `umount` its
+        // unproven state is owed and the release goes on to REPORT — rather than
+        // spending the aggregate bound on invocations whose effect it could not
+        // read either.
+        _ => break,
+      }
+    }
+    // Both re-reported on every pass the flags are set, so a later pass cannot
+    // quietly drop the fact that cleanup stopped short — and so the report names
+    // WHY it stopped and not only what it left: "the umount was killed" and "the
+    // mount is still there" are different diagnostics, and only the first says
+    // where to look.
+    let mut residue = Vec::new();
+    if let Some(failed) = &self.wedged {
+      residue.push(failed.clone());
+    }
+    if self.overran {
+      residue.push(format!(
+        "the release exhausted its {aggregate:?} aggregate cleanup bound and stopped where it \
+         stood"
+      ));
+    }
+    match mount_state(&self.at) {
+      Some(false) => {}
+      Some(true) => residue.push(format!("{} is still mounted", self.at.display())),
+      None => residue.push(format!(
+        "{} mount state is UNVERIFIABLE (/proc/self/mountinfo unreadable)",
+        self.at.display()
+      )),
+    }
+    if residue.is_empty() {
+      self.released = true;
+    }
+    residue
+  }
+
+  /// The explicit normal close: releases and FAILS on residue. A mount the cell
+  /// could not take apart shadows its directory for every later cell in this
+  /// binary — and, after a local `sudo` run, for the host — so the cell that
+  /// leaked it owns the failure instead of donating a mystery result to an
+  /// unrelated one.
+  fn close(mut self) {
+    let residue = self.release_once();
+    assert!(
+      residue.is_empty(),
+      "CLEANUP tmpfs at {}: {}",
+      self.at.display(),
+      residue.join("; ")
+    );
+  }
+}
+
+impl Drop for TmpfsMount {
+  fn drop(&mut self) {
+    let mut residue = Vec::new();
+    let mut passes = 0;
+    for _ in 0..RELEASE_ATTEMPTS {
+      passes += 1;
+      residue = self.release_once();
+      if residue.is_empty() {
+        return;
+      }
+      // Neither a killed utility nor a spent aggregate bound comes back within a
+      // pass gap, so the remaining passes are spent reporting instead of waiting.
+      if self.wedged.is_some() || self.overran {
+        break;
+      }
+      std::thread::sleep(Duration::from_millis(20));
+    }
+    if !std::thread::panicking() {
+      // On a path that was otherwise going to PASS, a leaked mount printed to a
+      // captured stderr is invisible — libtest keeps the buffer only for a cell
+      // that FAILS — so this one fails, exactly as [`TmpfsMount::close`] does.
+      // Nothing is unwinding here, so the panic starts one instead of aborting.
+      panic!(
+        "CLEANUP tmpfs at {} ({passes} attempts): {}",
+        self.at.display(),
+        residue.join("; ")
+      );
+    }
+    // Reports and never panics from here on: a panic in `drop` DURING an unwind
+    // aborts the process and destroys the failing cell's own diagnosis — the
+    // report every bound above exists to let the cell reach. The lines land after
+    // the original panic message, in the same captured buffer libtest prints for
+    // the failing cell, so cleanup can neither delay that message nor take its
+    // place.
+    for left in residue {
+      eprintln!(
+        "CLEANUP FAILED tmpfs at {} (while unwinding, {passes} attempts): {left}",
+        self.at.display()
+      );
+    }
+  }
+}
+
+/// Suite 8 (privileged, CI: `linux-verify.sh inotify-priv`) — the SCOPE FENCE
+/// that decides which teardowns the Monitor's live non-root `Ignored` branch can
+/// ever see on this backend.
+///
+/// A scope is one mount. `core::crosses_mount_boundary` lowers any enumerated
+/// directory sitting across the root's mount frame to `FileKind::Other`, so the
+/// descent never arms a submount — which is why an unmount BELOW the watched root
+/// raises no teardown record at all: there was never a binding on that superblock
+/// to destroy. The live non-root `Ignored` the Monitor covers therefore arrives
+/// from the traces that survive this fence (a whole-superblock unmount, whose
+/// records include the root's own; an `IN_IGNORED` whose self-record the queue
+/// dropped), never from a submount.
+///
+/// This cell exists because that fence is an ASSUMPTION the Monitor-side cover is
+/// costed against. Relaxing it would put real, arm-able mountpoints inside a
+/// scope and make submount teardown reachable — so it must not be relaxed
+/// silently, and this fails loudly if it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_submount_is_outside_the_scope_and_raises_no_teardown() {
+  const CELL: &str = "a_submount_is_outside_the_scope_and_raises_no_teardown";
+  if !privileged_or_skip(CELL) {
+    return;
+  }
+
+  let root = scratch_root("submount-fence");
+  let plain = root.join("plain");
+  let mount = root.join("mnt");
+  std::fs::create_dir_all(&plain).expect("plain subdirectory");
+  let mut tmpfs = match TmpfsMount::at(&mount) {
+    TmpfsSetup::Mounted(tmpfs) => tmpfs,
+    // The one refusal this cell may skip on, and it is a VERIFIED one: the
+    // utility completed and the kernel's table says the path carries no mount,
+    // so the environment has no tmpfs to give and there is no boundary here to
+    // fence.
+    TmpfsSetup::Refused => {
+      common::skip_notice(format_args!(
+        "{CELL}: this environment refuses a private tmpfs at {}, so there is no mount \
+         boundary inside the root to fence",
+        mount.display()
+      ));
+      let _ = std::fs::remove_dir_all(&root);
+      return;
+    }
+    // The harness failed to stage its own experiment, which is this cell's
+    // failure and not a precondition it may skip on — a skip here reports every
+    // assertion below as having held when not one of them ran.
+    //
+    // `_fixture` is held to the end of the arm on purpose: it may own a live
+    // mount, and its [`Drop`] gets its last bounded pass on the unwind out of
+    // this panic. Nothing recursively removes `root` here for the same reason —
+    // a remove aimed at a still-mounted point walks INTO the live filesystem.
+    TmpfsSetup::Failed {
+      residue,
+      fixture: _fixture,
+    } => panic!(
+      "{CELL}: the tmpfs fixture could not be staged at {}: {}",
+      mount.display(),
+      residue.join("; ")
+    ),
+  };
+
+  let mut w = inotify_watcher();
+  let _handle = w.watch(&root, Interest::all()).await.expect("watch");
+  assert!(
+    coverage_becomes_live(&mut w, &root, "birth").await,
+    "the birth crawl settles"
+  );
+  // The control: an ordinary same-mount directory IS armed and DOES deliver at
+  // its own path. Without it the fence assertion below would also pass on a
+  // descent that armed nothing at all.
+  assert!(
+    child_watch_delivers(&mut w, &plain, "plain").await,
+    "the descent arms an ordinary subdirectory"
+  );
+  // The fence: a create inside the submount is never delivered at its own path,
+  // because nothing ever armed it.
+  assert!(
+    !child_watch_delivers(&mut w, &mount, "submount").await,
+    "a submount is outside the scope: {} must not be descended into",
+    mount.display()
+  );
+
+  // And so its unmount destroys no binding and raises no located teardown. A
+  // `Rescan` addressed at the mountpoint is precisely what the Monitor emits when
+  // it DOES lose a live non-root binding, so its absence here is the fence's
+  // observable consequence rather than a bare timeout.
+  let residue = tmpfs.release_once();
+  assert!(
+    residue.is_empty(),
+    "the submount unmounts while the root is watched: {}",
+    residue.join("; ")
+  );
+  let located = tokio::time::timeout(scaled(Duration::from_secs(2)), async {
+    while let Some(event) = w.next().await {
+      if event.is_rescan() && event.path() == mount {
+        return true;
+      }
+    }
+    false
+  })
+  .await
+  .unwrap_or(false);
+  assert!(
+    !located,
+    "no binding existed under {}, so its unmount owes no located cover",
+    mount.display()
+  );
+
+  // The release above already verified the unmount, so this is the residue check
+  // rather than a second teardown — and it FAILS the cell if the fixture is
+  // somehow still holding a mount, which a `drop` here could only print into a
+  // buffer libtest discards for a passing cell.
+  tmpfs.close();
+  w.close().await.expect("close");
+  let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Whether `path` is a mount point right now, read from the kernel's own table
 /// rather than inferred from a command's exit status: a cell whose bracket died
 /// mid-cycle leaves nothing mounted, so a failing `umount` there is correct
@@ -1784,6 +2198,10 @@ fn loop_attached(loopdev: &str) -> bool {
 /// A bound per call is still not a bound on the RELEASE, which is what
 /// [`cleanup_budget`] adds: a utility that keeps returning is affordable here every
 /// time and unaffordable in aggregate.
+///
+/// A fixture's SETUP utility runs through here too ([`TmpfsMount::at`]): `status()`
+/// is just as unbounded there, and a `mount` that never returns wedges its cell
+/// before that cell has any assertion to report at all.
 fn cleanup_within(
   what: &str,
   command: &mut std::process::Command,
