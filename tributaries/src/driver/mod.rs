@@ -1196,15 +1196,17 @@ where
   /// ) — is bounded and never awaits.
   cleanup_rx: async_channel::Receiver<Cleanup>,
   events: async_channel::Sender<Event<C, V>>,
-  /// A **debug-only** tripwire for the generation-unique [`Source::Handle`] contract: the most
-  /// recent [`OBSERVED_HANDLE_HISTORY`] handles this owner observed from a successful live
-  /// [`arm`](Self::arm). The arm choke point asserts each freshly-armed handle is not in that
-  /// window, catching reuse of a still-recorded sibling and reuse of a handle already removed from
-  /// the live index by unwatch or terminal retirement (the post-retirement case the per-site
-  /// live-index checks missed). Observations leave only by eviction, so the window bounds the
-  /// debug build's memory by itself rather than by the owner's lifetime arm count — see
-  /// [`OBSERVED_HANDLE_HISTORY`] for what that costs the check. `#[cfg(debug_assertions)]` so the
-  /// field, its init, and its assert add zero release-build cost.
+  /// The **debug-only** RETIREMENT half of the generation-unique [`Source::Handle`] tripwire: the
+  /// most recent [`OBSERVED_HANDLE_HISTORY`] handles this owner observed from a successful live
+  /// [`arm`](Self::arm). It exists for the case no live structure can testify to — reuse of a
+  /// handle already removed from the live index by unwatch or terminal retirement, which the old
+  /// per-site live-index checks missed. Reuse of a handle that is STILL live is decided at the
+  /// same choke point against [`subsumer`](Self::subsumer)'s own index instead, exhaustively,
+  /// because observations leave this window by eviction and eviction is keyed on arm history
+  /// rather than on live population. The window is what bounds the debug build's memory by itself
+  /// rather than by the owner's lifetime arm count — see [`OBSERVED_HANDLE_HISTORY`].
+  /// `#[cfg(debug_assertions)]` so the field, its init, and its assert add zero release-build
+  /// cost.
   #[cfg(debug_assertions)]
   observed_handles: ObservedHandles<S::Handle>,
   _rt: PhantomData<R>,
@@ -1785,20 +1787,26 @@ const COMMAND_FAIRNESS_BUDGET: u32 = 32;
 const MAX_PENDING_SYNCS: usize = 256;
 
 /// How many recently-armed [`Source::Handle`]s the debug-only generation-uniqueness
-/// tripwire remembers ([`ObservedHandles`]).
+/// tripwire remembers ([`ObservedHandles`]) **beyond** what the subsumer's live index
+/// already answers.
 ///
-/// An all-time history makes the tripwire exhaustive but changes the debug build's
-/// resource model from "peak live roots plus bounded debt" to "every arm since the owner
-/// was constructed": a long-running debug or staging watcher that churns disjoint roots
-/// grows without bound even when every live root and delivery obligation is reclaimed
-/// correctly — a soak meant to expose leaks then contains a growth source of its own.
+/// An all-time history changes the debug build's resource model from "peak live roots
+/// plus bounded debt" to "every arm since the owner was constructed": a long-running
+/// debug or staging watcher that churns disjoint roots grows without bound even when
+/// every live root and delivery obligation is reclaimed correctly — a soak meant to
+/// expose leaks then contains a growth source of its own.
 ///
-/// So the history is a bounded most-recent window. Chosen well above any plausible peak
-/// live-root population, because that is what makes the window's two guarantees hold:
-/// reuse of a **live** handle is caught whenever live roots stay under this many, and
-/// reuse **after** retirement is caught within this many intervening arms — the shape a
-/// handle-recycling source actually has. Beyond that window the check is silent; it is a
-/// debug tripwire for a contract violation, never a correctness mechanism.
+/// So the history is a bounded most-recent window, and it is deliberately NOT what
+/// answers the live-alias question: eviction here is keyed on arm history, not on live
+/// population, so a root held live across more than this many intervening arms would
+/// fall out of the window while it is still recorded. That case — the alias that can
+/// overwrite the reverse handle mapping and strand a live root — is answered
+/// exhaustively by the subsumer's own live index, at the arm choke point, whatever this
+/// window holds. What is left for the window is reuse **after** retirement, which no
+/// live structure can testify to; that is caught within this many intervening arms, the
+/// shape a handle-recycling source actually has. Beyond it the retirement check is
+/// silent; it is a debug tripwire for a contract violation, never a correctness
+/// mechanism.
 #[cfg(debug_assertions)]
 const OBSERVED_HANDLE_HISTORY: usize = 4096;
 
@@ -1808,7 +1816,8 @@ const OBSERVED_HANDLE_HISTORY: usize = 4096;
 ///
 /// Bounded by construction — the oldest observation is evicted to make room — so the
 /// debug build's memory stays proportional to the window rather than to the number of
-/// arms the owner has ever performed.
+/// arms the owner has ever performed. That eviction is exactly why the window does not
+/// decide the live-alias case; see [`OBSERVED_HANDLE_HISTORY`].
 #[cfg(debug_assertions)]
 struct ObservedHandles<H> {
   seen: std::collections::HashSet<H>,
@@ -1828,8 +1837,9 @@ where
   }
 
   /// Records `handle` as observed, reporting `false` if it is **still in the window** —
-  /// the tripwire's verdict. Evicting the oldest observation keeps the window bounded;
-  /// eviction is the only way an observation ever leaves.
+  /// half the tripwire's verdict, the half no live structure could give. Evicting the
+  /// oldest observation keeps the window bounded; eviction is the only way an
+  /// observation ever leaves.
   fn observe(&mut self, handle: H) -> bool {
     if !self.seen.insert(handle) {
       return false;
@@ -2284,8 +2294,8 @@ where
         }
         // A fresh arm's handle is generation-unique (see `Source::Handle`), so it is absent from the
         // reverse index and `commit_watch`'s `by_handle` insert cannot clobber a live root's entry.
-        // A contract-violating source is caught by the arm choke point's exhaustive observed-handle
-        // tripwire, which fires on ANY reuse before this commit is ever reached.
+        // A contract-violating source is caught by the arm choke point's handle tripwire, whose
+        // live-index half fires on ANY still-live alias before this commit is ever reached.
         self.subsumer.commit_watch(&outcome, handle, &fs_key);
         self.filters.insert(sub, SubscriptionFilter::new(filter));
         self.register_debounce(sub, debounce);
@@ -2463,8 +2473,8 @@ where
         // The wider arm's handle is generation-unique (see `Source::Handle`): it aliases none of the
         // still-recorded subsumed roots `commit_watch` is about to drop, nor any other live root, so
         // its `by_handle` insert cannot clobber a live entry. A contract-violating source is caught
-        // by the arm choke point's exhaustive observed-handle tripwire before this
-        // commit is ever reached.
+        // by the arm choke point's handle tripwire — its live-index half covers exactly these
+        // still-recorded roots — before this commit is ever reached.
         self.commit_widen(&outcome, handle, &fs_key, sub, filter, debounce, &repointed);
         Ok(sub)
       }
@@ -2652,11 +2662,12 @@ where
   /// Arm-time + reuse-time + terminal-time liveness together close the
   /// handle-liveness class.
   ///
-  /// Because every arming path funnels through here, this is also where the **exhaustive**
-  /// generation-unique [`Source::Handle`] tripwire lives: a debug-only assert that the
-  /// freshly-armed, live handle was NEVER observed by this owner before. It subsumes the old
-  /// per-site live-index checks AND additionally catches reuse of a handle already removed from the
-  /// live index by unwatch or terminal retirement (see `observed_handles`).
+  /// Because every arming path funnels through here, this is also where the generation-unique
+  /// [`Source::Handle`] tripwire lives: a debug-only assert that the freshly-armed, live handle
+  /// was never observed by this owner before. It reads the subsumer's live index — **exhaustively**
+  /// subsuming the old per-site live-index checks, with no window a still-live root can age out of
+  /// — AND a bounded history of recent arms, which additionally catches reuse of a handle already
+  /// removed from that index by unwatch or terminal retirement (see `observed_handles`).
   ///
   /// An overlap rejection (the fs binding's `Overlaps`) from a conforming source is now
   /// **unreachable**, so there is no overlap-retry here. [`Source::disarm`]'s
@@ -2756,20 +2767,36 @@ where
       return Err(WatchError::DeadOnArrival.into());
     }
     // The single tripwire for the generation-unique `Source::Handle` contract: a freshly-armed,
-    // live handle must not be one this owner recently observed. This one choke-point check
-    // subsumes the old per-site live-index `entry(handle).is_none()` asserts (Disjoint/Widen
-    // commit, restore rebind) AND additionally catches reuse of a handle already removed from the
-    // live index by unwatch or terminal retirement — which those per-site checks missed, because a
-    // stale event still carrying it could then route through the re-armed root. `observe` reports
-    // `false` for any handle still in its bounded window, so a retired-then-reused handle still
-    // trips within that window (`OBSERVED_HANDLE_HISTORY` states the bound and what it costs).
+    // live handle must be one this owner has never seen. It reads TWO structures, because each
+    // answers a case the other cannot.
+    //
+    // The subsumer's live index is EXHAUSTIVE and is what covers the case that matters most: a
+    // handle still naming a live root. That is the alias `commit_watch` / `rebind_root` would let
+    // overwrite the reverse handle mapping, stranding the original root and misrouting its events
+    // into the new one. It subsumes the old per-site `entry(handle).is_none()` asserts
+    // (Disjoint/Widen commit, restore rebind) with no window to fall out of — a root may stay live
+    // across arbitrarily many arms of other roots, so a bounded most-recent history CANNOT decide
+    // this and must not be asked to.
+    //
+    // The bounded observed-handle window covers what no live structure remembers: a handle already
+    // removed from the live index by unwatch or terminal retirement, whose reuse is equally a
+    // violation because a stale event still carrying it would route through the re-armed root.
+    // `observe` reports `false` while the handle is still in the window
+    // (`OBSERVED_HANDLE_HISTORY` states the bound and what it costs).
+    //
+    // Both are evaluated before the assert so the window records this arm either way.
     // Debug-only: the field, this assert, and its cost all vanish in release builds.
     #[cfg(debug_assertions)]
-    debug_assert!(
-      self.observed_handles.observe(handle),
-      "Source::arm returned a handle already observed by this owner (a reused handle, even after \
-       retirement) — a generation-unique Source::Handle contract violation; see Source::Handle"
-    );
+    {
+      let aliases_a_live_root = self.subsumer.entry(handle).is_some();
+      let unseen_recently = self.observed_handles.observe(handle);
+      debug_assert!(
+        !aliases_a_live_root && unseen_recently,
+        "Source::arm returned a handle already observed by this owner (a reused handle, even \
+         after retirement) — a generation-unique Source::Handle contract violation; see \
+         Source::Handle"
+      );
+    }
     Ok((handle, armed.canonical_key().to_vec()))
   }
 
@@ -2928,9 +2955,9 @@ where
   ///   **generation-unique** handle by contract (see [`Source::Handle`]), so it can alias neither
   ///   `old` nor a not-yet-restored sibling still recorded here; the earlier defensive
   ///   alias-detection is gone (it was incomplete, and disarming an aliased handle
-  ///   stranded an *unrelated live* root), replaced by the arm choke point's exhaustive
-  ///   observed-handle `debug_assert` tripwire that fires loudly on a contract-violating
-  ///   source without corrupting release builds.
+  ///   stranded an *unrelated live* root), replaced by the arm choke point's `debug_assert`
+  ///   tripwire — whose live-index half covers every still-recorded root exhaustively — which
+  ///   fires loudly on a contract-violating source without corrupting release builds.
   /// - if the re-arm **fails** (the root is genuinely dead) or its committed key **diverged** (a
   ///   canonicalization race we cannot cleanly rebind), **retire** the root through the shared
   ///   [`retire_root_with_terminal_rescan`](Self::retire_root_with_terminal_rescan): a durable
@@ -2972,8 +2999,8 @@ where
           // re-armed root and be stamped in the new generation past the restore Rescan — so `old`
           // must fall to the dead-root drain path, and reusing `old` is NOT exempt. Any reuse —
           // a sibling, `old`, or a handle already removed from the live index by a prior retirement —
-          // is caught by the arm choke point's exhaustive observed-handle tripwire
-          // before this rebind is ever reached.
+          // is caught by the arm choke point's handle tripwire (the live index for the first two,
+          // the observed-handle window for the third) before this rebind is ever reached.
           //
           // Re-armed at the same coordinate with a fresh handle: rebind onto it and re-point each
           // subscriber (raw epochs restarted at zero) with a dominating Rescan.
