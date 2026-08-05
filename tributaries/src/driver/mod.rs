@@ -4297,42 +4297,62 @@ where
   /// post-cookie state — so a key-only match left those barriers unresolved until their caller's
   /// own timeout fired, over a source that had done nothing wrong.
   ///
-  /// The two arms cannot both fire for one pending entry: the first match wins and the entry is
-  /// removed, and a move whose two endpoints are the same key is not a move.
+  /// The two arms cannot both fire for one pending entry: a move whose two endpoints are the
+  /// same key is not a move, so at most one of them names any given cookie.
+  ///
+  /// # Every matching barrier resolves, not just the first
+  ///
+  /// Two completed sync writes coexist routinely (a `RootHandle` is `Copy`, and one
+  /// subscription may hold several barriers), and ONE [`All`](ReservedEndpoints::All) move can
+  /// name both of their cookies — cookie `K1` renamed onto cookie `K2`. That single observation
+  /// is ordered after both writes and therefore proves both barriers, so both must be answered
+  /// here: overwriting `K2` need not produce any further record of it, and a barrier left
+  /// behind would wait out its caller's deadline over a source that did nothing wrong. The scan
+  /// therefore drains every match, and each one keeps the reap → flush → outcome ordering
+  /// below in full.
+  ///
+  /// [`swap_remove`](Vec::swap_remove) reorders the tail, so the cursor deliberately does NOT
+  /// advance on a removal: the entry moved down into the vacated slot is examined on the next
+  /// turn instead of being skipped. Same idiom as
+  /// [`dominate_pending_syncs`](Self::dominate_pending_syncs).
   fn resolve_matching_pending_sync(
     &mut self,
     event: &SourceEvent<C, S::Handle>,
     reserved: ReservedEndpoints,
   ) {
     let move_from = event.move_from();
-    let Some(idx) = self.pending_syncs.iter().position(|pending| {
-      let cookie = pending.cookie_key.as_slice();
-      (reserved.masks_destination() && cookie == event.key())
-        || (reserved.masks_source() && move_from.is_some_and(|from| cookie == from))
-    }) else {
-      return;
-    };
-    let pending = self.pending_syncs.swap_remove(idx);
-    // A loss touched the sub DURING the barrier (serial advanced) — even if its parked Rescan has
-    // since been published and cleared — OR debt already stood at install (a pre-call loss the cookie
-    // cannot un-owe): either way re-enumeration stands in for delivery.
-    let lost_during_window =
-      self.loss_serial.get(&pending.sub).copied().unwrap_or(0) != pending.loss_serial_at_install;
-    let dominated_at_install = pending.dominated_at_install;
-    // Reap the cookie BEFORE the flush. Its observation already happened (its own event is what
-    // matched here), and `flush_subscription_now` can UNWIND — it runs `R::now` and clones/orders
-    // caller key/value types in the coalescer. Reaping first keeps a flush panic from leaking the
-    // marker: once swap-removed, this entry is out of `pending_syncs`, so `Owner::drop` (which reaps
-    // only entries still in the vector) would never reap it. The outcome still uses the flush result.
-    self.reap_cookie(pending.root, &pending.cookie_key);
-    let clean =
-      self.flush_subscription_now(pending.sub) && !lost_during_window && !dominated_at_install;
-    let outcome = if clean {
-      SyncOutcome::Delivered
-    } else {
-      SyncOutcome::Dominated
-    };
-    let _ = pending.reply.send(Ok(outcome));
+    let key = event.key();
+    let mut i = 0;
+    while i < self.pending_syncs.len() {
+      let cookie = self.pending_syncs[i].cookie_key.as_slice();
+      let matched = (reserved.masks_destination() && cookie == key)
+        || (reserved.masks_source() && move_from.is_some_and(|from| cookie == from));
+      if !matched {
+        i += 1;
+        continue;
+      }
+      let pending = self.pending_syncs.swap_remove(i);
+      // A loss touched the sub DURING the barrier (serial advanced) — even if its parked Rescan has
+      // since been published and cleared — OR debt already stood at install (a pre-call loss the cookie
+      // cannot un-owe): either way re-enumeration stands in for delivery.
+      let lost_during_window =
+        self.loss_serial.get(&pending.sub).copied().unwrap_or(0) != pending.loss_serial_at_install;
+      let dominated_at_install = pending.dominated_at_install;
+      // Reap the cookie BEFORE the flush. Its observation already happened (its own event is what
+      // matched here), and `flush_subscription_now` can UNWIND — it runs `R::now` and clones/orders
+      // caller key/value types in the coalescer. Reaping first keeps a flush panic from leaking the
+      // marker: once swap-removed, this entry is out of `pending_syncs`, so `Owner::drop` (which reaps
+      // only entries still in the vector) would never reap it. The outcome still uses the flush result.
+      self.reap_cookie(pending.root, &pending.cookie_key);
+      let clean =
+        self.flush_subscription_now(pending.sub) && !lost_during_window && !dominated_at_install;
+      let outcome = if clean {
+        SyncOutcome::Delivered
+      } else {
+        SyncOutcome::Dominated
+      };
+      let _ = pending.reply.send(Ok(outcome));
+    }
   }
 
   /// A live-root `Rescan` at or above a pending cookie's key stands in for it:

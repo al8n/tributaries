@@ -53,24 +53,39 @@ impl Event {
   }
 
   /// Assembles a consumer event exactly as [`Watcher`](crate::Watcher)'s own delivery path
-  /// does — `Event::from_change` under a [`RootHandle`] branded with `instance` and the
-  /// change's own scope.
+  /// does — `Event::from_change` under a [`RootHandle`] the caller **already holds**.
   ///
-  /// **Internal, not public API** (hence `#[doc(hidden)]`; it is exempt from this crate's
-  /// semver surface and may change or vanish in a patch release). It exists because the
-  /// `tributaries` umbrella binds this vocabulary to its own
-  /// (`SourceEvent::from_fs`) and that binding had no cell of its own: an `Event` is minted
-  /// only by a live watcher draining a real kernel stream, so every test of the binding was
-  /// forced to hand-build the *output* and assert against itself, leaving the conversion —
-  /// including which of a rename's two locations reaches the umbrella — unwitnessed. A
-  /// cross-crate seam that mints a REAL lower-layer event from a real [`Change`] is what lets
-  /// that conversion be tested as the conversion it is.
+  /// **Internal, not public API.** `#[doc(hidden)]` keeps it out of rustdoc; it does not make
+  /// it semver-exempt. The item is unconditionally `pub`, so it is part of what this crate
+  /// compiles into every dependent and removing it is a breaking change like any other — the
+  /// hiding is a discoverability measure, not a compatibility escape hatch. It exists because
+  /// the `tributaries` umbrella binds this vocabulary to its own (`SourceEvent::from_fs`) and
+  /// that binding had no cell of its own: an `Event` is minted only by a live watcher draining
+  /// a real kernel stream, so every test of the binding was forced to hand-build the *output*
+  /// and assert against itself, leaving the conversion — including which of a rename's two
+  /// locations reaches the umbrella — unwitnessed. A cross-crate seam that mints a REAL
+  /// lower-layer event from a real [`Change`] is what lets that conversion be tested as the
+  /// conversion it is.
+  ///
+  /// # Why it takes the handle instead of an instance
+  ///
+  /// A [`RootHandle`] is a **capability**, not a name: this crate's mutators trust the
+  /// instance/scope pair one carries, and [`root`](Self::root) hands the pair back out of any
+  /// `Event`. A seam taking a caller-chosen instance plus the change's own scope would
+  /// therefore MINT authority — instances and scopes are drawn from short predictable
+  /// sequences and [`root_path`](crate::Watcher::root_path) confirms a guess, so a caller
+  /// holding a [`Watcher`](crate::Watcher) but not some root's handle could forge one and
+  /// silently drop that root's coverage. Taking the handle removes the choice: the seam can
+  /// only RE-EXPRESS a capability [`watch`](crate::Watcher::watch) already issued to this
+  /// caller, never manufacture one for a root it cannot already address. `change`'s own
+  /// [`scope`](Change::scope) is deliberately ignored — `root` alone says which root the
+  /// resulting event belongs to, exactly as in the delivery path.
   ///
   /// It is deliberately not `#[cfg(test)]`: `cfg(test)` does not apply to a crate compiled as
   /// a dependency, which is exactly how the umbrella's unit tests see this one.
   #[doc(hidden)]
-  pub fn from_change_under_instance(instance: u64, root_path: &Path, change: &Change) -> Self {
-    Self::from_change(RootHandle::new(instance, change.scope()), root_path, change)
+  pub fn from_change_under_root(root: RootHandle, root_path: &Path, change: &Change) -> Self {
+    Self::from_change(root, root_path, change)
   }
 
   /// The watched root this event belongs to.

@@ -751,17 +751,33 @@ impl<R> Source<OsString> for FsSource<R> {
     //
     // Neither ground reads any deeper component, so a user file merely living under
     // some ancestor whose name shares the stem stays a user change.
-    let Some(leaf) = key.last().and_then(|leaf| leaf.to_str()) else {
-      return false;
-    };
-    if is_cookie_name(leaf) || tributary_fs::is_sync_cookie_dir_name(leaf) {
-      return true;
-    }
-    key
+    //
+    // GROUND 2 IS DECIDED FIRST, and reads only the PARENT component — because "whatever
+    // the leaf" has to include a leaf that is not UTF-8. Paths on Unix are bytes, so an
+    // active cookie can be renamed to an undecodable name while staying inside the
+    // directory that reserves it; testing the leaf's `to_str()` first classified exactly
+    // that move as reserved at its source alone, and the routing then projected the
+    // internal destination onto consumer streams as a user-visible `Created`.
+    //
+    // The parent still converts, and needs no lossy fallback: a cookie directory's name is
+    // minted as `format!("{prefix}-{euid}")`, pure ASCII, so a component that fails
+    // `to_str()` cannot be one — the conversion rejects only names the classifier rejects
+    // anyway. It is the LEAF whose text is optional, and only Ground 1 needs it.
+    let parent_is_cookie_dir = key
       .len()
       .checked_sub(2)
       .and_then(|parent| key[parent].to_str())
-      .is_some_and(tributary_fs::is_sync_cookie_dir_name)
+      .is_some_and(tributary_fs::is_sync_cookie_dir_name);
+    if parent_is_cookie_dir {
+      return true;
+    }
+    // GROUND 1 is a grammar over TEXT, so a leaf this crate could have minted is UTF-8 by
+    // construction; an undecodable leaf simply matches no minted shape and is left to the
+    // ground above, which has already answered.
+    key
+      .last()
+      .and_then(|leaf| leaf.to_str())
+      .is_some_and(|leaf| is_cookie_name(leaf) || tributary_fs::is_sync_cookie_dir_name(leaf))
   }
 
   fn root_key(&self, handle: RootHandle) -> Option<Vec<OsString>> {
