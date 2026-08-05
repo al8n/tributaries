@@ -361,6 +361,15 @@ async fn dropped_lane_releases_its_sub_to_rest_without_stalling_the_demux() {
     "lane B keeps flowing past the dead lane (no stall on it)"
   );
   assert_eq!(alive.key(), key("/b/alive").as_slice());
+  // Read WHILE the router is live: routing is sequential and FIFO, so lane B's
+  // /b/alive arriving proves every /a/after event was already routed — and with them
+  // the send-time reclamation of the dropped lane. (After the router exits the gauge
+  // reads zero by construction, which would prove nothing about reclamation.)
+  assert_eq!(
+    demux.tracked_lanes(),
+    1,
+    "the released sub's slot was reclaimed; only lane B remains tracked"
+  );
 
   // The released sub reverted to UNCLAIMED: every post-drop /a event —
   // including one a send-time reclamation recovered — surfaces on rest, none is lost,
@@ -383,11 +392,6 @@ async fn dropped_lane_releases_its_sub_to_rest_without_stalling_the_demux() {
   assert_eq!(
     rest_a, 4,
     "all post-release /a traffic flows to rest — the sub is unclaimed again, nothing lost"
-  );
-  assert_eq!(
-    demux.tracked_lanes(),
-    1,
-    "the released sub's slot was reclaimed; only lane B remains tracked"
   );
 }
 
@@ -831,6 +835,98 @@ async fn closed_watcher_ends_every_lane_after_draining_buffers() {
       .is_none(),
     "the rest lane ends with the stream too"
   );
+}
+
+/// The tracked-lane gauge returns to zero on EVERY way the routing task can end —
+/// `shutdown()`, end-of-stream, and an aborted driver future. A departed task tracks
+/// nothing; a residual count would name lanes that no longer exist and can never be
+/// released or reclaimed, so a caller sizing work off it would size it off a ghost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_tracked_gauge_zeroes_on_every_routing_task_exit() {
+  // Exit 1: the orderly `shutdown()` stop.
+  {
+    let (w, mut feed) = rig(1024);
+    let sub_a = watch(&w, "/a").await;
+    let sub_b = watch(&w, "/b").await;
+    let (demux, _rest, driver) = Demux::parts(w.clone(), 16);
+    let routing = tokio::spawn(driver);
+    let lane_a = demux.lane(sub_a, 16).await;
+    let lane_b = demux.lane(sub_b, 16).await;
+
+    feed.modified("/a", "/a/one").await;
+    feed.modified("/b", "/b/one").await;
+    assert_eq!(recv(&lane_a).await.subscription(), sub_a);
+    assert_eq!(recv(&lane_b).await.subscription(), sub_b);
+    assert_eq!(
+      demux.tracked_lanes(),
+      2,
+      "both lanes are live and tracked before the stop"
+    );
+
+    demux.shutdown().await;
+    tokio::time::timeout(DEADLINE, routing)
+      .await
+      .expect("the routing future resolves after shutdown")
+      .expect("routing task");
+    assert_eq!(
+      demux.tracked_lanes(),
+      0,
+      "an orderly shutdown leaves no tracked lanes behind"
+    );
+  }
+
+  // Exit 2: end-of-stream (the watcher closed under the router).
+  {
+    let (w, mut feed) = rig(1024);
+    let sub_a = watch(&w, "/a").await;
+    let (demux, rest, driver) = Demux::parts(w.clone(), 16);
+    let routing = tokio::spawn(driver);
+    let lane_a = demux.lane(sub_a, 16).await;
+
+    feed.modified("/a", "/a/one").await;
+    assert_eq!(recv(&lane_a).await.subscription(), sub_a);
+    assert_eq!(demux.tracked_lanes(), 1, "the lane is tracked while live");
+
+    w.close().await.expect("close");
+    tokio::time::timeout(DEADLINE, routing)
+      .await
+      .expect("the routing future resolves at end-of-stream")
+      .expect("routing task");
+    assert!(
+      tokio::time::timeout(DEADLINE, rest.recv())
+        .await
+        .expect("rest settles")
+        .is_none(),
+      "rest ends with the stream"
+    );
+    assert_eq!(
+      demux.tracked_lanes(),
+      0,
+      "an end-of-stream exit leaves no tracked lanes behind"
+    );
+  }
+
+  // Exit 3: the documented hard stop — the driver future aborted mid-poll, where no
+  // statement in the routing loop ever runs again.
+  {
+    let (w, mut feed) = rig(1024);
+    let sub_a = watch(&w, "/a").await;
+    let (demux, _rest, driver) = Demux::parts(w.clone(), 16);
+    let routing = tokio::spawn(driver);
+    let lane_a = demux.lane(sub_a, 1).await;
+
+    feed.modified("/a", "/a/one").await;
+    assert_eq!(recv(&lane_a).await.subscription(), sub_a);
+    assert_eq!(demux.tracked_lanes(), 1, "the lane is tracked while live");
+
+    routing.abort();
+    let _ = routing.await;
+    assert_eq!(
+      demux.tracked_lanes(),
+      0,
+      "an aborted routing future leaves no tracked lanes behind"
+    );
+  }
 }
 
 /// Unwatching a subscription while its delivered events sit undrained in its lane:

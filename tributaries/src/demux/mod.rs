@@ -329,6 +329,10 @@ impl<C, V> Demux<C, V> {
   /// How many subscriptions the routing task currently tracks (registered lanes not
   /// yet released or reclaimed). Bounded by concurrently live lanes — never by
   /// lifetime registrations; the churn test pins that property.
+  ///
+  /// Reads `0` once the routing task is gone — by shutdown, by end-of-stream, or by an
+  /// aborted driver future. A departed task tracks nothing, so a residual count would
+  /// describe lanes that no longer exist and can never be reclaimed.
   pub fn tracked_lanes(&self) -> usize {
     self.tracked.load(Ordering::Acquire)
   }
@@ -439,6 +443,11 @@ async fn run<C, V, R, H>(
 ) where
   R: RuntimeLite,
 {
+  // Zeroes the gauge on EVERY way out of this task — the two `break`s below, and an
+  // abort (the `parts` driver dropped mid-poll, which no `store` on a code path can
+  // reach). The lane table dies with the task, so a surviving non-zero count would
+  // advertise lanes nobody can drain, release or reclaim.
+  let _gauge = TrackedGauge(Arc::clone(&tracked));
   // Value = (registration generation, send side). Entries are REMOVED on release or
   // send-time reclamation — the table is bounded by live lanes, not lifetime
   // registrations.
@@ -543,6 +552,17 @@ async fn run<C, V, R, H>(
 /// The routing task's lane table: each claimed subscription's registration generation
 /// and bounded send side.
 type LaneTable<C, V> = HashMap<Subscription, (u64, async_channel::Sender<Event<C, V>>)>;
+
+/// Ties the [`tracked_lanes`](Demux::tracked_lanes) gauge to the routing task's lifetime:
+/// held by [`run`], so the count returns to zero whenever that task ends — including the
+/// abort path, where no statement in the loop body ever runs again.
+struct TrackedGauge(Arc<AtomicUsize>);
+
+impl Drop for TrackedGauge {
+  fn drop(&mut self) {
+    self.0.store(0, Ordering::Release);
+  }
+}
 
 /// One delivery: route `event` to its subscription's lane — THE deliberate stall
 /// (stall-not-shed): the bounded lane send is awaited, so a full lane parks the caller
