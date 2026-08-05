@@ -20,6 +20,14 @@ smol = ["agnostic-lite/smol"]
 # `test` job runs the feature powerset in parallel, which those cells cannot
 # tolerate, so it excludes this feature; the dedicated `linux-integration` job
 # enables it (via `--all-features`) and runs them single-threaded.
+#
+# It also gates the test-only items a DEPENDENT crate's tests need to reach.
+# `cfg(test)` does not apply to this crate when it is compiled as a dependency, so
+# anything the `tributaries` umbrella's own cells must call (the reader's rebuild-
+# threshold override, the USN premise types, `Event::from_change_under_root`) is
+# gated on `any(test, feature = "_integration")` instead. The umbrella enables the
+# feature on its DEV-dependency, so those items stay out of the library an ordinary
+# dependent compiles.
 _integration = []
 
 [dependencies]

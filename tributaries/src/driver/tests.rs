@@ -9943,14 +9943,24 @@ mod reserved_namespace {
   /// caller waits out its own deadline over a source that did exactly what it was asked.
   ///
   /// The third, unrelated barrier is here for the removal mechanics rather than the
-  /// arithmetic: `swap_remove` moves the vector's TAIL into the vacated slot, so a scan that
-  /// advanced its cursor past a removal would step over whatever landed there. It sits last,
-  /// which is precisely the entry that gets moved, and it must come through untouched.
+  /// arithmetic, and its POSITION is the point: it sits in the MIDDLE, so the vector's tail is
+  /// a MATCH. `swap_remove` moves the tail into the vacated slot, so resolving the source
+  /// barrier at index 0 relocates the DESTINATION barrier down into index 0 — and a scan that
+  /// advanced its cursor past a removal would step over exactly that relocated match and leave
+  /// its caller waiting forever. Had the unrelated entry been last instead, the skipped element
+  /// would have been the one nothing is waiting on, the destination barrier would still resolve
+  /// from its original slot, and every assertion below would stay green under the mutation the
+  /// stationary cursor exists to prevent.
   ///
-  /// FAIL-ON-REVERT: put back the single `position()` + `swap_remove()` in
-  /// `resolve_matching_pending_sync` (resolve the first match and return) and the DESTINATION
-  /// barrier never completes — `now_or_never()` answers `None` — while its entry stays in
-  /// `pending_syncs` with nothing left to match it.
+  /// FAIL-ON-REVERT — two distinct mutations, and this cell must catch BOTH:
+  /// * put back the single `position()` + `swap_remove()` in `resolve_matching_pending_sync`
+  ///   (resolve the first match and return) and the DESTINATION barrier never completes —
+  ///   `now_or_never()` answers `None` — while its entry stays in `pending_syncs` with nothing
+  ///   left to match it;
+  /// * advance the cursor on a removal (`i += 1` after the `swap_remove`, instead of leaving it
+  ///   stationary) and that same destination barrier is skipped — `swap_remove` had just moved
+  ///   it down into the slot the cursor abandoned — so it is never reaped, never answered, and
+  ///   is still sitting in `pending_syncs` at the end.
   #[tokio::test]
   async fn one_move_naming_two_pending_cookies_resolves_both_barriers() {
     let mut h = Harness::new();
@@ -9974,10 +9984,14 @@ mod reserved_namespace {
       });
       reply_rx
     };
+    // Order matters: a MATCH is at the tail, with the unrelated entry between the two matches.
+    // The first `swap_remove` therefore relocates the destination barrier into the cursor's own
+    // slot, which is the only arrangement under which a cursor that advanced on a removal skips
+    // an entry anyone is waiting on.
     let mut at_source = install("/a/cookie-7");
-    let mut at_destination = install(&destination);
     // Not named by this move at all: it must still be waiting afterwards.
     let mut unrelated = install("/a/cookie-99");
+    let mut at_destination = install(&destination);
 
     h.owner.consume_source_event(&source_moved_at(
       1,
@@ -10005,7 +10019,8 @@ mod reserved_namespace {
         Some(Ok(Ok(SyncOutcome::Delivered)))
       ),
       "and so does the barrier whose cookie is the move's destination — one observation \
-       proves both writes, so it must answer both callers"
+       proves both writes, so it must answer both callers, and this is the entry `swap_remove` \
+       relocated into the slot the cursor deliberately does not advance past"
     );
     assert!(
       (&mut unrelated).now_or_never().is_none(),

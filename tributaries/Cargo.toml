@@ -46,10 +46,20 @@ tributary-proto = { version = "0.1", path = "../tributary-proto" }
 # `Source` would — with this crate's own `fs` feature OFF, so the dev-dependency is
 # unconditional and carries its own `tokio` layer (the weak `tributary-fs?/tokio`
 # forwarding above deliberately does not fire when `fs` is off).
+#
+# `_integration` is `tributary-fs`'s internal test-only gate. It is enabled HERE, on the
+# dev-dependency, because the fs-binding cell mints its lower-layer input through that
+# crate's `Event::from_change_under_root` seam, which lives behind the gate. Features of a
+# dev-dependency are not unified into a plain `cargo build` of this crate, so the seam stays
+# out of the library any dependent compiles: it reaches this crate only while its own tests
+# are being built.
 agnostic-lite = { version = "0.7", features = ["time"] }
 proptest = "1"
 tempfile = "3"
-tributary-fs = { version = "0.1", path = "../tributary-fs", features = ["tokio"] }
+tributary-fs = { version = "0.1", path = "../tributary-fs", features = [
+  "tokio",
+  "_integration",
+] }
 
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 tokio = { version = "1.30", features = ["macros", "rt-multi-thread", "time", "test-util"] }
