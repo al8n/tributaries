@@ -994,7 +994,7 @@ fn dfid_name_dot_root_delete_reaches_root_death_at_the_reader() {
   map.seed([SeedEntry::root(root, Path::new("/root"))]);
 
   let buf = dfid_name_event(FAN_DELETE_SELF | FAN_ONDIR, FSID, 1, b"root-handle", b".");
-  let decoded = decode_events(&buf);
+  let decoded = decode_events(&buf).expect("the buffer carries this build's metadata version");
   assert!(
     !decoded.lossy && decoded.events.len() == 1 && decoded.events[0].name.is_none(),
     "decode folded the '.' self-name to the name-less self shape"
@@ -1681,15 +1681,19 @@ mod exclusion_fence {
 }
 
 /// Reader-teardown fairness: the drain loop observes a pending shutdown between
-/// reads, so a source that stays readable can never wedge teardown. A real fd is
-/// needed (`/dev/zero`), so this is Linux-only and off under miri; the mid-drain
-/// arrival under a live producer is covered by the container smoke.
+/// reads, so a source that stays readable can never wedge teardown — and the
+/// sibling property, that a source whose event ABI this build cannot decode is
+/// abandoned rather than read forever. A real fd is needed (`/dev/zero`), so this
+/// is Linux-only and off under miri; the mid-drain arrival under a live producer
+/// is covered by the container smoke.
 #[cfg(all(target_os = "linux", not(miri)))]
 mod liveness {
   use std::{sync::mpsc, time::Duration};
 
   use super::super::{Control, DrainExit, ReaderShared, ReseedContext, drain_events};
-  use crate::os::{BackendStatsShared, linux::fanotify::map::FidMap, transport::TransportState};
+  use crate::os::{
+    BackendStatsShared, SourceMessage, linux::fanotify::map::FidMap, transport::TransportState,
+  };
 
   /// An always-readable fd that never returns `EAGAIN`, standing in for a source
   /// under sustained traffic: `drain_events` reads it forever unless it observes a
@@ -1741,5 +1745,64 @@ mod liveness {
       .expect("the drain must observe the pending shutdown, not spin on /dev/zero");
     assert_eq!(exit, DrainExit::Shutdown);
     worker.join().expect("worker joins");
+  }
+
+  /// A foreign `fanotify_event_metadata.vers` is the DESCRIPTOR's verdict, not one
+  /// buffer's, and the drain must terminate on it. `/dev/zero` is exactly such a
+  /// source: every 24-byte "header" it yields carries `vers = 0`, and it never
+  /// returns `EAGAIN`. Routed through the loss barrier the reader would reseed the
+  /// map, emit a covering `Overflow`, and read the same undecodable fd again — a
+  /// cycle that re-enumerates the tree on every buffer, forever, without one
+  /// notification ever being decoded and without ever saying the source is
+  /// unusable. So this asserts the three halves of the terminal together: the
+  /// drain DIES, the consumer's queue carries the `Fatal` and nothing else (no
+  /// `Overflow` ahead of it, no `Batch`), and NO recovery walk was attempted.
+  ///
+  /// The reseed root is deliberately unwalkable, which is what makes the exit
+  /// codes alone insufficient evidence: a regressed reader reaches the terminal
+  /// too, by the long way round (loss → reseed twice → blind → `Fatal`). The
+  /// reseed COUNT is what separates the two. A watchdog bounds the wait so a
+  /// regression that instead spins on a walkable root fails as a timeout rather
+  /// than hanging the suite.
+  ///
+  /// MUTATION WITNESS: hand the verdict to the loss path instead of the terminal
+  /// (a `lossy` outcome out of the `Err` arm) and this FAILS at `a foreign ABI
+  /// version never reseeds` with `left: 1, right: 0` — the drain still ends up
+  /// dead, but by the long way round, through the recovery this cell forbids.
+  #[test]
+  fn a_foreign_metadata_version_terminates_the_drain() {
+    let fd = never_eagain_fd();
+    // No control message: only the ABI verdict can end this drain.
+    let (_tx, rx) = mpsc::channel::<Control>();
+    let (shared, queue_rx) = reader_shared();
+    let stats = std::sync::Arc::clone(&shared.stats);
+    let reseed = ReseedContext::for_test(std::path::PathBuf::from("/nonexistent"));
+    let mut map = FidMap::new();
+    let mut buf = vec![0u8; 64 * 1024];
+
+    let (done_tx, done_rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+      let exit = drain_events(&fd, &mut buf, &mut map, &reseed, &rx, &shared);
+      let _ = done_tx.send(exit);
+    });
+    let exit = done_rx
+      .recv_timeout(Duration::from_secs(5))
+      .expect("a foreign metadata version must abandon the fd, not read it forever");
+    assert_eq!(exit, DrainExit::Died);
+    worker.join().expect("worker joins");
+
+    assert_eq!(
+      stats.snapshot().reseeds(),
+      0,
+      "a foreign ABI version never reseeds — there is no map to repair, only an fd to abandon"
+    );
+    assert!(
+      matches!(queue_rx.try_recv(), Ok(SourceMessage::Fatal(_))),
+      "the terminal is the FIRST thing the consumer sees — no recoverable Overflow precedes it"
+    );
+    assert!(
+      queue_rx.try_recv().is_err(),
+      "and the only thing: the source is done, not covered and continuing"
+    );
   }
 }

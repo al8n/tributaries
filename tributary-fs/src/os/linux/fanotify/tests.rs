@@ -817,7 +817,7 @@ fn dfid_name_dot_root_self_event_reaches_root_death() {
     map.seed([SeedEntry::root(root, Path::new("/root"))]);
 
     let buf = dfid_name_event(mask, FSID, 1, b"root-handle", b".");
-    let decoded = decode_events(&buf);
+    let decoded = decode_events(&buf).expect("the buffer carries this build's metadata version");
     assert!(!decoded.lossy && decoded.events.len() == 1);
     assert!(
       decoded.events[0].name.is_none(),
@@ -853,7 +853,7 @@ fn dfid_name_dot_dir_metadata_forwards_own_path() {
     ]);
 
     let buf = dfid_name_event(mask, FSID, 1, b"sub-handle", b".");
-    let decoded = decode_events(&buf);
+    let decoded = decode_events(&buf).expect("the buffer carries this build's metadata version");
     assert!(!decoded.lossy && decoded.events.len() == 1 && decoded.events[0].name.is_none());
 
     let admission = classify_one(&mut map, &decoded.events[0]);

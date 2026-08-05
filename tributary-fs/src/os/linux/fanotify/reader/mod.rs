@@ -9,8 +9,8 @@
 //! no wake elision applies here, but the park/guard/drain shape is shared with
 //! the inotify reader for one wakeup story. A `FAN_Q_OVERFLOW` marker (or a
 //! truncated/malformed record) degrades to the ordered loss signal; a read
-//! error or a panic degrades to the terminal `Fatal` exactly once, then the
-//! thread exits.
+//! error, a foreign event-metadata ABI version, or a panic degrades to the
+//! terminal `Fatal` exactly once, then the thread exits.
 //!
 //! # Teardown-fairness invariant
 //!
@@ -58,7 +58,7 @@ use super::{
     wake::WakeState,
   },
   Admission, MemoBatch, classify,
-  fid::decode_events,
+  fid::{AbiMismatch, FANOTIFY_METADATA_VERSION, decode_events},
   map::{FidMap, SeedEntry},
   source::ReseedContext,
 };
@@ -205,8 +205,10 @@ enum DrainExit {
 /// lands mid-reseed quiesces cleanly at the next read boundary rather than
 /// interrupting the walk. fanotify has no arm traffic, so shutdown is the only
 /// control message. Returns [`DrainExit::Died`] when the stream died (fatal
-/// already signaled), [`DrainExit::Shutdown`] on a mid-drain shutdown, and
-/// [`DrainExit::Parked`] when the instance drained clean.
+/// already signaled — a failed read, a foreign event-metadata ABI version, or a
+/// recovery that could not restore sight), [`DrainExit::Shutdown`] on a
+/// mid-drain shutdown, and [`DrainExit::Parked`] when the instance drained
+/// clean.
 fn drain_events(
   fd: &OwnedFd,
   buf: &mut [u8],
@@ -232,7 +234,23 @@ fn drain_events(
     if n == 0 {
       return DrainExit::Parked;
     }
-    let decoded = decode_events(&buf[..n]);
+    let decoded = match decode_events(&buf[..n]) {
+      Ok(decoded) => decoded,
+      // Not this buffer's defect but this FD's: the event-metadata ABI is fixed
+      // for the descriptor's life, so the loss barrier would reseed, cover, and
+      // hand the next read straight back here — forever, and never decoding a
+      // notification. The terminal is the only exit that ends it, and the same
+      // one a failed read takes.
+      Err(mismatch) => {
+        signal_fatal(
+          shared,
+          SourceError::ReadFailed {
+            source: abi_mismatch_error(mismatch),
+          },
+        );
+        return DrainExit::Died;
+      }
+    };
     if !process_decoded(
       decoded,
       map,
@@ -583,6 +601,18 @@ fn cap_exceeded_error() -> std::io::Error {
   std::io::Error::other(
     "the fanotify FID map exceeded its directory cap on a live create/move-in; the source cannot keep learning",
   )
+}
+
+/// The error a foreign `fanotify_event_metadata.vers` escalates through the
+/// terminal `Fatal`: the running kernel's event ABI is not the one this build
+/// decodes, so no read of this fd can be parsed and fanotify(7)'s own
+/// instruction is to abandon it. Carries both versions, which is what separates
+/// "the kernel grew a newer event ABI" from "this stream is not fanotify".
+fn abi_mismatch_error(mismatch: AbiMismatch) -> std::io::Error {
+  std::io::Error::other(format!(
+    "the fanotify stream reports event-metadata ABI version {}, not the {FANOTIFY_METADATA_VERSION} this build decodes; the source cannot be parsed",
+    mismatch.found
+  ))
 }
 
 /// A completed walk's duration in whole microseconds, saturating so a pathological

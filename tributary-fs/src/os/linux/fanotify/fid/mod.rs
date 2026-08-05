@@ -21,6 +21,11 @@
 //! panic on i686 before the slice bound is tested.) Unknown info-record types
 //! are skipped by their own `len`, so a kernel that grows the vocabulary
 //! degrades gracefully.
+//!
+//! The header's `vers` is the ONE gate that is not per-event: it is the
+//! DESCRIPTOR's ABI version, fixed for the fd's whole life, so a mismatch means
+//! every later read decodes to the same refusal. Decode hands it back as
+//! [`AbiMismatch`] instead of a `lossy` outcome — see that type.
 
 use std::{boxed::Box, vec::Vec};
 
@@ -56,8 +61,9 @@ pub(crate) const EOVERFLOW: i32 = 75;
 /// compile-time-vs-run-time ABI check and tells an application that sees a
 /// mismatch to abandon the fd: a different version means the fixed header this
 /// module indexes by is not the header on the wire, so every field offset below
-/// would name a different field. Restated locally so this pure module carries
-/// no libc dependency; the FFI layer cross-asserts it against libc.
+/// would name a different field. Abandoning the fd is [`AbiMismatch`]. Restated
+/// locally so this pure module carries no libc dependency; the FFI layer
+/// cross-asserts it against libc.
 pub(crate) const FANOTIFY_METADATA_VERSION: u8 = 3;
 
 /// A record carrying a bare FID (the affected object's own handle, e.g. the
@@ -265,6 +271,31 @@ pub(crate) struct DecodeOutcome {
   pub(crate) lossy: bool,
 }
 
+/// A header whose `vers` is not the [`FANOTIFY_METADATA_VERSION`] this build
+/// decodes — a verdict on the DESCRIPTOR, not on one event, which is why it is
+/// not a `lossy` [`DecodeOutcome`].
+///
+/// The kernel stamps one metadata version for an fd's whole life, so a mismatch
+/// cannot clear on a later read: routed through the per-event loss barrier it
+/// would reseed the map, emit a covering `Overflow`, and read the very same
+/// undecodable fd again — every batch, forever under sustained activity, without
+/// one notification ever being decoded. Unbounded re-enumeration that never
+/// surfaces the fact that the source is unusable. Returned as an error instead,
+/// so the reader terminates the source: fanotify(7)'s "abandon the fd", which a
+/// `Result` makes structurally unignorable at the call site.
+///
+/// The events decoded from THIS buffer before the bad header go with it. The
+/// terminal already owes the consumer a covering rescan for everything the
+/// source could have said, so delivering a prefix batch off a stream this build
+/// has just proven it cannot parse buys nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AbiMismatch {
+  /// The `vers` the header carried. Kept for the terminal's message: it is what
+  /// tells an operator whether the kernel simply speaks a newer event ABI than
+  /// this build, or the stream is not fanotify at all.
+  pub(crate) found: u8,
+}
+
 /// `fanotify_event_metadata` header size (native ABI): u32 + u8 + u8 + u16 +
 /// u64 + i32 + i32.
 const METADATA_LEN: usize = 24;
@@ -284,8 +315,10 @@ struct FidRecord {
 
 /// Decodes a buffer of packed `fanotify_event_metadata` records with their
 /// info records. Never panics: a truncated or structurally impossible record
-/// marks the outcome `lossy` and stops.
-pub(crate) fn decode_events(buf: &[u8]) -> DecodeOutcome {
+/// marks the outcome `lossy` and stops. A header carrying a foreign ABI version
+/// is not such a record — it is the fd's own verdict, returned as
+/// [`AbiMismatch`].
+pub(crate) fn decode_events(buf: &[u8]) -> Result<DecodeOutcome, AbiMismatch> {
   let mut events = Vec::new();
   let mut lossy = false;
   let mut at = 0usize;
@@ -300,12 +333,24 @@ pub(crate) fn decode_events(buf: &[u8]) -> DecodeOutcome {
     let metadata_len = u16::from_ne_bytes(header[6..8].try_into().expect("2 bytes")) as usize;
     let mask = u64::from_ne_bytes(header[8..16].try_into().expect("8 bytes"));
 
-    // The three header contracts of `struct fanotify_event_metadata`
-    // (fanotify(7)), all settled before a single payload byte is read:
-    //   - `vers` is that struct's own ABI version; anything but the version
-    //     this build compiled against means the offsets just loaded name
-    //     different fields, and the man page's instruction is to abandon the
-    //     stream rather than parse it;
+    // The header contracts of `struct fanotify_event_metadata` (fanotify(7)),
+    // all settled before a single payload byte is read. `vers` goes first, and
+    // not merely for ordering: it is what makes the rest of the header MEAN
+    // anything. Under a different struct version the offsets just loaded name
+    // different fields, so `metadata_len` and `event_len` are not lengths at
+    // all and testing them would be testing noise.
+    //
+    // It is also the only one of the three that is not about this event.
+    // `metadata_len` and `event_len` are per-event framing the kernel can get
+    // wrong one record at a time; `vers` is the descriptor's ABI, fixed for the
+    // fd's life. So it leaves by a different door — see `AbiMismatch`, which
+    // the reader turns into the source's terminal instead of a loss the same
+    // undecodable fd would re-earn on every read.
+    if vers != FANOTIFY_METADATA_VERSION {
+      return Err(AbiMismatch { found: vers });
+    }
+
+    // The two LENGTH contracts, both per-event and both recoverable:
     //   - `metadata_len` is the header's size ON THE WIRE, and the info records
     //     begin exactly there — that is what the field is for ("optional
     //     headers per event type"), so a fixed 24 would misparse a grown header
@@ -314,14 +359,10 @@ pub(crate) fn decode_events(buf: &[u8]) -> DecodeOutcome {
     //   - `event_len` spans the whole event (header + every info record), so a
     //     value below the header, or past the buffer, is structurally
     //     impossible.
-    // Each of the three stops the walk rather than letting it run off the
-    // record, and the caller degrades the batch to the ordered loss barrier —
-    // a refused record narrows the map's coverage nowhere.
-    if vers != FANOTIFY_METADATA_VERSION
-      || metadata_len < METADATA_LEN
-      || event_len < metadata_len
-      || event_len > buf.len() - at
-    {
+    // Either stops the walk rather than letting it run off the record, and the
+    // caller degrades the batch to the ordered loss barrier — a refused record
+    // narrows the map's coverage nowhere.
+    if metadata_len < METADATA_LEN || event_len < metadata_len || event_len > buf.len() - at {
       lossy = true;
       break;
     }
@@ -346,7 +387,7 @@ pub(crate) fn decode_events(buf: &[u8]) -> DecodeOutcome {
     at += event_len;
   }
 
-  DecodeOutcome { events, lossy }
+  Ok(DecodeOutcome { events, lossy })
 }
 
 /// Parses one event's info-record region into whatever FIDs and names the wire
