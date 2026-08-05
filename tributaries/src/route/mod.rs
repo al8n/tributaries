@@ -102,11 +102,83 @@
 //! [`Event`](crate::Event) in the umbrella's own neutral vocabulary — and every
 //! projection of one raw move carries that subscriber's umbrella epoch stamp (assigned
 //! downstream, design §8).
+//!
+//! ## A reserved endpoint is an endpoint nobody covers
+//!
+//! A [`Source`](crate::Source) mints its own sync-barrier artifacts inside the tree it
+//! watches, and no consumer may ever be told about one
+//! ([`ReservedEndpoints`]). A rename can put such an artifact at **one** end and an
+//! ordinary user object at the other, so the reservation is a property of an *endpoint*,
+//! never of the whole change: masking the endpoint out of every subscriber's coverage is
+//! what keeps the two questions separate. The four move cases above then answer this one
+//! too, unchanged — the user endpoint is delivered by exactly the projection a subscriber
+//! covering only that end already receives, and a change reserved at every endpoint it has
+//! reaches nobody because nobody covers any of it.
+//!
+//! Discarding the whole change on one endpoint's reservation instead is silent loss: the
+//! user endpoint's own removal (or arrival) is deleted from every stream that was watching
+//! it, with no [`Rescan`](crate::EventKind::Rescan) owed for it and nothing to tell a
+//! consumer its picture of that name is now stale.
 
 use crate::subscription::Subscription;
 
 #[cfg(test)]
 mod tests;
+
+/// Which of a change's endpoints lie in the source's **reserved namespace** — the
+/// sync-barrier artifacts a [`Source`](crate::Source) writes into the watched tree and
+/// identifies through [`is_sync_artifact`](crate::Source::is_sync_artifact).
+///
+/// [`fan_out`] treats a reserved endpoint as covered by **nobody**, whatever the
+/// subscribers' keys say, which is what makes suppression namespace-total without making
+/// it event-total (see the [module docs](self#a-reserved-endpoint-is-an-endpoint-nobody-covers)).
+///
+/// A [`Rescan`](crate::EventKind::Rescan) is never classified — it is coverage
+/// information rather than an object, and is structurally unmaskable — so it always
+/// arrives here as [`None`](Self::None).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReservedEndpoints {
+  /// No endpoint is reserved: the ordinary change, routed by coverage alone.
+  None,
+  /// A move's **source** endpoint only ([`move_from`](RoutableEvent::move_from)) — an
+  /// artifact renamed out to an ordinary name, whose destination is a user object.
+  Source,
+  /// A move's **destination** endpoint only ([`key`](RoutableEvent::key)) — a user object
+  /// renamed INTO the reserved namespace, whose source is an ordinary name.
+  Destination,
+  /// Every endpoint this change has: a single-endpoint change at a reserved key, or a
+  /// rename BETWEEN two reserved names. Nothing about it may reach any subscriber.
+  All,
+}
+
+impl ReservedEndpoints {
+  /// Whether the move **source** endpoint is masked out of coverage.
+  #[inline]
+  pub(crate) const fn masks_source(self) -> bool {
+    matches!(self, Self::Source | Self::All)
+  }
+
+  /// Whether the [`key`](RoutableEvent::key) — a move's **destination** — is masked out
+  /// of coverage.
+  #[inline]
+  pub(crate) const fn masks_destination(self) -> bool {
+    matches!(self, Self::Destination | Self::All)
+  }
+
+  /// Whether **any** endpoint is reserved: the changes a source's own sync barrier may be
+  /// waiting on, and so the ones the driver must offer its pending-sync map.
+  #[inline]
+  pub(crate) const fn any(self) -> bool {
+    !matches!(self, Self::None)
+  }
+
+  /// Whether **every** endpoint is reserved, so no subscriber may be told anything at all
+  /// about this change — the case the driver can settle without routing it.
+  #[inline]
+  pub(crate) const fn is_total(self) -> bool {
+    matches!(self, Self::All)
+  }
+}
 
 /// A raw event, viewed by [`fan_out`] through only what routing needs — its endpoint
 /// keys, whether it is a [`Rescan`](crate::EventKind::Rescan), and how to mint
@@ -134,6 +206,12 @@ pub(crate) trait RoutableEvent<C> {
   /// Whether this is a [`Rescan`](crate::EventKind::Rescan) — delivered to
   /// every subscriber regardless of coverage.
   fn is_rescan(&self) -> bool;
+
+  /// Which of this event's endpoints lie in the source's reserved namespace and are
+  /// therefore covered by nobody (see [`ReservedEndpoints`]). Read once per event, not
+  /// once per subscriber: the answer is the source's, and no subscriber's key can change
+  /// it.
+  fn reserved(&self) -> ReservedEndpoints;
 
   /// Mints the whole delivery retagged with `sub` — the event as-is (a plain
   /// single-endpoint change, a `Rescan`, or the full `Moved` for a both-covering
@@ -264,6 +342,10 @@ where
   let move_from = event.move_from();
   let to = event.key();
   let captured_root_depth = event.captured_root_depth();
+  // Hoisted with the endpoint keys, for the same reason they are: the reservation is the
+  // source's answer about this change, so re-asking it per subscriber would cost a call
+  // per subscriber of the root and could never answer differently.
+  let reserved = event.reserved();
   let mut delivered = Vec::new();
   for &sub in subscribers {
     let Some(canonical) = canonical_of(sub) else {
@@ -279,7 +361,7 @@ where
     let projected = if rescan {
       project_rescan(event, sub, canonical, to)
     } else {
-      project(event, sub, canonical, to, move_from)
+      project(event, sub, canonical, to, move_from, reserved)
     };
     let Some(mut projected) = projected else {
       continue;
@@ -307,23 +389,30 @@ where
 /// The single projection `sub` (registered at `canonical`) receives for one event,
 /// or `None` if it covers nothing of it. A non-move tests only `to`; a move
 /// (`move_from` is `Some`) decomposes per the two-endpoint rule (design §5).
+///
+/// An endpoint `reserved` names is covered by nobody, so it drops out of the coverage
+/// pair before the decomposition reads it — see the
+/// [module docs](self#a-reserved-endpoint-is-an-endpoint-nobody-covers).
 fn project<C, E>(
   event: &E,
   sub: Subscription,
   canonical: &[C],
   to: &[C],
   move_from: Option<&[C]>,
+  reserved: ReservedEndpoints,
 ) -> Option<E::Delivered>
 where
   C: PartialEq,
   E: RoutableEvent<C>,
 {
+  let covers_to = to.starts_with(canonical) && !reserved.masks_destination();
   let Some(from) = move_from else {
     // A single-endpoint event: delivered whole iff its key is covered.
-    return to.starts_with(canonical).then(|| event.deliver(sub));
+    return covers_to.then(|| event.deliver(sub));
   };
   // A move has two endpoints; the four coverage cases are disjoint (structural dedup).
-  match (from.starts_with(canonical), to.starts_with(canonical)) {
+  let covers_from = from.starts_with(canonical) && !reserved.masks_source();
+  match (covers_from, covers_to) {
     (true, true) => Some(event.deliver(sub)), // both → the whole Moved
     (true, false) => Some(event.deliver_move_out(sub)), // source only → Removed(from)
     (false, true) => Some(event.deliver_move_in(sub)), // dest only → Created(to)

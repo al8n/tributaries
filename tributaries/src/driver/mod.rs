@@ -50,7 +50,7 @@ use crate::{
   event::Event,
   filter::{Filter, FilterInput},
   options::{Debounce, DebounceConfig, TributariesOptions, WatchOptions},
-  route::RoutableEvent,
+  route::{ReservedEndpoints, RoutableEvent},
   source::{Armed, LocalSource, Source, SourceEvent, SyncOutcome, SyncToken},
   subscription::Subscription,
   subsume::{Subsumer, UnwatchOutcome, WatchOutcome},
@@ -3186,11 +3186,33 @@ where
   /// [`widen_parked_debt`](Self::widen_parked_debt) grows the `Rescan` to cover it —
   /// the same treatment every other event suppressed behind standing debt gets, and no
   /// silent loss, because the `Rescan` re-enumerates exactly what was suppressed.
-  fn fan_out_and_push(&mut self, raw: &SourceEvent<C, S::Handle>) {
-    let (fanned, poisoned) = self.fan_out_raw(raw);
+  ///
+  /// # The reserved namespace is masked here, at the one delivery seam
+  ///
+  /// This is where a change is classified against the source's sync-artifact namespace
+  /// ([`reserved_endpoints`](Self::reserved_endpoints)) and where that classification is
+  /// enforced, because this is the ONE place a raw change becomes deliveries: a cookie
+  /// (ours, another instance's, or a crashed process's leftover — and the unlink events of
+  /// all of them) can then reach no consumer by construction rather than by every caller
+  /// remembering to check. A change reserved at **every** endpoint it has returns here
+  /// before any routing at all — never fanned out, never coalesced, never delivered, and
+  /// never admitted to the coalescer whose drain would otherwise tick on it. One reserved
+  /// endpoint of a rename is instead masked out of coverage inside the fan-out, which
+  /// delivers the move's *other*, user endpoint to the subscribers watching it.
+  ///
+  /// The classification is RETURNED because it decides one thing this seam cannot: whether
+  /// a pending sync barrier may resolve on this change. The caller resolves it strictly
+  /// after this call, never before — see
+  /// [`consume_source_event`](Self::consume_source_event).
+  fn fan_out_and_push(&mut self, raw: &SourceEvent<C, S::Handle>) -> ReservedEndpoints {
+    let reserved = self.reserved_endpoints(raw);
+    if reserved.is_total() {
+      return reserved;
+    }
+    let (fanned, poisoned) = self.fan_out_raw(raw, reserved);
     if poisoned.is_empty() {
       self.push_all(fanned);
-      return;
+      return reserved;
     }
     self.quarantine_filters(&poisoned);
     let (behind_new_debt, rest): (Vec<_>, Vec<_>) = fanned
@@ -3200,6 +3222,54 @@ where
       self.try_emit(event);
     }
     self.push_all(rest);
+    reserved
+  }
+
+  /// Classifies both of `raw`'s endpoints against the source's reserved sync namespace
+  /// ([`Source::is_sync_artifact`]) — the ONE classification each change gets, whose result
+  /// then decides suppression, coverage masking and barrier resolution alike.
+  ///
+  /// # Why per endpoint, and not per event
+  ///
+  /// A rename has TWO endpoints and [`SourceEvent::key`] is only its destination, so a
+  /// single-key test answers the wrong question for exactly the change that matters: a user
+  /// file renamed INTO the reserved namespace matches on its destination while its source is
+  /// an ordinary path subscribers are watching. Discarding the whole change there deletes
+  /// that removal from every one of their streams — with no `Rescan` owed for it, so nothing
+  /// ever tells those consumers their picture of that name went stale. Classifying each
+  /// endpoint on its own lets the fan-out mask the reserved end and still deliver the user
+  /// end (see [`fan_out_and_push`](Self::fan_out_and_push)).
+  ///
+  /// # Cost
+  ///
+  /// One call for a single-endpoint change — the shape of nearly every event — because
+  /// [`move_from`](SourceEvent::move_from) is `None` and short-circuits the second. A move
+  /// costs two, which is the minimum: neither endpoint's answer implies the other's, and
+  /// both are needed to tell a wholly-reserved change from a half-reserved one.
+  ///
+  /// A [`Rescan`](crate::EventKind::Rescan) is never classified. It names no object — it is
+  /// the statement that coverage below a key became uncertain — so it has no endpoint to
+  /// reserve, and masking one would hide a coverage loss behind the very namespace whose
+  /// events it may have eaten.
+  fn reserved_endpoints(&self, raw: &SourceEvent<C, S::Handle>) -> ReservedEndpoints {
+    if raw.kind().is_rescan() {
+      return ReservedEndpoints::None;
+    }
+    let destination = self.source.is_sync_artifact(raw.key());
+    let Some(from) = raw.move_from() else {
+      // One endpoint, so its verdict is the whole change's.
+      return if destination {
+        ReservedEndpoints::All
+      } else {
+        ReservedEndpoints::None
+      };
+    };
+    match (self.source.is_sync_artifact(from), destination) {
+      (true, true) => ReservedEndpoints::All,
+      (true, false) => ReservedEndpoints::Source,
+      (false, true) => ReservedEndpoints::Destination,
+      (false, false) => ReservedEndpoints::None,
+    }
   }
 
   /// The single event-emit funnel (design backpressure doc): the owner **never awaits** the
@@ -3583,7 +3653,11 @@ where
   /// A [`Moved`](crate::EventKind::Moved) is decomposed per subscriber inside
   /// [`fan_out`](crate::route::fan_out) (both endpoints → the whole move; source only → a
   /// synthesized `Removed`; destination only → a synthesized `Created`), and the filter +
-  /// interest gate below runs against that already-projected delivery.
+  /// interest gate below runs against that already-projected delivery. `reserved` — this
+  /// change's [`Source`] namespace classification, decided once by the caller
+  /// ([`reserved_endpoints`](Self::reserved_endpoints)) — masks a reserved endpoint out of
+  /// every subscriber's coverage, so the same decomposition projects the *user* endpoint of
+  /// a rename that touches the reserved namespace at one end.
   ///
   /// Returns the stamped deliveries **and** the subscriptions whose filter predicate
   /// unwound while producing them. The caller applies the quarantine and decides where
@@ -3592,6 +3666,7 @@ where
   fn fan_out_raw(
     &mut self,
     raw: &SourceEvent<C, S::Handle>,
+    reserved: ReservedEndpoints,
   ) -> (Vec<Event<C, V>>, Vec<Subscription>) {
     // Disjoint field borrows: `subsumer` resolves the root/coverage/interest, `filters`
     // the per-subscription filter, `epochs` owns the per-subscription stamp state.
@@ -3603,7 +3678,7 @@ where
     // (`RoutableEvent::captured_root_depth`), not on the root the handle resolves to
     // here: an in-place widen keeps the handle — and its queue — so a change captured
     // under the older, deeper root is still drained on this path afterwards.
-    let routable = SourceRoutable::<C, V, S::Handle>::new(raw);
+    let routable = SourceRoutable::<C, V, S::Handle>::new(raw, reserved);
     // Subscriptions whose filter predicate UNWOUND during this fan-out. The gate
     // below borrows `filters` immutably, so the quarantine is applied by the caller,
     // after the fan-out returns (see [`quarantine_filters`](Self::quarantine_filters)).
@@ -3805,16 +3880,6 @@ where
   /// signal can never reach subscribers with the stale claim left standing on either path.
   fn consume_source_event(&mut self, event: &SourceEvent<C, S::Handle>) {
     if !self.retire_if_dead(event) {
-      // A cookie (ours, another instance's, or a crashed process's leftover —
-      // and the unlink events of all of them) is CONSUMED here: never fanned
-      // out, never coalesced, never delivered. Suppression is namespace-total,
-      // so it can never depend on the pending map. A `Rescan` is never a
-      // cookie (checked first), because it is coverage information and is
-      // structurally unmaskable.
-      if !event.kind().is_rescan() && self.source.is_sync_artifact(event.key()) {
-        self.resolve_matching_pending_sync(event);
-        return;
-      }
       // A make-before-break `replace` commits an epoch-bumped full-root `Rescan` on the PRESERVED
       // handle for each leg, so a diverging-then-rolled-back widen leaves a stale `Rescan` whose key
       // names the transient divergent root the handle no longer watches. `retire_if_dead` saw the
@@ -3827,7 +3892,10 @@ where
       let clamped = self.clamp_disjoint_live_root_rescan(event);
       let event = clamped.as_ref().unwrap_or(event);
       self.degrade_retained_cover_on_rescan(event);
-      self.fan_out_and_push(event);
+      // Every reserved-namespace change is consumed inside this call — wholly, or down to
+      // the user endpoint of a rename that touched the namespace at one end — and the
+      // classification comes back so a pending barrier can be resolved on it below.
+      let reserved = self.fan_out_and_push(event);
       // A `Rescan` can DOMINATE a pending cookie — a loss that ate the
       // cookie's own event elects a covering signal at that position, and
       // re-enumeration meets the barrier just as delivery would. It is
@@ -3837,6 +3905,15 @@ where
       // yet in the channel or `needs_rescan` — the prohibited half-barrier.
       if event.kind().is_rescan() {
         self.dominate_pending_syncs(event);
+      } else if reserved.any() {
+        // The cookie's own event, however it arrived: created in place, unlinked, or
+        // RENAMED into the reserved namespace, which is a cookie observation on the same
+        // terms as any other. Resolved under the identical discipline the `Rescan` above
+        // obeys — strictly after this change's own publication, so a caller waking on
+        // another thread cannot drain past a delivery this barrier's resolution implies it
+        // will find. A `Rescan` is never classified, so the two arms are disjoint by
+        // construction rather than by ordering luck.
+        self.resolve_matching_pending_sync(event);
       }
     }
   }
@@ -4667,14 +4744,20 @@ fn widen_to_cover<C: PartialEq>(parked: &mut Vec<C>, key: &[C]) {
 /// [`Source`] binding.
 struct SourceRoutable<'a, C, V, H> {
   event: &'a SourceEvent<C, H>,
+  /// This change's reserved-namespace classification, decided ONCE at the
+  /// [`Source`] seam ([`Owner::reserved_endpoints`]) and carried here. The router
+  /// re-reads it per event, never per subscriber, and cannot recompute it — the
+  /// namespace belongs to the source, not to the key space.
+  reserved: ReservedEndpoints,
   _value: PhantomData<V>,
 }
 
 impl<'a, C, V, H> SourceRoutable<'a, C, V, H> {
   #[inline]
-  fn new(event: &'a SourceEvent<C, H>) -> Self {
+  fn new(event: &'a SourceEvent<C, H>, reserved: ReservedEndpoints) -> Self {
     Self {
       event,
+      reserved,
       _value: PhantomData,
     }
   }
@@ -4699,6 +4782,11 @@ where
   #[inline]
   fn is_rescan(&self) -> bool {
     self.event.is_rescan()
+  }
+
+  #[inline]
+  fn reserved(&self) -> ReservedEndpoints {
+    self.reserved
   }
 
   #[inline]
