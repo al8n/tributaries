@@ -2195,6 +2195,50 @@ async fn rearm_reusing_a_retired_handle_trips_the_tripwire() {
   let _ = h.watch("/b", Interest::all()).await;
 }
 
+/// Regression (the LIVE-alias guarantee must not ride on the bounded window): the window evicts by
+/// ARM HISTORY, not by live-root population, so a root held live across more than
+/// [`super::OBSERVED_HANDLE_HISTORY`] intervening arms ages out of it while it is still recorded.
+/// A later arm reusing THAT handle is the violation this tripwire most exists to catch — the live
+/// alias `commit_watch` would let overwrite the reverse handle mapping, stranding `/live` and
+/// misrouting its events into the new root. Peak live roots here is TWO; only the arm count is
+/// large, so nothing about this owner's resource use excuses the miss.
+///
+/// Fail-on-old: with the window as the tripwire's only input, the churn has evicted handle 1, so
+/// `observe` reports it unseen, the assert passes, and the reuse commits silently — no panic, and
+/// `#[should_panic]` fails the cell.
+#[tokio::test]
+#[should_panic(expected = "already observed by this owner")]
+#[cfg_attr(
+  not(debug_assertions),
+  ignore = "the debug_assert tripwire is compiled out in release builds"
+)]
+#[cfg(debug_assertions)]
+async fn rearm_reusing_a_live_handle_aged_out_of_the_window_trips_the_tripwire() {
+  let mut h = Harness::new();
+
+  // Handle 1, and it stays live for the whole cell — never unwatched, never retired.
+  let _live = h
+    .watch("/live", Interest::all())
+    .await
+    .expect("watch the root that stays live");
+
+  // Churn disjoint roots past the window's capacity. Each cycle arms a fresh handle and retires it
+  // again, so live roots never exceed two — but the arm history alone evicts handle 1.
+  for i in 0..=super::OBSERVED_HANDLE_HISTORY {
+    let sub = h
+      .watch(&format!("/churn{i}"), Interest::all())
+      .await
+      .expect("watch a disjoint root");
+    h.unwatch(sub).expect("unwatch it again");
+  }
+
+  // A disjoint newcomer whose arm REUSES the still-live handle 1 — a generation-unique
+  // `Source::Handle` violation. The subsumer still records `/live` under handle 1, so the arm choke
+  // point's live-index check trips regardless of what the window has evicted.
+  h.owner.source.reuse_next_arm_handle(1);
+  let _ = h.watch("/newcomer", Interest::all()).await;
+}
+
 /// The observed-handle tripwire is a bounded WINDOW, not a lifetime ledger: ordinary
 /// watch/unwatch churn of disjoint roots must leave the debug build's history bounded by
 /// [`super::OBSERVED_HANDLE_HISTORY`], not by the number of arms the owner has ever performed.
