@@ -1,6 +1,7 @@
 use super::Source;
 
-/// Compile-time proof that the **two** async [`Source`] futures — [`arm`](Source::arm) and the event
+/// Compile-time proof that the async [`Source`] futures — the key resolution
+/// [`canonicalize_key`](Source::canonicalize_key), [`arm`](Source::arm) and the event
 /// pump [`next`](Source::next) — are `Send`, so the owner (which drives them inline in one `select!`
 /// loop) can be spawned via [`R::spawn_detach`](agnostic_lite::RuntimeLite::spawn_detach) on a
 /// multi-threaded tokio or smol executor. [`disarm`](Source::disarm) is synchronous (it returns no
@@ -11,6 +12,7 @@ use super::Source;
 #[allow(dead_code)]
 fn assert_source_futures_send<C, S: Source<C>>(s: &mut S, key: &[C], handle: S::Handle) {
   fn needs_send<F: Send>(_: F) {}
+  needs_send(s.canonicalize_key(key));
   needs_send(s.arm(key));
   needs_send(s.next());
   // `disarm` is synchronous — no future to prove `Send`; the call keeps `handle` exercised.
@@ -38,8 +40,12 @@ fn blanket_local_source_forwards_every_item() {
   impl Source<u8> for Probe {
     type Handle = u8;
 
-    fn canonicalize_key(&self, key: &[u8]) -> Result<Vec<u8>, WatchError> {
-      Ok(key.to_vec())
+    fn canonicalize_key(
+      &self,
+      key: &[u8],
+    ) -> impl Future<Output = Result<Vec<u8>, WatchError>> + Send {
+      let canonical = key.to_vec();
+      async move { Ok(canonical) }
     }
 
     fn arm(
@@ -84,7 +90,10 @@ fn blanket_local_source_forwards_every_item() {
   // owner's generic `S: LocalSource` bound resolves them) and assert the implementor's
   // overrides answer.
   assert_eq!(
-    LocalSource::canonicalize_key(&probe, &[1u8]).expect("canonicalize_key forwards"),
+    LocalSource::canonicalize_key(&probe, &[1u8])
+      .now_or_never()
+      .expect("the forwarded canonicalize_key future is ready")
+      .expect("canonicalize_key forwards"),
     vec![1u8],
   );
   let armed = LocalSource::arm(&mut probe, &[1u8])
