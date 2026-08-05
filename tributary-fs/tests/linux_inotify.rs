@@ -1770,10 +1770,43 @@ struct TmpfsMount {
   overran: bool,
 }
 
+/// What one attempt to stage [`TmpfsMount::at`]'s tmpfs ENDED as.
+///
+/// Three genuinely different endings, told apart rather than folded into one
+/// absence, because only ONE of them may become a skip and a cell that skips
+/// still PASSES. Reporting a wedged setup utility — or a kernel table that would
+/// not answer — as "the environment has no tmpfs" makes the privileged cell green
+/// without running an assertion, which is the same false certification the bounds
+/// around this fixture exist to remove, moved from "hangs until the job's outer
+/// timeout fires" to "skips and reports success".
+enum TmpfsSetup {
+  /// Mounted, and the kernel's own table says so: the cell proceeds.
+  Mounted(TmpfsMount),
+  /// The utility completed inside its bound and the table AGREES nothing is
+  /// mounted at the path — this environment refuses tmpfs here. The one ending a
+  /// skip is honest for: nothing was staged, and nothing was left behind.
+  Refused,
+  /// The SETUP itself failed: the utility had to be killed at its bound, could
+  /// not be run at all, or left a state the kernel's table would not confirm
+  /// either way. The cell FAILS carrying `residue`.
+  Failed {
+    /// What failed, and then whatever the release below could not clear.
+    residue: Vec<String>,
+    /// Carried to the caller instead of dropped with the verdict, because both
+    /// failing endings can leave a mount that is LIVE — a `mount` killed the
+    /// instruction after its mount landed, and an unreadable table that has
+    /// disproved nothing — and this is the only thing that owns it. Its bounded
+    /// [`Drop`] is then one more pass over ground the release in
+    /// [`TmpfsMount::at`] already tried once.
+    fixture: TmpfsMount,
+  },
+}
+
 impl TmpfsMount {
   /// Mounts a fresh, private tmpfs at `dir` — a NEW superblock, which is what
   /// makes its unmount a real `IN_UNMOUNT`/`IN_IGNORED` teardown rather than a
-  /// namespace detach. `None` if the environment refused it.
+  /// namespace detach. What the attempt ENDED as is [`TmpfsSetup`], and only its
+  /// verified refusal is a cell's to skip on.
   ///
   /// The setup utility carries the same wall-clock bound as the release's: a
   /// `mount` that never returns wedges the cell before it has staged anything at
@@ -1784,30 +1817,55 @@ impl TmpfsMount {
   /// exit status ([`cleanup_within`] discards it deliberately) — a `mount` killed
   /// just after its mount landed still leaves this fixture owning a mount it must
   /// release.
-  fn at(dir: &Path) -> Option<Self> {
-    std::fs::create_dir_all(dir).ok()?;
+  fn at(dir: &Path) -> TmpfsSetup {
+    // The owner is minted BEFORE there is anything to own. Every step below can
+    // end with a live tmpfs at `dir`, including the steps that report failure,
+    // and a fixture built only once the setup is known to have SUCCEEDED is
+    // precisely the fixture those endings never get.
+    let mut fixture = Self {
+      at: dir.to_path_buf(),
+      released: false,
+      wedged: None,
+      deadline: None,
+      overran: false,
+    };
     let budget = StopBudget::current();
-    if let Err(failed) = cleanup_within(
+    let mut residue = Vec::new();
+    if let Err(err) = std::fs::create_dir_all(dir) {
+      residue.push(format!(
+        "the mountpoint {} could not be created: {err}",
+        dir.display()
+      ));
+    } else if let Err(failed) = cleanup_within(
       &format!("mount -t tmpfs {}", dir.display()),
       std::process::Command::new("mount")
         .args(["-t", "tmpfs", "-o", "size=4m", "tributary-submount"])
         .arg(dir),
       &budget,
     ) {
-      // Named here rather than left to the caller's skip notice: "the mount
-      // utility had to be killed" and "this environment refuses tmpfs" are
-      // different facts, and only the first one says the harness itself is the
-      // thing that wedged. Written past libtest's capture because a cell that
-      // skips still PASSES, and a captured line is discarded exactly then.
-      common::raw_stderr_line(format_args!("CLEANUP tmpfs at {}: {failed}", dir.display()));
+      // Kept as a fact of its own: "the mount utility had to be killed" and
+      // "this environment refuses tmpfs" are different facts, and only the first
+      // one says the harness itself is the thing that wedged. It travels into
+      // the cell's FAILURE rather than a line printed beside a skip, because a
+      // cell that skips still PASSES — and a fact whose whole job is to say the
+      // harness never ran the experiment is worth nothing on a green run, wherever
+      // it is printed.
+      residue.push(failed);
     }
-    (mount_state(dir) == Some(true)).then(|| Self {
-      at: dir.to_path_buf(),
-      released: false,
-      wedged: None,
-      deadline: None,
-      overran: false,
-    })
+    match mount_state(dir) {
+      Some(true) if residue.is_empty() => TmpfsSetup::Mounted(fixture),
+      Some(false) if residue.is_empty() => TmpfsSetup::Refused,
+      // Every remaining ending is the setup failing over ground that may still
+      // be mounted: the table would not answer, or the killed utility was killed
+      // the instruction after its mount landed. So the fixture takes itself apart
+      // HERE, under the bounds it already carries, and what it could not clear
+      // joins the report the cell fails with — a guard dropped on this path
+      // instead is how a live mount ends up with nobody left to release it.
+      _ => {
+        residue.extend(fixture.release_once());
+        TmpfsSetup::Failed { residue, fixture }
+      }
+    }
   }
 
   /// Unmounts and reports what is STILL there — an empty residue is the kernel's
@@ -1835,7 +1893,13 @@ impl TmpfsMount {
       self.deadline = Some(std::time::Instant::now() + aggregate);
     }
     for _ in 0..UNMOUNT_ATTEMPTS {
-      if mount_state(&self.at) != Some(true) {
+      // Only the kernel's own AGREEMENT that nothing is mounted ends the
+      // release. A table that could not be read has disproved nothing (see
+      // [`mount_state`]), so an unverifiable state is presumed to be holding the
+      // mount this fixture owes back and still gets its bounded `umount` —
+      // walking away from it because the answer was unreadable is how a live
+      // mount outlives the cell that made it.
+      if mount_state(&self.at) == Some(false) {
         break;
       }
       // A utility already known wedged, or a budget already spent, ends the loop
@@ -1856,8 +1920,16 @@ impl TmpfsMount {
         self.wedged = Some(failed);
         break;
       }
-      if mount_state(&self.at) == Some(true) {
-        std::thread::sleep(Duration::from_millis(20));
+      match mount_state(&self.at) {
+        // Still mounted is the transient `EBUSY` this retry exists for: nap and
+        // go again.
+        Some(true) => std::thread::sleep(Duration::from_millis(20)),
+        // Gone, or unknowable. A table that cannot be read offers the retry no
+        // progress to wait on, so the mount has had the one bounded `umount` its
+        // unproven state is owed and the release goes on to REPORT — rather than
+        // spending the aggregate bound on invocations whose effect it could not
+        // read either.
+        _ => break,
       }
     }
     // Both re-reported on every pass the flags are set, so a later pass cannot
@@ -1976,14 +2048,37 @@ async fn a_submount_is_outside_the_scope_and_raises_no_teardown() {
   let plain = root.join("plain");
   let mount = root.join("mnt");
   std::fs::create_dir_all(&plain).expect("plain subdirectory");
-  let Some(mut tmpfs) = TmpfsMount::at(&mount) else {
-    common::skip_notice(format_args!(
-      "{CELL}: a private tmpfs could not be mounted at {}, so there is no mount \
-       boundary inside the root to fence",
-      mount.display()
-    ));
-    let _ = std::fs::remove_dir_all(&root);
-    return;
+  let mut tmpfs = match TmpfsMount::at(&mount) {
+    TmpfsSetup::Mounted(tmpfs) => tmpfs,
+    // The one refusal this cell may skip on, and it is a VERIFIED one: the
+    // utility completed and the kernel's table says the path carries no mount,
+    // so the environment has no tmpfs to give and there is no boundary here to
+    // fence.
+    TmpfsSetup::Refused => {
+      common::skip_notice(format_args!(
+        "{CELL}: this environment refuses a private tmpfs at {}, so there is no mount \
+         boundary inside the root to fence",
+        mount.display()
+      ));
+      let _ = std::fs::remove_dir_all(&root);
+      return;
+    }
+    // The harness failed to stage its own experiment, which is this cell's
+    // failure and not a precondition it may skip on — a skip here reports every
+    // assertion below as having held when not one of them ran.
+    //
+    // `_fixture` is held to the end of the arm on purpose: it may own a live
+    // mount, and its [`Drop`] gets its last bounded pass on the unwind out of
+    // this panic. Nothing recursively removes `root` here for the same reason —
+    // a remove aimed at a still-mounted point walks INTO the live filesystem.
+    TmpfsSetup::Failed {
+      residue,
+      fixture: _fixture,
+    } => panic!(
+      "{CELL}: the tmpfs fixture could not be staged at {}: {}",
+      mount.display(),
+      residue.join("; ")
+    ),
   };
 
   let mut w = inotify_watcher();
