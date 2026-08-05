@@ -77,6 +77,12 @@ impl RoutableEvent<OsString> for FakeEvent {
     self.rescan
   }
 
+  /// The epoch ledger's fixture routes ordinary changes only: nothing here models the
+  /// source's reserved sync namespace, so no endpoint is ever masked out of coverage.
+  fn reserved(&self) -> crate::route::ReservedEndpoints {
+    crate::route::ReservedEndpoints::None
+  }
+
   fn deliver(&self, sub: Subscription) -> (Subscription, Projection) {
     (sub, Projection::Whole)
   }

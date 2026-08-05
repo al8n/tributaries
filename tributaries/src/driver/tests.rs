@@ -37,6 +37,15 @@ fn components(path: &Path) -> Vec<OsString> {
     .collect()
 }
 
+/// The directory the fake's SECOND classification ground names — one concrete rendering of
+/// the cookie directory `FsSource::is_sync_artifact` matches through
+/// `tributary_fs::is_sync_cookie_dir_name`, uid suffix and all.
+///
+/// No pre-existing key anywhere in this file carries a component of this name (the only
+/// dotted leaves in it are `.cookie`, under ordinary parents), so admitting the ground
+/// reclassifies nothing the cells sharing [`FakeSource`] already rest on.
+const COOKIE_DIR: &str = ".tributaries-sync-cookies-501";
+
 /// One recorded call against the fake source, in the order it happened.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Call {
@@ -410,11 +419,29 @@ impl Source<OsString> for FakeSource {
   }
 
   fn is_sync_artifact(&self, key: &[OsString]) -> bool {
-    // The fake's reserved namespace: a leaf starting with `cookie-`.
+    // The fake's reserved namespace carries BOTH of the grounds `FsSource::is_sync_artifact`
+    // does, because an endpoint classifier proven against one of them has been proven
+    // against neither: the grounds read different components of the key, so a suppression
+    // that discards a whole change can survive under the leaf ground while the parent
+    // ground never exercises it.
+    //
+    // GROUND 1 — the LEAF is a name this fake mints (`cookie-…`, standing in for the
+    // binding's cookie grammar), or the leaf IS the cookie directory.
+    //
+    // GROUND 2 — the leaf's IMMEDIATE parent is exactly the cookie directory, whatever the
+    // leaf: the shape the real source uses for cookies whose names it cannot predict. Like
+    // the real one, neither ground reads any deeper component.
+    let Some(leaf) = key.last().and_then(|leaf| leaf.to_str()) else {
+      return false;
+    };
+    if leaf.starts_with("cookie-") || leaf == COOKIE_DIR {
+      return true;
+    }
     key
-      .last()
-      .and_then(|leaf| leaf.to_str())
-      .is_some_and(|leaf| leaf.starts_with("cookie-"))
+      .len()
+      .checked_sub(2)
+      .and_then(|parent| key[parent].to_str())
+      .is_some_and(|parent| parent == COOKIE_DIR)
   }
 
   fn end_sync(&mut self, _handle: u32, cookie_key: &[OsString]) {
@@ -9232,6 +9259,591 @@ mod location_coordinate {
           .collect::<Vec<_>>()
       ),
       "a whole move stays located at its destination"
+    );
+  }
+}
+
+/// A [`Source`] mints its own sync-barrier artifacts inside the tree it watches, and no
+/// consumer may ever be told about one. A rename, though, has TWO endpoints and can put an
+/// artifact at one of them and an ordinary user object at the other — so the reservation is
+/// a property of an ENDPOINT, and testing it against the event's key alone answers the
+/// wrong question.
+///
+/// # The loss these cells stand over
+///
+/// `consume_source_event` used to test `is_sync_artifact(event.key())` and `return` on a
+/// match. `SourceEvent::key` is a move's DESTINATION, so a user file renamed INTO the
+/// reserved namespace matched — and the whole change was discarded before it ever reached
+/// the fan-out. The subscriber watching the source endpoint was told nothing: no `Moved`,
+/// no projected `Removed`, and no [`Rescan`](crate::EventKind::Rescan), because nothing
+/// classified this as a coverage loss. Its picture of that name stayed stale for the life
+/// of the watch, under a barrier that certifies delivery.
+///
+/// # Why every row runs twice
+///
+/// `FakeSource::is_sync_artifact` carries both of the grounds the real
+/// `FsSource::is_sync_artifact` does — a leaf grammar and the leaf's immediate parent
+/// directory — and they read different components of the key. A single-key suppression can
+/// therefore survive under one ground while never being exercised by the other, which is
+/// how this class of defect stays alive. Each row below is pinned against BOTH.
+///
+/// # The matrix
+///
+/// | source endpoint | destination endpoint | what a covering subscriber receives |
+/// |---|---|---|
+/// | artifact | artifact | nothing at all |
+/// | user     | artifact | `Removed`, keyed and located at the SOURCE |
+/// | artifact | user     | `Created`, keyed and located at the DESTINATION |
+/// | user     | user     | the whole `Moved`, unchanged |
+mod reserved_namespace {
+  use futures_util::FutureExt;
+
+  use super::*;
+  use crate::source::SyncOutcome;
+
+  /// A root-relative [`Location`] from `/`-joined segments — the coordinate form every
+  /// assertion here compares against, built exactly as the source-event helpers build the
+  /// coordinates they feed in.
+  fn located(location: &str) -> Location {
+    Location::from_segments(
+      location
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(tributary_proto::Segment::new)
+        .collect::<Vec<_>>(),
+    )
+  }
+
+  /// GROUND 2's reserved path and its root-relative location under `/a`: a leaf no grammar
+  /// could predict, classified only by the cookie DIRECTORY holding it.
+  fn inside_the_cookie_directory(leaf: &str) -> (String, String) {
+    (
+      format!("/a/{COOKIE_DIR}/{leaf}"),
+      format!("{COOKIE_DIR}/{leaf}"),
+    )
+  }
+
+  // ---------------------------------------------------------------------------
+  // Row: user → artifact. A `Removed` at the SOURCE endpoint.
+  // ---------------------------------------------------------------------------
+
+  /// The rename the whole-event discard swallowed. Two geometries are watched at once:
+  /// `wide` covers BOTH endpoints (so an unmasked destination hands it the whole `Moved`,
+  /// artifact path and all), and `source_only` covers ONLY the source — the subscription
+  /// that used to receive nothing whatsoever.
+  ///
+  /// The location assertions are the point of using the two-location move helper: the
+  /// move-out projection is re-keyed onto the source endpoint, so it must carry the
+  /// SOURCE's coordinate, rebased into each subscriber's own.
+  async fn assert_a_move_into_the_reserved_namespace_delivers_its_source_endpoint(
+    artifact: &str,
+    artifact_location: &str,
+  ) {
+    let mut h = Harness::new();
+    let wide = h.watch("/a", Interest::all()).await.expect("watch /a");
+    let source_only = h
+      .watch("/a/important", Interest::all())
+      .await
+      .expect("watch /a/important");
+    h.drain();
+
+    h.owner.consume_source_event(&source_moved_at(
+      1,
+      "/a/important/file",
+      "important/file",
+      artifact,
+      artifact_location,
+      1,
+    ));
+
+    let delivered = h.drain();
+    assert_eq!(
+      delivered.len(),
+      2,
+      "both covering subscriptions learn the file left: {delivered:?}"
+    );
+    for (sub, coordinate) in [(wide, "important/file"), (source_only, "file")] {
+      let projected = delivered
+        .iter()
+        .find(|e| e.subscription() == sub)
+        .expect("a subscriber covering the source endpoint is served");
+      assert!(
+        projected.kind().is_removed(),
+        "the covered endpoint is the source, so the move projects to a Removed: {projected:?}"
+      );
+      assert_eq!(
+        projected.path(),
+        Path::new("/a/important/file"),
+        "keyed on the source endpoint, never on the reserved destination"
+      );
+      assert_eq!(
+        projected.location(),
+        &located(coordinate),
+        "and located there too, rebased into this subscriber's own coordinate"
+      );
+      assert_eq!(
+        projected.move_from(),
+        None,
+        "a Removed names no other endpoint, so the artifact path cannot leak through it"
+      );
+    }
+  }
+
+  /// FAIL-ON-REVERT: restore the whole-event discard (`if !event.kind().is_rescan() &&
+  /// self.source.is_sync_artifact(event.key()) { .. return; }` at the head of
+  /// `consume_source_event`) and NOTHING is delivered — the silent loss this class is.
+  /// Dropping only the destination mask (`covers_to` back to a bare
+  /// `to.starts_with(canonical)` in `route::project`) fails it the other way: `wide` gets a
+  /// whole `Moved` naming the reserved destination.
+  #[tokio::test]
+  async fn a_move_into_the_reserved_namespace_delivers_its_source_endpoint_by_leaf_grammar() {
+    assert_a_move_into_the_reserved_namespace_delivers_its_source_endpoint(
+      "/a/cookie-7",
+      "cookie-7",
+    )
+    .await;
+  }
+
+  /// The same row on the OTHER ground: the destination is reserved by the directory holding
+  /// it, not by any name this crate could predict.
+  ///
+  /// FAIL-ON-REVERT: as above; additionally, drop the parent-directory ground from
+  /// `FakeSource::is_sync_artifact` and this cell stops testing anything — the move becomes
+  /// an ordinary one and the `Removed` assertion fails against a whole `Moved`.
+  #[tokio::test]
+  async fn a_move_into_the_reserved_namespace_delivers_its_source_endpoint_by_parent_directory() {
+    let (artifact, location) = inside_the_cookie_directory("anything");
+    assert_a_move_into_the_reserved_namespace_delivers_its_source_endpoint(&artifact, &location)
+      .await;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Row: artifact → user. A `Created` at the DESTINATION endpoint.
+  // ---------------------------------------------------------------------------
+
+  /// The mirror: an artifact renamed OUT to an ordinary name. A subscriber covering the
+  /// destination must learn an object ARRIVED in its tree — and must not learn that what
+  /// arrived was the source's own barrier marker, so the projection names no `from`.
+  async fn assert_a_move_out_of_the_reserved_namespace_delivers_its_destination_endpoint(
+    artifact: &str,
+    artifact_location: &str,
+  ) {
+    let mut h = Harness::new();
+    let wide = h.watch("/a", Interest::all()).await.expect("watch /a");
+    let dest_only = h
+      .watch("/a/adopted", Interest::all())
+      .await
+      .expect("watch /a/adopted");
+    h.drain();
+
+    h.owner.consume_source_event(&source_moved_at(
+      1,
+      artifact,
+      artifact_location,
+      "/a/adopted/file",
+      "adopted/file",
+      1,
+    ));
+
+    let delivered = h.drain();
+    assert_eq!(
+      delivered.len(),
+      2,
+      "both covering subscriptions learn the object arrived: {delivered:?}"
+    );
+    for (sub, coordinate) in [(wide, "adopted/file"), (dest_only, "file")] {
+      let projected = delivered
+        .iter()
+        .find(|e| e.subscription() == sub)
+        .expect("a subscriber covering the destination endpoint is served");
+      assert!(
+        projected.kind().is_created(),
+        "the covered endpoint is the destination, so the move projects to a Created: \
+         {projected:?}"
+      );
+      assert_eq!(
+        projected.path(),
+        Path::new("/a/adopted/file"),
+        "keyed on the destination endpoint: {projected:?}"
+      );
+      assert_eq!(
+        projected.location(),
+        &located(coordinate),
+        "located at the destination, rebased into this subscriber's own coordinate"
+      );
+      assert_eq!(
+        projected.move_from(),
+        None,
+        "a Created names no source, so the artifact it was cannot leak through it"
+      );
+    }
+  }
+
+  /// FAIL-ON-REVERT: drop the source mask (`covers_from` back to a bare
+  /// `from.starts_with(canonical)` in `route::project`) and `wide` receives a whole `Moved`
+  /// whose `from` is the artifact's own path.
+  #[tokio::test]
+  async fn a_move_out_of_the_reserved_namespace_delivers_its_destination_endpoint_by_leaf_grammar()
+  {
+    assert_a_move_out_of_the_reserved_namespace_delivers_its_destination_endpoint(
+      "/a/cookie-7",
+      "cookie-7",
+    )
+    .await;
+  }
+
+  /// The same row on the parent-directory ground.
+  #[tokio::test]
+  async fn a_move_out_of_the_reserved_namespace_delivers_its_destination_endpoint_by_parent_directory()
+   {
+    let (artifact, location) = inside_the_cookie_directory("anything");
+    assert_a_move_out_of_the_reserved_namespace_delivers_its_destination_endpoint(
+      &artifact, &location,
+    )
+    .await;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Row: artifact → artifact. Nothing at all.
+  // ---------------------------------------------------------------------------
+
+  /// A rename BETWEEN two reserved names is reserved at every endpoint it has, so it is
+  /// settled without routing: never fanned out, never coalesced, never delivered.
+  async fn assert_a_move_within_the_reserved_namespace_reaches_nobody(
+    from: &str,
+    from_location: &str,
+    to: &str,
+    to_location: &str,
+  ) {
+    let mut h = Harness::new();
+    let _wide = h.watch("/a", Interest::all()).await.expect("watch /a");
+    h.drain();
+
+    h.owner
+      .consume_source_event(&source_moved_at(1, from, from_location, to, to_location, 1));
+
+    let delivered = h.drain();
+    assert!(
+      delivered.is_empty(),
+      "a change reserved at every endpoint it has reaches no consumer: {delivered:?}"
+    );
+  }
+
+  /// FAIL-ON-REVERT: narrow `ReservedEndpoints::is_total` to `matches!(self,
+  /// Self::Destination | Self::All)`'s complement — or, minimally, drop `Self::All` from
+  /// `masks_source` — and the whole-move suppression degrades to a `Removed` naming one
+  /// artifact path.
+  #[tokio::test]
+  async fn a_move_within_the_reserved_namespace_reaches_nobody_by_leaf_grammar() {
+    assert_a_move_within_the_reserved_namespace_reaches_nobody(
+      "/a/cookie-7",
+      "cookie-7",
+      "/a/cookie-8",
+      "cookie-8",
+    )
+    .await;
+  }
+
+  /// The same row on the parent-directory ground: two unpredictable leaves inside the one
+  /// cookie directory.
+  #[tokio::test]
+  async fn a_move_within_the_reserved_namespace_reaches_nobody_by_parent_directory() {
+    let (from, from_location) = inside_the_cookie_directory("one");
+    let (to, to_location) = inside_the_cookie_directory("two");
+    assert_a_move_within_the_reserved_namespace_reaches_nobody(
+      &from,
+      &from_location,
+      &to,
+      &to_location,
+    )
+    .await;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Row: user → user. The move, unchanged — the over-suppression guard.
+  // ---------------------------------------------------------------------------
+
+  /// Suppression removes a change from every stream, so a ground that over-reaches is the
+  /// same silent loss with the endpoints swapped. Each of these destinations sits one step
+  /// outside its ground — a leaf the grammar does not mint, and a leaf whose cookie
+  /// directory is its GRANDparent rather than its parent (neither ground reads deeper than
+  /// the immediate parent) — and the move must survive whole.
+  async fn assert_a_move_near_but_outside_the_reserved_namespace_is_not_masked(
+    to: &str,
+    to_location: &str,
+  ) {
+    let mut h = Harness::new();
+    let wide = h.watch("/a", Interest::all()).await.expect("watch /a");
+    h.drain();
+
+    h.owner.consume_source_event(&source_moved_at(
+      1,
+      "/a/important/file",
+      "important/file",
+      to,
+      to_location,
+      1,
+    ));
+
+    let delivered = h.drain();
+    assert_eq!(
+      delivered.len(),
+      1,
+      "one covering subscriber, one whole move: {delivered:?}"
+    );
+    let whole = &delivered[0];
+    assert_eq!(whole.subscription(), wide);
+    assert_eq!(
+      whole.move_from(),
+      Some(key("/a/important/file").as_slice()),
+      "an unreserved move keeps BOTH endpoints"
+    );
+    assert_eq!(whole.path(), Path::new(to));
+    assert_eq!(
+      whole.location(),
+      &located(to_location),
+      "a whole move stays located at its destination"
+    );
+  }
+
+  /// FAIL-ON-REVERT: widen the fake's leaf ground to a bare `starts_with("cookie")` and the
+  /// destination becomes reserved — the delivery degrades to a source-only `Removed`.
+  #[tokio::test]
+  async fn a_move_to_a_leaf_the_grammar_does_not_mint_is_not_masked() {
+    assert_a_move_near_but_outside_the_reserved_namespace_is_not_masked(
+      "/a/cookies-7",
+      "cookies-7",
+    )
+    .await;
+  }
+
+  /// FAIL-ON-REVERT: let the parent ground scan every component instead of only `key[len -
+  /// 2]` and this deeper descendant is reserved — a user file erased from every stream.
+  #[tokio::test]
+  async fn a_move_below_the_cookie_directorys_own_children_is_not_masked() {
+    let (to, to_location) = inside_the_cookie_directory("sub/leaf");
+    assert_a_move_near_but_outside_the_reserved_namespace_is_not_masked(&to, &to_location).await;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Single-endpoint kinds keep today's single-key answer.
+  // ---------------------------------------------------------------------------
+
+  /// A change with ONE endpoint has one verdict, and a reserved key makes it total: the
+  /// cookie's own create (and its unlink) reaches nobody. Endpoint-awareness must not have
+  /// loosened this — it is the suppression the namespace exists for.
+  async fn assert_a_single_endpoint_change_at_a_reserved_key_reaches_nobody(artifact: &str) {
+    let mut h = Harness::new();
+    let _wide = h.watch("/a", Interest::all()).await.expect("watch /a");
+    h.drain();
+
+    h.owner
+      .consume_source_event(&source_created(1, artifact, 1));
+
+    let delivered = h.drain();
+    assert!(
+      delivered.is_empty(),
+      "the artifact's own single-endpoint change is covered by nobody: {delivered:?}"
+    );
+  }
+
+  /// FAIL-ON-REVERT: drop the mask from `route::project`'s single-endpoint arm (`return
+  /// to.starts_with(canonical).then(|| event.deliver(sub))`) and the cookie's create is
+  /// delivered to every covering subscriber.
+  #[tokio::test]
+  async fn a_single_endpoint_change_at_a_reserved_key_reaches_nobody_by_leaf_grammar() {
+    assert_a_single_endpoint_change_at_a_reserved_key_reaches_nobody("/a/cookie-7").await;
+  }
+
+  /// The same, on the parent-directory ground.
+  #[tokio::test]
+  async fn a_single_endpoint_change_at_a_reserved_key_reaches_nobody_by_parent_directory() {
+    let (artifact, _location) = inside_the_cookie_directory("anything");
+    assert_a_single_endpoint_change_at_a_reserved_key_reaches_nobody(&artifact).await;
+  }
+
+  // ---------------------------------------------------------------------------
+  // A `Rescan` is never classified, so it is never suppressed.
+  // ---------------------------------------------------------------------------
+
+  /// A [`Rescan`](crate::EventKind::Rescan) names no object — it is the statement that
+  /// coverage below a key became uncertain — so it has no endpoint to reserve. Classifying
+  /// one would hide a coverage loss behind the very namespace whose events it may have
+  /// eaten, and the loss would be unrecoverable: nothing else is owed for it.
+  async fn assert_a_rescan_inside_the_reserved_namespace_is_still_delivered(
+    at: &str,
+    location: &str,
+  ) {
+    let mut h = Harness::new();
+    let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+    h.drain();
+
+    h.owner
+      .consume_source_event(&rescan_event_at(1, at, location, 1));
+
+    let delivered = h.drain();
+    let projected = delivered
+      .iter()
+      .find(|e| e.subscription() == sub)
+      .expect("a coverage-loss signal is never suppressed, wherever it is located");
+    assert!(
+      projected.kind().is_rescan(),
+      "a Rescan is delivered as itself, never reshaped by the namespace: {projected:?}"
+    );
+    assert_eq!(
+      projected.path(),
+      Path::new(at),
+      "the re-enumeration keeps the located key the loss names"
+    );
+  }
+
+  /// FAIL-ON-REVERT: drop the `is_rescan` early return from `Owner::reserved_endpoints` and
+  /// this `Rescan` classifies `All`, so `fan_out_and_push` settles it without routing —
+  /// coverage loss, silently swallowed.
+  #[tokio::test]
+  async fn a_rescan_at_a_reserved_key_is_still_delivered_by_leaf_grammar() {
+    assert_a_rescan_inside_the_reserved_namespace_is_still_delivered("/a/cookie-7", "cookie-7")
+      .await;
+  }
+
+  /// The same, on the parent-directory ground.
+  #[tokio::test]
+  async fn a_rescan_at_a_reserved_key_is_still_delivered_by_parent_directory() {
+    let (at, location) = inside_the_cookie_directory("anything");
+    assert_a_rescan_inside_the_reserved_namespace_is_still_delivered(&at, &location).await;
+  }
+
+  // ---------------------------------------------------------------------------
+  // A barrier still resolves on a cookie that arrives by RENAME.
+  // ---------------------------------------------------------------------------
+
+  /// A cookie is an observation however it arrives, and a rename is one of the ways it can.
+  /// The pre-fix code resolved the barrier on exactly this event and then discarded the
+  /// whole change; the fix keeps the resolution AND delivers the user endpoint, so this
+  /// cell asserts both halves — a resolution that came at the price of the `Removed` would
+  /// be the same loss with a certificate on top.
+  async fn assert_a_cookie_arriving_by_rename_resolves_its_barrier(
+    cookie: &str,
+    cookie_location: &str,
+  ) {
+    let mut h = Harness::new();
+    let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+    let handle = h.owner.subsumer.subscription_root(sub).expect("live root");
+    h.drain();
+
+    let (reply_tx, mut reply_rx) = futures_channel::oneshot::channel();
+    h.owner.pending_syncs.push(crate::driver::PendingSync {
+      cookie_key: key(cookie),
+      sub,
+      root: handle,
+      loss_serial_at_install: 0,
+      dominated_at_install: false,
+      reply: reply_tx,
+    });
+
+    h.owner.consume_source_event(&source_moved_at(
+      1,
+      "/a/important/file",
+      "important/file",
+      cookie,
+      cookie_location,
+      1,
+    ));
+
+    let delivered = h.drain();
+    let projected = delivered
+      .iter()
+      .find(|e| e.subscription() == sub)
+      .expect("the user endpoint is delivered, barrier or no barrier");
+    assert!(
+      projected.kind().is_removed(),
+      "the user endpoint arrives as the source-only projection, not as a whole move naming \
+       the cookie: {projected:?}"
+    );
+    assert_eq!(projected.path(), Path::new("/a/important/file"));
+    assert_eq!(projected.location(), &located("important/file"));
+    assert!(
+      matches!(
+        (&mut reply_rx).now_or_never(),
+        Some(Ok(Ok(SyncOutcome::Delivered)))
+      ),
+      "a cookie that arrived by rename resolves its barrier Delivered"
+    );
+  }
+
+  /// FAIL-ON-REVERT: gate the resolution back on `reserved.is_total()` instead of
+  /// `reserved.any()` in `consume_source_event` and the barrier never resolves — the reply
+  /// stays pending and the caller waits out its whole timeout.
+  #[tokio::test]
+  async fn a_cookie_arriving_by_rename_resolves_its_barrier_by_leaf_grammar() {
+    assert_a_cookie_arriving_by_rename_resolves_its_barrier("/a/cookie-7", "cookie-7").await;
+  }
+
+  /// The same, on the parent-directory ground — the shape a second consumer of the lower
+  /// crate actually produces, since its cookie names follow no grammar this crate knows.
+  #[tokio::test]
+  async fn a_cookie_arriving_by_rename_resolves_its_barrier_by_parent_directory() {
+    let (cookie, location) = inside_the_cookie_directory("anything");
+    assert_a_cookie_arriving_by_rename_resolves_its_barrier(&cookie, &location).await;
+  }
+
+  // ---------------------------------------------------------------------------
+  // The resolution is strictly AFTER the change's own publication.
+  // ---------------------------------------------------------------------------
+
+  /// `consume_source_event` resolves a barrier only once `fan_out_and_push` has published
+  /// this change or durably parked it. A barrier resolved first would let a caller waking
+  /// on another thread drain past a delivery the resolution implies it will find — the
+  /// prohibited half-barrier.
+  ///
+  /// The order is made OBSERVABLE by making this change's own publication the thing that
+  /// creates the debt: the one-slot channel is already full, so the projected `Removed`
+  /// sheds the subscription to a parked `Rescan` and advances its loss serial. The
+  /// resolution reads both. Resolving BEFORE the fan-out would find an empty debt map and
+  /// an unmoved serial, and would answer `Delivered`; resolving after finds the debt this
+  /// very change created, and answers `Dominated`.
+  ///
+  /// FAIL-ON-REVERT: hoist the `resolve_matching_pending_sync` call above
+  /// `self.fan_out_and_push(event)` and the outcome flips to `Delivered` — a clean-delivery
+  /// certificate handed out over a subscription that owes a re-enumeration.
+  #[tokio::test]
+  async fn a_barrier_resolves_only_after_its_own_change_is_durably_parked() {
+    let mut h = Harness::bounded(1);
+    let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+    let handle = h.owner.subsumer.subscription_root(sub).expect("live root");
+
+    // Fill the one slot, so THIS change's own publication is what sheds.
+    h.owner.try_emit(modified_event(sub, "/a/x", 1));
+
+    let (reply_tx, mut reply_rx) = futures_channel::oneshot::channel();
+    h.owner.pending_syncs.push(crate::driver::PendingSync {
+      cookie_key: key("/a/cookie-7"),
+      sub,
+      root: handle,
+      loss_serial_at_install: 0,
+      dominated_at_install: false,
+      reply: reply_tx,
+    });
+
+    h.owner.consume_source_event(&source_moved_at(
+      1,
+      "/a/important/file",
+      "important/file",
+      "/a/cookie-7",
+      "cookie-7",
+      2,
+    ));
+
+    assert!(
+      h.owner.needs_rescan.contains_key(&sub),
+      "the user endpoint could not be published, so it parked as durable Rescan debt"
+    );
+    assert!(
+      matches!(
+        (&mut reply_rx).now_or_never(),
+        Some(Ok(Ok(SyncOutcome::Dominated)))
+      ),
+      "the resolution read the debt this change's own publication created, so it ran after it"
     );
   }
 }
