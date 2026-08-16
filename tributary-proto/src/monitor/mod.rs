@@ -660,6 +660,13 @@ struct StatSlot {
   /// keeps the mark's lifetime exactly the window's — the stamp travels with the
   /// request, and is inert until an answer arrives, so nothing counted is added
   /// here.
+  ///
+  /// The stamp has a second half, and it is NOT inert: while the request stands,
+  /// so does the scope's settlement loss
+  /// ([`Monitor::bootstrap_stats`]). The install-routing above answers "what
+  /// does a late answer do"; the loss answers "what may a barrier claim in the
+  /// meantime", and without it a fence opened between the queue and the answer
+  /// certifies a window whose possible directory has no watch at all.
   bootstrap: bool,
 }
 
@@ -965,12 +972,49 @@ pub struct Monitor {
   /// conjunct of [`coverage_settled`](Self::coverage_settled): an unanswered
   /// stat must degrade to a re-signalled `Rescan`, not wedge every barrier of
   /// the scope.
+  ///
+  /// A REGISTRATION-window request additionally stands its scope's settlement
+  /// loss for as long as it is owed
+  /// ([`bootstrap_stats`](Self::bootstrap_stats)) — the honest half of the
+  /// exemption above, since the deficit re-signal that covers this darkness
+  /// reaches a sync cookie's dispatch and not an ordinary set-cover reply.
   pending_stat: BTreeMap<ReqId, StatSlot>,
   /// The slots [`pending_stat`](Self::pending_stat) currently owes an answer
   /// for, mapped to the request that owes it, so asking twice for one is an
   /// O(log n) decision rather than a scan of every outstanding request. Mirrors
   /// that map's slots exactly (asserted by the test invariant checker).
   stat_slots: BTreeMap<(WatchId, Segment), ReqId>,
+  /// Per-scope count of outstanding stats stamped with the registration window
+  /// ([`StatSlot::bootstrap`]) — the O(1) backing for
+  /// [`bootstrap_stat_outstanding`](Self::bootstrap_stat_outstanding), and the
+  /// scope's SETTLEMENT-LOSS half of that stamp.
+  ///
+  /// The stamp alone governs only what the ANSWER's install does. Between the
+  /// queue and the answer the scope has already left its counted re-arm state —
+  /// queueing sets neither bridge bit and nothing counted — so a barrier built
+  /// on [`coverage_settled`](Self::coverage_settled) can pass while the stamped
+  /// slot still holds no child watch, and a set-cover fence would certify a
+  /// window whose possible directory is uncovered. This counter is what the
+  /// consumer reads to refuse that certification.
+  ///
+  /// It is deliberately NOT a conjunct of `coverage_settled`. A blocking
+  /// conjunct would let a driver that never answers wedge every barrier of the
+  /// scope forever — the liveness hazard [`defer_stat_descent`] exists to
+  /// avoid — whereas a loss signal degrades the verdict and leaves the settle
+  /// floor under-claimed, which instructs the consumer to re-enumerate exactly
+  /// as the coverage contract already asks.
+  ///
+  /// Maintained at the three edges every stamped request passes: the stamped
+  /// [`queue_stat`](Self::queue_stat), the answer's removal in
+  /// [`ingest_stat_result`](Self::ingest_stat_result) (whatever the answer says,
+  /// including a failure, an unresolvable kind, and one whose parent died under
+  /// it), and the parent's own death ([`NodeMarker::StatSlots`]). An entry
+  /// leaves the map at zero, so a scope holds no residue — and the whole map
+  /// mirrors `pending_stat`'s stamped rows exactly (asserted by the test
+  /// invariant checker).
+  ///
+  /// [`defer_stat_descent`]: Self::defer_stat_descent
+  bootstrap_stats: BTreeMap<ScopeId, usize>,
   /// The downward descent each watch is OWED by a read that deferred to its
   /// slot's stat ([`StatDescent`]), keyed by the watch itself.
   ///
@@ -1148,6 +1192,7 @@ impl Monitor {
       pending_enumerate: BTreeMap::new(),
       pending_stat: BTreeMap::new(),
       stat_slots: BTreeMap::new(),
+      bootstrap_stats: BTreeMap::new(),
       owed_descents: BTreeMap::new(),
       pending_moves: BTreeMap::new(),
       held_sources: BTreeSet::new(),
@@ -2013,6 +2058,41 @@ impl Monitor {
       && self.moves_settled(scope)
   }
 
+  /// Whether `scope` still owes an answer to a stat its REGISTRATION window
+  /// queued — a listing entry of unknown kind whose slot may be a directory the
+  /// scope has no watch on yet.
+  ///
+  /// This is a LOSS signal for a settlement, and deliberately not a sixth
+  /// conjunct of [`coverage_settled`](Self::coverage_settled). The two differ in
+  /// exactly the way that matters here:
+  ///
+  /// - As a **conjunct**, a driver that never answers — the case the deferred
+  ///   descent booking is written against, and the reason the stat is uncounted
+  ///   at all — would hold every barrier of the scope down forever. No vehicle
+  ///   that can be a barrier's sole cover may lack a proven bounded release, and
+  ///   an unanswered stat has none.
+  /// - As a **loss signal**, a fence settling while the stat stands reports a
+  ///   degraded window and keeps its under-claimed settle floor, which instructs
+  ///   the consumer to re-enumerate — the same instruction the slot's standing
+  ///   coverage deficit already owes it, and the one the coverage contract
+  ///   already asks for. The barrier still resolves, on time.
+  ///
+  /// Between the queue and the answer the scope is genuinely uncovered there and
+  /// genuinely settled: the crawl that listed the slot reconciled nothing for it
+  /// (it books darkness and asks for a kind), and the scope leaves its counted
+  /// re-arm state without waiting. A consumer that certifies coverage over that
+  /// window would claim a cover the slot's possible directory is outside of, and
+  /// writes beneath it would be recorded by nothing.
+  ///
+  /// False for a scope with no such stat outstanding, for a kernel-recursive one
+  /// (which queues no bootstrap read at all), and for an unknown or torn-down
+  /// one. Reading it allocates nothing.
+  #[cfg_attr(not(tarpaulin), inline)]
+  #[must_use]
+  pub fn bootstrap_stat_outstanding(&self, scope: ScopeId) -> bool {
+    self.bootstrap_stats.contains_key(&scope)
+  }
+
   /// `scope`'s coverage-work epoch: a monotone count of how many times the
   /// scope has ACQUIRED work that [`coverage_settled`](Self::coverage_settled)
   /// counts — a re-arm obligation, a detached-and-held move source, an
@@ -2485,6 +2565,16 @@ impl Monitor {
       bootstrap,
     } = slot;
     self.stat_slots.remove(&(parent, name.clone()));
+    // The stamp's settlement-loss half is discharged by the ANSWER ARRIVING, not
+    // by what the answer says, so it is released here — ahead of every early
+    // return and every branch below. A failure, a kind that is `Unknown` again,
+    // an answer the placement staled, and one whose parent died under it all
+    // reach a terminal that re-books the darkness in the DEFICIT book (which the
+    // dispatch re-signal covers) or dies with the node; none of them leaves a
+    // stat outstanding, so none of them may leave the loss standing either.
+    if bootstrap {
+      self.bootstrap_stat_dec(scope, 1);
+    }
     // The slot's parent can have died while the stat ran; there is then no slot
     // left to settle, and its deficit died with the node.
     if !self.is_watched(parent) {
@@ -2698,6 +2788,13 @@ impl Monitor {
     }
     let req = self.next_req_id();
     let bootstrap = self.in_bootstrap_window(scope);
+    if bootstrap {
+      // The stamp's SETTLEMENT-LOSS half, standing from here until the answer
+      // (or the parent's death) discharges it — see [`bootstrap_stats`].
+      //
+      // [`bootstrap_stats`]: Self::bootstrap_stats
+      self.bootstrap_stat_inc(scope);
+    }
     self.stat_slots.insert((parent, name.clone()), req);
     self.pending_stat.insert(
       req,
@@ -2743,7 +2840,12 @@ impl Monitor {
   /// degrade to a re-signalled `Rescan`, never wedge the scope's every barrier.
   /// Nothing rests on the answer ALONE — the incumbent keeps its watch and its
   /// coverage meanwhile, and the crawl that deferred stood its own `Rescan` — so
-  /// an answer that never comes costs a degraded cover rather than a wedge.
+  /// an answer that never comes costs a degraded cover rather than a wedge. For
+  /// a REGISTRATION-window request the degrade is made explicit rather than left
+  /// to the deficit re-signal, which reaches a sync cookie's dispatch and not an
+  /// ordinary set-cover reply: the standing request marks the scope's
+  /// settlement lossy ([`bootstrap_stats`](Self::bootstrap_stats)) for exactly
+  /// as long as it is owed.
   fn defer_stat_descent(&mut self, parent: WatchId, name: &Segment, descent: StatDescent) {
     if !self.stat_slots.contains_key(&(parent, name.clone())) {
       return;
@@ -5807,7 +5909,21 @@ impl Monitor {
       // the darkness such a slot stands for is booked as a DEFICIT, which the
       // `Deficits` marker erases and discharges per the caller's reason.
       NodeMarker::StatSlots => {
-        self.pending_stat.retain(|_, slot| slot.parent != id);
+        // The registration-window stamp's settlement-loss half dies with the
+        // request it was standing for: the slot is gone, so no answer can ever
+        // arrive to release it, and leaving it standing would degrade every
+        // later fence of the scope forever. Counted from the reclaimed rows
+        // rather than assumed, since only some of them carry the stamp; each
+        // one's scope is its parent's (the invariant checker pins it).
+        let mut stamped = 0usize;
+        self.pending_stat.retain(|_, slot| {
+          if slot.parent != id {
+            return true;
+          }
+          stamped += usize::from(slot.bootstrap);
+          false
+        });
+        self.bootstrap_stat_dec(node.scope, stamped);
         self.stat_slots.retain(|(parent, _), _| *parent != id);
         ErasedCover::Nothing
       }
@@ -6044,6 +6160,32 @@ impl Monitor {
       *count -= 1;
       if *count == 0 {
         self.rearm_pending.remove(&scope);
+      }
+    }
+  }
+
+  /// Counts one stamped registration-window stat of `scope` queued.
+  ///
+  /// Deliberately NOT [`acquired_coverage_work`](Self::acquired_coverage_work):
+  /// the stat is uncounted, so it acquires no coverage work, and bumping the
+  /// epoch here would retire every ordering proof a settled window is holding
+  /// for a request that adds nothing for a proof to order.
+  fn bootstrap_stat_inc(&mut self, scope: ScopeId) {
+    *self.bootstrap_stats.entry(scope).or_insert(0) += 1;
+  }
+
+  /// Releases `by` of `scope`'s stamped registration-window stats, dropping the
+  /// entry at zero so a scope with none holds no residue. A zero release is a
+  /// no-op, which is what lets the teardown edge call it unconditionally with
+  /// whatever it reclaimed.
+  fn bootstrap_stat_dec(&mut self, scope: ScopeId, by: usize) {
+    if by == 0 {
+      return;
+    }
+    if let Some(count) = self.bootstrap_stats.get_mut(&scope) {
+      *count -= by;
+      if *count == 0 {
+        self.bootstrap_stats.remove(&scope);
       }
     }
   }
@@ -6725,6 +6867,19 @@ impl Monitor {
         "an outstanding stat belongs to its parent's scope"
       );
     }
+    // The registration-window loss counter mirrors the STAMPED outstanding stats
+    // exactly. A counter that over-read would degrade every later fence of the
+    // scope for the rest of its life; one that under-read would certify the very
+    // window this signal exists to refuse — so it is pinned to the map rather
+    // than trusted to its three edges.
+    let mut stamped: BTreeMap<ScopeId, usize> = BTreeMap::new();
+    for slot in self.pending_stat.values().filter(|slot| slot.bootstrap) {
+      *stamped.entry(slot.scope).or_insert(0) += 1;
+    }
+    assert_eq!(
+      stamped, self.bootstrap_stats,
+      "the registration-window stat counter mirrors the stamped requests exactly"
+    );
     // Every booked descent names a LIVE watch — the drop walk is the funnel
     // that discharges one whose owner dies, so a key with no node would be an
     // obligation nothing can ever perform and nothing ever covered.

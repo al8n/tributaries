@@ -487,6 +487,14 @@ impl SettlePass<'_> {
 ///   does not see, so the scope can read settled while the obligation is
 ///   latent (lossy **from birth**, per the fence design's F0 amendment).
 ///
+/// A third source is a standing CONDITION rather than an event, so it is read
+/// at the settle observation instead of being remembered here: a registration
+/// window's unanswered classification stat
+/// ([`Monitor::bootstrap_stat_outstanding`], read in
+/// [`poll_cover_settlements`](DriverCore::poll_cover_settlements)). An event
+/// mark would be spent by the first observation to pass while the slot stayed
+/// dark, so the condition is re-read every time a verdict is minted.
+///
 /// Either event marks every currently-pending fence lossy AND is remembered
 /// here until the scope next settles, so a fence opened AFTER the event but
 /// BEFORE that settle inherits it — a reply-less reconcile
@@ -2131,6 +2139,30 @@ impl DriverCore {
     for scope in scopes {
       if !self.barrier_settled(scope) {
         continue;
+      }
+      // The registration window's unanswered classification stat is a LOSS this
+      // settlement must carry, and it is read here — at the observation — rather
+      // than at an edge, because it is a STANDING condition and not an event. A
+      // scope's loss memory is spent by every settle observation, so a mark laid
+      // when the stat was queued would be cleared by the first observation to
+      // pass and the next fence would certify the same uncovered window anyway.
+      //
+      // The slot may be a directory the scope has no watch on: the crawl that
+      // listed it as `FileKind::Unknown` reconciled nothing for it, and the stat
+      // is uncounted, so the barrier above quiesces with the slot dark. The
+      // verdict degrades and the settle floor keeps its under-claim, which sends
+      // the consumer back to enumerate — never `Applied` over ground writes go
+      // unrecorded beneath.
+      //
+      // Deliberately NOT a conjunct of the barrier
+      // ([`Monitor::bootstrap_stat_outstanding`]): a driver that never answers
+      // must cost a degraded verdict, not a wedged scope. Everything below still
+      // runs — the residue and certification deferrals, the ordering proof, the
+      // resolution — exactly as for any other lossy window.
+      if self.monitor.bootstrap_stat_outstanding(scope)
+        && let Some(entry) = self.cover_fences.get_mut(&scope)
+      {
+        entry.mark_lossy();
       }
       // The residue deferral: this scope's lane still holds items the pass
       // counted and did not read, and an unread terminal `Fatal` among them
