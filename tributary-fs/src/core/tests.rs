@@ -4676,6 +4676,19 @@ mod descending {
   }
 
   fn run_cascade(core: &mut DriverCore, listings: &BTreeMap<&str, Vec<RawDirEntry>>) {
+    let _ = run_cascade_probing(core, listings);
+  }
+
+  /// [`run_cascade`], additionally reporting every `Effect::Probe` it passed
+  /// over. A cascade answers arms and reads; the slot-kind stat an
+  /// unclassifiable listing entry asks for is deliberately left OUTSTANDING —
+  /// no cascade can answer it — so a cell that needs the request must be handed
+  /// it from here.
+  fn run_cascade_probing(
+    core: &mut DriverCore,
+    listings: &BTreeMap<&str, Vec<RawDirEntry>>,
+  ) -> Vec<(ProbeId, PathBuf)> {
+    let mut probes = Vec::new();
     let mut wd = 100;
     for _ in 0..32 {
       let effects = drain(core);
@@ -4699,11 +4712,12 @@ mod descending {
             core.on_enumerated(*req, listed(entries));
             progressed = true;
           }
+          Effect::Probe { probe, path } => probes.push((*probe, path.clone())),
           _ => {}
         }
       }
       if !progressed {
-        return;
+        return probes;
       }
     }
     panic!("the cascade did not quiesce within the iteration bound");
@@ -4801,6 +4815,215 @@ mod descending {
     assert_eq!(state.settle_floor, Some(vec![p("/r/keep")]));
     assert!(core.cover_fences.is_empty());
     (core, scope, root_watch)
+  }
+
+  /// [`root_listing`] plus one entry no kind could be read for — the
+  /// `DT_UNKNOWN` shape. The crawl reconciles nothing for `mystery`: it books
+  /// the slot as darkness and asks the driver for a kind.
+  fn root_listing_with_unknown() -> Vec<RawDirEntry> {
+    let mut entries = root_listing();
+    entries.push(entry("mystery", FileKind::Unknown, 1, 13));
+    entries
+  }
+
+  /// The same listing once the slot has been classified, for the re-arm reads a
+  /// later window performs: an unchanged `mystery` must re-list as what it turned
+  /// out to be, or the read would retire its watch and stand a `Rescan` of its
+  /// own — a cover the cells below must not be able to pass on.
+  fn root_listing_with_classified() -> Vec<RawDirEntry> {
+    let mut entries = root_listing();
+    entries.push(entry("mystery", FileKind::Dir, 1, 13));
+    entries
+  }
+
+  /// A live descending scope at `/r` whose REGISTRATION listing carried one
+  /// unclassifiable entry: `keep` and `drop` are armed, the registration
+  /// window's own loss memory is spent, and the stat that must decide
+  /// `/r/mystery` is outstanding and stamped with that window
+  /// ([`Monitor::bootstrap_stat_outstanding`]).
+  ///
+  /// The stat is uncounted and no conjunct of the barrier, so the scope reads
+  /// settled here with `/r/mystery` covered by nothing — which is the whole
+  /// window the two cells below are about.
+  fn bootstrapped_with_unknown_slot() -> (DriverCore, ScopeId, ProbeId) {
+    let (mut core, scope, req, _root) = live_descending();
+    core.on_enumerated(req, listed(root_listing_with_unknown()));
+    let probes = run_cascade_probing(&mut core, &BTreeMap::new());
+    let (probe, path) = probes
+      .into_iter()
+      .find(|(_, path)| path.as_path() == Path::new("/r/mystery"))
+      .expect("the unclassifiable slot is probed for its kind");
+    assert_eq!(path, p("/r/mystery"));
+    assert!(
+      core.monitor.rearm_settled(scope),
+      "the crawl quiesced without waiting for the stat"
+    );
+    clear_registration_loss(&mut core, scope);
+    assert!(
+      core.monitor.bootstrap_stat_outstanding(scope),
+      "and the stamped stat outlives the window that queued it"
+    );
+    let state = core.scopes.get(&scope).unwrap();
+    assert_eq!(state.applied_cover, None, "no claim has been recorded yet");
+    assert_eq!(state.settle_floor, None);
+    (core, scope, probe)
+  }
+
+  /// Narrows `scope` to `{/r/keep}` and observes the settle, so the scope has a
+  /// recorded floor for the broadening cover below to under-claim against.
+  /// Reply-less, so no fence's verdict rides it.
+  fn narrow_to_keep(core: &mut DriverCore, scope: ScopeId) {
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep")]),
+      CoverReconcile::Reconciling
+    );
+    assert!(
+      drain(core)
+        .iter()
+        .any(|e| matches!(e, Effect::RemoveWatch { .. })),
+      "the shrink prunes what /r/keep leaves out"
+    );
+    core.mark_cut_inflight(scope, 1);
+    core.prove_cut(scope, 1);
+    assert_eq!(core.poll_cover_settlements(DRAINED), Vec::new());
+    let state = core.scopes.get(&scope).unwrap();
+    assert_eq!(state.applied_cover, Some(vec![p("/r/keep")]));
+    assert_eq!(state.settle_floor, Some(vec![p("/r/keep")]));
+  }
+
+  /// 42-10 cell 6c — a fence may not certify a window a REGISTRATION-stamped
+  /// stat is still owed an answer for.
+  ///
+  /// `/r/mystery` may be a directory, and until the stat says so the scope holds
+  /// no watch on it: an entry created beneath it is recorded by nobody. The stat
+  /// is deliberately uncounted and deliberately no conjunct of
+  /// [`Monitor::coverage_settled`], so the barrier quiesces regardless — the
+  /// window between the queue and the answer is exactly a settled scope with an
+  /// uncovered slot, and a fence opened inside it used to resolve `Applied`.
+  ///
+  /// Both halves of the honest verdict are pinned, because the verdict alone
+  /// under-states it: the fence reports `Degraded`, AND the settle floor keeps
+  /// its under-claim instead of promoting the broadened cover — which is what
+  /// makes the next `set_cover` recompute a real broadening delta rather than
+  /// ride a claim nothing proved.
+  ///
+  /// Staged as a BROADENING cover so the two are distinguishable at all: after a
+  /// narrow to `{/r/keep}` the floor and the applied claim differ, and a clean
+  /// settle would promote the floor to `{/r/keep, /r/drop}`.
+  ///
+  /// Mutation that kills it: drop the settlement's
+  /// `bootstrap_stat_outstanding` consult in `poll_cover_settlements`. The
+  /// fence then certifies the window and promotes the floor over a slot the
+  /// scope has never covered.
+  #[test]
+  fn a_fence_over_an_unanswered_bootstrap_stat_settles_degraded_and_keeps_its_floor() {
+    let (mut core, scope, _probe) = bootstrapped_with_unknown_slot();
+    narrow_to_keep(&mut core, scope);
+
+    // The broadening cover: a PURE grow, which stands no `Rescan` of its own —
+    // so the standing stat is the only thing that can degrade this window.
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep"), p("/r/drop")]),
+      CoverReconcile::Reconciling
+    );
+    let fence = core.open_cover_fence(scope);
+    run_cascade(
+      &mut core,
+      &BTreeMap::from([("/r", root_listing_with_unknown())]),
+    );
+    assert!(
+      core.monitor.rearm_settled(scope),
+      "the regrow quiesced, so nothing counted withholds the verdict"
+    );
+    assert!(
+      core.monitor.bootstrap_stat_outstanding(scope),
+      "and the slot is still uncovered when the fence is asked"
+    );
+
+    core.mark_cut_inflight(scope, 1);
+    core.prove_cut(scope, 1);
+    assert_eq!(
+      core.poll_cover_settlements(DRAINED),
+      vec![(fence, CoverSettle::Degraded)],
+      "a settled scope with an unanswered registration stat is not a covered one"
+    );
+    let state = core.scopes.get(&scope).unwrap();
+    assert_eq!(
+      state.settle_floor,
+      Some(vec![p("/r/keep")]),
+      "the floor keeps its under-claim rather than promoting the broadened cover"
+    );
+    assert_eq!(
+      state.applied_cover,
+      Some(vec![p("/r/keep")]),
+      "and the optimistic claim rewinds to it"
+    );
+  }
+
+  /// …and the loss is exactly as short-lived as the request. Once the stat is
+  /// answered the slot is covered, the signal clears, and the next window
+  /// certifies normally — `Applied`, with the floor promoted to the cover it
+  /// just proved.
+  ///
+  /// The counterpart the cell above needs to mean anything: a signal that never
+  /// cleared would degrade every fence the scope ever opens, which is
+  /// indistinguishable from the fix working and strictly worse than the defect.
+  ///
+  /// Mutation that kills it: release the loss nowhere (drop the
+  /// `bootstrap_stat_dec` at `ingest_stat_result`'s request removal). The
+  /// answered scope then never certifies again.
+  #[test]
+  fn an_answered_bootstrap_stat_lets_the_next_fence_certify() {
+    let (mut core, scope, probe) = bootstrapped_with_unknown_slot();
+
+    // The answer: `mystery` is a directory after all. Its install is routed
+    // through the crawl's own suppression (C1), so the sub-window it opens is
+    // counted and closes with a covering `Rescan` — spent below, exactly as the
+    // registration window's own was, so the fence beneath is not riding it.
+    core.on_probe_result(
+      probe,
+      ProbeOutcome::Present {
+        kind: FileKind::Dir,
+        file_id: NonZeroU64::new(13),
+        dev: 1,
+      },
+      at(1),
+    );
+    run_cascade(
+      &mut core,
+      &BTreeMap::from([("/r", root_listing_with_classified())]),
+    );
+    assert!(
+      !core.monitor.bootstrap_stat_outstanding(scope),
+      "the answer released the loss it was standing for"
+    );
+    clear_registration_loss(&mut core, scope);
+    narrow_to_keep(&mut core, scope);
+
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep"), p("/r/drop")]),
+      CoverReconcile::Reconciling
+    );
+    let fence = core.open_cover_fence(scope);
+    run_cascade(
+      &mut core,
+      &BTreeMap::from([("/r", root_listing_with_classified())]),
+    );
+    assert!(core.monitor.rearm_settled(scope));
+
+    core.mark_cut_inflight(scope, 1);
+    core.prove_cut(scope, 1);
+    assert_eq!(
+      core.poll_cover_settlements(DRAINED),
+      vec![(fence, CoverSettle::Applied)],
+      "the answered scope certifies its window like any other"
+    );
+    let state = core.scopes.get(&scope).unwrap();
+    assert_eq!(
+      state.settle_floor,
+      Some(vec![p("/r/keep"), p("/r/drop")]),
+      "and the clean verdict promotes the floor to the cover it proved"
+    );
   }
 
   /// A mark licenses nothing outside the epoch it was stamped under.

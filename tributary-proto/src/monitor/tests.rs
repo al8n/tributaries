@@ -17429,3 +17429,169 @@ fn a_bootstrap_stat_answered_after_the_settle_edge_installs_suppressed() {
   assert!(m.is_watched(mystery) && m.is_watched(inner));
   m.assert_invariants();
 }
+
+/// 42-10 cell 6c — the stamped stat's SETTLEMENT-LOSS half, and the liveness
+/// property that is the whole reason it is a loss signal rather than a barrier
+/// conjunct.
+///
+/// A driver that never answers must cost a degraded verdict, never a wedge:
+/// [`Monitor::coverage_settled`] reads true here and keeps reading true however
+/// much the scope is pumped, while
+/// [`Monitor::bootstrap_stat_outstanding`] reports the window honestly. Both
+/// halves are asserted together because either alone is satisfiable by a
+/// mistake — a signal that never stands is silent, and a signal that also gates
+/// the barrier trades this design's silent-loss hole for a liveness one.
+///
+/// Mutation that kills it: make the outstanding stamped stat a conjunct of
+/// `coverage_settled` (`&& !self.bootstrap_stat_outstanding(scope)`). The scope
+/// then never settles at all, and every barrier built on it waits for an answer
+/// nobody owes.
+#[test]
+fn a_never_answered_bootstrap_stat_stands_as_loss_without_wedging_the_barrier() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (root, read) = bootstrap_read(&mut m, s);
+  m.on_enumerate(
+    read,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("mystery"), FileKind::Unknown)]),
+  );
+  let _stat = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_stat().map(|c| c.req()))
+    .expect("the unclassifiable slot is stat'd");
+
+  assert!(
+    m.bootstrap_stat_outstanding(s),
+    "the registration window owes an answer for a slot it never covered"
+  );
+  assert!(
+    m.coverage_settled(s),
+    "and the barrier still settles: an uncounted stat wedges nothing"
+  );
+  assert!(
+    m.has_coverage_deficit(s),
+    "the slot's darkness is booked, so the dispatch re-signal keeps covering it"
+  );
+
+  // Pump the scope past the settle edge repeatedly. Nothing here can answer the
+  // stat, so a barrier that has taken the answer as a precondition would never
+  // recover from it.
+  for tick in 0..8 {
+    m.on_os_record(
+      OsRecord::new(root, RecordKind::Created).with_name(seg("noise.txt")),
+      at(tick + 2),
+    );
+    let _ = drain_events(&mut m);
+    let _ = drain_actions(&mut m);
+    assert!(
+      m.coverage_settled(s),
+      "the barrier stays settled across the whole wait"
+    );
+    assert!(
+      m.bootstrap_stat_outstanding(s),
+      "and the loss stays standing for exactly as long"
+    );
+  }
+  m.assert_invariants();
+}
+
+/// The stamped stat's loss half is released by the ANSWER ARRIVING, whatever the
+/// answer says — a directory, a file, a kind still nobody can read, a vanish, or
+/// a bare I/O failure. Each of those terminals either covers the slot or re-books
+/// its darkness in the deficit book, and none of them leaves a request
+/// outstanding; a release keyed on the resolving answers alone would strand the
+/// loss forever on the failing ones, degrading the scope's every later fence for
+/// the rest of its life.
+///
+/// Mutation that kills it: release the loss only in `ingest_stat_result`'s
+/// resolving `Ok` arm instead of at the request's removal — the failing shapes
+/// then leave `bootstrap_stat_outstanding` standing with nothing owed.
+#[test]
+fn every_answer_shape_releases_the_bootstrap_stat_loss() {
+  for answer in [
+    StatResult::Ok(StatEntry::new(FileKind::Dir).with_node(ident(7))),
+    StatResult::Ok(StatEntry::new(FileKind::File)),
+    StatResult::Ok(StatEntry::new(FileKind::Unknown)),
+    StatResult::Failed(IoClass::NotFound),
+    StatResult::Failed(IoClass::Io),
+  ] {
+    let mut m = per_dir();
+    let s = scope(1);
+    let (_root, read) = bootstrap_read(&mut m, s);
+    m.on_enumerate(
+      read,
+      EnumerateResult::Ok(vec![DirEntry::new(seg("mystery"), FileKind::Unknown)]),
+    );
+    let stat = drain_actions(&mut m)
+      .iter()
+      .find_map(|a| a.as_stat().map(|c| c.req()))
+      .expect("the unclassifiable slot is stat'd");
+    assert!(
+      m.bootstrap_stat_outstanding(s),
+      "staging: the loss stands before the answer ({answer:?})"
+    );
+
+    m.on_stat_result(stat, answer);
+    assert!(
+      !m.bootstrap_stat_outstanding(s),
+      "the answer releases the loss whatever it says: {answer:?}"
+    );
+    m.assert_invariants();
+
+    // A duplicate answer for a request already spent releases nothing a second
+    // time — the counter would otherwise underflow on a driver that re-reports.
+    m.on_stat_result(stat, answer);
+    assert!(!m.bootstrap_stat_outstanding(s));
+    m.assert_invariants();
+  }
+}
+
+/// …and the one release the answer cannot perform: the stat's PARENT dies while
+/// the request is still in flight. No answer can ever settle a slot that no
+/// longer exists, so the parent's own teardown is the release — the same
+/// `NodeMarker::StatSlots` walk that reclaims the request itself.
+///
+/// Mutation that kills it: release the loss only in `ingest_stat_result` and not
+/// at the `StatSlots` marker. The pruned parent's stamp then outlives every
+/// object it described and degrades the scope's fences forever.
+#[test]
+fn a_parent_teardown_releases_an_outstanding_bootstrap_stat_loss() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (_root, read) = bootstrap_read(&mut m, s);
+  m.on_enumerate(
+    read,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("sub"), FileKind::Dir)]),
+  );
+  let sub = queued_install(&mut m);
+  let read = armed_read(&mut m, sub);
+  m.on_enumerate(
+    read,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("mystery"), FileKind::Unknown)]),
+  );
+  let stat = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_stat().map(|c| c.req()))
+    .expect("the unclassifiable slot under sub is stat'd");
+  let _ = drain_events(&mut m);
+  assert!(
+    m.bootstrap_stat_outstanding(s),
+    "staging: the crawl stamped the stat inside the registration window"
+  );
+
+  // The consumer prunes `sub` — the slot, and with it the request, are gone.
+  assert!(m.drop_watch_subtree(sub), "the prune drops the subtree");
+  assert!(
+    !m.bootstrap_stat_outstanding(s),
+    "the parent's teardown releases the loss its request was standing for"
+  );
+  m.assert_invariants();
+
+  // And a late answer for the reclaimed request releases nothing twice.
+  m.on_stat_result(
+    stat,
+    StatResult::Ok(StatEntry::new(FileKind::Dir).with_node(ident(7))),
+  );
+  assert!(!m.bootstrap_stat_outstanding(s));
+  m.assert_invariants();
+}
