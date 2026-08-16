@@ -331,8 +331,12 @@ impl Drop for SysctlGuard {
 ///
 /// The deep create carries a second, stronger claim beside it: the descent
 /// reached `a/b` and a create was DELIVERED at that exact path — as the
-/// kernel's own `IN_CREATE`, or as the cold enumerate's `Created` when the arm
-/// landed after the write. A backend whose descent had stopped arming would
+/// kernel's own `IN_CREATE`, or as the `Created` of a cold enumerate under a
+/// RECORD-installed directory when the arm landed after the write. (A
+/// registration's own crawl announces nothing: its reads are suppressed and its
+/// window closes with one `Rescan`, which the re-staging below already handles
+/// as a loss the claim must be held past.) A backend whose descent had stopped
+/// arming would
 /// converge and fail this, however many times it is asked.
 ///
 /// Both facts are collected in ONE pass over the stream; a second wait would be
