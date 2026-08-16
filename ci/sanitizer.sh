@@ -43,8 +43,18 @@ run_msan() {
   # integration binaries exist to drive that same kernel watch — and skips the
   # umbrella lib's own fs-source integration module. The sans-I/O core, view,
   # subsume, demux, and coalesce suites all stay under MSAN.
+  #
+  # The umbrella keeps one real-watch cell OUTSIDE that module deliberately — the fs event
+  # seam's capability boundary must be pinned by the main and narrow gates, not only by the
+  # integration one — so it is named here individually. A real `Watcher::watch` reports
+  # `use-of-uninitialized-value` inside the backend's spawn barrier (the `statx`/`statfs`
+  # results the kernel writes) and ABORTS the lib binary, so the suite reports no result at
+  # all. Any future cell driving a real kernel watch belongs on this list: `cfg(sanitize)`
+  # cannot gate one out, being feature-gated (E0658) on the stable this workspace targets.
   RUSTFLAGS="-Z sanitizer=memory" \
-  cargo -Zbuild-std test --lib --target "$TARGET" --all-features --workspace --exclude tributary-fs -- --skip source::fs::tests::integration
+  cargo -Zbuild-std test --lib --target "$TARGET" --all-features --workspace --exclude tributary-fs \
+    -- --skip source::fs::tests::integration \
+       --skip source::fs::tests::a_real_fs_move_carries_its_source_coordinate_into_the_move_out_projection
 }
 
 run_tsan() {
