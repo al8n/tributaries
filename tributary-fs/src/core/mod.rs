@@ -307,12 +307,21 @@ pub(crate) enum CoverNoop {
   /// The scope is not registered.
   UnknownScope,
   /// The scope is not publicly live: between its spawn and the root-arm grant
-  /// (or root-less before spawn) no caller holds a handle, and a reconcile in
-  /// that window would mark the root's pending COLD arm as a re-arm —
-  /// converting the initial cold discovery into a `Created`-suppressing
-  /// re-arm read. Refused outright; the caller's cover is re-issued once the
-  /// grant commits (the umbrella only ever covers committed watches, so only
-  /// the re-publicized API can reach this).
+  /// (or root-less before spawn) no caller holds a handle, so there is no
+  /// coverage CLAIM to reconcile — the registration's own crawl is still
+  /// installing the scope's whole coverage, and a reconcile over it would prune
+  /// or re-issue ground the grant has not handed anyone. Refused outright; the
+  /// caller's cover is re-issued once the grant commits (the umbrella only ever
+  /// covers committed watches, so only the re-publicized API can reach this).
+  ///
+  /// This clause once carried a second, sharper reason: a pre-grant grow would
+  /// mark the root's pending COLD arm as a re-arm and so suppress the initial
+  /// inventory's `Created`s. That harm did not go away — it became the DESIGN.
+  /// A registration births its root re-arm-flavored deliberately, because the
+  /// contract reports no inventory for state that merely pre-existed the grant,
+  /// and the window is marked so the suppression is never silent. The refusal
+  /// therefore rests on the claim argument alone; the retired reason is recorded
+  /// rather than dropped, because the clause reads vestigial without it.
   NotLive,
   /// The scope's backend is kernel-recursive: one whole-subtree stream is the
   /// coverage, which never narrowed, so there is nothing to prune or re-arm.
@@ -1630,11 +1639,11 @@ impl DriverCore {
   /// floor untouched — for:
   ///
   /// - an **unknown scope** ([`UnknownScope`](CoverNoop::UnknownScope));
-  /// - a scope that is **not publicly live** ([`NotLive`](CoverNoop::NotLive)) — between a
-  ///   descending scope's spawn and its root-arm grant the root's arm is still COLD, and a
-  ///   reconcile's grow would mark it re-arm-flavored, suppressing the initial inventory's
-  ///   `Created`s (re-arms deliberately emit none); no caller holds a handle yet, so there is
-  ///   no coverage to reconcile;
+  /// - a scope that is **not publicly live** ([`NotLive`](CoverNoop::NotLive)) — no caller
+  ///   holds a handle between a descending scope's spawn and its root-arm grant, so there is no
+  ///   coverage CLAIM to reconcile: the registration's own crawl is installing all of it (see
+  ///   [`NotLive`](CoverNoop::NotLive) for the sharper reason this clause used to carry, and
+  ///   why it is now the design rather than the harm);
   /// - a **kernel-recursive** scope (fanotify / FSEvents;
   ///   [`KernelRecursive`](CoverNoop::KernelRecursive)): its single whole-subtree stream has no
   ///   per-directory children, so coverage never narrowed and there is nothing to prune or
@@ -1660,8 +1669,8 @@ impl DriverCore {
     let Some(state) = self.scopes.get(&scope) else {
       return CoverReconcile::Noop(CoverNoop::UnknownScope);
     };
-    // The publicly-live gate (see the refusal table above): a pre-grant reconcile would
-    // convert the root's cold discovery into a `Created`-suppressing re-arm.
+    // The publicly-live gate (see the refusal table above): pre-grant there is no
+    // coverage claim to reconcile — the registration's own crawl owns all of it.
     if !state.publicly_live {
       return CoverReconcile::Noop(CoverNoop::NotLive);
     }
@@ -2378,8 +2387,10 @@ impl DriverCore {
   /// Feeds one descending arm's outcome. An [`Aliased`](WatchOutcome::Aliased)
   /// anchor maps to a successful watch-result exactly like a fresh install:
   /// the wd table fans the shared kernel watch's events out to every anchor,
-  /// so the anchor's coverage is real — the Monitor proceeds to its cold
-  /// enumerate and the inventory is correct.
+  /// so the anchor's coverage is real — the Monitor proceeds to the post-arm
+  /// read the node's own flavor selects (a registration's is re-arm-flavored and
+  /// announces nothing; a live discovery's is cold) and the coverage it takes is
+  /// correct either way.
   /// The scope a watch belongs to, while the watch is tracked. The driver
   /// uses this to route a root arm's outcome to its deferred registration
   /// grant.
