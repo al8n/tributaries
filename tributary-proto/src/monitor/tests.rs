@@ -141,14 +141,21 @@ fn kernel_recursive_watch_success_does_not_enumerate() {
   );
 }
 
+/// Re-staged on a POST-REGISTRATION cold read (42-10): a registration's own
+/// crawl is `Created`-suppressed — the contract reports no inventory for state
+/// that merely pre-existed the grant — so the cold-discovery semantics this cell
+/// is about now live at a directory the LIVE stream discovers, whose post-arm
+/// read is cold. Every assertion is otherwise the original, re-anchored one
+/// level down.
 #[test]
 fn enumerate_emits_created_and_descends_into_dirs() {
   let mut m = per_dir();
-  let root = live_root(&mut m, scope(1));
-  let _ = drain_actions(&mut m);
+  let root = live_root_idle(&mut m, scope(1));
+  let d = discovered_child_dir(&mut m, root, "d");
+  let read = armed_read(&mut m, d);
 
   m.on_enumerate(
-    ReqId::new(NonZeroU64::new(1).unwrap()),
+    read,
     EnumerateResult::Ok(vec![
       DirEntry::new(seg("a.txt"), FileKind::File),
       DirEntry::new(seg("sub"), FileKind::Dir),
@@ -159,8 +166,8 @@ fn enumerate_emits_created_and_descends_into_dirs() {
   assert_eq!(events.len(), 2);
   assert!(events.iter().all(|e| e.kind().is_created()));
   let locations: Vec<&Location> = events.iter().map(|e| e.location()).collect();
-  assert!(locations.contains(&&loc(&["a.txt"])));
-  assert!(locations.contains(&&loc(&["sub"])));
+  assert!(locations.contains(&&loc(&["d", "a.txt"])));
+  assert!(locations.contains(&&loc(&["d", "sub"])));
 
   let actions = drain_actions(&mut m);
   assert_eq!(
@@ -169,7 +176,7 @@ fn enumerate_emits_created_and_descends_into_dirs() {
     "only the directory should get a child watch"
   );
   let child = actions[0].as_watch().unwrap();
-  assert_eq!(child.target(), &WatchTarget::child(root, seg("sub")));
+  assert_eq!(child.target(), &WatchTarget::child(d, seg("sub")));
 }
 
 #[test]
@@ -676,22 +683,15 @@ fn ignored_record_tears_down_the_watch() {
   assert!(actions.iter().any(|a| a.as_unwatch() == Some(root)));
 }
 
+/// Re-staged on a POST-REGISTRATION cold read (42-10): the delivery whose path
+/// is reconstructed must be one the contract still makes, and a registration's
+/// own crawl announces nothing.
 #[test]
 fn path_reconstruction_walks_to_root() {
   let mut m = per_dir();
-  let _root = live_root(&mut m, scope(1));
-  let _ = drain_actions(&mut m);
-  let _ = drain_events(&mut m);
-
-  m.on_enumerate(
-    ReqId::new(NonZeroU64::new(1).unwrap()),
-    EnumerateResult::Ok(vec![DirEntry::new(seg("a"), FileKind::Dir)]),
-  );
-  let a_id = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  let _ = drain_events(&mut m);
-  m.ack_watch(a_id, Ok(WatchAck::Installed));
-  let enumerate_a = drain_actions(&mut m);
-  let req_a = enumerate_a[0].as_enumerate().unwrap().req();
+  let root = live_root_idle(&mut m, scope(1));
+  let a_id = discovered_child_dir(&mut m, root, "a");
+  let req_a = armed_read(&mut m, a_id);
 
   m.on_enumerate(
     req_a,
@@ -1978,25 +1978,62 @@ fn a_refusal_whose_destination_left_the_scope_closes_with_no_second_rescan() {
   m.assert_invariants();
 }
 
-/// A refusal landing while the ROOT's own cold read is still in flight cannot start
-/// a second read: the obligation coalesces onto that read instead. `rearm_settled`
-/// deliberately does not count a dirtied cold read, so the LATENT conjunct is what
-/// holds the barrier — and the read's completion escalates into the covering
-/// `Rescan` plus a counted retry.
+/// A refusal whose recovery crawl reaches a node with a COLD read still in flight
+/// cannot start a second read there: the obligation coalesces onto that read
+/// instead. `rearm_settled` deliberately does not count a dirtied cold read, so
+/// the LATENT conjunct is what holds the barrier — and the read's completion
+/// escalates into the covering `Rescan` plus a counted retry.
+///
+/// Re-staged on a POST-REGISTRATION cold read (42-10). The registration crawl is
+/// re-arm-flavored and COUNTED now, so the root's own bootstrap read is never the
+/// latent case; a live-discovered directory's read is where a cold read lives,
+/// and the recovery's root crawl cascades into it exactly as it did into the
+/// root's own.
 #[test]
-fn a_refusal_during_a_root_cold_read_holds_the_barrier_latently() {
+fn a_refusal_during_a_cold_read_holds_the_barrier_latently() {
   let mut m = per_dir();
-  let root = live_root(&mut m, scope(1));
-  let boot = drain_actions(&mut m)
+  let root = live_root_idle(&mut m, scope(1));
+  // A live-discovered directory whose COLD read is still outstanding.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("d"))
+      .with_is_dir(true)
+      .with_node(ident(5)),
+    at(1),
+  );
+  let d = drain_actions(&mut m)
     .iter()
-    .find_map(|a| a.as_enumerate().map(|e| e.req()))
-    .expect("the root's bootstrap cold read");
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("the discovered directory arms");
+  m.ack_watch(d, Ok(WatchAck::Installed));
+  let cold = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == d).map(|e| e.req()))
+    .expect("its cold read");
   let _ = drain_events(&mut m);
+
   let refused = staged_at_the_bound(&mut m, root, "over");
   assert!(m.latent_settled(scope(1)), "nothing is latent yet");
 
+  // The refusal's recovery is the ROOT crawl; its completion cascades into the
+  // survivor `d`, whose in-flight COLD read is DIRTIED rather than re-read.
   refuse_source(&mut m, root, "over", 1);
   assert!(!m.is_watched(refused));
+  let recovery = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_enumerate()
+        .filter(|e| e.dir() == root)
+        .map(|e| e.req())
+    })
+    .expect("the recovery's root re-arm read");
+  let _ = drain_events(&mut m);
+  m.on_enumerate(
+    recovery,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("d"), FileKind::Dir).with_node(ident(5)),
+    ]),
+  );
   assert!(
     m.rearm_settled(scope(1)),
     "a dirtied COLD read is not counted by the re-arm predicate"
@@ -2009,7 +2046,7 @@ fn a_refusal_during_a_root_cold_read_holds_the_barrier_latently() {
   let _ = drain_events(&mut m);
 
   // The cold read returns; being dirtied it escalates rather than being trusted.
-  m.on_enumerate(boot, EnumerateResult::Ok(Vec::new()));
+  m.on_enumerate(cold, EnumerateResult::Ok(Vec::new()));
   assert!(m.latent_settled(scope(1)), "the latent read resolved");
   let escalation = drain_events(&mut m);
   assert!(
@@ -2554,17 +2591,15 @@ fn a_failed_carry_over_under_a_dead_parent_counts_its_root_escalation() {
 
 // ── Every non-success watch result is coverage loss ──
 
+/// Re-staged on a POST-REGISTRATION discovery (42-10): the refusal's edge
+/// `Rescan` is asserted to be the window's ONLY event, and a refusal inside the
+/// registration window legitimately closes that window with a second, covering
+/// `Rescan`. Staging the refused install on the live stream instead keeps the
+/// cell about the refusal edge alone.
 fn watch_failure_is_coverage_loss(err: WatchError) {
   let mut m = per_dir();
-  let _root = live_root(&mut m, scope(1));
-  let _ = drain_actions(&mut m);
-  let _ = drain_events(&mut m);
-  m.on_enumerate(
-    ReqId::new(NonZeroU64::new(1).unwrap()),
-    EnumerateResult::Ok(vec![DirEntry::new(seg("sub"), FileKind::Dir)]),
-  );
-  let child_id = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  let _ = drain_events(&mut m);
+  let root = live_root_idle(&mut m, scope(1));
+  let child_id = discovered_child_dir(&mut m, root, "sub");
 
   m.ack_watch(child_id, Err(err));
   assert!(
@@ -2606,18 +2641,15 @@ fn no_space_watch_result_drops_node() {
   assert!(actions.iter().any(|a| a.as_unwatch() == Some(root)));
 }
 
-/// `NotFound` now also emits a `Rescan` (was: silent drop).
+/// `NotFound` now also emits a `Rescan` (was: silent drop). Re-staged on a
+/// POST-REGISTRATION discovery for the same reason as
+/// [`watch_failure_is_coverage_loss`]: the edge `Rescan` is asserted to be the
+/// only event, which a refusal inside the registration window is not.
 #[test]
 fn not_found_watch_result_drops_and_rescans() {
   let mut m = per_dir();
-  let _root = live_root(&mut m, scope(1));
-  let _ = drain_actions(&mut m);
-  m.on_enumerate(
-    ReqId::new(NonZeroU64::new(1).unwrap()),
-    EnumerateResult::Ok(vec![DirEntry::new(seg("sub"), FileKind::Dir)]),
-  );
-  let child_id = drain_actions(&mut m)[0].as_watch().unwrap().id();
-  let _ = drain_events(&mut m);
+  let root = live_root_idle(&mut m, scope(1));
+  let child_id = discovered_child_dir(&mut m, root, "sub");
 
   m.ack_watch(child_id, Err(WatchError::NotFound));
   assert!(!m.is_watched(child_id));
@@ -3414,15 +3446,19 @@ fn removed_then_created_at_same_slot_rewatches_replacement() {
 /// could read is not evidence of a non-directory — booked as darkness and stat'd,
 /// rather than passed over as a file. A `Dir` entry in the same result is watched
 /// outright.
+///
+/// Re-staged on a POST-REGISTRATION cold read (42-10): a registration's own crawl
+/// emits no `Created` for either entry. The unknown-kind HANDLING is identical on
+/// both flavors — cell 6b covers the bootstrap side.
 #[test]
 fn enumerate_unknown_kind_entry_is_stat_resolved_not_assumed_a_file() {
   let mut m = per_dir();
-  let root = live_root(&mut m, scope(1));
-  let _ = drain_actions(&mut m);
-  let _ = drain_events(&mut m);
+  let root = live_root_idle(&mut m, scope(1));
+  let d = discovered_child_dir(&mut m, root, "d");
+  let read = armed_read(&mut m, d);
 
   m.on_enumerate(
-    ReqId::new(NonZeroU64::new(1).unwrap()),
+    read,
     EnumerateResult::Ok(vec![
       DirEntry::new(seg("known"), FileKind::Dir),
       DirEntry::new(seg("mystery"), FileKind::Unknown),
@@ -3440,11 +3476,11 @@ fn enumerate_unknown_kind_entry_is_stat_resolved_not_assumed_a_file() {
   assert_eq!(actions.len(), 2, "{actions:?}");
   assert_eq!(
     actions[0].as_watch().unwrap().target(),
-    &WatchTarget::child(root, seg("known"))
+    &WatchTarget::child(d, seg("known"))
   );
   assert_eq!(
     actions[1].as_stat().unwrap().of(),
-    &StatTarget::child(root, seg("mystery"))
+    &StatTarget::child(d, seg("mystery"))
   );
   assert!(m.has_coverage_deficit(scope(1)));
 }
@@ -9444,29 +9480,29 @@ fn rearm_settled_unknown_scope_is_settled() {
   assert!(m.rearm_settled(scope(1)));
 }
 
-/// Cold discovery — the bootstrap arm + enumerate of a fresh root, a discovered
-/// child's arm + read, and a live-churn `Created` descent — never unsettles the
-/// scope: it runs in non-re-arm states by construction, so ordinary churn cannot
-/// hold [`Monitor::rearm_settled`] down.
+/// LIVE-CHURN cold discovery — a `Created` record's arm, its cold read, and the
+/// grandchild that read discovers — never unsettles the scope: it runs in
+/// non-re-arm states by construction, so ordinary churn inside a settled scope
+/// cannot hold [`Monitor::rearm_settled`] down.
+///
+/// Re-staged past the registration (42-10). The two claims this cell used to
+/// make about the BOOTSTRAP — that a pending root arm and the root's own read are
+/// not re-arm work — are false by design now and inverted: the registration crawl
+/// is counted, which
+/// [`the_bootstrap_crawl_is_counted_and_its_first_fence_reads_lossy`] pins. What
+/// survives is the claim about churn, and it survives unchanged.
 #[test]
 fn cold_discovery_never_unsettles_rearm() {
   let mut m = per_dir();
   let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  assert!(m.rearm_settled(s), "a settled scope, past its registration");
 
-  let root = m.register_root(s, Interest::all());
-  assert!(m.rearm_settled(s), "a pending root arm is not re-arm work");
-  m.ack_watch(root, Ok(WatchAck::Installed));
-  assert!(
-    m.rearm_settled(s),
-    "a cold bootstrap read is not re-arm work"
-  );
-  let boot = drain_actions(&mut m)
-    .iter()
-    .find_map(|a| a.as_enumerate().map(|e| e.req()))
-    .expect("root bootstrap enumerate");
-  m.on_enumerate(
-    boot,
-    EnumerateResult::Ok(vec![DirEntry::new(seg("a"), FileKind::Dir)]),
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("a"))
+      .with_is_dir(true),
+    at(1),
   );
   assert!(
     m.rearm_settled(s),
@@ -9478,6 +9514,22 @@ fn cold_discovery_never_unsettles_rearm() {
     .expect("child watch armed");
   m.ack_watch(child, Ok(WatchAck::Installed));
   assert!(m.rearm_settled(s), "a child's cold read is not re-arm work");
+  let cold = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_enumerate()
+        .filter(|e| e.dir() == child)
+        .map(|e| e.req())
+    })
+    .expect("the child's cold read");
+  m.on_enumerate(
+    cold,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("g"), FileKind::Dir)]),
+  );
+  assert!(
+    m.rearm_settled(s),
+    "a grandchild discovered by a cold read is not re-arm work"
+  );
   m.on_os_record(
     OsRecord::new(root, RecordKind::Created)
       .with_name(seg("b"))
@@ -9488,6 +9540,64 @@ fn cold_discovery_never_unsettles_rearm() {
     m.rearm_settled(s),
     "live-churn discovery is not re-arm work"
   );
+  m.assert_invariants();
+}
+
+/// 42-10 cell 5 — the counted-semantics half. The registration crawl is RE-ARM
+/// work from the grant: its root is born re-arm-flavored (which is the
+/// suppression), so `rearm_settled` reads false from the registration until the
+/// whole crawl quiesces, and a cover fence opened right after the grant
+/// consequently reads LOSSY. That is the honest outcome — it instructs exactly
+/// the crawl the contract already told the consumer to perform — and it is the
+/// price of the suppression, so it is pinned rather than left to drift.
+///
+/// Mutation that kills it: make the bootstrap crawl uncounted (birth the root
+/// `rearm: false` again), which also un-suppresses the inventory.
+#[test]
+fn the_bootstrap_crawl_is_counted_and_its_first_fence_reads_lossy() {
+  let mut m = per_dir();
+  let s = scope(1);
+
+  let root = m.register_root(s, Interest::all());
+  assert!(
+    !m.rearm_settled(s),
+    "the registration's crawl is counted from the grant"
+  );
+  assert!(
+    !m.coverage_settled(s),
+    "so a cover fence opened at the grant reads lossy"
+  );
+  m.ack_watch(root, Ok(WatchAck::Installed));
+  assert!(!m.rearm_settled(s), "the root's own read is counted");
+  let boot = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().map(|e| e.req()))
+    .expect("root bootstrap enumerate");
+  m.on_enumerate(
+    boot,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("a"), FileKind::Dir)]),
+  );
+  assert!(
+    !m.rearm_settled(s),
+    "and so is the discovered child's pending arm"
+  );
+  let child = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("child watch armed");
+  m.ack_watch(child, Ok(WatchAck::Installed));
+  assert!(!m.rearm_settled(s), "and the child's own crawl read");
+  let read = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_enumerate()
+        .filter(|e| e.dir() == child)
+        .map(|e| e.req())
+    })
+    .expect("the child's crawl read");
+  m.on_enumerate(read, EnumerateResult::Ok(Vec::new()));
+  assert!(m.rearm_settled(s), "the crawl quiesced");
+  assert!(m.coverage_settled(s), "and the fence opens");
   m.assert_invariants();
 }
 
@@ -9557,25 +9667,27 @@ fn grow_rearm_unsettles_until_results_land() {
 /// completion then escalates into a counted re-arm retry plus a covering
 /// `Rescan`, unsettling the scope until the retry lands. A fence consumes the
 /// `Coalesced` report as lossy-from-birth precisely because of this window.
+///
+/// Re-staged on a POST-REGISTRATION cold read (42-10): the registration crawl is
+/// counted now, so the cold read a grow can coalesce onto is a live-discovered
+/// directory's, never the root's own bootstrap read.
 #[test]
 fn coalesced_grow_rides_the_inflight_cold_read() {
   let mut m = per_dir();
   let s = scope(1);
 
-  // A fresh root whose bootstrap COLD read is still outstanding.
-  let root = m.register_root(s, Interest::all());
-  m.ack_watch(root, Ok(WatchAck::Installed));
+  // A live-discovered directory whose COLD read is still outstanding.
+  let root = live_root_idle(&mut m, s);
+  let d = discovered_child_dir(&mut m, root, "d");
+  m.ack_watch(d, Ok(WatchAck::Installed));
   let boot = drain_actions(&mut m)
     .iter()
-    .find_map(|a| a.as_enumerate().map(|e| e.req()))
-    .expect("root bootstrap enumerate");
-  assert!(
-    m.rearm_settled(s),
-    "a cold bootstrap read is not re-arm work"
-  );
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == d).map(|e| e.req()))
+    .expect("the discovered directory's cold read");
+  assert!(m.rearm_settled(s), "a cold read is not re-arm work");
 
   // The grow coalesces onto the in-flight cold read: latent, and reported as such.
-  assert!(m.rearm_watch_subtree(root).is_coalesced());
+  assert!(m.rearm_watch_subtree(d).is_coalesced());
   assert!(
     m.rearm_settled(s),
     "the latent obligation is deliberately invisible to the settle counter"
@@ -12280,6 +12392,11 @@ fn rebind_after_a_depth_one_widen_purges_the_marker() {
   m.assert_invariants();
 }
 
+/// The outstanding old-world read is the REGISTRATION's own (42-10), so its
+/// reconciliation is proven by the coverage it installs rather than by a
+/// `Created` it may not emit: the registration crawl reports no inventory. The
+/// widen's own post-commit read is untouched by that and keeps its `Created`s —
+/// the cells that pin them are unchanged.
 #[test]
 fn widen_while_the_old_root_is_enumerating_reconciles_the_late_read() {
   let mut m = per_dir();
@@ -12302,12 +12419,29 @@ fn widen_while_the_old_root_is_enumerating_reconciles_the_late_read() {
       DirEntry::new(seg("late"), FileKind::Dir).with_node(ident(4)),
     ]),
   );
-  let events = drain_events(&mut m);
+  let actions = drain_actions(&mut m);
   assert!(
-    events
-      .iter()
-      .any(|e| e.kind().is_created() && e.location() == &loc(&["b", "late"])),
-    "{events:?}"
+    actions.iter().any(|a| a
+      .as_watch()
+      .is_some_and(|w| w.target() == &WatchTarget::child(old_root, seg("late")))),
+    "the late listing installs its child under the adopted node: {actions:?}"
+  );
+  assert_eq!(
+    m.location_of_checked(
+      actions
+        .iter()
+        .find_map(|a| a
+          .as_watch()
+          .filter(|w| w.target() == &WatchTarget::child(old_root, seg("late")))
+          .map(|w| w.id()))
+        .expect("the installed child")
+    ),
+    Some(loc(&["b", "late"])),
+    "addressed through the chain"
+  );
+  assert!(
+    !drain_events(&mut m).iter().any(|e| e.kind().is_created()),
+    "and the registration's own read announces no inventory"
   );
   m.assert_invariants();
 }
@@ -16886,6 +17020,24 @@ fn bootstrap_read(m: &mut Monitor, s: ScopeId) -> (WatchId, ReqId) {
   (root, req)
 }
 
+/// A directory the LIVE stream discovers under `parent` — a record-driven cold
+/// install, still `Arming`. The post-registration staging every cell that needs
+/// a COLD read now uses: a registration's own crawl is `Created`-suppressed.
+fn discovered_child_dir(m: &mut Monitor, parent: WatchId, name: &str) -> WatchId {
+  m.on_os_record(
+    OsRecord::new(parent, RecordKind::Created)
+      .with_name(seg(name))
+      .with_is_dir(true),
+    at(1),
+  );
+  let child = drain_actions(m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("the discovered directory arms");
+  let _ = drain_events(m);
+  child
+}
+
 /// Arms `dir` (whose install the crawl just queued) and returns its own read's
 /// request.
 fn armed_read(m: &mut Monitor, dir: WatchId) -> ReqId {
@@ -16968,5 +17120,306 @@ fn a_gap_create_under_a_bootstrap_armed_directory_is_dominated_by_the_closing_re
     &Location::new(),
     "located at the scope root, dominating the whole crawl"
   );
+  m.assert_invariants();
+}
+
+/// 42-10 cell 1 — the finding itself, over a DEPTH-2 pre-populated tree: the
+/// registration delivers ZERO `Created`s and exactly one closing `Rescan`, at
+/// coverage settle. Depth 2 is deliberate: a flat fixture would pass an
+/// under-fix that suppressed only the root's own read.
+///
+/// Mutation that kills it: revert the suppression (birth the root
+/// `rearm: false`), which restores the inventory.
+#[test]
+fn a_registration_over_a_deep_tree_delivers_no_inventory() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (_root, read) = bootstrap_read(&mut m, s);
+
+  m.on_enumerate(
+    read,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("top.txt"), FileKind::File),
+      DirEntry::new(seg("sub"), FileKind::Dir),
+    ]),
+  );
+  let sub = queued_install(&mut m);
+  let read = armed_read(&mut m, sub);
+  m.on_enumerate(
+    read,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("mid.txt"), FileKind::File),
+      DirEntry::new(seg("deep"), FileKind::Dir),
+    ]),
+  );
+  let deep = queued_install(&mut m);
+  let read = armed_read(&mut m, deep);
+  m.on_enumerate(
+    read,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("leaf.txt"), FileKind::File)]),
+  );
+
+  assert!(m.rearm_settled(s), "the crawl quiesced");
+  let events = drain_events(&mut m);
+  assert!(
+    !events.iter().any(|e| e.kind().is_created()),
+    "a registration reports no inventory at any depth: {events:?}"
+  );
+  assert_eq!(events.len(), 1, "exactly one signal: {events:?}");
+  assert!(events[0].kind().is_rescan());
+  assert_eq!(events[0].location(), &Location::new());
+  // …and the coverage the silent crawl took is real, all three levels of it.
+  assert!(m.is_watched(sub) && m.is_watched(deep));
+  m.assert_invariants();
+}
+
+/// 42-10 cell 1b — the self-scaling silence. A registration over an EMPTY root,
+/// and over a FILES-ONLY root, is completely silent: no `Created`, and no
+/// `Rescan` either. The root's own birth sets `fresh_rearm`, but nothing armed
+/// fresh BELOW it, so no loss half stands and the bridge conjunction refuses to
+/// fire.
+///
+/// Mutation that kills it: seed `saw_rescan` at registration instead of at a
+/// fresh descendant install — a silent root would then close with a `Rescan`
+/// instructing a re-read of nothing.
+#[test]
+fn a_registration_over_a_childless_root_is_completely_silent() {
+  for listing in [
+    std::vec::Vec::new(),
+    vec![
+      DirEntry::new(seg("a.txt"), FileKind::File),
+      DirEntry::new(seg("b.txt"), FileKind::File),
+    ],
+  ] {
+    let mut m = per_dir();
+    let s = scope(1);
+    let (_root, read) = bootstrap_read(&mut m, s);
+    m.on_enumerate(read, EnumerateResult::Ok(listing.clone()));
+
+    assert!(m.rearm_settled(s));
+    assert!(
+      drain_events(&mut m).is_empty(),
+      "a root with no subdirectories registers in silence: {listing:?}"
+    );
+    m.assert_invariants();
+  }
+}
+
+/// 42-10 cell 2a — the suppression takes only the LISTING's copy. A create
+/// landing in an ALREADY-ARMED directory during the walk is recorded by the
+/// kernel, and that record is delivered exactly once: the suppressed read
+/// neither announces it a second time nor swallows the kernel's copy.
+///
+/// Mutation that kills it: broaden the suppression to the kernel-sourced path.
+#[test]
+fn a_create_in_an_armed_directory_during_the_walk_is_delivered_once() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (root, read) = bootstrap_read(&mut m, s);
+  m.on_enumerate(
+    read,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("sub"), FileKind::Dir)]),
+  );
+  let sub = queued_install(&mut m);
+  let sub_read = armed_read(&mut m, sub);
+  assert!(drain_events(&mut m).is_empty(), "no inventory so far");
+
+  // `sub` is armed and its read is in flight: a create landing now IS recorded.
+  m.on_os_record(
+    OsRecord::new(sub, RecordKind::Created).with_name(seg("live.txt")),
+    at(1),
+  );
+  let delivered: Vec<Change> = drain_events(&mut m);
+  assert_eq!(
+    delivered.len(),
+    1,
+    "the kernel copy delivers: {delivered:?}"
+  );
+  assert!(delivered[0].kind().is_created());
+  assert_eq!(delivered[0].location(), &loc(&["sub", "live.txt"]));
+
+  // …and the suppressed read that also lists it says nothing more about it.
+  m.on_enumerate(
+    sub_read,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("live.txt"), FileKind::File)]),
+  );
+  assert!(
+    !drain_events(&mut m).iter().any(|e| e.kind().is_created()),
+    "the listing's copy is suppressed, so the create is delivered exactly once"
+  );
+  let _ = root;
+  m.assert_invariants();
+}
+
+/// 42-10 cell 3 — suppression is about DELIVERY, never about structure. A deep
+/// descendant that only the suppressed read discovers is still installed and
+/// armed, and a later mutation under it is delivered normally.
+///
+/// Mutation that kills it: suppress the structure lowering too (skip the
+/// crawl's installs), which would leave the subtree blind for the process's
+/// life.
+#[test]
+fn a_descendant_found_only_by_the_suppressed_read_is_still_armed() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (_root, read) = bootstrap_read(&mut m, s);
+  m.on_enumerate(
+    read,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("sub"), FileKind::Dir)]),
+  );
+  let sub = queued_install(&mut m);
+  let read = armed_read(&mut m, sub);
+  m.on_enumerate(
+    read,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("deep"), FileKind::Dir)]),
+  );
+  let deep = queued_install(&mut m);
+  let read = armed_read(&mut m, deep);
+  m.on_enumerate(read, EnumerateResult::Ok(Vec::new()));
+  let _ = drain_events(&mut m);
+
+  // The suppressed crawl armed it, so the kernel records under it are OURS.
+  assert!(m.is_watched(deep));
+  m.on_os_record(
+    OsRecord::new(deep, RecordKind::Created).with_name(seg("after.txt")),
+    at(2),
+  );
+  let events = drain_events(&mut m);
+  assert_eq!(events.len(), 1, "{events:?}");
+  assert!(events[0].kind().is_created());
+  assert_eq!(events[0].location(), &loc(&["sub", "deep", "after.txt"]));
+  m.assert_invariants();
+}
+
+/// 42-10 cell 6b (ordering 1: the answer beats the settle edge) — the
+/// unclassifiable-entry stat detour. A bootstrap listing entry of unknown kind
+/// is reconciled by no read: it books darkness and asks for a kind, and the
+/// directory it turns out to be is installed by the stat's ANSWER. That install
+/// is an ordinary cold one, so without routing it through the crawl's own
+/// suppression the whole subtree behind it announces itself as `Created`s — the
+/// registration inventory, leaking straight back on any `DT_UNKNOWN`-prone
+/// filesystem.
+///
+/// Mutation that kills it: leave the empty-slot stat install cold.
+#[test]
+fn a_bootstrap_stat_answered_before_the_settle_edge_installs_suppressed() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (_root, read) = bootstrap_read(&mut m, s);
+  m.on_enumerate(
+    read,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("sub"), FileKind::Dir),
+      DirEntry::new(seg("mystery"), FileKind::Unknown),
+    ]),
+  );
+  let actions = drain_actions(&mut m);
+  let sub = actions
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("the classified directory installs");
+  let stat = actions
+    .iter()
+    .find_map(|a| a.as_stat().map(|c| c.req()))
+    .expect("the unclassifiable slot is stat'd");
+  assert!(drain_events(&mut m).is_empty(), "no inventory so far");
+
+  // `sub` is still arming, so the crawl is counted and the mark still stands.
+  assert!(!m.rearm_settled(s), "staging: the window is still open");
+  m.on_stat_result(
+    stat,
+    StatResult::Ok(StatEntry::new(FileKind::Dir).with_node(ident(7))),
+  );
+  let mystery = queued_install(&mut m);
+  let read = armed_read(&mut m, mystery);
+  m.on_enumerate(
+    read,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("inner.txt"), FileKind::File),
+      DirEntry::new(seg("innerdir"), FileKind::Dir),
+    ]),
+  );
+  let inner = queued_install(&mut m);
+  let read = armed_read(&mut m, inner);
+  m.on_enumerate(read, EnumerateResult::Ok(Vec::new()));
+  let read = armed_read(&mut m, sub);
+  m.on_enumerate(read, EnumerateResult::Ok(Vec::new()));
+
+  assert!(m.rearm_settled(s), "the crawl quiesced");
+  let events = drain_events(&mut m);
+  assert!(
+    !events.iter().any(|e| e.kind().is_created()),
+    "the stat-detour subtree announces no inventory either: {events:?}"
+  );
+  assert_eq!(events.len(), 1, "one closing Rescan covers it: {events:?}");
+  assert!(events[0].kind().is_rescan());
+  assert_eq!(events[0].location(), &Location::new());
+  assert!(m.is_watched(mystery) && m.is_watched(inner));
+  m.assert_invariants();
+}
+
+/// 42-10 cell 6b (ordering 2: the answer arrives AFTER the settle edge) — the
+/// C1 case. The stat is deliberately uncounted, so a bootstrap-queued one can
+/// still be outstanding when the scope's first settle edge buries the bootstrap
+/// mark. Routing the answer's install off the LIVE mark would install cold here
+/// and resurrect the leak; the `StatSlot` is stamped at QUEUE time instead, and
+/// the answer routes off the stamp.
+///
+/// Mutation that kills it: leave the empty-slot stat install cold. (Keying the
+/// routing on the live mark instead of the stamp kills exactly this ordering,
+/// which is why both are staged.)
+#[test]
+fn a_bootstrap_stat_answered_after_the_settle_edge_installs_suppressed() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (_root, read) = bootstrap_read(&mut m, s);
+  m.on_enumerate(
+    read,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("mystery"), FileKind::Unknown)]),
+  );
+  let stat = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_stat().map(|c| c.req()))
+    .expect("the unclassifiable slot is stat'd");
+
+  // The settle edge has already passed — nothing counted is left, the window is
+  // closed, and the bootstrap mark is buried — while the stat is still owed.
+  assert!(m.rearm_settled(s), "staging: the first settle edge passed");
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "and it closed silently: nothing armed fresh"
+  );
+
+  m.on_stat_result(
+    stat,
+    StatResult::Ok(StatEntry::new(FileKind::Dir).with_node(ident(7))),
+  );
+  let mystery = queued_install(&mut m);
+  let read = armed_read(&mut m, mystery);
+  m.on_enumerate(
+    read,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("inner.txt"), FileKind::File),
+      DirEntry::new(seg("innerdir"), FileKind::Dir),
+    ]),
+  );
+  let inner = queued_install(&mut m);
+  let read = armed_read(&mut m, inner);
+  m.on_enumerate(read, EnumerateResult::Ok(Vec::new()));
+
+  assert!(m.rearm_settled(s), "the answer's own sub-window quiesced");
+  let events = drain_events(&mut m);
+  assert!(
+    !events.iter().any(|e| e.kind().is_created()),
+    "a late answer installs suppressed too: {events:?}"
+  );
+  assert_eq!(
+    events.len(),
+    1,
+    "and its sub-window closes with one covering Rescan: {events:?}"
+  );
+  assert!(events[0].kind().is_rescan());
+  assert_eq!(events[0].location(), &Location::new());
+  assert!(m.is_watched(mystery) && m.is_watched(inner));
   m.assert_invariants();
 }
