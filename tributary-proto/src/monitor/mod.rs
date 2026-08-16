@@ -216,10 +216,24 @@ const DEFICIT_CAP: usize = 16;
 /// `fresh_rearm` alone is a pure set-cover regrow of pruned coverage (the
 /// region was outside every committed claim; firing would degrade every
 /// prune/regrow cycle).
+///
+/// `bootstrap` is the REGISTRATION window's own mark, and it is not a half of
+/// that conjunction. It is seeded at
+/// [`register_root_with_profile`](Monitor::register_root_with_profile) — the
+/// same birth site the suppression itself keys on, so the two cannot drift
+/// apart — and says that the scope's initial crawl is still running. While it
+/// stands, a FRESH directory install by a suppressed crawl supplies the
+/// window's loss half (`saw_rescan`); a SURVIVOR re-arm never does, since a
+/// survivor was already covered. Living in this struct is what gives the mark
+/// its lifetime for free: the entry's removal at the settle edge
+/// ([`Monitor::settle_bridges`]) is the mark's funeral, and the two terminal
+/// removals ([`Monitor::unregister_root`], [`Monitor::invalidate_root`]) bury
+/// it with the scope.
 #[derive(Debug, Clone, Copy, Default)]
 struct BridgeFlags {
   saw_rescan: bool,
   fresh_rearm: bool,
+  bootstrap: bool,
 }
 
 /// Per-scope standing terminal coverage deficits: level-persistent darkness
@@ -628,6 +642,19 @@ struct StatSlot {
   /// does not, so an answer whose parent chain moved since is describing the
   /// vacated path and must not settle the slot the parent now occupies.
   placement: u64,
+  /// Whether the scope's registration window stood when this request was
+  /// QUEUED. The stat is deliberately uncounted
+  /// ([`Monitor::defer_stat_descent`]) and no conjunct of
+  /// [`Monitor::coverage_settled`], so the scope's first settle edge can pass —
+  /// burying the bootstrap mark — while a bootstrap-queued stat is still
+  /// outstanding. An answer routed off the LIVE mark would then install cold and
+  /// its post-arm read would announce the whole subtree as `Created`s: the exact
+  /// registration inventory the suppression removes, resurrected in the
+  /// answer-after-settle ordering. Deciding the window at queue time instead
+  /// keeps the mark's lifetime exactly the window's — the stamp travels with the
+  /// request, and is inert until an answer arrives, so nothing counted is added
+  /// here.
+  bootstrap: bool,
 }
 
 /// Key for a half-resolved rename. A [`MoveCookie`] is unique only within one
@@ -1420,6 +1447,25 @@ impl Monitor {
     let id = WatchId::new(self.watch_ids.mint());
     let attempt = self.next_arm_attempt();
     let placement = self.placement_now();
+    // The scope's books come FIRST: the birth below marks this scope's bridge
+    // window, and every bridge setter gates on `scope_descends`, which reads the
+    // profile stored here. Registering the profile after the birth would let a
+    // KR root take the constructor default's answer and mint a bridge entry no
+    // KR scope may hold.
+    self.scope_interests.insert(scope, mask);
+    self.scope_profiles.insert(scope, caps);
+    // The root is born RE-ARM-FLAVORED, which is the whole suppression: its
+    // post-arm read is a re-arm read, so the bootstrap crawl announces no
+    // `Created` for ground that merely pre-existed the registration — the
+    // contract says registration reports no inventory. Suppression is enabled at
+    // THIS birth site and nowhere else: `widen_root`'s insert and
+    // `install_child`'s stay cold, so a widen's convergence `Created`s and a
+    // record-driven discovery are untouched.
+    //
+    // The crawl is consequently COUNTED (`insert_node` books it against
+    // `rearm_pending`), which is the honest reading: a cover fence opened right
+    // after the grant sees coverage still moving and resolves lossy, exactly as
+    // it would inside any other re-arm window.
     self.insert_node(
       id,
       WatchNode {
@@ -1432,15 +1478,20 @@ impl Monitor {
         moved_at: NEVER_MOVED,
         identity: None,
         state: NodeState::Arming {
-          rearm: false,
+          rearm: true,
           reprove: false,
         },
         children: BTreeSet::new(),
       },
     );
     self.roots.insert(scope, id);
-    self.scope_interests.insert(scope, mask);
-    self.scope_profiles.insert(scope, caps);
+    // …and the window is MARKED, so the suppression cannot be a silent one. The
+    // arm-before-readdir invariant is per-DIRECTORY, so an entry created in a
+    // deep pre-existing directory between the grant and that directory's own arm
+    // has no kernel record and is announced by no suppressed read. The mark is
+    // what makes the crawl's first fresh descendant install stand the window's
+    // loss half, so the whole gap closes under one `Rescan` at coverage settle.
+    self.bridge_bootstrap(scope);
     self.queue_watch(
       id,
       crate::action::WatchTarget::Root(scope),
@@ -1456,12 +1507,46 @@ impl Monitor {
   ///
   /// Sound only while the root is still bootstrapping: its node has no children
   /// and no record has been ingested, so `caps` governs only decisions still to
-  /// come (the post-arm cold enumerate, every later descent gate). A no-op for
-  /// an unregistered scope.
+  /// come (the post-arm enumerate, every later descent gate). A no-op for an
+  /// unregistered scope.
+  ///
+  /// The registration's bridge window is re-established under the adopted
+  /// profile, in both directions. Every bridge setter gates on
+  /// [`scope_descends`](Self::scope_descends), so a window minted under a
+  /// provisional profile is bookkeeping the adopted one may not simply inherit:
+  /// a root that turns out KERNEL-RECURSIVE holds no bridge window at all (its
+  /// stream is its coverage; it queues no read for the mark to fire at), while
+  /// one that turns out DESCENDING must gain the bootstrap mark its registration
+  /// could not set — without it the root's suppressed post-arm crawl would run
+  /// with no loss half, which is the silent under-delivery the mark exists to
+  /// prevent.
   #[cfg_attr(not(tarpaulin), inline)]
   pub fn reprofile_root(&mut self, scope: ScopeId, caps: Capabilities) {
-    if self.roots.contains_key(&scope) {
-      self.scope_profiles.insert(scope, caps);
+    if !self.roots.contains_key(&scope) {
+      return;
+    }
+    self.scope_profiles.insert(scope, caps);
+    if !self.scope_descends(scope) {
+      self.bridge.remove(&scope);
+      return;
+    }
+    self.bridge_bootstrap(scope);
+    // The root's own birth flavour is unconditional (a provisional KR profile
+    // still births re-arm-flavored), so the window's counted half is re-stated
+    // here for the case the birth's own setter declined to record it. The exact
+    // shape the two state funnels recognize as a suppressed fresh install.
+    if matches!(
+      self
+        .roots
+        .get(&scope)
+        .and_then(|root| self.nodes.get(root))
+        .map(|node| node.state),
+      Some(NodeState::Arming {
+        rearm: true,
+        reprove: false
+      })
+    ) {
+      self.bridge_fresh_rearm(scope);
     }
   }
 
@@ -2387,6 +2472,7 @@ impl Monitor {
       name,
       scope,
       placement,
+      bootstrap,
     } = slot;
     self.stat_slots.remove(&(parent, name.clone()));
     // The slot's parent can have died while the stat ran; there is then no slot
@@ -2434,6 +2520,35 @@ impl Monitor {
           false,
           entry.node(),
         );
+        // The bootstrap crawl's unclassifiable-entry detour. A listing entry of
+        // unknown kind is not reconciled by the read at all — it books darkness
+        // and asks for a kind — so the directory it turns out to be is installed
+        // HERE, by an ordinary cold `install_child`, and its own post-arm cold
+        // read would announce the whole subtree as `Created`s. That is the
+        // registration inventory the suppression removes, leaking straight back
+        // on any `DT_UNKNOWN`-prone filesystem. Route the install through the
+        // crawl's own suppression instead: `inherit_rearm` makes the answer's
+        // post-arm read a re-arm read, and makes this sub-window counted so its
+        // closing `Rescan` cannot precede the recovery.
+        //
+        // Gated on the EMPTY slot (`incumbent.is_none()`, captured before the
+        // reconcile) — the same occupation check every other named site uses,
+        // and the only shape whose install is born cold. Named install site #3.
+        //
+        // Off the queue-time STAMP, never the live mark (see
+        // [`StatSlot::bootstrap`]). The loss half is stated for the one case the
+        // heal cannot carry: `install_child`'s `remove_slot_deficit` already
+        // stands both bridge bits when it removes a real entry, so an ordinary
+        // empty-slot unknown is `Rescan`-covered without this — but a book
+        // collapsed past `DEFICIT_CAP` records nothing to remove, and there this
+        // is the window's only loss half.
+        if bootstrap
+          && incumbent.is_none()
+          && let Some(fresh) = self.child_watch(parent, &name)
+        {
+          self.bridge_saw_rescan(scope);
+          let _ = self.inherit_rearm(fresh);
+        }
       }
       // The object vanished before the stat: the slot is empty, which the
       // ordinary `Gone` reconcile settles (dropping any stale watch and
@@ -2572,6 +2687,7 @@ impl Monitor {
       return;
     }
     let req = self.next_req_id();
+    let bootstrap = self.in_bootstrap_window(scope);
     self.stat_slots.insert((parent, name.clone()), req);
     self.pending_stat.insert(
       req,
@@ -2580,6 +2696,11 @@ impl Monitor {
         name: name.clone(),
         scope,
         placement: self.placement_now(),
+        // Stamped at QUEUE time, deliberately — see [`StatSlot::bootstrap`].
+        // The dedup above needs no upgrade rule: inside the registration window
+        // the only outstanding stat for a slot is one an earlier in-window read
+        // queued, which already carries the stamp.
+        bootstrap,
       },
     );
     self.actions.push_back(Action::stat(
@@ -2849,7 +2970,19 @@ impl Monitor {
     // child is picked up by the cascade that follows (it is now in the adjacency set).
     for entry in entries {
       let occupant = Self::entry_occupant(entry.kind());
+      // The occupation check, taken BEFORE the reconcile that performs the
+      // install — the fresh/survivor distinction the registration window's loss
+      // half keys on. Named install site #2; the HELD route is the reason it is
+      // here at all (a held read suppresses its own `Rescan` below, so an
+      // in-window additive install there has no other cover), and it must be the
+      // reconcile pass and never the cascade below, which re-arms survivors and
+      // fresh installs alike.
+      let fresh =
+        matches!(occupant, SlotOccupant::Dir) && self.child_watch(dir, entry.name()).is_none();
       self.reconcile_slot(dir, scope, entry.name(), occupant, false, entry.node());
+      if fresh {
+        self.mark_bootstrap_loss(scope);
+      }
     }
     // Cascade the re-arm into EVERY child of `dir` — those in a name-slot AND any
     // detached-and-held move source (mid-move, out of `child_index` but still in the
@@ -3209,6 +3342,11 @@ impl Monitor {
         if let Some(fresh) = self.child_watch(dir, entry.name()) {
           let _ = self.inherit_rearm(fresh);
         }
+        // The occupation check above IS the fresh/survivor distinction, so the
+        // registration window's loss half is stated right here — a survivor
+        // re-armed by the branch above never reaches it. Named install site #1;
+        // see `mark_bootstrap_loss`.
+        self.mark_bootstrap_loss(scope);
       }
     }
     // Book every unclassifiable name as darkness and ask for its kind — and hand that
@@ -5989,6 +6127,59 @@ impl Monitor {
     }
   }
 
+  /// Seeds `scope`'s BOOTSTRAP mark — the registration window is open. Called
+  /// from the registration birth site only (and re-stated by
+  /// [`reprofile_root`](Self::reprofile_root) when a provisional profile is
+  /// replaced by a descending one). The mark's funeral is the bridge entry's own
+  /// removal: the scope's first settle edge, or either terminal teardown.
+  fn bridge_bootstrap(&mut self, scope: ScopeId) {
+    if self.scope_descends(scope) {
+      self.bridge.entry(scope).or_default().bootstrap = true;
+    }
+  }
+
+  /// Whether `scope`'s registration window is still open.
+  fn in_bootstrap_window(&self, scope: ScopeId) -> bool {
+    self.bridge.get(&scope).is_some_and(|flags| flags.bootstrap)
+  }
+
+  /// The registration window's LOSS half: a FRESH directory install by a
+  /// suppressed crawl, while the bootstrap mark stands, marks the window lossy.
+  ///
+  /// A suppressed crawl announces no `Created`, so ground it arms for the first
+  /// time may hold an entry created between the grant and that directory's own
+  /// arm — recorded by no kernel watch (the arm-before-readdir invariant is
+  /// per-directory, not per-scope) and announced by no listing. Standing the
+  /// loss half here is what makes the window's closing `Rescan` fire, which is
+  /// the one instruction that covers the whole gap.
+  ///
+  /// A SURVIVOR re-arm deliberately never calls this: a survivor was already
+  /// covered, so only newly-armed ground can hold an unreported pre-arm
+  /// creation. The distinction is exactly [`install_child`]'s occupation check,
+  /// which is why this is called at the named install sites and never inside the
+  /// generic funnels ([`insert_node`](Self::insert_node),
+  /// [`set_state`](Self::set_state), [`inherit_rearm`](Self::inherit_rearm)):
+  /// those cannot tell a suppressed-crawl install from a record-driven cold one,
+  /// and a funnel-level rule would fire on a kernel `Created` racing the
+  /// bootstrap — a spurious closing `Rescan` on an otherwise-empty root.
+  ///
+  /// The mark's standing is a STEADY-STATE claim about which sites fire, not an
+  /// in-window invariant. A second suppressed crawl is reachable while the mark
+  /// stands (an overflow recovery, a grow-hijack, an incomplete-read retry, a
+  /// held read, an in-window regrow), and the rule fires there too. Every such
+  /// interleaving is benign: `saw_rescan` is monotone within a window
+  /// ([`emit_rescan`](Self::emit_rescan) sets it before the coalesce check) so a
+  /// fire at an already-covered site is a no-op, and the remainder are covers in
+  /// the safe direction. A per-site "not in-window" guard would break the HELD
+  /// case, which is a site with no cover of its own.
+  ///
+  /// [`install_child`]: Self::install_child
+  fn mark_bootstrap_loss(&mut self, scope: ScopeId) {
+    if self.in_bootstrap_window(scope) {
+      self.bridge_saw_rescan(scope);
+    }
+  }
+
   /// Counted covering recovery for a teardown that drops a subtree whose object
   /// provably SURVIVES at an unknown in-scope location — a teardown that cannot
   /// borrow [`drop_subtree`](Self::drop_subtree)'s erasure argument.
@@ -6364,7 +6555,7 @@ impl Monitor {
     // edge; a root-less scope is trivially settled, so none can linger).
     for (scope, flags) in &self.bridge {
       assert!(
-        flags.saw_rescan || flags.fresh_rearm,
+        flags.saw_rescan || flags.fresh_rearm || flags.bootstrap,
         "a bridge entry carries at least one set bit"
       );
       assert!(

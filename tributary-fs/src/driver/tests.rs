@@ -2721,17 +2721,42 @@ mod descending {
   }
 
   /// A SUCCESSFUL root arm still delivers normally — the fence opens exactly at
-  /// the arm, so the cold-inventory `Created`s (and later live records) flow.
-  /// The regression guard that the deferred-aware fence did not over-tighten.
+  /// the arm, so records the arm's own coverage takes flow to the consumer. The
+  /// regression guard that the deferred-aware fence did not over-tighten.
+  ///
+  /// Re-staged on a LIVE record. It used to loop until the bootstrap listing's
+  /// `Created` for a pre-existing file arrived; registration reports no
+  /// inventory, so that delivery is one the contract denies and the loop would
+  /// never terminate. The claim being pinned is about the FENCE, not about the
+  /// inventory — that a successful arm leaves delivery open — and the first
+  /// record the armed root records proves it just as directly, while an
+  /// over-tightened fence would swallow it exactly as it would have swallowed
+  /// the inventory.
   #[tokio::test(flavor = "multi_thread")]
   async fn successful_root_arm_delivers_normally() {
     let rig = inotify_rig();
     rig.fs.put("/r/present.txt", FileKind::File, 10);
     let _scope = watch(&rig, "/r").await;
-    // The cold inventory after the successful root arm reaches the consumer.
+    // The root's arm succeeded — its post-arm read is what proves it, and the
+    // recorded watch id is the anchor the live record below is attributed to.
+    assert!(
+      settle(|| !rig.fs.enumerates().is_empty()).await,
+      "staging: the root arm succeeded and its post-arm read ran"
+    );
+    let root_watch = rig
+      .fs
+      .enumerates()
+      .first()
+      .map(|(watch, _)| *watch)
+      .expect("the root enumerated");
+    rig.fs.put("/r/live.txt", FileKind::File, 20);
+    rig.fs.send_inotify_batch(
+      "/r",
+      vec![attributed(&[root_watch], IN_CREATE, b"live.txt")],
+    );
     loop {
       let (_scope, change) = next_event(&rig).await;
-      if change.kind().is_created() && change.location() == &loc(&["present.txt"]) {
+      if change.kind().is_created() && change.location() == &loc(&["live.txt"]) {
         break;
       }
     }
