@@ -2029,8 +2029,12 @@ mod the_invalid_uid_sentinel {
   impl Source<OsString> for FsClassified {
     type Handle = u32;
 
-    fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
-      Ok(key.to_vec())
+    fn canonicalize_key(
+      &self,
+      key: &[OsString],
+    ) -> impl Future<Output = Result<Vec<OsString>, WatchError>> + Send {
+      let canonical = key.to_vec();
+      async move { Ok(canonical) }
     }
 
     async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
