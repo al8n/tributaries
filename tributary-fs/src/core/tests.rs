@@ -3350,9 +3350,18 @@ mod descending {
     let (_core, _scope, _req, _watch) = live_descending();
   }
 
+  /// 42-10, end to end through the core: the bootstrap listing installs and arms
+  /// its children in SILENCE, and the window closes with one covering `Rescan` at
+  /// the scope root.
+  ///
+  /// Was `cold_listing_installs_children_and_emits_inventory`, whose two
+  /// `Created`s were the registration inventory the contract denies. Its
+  /// coverage half — the child is armed, and its arm continues the descent — is
+  /// kept verbatim; only the delivery half inverts, and the `Rescan` that
+  /// replaces it is asserted rather than merely tolerated.
   #[test]
-  fn cold_listing_installs_children_and_emits_inventory() {
-    let (mut core, _scope, req, _root) = live_descending();
+  fn bootstrap_listing_installs_children_without_an_inventory() {
+    let (mut core, scope, req, _root) = live_descending();
     core.on_enumerated(
       req,
       listed(vec![
@@ -3361,8 +3370,10 @@ mod descending {
       ]),
     );
     let effects = drain(&mut core);
-    let created: Vec<&Change> = emits(&effects);
-    assert_eq!(created.len(), 2, "cold inventory delivers: {effects:?}");
+    assert!(
+      emits(&effects).is_empty(),
+      "a registration reports no inventory: {effects:?}"
+    );
     let add = effects
       .iter()
       .find_map(|e| match e {
@@ -3372,20 +3383,33 @@ mod descending {
         _ => None,
       })
       .expect("the discovered directory is armed");
-    // The arm's success continues the descent: the child cold-enumerates.
+    // The arm's success continues the descent: the child enumerates.
     core.on_watch_installed(
       add,
       core.arm_attempt(add),
       crate::os::linux::WatchOutcome::Installed(2),
     );
     let effects = drain(&mut core);
+    let child_read = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, path, .. } if path.as_path() == Path::new("/r/sub") => Some(*req),
+        _ => None,
+      })
+      .expect("the armed child enumerates");
     assert!(
-      effects.iter().any(|e| matches!(
-        e,
-        Effect::Enumerate { path, .. } if path.as_path() == Path::new("/r/sub")
-      )),
-      "the armed child cold-enumerates: {effects:?}"
+      emits(&effects).is_empty(),
+      "still nothing announced: {effects:?}"
     );
+
+    // The crawl quiesces, and the window closes with its one covering `Rescan`.
+    core.on_enumerated(child_read, listed(Vec::new()));
+    let effects = drain(&mut core);
+    let closing = emits(&effects);
+    assert_eq!(closing.len(), 1, "one closing signal: {effects:?}");
+    assert!(closing[0].kind().is_rescan());
+    assert_eq!(closing[0].location(), &loc(&[]));
+    assert!(core.monitor.rearm_settled(scope));
   }
 
   #[test]
@@ -4634,6 +4658,23 @@ mod descending {
   /// its listing from `listings` (absent paths list empty), repeating until a
   /// drain holds neither — the hand-driven equivalent of the async driver's
   /// execute-effects loop, quiescing a discovery or re-arm cascade.
+  /// Spends the REGISTRATION window's loss memory (42-10). A registration closes
+  /// its window with one covering `Rescan` at the scope root, and the scope's
+  /// cover-fence entry remembers that loss until a settle observation clears it —
+  /// so a first fence opened straight after the grant inherits it and resolves
+  /// `Degraded`. That is the design's stated consequence, not a defect; a cell
+  /// whose subject is a LATER window spends the memory here first, exactly as
+  /// [`shrunk_to_keep`] does with its own.
+  fn clear_registration_loss(core: &mut DriverCore, scope: ScopeId) {
+    core.mark_cut_inflight(scope, 1);
+    core.prove_cut(scope, 1);
+    assert_eq!(core.poll_cover_settlements(DRAINED), Vec::new());
+    assert!(
+      !core.cover_fences.contains_key(&scope),
+      "the registration window's loss memory is spent"
+    );
+  }
+
   fn run_cascade(core: &mut DriverCore, listings: &BTreeMap<&str, Vec<RawDirEntry>>) {
     let mut wd = 100;
     for _ in 0..32 {
@@ -4939,6 +4980,7 @@ mod descending {
     let (mut core, scope, req, _root) = live_descending();
     core.on_enumerated(req, listed(root_listing()));
     run_cascade(&mut core, &BTreeMap::new());
+    clear_registration_loss(&mut core, scope);
 
     // The full cover: nothing is outside it and the never-pruned initial claim
     // already covers it, so this opens the window without moving any coverage.
@@ -5744,8 +5786,12 @@ mod descending {
       "no fence window opens pre-grant"
     );
 
-    // The grant commits: the root arms, cold-enumerates, and the inventory's
-    // `Created`s flow — cold discovery was not converted into a re-arm.
+    // The grant commits: the root arms, reads, and takes its coverage. The tail
+    // used to assert the inventory's `Created`s here, as a guard that the refused
+    // covers had not converted the root's discovery into a re-arm. Registration
+    // IS a re-arm now, deliberately (42-10), so that guard is re-pinned on what
+    // it was really about — the refusals recorded nothing, so the grant's own
+    // crawl is what installs the coverage, and it installs all of it.
     core.on_watch_installed(
       root_watch,
       core.arm_attempt(root_watch),
@@ -5757,12 +5803,20 @@ mod descending {
         Effect::Enumerate { req, watch, .. } if *watch == root_watch => Some(*req),
         _ => None,
       })
-      .expect("the granted root cold-enumerates");
+      .expect("the granted root enumerates");
     core.on_enumerated(req, listed(vec![entry("keep", FileKind::Dir, 1, 11)]));
     let effects = drain(&mut core);
     assert!(
-      emits(&effects).iter().any(|c| c.kind().is_created()),
-      "cold discovery still emits its inventory: {effects:?}"
+      emits(&effects).is_empty(),
+      "and it reports no inventory: {effects:?}"
+    );
+    assert!(
+      effects.iter().any(|e| matches!(
+        e,
+        Effect::AddWatch { path, .. } if path.as_path() == Path::new("/r/keep")
+      )),
+      "the grant's crawl takes the coverage the refused covers never claimed: \
+       {effects:?}"
     );
   }
 
@@ -6798,9 +6852,10 @@ mod descending {
         Effect::Enumerate { req, path, .. } if path.as_path() == Path::new("/r/d") => Some(*req),
         _ => None,
       })
-      .expect("the armed child cold-enumerates");
+      .expect("the armed child enumerates");
     core.on_enumerated(cold, listed(Vec::new()));
     let _ = drain(&mut core);
+    clear_registration_loss(&mut core, scope);
 
     core.on_inotify_events(
       scope,
@@ -6860,9 +6915,10 @@ mod descending {
         Effect::Enumerate { req, path, .. } if path.as_path() == Path::new("/r/d") => Some(*req),
         _ => None,
       })
-      .expect("the armed child cold-enumerates");
+      .expect("the armed child enumerates");
     core.on_enumerated(cold, listed(Vec::new()));
     let _ = drain(&mut core);
+    clear_registration_loss(&mut core, scope);
 
     core.on_inotify_events(
       scope,
@@ -10840,18 +10896,22 @@ mod root_widened {
       },
     );
     let effects = drain(&mut core);
+    // The outstanding read is the REGISTRATION's own, so its reconciliation is
+    // proven by the coverage it installs rather than by a `Created` it may not
+    // emit (42-10): a registration reports no inventory. The widen's OWN
+    // post-commit read is untouched by that and keeps its `Created`s — the cells
+    // that pin them are unchanged.
     assert!(
-      emits(&effects)
-        .iter()
-        .any(|c| c.kind().is_created() && c.location() == &loc(&["sub", "kid"])),
-      "the late read reconciles through the adopted chain: {effects:?}"
+      !emits(&effects).iter().any(|c| c.kind().is_created()),
+      "the registration's own read announces no inventory: {effects:?}"
     );
     assert!(
       effects.iter().any(|e| matches!(
         e,
         Effect::AddWatch { path, .. } if path.as_path() == Path::new("/r/sub/kid")
       )),
-      "the discovered child arms at its absolute path: {effects:?}"
+      "the late read reconciles through the adopted chain — the discovered child \
+       arms at its absolute path: {effects:?}"
     );
     let _ = root_watch;
   }
@@ -11726,16 +11786,53 @@ mod exclusions {
       !mentions(&changes, "cache"),
       "nothing about the excluded directory is announced: {changes:?}"
     );
-    assert_eq!(
-      changes.len(),
-      2,
-      "the reported inventory is exactly `cached` and `keep.txt`: {changes:?}"
+    assert!(
+      changes.is_empty(),
+      "a registration reports no inventory at all (42-10), excluded or not: \
+       {changes:?}"
     );
     assert!(
       !changes.iter().any(|change| change.kind().is_rescan()),
       "a filtered listing is not a partial one — no covering rescan is owed, and \
        above all none naming the excluded path: {changes:?}"
     );
+
+    // The crawl quiesces. The window closes with ONE covering `Rescan`, at the
+    // scope ROOT — the exclusion fence is what keeps that signal from ever being
+    // located at, or otherwise naming, the excluded path.
+    let add = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch { watch, path, .. } if path.as_path() == Path::new("/r/cached") => {
+          Some(*watch)
+        }
+        _ => None,
+      })
+      .expect("the included directory arms");
+    core.on_watch_installed(
+      add,
+      core.arm_attempt(add),
+      crate::os::linux::WatchOutcome::Installed(2),
+    );
+    let read = drain(&mut core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, path, .. } if path.as_path() == Path::new("/r/cached") => {
+          Some(*req)
+        }
+        _ => None,
+      })
+      .expect("and enumerates");
+    core.on_enumerated(read, listed(Vec::new()));
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+    assert!(
+      !mentions(&changes, "cache"),
+      "and the closing signal names nothing excluded either: {changes:?}"
+    );
+    assert_eq!(changes.len(), 1, "one closing Rescan: {effects:?}");
+    assert!(changes[0].kind().is_rescan());
+    assert_eq!(changes[0].location(), &loc(&[]));
   }
 
   /// The live half, in its create shape: a directory created under an exclusion

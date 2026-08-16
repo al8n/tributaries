@@ -196,6 +196,31 @@ fn loc(parts: &[&str]) -> Location {
   Location::from_segments(parts.iter().map(|p| Segment::new(*p)))
 }
 
+/// Fences a scope's BIRTH crawl, and pins what a registration over pre-existing
+/// subdirectories now delivers (42-10): the contract reports no inventory, so the
+/// crawl's one signal is the window's closing `Rescan` at the SCOPE ROOT, emitted
+/// at coverage settle.
+///
+/// That `Rescan` is a stronger fence than the inventory `Created` these cells used
+/// to consume, and it is the reason this helper replaced it wholesale: it is
+/// emitted at the settle edge, so it postdates the root's read AND every
+/// descendant arm by construction, whereas a `Created` for one entry proved only
+/// that one read had reached the consumer.
+async fn fence_birth_crawl(rig: &Rig, scope: ScopeId, root: &str) {
+  let (s, r, change) = next_rooted(rig).await;
+  assert_eq!((s, r.as_path()), (scope, std::path::Path::new(root)));
+  assert!(
+    change.kind().is_rescan(),
+    "a registration announces no inventory — its one signal is the window's \
+     closing Rescan: {change:?}"
+  );
+  assert_eq!(
+    change.location(),
+    &loc(&[]),
+    "located at the scope root, dominating the whole crawl"
+  );
+}
+
 /// How much REAL time one settle round hands to the threads the runtime does not
 /// schedule, before [`timing_scale`] is applied.
 ///
@@ -1982,27 +2007,33 @@ mod descending {
 
   const IN_CREATE: u32 = 0x0000_0100;
 
-  /// Registration → root arm at spawn → cold enumerate against the fake tree
-  /// → discovered directory armed → its own enumerate → the inventory reaches
-  /// the consumer. The whole dormant vocabulary, driven by the real loop.
+  /// Registration → root arm at spawn → enumerate against the fake tree →
+  /// discovered directory armed → its own enumerate → ONE closing `Rescan` at
+  /// coverage settle. The whole dormant vocabulary, driven by the real loop.
+  ///
+  /// Was `descending_watch_inventories_and_descends`, which drained three
+  /// inventory `Created`s. A registration reports no inventory (42-10) — the
+  /// contract says pre-existing state is not a change — so the delivery half
+  /// inverts: the crawl is silent and its window closes with one `Rescan` at the
+  /// scope root. The DESCENT half, which is what the rest of this cell is about,
+  /// is asserted exactly as before.
   #[tokio::test(flavor = "multi_thread")]
-  async fn descending_watch_inventories_and_descends() {
+  async fn descending_watch_descends_without_an_inventory() {
     let rig = inotify_rig();
     rig.fs.put("/r/a.txt", FileKind::File, 10);
     rig.fs.put("/r/sub", FileKind::Dir, 11);
     rig.fs.put("/r/sub/inner.txt", FileKind::File, 12);
-    let _scope = watch(&rig, "/r").await;
+    let scope = watch(&rig, "/r").await;
 
-    let mut seen = std::collections::BTreeSet::new();
-    for _ in 0..3 {
-      let (_scope, change) = next_event(&rig).await;
-      if change.kind().is_created() {
-        seen.insert(change.location().clone());
-      }
-    }
-    assert!(seen.contains(&loc(&["a.txt"])), "{seen:?}");
-    assert!(seen.contains(&loc(&["sub"])), "{seen:?}");
-    assert!(seen.contains(&loc(&["sub", "inner.txt"])), "{seen:?}");
+    // The crawl's one signal, and it postdates every read the crawl performed.
+    fence_birth_crawl(&rig, scope, "/r").await;
+    assert!(
+      matches!(
+        tokio::time::timeout(Duration::from_millis(200), rig.events.recv()).await,
+        Err(_)
+      ),
+      "and nothing else: a registration announces no inventory at any depth"
+    );
     settle(|| {
       rig
         .fs
@@ -7477,16 +7508,15 @@ mod descending {
         .expect("the birth root arm")
         .0;
 
-      // Let the birth crawl finish before driving records: consuming `deep`'s
-      // and `deep/leaf`'s discoveries proves the root's AND `deep`'s cold
-      // reads completed (a record racing an in-flight read would dirty it into
-      // the ordinary escalation Rescan — a different story than the widen's).
-      for expected in [loc(&["deep"]), loc(&["deep", "leaf"])] {
-        let (s, root, change) = next_rooted(&rig).await;
-        assert_eq!((s, root.as_path()), (scope, std::path::Path::new("/r/sub")));
-        assert!(change.kind().is_created());
-        assert_eq!(change.location(), &expected);
-      }
+      // Let the birth crawl finish before driving records: the registration's
+      // closing `Rescan` is emitted at COVERAGE SETTLE, so consuming it proves
+      // the root's AND `deep`'s reads completed (a record racing an in-flight
+      // read would dirty it into the ordinary escalation Rescan — a different
+      // story than the widen's). It replaces the pair of inventory `Created`s
+      // this used to consume, which a registration no longer delivers (42-10),
+      // and fences strictly more: the pair proved two reads, the settle edge
+      // proves every one of them.
+      fence_birth_crawl(&rig, scope, "/r/sub").await;
 
       // A pre-widen delivery pins the epoch the widen must NOT dominate.
       rig.fs.send_inotify_batch(
@@ -7601,8 +7631,7 @@ mod descending {
         .0;
       // Fence the birth crawl (see the flagship cell): the root's read is
       // complete once its discovery delivers, so later records cannot dirty it.
-      let (_, _, change) = next_rooted(&rig).await;
-      assert_eq!(change.location(), &loc(&["deep"]));
+      fence_birth_crawl(&rig, scope, "/r/sub").await;
 
       rig.fs.remove("/r");
       let err = replace(&rig, scope, "/r")
@@ -7643,8 +7672,7 @@ mod descending {
         .expect("the birth root arm")
         .0;
       // Fence the birth crawl (see the flagship cell).
-      let (_, _, change) = next_rooted(&rig).await;
-      assert_eq!(change.location(), &loc(&["deep"]));
+      fence_birth_crawl(&rig, scope, "/r/sub").await;
 
       let err = replace(&rig, scope, "/r").await.expect_err("the arm fails");
       assert!(
@@ -7780,8 +7808,7 @@ mod descending {
       rig.fs.put("/r/sub/deep", FileKind::Dir, 3);
       let scope = watch(&rig, "/r/sub").await;
       // Fence the birth crawl (see the flagship cell).
-      let (_, _, change) = next_rooted(&rig).await;
-      assert_eq!(change.location(), &loc(&["deep"]));
+      fence_birth_crawl(&rig, scope, "/r/sub").await;
 
       // Park the write IN THE POOL: dispatched under the pre-widen world,
       // claiming only after the commit.
@@ -7840,8 +7867,7 @@ mod descending {
         .expect("the birth root arm")
         .0;
       // Fence the birth crawl (see the flagship cell).
-      let (_, _, change) = next_rooted(&rig).await;
-      assert_eq!(change.location(), &loc(&["deep"]));
+      fence_birth_crawl(&rig, scope, "/r/a/b").await;
 
       // Freeze every post-commit read: the tripwire cannot resolve.
       let hold = rig.fs.hold_enumerates();
@@ -7926,8 +7952,7 @@ mod descending {
       rig.fs.put("/r/a/b", FileKind::Dir, 11);
       rig.fs.put("/r/a/b/deep", FileKind::Dir, 12);
       let scope = watch(&rig, "/r/a/b").await;
-      let (_, _, change) = next_rooted(&rig).await;
-      assert_eq!(change.location(), &loc(&["deep"]));
+      fence_birth_crawl(&rig, scope, "/r/a/b").await;
 
       let hold = rig.fs.hold_enumerates();
       assert!(replace(&rig, scope, "/r").await.is_ok());
@@ -8002,8 +8027,7 @@ mod descending {
       rig.fs.put("/r/sub", FileKind::Dir, 2);
       rig.fs.put("/r/sub/deep", FileKind::Dir, 3);
       let scope = watch(&rig, "/r/sub").await;
-      let (_, _, change) = next_rooted(&rig).await;
-      assert_eq!(change.location(), &loc(&["deep"]));
+      fence_birth_crawl(&rig, scope, "/r/sub").await;
 
       // Park the verification edge, then widen and let the adoption confirm
       // (the slice discovery delivering proves the widened root's read ran).
@@ -8052,8 +8076,7 @@ mod descending {
       rig.fs.put("/r/sub", FileKind::Dir, 2);
       rig.fs.put("/r/sub/deep", FileKind::Dir, 3);
       let scope = watch(&rig, "/r/sub").await;
-      let (_, _, change) = next_rooted(&rig).await;
-      assert_eq!(change.location(), &loc(&["deep"]));
+      fence_birth_crawl(&rig, scope, "/r/sub").await;
 
       // Park the pre-arm, dispatch the widen, and wait for the pre-arm to be
       // ENTERED: the witnessed window is provably open from here (the
@@ -8299,8 +8322,7 @@ mod descending {
       rig.fs.put("/r/sub", FileKind::Dir, 2);
       rig.fs.put("/r/sub/deep", FileKind::Dir, 3);
       let scope = watch(&rig, "/r/sub").await;
-      let (_, _, change) = next_rooted(&rig).await;
-      assert_eq!(change.location(), &loc(&["deep"]));
+      fence_birth_crawl(&rig, scope, "/r/sub").await;
 
       let hold = rig.fs.hold_prearms();
       let (reply, on_reply) = futures_channel::oneshot::channel();
@@ -8364,8 +8386,7 @@ mod descending {
       rig.fs.put("/r/sub", FileKind::Dir, 2);
       rig.fs.put("/r/sub/deep", FileKind::Dir, 3);
       let scope = watch(&rig, "/r/sub").await;
-      let (_, _, change) = next_rooted(&rig).await;
-      assert_eq!(change.location(), &loc(&["deep"]));
+      fence_birth_crawl(&rig, scope, "/r/sub").await;
       assert_eq!(
         last_published(&registry, scope),
         Some(PathBuf::from("/r/sub")),
@@ -8435,8 +8456,7 @@ mod descending {
         .cloned()
         .expect("the birth root arm")
         .0;
-      let (_, _, change) = next_rooted(&rig).await;
-      assert_eq!(change.location(), &loc(&["deep"]));
+      fence_birth_crawl(&rig, scope, "/r/sub").await;
 
       let spawns_hold = rig.fs.hold_spawns();
       let prearm_hold = rig.fs.hold_prearms();
@@ -8516,8 +8536,7 @@ mod descending {
       rig.fs.put("/r/sub", FileKind::Dir, 2);
       rig.fs.put("/r/sub/deep", FileKind::Dir, 3);
       let scope = watch(&rig, "/r/sub").await;
-      let (_, _, change) = next_rooted(&rig).await;
-      assert_eq!(change.location(), &loc(&["deep"]));
+      fence_birth_crawl(&rig, scope, "/r/sub").await;
 
       let hold = rig.fs.hold_prearms();
       let (reply, on_reply) = futures_channel::oneshot::channel();
@@ -8601,8 +8620,7 @@ mod descending {
         .cloned()
         .expect("the birth root arm")
         .0;
-      let (_, _, change) = next_rooted(&rig).await;
-      assert_eq!(change.location(), &loc(&["deep"]));
+      fence_birth_crawl(&rig, scope, "/r/sub").await;
 
       let hold = rig.fs.hold_prearms();
       let (reply, on_reply) = futures_channel::oneshot::channel();
@@ -9097,8 +9115,7 @@ mod descending {
         .cloned()
         .expect("the birth root arm")
         .0;
-      let (_, _, change) = next_rooted(&rig).await;
-      assert_eq!(change.location(), &loc(&["deep"]));
+      fence_birth_crawl(&rig, scope, "/r/sub").await;
 
       let hold = rig.fs.hold_prearms();
       let (reply, on_reply) = futures_channel::oneshot::channel();
@@ -9219,8 +9236,7 @@ mod descending {
         .cloned()
         .expect("the birth root arm")
         .0;
-      let (_, _, change) = next_rooted(&rig).await;
-      assert_eq!(change.location(), &loc(&["deep"]));
+      fence_birth_crawl(&rig, scope, "/r/sub").await;
 
       let hold = rig.fs.hold_prearms();
       let (reply, on_reply) = futures_channel::oneshot::channel();
@@ -9314,8 +9330,7 @@ mod descending {
         .cloned()
         .expect("the birth root arm")
         .0;
-      let (_, _, change) = next_rooted(&rig).await;
-      assert_eq!(change.location(), &loc(&["deep"]));
+      fence_birth_crawl(&rig, scope, "/r/sub").await;
 
       let hold = rig.fs.hold_prearms();
       let (reply, on_reply) = futures_channel::oneshot::channel();
@@ -9409,8 +9424,7 @@ mod descending {
         .cloned()
         .expect("the birth root arm")
         .0;
-      let (_, _, change) = next_rooted(&rig).await;
-      assert_eq!(change.location(), &loc(&["deep"]));
+      fence_birth_crawl(&rig, scope, "/r/sub").await;
 
       let hold = rig.fs.hold_prearms();
       let (reply, on_reply) = futures_channel::oneshot::channel();
@@ -9495,8 +9509,7 @@ mod descending {
         .cloned()
         .expect("the birth root arm")
         .0;
-      let (_, _, change) = next_rooted(&rig).await;
-      assert_eq!(change.location(), &loc(&["deep"]));
+      fence_birth_crawl(&rig, scope, "/r/sub").await;
 
       let hold = rig.fs.hold_prearms();
       let (reply, on_reply) = futures_channel::oneshot::channel();
@@ -9577,8 +9590,7 @@ mod descending {
       rig.fs.put("/r/sub", FileKind::Dir, 2);
       rig.fs.put("/r/sub/deep", FileKind::Dir, 3);
       let scope = watch(&rig, "/r/sub").await;
-      let (_, _, change) = next_rooted(&rig).await;
-      assert_eq!(change.location(), &loc(&["deep"]));
+      fence_birth_crawl(&rig, scope, "/r/sub").await;
 
       let hold = rig.fs.hold_prearms();
       let (reply, on_reply) = futures_channel::oneshot::channel();
@@ -9657,8 +9669,7 @@ mod descending {
         .cloned()
         .expect("the birth root arm")
         .0;
-      let (_, _, change) = next_rooted(&rig).await;
-      assert_eq!(change.location(), &loc(&["deep"]));
+      fence_birth_crawl(&rig, scope, "/r/sub").await;
 
       let hold = rig.fs.hold_prearms();
       let (reply, on_reply) = futures_channel::oneshot::channel();
@@ -9736,8 +9747,7 @@ mod descending {
       rig.fs.put("/r/sub", FileKind::Dir, 2);
       rig.fs.put("/r/sub/deep", FileKind::Dir, 3);
       let scope = watch(&rig, "/r/sub").await;
-      let (_, _, change) = next_rooted(&rig).await;
-      assert_eq!(change.location(), &loc(&["deep"]));
+      fence_birth_crawl(&rig, scope, "/r/sub").await;
 
       let hold = rig.fs.hold_refreshes();
       assert!(replace(&rig, scope, "/r").await.is_ok());
@@ -9781,8 +9791,7 @@ mod descending {
         .cloned()
         .expect("the birth root arm")
         .0;
-      let (_, _, change) = next_rooted(&rig).await;
-      assert_eq!(change.location(), &loc(&["deep"]));
+      fence_birth_crawl(&rig, scope, "/r/sub").await;
 
       rig.fs.swap_after_prearm("/r", FileKind::Dir, 99);
       let err = replace(&rig, scope, "/r")
