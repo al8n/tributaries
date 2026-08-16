@@ -4,12 +4,17 @@
 # paths. TMPDIR rides a tmpfs so bind-mount unreliability can never leak into
 # inotify results, and the cargo registry/target volumes keep the loop warm.
 #
-# Usage: ci/linux-verify.sh <unit|inotify|inotify-priv|fanotify|all|shell> [repo-path]
+# Usage: ci/linux-verify.sh <unit|umbrella|inotify|inotify-priv|fanotify|all|shell> [repo-path]
 #   REPO=<path> may be set instead of the second argument; defaults to the
 #   repository this script lives in.
 #
 # Suites:
 #   unit         - cargo test -p tributary-fs (linux cfg), default caps
+#   umbrella     - the umbrella crate on the linux cfg, default caps: its lib —
+#                  where `source::fs::tests::integration` drives a real kernel
+#                  watch — plus both integration targets (tests/umbrella.rs,
+#                  tests/indexer_shaped.rs). `--tests` picks up the lib test
+#                  target and the integration targets in one invocation
 #   inotify      - the linux_inotify integration suite, default caps
 #                  (privileged cells self-probe and skip loudly)
 #   inotify-priv - the same binary under --privileged: unlocks the sysctl
@@ -24,7 +29,7 @@
 set -u
 
 IMAGE="${IMAGE:-tributaries-linux-verify:dev}"
-SUITE="${1:?usage: linux-verify.sh <unit|inotify|inotify-priv|fanotify|all|shell> [repo]}"
+SUITE="${1:?usage: linux-verify.sh <unit|umbrella|inotify|inotify-priv|fanotify|all|shell> [repo]}"
 DEFAULT_REPO="$(cd "$(dirname "$0")/.." && pwd)"
 REPO="${2:-${REPO:-$DEFAULT_REPO}}"
 
@@ -56,6 +61,13 @@ case "$SUITE" in
   unit)
     run_default 'cargo test -p tributary-fs --all-features --lib'
     ;;
+  # The umbrella's own real-backend surface, which `unit` never touches: the lib
+  # test target carries `source::fs::tests::integration`, and the two integration
+  # targets drive the public API (pure-fs) and a caller-supplied generic source.
+  # Unprivileged by design — none of these cells need a capability.
+  umbrella)
+    run_default 'cargo test -p tributaries --all-features --tests'
+    ;;
   # Single-threaded by contract: the privileged cells shrink the user
   # namespace's inotify sysctls, which would starve concurrent event tests.
   #
@@ -78,6 +90,7 @@ case "$SUITE" in
     ;;
   all)
     run_priv 'cargo test -p tributary-fs --all-features --lib \
+      && cargo test -p tributaries --all-features --tests \
       && cargo test -p tributary-fs --all-features --test linux_inotify -- --test-threads=1 \
       && cargo test -p tributary-fs --all-features --test linux_fanotify -- --test-threads=1 \
       && cargo test -p tributary-fs --all-features --doc \
