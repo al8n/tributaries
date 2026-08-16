@@ -2096,7 +2096,7 @@ mod descending {
       !arms
         .iter()
         .any(|(_, p)| p == std::path::Path::new("/r/bound")),
-      "the bind-mount directory is delivered but never armed: {arms:?}"
+      "the bind-mount directory is lowered but never armed: {arms:?}"
     );
   }
 
