@@ -128,6 +128,60 @@ fn reaches(event: &Ev, path: &Path) -> bool {
   event.reaches(&key(path))
 }
 
+/// One settle probe's window; the handshake below re-probes until [`DEADLINE`].
+const SETTLE_STEP: Duration = Duration::from_millis(250);
+
+/// Settles a **pre-existing** directory's coverage before a delivery probe, so that probe
+/// tests a real delivery rather than the registration window.
+///
+/// `watch()` resolves once the ROOT's native stream is live — never once a descending
+/// backend's bootstrap crawl has armed the subtree that already existed below it. A write
+/// into an already-existing subdirectory issued the instant `watch()` returns can therefore
+/// land in a not-yet-armed directory: no kernel record, and no listing announces it either
+/// (the registration's crawl reports no inventory for ground that merely pre-existed the
+/// grant). What answers it is the window's closing `Rescan` **at the root** — and since
+/// [`Event::reaches`] is satisfied by a `Rescan` at the key **or any ancestor**, a probe
+/// asserted with `reaches` alone inside that window is satisfied by the `Rescan` and proves
+/// nothing about delivery. That softness is older than the window: any `Rescan`-only
+/// backend would have satisfied such a predicate. What changed is only that it became
+/// reachable on the common path, at registration.
+///
+/// The handshake: touch a throwaway name in `dir` until one comes back as a **genuine**
+/// (non-`Rescan`) event. A genuine delivery for a file in `dir` is proof `dir` itself is
+/// armed and live, which is exactly what the cell's own probe needs — and it establishes
+/// that without waiting on the bootstrap `Rescan`, which would couple these cells to the
+/// mechanism under change and does not exist at all on a kernel-recursive backend (there
+/// the first probe is delivered immediately and the handshake costs one write).
+async fn settle_delivery_under(w: &mut TokioTributaries, dir: &Path) {
+  let settled = tokio::time::timeout(DEADLINE, async {
+    let mut attempt = 0u32;
+    loop {
+      let probe = dir.join(format!("settle-{attempt}.probe"));
+      attempt += 1;
+      std::fs::write(&probe, b"settle").expect("write the settle probe");
+      let seen = tokio::time::timeout(SETTLE_STEP, async {
+        while let Some(event) = w.next().await {
+          if !event.is_rescan() && reaches(&event, &probe) {
+            return true;
+          }
+        }
+        false
+      })
+      .await
+      .unwrap_or(false);
+      if seen {
+        return;
+      }
+    }
+  })
+  .await;
+  assert!(
+    settled.is_ok(),
+    "coverage under {} never settled: no probe written there came back as a genuine event",
+    dir.display()
+  );
+}
+
 /// Two overlapping subscriptions collapse onto a single kernel watch (design §4): the
 /// second `watch()` of a nested path — which the layer below would reject with
 /// `Overlaps` — succeeds here, because subsumption folds it onto the shared root rather
@@ -158,11 +212,17 @@ async fn overlapping_subscriptions_one_kernel_watch() {
     "each watch call yields its own subscription id"
   );
 
-  // A change under the nested overlap is still delivered (the shared watch is live).
+  // A change under the nested overlap is still delivered (the shared watch is live). Settle
+  // `nested`'s coverage first, then demand a GENUINE event: a `Rescan` at the root reaches
+  // every key below it, so `reaches` alone would be satisfied by the registration window's
+  // closing `Rescan` without the shared watch delivering anything.
+  settle_delivery_under(&mut w, &sub_dir).await;
   let file = sub_dir.join("probe.txt");
   std::fs::write(&file, b"hi").expect("write probe");
   assert!(
-    wait_for(&mut w, |e| reaches(e, &file)).await.is_some(),
+    wait_for(&mut w, |e| !e.is_rescan() && reaches(e, &file))
+      .await
+      .is_some(),
     "the single shared kernel watch delivers a change under the overlap"
   );
 
@@ -249,11 +309,19 @@ async fn event_fans_to_both_overlapping_subs() {
     .await
     .expect("watch nested");
 
+  // Settle `nested`'s coverage before probing, and demand GENUINE events below: the
+  // registration window's closing `Rescan` is at the root, and a root `Rescan` reaches every
+  // key under it — so `reaches` alone would fan a re-enumeration instruction out to both
+  // subscriptions and satisfy the fan-out claim with no change delivered at all.
+  settle_delivery_under(&mut w, &sub_dir).await;
   let file = sub_dir.join("shared.txt");
   std::fs::write(&file, b"payload").expect("write shared file");
 
   // The one write must reach BOTH subscriptions, each retagged with its own id.
-  let both = wait_until_all(&mut w, &[outer, inner], |e| reaches(e, &file)).await;
+  let both = wait_until_all(&mut w, &[outer, inner], |e| {
+    !e.is_rescan() && reaches(e, &file)
+  })
+  .await;
   assert!(
     both,
     "a write under the overlap fans out to both the outer and the nested subscription"
