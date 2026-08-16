@@ -5760,10 +5760,9 @@ mod descending {
   }
 
   /// A set-cover between a descending scope's SPAWN and its root-arm GRANT is
-  /// refused `NotLive`: the root's arm is still COLD, and a grow would mark it
-  /// re-arm-flavored — suppressing the initial inventory's `Created`s (re-arms
-  /// deliberately emit none). The refusal perturbs nothing, and the later cold
-  /// discovery delivers its inventory intact.
+  /// refused `NotLive`: no caller holds a handle yet, so there is no coverage
+  /// claim to reconcile. The refusal perturbs nothing — the grant's own crawl
+  /// then takes the whole coverage, in the silence the contract requires.
   #[test]
   fn set_cover_before_the_grant_is_refused_not_live() {
     let mut core = DriverCore::new(WINDOW, LIVENESS);

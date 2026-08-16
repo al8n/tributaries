@@ -31,6 +31,12 @@ const REARM_MAX_RETRIES: u8 = 2;
 
 /// Which enumerate a watch has outstanding: a cold discovery read (emits `Created`
 /// for each entry) or a rescan re-arm read (reconciles coverage, `Created`-suppressed).
+///
+/// A REGISTRATION's crawl is the second kind, not the first: the contract reports
+/// no inventory for state that merely pre-existed the grant, so the root is born
+/// re-arm-flavored and the flavor descends through the crawl's own installs. A
+/// cold read is therefore what a LIVE discovery gets — a `Created` record's
+/// install, a widen's post-commit read — where the entries really are changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EnumKind {
   /// Discovery of a freshly-armed directory — each entry is a new `Created`.
@@ -1511,9 +1517,9 @@ impl Monitor {
   /// unregistered scope.
   ///
   /// The registration's bridge window is re-established under the adopted
-  /// profile, in both directions. Every bridge setter gates on
-  /// [`scope_descends`](Self::scope_descends), so a window minted under a
-  /// provisional profile is bookkeeping the adopted one may not simply inherit:
+  /// profile, in both directions. Every bridge setter gates on whether the
+  /// profile DESCENDS, so a window minted under a provisional profile is
+  /// bookkeeping the adopted one may not simply inherit:
   /// a root that turns out KERNEL-RECURSIVE holds no bridge window at all (its
   /// stream is its coverage; it queues no read for the mark to fire at), while
   /// one that turns out DESCENDING must gain the bootstrap mark its registration
@@ -1945,10 +1951,14 @@ impl Monitor {
   /// This is the coverage-reconcile settle predicate: a driver that triggered
   /// re-arm work for `scope` — a [`rearm_watch_subtree`](Self::rearm_watch_subtree)
   /// grow, an [`on_overflow`](Self::on_overflow) recovery — polls this after
-  /// feeding results back to learn when that work has quiesced. Cold discovery
-  /// never holds it down: a fresh root's or a live-churn directory's initial arm
-  /// and enumerate run in non-re-arm states by construction, so consumer churn
-  /// inside a settled scope cannot starve a fence built on this predicate. Every
+  /// feeding results back to learn when that work has quiesced. LIVE-CHURN cold
+  /// discovery never holds it down: a discovered directory's arm and enumerate
+  /// run in non-re-arm states by construction, so consumer churn inside a settled
+  /// scope cannot starve a fence built on this predicate. A REGISTRATION does
+  /// hold it down, and deliberately: its crawl is re-arm-flavored (the inventory
+  /// suppression), so it is counted from the grant until coverage settles, and a
+  /// cover fence opened right after the grant reads lossy — the honest outcome,
+  /// since it instructs exactly the crawl the contract already ordered. Every
   /// counted obligation is bounded — an unreadable re-arm read retries at most
   /// `REARM_MAX_RETRIES` times before its [`Rescan`](ChangeKind::Rescan) stands —
   /// so each terminal is armed-live or dropped-with-a-standing-`Rescan`, and a

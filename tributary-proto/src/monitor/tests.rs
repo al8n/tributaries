@@ -2661,8 +2661,14 @@ fn not_found_watch_result_drops_and_rescans() {
 
 // ── Descent is idempotent via the child index ──
 
-/// A cold enumerate racing a live `Created` for one path installs a single child
-/// watch and delivers the change once.
+/// A bootstrap enumerate racing a live `Created` for one path installs a single
+/// child watch and delivers the change once.
+///
+/// The single delivery is the KERNEL's copy, and that is what changed under 42-10:
+/// the listing's copy used to be deduped against it, and is now suppressed
+/// outright, because a registration reports no inventory. Either way exactly one
+/// `Created` reaches the consumer — the assertion is unchanged and the reason
+/// under it is not.
 #[test]
 fn racing_descent_installs_one_child_watch() {
   let mut m = per_dir();

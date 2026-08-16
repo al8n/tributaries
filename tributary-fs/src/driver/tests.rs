@@ -2028,10 +2028,9 @@ mod descending {
     // The crawl's one signal, and it postdates every read the crawl performed.
     fence_birth_crawl(&rig, scope, "/r").await;
     assert!(
-      matches!(
-        tokio::time::timeout(Duration::from_millis(200), rig.events.recv()).await,
-        Err(_)
-      ),
+      tokio::time::timeout(Duration::from_millis(200), rig.events.recv())
+        .await
+        .is_err(),
       "and nothing else: a registration announces no inventory at any depth"
     );
     settle(|| {
@@ -2953,9 +2952,12 @@ mod descending {
     }
 
     /// A live descending rig over `/r` with the given child directories,
-    /// whose cold discovery has FULLY quiesced (every child's cold read
-    /// landed) — so a later grow can never coalesce into an in-flight cold
-    /// read and degrade a window these cells expect clean.
+    /// whose birth crawl has FULLY quiesced (every child's read landed) — so a
+    /// later grow can never coalesce into an in-flight read and degrade a window
+    /// these cells expect clean. That crawl is now the registration's own
+    /// re-arm-flavored one (42-10) rather than a cold discovery; what the helper
+    /// waits on — every child's read having been issued — is unchanged, and so is
+    /// why it waits.
     async fn covered_rig(children: &[(&str, u64)]) -> (Rig, ScopeId) {
       let fs = FakeFs::new(1);
       for (path, ino) in children {
@@ -4198,9 +4200,11 @@ mod descending {
       use std::sync::atomic::{AtomicBool, Ordering};
 
       // A scope wide enough that every spam reconcile's watch-table walk has
-      // real cost: keep + drop + 30 filler directories. The cold inventory
-      // (32 `Created`s) stays under the rig's 64-slot event channel, so no
-      // lag Rescan can pollute the fence verdict.
+      // real cost: keep + drop + 30 filler directories. The registration is
+      // silent now (42-10 — it announces no inventory, only its closing
+      // `Rescan`), so the rig's 64-slot event channel has even more headroom
+      // than the 32 `Created`s this budget was sized for: no lag Rescan can
+      // pollute the fence verdict.
       let filler: Vec<String> = (0..30).map(|i| format!("/r/d{i:02}")).collect();
       let mut children: Vec<(&str, u64)> = vec![("/r/keep", 11), ("/r/drop", 12)];
       children.extend(
