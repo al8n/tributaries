@@ -436,20 +436,34 @@ pub fn is_sync_cookie_dir_name(name: &str) -> bool {
   }
 }
 
-/// Whether `field` is exactly what `format!("{euid}")` renders for some `libc::uid_t`:
-/// decimal digits, no sign, no redundant leading zero (`0` itself is the one-digit case),
-/// and inside the 32-bit uid space every platform that opens a cookie directory uses.
+/// Whether `field` is exactly what `format!("{euid}")` renders for some `libc::uid_t` a
+/// [`cookie_dir_name`] minter could hold: decimal digits, no sign, no redundant leading zero
+/// (`0` itself is the one-digit case), and inside the 32-bit uid space every platform that
+/// opens a cookie directory uses — less its one unownable value, `(uid_t)-1`.
 ///
 /// A suffix outside that is one [`cookie_dir_name`] could never have produced, so the
 /// directory wearing it was created by somebody else. Admitting it would classify a user
 /// directory — and, for a consumer that suppresses what lands inside the cookie
 /// directory, everything reported within it — as this driver's artifact, and silently.
+///
+/// The bound is the MINTER's range, never the watching platform's: the suffix is matched for
+/// any uid (see [`is_sync_cookie_dir_name`]), and on a shared filesystem the minter may run
+/// on another platform entirely, so narrowing to this one's own uid ceiling would stop
+/// recognizing a genuine foreign cookie directory — the leak this classifier exists to close.
 fn is_minted_uid(field: &str) -> bool {
   field.bytes().all(|b| b.is_ascii_digit())
     && (field.len() == 1 || !field.starts_with('0'))
     // `parse` is what rejects the empty suffix and the overflowing one; the digit test
     // above is what rejects the leading sign `from_str` would otherwise accept.
-    && field.parse::<u32>().is_ok()
+    //
+    // `u32::MAX` is refused because it is `(uid_t)-1` — POSIX's invalid-uid sentinel, the
+    // value `chown`/`chgrp` read as "leave this id alone" and the one `setreuid` takes as
+    // "no change". No account is allocated it and no `geteuid()` returns it, so
+    // `cookie_dir_name` can never render this suffix. Do NOT simplify this back to a bare
+    // `parse::<u32>()`: a consumer suppresses every change reported inside a directory this
+    // admits, so admitting `.tributaries-sync-cookies-4294967295` erases a user directory's
+    // whole contents from every stream, with no `Rescan` and no diagnostic.
+    && field.parse::<u32>().is_ok_and(|uid| uid != u32::MAX)
 }
 
 /// The directory a cookie is created inside, held OPEN for as long as any cookie

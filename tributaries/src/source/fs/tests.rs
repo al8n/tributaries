@@ -1787,3 +1787,264 @@ async fn a_non_utf8_leaf_inside_the_cookie_directory_is_still_an_artifact() {
     "an undecodable leaf outside the reserved directory is an ordinary user change"
   );
 }
+
+/// The uid suffix is a MINTER's range, and its ceiling is the one place a plain
+/// `parse::<u32>()` gets that wrong.
+///
+/// `4294967295` parses as a `u32`, but it is `(uid_t)-1` — POSIX's invalid-uid sentinel, the
+/// value `chown` reads as "leave this id alone" and `setreuid` as "no change". It is
+/// allocated to no account and returned by no `geteuid()`, so `tributary_fs`'s
+/// `cookie_dir_name` cannot render `.tributaries-sync-cookies-4294967295`: a directory wearing
+/// that name is the user's own.
+///
+/// # Why the delivery half is the assertion
+///
+/// [`FsSource::is_sync_artifact`](crate::source::FsSource) applies this classifier to a leaf's
+/// IMMEDIATE PARENT, so admitting the sentinel does not merely mis-label one directory — it
+/// makes every ordinary create, modify and remove DIRECTLY INSIDE that user directory fully
+/// reserved. `Owner::reserved_endpoints` reads a single-endpoint change as
+/// `ReservedEndpoints::All`, whose `is_total()` settles it before any routing runs: the changes
+/// leave every consumer stream with no [`Rescan`](crate::EventKind::Rescan) and no diagnostic,
+/// which is silent loss of the user's files. Asserting the classifier alone would leave that
+/// consequence untested, so these cells drive the real driver end to end.
+///
+/// # And why the ceiling is not this platform's
+///
+/// The companion cell holds the OTHER direction. `is_sync_cookie_dir_name` matches ANY uid on
+/// purpose — two users may watch one tree, and a shared filesystem carries a directory minted
+/// by a process on another platform whose uid space is wider than the watcher's. Narrowing the
+/// bound to the watching platform's own cap (macOS's `2147483647`, say) would stop recognizing
+/// a genuine foreign cookie directory and republish another watcher's cookies as user creates,
+/// which is the leak the reserved namespace exists to close. `4294967294` — a real `nfsnobody`
+/// on some systems — is the largest uid a minter can hold, and it stays recognized.
+mod the_invalid_uid_sentinel {
+  use std::{
+    collections::{HashMap, VecDeque},
+    ffi::OsString,
+    num::NonZeroU64,
+    path::Path,
+    time::Duration,
+  };
+
+  use agnostic_lite::tokio::TokioRuntime;
+  use tributary_fs::WatcherOptions;
+  use tributary_proto::{ChangeId, Epoch, Location, Segment};
+
+  use crate::{
+    error::WatchError,
+    event::{EventKind, path_components},
+    options::{TributariesOptions, WatchOptions},
+    source::{Armed, FsSource, Source, SourceEvent},
+  };
+
+  /// A directory a real `geteuid()` can never have named: the uid field is `(uid_t)-1`.
+  const SENTINEL_UID_DIR: &str = ".tributaries-sync-cookies-4294967295";
+
+  /// A directory a real `geteuid()` CAN name — the largest one it can, one below the
+  /// sentinel.
+  const HIGHEST_MINTABLE_UID_DIR: &str = ".tributaries-sync-cookies-4294967294";
+
+  fn key(path: &str) -> Vec<OsString> {
+    path_components(Path::new(path))
+  }
+
+  fn loc(parts: &[&str]) -> Location {
+    Location::from_segments(parts.iter().map(|p| Segment::new(*p)))
+  }
+
+  /// A [`Source`] whose reserved-namespace verdict IS the shipped
+  /// [`FsSource`](crate::source::FsSource)'s — `is_sync_artifact` delegates to a real one
+  /// rather than restating its grammar, so a change to either classification ground reaches
+  /// these cells — over an injectable event queue, so the driver runs end to end without a
+  /// kernel watch. Every other method is the minimum a watch and a fan-out need.
+  ///
+  /// One queued event is released per trigger, exactly like `driver::tests::TriggeredSource`:
+  /// the queue is built before the root is armed, so the release has to wait for the handle
+  /// the events name.
+  struct FsClassified {
+    fs: FsSource<TokioRuntime>,
+    next_handle: u32,
+    live: HashMap<u32, Vec<OsString>>,
+    events: VecDeque<SourceEvent<OsString, u32>>,
+    trigger: async_channel::Receiver<()>,
+  }
+
+  impl Source<OsString> for FsClassified {
+    type Handle = u32;
+
+    fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
+      Ok(key.to_vec())
+    }
+
+    async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+      self.next_handle += 1;
+      let handle = self.next_handle;
+      self.live.insert(handle, key.to_vec());
+      Ok(Armed::new(handle, key.to_vec()))
+    }
+
+    fn disarm(&mut self, handle: u32) {
+      self.live.remove(&handle);
+    }
+
+    fn is_sync_artifact(&self, key: &[OsString]) -> bool {
+      <FsSource<TokioRuntime> as Source<OsString>>::is_sync_artifact(&self.fs, key)
+    }
+
+    async fn next(&mut self) -> Option<SourceEvent<OsString, u32>> {
+      match self.trigger.recv().await {
+        Ok(()) => self.events.pop_front(),
+        Err(_) => None,
+      }
+    }
+
+    fn root_key(&self, handle: u32) -> Option<Vec<OsString>> {
+      self.live.get(&handle).cloned()
+    }
+  }
+
+  /// Watches `/r`, reports a create, a modify and a remove of `/r/<dir>/notes.txt`, then one
+  /// ORDINARY change beside them (`/r/after.txt`), and returns what the subscriber received
+  /// up to and including that last one, as `(key, kind)` pairs.
+  ///
+  /// The trailing ordinary change is the barrier that makes a NON-delivery provable without
+  /// waiting out a deadline: the driver consumes source events one at a time in order, so its
+  /// arrival proves every change queued before it has already been classified and either
+  /// delivered or dropped.
+  async fn deliveries_inside(dir: &str) -> Vec<(Vec<OsString>, &'static str)> {
+    let inside = key(&format!("/r/{dir}/notes.txt"));
+    let beside = key("/r/after.txt");
+    let mut events = VecDeque::new();
+    for (n, kind) in [EventKind::Created, EventKind::Modified, EventKind::Removed]
+      .into_iter()
+      .enumerate()
+    {
+      events.push_back(SourceEvent::new(
+        1,
+        inside.clone(),
+        kind,
+        loc(&[dir, "notes.txt"]),
+        Epoch::new(0),
+        Some(ChangeId::new(
+          NonZeroU64::new(n as u64 + 1).expect("nonzero"),
+        )),
+      ));
+    }
+    events.push_back(SourceEvent::new(
+      1,
+      beside.clone(),
+      EventKind::Created,
+      loc(&["after.txt"]),
+      Epoch::new(0),
+      Some(ChangeId::new(NonZeroU64::new(4).expect("nonzero"))),
+    ));
+    let queued = events.len();
+
+    let (trigger_tx, trigger) = async_channel::unbounded::<()>();
+    let source = FsClassified {
+      fs: FsSource::<TokioRuntime>::new(WatcherOptions::new()).expect("build the fs source"),
+      next_handle: 0,
+      live: HashMap::new(),
+      events,
+      trigger,
+    };
+    let mut w: crate::Tributaries<OsString, (), TokioRuntime, u32> =
+      crate::Tributaries::with_source(source, TributariesOptions::new());
+    let sub = w
+      .watch(key("/r"), (), WatchOptions::new())
+      .await
+      .expect("watch /r");
+    for _ in 0..queued {
+      trigger_tx.try_send(()).expect("release a queued change");
+    }
+
+    let mut delivered = Vec::new();
+    loop {
+      let event = tokio::time::timeout(Duration::from_secs(5), w.next())
+        .await
+        .expect("the driver classifies every queued change and delivers the ordinary one")
+        .expect("the event stream is open");
+      assert_eq!(event.subscription(), sub, "the only subscription is served");
+      let at_barrier = event.key() == beside.as_slice();
+      delivered.push((event.key().to_vec(), event.kind().as_str()));
+      if at_barrier {
+        break;
+      }
+    }
+    delivered
+  }
+
+  /// A directory named for `(uid_t)-1` is a USER directory, so the changes inside it are user
+  /// changes and every one of them reaches the subscriber.
+  ///
+  /// FAIL-ON-REVERT: drop the `u32::MAX` refusal in `tributary_fs`'s `is_minted_uid` (back to
+  /// a bare `field.parse::<u32>().is_ok()`) and the three changes inside the directory are
+  /// classified reserved and settled without routing — only the ordinary change beside them
+  /// arrives, which is exactly the silent loss this cell stands over.
+  #[tokio::test]
+  async fn a_directory_named_for_the_invalid_uid_keeps_its_children_on_the_stream() {
+    use crate::{Source, source::FsSource};
+
+    // The CONSEQUENCE first, so a regression is caught at the stream a consumer actually
+    // reads rather than only at the classifier that decides it.
+    let inside = key(&format!("/r/{SENTINEL_UID_DIR}/notes.txt"));
+    assert_eq!(
+      deliveries_inside(SENTINEL_UID_DIR).await,
+      vec![
+        (inside.clone(), "created"),
+        (inside.clone(), "modified"),
+        (inside, "removed"),
+        (key("/r/after.txt"), "created"),
+      ],
+      "every change directly inside a user directory is delivered — suppressing them would \
+       erase the user's files from the stream with no Rescan"
+    );
+
+    // …and the ground that consequence rests on.
+    let source = FsSource::<TokioRuntime>::new(WatcherOptions::new()).expect("build");
+    assert!(
+      !source.is_sync_artifact(&key(&format!("/r/{SENTINEL_UID_DIR}"))),
+      "{SENTINEL_UID_DIR} is not a name this workspace can mint — no geteuid() returns \
+       (uid_t)-1"
+    );
+    assert!(
+      !source.is_sync_artifact(&key(&format!("/r/{SENTINEL_UID_DIR}/notes.txt"))),
+      "…so its children are the user's, not the fs driver's cookies"
+    );
+  }
+
+  /// The over-tightening guard, and the failure direction that LEAKS rather than swallows: the
+  /// largest uid a `geteuid()` can actually return still names a cookie directory, and its
+  /// children are still suppressed.
+  ///
+  /// Without this cell, capping the suffix at the WATCHING platform's uid ceiling — or at any
+  /// value a real account can hold — would silently stop recognizing a foreign watcher's
+  /// cookie directory on a shared filesystem, and republish its cookies as user creates on
+  /// every consumer stream.
+  ///
+  /// FAIL-ON-REVERT: tighten the ceiling past its minter — refuse `u32::MAX - 1` too, or cap
+  /// the suffix at macOS's `2147483647` — and the directory stops being recognized, so its
+  /// three cookie changes are delivered as user changes instead of being suppressed.
+  #[tokio::test]
+  async fn the_highest_uid_a_minter_can_hold_still_names_a_cookie_directory() {
+    use crate::{Source, source::FsSource};
+
+    // The consequence first, for the same reason as the cell above.
+    assert_eq!(
+      deliveries_inside(HIGHEST_MINTABLE_UID_DIR).await,
+      vec![(key("/r/after.txt"), "created")],
+      "the cookie directory's children are suppressed and only the ordinary change beside \
+       them is delivered"
+    );
+
+    let source = FsSource::<TokioRuntime>::new(WatcherOptions::new()).expect("build");
+    assert!(
+      source.is_sync_artifact(&key(&format!("/r/{HIGHEST_MINTABLE_UID_DIR}"))),
+      "{HIGHEST_MINTABLE_UID_DIR} is a directory some watcher's geteuid() can name"
+    );
+    assert!(
+      source.is_sync_artifact(&key(&format!("/r/{HIGHEST_MINTABLE_UID_DIR}/notes.txt"))),
+      "…so whatever lands directly inside it is that watcher's cookie, not a user change"
+    );
+  }
+}

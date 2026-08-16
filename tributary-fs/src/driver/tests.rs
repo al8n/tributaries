@@ -10722,6 +10722,16 @@ mod sync_cookie {
   /// space names a directory this crate could not have created, and a consumer that
   /// suppresses what lands inside the cookie directory would erase the user's directory
   /// and everything reported within it.
+  ///
+  /// # A disclosed correction
+  ///
+  /// This cell used to assert `.tributaries-sync-cookies-4294967295` as a name this crate
+  /// MINTS. It is not one: `4294967295` is `(uid_t)-1`, POSIX's invalid-uid sentinel — the
+  /// value `chown` reads as "leave this id alone" — which no account is allocated and no
+  /// `geteuid()` returns, so [`cookie_dir_name`] can never render that suffix. The assertion
+  /// pinned the very over-acceptance this cell exists to close. The literal moved to the
+  /// negative list below, and the ceiling is now proven at its true edge instead: `4294967294`
+  /// is the largest uid a minter can hold, and a real `nfsnobody` on some systems.
   #[test]
   fn the_cookie_directory_classifier_admits_only_names_this_crate_mints() {
     // What this crate actually names the directory, on this platform.
@@ -10733,8 +10743,12 @@ mod sync_cookie {
     assert!(crate::is_sync_cookie_dir_name(
       ".tributaries-sync-cookies-0"
     ));
+    // The uid ceiling, at the largest value a `geteuid()` can actually return. It is
+    // deliberately NOT this platform's own cap: a shared filesystem carries a directory
+    // minted by a process on another one, and refusing that uid would republish a genuine
+    // foreign cookie directory — and every cookie inside it — as user creates.
     assert!(crate::is_sync_cookie_dir_name(
-      ".tributaries-sync-cookies-4294967295"
+      ".tributaries-sync-cookies-4294967294"
     ));
 
     for user_leaf in [
@@ -10752,6 +10766,10 @@ mod sync_cookie {
       ".tributaries-sync-cookies-4294967296",
       ".tributaries-sync-cookies-99999999999999999999",
       ".tributaries-sync-cookies-+1",
+      // Inside the `u32` the suffix is parsed as, but still unmintable: `(uid_t)-1` is
+      // POSIX's invalid-uid sentinel, so no `geteuid()` hands it to `cookie_dir_name`. See
+      // this cell's disclosed correction — it was asserted as a MINTED name here.
+      ".tributaries-sync-cookies-4294967295",
     ] {
       assert!(
         !crate::is_sync_cookie_dir_name(user_leaf),
