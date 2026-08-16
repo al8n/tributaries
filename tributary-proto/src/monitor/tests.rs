@@ -16862,3 +16862,111 @@ fn a_counted_cover_inside_an_incomplete_read_strands_no_request() {
   assert!(m.is_rearm_enumerating(root), "and the root re-reads");
   m.assert_invariants();
 }
+
+// ---------------------------------------------------------------------------
+// 42-10: the registration window. A registration reports no inventory — the
+// contract says pre-existing state is not a change — so its crawl is
+// suppressed; and because the arm-before-readdir invariant is per-DIRECTORY,
+// that suppression owes a loss half, which is what the bootstrap mark supplies.
+// ---------------------------------------------------------------------------
+
+/// Registers a root and brings its post-arm read to the point of answering,
+/// returning `(root, req)`. The read is the crawl's, so it is re-arm-flavored
+/// and announces nothing.
+fn bootstrap_read(m: &mut Monitor, s: ScopeId) -> (WatchId, ReqId) {
+  let root = live_root(m, s);
+  let req = drain_actions(m)
+    .iter()
+    .find_map(|a| {
+      a.as_enumerate()
+        .filter(|e| e.dir() == root)
+        .map(|e| e.req())
+    })
+    .expect("the armed root reads");
+  (root, req)
+}
+
+/// Arms `dir` (whose install the crawl just queued) and returns its own read's
+/// request.
+fn armed_read(m: &mut Monitor, dir: WatchId) -> ReqId {
+  m.ack_watch(dir, Ok(WatchAck::Installed));
+  drain_actions(m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == dir).map(|e| e.req()))
+    .expect("the armed directory reads")
+}
+
+/// The watch the last drained action installs — the crawl's fresh child.
+fn queued_install(m: &mut Monitor) -> WatchId {
+  drain_actions(m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("the crawl installs the discovered directory")
+}
+
+/// 42-10 cell 2b — THE LOSS HALF. An entry created in a directory the bootstrap
+/// crawl DISCOVERED but had not yet armed is recorded by nobody: the
+/// arm-before-readdir invariant is per-DIRECTORY, so `deep`'s own arm postdates
+/// the grant, and the suppressed read that finally lists it announces nothing.
+/// The window's closing `Rescan` is the only instruction that covers that gap,
+/// and it must stand — otherwise this design trades over-delivery for SILENT
+/// under-delivery, which is strictly worse.
+///
+/// Mutation that kills it: drop the loss half (`mark_bootstrap_loss` at
+/// `rearm_enumerate`'s install loop). The window then closes silent.
+#[test]
+fn a_gap_create_under_a_bootstrap_armed_directory_is_dominated_by_the_closing_rescan() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (_root, read) = bootstrap_read(&mut m, s);
+
+  // The crawl discovers `sub` — a FRESH install, so its arm postdates the grant.
+  m.on_enumerate(
+    read,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("sub"), FileKind::Dir)]),
+  );
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "the bootstrap crawl announces no inventory"
+  );
+  let sub = queued_install(&mut m);
+
+  // …and `deep` under it, likewise armed only now.
+  let read = armed_read(&mut m, sub);
+  m.on_enumerate(
+    read,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("deep"), FileKind::Dir)]),
+  );
+  assert!(drain_events(&mut m).is_empty(), "still no inventory");
+  let deep = queued_install(&mut m);
+
+  // THE GAP: `gap.txt` is created under `deep` between the grant and `deep`'s
+  // own arm. No kernel record describes it (nothing was watching `deep` yet),
+  // and the suppressed read that lists it emits no `Created`.
+  let read = armed_read(&mut m, deep);
+  m.on_enumerate(
+    read,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("gap.txt"), FileKind::File)]),
+  );
+
+  // The crawl has quiesced, so the window closes — with exactly one `Rescan` at
+  // the scope root, which postdates the gap create by construction.
+  assert!(m.rearm_settled(s), "the counted crawl quiesced");
+  let events = drain_events(&mut m);
+  assert_eq!(
+    events.len(),
+    1,
+    "the closing Rescan is the window's one signal: {events:?}"
+  );
+  assert!(
+    events[0].kind().is_rescan(),
+    "and it is a Rescan, not an inventory Created: {:?}",
+    events[0]
+  );
+  assert_eq!(
+    events[0].location(),
+    &Location::new(),
+    "located at the scope root, dominating the whole crawl"
+  );
+  m.assert_invariants();
+}
