@@ -119,6 +119,19 @@ fn watch_error_from_fs_classifies_honestly() {
 ///   (`RootHandle::new(root.instance(), change.scope())`) — the forgery whose instance half is
 ///   indistinguishable — and the same assertion fails on the scope, because the change carries
 ///   the decoy root's.
+///
+/// # Not run under MemorySanitizer
+///
+/// `ci/sanitizer.sh`'s msan leg names this cell in its `--skip` list, next to the
+/// `integration` module below, and for the same reason: MSAN instruments neither libc nor
+/// the kernel, so a buffer a raw syscall fills reads as uninitialized however fully the
+/// kernel wrote it. The real `Watcher::watch` this cell performs walks the backend's spawn
+/// barrier (`statx`, and the `statfs` behind the locality refusal), which MSAN reports as
+/// `use-of-uninitialized-value` — and that report ABORTS the lib binary, so the whole
+/// umbrella suite would report no result at all rather than one failure. The gate cannot be
+/// expressed as a `cfg` on the cell: `cfg(sanitize = "memory")` is still feature-gated
+/// (E0658, rust#39699) and this workspace builds on stable. Every other gate runs it — the
+/// main lib suite, the narrow gate, and the ASAN/LSAN/TSAN legs, which do model syscalls.
 #[cfg(all(not(miri), any(target_os = "macos", target_os = "linux")))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_real_fs_move_carries_its_source_coordinate_into_the_move_out_projection() {
