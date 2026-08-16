@@ -431,6 +431,61 @@ async fn wait_until_all(
   .unwrap_or(false)
 }
 
+/// One settle probe's window; the handshake below re-probes until [`DEADLINE`].
+const SETTLE_STEP: Duration = Duration::from_millis(250);
+
+/// Settles a **pre-existing** directory's coverage before a delivery probe, so that probe
+/// tests a real delivery rather than the registration window.
+///
+/// `watch()` resolves once the ROOT's native stream is live — never once a descending
+/// backend's bootstrap crawl has armed the subtree that already existed below it. A write
+/// into an already-existing subdirectory issued the instant `watch()` returns can therefore
+/// land in a not-yet-armed directory: no kernel record, and no listing announces it either
+/// (the registration's crawl reports no inventory for ground that merely pre-existed the
+/// grant). What answers it is the window's closing `Rescan` **at the root** — and since
+/// [`Event::reaches`] is satisfied by a `Rescan` at the key **or any ancestor**, a probe
+/// asserted with `reaches` alone inside that window is satisfied by the `Rescan` and proves
+/// nothing about delivery. That softness is older than the window: any `Rescan`-only
+/// backend would have satisfied such a predicate. What changed is only that it became
+/// reachable on the common path, at registration.
+///
+/// The handshake: touch a throwaway name in `dir` until one comes back as a **genuine**
+/// (non-`Rescan`) event. A genuine delivery for a file in `dir` is proof `dir` itself is
+/// armed and live, which is exactly what the cell's own probe needs — and it establishes
+/// that without waiting on the bootstrap `Rescan`, which would couple these cells to the
+/// mechanism under change and does not exist at all on a kernel-recursive backend (there
+/// the first probe is delivered immediately and the handshake costs one write).
+async fn settle_delivery_under(w: &mut Indexer, dir: &Path, dir_key: &[Comp]) {
+  let settled = tokio::time::timeout(DEADLINE, async {
+    let mut attempt = 0u32;
+    loop {
+      let name = format!("settle-{attempt}.probe");
+      attempt += 1;
+      let probe_key = key(dir_key, &[name.as_str()]);
+      std::fs::write(dir.join(&name), b"settle").expect("write the settle probe");
+      let seen = tokio::time::timeout(SETTLE_STEP, async {
+        while let Some(event) = w.next().await {
+          if !event.is_rescan() && event.reaches(&probe_key) {
+            return true;
+          }
+        }
+        false
+      })
+      .await
+      .unwrap_or(false);
+      if seen {
+        return;
+      }
+    }
+  })
+  .await;
+  assert!(
+    settled.is_ok(),
+    "coverage under {} never settled: no probe written there came back as a genuine event",
+    dir.display()
+  );
+}
+
 /// Polls the wait-free [`WatchView`] `pred` until it holds, or the deadline lapses. Every
 /// probe is an `&self` load (no lock, no driver round-trip); this only bounds *eventual
 /// consistency*, never blocks.
@@ -572,11 +627,18 @@ async fn overlap_subsumption_widens_and_folds_descendant() {
   );
 
   // Routing survives the fold: a write under the DEEP dir reaches BOTH the folded descendant
-  // subscription and the wider ancestor subscription, through the one widened root.
+  // subscription and the wider ancestor subscription, through the one widened root. Settle
+  // the widened root's coverage of the (pre-existing) deep dir first, and demand GENUINE
+  // events: the widen's own registration closes its bootstrap window with a `Rescan` at
+  // `/a`, which reaches every key below it — so `reaches` alone would retire both
+  // subscriptions on a re-enumeration instruction, with no routing exercised at all.
+  settle_delivery_under(&mut w, &deep_dir, &key(&volume, &["a", "b", "c"])).await;
   let file_key = key(&volume, &["a", "b", "c", "probe.txt"]);
   std::fs::write(deep_dir.join("probe.txt"), b"x").expect("write probe");
   assert!(
-    wait_until_all(&mut w, &[deep, anc], |e| e.reaches(&file_key)).await,
+    wait_until_all(&mut w, &[deep, anc], |e| !e.is_rescan()
+      && e.reaches(&file_key))
+    .await,
     "a write under the folded descendant routes to both subscriptions"
   );
 
@@ -629,8 +691,19 @@ async fn attribution_fans_out_to_covering_subs_and_resolves_owning_loc() {
   // np/child probe, while other_sub is required to retire on its own change. All three
   // retiring proves the channel to other_sub is live/reachable and still correctly excluded
   // the disjoint np/child event (mirrors umbrella.rs::filter_narrows_delivery_on_the_real_stack).
+  //
+  // Both probe directories pre-exist their registration, so both are settled first and both
+  // positive halves demand a GENUINE (non-`Rescan`) event. Each registration closes its
+  // bootstrap window with a `Rescan` at its own root, and a root `Rescan` reaches every key
+  // below it — so `reaches` alone retires all three subscriptions on re-enumeration
+  // instructions, proving neither the fan-out nor other_sub's liveness bound. The exclusion
+  // assertion is deliberately left exactly as it was: it must fire on `Rescan`s too, and it
+  // cannot be tripped by one, since `other` is not an ancestor of `np/child/probe.txt` and a
+  // `Rescan` only reaches keys at or below its own.
   let probe_key = key(&volume, &["np", "child", "probe.txt"]);
   let other_probe_key = key(&volume, &["other", "probe.txt"]);
+  settle_delivery_under(&mut w, &np_child, &child_key).await;
+  settle_delivery_under(&mut w, &other_dir, &other_key).await;
   std::fs::write(np_child.join("probe.txt"), b"x").expect("write np/child probe");
   std::fs::write(other_dir.join("probe.txt"), b"x").expect("write other probe");
   assert!(
@@ -641,10 +714,10 @@ async fn attribution_fans_out_to_covering_subs_and_resolves_owning_loc() {
       );
       if e.subscription() == other_sub {
         // other_sub's liveness bound: it DOES receive the change under its own key.
-        e.reaches(&other_probe_key)
+        !e.is_rescan() && e.reaches(&other_probe_key)
       } else {
         // np_sub / child_sub: the fan-out of the one np/child change to every covering sub.
-        e.reaches(&probe_key)
+        !e.is_rescan() && e.reaches(&probe_key)
       }
     })
     .await,
