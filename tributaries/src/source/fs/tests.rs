@@ -673,7 +673,7 @@ mod integration {
     );
     assert_eq!(
       source.root_key(armed.handle()),
-      Some(parent_key),
+      Some(parent_key.clone()),
       "the parent armed and is live"
     );
     assert!(
@@ -694,6 +694,25 @@ mod integration {
 
     // The armed parent genuinely delivers: a change under one of the (now folded) descendant dirs
     // surfaces for the parent's handle, proving the fresh recursive watch is live.
+    //
+    // SETTLE THE COVERAGE FIRST — the delivery below must be a genuine `Created` in an ARMED
+    // directory, not a race. `arm` resolves once the ROOT's native stream is live
+    // (`Watcher::watch`: "resolving once the native stream is live"), never once a descending
+    // backend's bootstrap crawl has armed the pre-existing subtree — so `d0`, which already
+    // existed when the parent armed, is not yet covered at that instant. A write landing in that
+    // window leaves no kernel record and is answered by the window's closing `Rescan` at coverage
+    // settle, never by a `Created` at the file's key; racing it would exercise the registration
+    // window rather than this cell's subject. `grow` to full coverage is the fenced handshake that
+    // ends the window: `CoverOutcome::Applied` is an effect-completion fence whose contract is
+    // exactly "writes under the retained cover from the moment the ack resolves are delivered",
+    // and a kernel-recursive root short-circuits it (its stream never narrowed), so the one line
+    // is correct on both profiles.
+    grow_until_applied(
+      &mut source,
+      armed.handle(),
+      std::slice::from_ref(&parent_key),
+    )
+    .await;
     let file = parent.join("d0").join("after.txt");
     std::fs::write(&file, b"hi").expect("write probe under the parent");
     let observed = wait_for(&mut source, DEADLINE, |event| {
