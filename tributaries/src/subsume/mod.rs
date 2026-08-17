@@ -43,6 +43,8 @@ use iradix::sync::Radix;
 use tributary_proto::ScopeId;
 
 use crate::{
+  event::Event,
+  filter::Filter,
   interest::Interest,
   subscription::{InstanceId, Subscription},
   view::WatchView,
@@ -218,28 +220,38 @@ impl<V> CoverEntry<V> {
 }
 
 impl<V: Clone> CoverEntry<V> {
-  /// Records one more live subscription `sub` at this key, carrying `value`.
-  fn push(&mut self, sub: Subscription, value: V) {
+  /// Records one more live subscription `sub` at this key, carrying `value`, and hands back any
+  /// value that stood under the same id (never one in practice — ids are minted monotonically and
+  /// never reused — but a displaced caller value is a caller destructor either way, so it leaves
+  /// by the same door every other one does).
+  fn push(&mut self, sub: Subscription, value: V) -> Option<V> {
     let mut txn = self.subs.txn();
-    txn.insert(&sub.id().as_u64(), value);
+    let displaced = txn.insert(&sub.id().as_u64(), value);
     self.subs = txn.commit();
+    displaced
   }
 
-  /// Drops `sub` from this key (a no-op if absent), leaving every other subscription sharing it
-  /// — so attribution falls back to a surviving owner rather than to nothing.
-  fn remove(&mut self, sub: Subscription) {
+  /// Removes `sub` from this key (a no-op if absent), leaving every other subscription sharing it
+  /// — so attribution falls back to a surviving owner rather than to nothing — and hands its
+  /// caller value back rather than destroying it here (see [`Salvage`]).
+  fn remove(&mut self, sub: Subscription) -> Option<V> {
     let mut txn = self.subs.txn();
-    txn.remove(&sub.id().as_u64());
+    let removed = txn.remove(&sub.id().as_u64());
     self.subs = txn.commit();
+    removed
   }
 
-  /// Drops every subscription in `departing` under ONE transaction — the batch-retirement
+  /// Removes every subscription in `departing` under ONE transaction — the batch-retirement
   /// primitive a cohort retire uses, so a whole root's departure is one commit rather than one
-  /// per departing member.
-  fn remove_all(&mut self, departing: &std::collections::HashSet<Subscription>) {
+  /// per departing member — handing every removed caller value back (see [`Salvage`]).
+  fn remove_all(
+    &mut self,
+    departing: &std::collections::HashSet<Subscription>,
+    removed: &mut Vec<V>,
+  ) {
     let mut txn = self.subs.txn();
     for sub in departing {
-      txn.remove(&sub.id().as_u64());
+      removed.extend(txn.remove(&sub.id().as_u64()));
     }
     self.subs = txn.commit();
   }
@@ -319,8 +331,15 @@ impl<C, H> RootRecord<C, H> {
 
 /// The plan [`Subsumer::plan_watch`] produces: which operations the driver must
 /// perform for one `watch`, before the state transition is committed.
+///
+/// Carries no key. Every variant's root key is *by construction* the new subscription's own
+/// canonicalized key, which the driver already owns for the whole reconcile and hands to
+/// `commit_watch` directly — so a key field here would be a duplicate the driver has no reader
+/// for, and one more owned `Vec<C>` whose destructor is the CALLER's code, destroyed by an
+/// abandoned reconcile's frame exit rather than placed through [`Salvage`]. Hence the key
+/// component `C` does not appear at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum WatchOutcome<C, H> {
+pub(crate) enum WatchOutcome<H> {
   /// The subtree is already watched by an existing root at or above the key. No new
   /// kernel watch: `commit_watch` just adds `sub` to that root's subscribers.
   Covered {
@@ -347,8 +366,6 @@ pub(crate) enum WatchOutcome<C, H> {
   /// receives. `commit_watch` re-points `repointed` (and adds the new `sub`) onto the
   /// wider root.
   Widen {
-    /// The key of the new, wider root (equal to the new subscription's own key).
-    new_root_key: Vec<C>,
     /// The subscribers of every subsumed root, to re-point onto the wider root, in
     /// deterministic (root key, then registration) order.
     repointed: Vec<Subscription>,
@@ -360,8 +377,6 @@ pub(crate) enum WatchOutcome<C, H> {
   /// The key neither is covered by nor covers any existing root. The driver arms a
   /// fresh watch; `commit_watch` records the new root once its handle is known.
   Disjoint {
-    /// The key of the fresh root (equal to the subscription's key).
-    root_key: Vec<C>,
     /// The new subscription.
     sub: Subscription,
   },
@@ -424,6 +439,216 @@ struct PendingWatch<C, V> {
   key: Vec<C>,
   value: V,
   interest: Interest,
+}
+
+/// Caller-owned state a mutator **removed from the engine and deliberately did not destroy**,
+/// handed back for its owner to release deliberately.
+///
+/// # Why a mutator hands its removals back instead of dropping them
+///
+/// `C` and `V` are caller types, so every one of these releases runs a caller destructor, and a
+/// caller destructor is as fallible as a caller [`Filter`](crate::Filter) predicate — the contract
+/// cannot require panic-freedom of either. WHERE that destructor runs is therefore a placement
+/// decision, and inside a mutator is the one place it can never be placed well: the unwind leaves
+/// through the mutator's call site, in front of whatever that call site still owed. On the driver's
+/// terminal path what it owes is the source's teardown seam, every pending cookie's reap, the
+/// bounded quiescence wait and the acknowledgement that carries its verdict — none of which can be
+/// re-attempted once an unwind has gone past them, and the last two of which nothing downstream of
+/// the run loop is even able to perform.
+///
+/// So every mutator that would destroy caller-owned state returns it in one of these instead. The
+/// type is `#[must_use]`, which is what keeps that from being a convention: a call site cannot
+/// ignore the return, and the one disposal route it can reach decides — by the driver's teardown
+/// latch — whether the release happens at once or is held to the end of the teardown.
+///
+/// # What lands here, and what needs no place here
+///
+/// Both authoritative trees are persistent, so a removal from either frees nothing on its own: the
+/// pre-mutation version is still owned by the publication standing in the shared slot, and the
+/// nodes the mutation unlinked die with THAT. Capturing the DISPLACED PUBLICATION therefore defers
+/// every radix-borne `C` and `V` of that mutation at once — which is why most mutators salvage
+/// nothing else, and why capturing it is not optional bookkeeping but the bulk of the guarantee.
+///
+/// What escapes that net is what never lived in a tree, or what a removal hands back as an owned
+/// value: a not-yet-committed [`PendingWatch`] reservation, a [`RootRecord`] or [`SubRecord`] a
+/// `remove` returned, a cover value, a reverse-index key.
+///
+/// # Not only this engine's removals
+///
+/// The bundle is named for its first producer but scoped by the CATEGORY it holds: a value whose
+/// destructor is the caller's own code. The driver's own per-subscription planes hold exactly that
+/// — a parked re-enumeration's key and baked value, an undelivered [`Event`], a subscription's
+/// admission [`Filter`] — and their removals travel and are released the same way, through the same
+/// one route, rather than through a second bundle that would be one more thing to keep ordered
+/// against the teardown's bounded wait. Which is why those planes' element types are NOT held here:
+/// a `ParkedRescan` is a driver concept and belongs to the driver, so it is decomposed at the
+/// boundary into the caller-owned halves this bundle already carries (a key, a value) and the
+/// bookkeeping that is not caller-owned at all (an epoch) is simply not handed over.
+///
+/// # The one window this cannot cover
+///
+/// A bundle is a LOCAL until its producer returns it. So caller code the producer itself runs
+/// **mid-removal** — `C::cmp` on a radix descent, `C::clone`, `H::hash`, and `C::drop` — unwinds
+/// past the bundle and takes everything already placed in it with it, exactly as if those values
+/// had been destroyed at the site.
+///
+/// `C::drop` is in that list for a reason that is measured, not theoretical, and it is the one
+/// place the "capturing the displaced publication defers every radix-borne `C`" argument above does
+/// NOT reach. That argument is about the tree's SHARED nodes: the pre-mutation version still owns
+/// them, so unlinking frees nothing. A copy-on-write transaction also builds nodes of its OWN —
+/// split labels, merged labels from a collapse — and those are unshared, so when the txn's edit
+/// discards one its label's components are destroyed inside the radix, in the middle of the
+/// mutator, with the bundle still a local. A caller key removed by
+/// [`force_remove_root`](Subsumer::force_remove_root) or
+/// [`cover_remove`](Subsumer::cover_remove) whose node the removal collapses reaches a caller
+/// destructor exactly there.
+///
+/// Nothing in this type closes that. Making the bundle an owner field instead of a local moves the
+/// same window (the owner is borrowed by the producer); catching around every mutator puts a
+/// containment boundary on the hot path to buy a window only caller code can open; and the
+/// intermediate labels are the radix's, reachable through no API this crate has. What narrows it is
+/// ORDERING inside each producer — retain first, then run caller code (see `force_remove_root`,
+/// whose grouping borrows already-retained keys rather than owning one) — and that is as far as
+/// ordering goes: a producer that must compare before it can know what to remove still has a first
+/// comparison. It is a stated limit rather than an unexamined one; the containment at the end of
+/// the driver's teardown keeps the blast radius of the panic itself to one unwind either way.
+#[must_use = "these are caller-owned values whose destructors are the caller's own code — release \
+              them deliberately, never by discarding a removal's return"]
+pub(crate) struct Salvage<C, V, H> {
+  /// Publications displaced out of the shared slot by a republish. Each is the last owner of
+  /// every node its successor unlinked.
+  publications: Vec<Arc<Published<C, V, H>>>,
+  /// Root records an index removal handed back.
+  roots: Vec<RootRecord<C, H>>,
+  /// Live-subscription records a side-table removal handed back.
+  subs: Vec<SubRecord<C, H>>,
+  /// Not-yet-committed reservations an aborted plan handed back.
+  pending: Vec<PendingWatch<C, V>>,
+  /// Caller values a coverage-plane removal handed back, and caller values the driver salvaged
+  /// from a request it is abandoning.
+  values: Vec<V>,
+  /// Keys a reverse-index removal handed back, request keys the driver salvaged, superseded
+  /// reservation keys, the retained-cover prefixes a coverage re-record replaced, and the driver's
+  /// parked re-enumeration keys — including the tail a widen truncated off one.
+  keys: Vec<Vec<C>>,
+  /// Deliveries that were minted but never handed to the consumer: an offer a full or closed
+  /// channel refused, and the buffered deltas a subscription's retirement discards. Each owns the
+  /// key it was located at and the value baked onto it.
+  events: Vec<Event<C, V>>,
+  /// Admission gates a retiring subscription's driver-side entry handed back. The gate's caller
+  /// half only: the driver's per-subscription quarantine verdict rides with the subscription, not
+  /// with the caller's predicate, and is not caller-owned.
+  filters: Vec<Filter<C>>,
+}
+
+// Hand-written rather than derived: a derive would demand `C: Default` / `V: Default` /
+// `H: Default`, and an empty bundle needs none of them — every field starts as an empty `Vec`.
+// Staying bound-free is what lets the driver's destructor, which carries only `S: LocalSource<C>`,
+// take the bundle out of the owner on its way past.
+impl<C, V, H> Default for Salvage<C, V, H> {
+  fn default() -> Self {
+    Self {
+      publications: Vec::new(),
+      roots: Vec::new(),
+      subs: Vec::new(),
+      pending: Vec::new(),
+      values: Vec::new(),
+      keys: Vec::new(),
+      events: Vec::new(),
+      filters: Vec::new(),
+    }
+  }
+}
+
+impl<C, V, H> Salvage<C, V, H> {
+  /// An empty bundle — what a mutator that removed nothing caller-owned hands back.
+  pub(crate) fn new() -> Self {
+    Self::default()
+  }
+
+  /// Takes everything `other` holds into this bundle, so several mutators' removals travel — and
+  /// are released — as one.
+  pub(crate) fn absorb(&mut self, mut other: Self) {
+    self.publications.append(&mut other.publications);
+    self.roots.append(&mut other.roots);
+    self.subs.append(&mut other.subs);
+    self.pending.append(&mut other.pending);
+    self.values.append(&mut other.values);
+    self.keys.append(&mut other.keys);
+    self.events.append(&mut other.events);
+    self.filters.append(&mut other.filters);
+  }
+
+  /// Retains a publication displaced out of the shared slot — including the one
+  /// [`swap_in_empty`](Subsumer::swap_in_empty) hands back to a teardown.
+  pub(crate) fn keep_publication(&mut self, publication: Arc<Published<C, V, H>>) {
+    self.publications.push(publication);
+  }
+
+  /// Retains a caller value the driver salvaged from a request it is abandoning.
+  pub(crate) fn keep_value(&mut self, value: V) {
+    self.values.push(value);
+  }
+
+  /// Retains a key the driver salvaged from a request it is abandoning.
+  pub(crate) fn keep_key(&mut self, key: Vec<C>) {
+    self.keys.push(key);
+  }
+
+  /// Retains a delivery that was minted but never reached the consumer — a refused offer, or a
+  /// buffered delta a retirement discards.
+  pub(crate) fn keep_event(&mut self, event: Event<C, V>) {
+    self.events.push(event);
+  }
+
+  /// Retains the caller half of an admission gate a retiring subscription handed back.
+  pub(crate) fn keep_filter(&mut self, filter: Filter<C>) {
+    self.filters.push(filter);
+  }
+
+  /// Whether this bundle holds nothing at all — the reading a cell takes to pin that a LIVE path
+  /// deferred nothing. Never consulted to decide anything: the bundle is storage, not state.
+  #[cfg(all(test, feature = "tokio"))]
+  pub(crate) fn is_empty(&self) -> bool {
+    self.publications.is_empty()
+      && self.roots.is_empty()
+      && self.subs.is_empty()
+      && self.pending.is_empty()
+      && self.values.is_empty()
+      && self.keys.is_empty()
+      && self.events.is_empty()
+      && self.filters.is_empty()
+  }
+
+  /// How many admission gates this bundle holds — the reading a cell takes to BOUND what a
+  /// teardown retains, where emptiness is the wrong question and a count is the right one. Never
+  /// consulted to decide anything: the bundle is storage, not state.
+  #[cfg(all(test, feature = "tokio"))]
+  pub(crate) fn filters_len(&self) -> usize {
+    self.filters.len()
+  }
+
+  /// Releases everything at the call site — the disposal a cell takes when it drives the engine
+  /// directly and no teardown is in play.
+  #[cfg(test)]
+  pub(crate) fn release(self) {
+    drop(self);
+  }
+
+  /// Retains a root record an index removal handed back.
+  fn keep_root(&mut self, record: RootRecord<C, H>) {
+    self.roots.push(record);
+  }
+
+  /// Retains a live-subscription record a side-table removal handed back.
+  fn keep_sub(&mut self, record: SubRecord<C, H>) {
+    self.subs.push(record);
+  }
+
+  /// Retains a not-yet-committed reservation an aborted plan handed back.
+  fn keep_pending(&mut self, reservation: PendingWatch<C, V>) {
+    self.pending.push(reservation);
+  }
 }
 
 /// The sans-I/O overlap-subsumption engine, generic over the key component `C`, the
@@ -510,21 +735,53 @@ where
 // assuming only the `Source` bound the `Owner` struct carries (a `Drop` impl may not add bounds
 // its type definition lacks).
 impl<C, V, H> Subsumer<C, V, H> {
-  /// Publishes an **empty** read-plane snapshot into the shared slot, so every [`WatchView`]
-  /// reader reports "nothing watched" — `is_watched`/`covering`/`resolve` all empty and
-  /// `contains`/`len` zero. The driver empties the plane at owner teardown — on the normal path
-  /// after draining owed Rescans, and unconditionally from the owner's `Drop` guard, so a panic in
-  /// any caller callback still empties it: the authoritative watch-set is about to drop with the
-  /// owner task and its source, so a retained view must stop advertising coverage whose owner and
-  /// source no longer exist (design §5). Like [`publish`](Self::publish) it is a single synchronous
-  /// `arc_swap` store of a fresh empty snapshot — idempotent, and running no caller `C`/`V`/`H`
-  /// method (the two trees are empty), so it needs no bounds and cannot itself panic, which makes it
-  /// safe to call while unwinding.
-  pub(crate) fn publish_empty(&self) {
-    self.shared.store(Arc::new(Published {
+  /// Installs an **empty** read-plane snapshot in the shared slot — so every [`WatchView`] reader
+  /// reports "nothing watched": `is_watched`/`covering`/`resolve` all empty and `contains`/`len`
+  /// zero — and hands back the publication it DISPLACED rather than releasing it here. The driver
+  /// empties the plane at owner teardown — on the normal path after draining owed Rescans, and
+  /// unconditionally from the owner's `Drop` guard, so a panic in any caller callback still empties
+  /// it: the authoritative watch-set is about to drop with the owner task and its source, so a
+  /// retained view must stop advertising coverage whose owner and source no longer exist
+  /// (design §5). Like [`publish`](Self::publish) the install itself is a single synchronous
+  /// `arc_swap` swap of a fresh empty snapshot — idempotent, and running no caller `C`/`V`/`H`
+  /// method (the two trees it installs are empty), so it needs no bounds and cannot itself panic,
+  /// which makes it safe to call while unwinding.
+  ///
+  /// # Why the displaced snapshot comes back instead of being dropped
+  ///
+  /// Emptying the plane is TWO operations, and only the first is infallible. Installing the empty
+  /// snapshot runs no caller code. **Releasing the one it replaces runs caller destructors**: that
+  /// snapshot owns radix nodes holding caller `C` keys and `V` values, and it can be their LAST
+  /// owner — a mutation that removed a value from the authoritative trees leaves it alive in the
+  /// published snapshot alone until the next publish, so a caller callback that unwound out of a
+  /// mutator between its commit and its [`publish`](Self::publish) strands exactly that. A `store`
+  /// fuses the two, and the caller destructor then unwinds out of the *install's* call site.
+  ///
+  /// That is why this hands the snapshot back: the release is the caller's to place and to contain,
+  /// while the install — the part the read-plane guarantee actually rests on — has already
+  /// happened and cannot be undone by an unwinding `Drop`.
+  #[must_use = "the displaced publication owns caller `C`/`V` values, so releasing it runs caller \
+                destructors — place that release deliberately, inside an unwind boundary"]
+  pub(crate) fn swap_in_empty(&self) -> Arc<Published<C, V, H>> {
+    self.shared.swap(Arc::new(Published {
       roots: Radix::new(),
       covers: Radix::new(),
-    }));
+    }))
+  }
+
+  /// Re-installs a publication the caller previously took out of the slot, discarding whatever
+  /// stands there now.
+  ///
+  /// Staging only, and there is no product caller: every mutator publishes FORWARD, so nothing but
+  /// a panic can leave the slot holding a snapshot the authoritative trees have already moved past
+  /// — and a panic sited precisely inside a mutator's commit-to-publish window needs a caller `C`
+  /// whose `Clone` unwinds or a caller handle whose `Hash` does, both of which land mid-mutator by
+  /// a call count that is the mutator's own business. A cell that wants the STATE (the published
+  /// snapshot as the last owner of a departed `V`) rather than that call count assembles it here:
+  /// take the snapshot out with [`swap_in_empty`](Self::swap_in_empty), mutate, put it back.
+  #[cfg(all(test, feature = "tokio"))]
+  pub(crate) fn test_reinstall_publication(&self, snapshot: Arc<Published<C, V, H>>) {
+    self.shared.store(snapshot);
   }
 }
 
@@ -575,11 +832,20 @@ where
   /// planes (the armed-root `index` and the live-subscription `covers`) are swapped
   /// together as one [`Published`] snapshot, so a reader never sees them torn apart;
   /// each tree is an O(1) structural-sharing clone.
-  fn publish(&self) {
-    self.shared.store(Arc::new(Published {
+  ///
+  /// A SWAP rather than a store, and the displaced snapshot comes back rather than dying here, for
+  /// the reason [`swap_in_empty`](Self::swap_in_empty) spells out at length: that snapshot holds
+  /// the pre-mutation version of both trees, so it — not the commit above it — is the last owner of
+  /// every node this mutation unlinked, and releasing it runs those caller `C`/`V` destructors. A
+  /// store would run them inside the mutator, which is the one placement from which the unwind is
+  /// guaranteed to leave through the caller's frame ahead of whatever that caller still owed. See
+  /// [`Salvage`].
+  #[must_use = "the displaced publication is the last owner of every node this mutation unlinked"]
+  fn publish(&self) -> Arc<Published<C, V, H>> {
+    self.shared.swap(Arc::new(Published {
       roots: self.index.clone(),
       covers: self.covers.clone(),
-    }));
+    }))
   }
 
   /// Records one more live subscription `sub` at `key` in the coverage plane, carrying its caller
@@ -587,10 +853,10 @@ where
   /// committed `watch` regardless of outcome — `Disjoint`, `Widen`, and `Covered` all add a live
   /// subscription whose own key must answer `is_watched` truthfully **and** resolve to its own
   /// value.
-  fn cover_add(&mut self, sub: Subscription, key: &[C], value: V) {
+  fn cover_add(&mut self, sub: Subscription, key: &[C], value: V, salvage: &mut Salvage<C, V, H>) {
     let mut txn = self.covers.txn();
     let mut entry = txn.get(key).cloned().unwrap_or_else(CoverEntry::new);
-    entry.push(sub, value);
+    salvage.values.extend(entry.push(sub, value));
     txn.insert(key, entry);
     self.covers = txn.commit();
   }
@@ -598,11 +864,12 @@ where
   /// Drops the live subscription `sub` at `key` from the coverage plane, removing the key once
   /// its last subscription is gone. Called on every `unwatch` and for every subscriber of a
   /// force-removed dead root, so `covers` tracks exactly the set of keys — and owning values —
-  /// some live subscription still covers.
-  fn cover_remove(&mut self, sub: Subscription, key: &[C]) {
+  /// some live subscription still covers. The removed caller value goes into `salvage` rather than
+  /// being destroyed here (see [`Salvage`]).
+  fn cover_remove(&mut self, sub: Subscription, key: &[C], salvage: &mut Salvage<C, V, H>) {
     let mut txn = self.covers.txn();
     if let Some(mut entry) = txn.get(key).cloned() {
-      entry.remove(sub);
+      salvage.values.extend(entry.remove(sub));
       if entry.is_empty() {
         txn.remove(key);
       } else {
@@ -618,12 +885,7 @@ where
   ///
   /// The new subscription's id is minted from the engine's own monotonic counter, so
   /// overlapping subscriptions never collide even when they subsume onto one root.
-  pub(crate) fn plan_watch(
-    &mut self,
-    key: &[C],
-    value: V,
-    interest: Interest,
-  ) -> WatchOutcome<C, H> {
+  pub(crate) fn plan_watch(&mut self, key: &[C], value: V, interest: Interest) -> WatchOutcome<H> {
     let sub = self.mint_subscription();
     self.pending.insert(
       sub,
@@ -667,7 +929,6 @@ where
     }
     if !unwatch.is_empty() {
       return WatchOutcome::Widen {
-        new_root_key: key.to_vec(),
         repointed,
         unwatch,
         sub,
@@ -675,10 +936,7 @@ where
     }
 
     // Case 3 — Disjoint: neither covered nor covering.
-    WatchOutcome::Disjoint {
-      root_key: key.to_vec(),
-      sub,
-    }
+    WatchOutcome::Disjoint { sub }
   }
 
   /// Commits the state transition for `outcome`, binding the real `fs_root` the driver
@@ -692,12 +950,16 @@ where
   /// its key validated — when first created), so `fs_root_key` is ignored and the
   /// newcomer's own key is used unchanged. Each committed mutation republishes the
   /// watch-set (design §5).
+  ///
+  /// Returns the caller-owned state the commit displaced — above all the publication its republish
+  /// swapped out, which is the last owner of every node this commit unlinked (see [`Salvage`]).
   pub(crate) fn commit_watch(
     &mut self,
-    outcome: &WatchOutcome<C, H>,
+    outcome: &WatchOutcome<H>,
     fs_root: H,
     fs_root_key: &[C],
-  ) {
+  ) -> Salvage<C, V, H> {
+    let mut salvage = Salvage::new();
     match outcome {
       WatchOutcome::Covered { sub, .. } => {
         let PendingWatch {
@@ -716,21 +978,30 @@ where
         // OWN value — so `is_watched` stays truthful for it AND attribution resolves it to its
         // own value, never the covering root's (whose own watch may later depart, leaving the
         // armed root broader than any live subscription — design §5).
-        self.cover_add(*sub, &key, value);
-        self.subs.insert(
+        self.cover_add(*sub, &key, value, &mut salvage);
+        if let Some(displaced) = self.subs.insert(
           *sub,
           SubRecord {
             root: fs_root,
             key,
             interest,
           },
-        );
-        self.publish();
+        ) {
+          salvage.keep_sub(displaced);
+        }
+        salvage.keep_publication(self.publish());
       }
       WatchOutcome::Disjoint { sub, .. } => {
+        // The reservation's own key is SUPERSEDED here by `fs_root_key` — the authoritative key the
+        // source reported for the armed handle — so it is not stored. It is still the caller's
+        // `Vec<C>`, and destroying it here would run caller destructors inside a half-applied
+        // mutation; it leaves by the same door every other removal does.
         let PendingWatch {
-          value, interest, ..
+          key: superseded,
+          value,
+          interest,
         } = self.take_pending(*sub);
+        salvage.keep_key(superseded);
         let root_key = fs_root_key.to_vec();
         let record = RootRecord {
           key: root_key.clone(),
@@ -740,23 +1011,29 @@ where
           retained_cover: None,
         };
         let mut txn = self.index.txn();
-        txn.insert(root_key.as_slice(), record);
+        if let Some(displaced) = txn.insert(root_key.as_slice(), record) {
+          salvage.keep_root(displaced);
+        }
         self.index = txn.commit();
-        self.by_handle.insert(fs_root, root_key.clone());
+        if let Some(displaced) = self.by_handle.insert(fs_root, root_key.clone()) {
+          salvage.keep_key(displaced);
+        }
         self.root_subs.insert(fs_root, std::vec![*sub]);
         // The disjoint root's own subscription joins the coverage plane carrying its value, so
         // attribution resolves the root and its descendants to it (the value plane lives on
         // `covers`, not the armed root — design §5).
-        self.cover_add(*sub, &root_key, value);
-        self.subs.insert(
+        self.cover_add(*sub, &root_key, value, &mut salvage);
+        if let Some(displaced) = self.subs.insert(
           *sub,
           SubRecord {
             root: fs_root,
             key: root_key,
             interest,
           },
-        );
-        self.publish();
+        ) {
+          salvage.keep_sub(displaced);
+        }
+        salvage.keep_publication(self.publish());
       }
       WatchOutcome::Widen {
         repointed,
@@ -764,9 +1041,14 @@ where
         sub,
         ..
       } => {
+        // Superseded by `fs_root_key`, exactly as on the `Disjoint` arm above, and placed rather
+        // than destroyed for the same reason.
         let PendingWatch {
-          value, interest, ..
+          key: superseded,
+          value,
+          interest,
         } = self.take_pending(*sub);
+        salvage.keep_key(superseded);
         let root_key = fs_root_key.to_vec();
 
         let mut subscribers = repointed.clone();
@@ -784,15 +1066,22 @@ where
         // remove every strict descendant of the wider key (exactly the subsumed set,
         // which the driver's `fs_path_preserves_plan` guard verified), then insert.
         let mut txn = self.index.txn();
+        // The subsumed roots' records go with their keys. `remove_descendants` clones no removed
+        // value, so those records are freed only when the last version holding them dies — the
+        // publication salvaged below.
         txn.remove_descendants(root_key.as_slice());
-        txn.insert(root_key.as_slice(), record);
+        if let Some(displaced) = txn.insert(root_key.as_slice(), record) {
+          salvage.keep_root(displaced);
+        }
         self.index = txn.commit();
 
         for old in unwatch {
-          self.by_handle.remove(old);
+          salvage.keys.extend(self.by_handle.remove(old));
           self.root_subs.remove(old);
         }
-        self.by_handle.insert(fs_root, root_key.clone());
+        if let Some(displaced) = self.by_handle.insert(fs_root, root_key.clone()) {
+          salvage.keep_key(displaced);
+        }
         self.root_subs.insert(fs_root, subscribers);
         for &moved in repointed {
           self
@@ -804,32 +1093,46 @@ where
         // Only the new (widening) subscription's key joins the coverage plane, carrying its
         // value; each re-pointed subscription's own key + value is invariant under the widen (it
         // rides a new root, but its key is unchanged), so it is already counted in `covers`.
-        self.cover_add(*sub, &root_key, value);
-        self.subs.insert(
+        self.cover_add(*sub, &root_key, value, &mut salvage);
+        if let Some(displaced) = self.subs.insert(
           *sub,
           SubRecord {
             root: fs_root,
             key: root_key,
             interest,
           },
-        );
-        self.publish();
+        ) {
+          salvage.keep_sub(displaced);
+        }
+        salvage.keep_publication(self.publish());
       }
     }
+    salvage
   }
 
-  /// Abandons the plan `outcome` without committing it, discarding the pending
-  /// reservation `plan_watch` stashed. Call this on every path where arming failed, so
-  /// the not-yet-committed subscription's pending entry cannot leak. Idempotent per
-  /// plan (consuming an already-committed or already-aborted id is a no-op). No
-  /// watch-set change committed, so nothing is republished.
-  pub(crate) fn abort_watch(&mut self, outcome: &WatchOutcome<C, H>) {
+  /// Abandons the plan `outcome` without committing it, **handing back** the pending reservation
+  /// `plan_watch` stashed. Call this on every path where arming failed, so the not-yet-committed
+  /// subscription's pending entry cannot leak. Idempotent per plan (consuming an already-committed
+  /// or already-aborted id yields an empty bundle). No watch-set change committed, so nothing is
+  /// republished.
+  ///
+  /// The reservation holds the caller's key AND the caller's value, so destroying it here would run
+  /// two caller destructors inside the funnel — invisibly, since the old signature returned nothing
+  /// and the removal read as bookkeeping. Every one of this method's call sites is an abandoned
+  /// reconcile, and several of them are TERMINAL: they hold a consumed [`CloseReply`] that the run
+  /// tail still has to answer with the source's quiescence verdict, which an unwind out of here
+  /// would downgrade to a dropped sender. So it hands the reservation back (see [`Salvage`]).
+  pub(crate) fn abort_watch(&mut self, outcome: &WatchOutcome<H>) -> Salvage<C, V, H> {
     let sub = match outcome {
       WatchOutcome::Covered { sub, .. }
       | WatchOutcome::Widen { sub, .. }
       | WatchOutcome::Disjoint { sub, .. } => *sub,
     };
-    self.pending.remove(&sub);
+    let mut salvage = Salvage::new();
+    if let Some(reservation) = self.pending.remove(&sub) {
+      salvage.keep_pending(reservation);
+    }
+    salvage
   }
 
   /// Removes `sub`, reporting whether its root emptied (returns `None` for an unknown
@@ -838,8 +1141,19 @@ where
   /// On the non-emptied ([`Dropped`](UnwatchOutcome::Dropped)) path it also reports
   /// whether the armed root is now **over-broad** and the source may shrink its coverage
   /// in place (the set-cover design) — see [`detect_shrink`](Self::detect_shrink).
-  pub(crate) fn plan_unwatch(&mut self, sub: Subscription) -> Option<UnwatchOutcome<C, H>> {
-    let record = self.subs.remove(&sub)?;
+  ///
+  /// The caller-owned state the departure removed — the subscription record, its cover value, the
+  /// reverse-index key, the displaced publication — travels back in the [`Salvage`] rather than
+  /// being destroyed here. The bundle is returned even on the unknown-subscription path, where it
+  /// is empty, so the disposal is uniform.
+  pub(crate) fn plan_unwatch(
+    &mut self,
+    sub: Subscription,
+  ) -> (Option<UnwatchOutcome<C, H>>, Salvage<C, V, H>) {
+    let mut salvage = Salvage::new();
+    let Some(record) = self.subs.remove(&sub) else {
+      return (None, salvage);
+    };
     let root_key = self
       .by_handle
       .get(&record.root)
@@ -859,16 +1173,18 @@ where
     let survivors = cohort.clone();
     if emptied {
       let mut txn = self.index.txn();
-      txn.remove(root_key.as_slice());
+      if let Some(removed) = txn.remove(root_key.as_slice()) {
+        salvage.keep_root(removed);
+      }
       self.index = txn.commit();
     }
 
     // Drop this subscription from the coverage plane (the root may live on for its other,
     // narrower subscribers, and the key stays covered iff another live sub shares it).
-    self.cover_remove(sub, &record.key);
+    self.cover_remove(sub, &record.key, &mut salvage);
 
     let outcome = if emptied {
-      self.by_handle.remove(&record.root);
+      salvage.keys.extend(self.by_handle.remove(&record.root));
       self.root_subs.remove(&record.root);
       UnwatchOutcome::RootEmptied {
         fs_root: record.root,
@@ -877,11 +1193,14 @@ where
       // The root lives on for its narrower subscribers; report whether the departure left the source
       // coverage reclaimable — either newly over-broad (full coverage, the root-key sub departed) or
       // an already-narrowed cover that can shrink further (a non-root sub departed — F2).
-      let shrink = self.detect_shrink(&root_key, record.root, &survivors);
+      let shrink = self.detect_shrink(&root_key, record.root, &survivors, &mut salvage);
       UnwatchOutcome::Dropped { shrink }
     };
-    self.publish();
-    Some(outcome)
+    salvage.keep_publication(self.publish());
+    // The departing subscription's own record — its key is the caller's — leaves by the same door.
+    salvage.keep_sub(record);
+    salvage.keep_key(root_key);
+    (Some(outcome), salvage)
   }
 
   /// Whether the drop that left `survivors` behind on the armed root at `root_key` (handle
@@ -910,6 +1229,7 @@ where
     root_key: &[C],
     root_handle: H,
     survivors: &[Subscription],
+    salvage: &mut Salvage<C, V, H>,
   ) -> Option<(H, Vec<Vec<C>>)> {
     let survivor_keys: Vec<Vec<C>> = survivors
       .iter()
@@ -922,19 +1242,23 @@ where
       })
       .collect();
     // The cover last ISSUED to the source for this root — read from the just-committed record (the
-    // root is not emptied on this path, so it is present).
+    // root is not emptied on this path, so it is present). BORROWED, not cloned: this is a pure
+    // comparison, and a deep clone here would be one more copy of the caller's components for this
+    // frame to dispose of.
     let recorded = self
       .index
       .get(root_key)
-      .and_then(|record| record.retained_cover.clone());
+      .and_then(|record| record.retained_cover.as_ref());
     match recorded {
       // Full coverage: a survivor still at the root key keeps the wide coverage legitimately watched
       // — not over-broad.
       None => {
         if survivor_keys.iter().any(|key| key.as_slice() == root_key) {
+          // Nothing to reclaim, and the survivors' cloned keys are still caller components.
+          salvage.keys.extend(survivor_keys);
           return None;
         }
-        Some((root_handle, antichain(survivor_keys)))
+        Some((root_handle, antichain(survivor_keys, salvage)))
       }
       // Already narrowed: re-prune iff the survivors' antichain is strictly narrower than the
       // recorded cover — unequal AND contained by it. A survivor OUTSIDE the recorded cover
@@ -945,11 +1269,17 @@ where
       // classify Covered-INSIDE and commit over the unproven region. Skip the reclaim and
       // keep the degraded record: it broadens only through an awaited successful grow.
       Some(cover) => {
-        let survivor_antichain = antichain(survivor_keys);
+        let survivor_antichain = antichain(survivor_keys, salvage);
         let contained = survivor_antichain
           .iter()
           .all(|key| cover.iter().any(|c| key.starts_with(c.as_slice())));
-        (contained && survivor_antichain != cover).then_some((root_handle, survivor_antichain))
+        if contained && survivor_antichain != *cover {
+          return Some((root_handle, survivor_antichain));
+        }
+        // No reclaim: the antichain is not issued to anyone, so its keys go back the same way the
+        // pruned ones already did.
+        salvage.keys.extend(survivor_antichain);
+        None
       }
     }
   }
@@ -974,6 +1304,7 @@ where
     &self,
     handle: H,
     newcomer: Option<&[C]>,
+    salvage: &mut Salvage<C, V, H>,
   ) -> Option<Vec<Vec<C>>> {
     let root_key = self.by_handle.get(&handle)?;
     self.index.get(root_key)?;
@@ -999,9 +1330,25 @@ where
       .iter()
       .any(|key| key.as_slice() == root_key.as_slice())
     {
+      // Nothing to reclaim, and the cloned subscriber keys are still caller components.
+      salvage.keys.extend(subscriber_keys);
       return None;
     }
-    Some(antichain(subscriber_keys))
+    Some(antichain(subscriber_keys, salvage))
+  }
+
+  /// [`retained_cover_for`](Self::retained_cover_for) with its [`Salvage`] released at the call
+  /// site, for the same reason [`test_plan_unwatch`](Self::test_plan_unwatch) exists.
+  #[cfg(test)]
+  pub(crate) fn test_retained_cover_for(
+    &self,
+    handle: H,
+    newcomer: Option<&[C]>,
+  ) -> Option<Vec<Vec<C>>> {
+    let mut salvage = Salvage::new();
+    let cover = self.retained_cover_for(handle, newcomer, &mut salvage);
+    salvage.release();
+    cover
   }
 
   /// Records the source's ACTUAL coverage for the root `handle` (the set-cover record) — the bookkeeping
@@ -1020,18 +1367,39 @@ where
   /// unknown handle (nothing to record). Republishes so the read plane's `roots` snapshot stays in
   /// lockstep with the index (no [`WatchView`] reader consults `retained_cover`, but the two planes
   /// are always swapped together — design §5).
-  pub(crate) fn set_retained_cover(&mut self, handle: H, cover: Option<Vec<Vec<C>>>) {
+  pub(crate) fn set_retained_cover(
+    &mut self,
+    handle: H,
+    cover: Option<Vec<Vec<C>>>,
+  ) -> Salvage<C, V, H> {
+    let mut salvage = Salvage::new();
     let Some(root_key) = self.by_handle.get(&handle).cloned() else {
-      return;
+      return salvage;
     };
     let mut txn = self.index.txn();
     let Some(mut record) = txn.get(&root_key).cloned() else {
-      return;
+      // The reverse-index key was cloned out to look the record up, so even the nothing-to-do exit
+      // owns a caller `Vec<C>` — placed here rather than destroyed by this frame, exactly as on the
+      // path below.
+      salvage.keep_key(root_key);
+      return salvage;
     };
-    record.retained_cover = cover;
-    txn.insert(root_key.as_slice(), record);
+    // The record this replaces carries the previous cover — caller `C` components — so it leaves
+    // by the same door every other removal does (see [`Salvage`]). TWO copies exist: the displaced
+    // record `insert` hands back below, and this clone's own, which a plain assignment would
+    // destroy right here. Both are placed.
+    salvage.keys.extend(
+      core::mem::replace(&mut record.retained_cover, cover)
+        .into_iter()
+        .flatten(),
+    );
+    if let Some(displaced) = txn.insert(root_key.as_slice(), record) {
+      salvage.keep_root(displaced);
+    }
     self.index = txn.commit();
-    self.publish();
+    salvage.keep_publication(self.publish());
+    salvage.keep_key(root_key);
+    salvage
   }
 
   /// Degrades a NARROWED retained-cover record (`Some(cover)`) for the root `handle` to the
@@ -1042,22 +1410,39 @@ where
   /// span a hole, and trusting it would commit newcomers with no kernel backing. A
   /// never-narrowed record (`None` — full coverage, healed by the source's own re-arm
   /// machinery), an already-empty record, and an unknown handle are untouched.
-  pub(crate) fn degrade_retained_cover(&mut self, handle: H) {
+  pub(crate) fn degrade_retained_cover(&mut self, handle: H) -> Salvage<C, V, H> {
+    let mut salvage = Salvage::new();
     let Some(root_key) = self.by_handle.get(&handle).cloned() else {
-      return;
+      return salvage;
     };
     let Some(record) = self.index.get(&root_key) else {
-      return;
+      salvage.keep_key(root_key);
+      return salvage;
     };
+    // The ORDINARY no-op — a never-narrowed or already-empty record — and it owns the cloned
+    // reverse-index key just as much as the mutating path does.
     if record.retained_cover.as_ref().is_none_or(Vec::is_empty) {
-      return;
+      salvage.keep_key(root_key);
+      return salvage;
     }
     let mut record = record.clone();
-    record.retained_cover = Some(Vec::new());
+    // The clone's own copy of the previous cover, overwritten here — placed rather than destroyed
+    // inside the mutator, exactly as in `set_retained_cover`.
+    salvage.keys.extend(
+      record
+        .retained_cover
+        .replace(Vec::new())
+        .into_iter()
+        .flatten(),
+    );
     let mut txn = self.index.txn();
-    txn.insert(root_key.as_slice(), record);
+    if let Some(displaced) = txn.insert(root_key.as_slice(), record) {
+      salvage.keep_root(displaced);
+    }
     self.index = txn.commit();
-    self.publish();
+    salvage.keep_publication(self.publish());
+    salvage.keep_key(root_key);
+    salvage
   }
 
   /// The retained cover last recorded for the root `handle` (see
@@ -1100,49 +1485,66 @@ where
   /// died (the source tore its handle down and emitted a terminal `Rescan`, already fanned
   /// out to every subscriber), so the dead root is torn out of index / reverse-index /
   /// side-table and no later event routes to its dead handle. Republishes.
-  pub(crate) fn force_remove_root(&mut self, handle: H) -> Vec<Subscription> {
+  pub(crate) fn force_remove_root(&mut self, handle: H) -> (Vec<Subscription>, Salvage<C, V, H>) {
+    let mut salvage = Salvage::new();
     let Some(root_key) = self.by_handle.remove(&handle) else {
-      return Vec::new();
+      return (Vec::new(), salvage);
     };
     let mut txn = self.index.txn();
-    txn
-      .remove(root_key.as_slice())
-      .expect("force-removed root record");
+    salvage.keep_root(
+      txn
+        .remove(root_key.as_slice())
+        .expect("force-removed root record"),
+    );
     self.index = txn.commit();
     let subscribers = self.root_subs.remove(&handle).unwrap_or_default();
     // Free the dead root's subscribers from the side table AND the coverage plane, so a
     // retired root's keys stop answering `is_watched` true (they cover nothing now).
+    //
+    // EVERY removed side-table record is retained FIRST, before any grouping. Several
+    // subscriptions may share one key, and a grouping keyed by an OWNED `Vec<C>` destroys every
+    // duplicate the moment its entry is found occupied — caller destructors running inside the
+    // mutator, which is the one placement the bundle exists to keep them out of, and which no
+    // `#[must_use]` on the return can see. The grouping below therefore borrows the retained keys
+    // and owns none of them.
+    let retained_from = salvage.subs.len();
+    let mut departing_subs = Vec::with_capacity(subscribers.len());
+    for &sub in &subscribers {
+      if let Some(sub_record) = self.subs.remove(&sub) {
+        salvage.keep_sub(sub_record);
+        departing_subs.push(sub);
+      }
+    }
     // BATCHED per cover key: the per-subscriber `cover_remove` cloned the
     // whole same-key cohort entry once per departing member — O(cohort squared) deep
     // value clones plus a txn commit each. Grouping the departures by key makes the
     // conversion genuinely linear: one entry clone, one retain pass, and one commit
     // for the whole root.
     let mut departing_by_key: std::collections::BTreeMap<
-      Vec<C>,
+      &[C],
       std::collections::HashSet<Subscription>,
     > = std::collections::BTreeMap::new();
-    for &sub in &subscribers {
-      if let Some(sub_record) = self.subs.remove(&sub) {
-        departing_by_key
-          .entry(sub_record.key)
-          .or_default()
-          .insert(sub);
-      }
+    for (&sub, record) in departing_subs.iter().zip(&salvage.subs[retained_from..]) {
+      departing_by_key
+        .entry(record.key.as_slice())
+        .or_default()
+        .insert(sub);
     }
     let mut txn = self.covers.txn();
     for (key, departing) in departing_by_key {
-      if let Some(mut entry) = txn.get(&key).cloned() {
-        entry.remove_all(&departing);
+      if let Some(mut entry) = txn.get(key).cloned() {
+        entry.remove_all(&departing, &mut salvage.values);
         if entry.is_empty() {
-          txn.remove(&key);
+          txn.remove(key);
         } else {
-          txn.insert(key.as_slice(), entry);
+          txn.insert(key, entry);
         }
       }
     }
     self.covers = txn.commit();
-    self.publish();
-    subscribers
+    salvage.keep_publication(self.publish());
+    salvage.keep_key(root_key);
+    (subscribers, salvage)
   }
 
   /// Rebinds the live root `old` onto a fresh handle `new`, keeping its key, record, and
@@ -1157,19 +1559,25 @@ where
   /// never clobber another live root's reverse-map entry. The driver `debug_assert`s this at the arm
   /// choke point (an exhaustive owner-level observed-handle tripwire for a contract-violating
   /// source), so no in-band alias recovery is needed here.
-  pub(crate) fn rebind_root(&mut self, old: H, new: H) {
+  pub(crate) fn rebind_root(&mut self, old: H, new: H) -> Salvage<C, V, H> {
+    let mut salvage = Salvage::new();
     let Some(root_key) = self.by_handle.get(&old).cloned() else {
-      return;
+      return salvage;
     };
     let mut txn = self.index.txn();
     let Some(mut record) = txn.get(&root_key).cloned() else {
-      return;
+      salvage.keep_key(root_key);
+      return salvage;
     };
     record.handle = new;
-    txn.insert(root_key.as_slice(), record);
+    if let Some(displaced) = txn.insert(root_key.as_slice(), record) {
+      salvage.keep_root(displaced);
+    }
     self.index = txn.commit();
-    self.by_handle.remove(&old);
-    self.by_handle.insert(new, root_key);
+    salvage.keys.extend(self.by_handle.remove(&old));
+    if let Some(displaced) = self.by_handle.insert(new, root_key) {
+      salvage.keep_key(displaced);
+    }
     let subscribers = self.root_subs.remove(&old).unwrap_or_default();
     for &sub in &subscribers {
       if let Some(side) = self.subs.get_mut(&sub) {
@@ -1177,7 +1585,26 @@ where
       }
     }
     self.root_subs.insert(new, subscribers);
-    self.publish();
+    salvage.keep_publication(self.publish());
+    salvage
+  }
+
+  /// [`plan_unwatch`](Self::plan_unwatch) with its [`Salvage`] released at the call site — the
+  /// disposal a cell that drives the engine directly wants, there being no teardown to hold it for.
+  #[cfg(test)]
+  pub(crate) fn test_plan_unwatch(&mut self, sub: Subscription) -> Option<UnwatchOutcome<C, H>> {
+    let (outcome, salvage) = self.plan_unwatch(sub);
+    salvage.release();
+    outcome
+  }
+
+  /// [`force_remove_root`](Self::force_remove_root) with its [`Salvage`] released at the call site,
+  /// for the same reason [`test_plan_unwatch`](Self::test_plan_unwatch) exists.
+  #[cfg(test)]
+  pub(crate) fn test_force_remove_root(&mut self, handle: H) -> Vec<Subscription> {
+    let (subscribers, salvage) = self.force_remove_root(handle);
+    salvage.release();
+    subscribers
   }
 
   /// The key a live subscription was registered at, if any (its entry in the §4 side
@@ -1289,17 +1716,36 @@ where
 /// prefixes. So a survivor set `{[a,b], [a,b,c], [a,c]}` reduces to `{[a,b], [a,c]}` — `[a,b,c]`
 /// is already covered by `[a,b]`. Siblings with no ancestor among the set (`{[a,b,c], [a,b,d]}`)
 /// are all kept: neither covers the other, so both subtrees must be retained.
-fn antichain<C: Ord + Clone>(mut keys: Vec<Vec<C>>) -> Vec<Vec<C>> {
+fn antichain<C: Ord, V, H>(mut keys: Vec<Vec<C>>, salvage: &mut Salvage<C, V, H>) -> Vec<Vec<C>> {
   keys.sort();
-  keys.dedup();
-  keys
+  // Both prunings — the duplicates and the covered descendants — hand the key back rather than
+  // destroying it: `keys` is built by CLONING live subscribers' keys, so each one is caller
+  // components, and this runs inside `plan_unwatch`, which the teardown tail's queued grant cleanup
+  // reaches with everything that teardown owes still ahead of it.
+  let mut deduped: Vec<Vec<C>> = Vec::with_capacity(keys.len());
+  for key in keys {
+    if deduped.last().is_some_and(|last| *last == key) {
+      salvage.keep_key(key);
+    } else {
+      deduped.push(key);
+    }
+  }
+  // Drop `key` iff some strictly-shorter OTHER key is a proper prefix (ancestor) of it.
+  let covered: Vec<bool> = deduped
     .iter()
-    .filter(|key| {
-      // Drop `key` iff some strictly-shorter OTHER key is a proper prefix (ancestor) of it.
-      !keys
+    .map(|key| {
+      deduped
         .iter()
         .any(|other| other.len() < key.len() && key.starts_with(other.as_slice()))
     })
-    .cloned()
-    .collect()
+    .collect();
+  let mut kept = Vec::with_capacity(deduped.len());
+  for (key, covered) in deduped.into_iter().zip(covered) {
+    if covered {
+      salvage.keep_key(key);
+    } else {
+      kept.push(key);
+    }
+  }
+  kept
 }

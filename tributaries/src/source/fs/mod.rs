@@ -799,6 +799,12 @@ impl<R> Source<OsString> for FsSource<R> {
   /// Nothing to initiate ahead of the wait: the lower watcher's close is ONE command, and
   /// [`join_close`](Self::join_close) issues it. There is no cheaper, non-blocking half to split off
   /// — sending the command is itself the initiation, and it already awaits only mailbox room.
+  ///
+  /// Being a no-op is also why the umbrella entering this seam EARLY — at the instant it decides to
+  /// stop, ahead of the cookie reaps and coverage releases its teardown still issues (see the seam's
+  /// [contract](Source::begin_close)) — changes nothing this binding observes: the lower close is
+  /// issued by `join_close`, which stays last, so every one of those requests still reaches the watcher
+  /// before it is asked to close.
   fn begin_close(&mut self) {}
 
   /// Forwards the LOWER watcher's close — the strongest lifecycle fact this stack produces — as this
@@ -890,6 +896,14 @@ fn watch_error_from_fs(err: WatchRootError) -> WatchError {
       SourceError::InstanceLimit => FaultKind::Capacity,
       _ => FaultKind::Other,
     },
+    // A retryable admission REFUSAL, not a fault: the watcher's teardown backlog is at its bound
+    // and it declined to admit another native stream, leaving the caller's coverage untouched —
+    // a source resource budget exhausted, which is exactly what [`FaultKind::Capacity`] names
+    // (the instance limit above is the other one). Degrading it to `Other` destroyed the only
+    // signal that separates "ask again shortly" from "this root is dead", and the umbrella's
+    // failed-widen unwind reads that difference to decide whether to RETIRE established roots.
+    // The sync seam already draws the same line (`SyncRootError::CleanupBacklog` → `Busy`).
+    WatchRootError::CleanupBacklog => FaultKind::Capacity,
     WatchRootError::Closed => return WatchError::Closed,
     _ => FaultKind::Other,
   };
@@ -897,9 +911,16 @@ fn watch_error_from_fs(err: WatchRootError) -> WatchError {
 }
 
 /// Classifies a failed in-place root replacement into the neutral vocabulary.
-/// Every variant is honest and NON-fatal to the caller's watch: the umbrella
-/// falls back to release-and-rearm on any of them, because `replace_root` is
-/// atomic on failure — the old root's coverage is exactly as it was.
+/// Every variant leaves the caller's coverage exactly as it was, because
+/// `replace_root` is atomic on failure. Most fall through to the umbrella's
+/// release-and-rearm; the retryable refusals classified
+/// [`Capacity`](FaultKind::Capacity) — the teardown backlog, and the
+/// watch-instance ceiling a new stream hits — are triaged there instead and fail
+/// the watch outright, because release-and-rearm would tear that untouched
+/// coverage down and then ask the very budget that just refused to rebuild it.
+/// Both of the layer's capacity refusals must be classified here, not just one:
+/// the triage reads the KIND, so a refusal left as `Other` falls into exactly
+/// the unwind it is supposed to prevent.
 fn replace_error_to_watch_error(err: ReplaceRootError, root: &std::path::Path) -> WatchError {
   let kind = match err {
     ReplaceRootError::NotFound { .. } => FaultKind::NotFound,
@@ -912,9 +933,27 @@ fn replace_error_to_watch_error(err: ReplaceRootError, root: &std::path::Path) -
     | ReplaceRootError::Retired
     | ReplaceRootError::UnknownRoot
     | ReplaceRootError::ReplaceInFlight => FaultKind::Unsupported,
+    // The same reclassification the watch seam makes, and it is needed in BOTH: the widen tries
+    // the in-place retarget FIRST, so a backlog refusal that arrives here is the one the umbrella
+    // must recognize BEFORE it disarms anything. Left as `Other` it falls through to
+    // release-and-rearm, which disarms the sole subsumed root and then re-arms it against the
+    // very budget that just refused.
+    ReplaceRootError::CleanupBacklog => FaultKind::Capacity,
     ReplaceRootError::Closed => return WatchError::Closed,
     ReplaceRootError::Source(source) => {
-      return WatchError::Source(SourceFault::new(FaultKind::Other).with_source(source));
+      // The retarget's OTHER capacity refusal, and the one the watch seam above has always
+      // recognized: a make-before-break replacement STARTS a new native stream, so the per-user
+      // watch-instance ceiling is refused right here rather than through `CleanupBacklog`.
+      // Classifying it `Other` left the widen's in-place triage blind to the more common of the two
+      // — the retarget fell through to release-and-rearm, which disarms the sole healthy root and
+      // then asks that same exhausted ceiling for a fresh stream, which is exactly the retirement
+      // of a healthy root the triage exists to prevent. Every other start failure stays `Other`: a
+      // stream that could not be created or started is a persistent failure, not a budget.
+      let kind = match source {
+        SourceError::InstanceLimit => FaultKind::Capacity,
+        _ => FaultKind::Other,
+      };
+      return WatchError::Source(SourceFault::new(kind).with_source(source));
     }
     _ => FaultKind::Other,
   };

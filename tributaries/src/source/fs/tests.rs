@@ -39,6 +39,12 @@ fn watch_error_from_fs_classifies_honestly() {
       WatchRootError::Source(SourceError::InstanceLimit),
       FaultKind::Capacity,
     ),
+    // A teardown-backlog refusal is a resource budget exhausted, not a fault: the watcher
+    // declined to admit another native stream and left the caller's coverage untouched, and it
+    // will admit one once the wedged teardowns return. Degraded to `Other` it is
+    // indistinguishable from a persistent failure — and the umbrella's failed-widen unwind reads
+    // exactly that difference to decide whether to RETIRE established roots.
+    (WatchRootError::CleanupBacklog, FaultKind::Capacity),
     // A source failure outside the classified cases degrades to the conservative Other.
     (
       WatchRootError::Source(SourceError::CreateFailed),
@@ -64,6 +70,68 @@ fn watch_error_from_fs_classifies_honestly() {
   assert!(
     super::watch_error_from_fs(WatchRootError::Closed).is_closed(),
     "a closed fs watcher maps to the umbrella's own Closed, with no fault payload"
+  );
+}
+
+/// The SAME reclassification on the in-place retarget's seam
+/// ([`replace_error_to_watch_error`](super::replace_error_to_watch_error)), which is a separate
+/// mapping over a separate fs error enum. Both are load-bearing and for different reasons: the
+/// widen tries the retarget FIRST, so a backlog refusal arriving here is the one the umbrella
+/// triages BEFORE it disarms anything, while the watch seam's is what the release-and-rearm
+/// restore retries on. Fixing one and not the other leaves the retarget refusal falling through
+/// into the very unwind it is supposed to avoid.
+///
+/// BOTH of the layer's capacity refusals must be classified, on BOTH seams. A make-before-break
+/// replacement starts a native stream, so it can be refused by the per-user watch-instance ceiling
+/// exactly as a fresh watch can — arriving as
+/// [`ReplaceRootError::Source`]`(`[`SourceError::InstanceLimit`]`)`, the very refusal the watch seam
+/// has always recognized. Left `Other`, the more common of the two refusals stayed invisible to the
+/// triage while the rarer one was fixed.
+#[test]
+fn replace_error_from_fs_classifies_both_capacity_refusals_as_capacity_refusals() {
+  use std::path::Path;
+
+  use tributary_fs::{ReplaceRootError, SourceError};
+
+  use crate::error::FaultKind;
+
+  let mapped =
+    super::replace_error_to_watch_error(ReplaceRootError::CleanupBacklog, Path::new("/a"));
+  assert_eq!(
+    mapped.fault().map(crate::error::SourceFault::kind),
+    Some(FaultKind::Capacity),
+    "a retryable retarget refusal is a capacity refusal, not an unclassified fault: {mapped:?}"
+  );
+  let limited = super::replace_error_to_watch_error(
+    ReplaceRootError::Source(SourceError::InstanceLimit),
+    Path::new("/a"),
+  );
+  assert_eq!(
+    limited.fault().map(crate::error::SourceFault::kind),
+    Some(FaultKind::Capacity),
+    "the replacement stream hitting the watch-instance ceiling is the same retryable budget \
+     refusal the watch seam classifies, not an unclassified start failure: {limited:?}"
+  );
+  // …and only that one: a stream that could not be created is a persistent failure, and reading it
+  // as retryable would fail widens the release-and-rearm fallback can still serve.
+  assert_eq!(
+    super::replace_error_to_watch_error(
+      ReplaceRootError::Source(SourceError::CreateFailed),
+      Path::new("/a")
+    )
+    .fault()
+    .map(crate::error::SourceFault::kind),
+    Some(FaultKind::Other),
+    "an ordinary start failure stays the conservative Other"
+  );
+  // The neighbouring "not something to retry in place" cases are unchanged: they are genuine
+  // reasons the retarget cannot be done at all, and release-and-rearm is their right answer.
+  assert_eq!(
+    super::replace_error_to_watch_error(ReplaceRootError::Retired, Path::new("/a"))
+      .fault()
+      .map(crate::error::SourceFault::kind),
+    Some(FaultKind::Unsupported),
+    "a root that died mid-replace still falls through to release-and-rearm"
   );
 }
 

@@ -25,10 +25,11 @@
 //! one `tributary-fs` watcher (the [`TokioTributaries`] / [`SmolTributaries`] aliases).
 
 use std::{
-  collections::{BTreeMap, HashMap},
+  collections::HashMap,
   ffi::OsString,
   hash::Hash,
   marker::PhantomData,
+  ops::Bound,
   sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -49,18 +50,22 @@ use crate::{
   error::{CloseError, SyncError, UnwatchError, WatchError},
   event::Event,
   filter::{Filter, FilterInput},
+  interest::Interest,
   options::{Debounce, DebounceConfig, TributariesOptions, WatchOptions},
   route::{ReservedEndpoints, RoutableEvent},
   source::{Armed, LocalSource, Source, SourceEvent, SyncOutcome, SyncToken},
   subscription::Subscription,
-  subsume::{Subsumer, UnwatchOutcome, WatchOutcome},
+  subsume::{Salvage, Subsumer, UnwatchOutcome, WatchOutcome},
   view::WatchView,
 };
 
 #[cfg(feature = "fs")]
 use crate::{error::BuildError, source::FsSource};
 
-use self::epoch::EpochLedger;
+use self::{
+  epoch::EpochLedger,
+  planes::{Filters, ParkedRescans},
+};
 
 mod epoch;
 
@@ -554,12 +559,14 @@ where
     let loss_gen = Arc::new(AtomicU64::new(0));
     let owner = Owner {
       source,
+      source_closing: false,
+      deferred: Salvage::new(),
       subsumer,
       epochs: EpochLedger::new(),
-      filters: HashMap::new(),
+      filters: Filters::new(),
       filter_payload_forgotten: false,
-      needs_rescan: BTreeMap::new(),
-      suppressed_rescan: BTreeMap::new(),
+      needs_rescan: ParkedRescans::new(),
+      suppressed_rescan: ParkedRescans::new(),
       unclaimed: std::collections::HashSet::new(),
       flush_cursor: None,
       #[cfg(test)]
@@ -1008,13 +1015,68 @@ where
   S: LocalSource<C>,
 {
   source: S,
+  /// Whether this owner has already entered the source's teardown seam
+  /// ([`begin_source_close`](Self::begin_source_close) → [`Source::begin_close`]). It exists to make
+  /// that seam ENTERABLE EARLY while still entered EXACTLY ONCE — the two halves of the invariant the
+  /// widen unwind rests on.
+  ///
+  /// The seam used to sit at the very END of [`run`]'s teardown tail, which made it unreachable as an
+  /// ordering guarantee: a mid-reconcile terminal outcome retires the widen's roots and the tail then
+  /// reaps cookies and applies queued grant cleanup, so [`Source::end_sync`],
+  /// [`Source::disarm`] and [`Source::set_cover`] all ran BETWEEN a cancelled [`Source::arm`] and
+  /// `begin_close`. Trying to keep those chains source-free is a promise about a call graph that grows;
+  /// moving the seam AHEAD of them is a promise about one statement. So every terminal decision enters
+  /// the seam before it retires anything, and the tail enters it as its first act — this latch making
+  /// the second a no-op after the first (see [`begin_source_close`](Self::begin_source_close)).
+  ///
+  /// It is OWNER lifecycle state, not root state: no root record gains a field, a state, or a
+  /// transition, and the widen's roots stay exactly as recorded-and-disarmed as they were.
+  ///
+  /// It is also the ONE discriminator [`retire_salvage`](Self::retire_salvage) reads to decide
+  /// whether caller-owned state a mutator handed back is released at once or held to the end of the
+  /// teardown — which works only because every terminal decision enters the seam BEFORE it unwinds
+  /// anything. That was the claim this latch was introduced with; making it true at every terminal
+  /// mint, not just at the widen's retirement, is what makes the latch a sound reading of
+  /// "the owner is on its terminal path".
+  source_closing: bool,
+  /// Caller-owned state a [`Subsumer`] mutator removed and handed back rather than destroyed, held
+  /// until the teardown has discharged everything it owes.
+  ///
+  /// # Storage, not state
+  ///
+  /// Nothing ever reads this to decide anything — not its contents, not its emptiness. It is
+  /// written by exactly one method ([`retire_salvage`](Self::retire_salvage)) and read by exactly
+  /// one act per path (the release at the end of [`run`]'s tail, and the one in
+  /// [`drop`](Self::drop)). The decision it looks like it might carry — release now or hold — is
+  /// [`source_closing`](Self::source_closing)'s, and that latch already existed.
+  ///
+  /// # Why it is bounded
+  ///
+  /// It fills only while `source_closing` is set, and that latch is set exactly once, by the
+  /// decision to tear this owner down. So what accumulates here is one teardown's worth of
+  /// removals — the widen's retirement, the tail's queued grant cleanup, the tail's final drains —
+  /// and the owner is gone immediately after. On every LIVE path `retire_salvage` releases at the
+  /// call site and nothing lands here at all, which is the property
+  /// `a_live_path_defers_nothing_the_terminal_path_would_hold` pins: without it a future change
+  /// could defer forever and the growth would have no witness.
+  ///
+  /// "One teardown's worth" is a bound only because nothing a teardown does is repeatable by a
+  /// caller. Each of those removals converts state that already existed and is not replaced, so
+  /// their count is the owner's own live population. The one contributor that took INPUT — the
+  /// source-drain retry refusing public `Watch` requests — was the exception, and it is bounded at
+  /// its source instead: that drain CUTS the public mailbox before its first pass
+  /// ([`drain_owed_before_shutdown`](Self::drain_owed_before_shutdown)), so at most one mailbox's
+  /// worth of refusals can ever be placed here, however long the teardown runs or how hard a live
+  /// handle pushes. Retaining is not ordering: an unbounded retention would be a defect on its own
+  /// terms, with or without a caller destructor that unwinds.
+  deferred: Salvage<C, V, S::Handle>,
   subsumer: Subsumer<C, V, S::Handle>,
   epochs: EpochLedger,
   /// Each live subscription's admission gate, as the driver holds it: the caller's
   /// [`Filter`] plus this owner's own quarantine verdict on it
   /// ([`SubscriptionFilter`]). One entry per subscription, born and reclaimed with the
   /// subscription itself.
-  filters: HashMap<Subscription, SubscriptionFilter<C>>,
+  filters: Filters<C>,
   /// Set once this owner has had to **forget** a filter panic payload, which permanently
   /// retires its whole filter plane.
   ///
@@ -1056,13 +1118,13 @@ where
   /// until `try_send` accepts it, and [`try_emit`](Self::try_emit) suppresses further
   /// ordinary deliveries to a parked subscription (they are dominated by its `Rescan`), so
   /// a shed can never be lost to a full channel (no-silent-loss).
-  needs_rescan: BTreeMap<Subscription, ParkedRescan<C, V>>,
+  needs_rescan: ParkedRescans<C, V>,
   /// Parked debt owed to a still-UNCLAIMED subscription (its grant unresolved), kept
   /// APART from the offerable map: suppressed entries cost the flush and
   /// the retry timer nothing — an all-unclaimed retired cohort no longer burns
   /// full-map probes every tick. A `Cleanup::Claim` moves the entry into
   /// [`needs_rescan`](Self::needs_rescan); a `DropOrphan`/release removes it.
-  suppressed_rescan: BTreeMap<Subscription, ParkedRescan<C, V>>,
+  suppressed_rescan: ParkedRescans<C, V>,
   /// The subscriptions whose committed [`WatchGrant`] is still **in flight** — grant sent, not yet
   /// claimed or dropped (design driver-golden doc). A sub is inserted by
   /// [`on_watch`](Self::on_watch) the instant the grant send **succeeds**, and removed by exactly one
@@ -1212,6 +1274,193 @@ where
   _rt: PhantomData<R>,
 }
 
+/// The seam entry lives in its own impl block, bounded by nothing but the source, because
+/// [`Drop`](Owner::drop) is one of its callers: a `Drop` impl may carry no bounds the type itself does
+/// not declare (E0367), and [`Owner`] declares only `S: LocalSource<C>`. Keeping the entry callable
+/// under exactly that bound is what lets the destructor reach the ONE latched entry instead of
+/// open-coding a second one — and "exactly once" is a property of a single `mem::replace`, so a second
+/// copy of it would be a second latch.
+impl<C, V, R, S> Owner<C, V, R, S>
+where
+  S: LocalSource<C>,
+{
+  /// The owner's **one and only** entry into the source teardown seam
+  /// ([`Source::begin_close`]) — synchronous, non-blocking, and idempotent by the
+  /// [`source_closing`](Self::source_closing) latch, so the first caller enters it and every later
+  /// one is a no-op. THREE KINDS of caller exist, and each must be able to be first:
+  ///
+  /// - a **mid-reconcile terminal mint**, which enters the seam BEFORE it unwinds anything — the
+  ///   race that consumed the reply or read the signal gone ([`arm`](Self::arm),
+  ///   [`grow`](Self::grow), [`replace_racing_close`](Self::replace_racing_close),
+  ///   [`on_sync`](Self::on_sync)), and the failed widen's shared retirement tail
+  ///   ([`begin_close_then_retire_disarmed_roots`](Self::begin_close_then_retire_disarmed_roots));
+  /// - [`run`]'s teardown tail, as its FIRST act — the entry for every teardown that reached the
+  ///   loop without passing a reconcile terminal (a plain close command, dropped handles, a source
+  ///   drain), and a no-op for every one that did;
+  /// - [`Owner::drop`], for the two terminations that never reach that tail at all — the caller
+  ///   DROPPING the [`run`] future, and a panic unwinding through it. Both run owner code that calls
+  ///   the source ([`Source::end_sync`], once per still-pending cookie), and neither can await, so the
+  ///   destructor is the only place the seam can be entered for them. Without it those two paths
+  ///   produced ZERO entries while still calling the source — the "never zero" half of the invariant
+  ///   holding only for exits through the loop tail.
+  ///
+  /// "Exactly once" is not a nicety here: [`Source::begin_close`] is documented as a once-per-owner
+  /// initiation, so a second entry would be a contract violation against every binding — and the
+  /// latch is what lets the seam move EARLIER without becoming a second call. It holds across the
+  /// destructor for free: the tail's entry sets the latch and the destructor that follows it reads
+  /// `true`, so a normal exit still enters once, while a dropped or unwinding future finds `false` and
+  /// is the one and only entrant.
+  ///
+  /// The seam is initiation ONLY: [`join_close`](Source::join_close) — the bounded wait that
+  /// produces the quiescence verdict — stays at the end of the tail, after every owed `Rescan` is
+  /// delivered and every cookie reaped. The destructor's entry has no `join_close` after it at all,
+  /// which [`Source::begin_close`] documents as the abnormal-teardown shape: nothing awaited can
+  /// follow a synchronous drop, and the source's own `Drop` is what reclaims the rest.
+  ///
+  /// # Why the containment is HERE and not at the call sites
+  ///
+  /// [`Source::begin_close`] is a public extension point that cannot be required to be panic-free,
+  /// and every entry above stands ahead of work nothing downstream can redo: the tail's cookie
+  /// reaps, the bounded [`join_close`](Source::join_close), and the acknowledgement carrying its
+  /// verdict — the last two unreachable from [`Owner::drop`], which cannot await and is not given
+  /// the reply. An unwind out of the initiation therefore answers `close()` off a dropped sender as
+  /// [`Stopped`](crate::error::CloseError::Stopped) over a source teardown nobody waited for, which
+  /// is exactly the downgrade splitting initiation from the wait exists to prevent.
+  ///
+  /// That is owed at EVERY entry, not just the tail's, and the mid-reconcile mints are the ones a
+  /// per-call-site boundary keeps missing: they run inside a reconcile, so an unwind there escapes
+  /// `run` ahead of the reaps and the acknowledgement while the latch it already set stops
+  /// [`Owner::drop`] from retrying. Placing the boundary in the funnel makes the property hold for
+  /// every caller by construction, present and future, instead of by each site remembering.
+  ///
+  /// The latch is what makes containment SAFE rather than merely useful: it is set BEFORE the source
+  /// is called, so an initiation that unwinds has already latched and every later entrant is the
+  /// no-op it would have been. Containment cannot turn one panicking initiation into a second call
+  /// against a once-per-owner contract.
+  ///
+  /// Containment does not SILENCE the panic — the hook reports it the moment it is raised. All the
+  /// boundary decides is how far the unwind travels. Through
+  /// [`contain`](tributary_proto::unwind::contain) rather than a bare `catch_unwind` because the
+  /// caught PAYLOAD is foreign code too: disposing of it runs the panicking source's `Drop`, which
+  /// would escape at the same place to the same effect — and at the destructor's entry, where a
+  /// second unwind during an unwind is an immediate process ABORT.
+  fn begin_source_close(&mut self) {
+    // `replace` rather than a read-then-set: the latch and the call cannot be separated by anything,
+    // and the old value IS the "was I first" answer. The containment goes around the CALL, never
+    // around the latch — a panicking initiation must still count as the one entry.
+    if !core::mem::replace(&mut self.source_closing, true) {
+      let source = &mut self.source;
+      let _ = tributary_proto::unwind::contain(move || source.begin_close());
+    }
+  }
+
+  /// The **one disposal route** for caller-owned state a [`Subsumer`] mutator handed back instead of
+  /// destroying ([`Salvage`]): released here on a live path, held to the end of the teardown on the
+  /// terminal one.
+  ///
+  /// # Why the decision is not the call site's
+  ///
+  /// Every one of these releases runs caller `C`/`V` destructors, and a caller destructor is as
+  /// fallible as a caller [`Filter`] predicate. On the terminal path an unwind out of one costs
+  /// things nothing downstream can redo: the run tail's bounded [`join_close`](Source::join_close)
+  /// and the acknowledgement carrying its verdict are unreachable from a destructor, so a caller
+  /// `Drop` that unwinds ahead of them turns the source's honest quiescence result into a dropped
+  /// sender and a `Stopped` verdict. Leaving each site to remember that is the shape this exists to
+  /// remove: the sites are the abandoned-reconcile arms, they are many, and the removal at each of
+  /// them reads as bookkeeping rather than as caller code — which is exactly how the same mistake
+  /// kept being made in a different one of them.
+  ///
+  /// So the mutators hand their removals back `#[must_use]` — a site cannot ignore one — and this
+  /// is the only thing a site can hand one to. The reading is [`source_closing`](Self::source_closing),
+  /// which every terminal decision sets before it unwinds anything, so "the owner is tearing down"
+  /// is one bit rather than a property of each call site's control flow.
+  ///
+  /// # The cost of holding, stated where it is paid
+  ///
+  /// A caller `V` held past [`join_close`](Source::join_close) is a value the SOURCE might be
+  /// waiting on to quiesce — a caller value owning a handle onto the same resource. `join_close` is
+  /// a BOUNDED wait, so the worst case is a source that reports
+  /// [`NotQuiesced`](crate::error::CloseError) where it would otherwise have reported clean, and
+  /// `close()` carries that verdict honestly. It can never wedge: nothing here is awaited, and the
+  /// wait's bound is the source's own.
+  fn retire_salvage(&mut self, salvage: Salvage<C, V, S::Handle>) {
+    if self.source_closing {
+      self.deferred.absorb(salvage);
+    } else {
+      // A live path releases at the call site, exactly as it always did — the mutator has already
+      // returned, so an unwinding caller destructor leaves through a consistent engine rather than
+      // out of a half-applied mutation, and it still reaches the owner's destructor the same way.
+      drop(salvage);
+    }
+  }
+}
+
+/// The **one disposal route** for a [`Source`]-returned future the owner raced and is now done with
+/// — the losing future a close signal CANCELLED, and the winning one it has already consumed.
+///
+/// # Why the destruction has to leave the `select`
+///
+/// `select_biased!` binds each arm's future in an internal scope and **destroys every one of them
+/// before it runs the winning arm's handler body**. So a race whose close arm wins destroys the
+/// source future first, produces the terminal reading second, and reaches
+/// [`begin_source_close`](Owner::begin_source_close) third — with the destruction standing ahead of
+/// all of it.
+///
+/// That order matters because destroying a source future RUNS CALLER CODE. What the owner cancels
+/// is a value of the implementor's own opaque type: an `async fn` future holding whatever its body
+/// parked with, or a hand-written one with a `Drop` of its own — and the [`Source`] contract
+/// requires neither to be panic-free, exactly as it requires nothing of a [`Filter`] predicate or a
+/// `C`/`V` destructor. An audit that enumerates `Source` **calls** does not reach it: cancelling a
+/// `Source`-returned **future** is a different piece of caller code, running at a different instant.
+///
+/// So each race holds its source future in a slot that outlives the `select` (the `select` only
+/// BORROWS it) and hands the slot here once the winner is known. `Pin::set` destroys the future in
+/// place, so the slot costs no allocation and no `unsafe`.
+///
+/// # Why the containment is CONDITIONED, and on what
+///
+/// `terminal` is the reading the call site already computes for
+/// [`begin_source_close`](Owner::begin_source_close): the close arm won and a `CloseReply` is in
+/// hand, or the signal read gone. It is the same latch-conditioned shape
+/// [`retire_salvage`](Owner::retire_salvage) keeps, and it is conditioned for the same reason —
+/// only the terminal path has work behind it that nothing downstream can redo.
+///
+/// On the TERMINAL path an unwind out of the destruction escapes [`run`] carrying off the consumed
+/// reply, ahead of every cookie reap, the bounded [`join_close`](Source::join_close) and the
+/// acknowledgement — the last two unreachable from [`Owner::drop`], which cannot await and is not
+/// given the reply. `close()` would then answer [`Stopped`](crate::error::CloseError::Stopped) off a
+/// dropped sender over a source teardown nobody waited for.
+///
+/// On a LIVE path there is no reply, no acknowledgement owed and no wait to skip, and the
+/// cancellation sits beside an **uncontained** await on the very same future — a panic raised inside
+/// the source's own `poll` escapes `run` today and cannot be contained at all, since no boundary
+/// spans an await. Containing the drop there would bound nothing its neighbour does not already
+/// expose, so the live path destroys the future exactly as it did before this funnel existed and
+/// pays nothing.
+///
+/// Containment does not SILENCE the panic — the hook reports it the moment it is raised. All the
+/// boundary decides is how far the unwind travels. Through
+/// [`contain`](tributary_proto::unwind::contain) rather than a bare `catch_unwind` because the
+/// caught PAYLOAD is foreign code too: disposing of it runs the panicking implementor's `Drop`,
+/// which would escape at the same place to the same effect.
+///
+/// # The one race that does NOT route through here, stated plainly
+///
+/// [`run`]'s own [`Source::next`] arm. Its cancellation is the same act with the same terminal
+/// sub-case — a close arm holding a reply while the pumped event future is destroyed — but the
+/// future cannot be lifted out of that `select`: the command and sync arms `await` against
+/// `&mut owner` inside their handler bodies, and the macro's destroy-before-the-handler order is
+/// exactly what releases the `&mut owner.source` borrow in time for them. Lifting it would mean
+/// hoisting every one of those handlers out of the macro. So the loop keeps the destruction the
+/// `select` gives it.
+fn retire_raced_source_future<F>(terminal: bool, mut raced: core::pin::Pin<&mut Option<F>>) {
+  if terminal {
+    let _ = tributary_proto::unwind::contain(move || raced.set(None));
+  } else {
+    raced.set(None);
+  }
+}
+
 impl<C, V, R, S> Drop for Owner<C, V, R, S>
 where
   S: LocalSource<C>,
@@ -1222,22 +1471,63 @@ where
   /// empty after draining owed Rescans; this covers every panic path at once, so a retained
   /// [`WatchView`] never keeps advertising subscriptions whose owner task and source have died (the
   /// stale-read-plane mode the teardown publish prevents — design §5). Drop runs before the owner's
-  /// fields drop, so `self.subsumer` is still alive; [`publish_empty`](Subsumer::publish_empty) is a
-  /// single synchronous `arc_swap` store that runs no caller code, so it is idempotent (the normal
-  /// path's double publish is a no-op) and cannot double-panic while unwinding. Owed Rescans cannot
-  /// be drained mid-unwind and are necessarily lost on a panic; emptying the plane is the achievable
-  /// guarantee.
+  /// fields drop, so `self.subsumer` is still alive; installing the empty snapshot
+  /// ([`swap_in_empty`](Subsumer::swap_in_empty)) is a single synchronous `arc_swap` swap that runs
+  /// no caller code, so it is idempotent (the normal path's double publish is a no-op) and cannot
+  /// itself unwind. RELEASING what it displaces is a separate matter and is contained below. Owed
+  /// Rescans cannot be drained mid-unwind and are necessarily lost on a panic; emptying the plane is
+  /// the achievable guarantee.
+  ///
+  /// It is also the TEARDOWN SEAM's third entry point, and the only one either of its two terminations
+  /// has. [`run`]'s tail — where the seam is entered as the opening act — is reached by exits through
+  /// the loop; a caller that drops the [`run`] future, and a panic unwinding through it, reach this
+  /// destructor instead and nothing else. Yet both still call the source, through the very reap below
+  /// ([`Source::end_sync`]), so leaving the seam to the tail left those two paths issuing `Source`
+  /// calls with ZERO `begin_close` behind them — against a contract that specifies exactly one — and
+  /// re-created the forbidden pre-seam re-entry whenever the dropped future was cancelled mid-`arm` or
+  /// mid-`replace`. The source's own `Drop` cannot stand in for it: the owner's fields drop only AFTER
+  /// this body has run, so it is strictly behind every callback here.
   fn drop(&mut self) {
-    // The state-safety operation comes FIRST, before any fallible or caller-defined work.
-    // `publish_empty` is a single synchronous `arc_swap` store that runs no caller code, so it
-    // always succeeds; the reap below calls `LocalSource::end_sync`, which is a PUBLIC extension
-    // point whose contract requires synchronous fire-and-forget behavior but cannot require
-    // panic-freedom. Reaping first meant one panicking `end_sync` implementation left the read plane
-    // published: on an ordinary cancellation a retained `WatchView` kept advertising subscriptions
-    // whose owner was gone, and during an unwind the second panic aborted the process before the
-    // plane was ever cleared. Ordering it first makes the guarantee this destructor exists for
-    // unconditional.
-    self.subsumer.publish_empty();
+    // The state-safety operation comes FIRST, before any fallible or caller-defined work: the SWAP
+    // that installs the empty read plane. It is a single synchronous `arc_swap` swap that runs no
+    // caller code, so it always succeeds; the seam and the reap below both call `LocalSource`
+    // methods, PUBLIC extension points whose contract requires synchronous fire-and-forget behavior
+    // but cannot require panic-freedom. Reaping first meant one panicking `end_sync` implementation
+    // left the read plane published: on an ordinary cancellation a retained `WatchView` kept
+    // advertising subscriptions whose owner was gone, and during an unwind the second panic aborted
+    // the process before the plane was ever cleared. Ordering it first makes the guarantee this
+    // destructor exists for unconditional.
+    //
+    // What the swap DISPLACES is why this is a swap and not a store, and it is the surprising half:
+    // the displaced publication owns radix nodes holding caller `C` keys and `V` values, so
+    // RELEASING it runs caller destructors — and it can be their last owner, because a mutation that
+    // removed a value from the authoritative trees leaves it alive in the published snapshot alone
+    // until the next publish, which is exactly the state a caller callback that unwound out of a
+    // subsumer mutator leaves behind. A store performs that release inside the install, i.e. in
+    // front of everything below, where an unwinding caller `Drop` would skip the seam and every reap
+    // and — on the unwind path this destructor also runs on — abort the process outright. The
+    // release is therefore held here as a value and made LAST, behind every obligation this body
+    // has, contained.
+    let displaced = self.subsumer.swap_in_empty();
+    // THE SEAM — after the read plane is empty, BEFORE the first `Source` callback below it, and
+    // with nothing fallible in front of it at all: the only statement above is the infallible swap.
+    // The ordering against the plane is unchanged and deliberately so: the swap runs no caller code,
+    // while `begin_close` is a public extension point like `end_sync`, so putting it ahead of the
+    // swap would reintroduce exactly the "one panicking implementation leaves the read plane
+    // published" mode the publish-first rule exists to prevent. Below the swap and above the reaps
+    // is the one position that keeps both properties.
+    //
+    // Entered through [`begin_source_close`](Self::begin_source_close) so the `source_closing` latch —
+    // not this call site — decides whether the source sees anything: a normal exit already entered the
+    // seam in `run`'s tail, and this is then a no-op, while a dropped or unwinding future finds the
+    // latch unset and is the sole entrant. That is how the destructor can be unconditional without ever
+    // being a SECOND `begin_close`.
+    //
+    // The containment this needs lives INSIDE that funnel, around the source call and behind the
+    // latch, so no site can enter the seam without it: a panic escaping HERE would skip every cookie
+    // reap below — and abort the process outright when this destructor is itself running on an
+    // unwind. A second boundary at this call site would bound nothing the funnel's does not.
+    self.begin_source_close();
     // Best-effort reap of any cookie still pending — a panic from a caller
     // callback (a `Filter`) unwinds through here, bypassing the normal-exit
     // `reap_all_pending_syncs`, and the marker files must not survive.
@@ -1260,6 +1550,40 @@ where
         source.end_sync(pending.root, &pending.cookie_key);
       });
     }
+    // The other half of emptying the plane, and the LAST thing this body does: releasing what the
+    // swap displaced. Its position is what protects the work above it, because containment alone
+    // cannot. [`contain`](tributary_proto::unwind::contain) catches the FIRST panic — but while an
+    // unwind is leaving a panicking caller `C`/`V` destructor, drop glue carries on destroying the
+    // remaining radix nodes and fields of that same publication, and a SECOND caller destructor
+    // that panics there ABORTS the process before the containment ever regains control. One
+    // snapshot is enough to reach it: the interrupted-mutator state this release exists for — a
+    // caller callback that unwound out of a subsumer mutator between its commit and its publish —
+    // can strand SEVERAL removed entries at once, so several such values can be reachable in the
+    // publication freed here.
+    //
+    // Short of wrapping every caller value in a boundary of its own, that abort cannot be
+    // prevented; what can be arranged is that it costs nothing that was owed. With the release
+    // last, an abort out of it can no longer skip the seam entry or a single cookie reap, because
+    // both have already happened. Nothing is owed past this line: only the owner's own field drops
+    // follow, and `subsumer`, `filters` and `source` all hold caller-defined state that can abort
+    // this destructor the same way regardless of what it does about the read plane.
+    //
+    // The containment stays, because ONE panicking caller destructor should still be survivable: a
+    // `C`/`V` `Drop` is as fallible as `begin_close`, and this destructor runs on the owner's panic
+    // path as well as its normal one, where an escaping unwind is an immediate process abort rather
+    // than a contained failure. The read-plane guarantee pays nothing for the position either — the
+    // SWAP is what empties the plane and it ran first, so all this frees is the old contents.
+    //
+    // The displaced publication is not the only caller-owned state that reached this position: a
+    // terminal reconcile's abandoned reservation, and every record and value the roots it retired
+    // gave up, were handed back rather than destroyed and have been waiting here
+    // ([`retire_salvage`](Self::retire_salvage)). They are the same kind of thing — caller
+    // destructors with nothing owed behind them — so they are released in the SAME act, at the same
+    // position, under the same containment, rather than at a second one that would have to be kept
+    // ordered against this.
+    let mut released = core::mem::take(&mut self.deferred);
+    released.keep_publication(displaced);
+    let _ = tributary_proto::unwind::contain(move || drop(released));
   }
 }
 
@@ -1274,12 +1598,48 @@ enum Flow {
   /// Break out to teardown, carrying the close acknowledgement and the source-drain flag.
   Break {
     /// The close reply to acknowledge after teardown, or [`None`] when the break was a dropped
-    /// last handle or a source drain (nobody to confirm to).
+    /// last handle or a source drain (nobody to confirm to). A dropped last handle reaches this two
+    /// ways: the loop's own command arm, once the mailbox reads closed AND drained, and a RECONCILE
+    /// observing the close signal gone mid-flight ([`Teardown::HandlesGone`]) — the second carries no
+    /// reply for the same reason the first does not.
     closing: Option<CloseReply>,
     /// `true` only on a **source drain** (`next` yielded `None` with a consumer still attached),
     /// which owes that consumer every parked Rescan before the stream ends.
     drain_owed: bool,
   },
+}
+
+/// Why a reconcile ended the [`run`] loop instead of settling — [`Owner::on_watch`]'s teardown
+/// verdict, which [`Owner::dispatch_command`] turns into the one [`Flow::Break`] the loop's own arms
+/// produce. It exists because the two teardown shapes owe the break DIFFERENT acknowledgements, and
+/// an `Option<CloseReply>` alone cannot say which: [`None`] would read as "settled" rather than "no
+/// one is left to acknowledge".
+///
+/// Both come off the ONE dedicated close signal, mid-reconcile, and both mean the same thing about
+/// what may happen next: nothing of the owner's own. No queued command may be dispatched, and no
+/// [`Source`] call issued for any root, between the reconcile's cancelled source future and the
+/// source's own teardown seam — [`begin_close`](Source::begin_close), then the bounded
+/// [`join_close`](Source::join_close), then `Drop`, which is where the [`Source`] contract's
+/// cancellation clause reclaims what that future may have started (see [`RestoreTerminal`]).
+///
+/// **That window is empty because the seam MOVED into it, not because the unwind avoids the source.**
+/// It does not, and cannot: retiring a root with a pending sync reaches
+/// [`Source::end_sync`] through the shared no-silent-loss primitive, and [`run`]'s tail then reaps the
+/// remaining cookies and applies queued grant cleanup ([`Source::disarm`], [`Source::set_cover`],
+/// `end_sync` again). So [`begin_close`](Source::begin_close) is entered FIRST — by
+/// [`Owner::begin_close_then_retire_disarmed_roots`] at the terminal decision, and by the tail as its
+/// opening act if no reconcile got there first, exactly once either way
+/// ([`Owner::begin_source_close`]) — which puts every one of those calls on the far side of the seam
+/// where each is the fire-and-forget request its own contract promises.
+enum Teardown {
+  /// A close was CONSUMED mid-reconcile: its reply rides back to be acknowledged after teardown, so
+  /// `close()` is answered by the teardown it asked for instead of by a dropped sender.
+  CloseRequested(CloseReply),
+  /// Every handle went away mid-reconcile: the break carries no acknowledgement, because the signal
+  /// that closed is the one every `close()` caller would have had to ride. Nothing to answer, and —
+  /// unlike the loop's own dropped-handles arm, which breaks only once the mailbox has DRAINED —
+  /// nothing more to dispatch first.
+  HandlesGone,
 }
 
 /// [`Owner::on_sync`]'s verdict for the [`run`] loop. The cookie write ([`Source::begin_sync`]) is
@@ -1319,16 +1679,32 @@ enum SyncStep<C> {
 /// It rides the `Err` channel because every variant ABANDONS the reconcile, leaving the committing
 /// paths (`Ok(sub)`) untouched: [`Failed`](Self::Failed) is the ordinary [`WatchError`] each
 /// pre-existing exit already returned — a [`From`] impl keeps those sites, and `canonicalize_key`'s
-/// `?`, verbatim — and [`CloseRequested`](Self::CloseRequested) diverts to teardown.
+/// `?`, verbatim — while [`CloseRequested`](Self::CloseRequested) and
+/// [`HandlesGone`](Self::HandlesGone) both divert to teardown ([`Teardown`]), differing only in
+/// whether anyone is left to acknowledge it.
 #[derive(Debug)]
 enum ReconcileStop {
   /// The reconcile failed: the error for the `watch()` caller.
   Failed(WatchError),
-  /// A close won the race while an in-place widen `replace` was in flight: its consumed
-  /// [`CloseReply`] rides back so [`Owner::dispatch_command`] hands the [`run`] loop the same
-  /// [`Flow::Break`] its own close arm produces. The widen is abandoned and the `watch()` caller's
-  /// dropped reply surfaces `Closed`.
+  /// A close won the race while an in-place widen `replace`, or a failed widen's re-arm, was in
+  /// flight: its consumed [`CloseReply`] rides back so [`Owner::dispatch_command`] hands the [`run`]
+  /// loop the same [`Flow::Break`] its own close arm produces. The widen is abandoned and the
+  /// `watch()` caller's dropped reply surfaces `Closed`.
   CloseRequested(CloseReply),
+  /// Every handle went away mid-reconcile, at any of the THREE places the widen can find it: a failed
+  /// widen's restore re-arming ([`RestoreTerminal::HandlesGone`]), and either of the in-place widen's
+  /// two [`replace`](Source::replace) races ([`ReplaceStep::HandlesGone`] — the initial retarget and
+  /// the divergence rollback alike). A teardown break with NO acknowledgement, not a failed watch. It
+  /// is a distinct variant rather than a `Failed(WatchError::Closed)` precisely because the difference
+  /// is the [`run`] loop's: a failed watch merely replies and the loop keeps going — pruning abandoned
+  /// barriers, dispatching whatever is still BUFFERED in the closed mailbox, and calling the source
+  /// again after the reconcile cancelled an arm or a retarget — whereas this exits the loop before any
+  /// of that can happen.
+  ///
+  /// The `watch()` caller is not owed a distinction: no handle is left, so no `watch()` future can
+  /// still be waiting (it borrows the handle it sent on), and a dropped reply reads as `Closed`
+  /// exactly as the error did.
+  HandlesGone,
 }
 
 impl From<WatchError> for ReconcileStop {
@@ -1343,14 +1719,153 @@ impl From<WatchError> for ReconcileStop {
 enum ReplaceStep<C, H> {
   /// A [`CloseReply`] arrived on the dedicated close signal: thread it back to teardown.
   Close(CloseReply),
-  /// The close channel closed — every handle is gone. Like [`SyncStep::Canceled`], that is an
-  /// ABANDON rather than a threaded close: no one is left to acknowledge, and the command channel —
-  /// whose sender drops in lockstep with the close sender — stays the dropped-handles teardown
-  /// signal, exactly as [`on_sync`](Owner::on_sync) leaves it.
+  /// The close channel closed — every handle is gone. There is no reply to thread and nobody to
+  /// acknowledge, so unlike [`Close`](Self::Close) it carries nothing; but it is still TERMINAL, and
+  /// both call sites raise it as [`ReconcileStop::HandlesGone`] so the [`run`] loop breaks on it.
+  ///
+  /// It is deliberately NOT the abandon-and-keep-looping that [`SyncStep::Canceled`] is. That one
+  /// reclaims its cancelled `begin_sync` BY NAME ([`Source::cancel_sync`] on the token the owner
+  /// minted), so nothing of the source's is left unnameable and the loop may safely go on. A dropped
+  /// [`replace`](Source::replace) has no such pair: it is not cancel-abortive — the binding may still
+  /// commit the retarget — so the owner must reach the teardown seam before it asks the source
+  /// anything else (see [`Teardown`]).
   HandlesGone,
   /// The retarget finished: the armed root it committed, or the error that falls through to
   /// release-and-rearm.
   Replaced(Result<Armed<C, H>, WatchError>),
+}
+
+/// A failed widen's [`restore_disarmed_roots`](Owner::restore_disarmed_roots) **terminal
+/// outcome**: a state of the WHOLE restore, not one root's re-arm verdict. Both conditions are
+/// read off the ONE dedicated close signal, both are read ATOMICALLY WITH every re-arm — in the
+/// restore's own [`rearm_racing_close`](Owner::rearm_racing_close) race, which is why a probe alone
+/// would not do (below) — and either ends the restore where it is found: the source teardown seam
+/// entered, then every root still awaiting restoration retired, and not one further re-arm issued for
+/// any of them.
+///
+/// The seam comes FIRST because the retirement is not source-free — it reaches [`Source::end_sync`]
+/// for a root carrying a pending sync, and [`run`]'s tail reaches `end_sync`,
+/// [`disarm`](Source::disarm) and [`set_cover`](Source::set_cover) after it — so the only way to keep
+/// a cancelled [`Source::arm`] from being followed by a source call is to have already told the source
+/// to wind down (see [`Owner::begin_close_then_retire_disarmed_roots`], and [`Teardown`] for the whole
+/// window).
+///
+/// Neither can be answered by asking the source again, and issuing an arm under either is the
+/// hazard, not merely a waste:
+///
+/// - a [`CloseReply`] in hand is a caller waiting on bounded teardown. The close signal is bounded
+///   at ONE slot and drains as it is consumed, so an arm issued after that reply was taken has NO
+///   close left to preempt it — a source that never returns wedges the [`run`] loop with the reply
+///   undelivered — and, worse, a SECOND close arriving meanwhile can be consumed by that arm,
+///   displacing the reply already held and breaking first-close-wins. Which is why a held reply is
+///   terminal rather than a "do not retry" policy: a policy still arms.
+/// - the signal CLOSING is every handle gone. Nothing will ever answer a close race again, so an
+///   arm issued past that point has nothing left able to interrupt it: a stalled source pins the
+///   owner and its native resources for good. Only returning to the [`run`] loop starts teardown,
+///   and this outcome BREAKS it there ([`Teardown::HandlesGone`]) rather than reporting a failed
+///   watch the loop would keep running past — past a cancelled arm, into whatever commands the
+///   closed mailbox still holds buffered.
+///
+/// **A non-blocking probe cannot establish either condition, however early or often it is taken.**
+/// It only reads the signal as of the instant it runs, and the generic [`arm`](Owner::arm) answers
+/// a signal that closed AFTER that instant by re-issuing an UN-RACED [`Source::arm`] — correct for
+/// an ordinary reconcile, which owes its caller a verdict, and exactly wrong here, where the
+/// teardown is owed a prompt exit. So a closure landing between a probe and the arm, after a
+/// retry's pace resolved on its timer, or while a raced arm is already pending would each leave the
+/// restore arming with the roots it already released merely recorded-and-disarmed. All three land on
+/// ONE reading instead: [`rearm_racing_close`](Owner::rearm_racing_close) maps the close signal's
+/// every answer — a reply, or the signal gone — straight to a terminal, in the same race as the arm
+/// it would otherwise issue.
+enum RestoreTerminal {
+  /// A close was consumed — at the restore's per-root probe, at its own
+  /// [`rearm_racing_close`](Owner::rearm_racing_close) arm race, or at a retry's pace. Its reply
+  /// rides back so `close()` is answered rather than left waiting out a widen's unwind, and rides
+  /// back UNCHANGED: no later close displaces it.
+  Closed(CloseReply),
+  /// Every handle is gone. An ABANDON rather than a threaded close — nobody is left to acknowledge a
+  /// reply — but NOT therefore an ordinary failed watch: it is a no-ack TEARDOWN
+  /// ([`Teardown::HandlesGone`]), which is what keeps the [`run`] loop from continuing past a
+  /// cancelled arm into a still-buffered command.
+  ///
+  /// It is deliberately NOT what [`ReplaceStep::HandlesGone`] and [`grow`](Owner::grow)'s
+  /// closed-channel arm do with the same reading, which is to fail the watch `Closed` and let the
+  /// loop drain its mailbox as it always has. Those cancel a [`replace`](Source::replace)/
+  /// [`grow`](Source::grow) against a root whose handle the owner still HOLDS: whatever the cancelled
+  /// call did or did not apply, the owner can still name and release it, and neither call mints
+  /// anything. A cancelled [`Source::arm`] is the one that can leave the source holding a watch the
+  /// owner has NO handle for — nameable again only when the source is dropped (the contract's
+  /// cancellation clause) — so it is the one reading whose unwind must reach the source teardown seam
+  /// before it reaches the source at all
+  /// ([`begin_close_then_retire_disarmed_roots`](Owner::begin_close_then_retire_disarmed_roots)).
+  HandlesGone,
+}
+
+impl RestoreTerminal {
+  /// The reconcile verdict a terminal restore outcome produces. It OUTRANKS the failure that sent
+  /// the widen into the restore, for both outcomes and for two different reasons.
+  ///
+  /// A consumed reply must ride back because dropping it answers the `close()` caller with a LIE.
+  /// (Not, as this doc long claimed, because `close()` would hang: [`CloseReply`] is a `oneshot`
+  /// sender, so dropping it CANCELS the caller's receiver and `close()` resolves promptly — as
+  /// `Err(CloseError::Stopped)`. That is the hazard. The owner is NOT stopped: at the instant that
+  /// reply is consumed it is mid-unwind, with the widen's roots still to retire, the read plane still
+  /// published, and the source's teardown at most INITIATED — its bounded
+  /// [`join_close`](Source::join_close) is awaited by [`run`]'s tail, and only after every owed
+  /// `Rescan` is delivered and every cookie reaped. A caller told `Stopped` may drop the runtime or
+  /// rebuild a watcher over a source that is still live, and the source's own quiescence verdict —
+  /// which a real ack carries — is never produced.)
+  ///
+  /// Every handle being gone outranks it because the failure is now moot: there is no `watch()`
+  /// caller to report it to, and reporting it as a failure is precisely what lets the [`run`] loop
+  /// carry on (see [`ReconcileStop::HandlesGone`]).
+  fn into_stop(self) -> ReconcileStop {
+    match self {
+      Self::Closed(close_reply) => ReconcileStop::CloseRequested(close_reply),
+      Self::HandlesGone => ReconcileStop::HandlesGone,
+    }
+  }
+}
+
+/// How one disarmed root's re-arm ([`rearm_disarmed_root`](Owner::rearm_disarmed_root)) ended,
+/// carrying only OWNED data out of its retry loop — the discipline [`SyncStep`] and
+/// [`ReplaceStep`] keep. The three outcomes are distinct because the restore owes each a different
+/// thing: rebind, retire this one, or stop entirely.
+enum RearmStep<C, H> {
+  /// Re-armed: the fresh handle, and the canonical key the source committed — which the caller
+  /// still compares against the root's own, since a divergent one cannot be cleanly rebound.
+  Armed(H, Vec<C>),
+  /// Refused, and no wait can change that: a fault outside the retryable capacity class, or a
+  /// capacity refusal that outlived [`RESTORE_RETRY_BUDGET`]. Retire the root, exactly as the
+  /// single pre-retry attempt retired it — an expired budget must report what a zero budget did,
+  /// never something softer — and carry on to the remaining roots. The refusal itself is discarded
+  /// here as it always was: the root's fate does not depend on which fault ended it.
+  Refused,
+  /// TERMINAL for the whole restore, found here rather than at the per-root probe. No further
+  /// source call may be issued for ANY root.
+  Terminal(RestoreTerminal),
+}
+
+/// Which arm of the restore's OWN [`rearm_racing_close`](Owner::rearm_racing_close) race resolved —
+/// ONE attempt of [`rearm_disarmed_root`](Owner::rearm_disarmed_root)'s retry loop — carrying only
+/// OWNED data out of the `select` so both borrows it takes (`&self.closes`, `&mut self.source`) are
+/// released before the winner is used, the discipline [`SyncStep`] and [`ReplaceStep`] keep.
+///
+/// It is deliberately NOT [`RearmStep`], which is the loop's verdict rather than one turn of it: an
+/// attempt's refusal must still carry the [`WatchError`] whose fault kind decides whether there IS
+/// another turn ([`is_capacity_refusal`]). Only the verdict discards it.
+enum RearmAttempt<C, H> {
+  /// The re-arm was admitted, validated live, and its canonical key adopted (the choke point's
+  /// post-arm half, [`adopt_armed`](Owner::adopt_armed)): the fresh handle and the key the source
+  /// committed.
+  Armed(H, Vec<C>),
+  /// The source refused this attempt, or reported an arm the liveness probe found dead. The error
+  /// rides back ONLY so the retry loop can triage its kind — *ask again shortly* against *this root
+  /// is dead* — and is dropped the moment that verdict is taken.
+  Refused(WatchError),
+  /// The close signal answered the race: TERMINAL for the whole restore ([`RestoreTerminal`]), read
+  /// off the SAME race as the arm rather than before it, so no closure can slip between the two and
+  /// be answered by an un-raced re-issue.
+  Terminal(RestoreTerminal),
 }
 
 /// The owner's single `select!` loop (design driver-golden doc): reconcile a command,
@@ -1715,6 +2230,38 @@ where
     }
   };
 
+  // THE SOURCE TEARDOWN SEAM, and the FIRST thing the tail does — see `begin_source_close`, which is
+  // idempotent, so a mid-reconcile terminal outcome that already entered it (a failed widen's unwind,
+  // which must enter it before retiring anything) makes this a no-op and no source sees a second
+  // `begin_close`.
+  //
+  // It sits here rather than at the end of the tail because everything below it CALLS THE SOURCE, and
+  // by the time a terminal reconcile arrives here a `Source::arm` future has already been cancelled by
+  // the close signal:
+  //
+  // - `reap_all_pending_syncs` → `Source::end_sync`, once per still-pending cookie;
+  // - the grant-cleanup drains → `release_subscription` → `Source::disarm` /
+  //   `Source::set_cover` / (via `retire_syncs_of_subscription`) `Source::end_sync`;
+  // - the source-drain path's `drain_owed_before_shutdown`, which drains grant cleanup on every one of
+  //   its retry passes and so reaches the same three.
+  //
+  // Every one of those is synchronous and fire-and-forget by its own contract — idempotent, tolerant,
+  // best-effort at an abnormal teardown — so each is legitimate on the far side of the initiation, and
+  // is where it must be relative to the seam rather than merely where it happened to be. Only
+  // `join_close` — the BOUNDED WAIT that produces the quiescence verdict — stays at the end, after the
+  // owed Rescans are delivered and the cookies reaped, which is the whole point of splitting
+  // initiation from the wait.
+  //
+  // The unwind boundary this entry needs lives INSIDE `begin_source_close`, around the source call
+  // and behind the latch, because the mid-reconcile mints owe it exactly as this does and a boundary
+  // written here would cover only this one. What it buys here is the two things the destructor
+  // cannot: an unwind out of the initiation would escape `run` ahead of EVERY reap, the bounded
+  // `join_close`, and the acknowledgement carrying its verdict, and the destructor that runs next can
+  // make neither of the last two (it cannot await, and it is not given the reply) — so `close()`
+  // would resolve off a dropped sender as `Stopped` over a source teardown nobody waited for. A
+  // second boundary at this call site would bound nothing the funnel's does not.
+  owner.begin_source_close();
+
   // Reap every cookie still riding a pending sync: their callers will see the
   // dropped reply as `Closed`, but the marker FILES must not survive the owner
   // (their names are unique, so unreaped they accrue in the watched trees).
@@ -1780,12 +2327,20 @@ where
   // whose owner task and source are about to be gone: otherwise it keeps answering
   // `is_watched`/`covering` from the last snapshot, and a dedup caller (the indexer) skips
   // re-installing that coverage and silently misses changes after rebuilding a fresh watcher
-  // (design §5). It is a synchronous `arc_swap` store — the owner still never awaits the event
+  // (design §5). It is a synchronous `arc_swap` swap — the owner still never awaits the event
   // sender, so no-deadlock (III) holds.
-  owner.subsumer.publish_empty();
-  // The source lifecycle split. `begin_close` is the synchronous, non-blocking initiation — it
-  // starts the source winding down at the instant the owner decides to stop, and can block nothing
-  // — and `join_close` is the bounded wait that produces an HONEST quiescence result.
+  //
+  // The swap is only the first half. RELEASING what it displaces runs caller destructors — the
+  // displaced publication owns caller `C`/`V` values and can be their last owner — so that half is
+  // held back here as a value and made at the very END of this tail, contained. A store would fuse
+  // it into the install and run those destructors right here, in front of everything the tail still
+  // owes; the plane, meanwhile, is already empty the instant this line returns, which is what
+  // `close()` resolving must not outrun.
+  let displaced = owner.subsumer.swap_in_empty();
+  // The far half of the source lifecycle split, whose near half — the synchronous, non-blocking
+  // `begin_close` initiation — was entered at the TOP of this tail (or earlier still, by a
+  // mid-reconcile terminal), at the instant the owner decided to stop. `join_close` is the BOUNDED
+  // WAIT that produces an HONEST quiescence result, and it stays here, last.
   //
   // Awaiting it before the acknowledgement is the whole point. Publishing empty and replying `Ok`
   // while the source is merely DROPPED afterwards means the caller's `close()` resolves over a
@@ -1794,13 +2349,41 @@ where
   // marker files it wrote — and the source's `NotQuiesced` evidence, the strongest lifecycle fact
   // the lower layer produces, is discarded unread. So the reply now carries the source's verdict.
   //
+  // Waiting HERE rather than beside the initiation is also what keeps the wait honest about the work
+  // above it: every cookie reap and coverage release the tail issues has already been handed over, so
+  // the source's verdict covers them instead of racing them.
+  //
   // The default seam is immediately `Ok(())`, so a source with no native resources pays nothing.
-  owner.source.begin_close();
   let quiesced = owner.source.join_close().await;
   // Dropping `owner` (and its source) performs the orderly source teardown.
   if let Some(reply) = ack {
     let _ = reply.send(quiesced.map_err(CloseError::Source));
   }
+  // The other half of emptying the plane, and the LAST thing this tail does: releasing what the
+  // swap displaced. The bounded quiescence wait above and the acknowledgement carrying its verdict
+  // are both work nothing else can do — the destructor that runs next can perform neither, since it
+  // cannot await and is not given the reply — so a caller `C`/`V` destructor unwinding out of this
+  // release must not be able to reach past either of them. Containment alone does not buy that: it
+  // catches the FIRST panic, while drop glue leaving a panicking caller destructor carries on
+  // destroying the remaining radix nodes of the same publication, and a SECOND one that panics
+  // there ABORTS the process outright. A single interrupted mutator can strand several removed
+  // entries in the snapshot freed here, so more than one such value can be reachable at once.
+  // Ordering the release last is therefore what keeps that abort from costing anything: what used
+  // to stand behind it — a `close()` answered by a dropped sender over a source teardown nobody
+  // waited for, the exact shape splitting `begin_close` from `join_close` exists to prevent — is by
+  // then already done.
+  //
+  // The containment stays, because ONE panicking caller destructor should still be survivable: the
+  // panic is reported by the hook the moment it is raised, and this tail then returns normally
+  // instead of unwinding into whoever spawned the owner.
+  //
+  // Everything a terminal reconcile and this tail's own mutators handed back rather than destroyed
+  // ([`Owner::retire_salvage`]) is released in the SAME act: it is caller-owned state with exactly
+  // the same nothing owed behind it, and a second release position would only be one more thing to
+  // keep ordered against the wait and the acknowledgement.
+  let mut released = core::mem::take(&mut owner.deferred);
+  released.keep_publication(displaced);
+  let _ = tributary_proto::unwind::contain(move || drop(released));
 }
 
 /// How long the owner waits before re-attempting delivery of a parked per-subscription
@@ -1809,6 +2392,45 @@ where
 /// resuming consumer's next drained slot is also retried on the following command/event
 /// tick; this bounds the wait when the stream is otherwise idle.
 const RETRY: Duration = Duration::from_millis(25);
+
+/// How long a failed widen's [`restore_disarmed_roots`](Owner::restore_disarmed_roots) may keep
+/// re-offering a re-arm the source is refusing on CAPACITY before it gives up and retires the root
+/// as it always did. **One budget for the whole restore**, not one per root: a widen subsumes as
+/// many roots as it covers, and a per-root budget would multiply the owner's stall by that count.
+///
+/// The bound exists because the refusal it waits on may never clear: a teardown backlog is pinned
+/// by streams wedged on a dead mount, so an UNBOUNDED retry would convert a coverage loss on the
+/// widen's roots into an indefinite full-driver outage — no events, no commands, no syncs for
+/// anyone — which for most deployments is strictly worse than the loud retirement it replaces.
+///
+/// Why seconds, and why this many:
+///
+/// - it must span the actual blip. The widen just released its subsumed roots before the wider
+///   arm, so an instance-limit refusal is usually already clearing while the restore runs; at the
+///   [`RESTORE_RETRY_PACE`] below this budget samples that ~20 times.
+/// - it must sit INSIDE the lower layer's own transient-refusal envelope, since that is what has
+///   to clear: `tributary-fs` retries a failing cookie unlink from a 100ms base up to a 5s cap, so
+///   two seconds covers its first several backoff rounds without reaching the cap — past which a
+///   refusal has stopped looking transient at all.
+/// - it must not become the outage it prevents. Nothing else in the owner runs while the restore
+///   paces, so this is the ceiling on how stale the data plane can go for a widen that lost its
+///   arm. `close()` is NOT bound by it: every re-arm attempt and every pace is raced against the
+///   close signal, and either answer is TERMINAL there rather than something to re-issue past (see
+///   [`RestoreTerminal`]), so shutdown stays bounded by one pace plus one arm whatever the budget is
+///   — and a close already consumed is terminal before the restore starts, spending none of this
+///   budget at all.
+/// - any positive value strictly dominates the pre-retry behaviour, which is this budget at ZERO,
+///   and expiry falls back to exactly that behaviour — so a longer refusal is never mis-reported,
+///   only waited on for a bounded while first.
+const RESTORE_RETRY_BUDGET: Duration = Duration::from_secs(2);
+
+/// How long the restore waits between two capacity-refused re-arms of the same root — paced, not
+/// hot: the refusal is a resource bound clearing on someone else's schedule, so re-offering as
+/// fast as the loop can spin burns the owner's only thread and the source's admission path
+/// without making the budget arrive any sooner. Mirrors the lower layer's own base retry delay
+/// for a transient refusal (`Watcher`'s cookie-retry base), and divides [`RESTORE_RETRY_BUDGET`]
+/// into enough samples that a refusal clearing at any point inside it is caught promptly.
+const RESTORE_RETRY_PACE: Duration = Duration::from_millis(100);
 
 /// How many consecutive command-arm wins the [`run`] loop tolerates before forcing one
 /// non-blocking data-plane service — a `now_or_never` source poll plus a due-coalescer drain —
@@ -1968,6 +2590,22 @@ fn min_deadline(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
   }
 }
 
+/// Whether a [`WatchError`] is the source's **retryable capacity refusal**: a resource budget is
+/// exhausted, the request was declined without touching anything, and it will be admitted again
+/// once the budget frees ([`FaultKind::Capacity`](crate::FaultKind) — for the fs binding the
+/// per-user watch-instance limit, and its teardown-backlog bound).
+///
+/// The widen unwind is the one place that difference is load-bearing, and it reads it in TWO
+/// places: the in-place retarget triage refuses the widen on it BEFORE disarming anything, and the
+/// release-and-rearm restore retries on it instead of concluding the root is dead. Every other
+/// kind stays fatal there, deliberately — `Closed` fails every retry instantly, `Conflict` is a
+/// source-contract violation rather than a transient, and `Other` is a mixed bag holding
+/// persistent failures (EACCES at arm, a stream that could not be created or started), so
+/// retrying any of them buys nothing and costs the owner its budget.
+fn is_capacity_refusal(err: &WatchError) -> bool {
+  err.fault().is_some_and(|fault| fault.kind().is_capacity())
+}
+
 impl<C, V, R, S> Owner<C, V, R, S>
 where
   C: Ord + Clone,
@@ -1982,11 +2620,18 @@ where
   /// caller-reply commands ([`Watch`](Command::Watch)/[`Unwatch`](Command::Unwatch)); grant
   /// resolution moved to the dedicated [`cleanup_rx`](Self::cleanup_rx) channel.
   ///
-  /// It breaks to teardown on two signals, neither of them a close command (a close is never a
+  /// It breaks to teardown on three signals, none of them a close command (a close is never a
   /// command — it rides the dedicated [`closes`](Self::closes) channel): the dropped-last-handle
-  /// `Err`, and a close that [`on_watch`](Self::on_watch) THREADED back after winning the race
-  /// inside an in-flight in-place widen [`replace`](Source::replace) — that reply was consumed off
-  /// the close channel mid-reconcile, so this break is the one path that delivers it to teardown.
+  /// `Err`, and either [`Teardown`] that [`on_watch`](Self::on_watch) hands back after the dedicated
+  /// close signal answered mid-reconcile — a CONSUMED reply (won inside an in-flight in-place widen
+  /// [`replace`](Source::replace), or a failed widen's re-arm), which this break is the one path that
+  /// delivers to teardown, or the signal GONE during a failed widen's restore, which breaks with
+  /// nothing to acknowledge.
+  ///
+  /// That last one is why the mid-reconcile teardown cannot be reported as a failed watch: the `Err`
+  /// arm below fires only once the mailbox is closed AND DRAINED, so a loop that merely kept going
+  /// would dispatch every command still buffered in it — arming the source again after the restore
+  /// cancelled an arm, for callers that are all provably gone.
   async fn dispatch_command(
     &mut self,
     cmd: Result<Command<C, V>, async_channel::RecvError>,
@@ -1999,11 +2644,17 @@ where
         reply,
       }) => match self.on_watch(key, value, options, reply).await {
         None => Flow::Continue,
-        // A close won the race inside an in-flight in-place widen `replace`: break to teardown
-        // carrying its reply, exactly as the dedicated close arm — and `on_sync`'s threaded close —
-        // does. Consumer-initiated, so it owes no source-drain pass.
-        Some(close_reply) => Flow::Break {
+        // A close won the race inside an in-flight source call: break to teardown carrying its
+        // reply, exactly as the dedicated close arm — and `on_sync`'s threaded close — does.
+        // Consumer-initiated, so it owes no source-drain pass.
+        Some(Teardown::CloseRequested(close_reply)) => Flow::Break {
           closing: Some(close_reply),
+          drain_owed: false,
+        },
+        // Every handle went away mid-reconcile: the same orderly teardown the `Err` arm below drives,
+        // reached WITHOUT dispatching the rest of the mailbox first, and with nothing to confirm to.
+        Some(Teardown::HandlesGone) => Flow::Break {
+          closing: None,
           drain_owed: false,
         },
       },
@@ -2040,15 +2691,9 @@ where
         // The claim lifts the suppression: any debt parked while the grant was
         // unclaimed becomes OFFERABLE now (it was kept apart so it cost
         // the flush nothing until this moment).
-        if let Some(parked) = self.suppressed_rescan.remove(&sub) {
-          merge_max(
-            &mut self.needs_rescan,
-            sub,
-            parked.key,
-            parked.epoch,
-            parked.value,
-          );
-        }
+        let salvage =
+          ParkedRescans::promote(&mut self.suppressed_rescan, &mut self.needs_rescan, sub);
+        self.retire_salvage(salvage);
       }
       Cleanup::DropOrphan(sub) => {
         let _ = self.release_subscription(sub);
@@ -2096,18 +2741,23 @@ where
   /// the reply" orphan branch) is gone: the owner is running this reconcile, so it is alive, and the
   /// cleanup channel it keeps is open.
   ///
-  /// Returns the [`CloseReply`] of a close that won the race inside an in-flight in-place widen
-  /// [`replace`](Source::replace) (see [`replace_racing_close`](Self::replace_racing_close)), for
-  /// [`dispatch_command`](Self::dispatch_command) to turn into the [`Flow::Break`] the [`run`] loop's
-  /// own close arm produces — and [`None`] whenever the reconcile settled, which is every other case.
+  /// Returns the [`Teardown`] the dedicated close signal produced mid-reconcile — a CONSUMED
+  /// [`CloseReply`] (a close that won the race inside an in-flight in-place widen
+  /// [`replace`](Source::replace), or inside a failed widen's re-arm), or the signal GONE during a
+  /// failed widen's restore — for [`dispatch_command`](Self::dispatch_command) to turn into the
+  /// [`Flow::Break`] the [`run`] loop's own arms produce. [`None`] whenever the reconcile settled,
+  /// which is every other case, the ordinary failure included.
   async fn on_watch(
     &mut self,
     key: Vec<C>,
     value: V,
     options: WatchOptions<C>,
     reply: futures_channel::oneshot::Sender<Result<WatchGrant, WatchError>>,
-  ) -> Option<CloseReply> {
-    match self.reconcile_watch(&key, value, options).await {
+  ) -> Option<Teardown> {
+    // `key` and `value` are the caller's own, handed over with the request and owned HERE — the
+    // reconcile borrows them. That is what lets the two terminal arms below salvage them instead of
+    // letting them fall out of an unwinding reconcile frame ahead of the bounded wait.
+    match self.reconcile_watch(&key, &value, options).await {
       Ok(sub) => {
         // Hand the committed subscription back inside a grant carrying a clone of the owner's strong
         // cleanup sender.
@@ -2141,15 +2791,46 @@ where
         let _ = reply.send(Err(err));
         None
       }
-      // A close won inside an in-flight in-place widen `replace`: the widen is abandoned, so there is
+      // A close won inside an in-flight source call: the widen is abandoned, so there is
       // no subscription to grant and no grant to orphan. DROP the caller's reply rather than send on
       // it — a dropped sender is exactly what `watch()` reads as `Closed` (the same way an abandoned
       // held sync's caller sees it) — and hand the reply up to drive teardown.
       Err(ReconcileStop::CloseRequested(close_reply)) => {
         drop(reply);
-        Some(close_reply)
+        // TERMINAL: the reply rides back to a tail that still owes the bounded quiescence wait and
+        // the acknowledgement carrying its verdict, so the request's own caller key and value go
+        // through the same disposal every abandoned mutator removal does rather than being
+        // destroyed by this frame's exit (see `retire_salvage`).
+        self.retire_watch_request(key, value);
+        Some(Teardown::CloseRequested(close_reply))
+      }
+      // Every handle went away mid-reconcile: the widen is abandoned with nothing to grant, and
+      // nothing to acknowledge either. The caller's reply is DROPPED for the same reason as above —
+      // `watch()` reads it as `Closed`, and no `watch()` future can even be left to read it, since it
+      // borrows the handle whose loss is this outcome — and the teardown is handed up so the loop
+      // exits here rather than dispatching the commands still buffered behind this one.
+      Err(ReconcileStop::HandlesGone) => {
+        drop(reply);
+        // TERMINAL, exactly as the arm above: no reply to acknowledge, but the tail's bounded wait
+        // still stands behind this frame.
+        self.retire_watch_request(key, value);
+        Some(Teardown::HandlesGone)
       }
     }
+  }
+
+  /// Routes an abandoned `watch` request's own caller key and value through the one disposal route
+  /// ([`retire_salvage`](Self::retire_salvage)), so a terminal reconcile's caller destructors are
+  /// placed with every other one instead of running as this frame unwinds.
+  ///
+  /// It matters that these are the CALLER's: the key came off the wire in [`Command::Watch`] and the
+  /// value is the very object [`covering`](WatchView::covering) would have attributed events to, so
+  /// both are as likely to carry a hostile destructor as anything the engine holds.
+  fn retire_watch_request(&mut self, key: Vec<C>, value: V) {
+    let mut salvage = Salvage::new();
+    salvage.keep_key(key);
+    salvage.keep_value(value);
+    self.retire_salvage(salvage);
   }
 
   /// Handles a [`Command::Unwatch`]: release the subscription and reply. Synchronous — the unified
@@ -2191,7 +2872,7 @@ where
   async fn reconcile_watch(
     &mut self,
     key: &[C],
-    value: V,
+    value: &V,
     options: WatchOptions<C>,
   ) -> Result<Subscription, ReconcileStop> {
     let (interest, filter, debounce) = options.into_parts();
@@ -2242,7 +2923,61 @@ where
     // `Armed::canonical_key` and guards it with `fs_path_preserves_plan`, closing the residual
     // TOCTOU where the coordinate changes between this canonicalization and the arm.
     let canonical_key = self.source.canonicalize_key(key)?;
-    let key = canonical_key.as_slice();
+    // The caller's ADMISSION GATE, held in a slot this frame owns for exactly the reason the
+    // canonicalized key is: the reconcile below consumes it only where it COMMITS, and every other
+    // way out is a `Result` that says nothing about it. Owned by the reconcile itself, an
+    // uninstalled filter died with that frame — and a `Filter` boxes caller code holding whatever
+    // the caller likes, so the terminal exits ran an arbitrary caller destructor before this frame
+    // resumed, before [`join_close`](Source::join_close), and before the acknowledgement carrying
+    // its verdict. The slot ends the borrow at the call: a commit `take`s the gate out to install
+    // it, and whatever is still here afterwards was never installed and goes through the one
+    // disposal route with the key.
+    let mut uninstalled = Some(filter);
+    let settled = self
+      .reconcile_canonical_watch(
+        canonical_key.as_slice(),
+        value,
+        interest,
+        &mut uninstalled,
+        debounce,
+      )
+      .await;
+    // The canonicalized key is a SECOND caller-owned `Vec<C>` — the source built it out of the
+    // caller's own components, so its destructor is the caller's code exactly as the request key's
+    // is, and `abort_watch` salvaging an EQUAL copy (the reservation's) places that copy, not this
+    // one. It is borrowed for the whole reconcile, which is what a per-exit disposal would have to
+    // buy with a `C::clone` at every exit — on the terminal path above all, where a clone is one
+    // more caller call in front of the very wait it must not skip. So the reconcile is a call
+    // instead: the borrow ends when it returns, and the key goes through the one disposal route,
+    // unconditionally. On a live outcome that releases it here, exactly as the frame exit did; on a
+    // terminal one it is held behind the tail's bounded wait and the acknowledgement.
+    let mut salvage = Salvage::new();
+    salvage.keep_key(canonical_key);
+    // The gate travels with it, on exactly the same terms — present only when the reconcile
+    // committed nothing.
+    if let Some(filter) = uninstalled {
+      salvage.keep_filter(filter);
+    }
+    self.retire_salvage(salvage);
+    settled
+  }
+
+  /// The reconcile proper, on the source's canonical coordinate: plan (re-planning past any dead
+  /// covering root), arm, commit. Split out of [`reconcile_watch`](Self::reconcile_watch) so the
+  /// canonicalized key it borrows is owned by a frame that OUTLIVES every one of this body's
+  /// terminal exits — see the disposal note at the call.
+  ///
+  /// `filter` is the caller's admission gate in a slot the CALLER's frame owns, for the same
+  /// reason: every committing arm `take`s it out to install, and every other exit leaves it there,
+  /// so an uninstalled gate is never destroyed by this body. See the note at the call.
+  async fn reconcile_canonical_watch(
+    &mut self,
+    key: &[C],
+    value: &V,
+    interest: Interest,
+    filter: &mut Option<Filter<C>>,
+    debounce: Debounce,
+  ) -> Result<Subscription, ReconcileStop> {
     // Plan the watch, **re-planning past any dead covering root** so no subscription ever binds a
     // source-forgotten handle (the structural close of the dead-root-coverage class).
     // The owner loop is command-biased, so a `watch` queued while a dead root's terminal event is
@@ -2272,7 +3007,8 @@ where
           // The covering root is source-forgotten (dead): discard this plan's pending reservation,
           // retire the dead root (parking every subscriber's dominating terminal Rescan before its
           // state is freed), and re-plan — never binding a `Covered` subscription to a dead handle.
-          self.subsumer.abort_watch(&outcome);
+          let salvage = self.subsumer.abort_watch(&outcome);
+          self.retire_salvage(salvage);
           self.retire_root_with_terminal_rescan(covering);
           continue;
         }
@@ -2329,10 +3065,19 @@ where
         // must be set to `record` after the commit: `Some(cover)` for the fresh
         // survivors+newcomer antichain, `None` for the cancel-equivalent (full coverage).
         let record_cover = if outside_cover {
-          match self.subsumer.retained_cover_for(fs_root, Some(key)) {
+          // The recompute prunes cloned subscriber keys on its way to the antichain, and hands the
+          // pruned ones back rather than destroying them inside a reconcile a close can turn
+          // terminal at the awaited grow just below.
+          let mut pruned = Salvage::new();
+          let recomputed = self
+            .subsumer
+            .retained_cover_for(fs_root, Some(key), &mut pruned);
+          self.retire_salvage(pruned);
+          match recomputed {
             Some(cover) => {
               if let Err(stop) = self.grow(fs_root, &cover).await {
-                self.subsumer.abort_watch(&outcome);
+                let salvage = self.subsumer.abort_watch(&outcome);
+                self.retire_salvage(salvage);
                 return Err(stop);
               }
               Some(Some(cover))
@@ -2348,7 +3093,8 @@ where
               {
                 Some(root_key) => {
                   if let Err(stop) = self.grow(fs_root, &[root_key]).await {
-                    self.subsumer.abort_watch(&outcome);
+                    let salvage = self.subsumer.abort_watch(&outcome);
+                    self.retire_salvage(salvage);
                     return Err(stop);
                   }
                   Some(None)
@@ -2364,11 +3110,14 @@ where
         } else {
           None
         };
-        self.subsumer.commit_watch(&outcome, fs_root, key);
-        self.filters.insert(sub, SubscriptionFilter::new(filter));
+        let salvage = self.subsumer.commit_watch(&outcome, fs_root, key);
+        self.retire_salvage(salvage);
+        let salvage = self.filters.install(sub, Self::take_gate(filter));
+        self.retire_salvage(salvage);
         self.register_debounce(sub, debounce);
         if let Some(cover) = record_cover {
-          self.subsumer.set_retained_cover(fs_root, cover);
+          let salvage = self.subsumer.set_retained_cover(fs_root, cover);
+          self.retire_salvage(salvage);
         }
         Ok(sub)
       }
@@ -2377,7 +3126,8 @@ where
         let armed = match self.arm(key).await {
           Ok(armed) => armed,
           Err(stop) => {
-            self.subsumer.abort_watch(&outcome);
+            let salvage = self.subsumer.abort_watch(&outcome);
+            self.retire_salvage(salvage);
             return Err(stop);
           }
         };
@@ -2387,15 +3137,18 @@ where
         let (handle, fs_key) = armed;
         if !self.subsumer.fs_path_preserves_plan(&fs_key, &[]) {
           self.source.disarm(handle);
-          self.subsumer.abort_watch(&outcome);
+          let salvage = self.subsumer.abort_watch(&outcome);
+          self.retire_salvage(salvage);
           return Err(canonical_race().into());
         }
         // A fresh arm's handle is generation-unique (see `Source::Handle`), so it is absent from the
         // reverse index and `commit_watch`'s `by_handle` insert cannot clobber a live root's entry.
         // A contract-violating source is caught by the arm choke point's handle tripwire, whose
         // live-index half fires on ANY still-live alias before this commit is ever reached.
-        self.subsumer.commit_watch(&outcome, handle, &fs_key);
-        self.filters.insert(sub, SubscriptionFilter::new(filter));
+        let salvage = self.subsumer.commit_watch(&outcome, handle, &fs_key);
+        self.retire_salvage(salvage);
+        let salvage = self.filters.install(sub, Self::take_gate(filter));
+        self.retire_salvage(salvage);
         self.register_debounce(sub, debounce);
         Ok(sub)
       }
@@ -2417,9 +3170,11 @@ where
         // re-keys by handle remove-then-insert, so the surviving handle lands back
         // in `by_handle` under the WIDER key.
         //
-        // `replace` is atomic on failure, so ANY error — including the default
+        // `replace` is atomic on failure, so an error — including the default
         // "this source cannot widen in place" — falls through to the old dance with
-        // the old root's coverage untouched. Nothing has been disarmed yet.
+        // the old root's coverage untouched. Nothing has been disarmed yet, which is
+        // also what lets a capacity REFUSAL be answered on the spot instead (below):
+        // the one error class release-and-rearm would turn into lost coverage.
         // Capture the sole subsumed root's key BEFORE the retarget, so a
         // canonicalization race can be rolled back exactly.
         let in_place = match unwatch.as_slice() {
@@ -2440,26 +3195,51 @@ where
         // `retargeted` is `Some` only when the sole subsumed root's retarget
         // COMMITTED. A retarget that fails resolves `Err` → `None` and falls
         // through to release-and-rearm — the source left the old root's coverage
-        // untouched (atomic on failure), and nothing has been disarmed yet.
+        // untouched (atomic on failure), and nothing has been disarmed yet — with
+        // one triaged exception, the capacity refusal answered in place below.
         let retargeted = match in_place {
           Some((only, only_key)) => match self.replace_racing_close(only, key).await {
             ReplaceStep::Replaced(Ok(armed)) => Some((armed, only_key)),
+            // A capacity REFUSAL is not a failure to fall through on: the source declined to
+            // admit the retarget because a budget is exhausted, and release-and-rearm would
+            // disarm this very root and then ask that same exhausted budget for a fresh stream —
+            // so the refusal arrives again at the restore, where it reads as "the root is
+            // genuinely dead" and retires a healthy root. Nothing has been disarmed here (see
+            // the two notes above: `replace` is atomic on failure and the disarm loop is below),
+            // so failing the watch outright is refusal BEFORE mutation: no teardown, no coverage
+            // gap, and no `Rescan` owed to anyone. The caller retries the watch when it wants to.
+            ReplaceStep::Replaced(Err(err)) if is_capacity_refusal(&err) => {
+              let salvage = self.subsumer.abort_watch(&outcome);
+              self.retire_salvage(salvage);
+              return Err(err.into());
+            }
             ReplaceStep::Replaced(Err(_)) => None,
             // A close won while the retarget was in flight: abandon the widen (the
             // plan unwinds exactly as every other non-committing exit unwinds it)
             // and ride the reply back so the run loop tears down through its own
             // close path. The `watch()` caller's dropped reply surfaces `Closed`.
             ReplaceStep::Close(close_reply) => {
-              self.subsumer.abort_watch(&outcome);
+              let salvage = self.subsumer.abort_watch(&outcome);
+              self.retire_salvage(salvage);
               return Err(ReconcileStop::CloseRequested(close_reply));
             }
             // Every handle is gone, so there is no reply to thread and nobody to
-            // acknowledge: abandon the widen and fail the watch `Closed` — the
-            // error's own "every handle dropped" case — leaving the command channel
-            // to drive teardown, exactly as `on_sync` leaves it.
+            // acknowledge — but this is still a TERMINAL outcome, not a failed watch, and the
+            // difference is the [`run`] loop's (see [`ReconcileStop::HandlesGone`]). The dropped
+            // `replace` future is not cancel-abortive: the source may yet commit the retarget this
+            // reconcile is abandoning, so nothing of the owner's own may run before the seam. A
+            // `Failed(WatchError::Closed)` returns [`Flow::Continue`] instead, and the very next
+            // iteration prunes abandoned barriers (→ [`Source::end_sync`]) and dispatches whatever is
+            // still BUFFERED in the closed mailbox (→ [`Source::arm`], [`Source::replace`]) — every one
+            // of them ahead of the seam and over a coverage picture the source may be about to change
+            // underneath. So break instead: `dispatch_command` turns this into the same
+            // [`Flow::Break`] a dropped last handle produces, and the tail's
+            // [`begin_source_close`](Self::begin_source_close) is then the next `Source` interaction
+            // there is.
             ReplaceStep::HandlesGone => {
-              self.subsumer.abort_watch(&outcome);
-              return Err(WatchError::Closed.into());
+              let salvage = self.subsumer.abort_watch(&outcome);
+              self.retire_salvage(salvage);
+              return Err(ReconcileStop::HandlesGone);
             }
           },
           None => None,
@@ -2468,7 +3248,8 @@ where
           let handle = armed.handle();
           let fs_key = armed.canonical_key().to_vec();
           if self.subsumer.fs_path_preserves_plan(&fs_key, unwatch) {
-            self.commit_widen(&outcome, handle, &fs_key, sub, filter, debounce, &repointed);
+            let gate = Self::take_gate(filter);
+            self.commit_widen(&outcome, handle, &fs_key, sub, gate, debounce, &repointed);
             return Ok(sub);
           }
           // A canonicalization race: the retarget committed a key that does
@@ -2490,12 +3271,19 @@ where
               matches!(res, Ok(armed) if armed.canonical_key() == only_key.as_slice())
             }
             ReplaceStep::Close(close_reply) => {
-              self.subsumer.abort_watch(&outcome);
+              let salvage = self.subsumer.abort_watch(&outcome);
+              self.retire_salvage(salvage);
               return Err(ReconcileStop::CloseRequested(close_reply));
             }
+            // TERMINAL for exactly the reason the retarget's own handles-gone arm above is, and here
+            // the handle is left at the DIVERGENT wider key with the rollback abandoned mid-flight —
+            // so a `Failed` verdict would let the loop go on planning against a coverage picture that
+            // is wrong now and may change again. Break, and let the tail's seam be the next `Source`
+            // interaction.
             ReplaceStep::HandlesGone => {
-              self.subsumer.abort_watch(&outcome);
-              return Err(WatchError::Closed.into());
+              let salvage = self.subsumer.abort_watch(&outcome);
+              self.retire_salvage(salvage);
+              return Err(ReconcileStop::HandlesGone);
             }
           };
           if restored {
@@ -2507,7 +3295,8 @@ where
             // `only_key`). `replace` preserves the handle, so the subsumer still keys the sole root's
             // subscribers by `handle` — exactly the coordinate `rescan_live_root` enumerates.
             self.rescan_live_root(handle);
-            self.subsumer.abort_watch(&outcome);
+            let salvage = self.subsumer.abort_watch(&outcome);
+            self.retire_salvage(salvage);
             return Err(canonical_race().into());
           }
           // The rollback did not restore the original coverage — it diverged
@@ -2519,7 +3308,8 @@ where
           // overlap checks (never a silent strand).
           self.retire_root_with_terminal_rescan(handle);
           self.source.disarm(handle);
-          self.subsumer.abort_watch(&outcome);
+          let salvage = self.subsumer.abort_watch(&outcome);
+          self.retire_salvage(salvage);
           return Err(canonical_race().into());
         }
 
@@ -2534,7 +3324,31 @@ where
         }
         let armed = match self.arm(key).await {
           Ok(armed) => armed,
-          Err(err) => {
+          // The wider arm lost the close race, so this caller's [`CloseReply`] is CONSUMED and in
+          // hand — which is a TERMINAL state of the restore rather than a posture to run it under,
+          // and terminal BEFORE any source call. The signal it came from is empty again, so a
+          // re-arm issued past this point has no close left to preempt it, and a SECOND close
+          // arriving meanwhile could be consumed by that re-arm and preferred over this reply —
+          // dropping it and breaking first-close-wins. So do not restore at all: retire every
+          // disarmed root SYNCHRONOUSLY (none is left recorded live on a released handle —
+          // invariant I3), then hand this exact reply straight back, unchanged.
+          //
+          // `HandlesGone` shares the arm because it owes the identical unwind — retire
+          // synchronously, issue no further source call, hand the stop back for the loop to break on
+          // — and because `arm` cannot produce it TODAY (its closed-signal path re-issues the arm
+          // un-raced and returns a verdict, deliberately: see `arm`). Handled rather than dismissed,
+          // so a stop that is terminal by construction can never be laundered into a restore here.
+          //
+          // "No further source call" is what the seam entry inside the unwind below MAKES true, rather
+          // than something the unwind manages to avoid: the retirement itself reaches
+          // `Source::end_sync` for a root with a pending sync, so `begin_close` goes AHEAD of it.
+          Err(stop @ (ReconcileStop::CloseRequested(_) | ReconcileStop::HandlesGone)) => {
+            self.begin_close_then_retire_disarmed_roots(unwatch);
+            let salvage = self.subsumer.abort_watch(&outcome);
+            self.retire_salvage(salvage);
+            return Err(stop);
+          }
+          Err(ReconcileStop::Failed(failed)) => {
             // The wider arm failed after the subsumed roots were released. Do NOT leave their live
             // subscriptions bound to released handles (they would read watched yet never see another
             // event). Restore the pre-widen armed state: re-arm each released root through the choke
@@ -2543,13 +3357,16 @@ where
             // re-arm is the awaited step; the future is bound before the `.await` so it never shares a
             // line with a `disarm` — the owner's await surface (only `arm`/`next` are awaited; every
             // `disarm` is now synchronous) stays greppable. Then abort the newcomer's plan.
+            //
+            // Nothing outside this reconcile is waiting on it here — no close reply was consumed on
+            // the way in — so the restore may wait a capacity refusal out on its own budget.
             let restore = self.restore_disarmed_roots(unwatch);
-            let closed = restore.await;
-            self.subsumer.abort_watch(&outcome);
-            // A close consumed during the restore outranks the arm's own error:
-            // dropping its reply would leave `close()` pending forever, while the
-            // caller's dropped `watch()` reply already reads as `Closed`.
-            return Err(closed.map_or(err, ReconcileStop::CloseRequested));
+            let terminal = restore.await;
+            let salvage = self.subsumer.abort_watch(&outcome);
+            self.retire_salvage(salvage);
+            // A terminal outcome reached during the restore outranks the arm's own error (see
+            // `RestoreTerminal::into_stop`).
+            return Err(terminal.map_or_else(|| failed.into(), RestoreTerminal::into_stop));
           }
         };
         let (handle, fs_key) = armed;
@@ -2559,24 +3376,39 @@ where
           // strand-avoidance the arm-failure branch runs (both post-release exits must restore, never
           // signal-and-strand). The restore future is bound before the `.await` for the same reason
           // as that branch (keeping the owner's await surface greppable — no `disarm` shares an
-          // `.await` line).
+          // `.await` line). The wider arm SUCCEEDED here, so no close reply was consumed on the
+          // way in and the restore may wait out a capacity refusal on its own budget.
           self.source.disarm(handle);
           let restore = self.restore_disarmed_roots(unwatch);
-          let closed = restore.await;
-          self.subsumer.abort_watch(&outcome);
-          return Err(
-            closed.map_or_else(|| canonical_race().into(), ReconcileStop::CloseRequested),
-          );
+          let terminal = restore.await;
+          let salvage = self.subsumer.abort_watch(&outcome);
+          self.retire_salvage(salvage);
+          return Err(terminal.map_or_else(|| canonical_race().into(), RestoreTerminal::into_stop));
         }
         // The wider arm's handle is generation-unique (see `Source::Handle`): it aliases none of the
         // still-recorded subsumed roots `commit_watch` is about to drop, nor any other live root, so
         // its `by_handle` insert cannot clobber a live entry. A contract-violating source is caught
         // by the arm choke point's handle tripwire — its live-index half covers exactly these
         // still-recorded roots — before this commit is ever reached.
-        self.commit_widen(&outcome, handle, &fs_key, sub, filter, debounce, &repointed);
+        let gate = Self::take_gate(filter);
+        self.commit_widen(&outcome, handle, &fs_key, sub, gate, debounce, &repointed);
         Ok(sub)
       }
     }
+  }
+
+  /// Takes the caller's admission gate out of the reconcile's ownership slot, at the one moment a
+  /// commit installs it.
+  ///
+  /// The slot is filled by [`reconcile_watch`](Self::reconcile_watch) before the call and taken by
+  /// whichever arm of [`reconcile_canonical_watch`](Self::reconcile_canonical_watch) commits — at
+  /// most one, and as that arm's last act, so no path can reach a second take. What the slot still
+  /// holds when the reconcile returns is therefore exactly "the caller's gate was never installed",
+  /// which is what the caller's frame places rather than destroys.
+  fn take_gate(filter: &mut Option<Filter<C>>) -> Filter<C> {
+    filter
+      .take()
+      .expect("a committing reconcile installs the caller's admission gate exactly once")
   }
 
   /// Awaits one [`Source::replace`] under a race against the owner's dedicated close signal, so a
@@ -2617,27 +3449,58 @@ where
     new_key: &[C],
   ) -> ReplaceStep<C, S::Handle> {
     // Split-borrow the two owner fields the race touches so they stay disjoint: the close arm reads
-    // `&self.closes` while `replace` reborrows `&mut self.source`. Both futures are dropped with this
-    // block, so the winner is used against a fully released `self`.
-    let closes = &self.closes;
-    let source = &mut self.source;
-    futures_util::select_biased! {
-      // Close is polled FIRST — a requested shutdown wins over everything, exactly as in the run
-      // loop's own biased `select!`. So a close already queued when this race begins abandons the
-      // retarget before `replace` is ever polled: the request is never even issued.
-      //
-      // Unlike `on_sync`'s write — which is polled first because dropping an ALREADY-ready `Ok(path)`
-      // would strand the cookie FILE it names, a resource that outlives the process — a ready-but-
-      // dropped `Armed` here names a source STREAM, and the only arm that can drop one is this close,
-      // which tears down at once: the fs driver's close sweep reclaims that stream (committed or not)
-      // during the very teardown this reply drives. So the tie costs a discarded retarget, never a
-      // leak, and close keeps the strictest bound.
-      close = closes.recv().fuse() => match close {
-        Ok(close_reply) => ReplaceStep::Close(close_reply),
-        Err(_) => ReplaceStep::HandlesGone,
-      },
-      res = source.replace(handle, new_key).fuse() => ReplaceStep::Replaced(res),
+    // `&self.closes` while `replace` reborrows `&mut self.source`. Both futures are released with
+    // this block, so the winner is used against a fully released `self`.
+    let step = {
+      let closes = &self.closes;
+      let source = &mut self.source;
+      // The retarget future is held in a slot the race only BORROWS, so destroying it is this
+      // frame's act rather than the `select`'s: the macro destroys what it owns BEFORE it runs the
+      // winning handler, which would put a caller destructor ahead of the terminal reading and the
+      // seam entry below. See `retire_raced_source_future`.
+      let mut raced = core::pin::pin!(Some(source.replace(handle, new_key)));
+      let step = {
+        let replace = raced
+          .as_mut()
+          .as_pin_mut()
+          .expect("the retarget future is placed in the slot immediately above");
+        futures_util::select_biased! {
+          // Close is polled FIRST — a requested shutdown wins over everything, exactly as in the run
+          // loop's own biased `select!`. So a close already queued when this race begins abandons the
+          // retarget before `replace` is ever polled: the request is never even issued.
+          //
+          // Unlike `on_sync`'s write — which is polled first because dropping an ALREADY-ready
+          // `Ok(path)` would strand the cookie FILE it names, a resource that outlives the process —
+          // a ready-but-dropped `Armed` here names a source STREAM, and the only arm that can drop
+          // one is this close, which tears down at once: the fs driver's close sweep reclaims that
+          // stream (committed or not) during the very teardown this reply drives. So the tie costs a
+          // discarded retarget, never a leak, and close keeps the strictest bound.
+          close = closes.recv().fuse() => match close {
+            Ok(close_reply) => ReplaceStep::Close(close_reply),
+            Err(_) => ReplaceStep::HandlesGone,
+          },
+          res = replace.fuse() => ReplaceStep::Replaced(res),
+        }
+      };
+      // Destroyed HERE, with the winner already decided, and contained on the terminal path alone —
+      // the two close readings, which are exactly what the seam entry below tests for. The boundary
+      // bounds how far a caller destructor's unwind travels; the hook still reports it.
+      retire_raced_source_future(
+        matches!(step, ReplaceStep::Close(_) | ReplaceStep::HandlesGone),
+        raced,
+      );
+      step
+    };
+    // BOTH close outcomes are TERMINAL at both call sites — each raises them as a
+    // `ReconcileStop::CloseRequested`/`HandlesGone` the run loop breaks on — so the seam is entered
+    // at the mint, for the reason spelled out on `arm`. It also makes true, for the abandoned
+    // retarget, what those call sites already claim: a dropped `replace` is not cancel-abortive, so
+    // nothing of the owner's own may run ahead of the seam, and the plan abort each of them
+    // performs IS owner work (it destroys the caller's reservation).
+    if matches!(step, ReplaceStep::Close(_) | ReplaceStep::HandlesGone) {
+      self.begin_source_close();
     }
+    step
   }
 
   /// The shared commit tail of a widen, whichever way its wider root was obtained:
@@ -2657,7 +3520,7 @@ where
   #[allow(clippy::too_many_arguments)]
   fn commit_widen(
     &mut self,
-    outcome: &WatchOutcome<C, S::Handle>,
+    outcome: &WatchOutcome<S::Handle>,
     handle: S::Handle,
     fs_key: &[C],
     sub: Subscription,
@@ -2665,8 +3528,10 @@ where
     debounce: Debounce,
     repointed: &[Subscription],
   ) {
-    self.subsumer.commit_watch(outcome, handle, fs_key);
-    self.filters.insert(sub, SubscriptionFilter::new(filter));
+    let salvage = self.subsumer.commit_watch(outcome, handle, fs_key);
+    self.retire_salvage(salvage);
+    let salvage = self.filters.install(sub, filter);
+    self.retire_salvage(salvage);
     self.register_debounce(sub, debounce);
     let mut rescans = Vec::with_capacity(repointed.len());
     for &moved in repointed {
@@ -2679,7 +3544,8 @@ where
       // DROP, not forget: the re-pointed subscription stays live on the wider root, so its
       // registered debounce policy must keep governing its post-widen events.
       if let Some(coalescer) = self.coalescer.as_mut() {
-        coalescer.drop_subscription(moved);
+        let salvage = coalescer.drop_subscription(moved);
+        self.retire_salvage(salvage);
       }
       let rescan = self.epochs.repoint(moved);
       // Keyed at the SUBSCRIPTION, not at the new wider root: the gap this Rescan closes is
@@ -2744,8 +3610,12 @@ where
   /// [`Source`], validates the armed root is **live**, and adopts the source's reported
   /// **canonical key** as the committed coordinate. Every arming path — the fresh `Disjoint`
   /// arm, the `Widen` arm, and the [`restore_disarmed_roots`](Self::restore_disarmed_roots)
-  /// re-arm — funnels through here, so no coverage check ever runs against a provisional key
-  /// AND no dead-on-arrival handle ever becomes a committed root, for **any** [`Source`] impl.
+  /// re-arm — funnels through the same VALIDATION, [`adopt_armed`](Self::adopt_armed), so no
+  /// coverage check ever runs against a provisional key AND no dead-on-arrival handle ever becomes a
+  /// committed root, for **any** [`Source`] impl. The restore's re-arm reaches it through its own
+  /// close race ([`rearm_racing_close`](Self::rearm_racing_close)) rather than through this method,
+  /// because the two owe different things to a signal that CLOSES mid-arm — see the re-issue note at
+  /// the end of this doc, and [`RestoreTerminal`].
   ///
   /// A successful [`Source::arm`] does **not** by itself guarantee liveness: a source may
   /// report an arm as succeeded for a root it has **already forgotten** — one removed between
@@ -2789,18 +3659,49 @@ where
   /// next newcomer under the pruned region re-issues the grow), and the close this lost to tears
   /// the source down immediately.
   async fn grow(&mut self, root: S::Handle, cover: &[Vec<C>]) -> Result<(), ReconcileStop> {
-    let closes = &self.closes;
-    let source = &mut self.source;
-    futures_util::select_biased! {
-      close = closes.recv().fuse() => match close {
-        Ok(close_reply) => Err(ReconcileStop::CloseRequested(close_reply)),
-        // Every handle is gone: an abandon, not a threaded close (see `arm`). The
-        // grow is left to the caller's next attempt; the command channel drives
-        // teardown.
-        Err(_) => Err(WatchError::Closed.into()),
-      },
-      res = source.grow(root, cover).fuse() => res.map_err(Into::into),
+    // The winner is decided inside the race and ACTED ON outside it, so the seam entry below can
+    // take `&mut self` — the two borrows the `select` splits (`&self.closes`, `&mut self.source`)
+    // are both released with the block, the same discipline `arm` keeps.
+    let grown = {
+      let closes = &self.closes;
+      let source = &mut self.source;
+      // Held in a slot the race only BORROWS, for the reason `retire_raced_source_future` gives:
+      // the `select` destroys what it owns ahead of the winning handler, and destroying a source
+      // future runs caller code.
+      let mut raced = core::pin::pin!(Some(source.grow(root, cover)));
+      let grown = {
+        let grow = raced
+          .as_mut()
+          .as_pin_mut()
+          .expect("the grow future is placed in the slot immediately above");
+        futures_util::select_biased! {
+          close = closes.recv().fuse() => match close {
+            Ok(close_reply) => Err(ReconcileStop::CloseRequested(close_reply)),
+            // Every handle is gone: an abandon, not a threaded close (see `arm`). The
+            // grow is left to the caller's next attempt; the command channel drives
+            // teardown.
+            Err(_) => Err(WatchError::Closed.into()),
+          },
+          res = grow.fuse() => res.map_err(Into::into),
+        }
+      };
+      // Contained on the CONSUMED-reply reading alone — the same predicate the seam entry below
+      // tests, so the two cannot disagree about what "terminal" means here. The handles-gone arm is
+      // a live `Failed` the loop goes on from, so its cancellation is destroyed bare, exactly as it
+      // was before. The boundary bounds how far an unwind travels; the hook still reports it.
+      retire_raced_source_future(
+        matches!(grown, Err(ReconcileStop::CloseRequested(_))),
+        raced,
+      );
+      grown
+    };
+    // A CONSUMED close reply is terminal, so enter the seam at the mint — see the same note on
+    // `arm`. The handles-gone arm above is deliberately NOT terminal here (it is a `Failed` the
+    // loop goes on from), so it must not enter the seam.
+    if matches!(grown, Err(ReconcileStop::CloseRequested(_))) {
+      self.begin_source_close();
     }
+    grown
   }
 
   /// The arm itself is RACED against the dedicated close receiver, exactly as
@@ -2820,30 +3721,81 @@ where
   /// the source's own `Drop` reclamation covers an in-flight arm, and an
   /// already-created stream the abandoned future would have reported is
   /// reclaimed by the lower driver's close sweep.
+  ///
+  /// A signal that CLOSES mid-arm is the one case answered by RE-ISSUING the arm un-raced, and that
+  /// is correct for this method's callers: every handle is gone, so there is no reply to thread and
+  /// no one left to interrupt anything, while the reconcile still owes its caller a verdict — a
+  /// `Disjoint` or `Widen` arm that returned "closed" without ever asking the source would invent a
+  /// failure for a watch the source might well admit. It is NOT correct for a failed widen's restore,
+  /// which owes the [`run`] loop a prompt return instead — its caller is already unwinding, and the
+  /// loop is where that reading BREAKS to teardown ([`Teardown::HandlesGone`]): re-issuing there
+  /// hands a possibly-stalled source an arm nothing can preempt. So the restore does not call this —
+  /// it races the arm itself ([`rearm_racing_close`](Self::rearm_racing_close),
+  /// [`RestoreTerminal`]) — and this method's behaviour is unchanged for the callers it does serve.
   async fn arm(&mut self, key: &[C]) -> Result<(S::Handle, Vec<C>), ReconcileStop> {
-    let armed = {
+    let raced_out = {
       // Split-borrow so the two arms stay disjoint: the close arm reads
       // `&self.closes` while `arm` reborrows `&mut self.source`.
       let closes = &self.closes;
       let source = &mut self.source;
-      futures_util::select_biased! {
-        // Close is polled FIRST — a requested shutdown wins over everything, so an
-        // arm not yet started is never issued at all. Every handle being gone is an
-        // ABANDON rather than a threaded close (`None`): the command channel remains
-        // the dropped-handles teardown signal, so the arm is left to finish rather
-        // than inventing a reply nobody is waiting for.
-        close = closes.recv().fuse() => close.ok(),
-        res = source.arm(key).fuse() => return match res {
+      // Held in a slot the race only BORROWS, for the reason `retire_raced_source_future` gives:
+      // the `select` destroys what it owns ahead of the winning handler, and destroying a source
+      // future runs caller code.
+      let mut raced = core::pin::pin!(Some(source.arm(key)));
+      // The winner leaves the race as OWNED data — the raw arm result, adopted BELOW rather than in
+      // the arm — so the seam entry and the adoption both find `self` fully released. That is also
+      // what lets the slot outlive the `select`: neither of them could take `&mut self` while a
+      // future borrowing `self.source` was still alive.
+      let raced_out = {
+        let arm = raced
+          .as_mut()
+          .as_pin_mut()
+          .expect("the arm future is placed in the slot immediately above");
+        futures_util::select_biased! {
+          // Close is polled FIRST — a requested shutdown wins over everything, so an
+          // arm not yet started is never issued at all. Every handle being gone is an
+          // ABANDON rather than a threaded close (`None`): the command channel remains
+          // the dropped-handles teardown signal, so the arm is left to finish rather
+          // than inventing a reply nobody is waiting for.
+          close = closes.recv().fuse() => Err(close.ok()),
+          res = arm.fuse() => Ok(res),
+        }
+      };
+      // Contained on the CONSUMED-reply reading alone — the same predicate the seam entry below
+      // tests, so the two cannot disagree about what "terminal" means here. The handles-gone arm
+      // re-issues un-raced and the reconcile goes on, so its cancellation is destroyed bare, exactly
+      // as it was before. The boundary bounds how far an unwind travels; the hook still reports it.
+      retire_raced_source_future(matches!(raced_out, Err(Some(_))), raced);
+      raced_out
+    };
+    let armed = match raced_out {
+      Err(close) => close,
+      Ok(res) => {
+        return match res {
           Ok(armed) => self.adopt_armed(armed),
           Err(err) => Err(err.into()),
-        },
+        };
       }
     };
     match armed {
-      Some(close_reply) => Err(ReconcileStop::CloseRequested(close_reply)),
+      // TERMINAL, and the seam is entered HERE rather than left to the tail. The reply is consumed,
+      // so the reconcile is going to break the run loop; everything the abandoned reconcile still
+      // does on its way out — the plan abort, the disarmed-root retirement — is owner work behind a
+      // cancelled `Source::arm`, which is exactly what the seam is ordered ahead of. Entering it at
+      // the mint makes that ordering a property of this line instead of of each unwinding arm, and
+      // makes `source_closing` a truthful reading of "terminal" for `retire_salvage`. The latch
+      // keeps it exactly once, and no `Source` call stands between here and the tail's own
+      // (idempotent) entry, so the source's observable order is unchanged.
+      Some(close_reply) => {
+        self.begin_source_close();
+        Err(ReconcileStop::CloseRequested(close_reply))
+      }
       // The close channel closed mid-arm. Re-issue against the source: this is
       // the abandon case above, and the reconcile still owes its caller a
-      // verdict.
+      // verdict. A caller that instead owes the run loop a prompt exit — a failed
+      // widen's restore — must NOT reach this line; it has its own arm race
+      // (`rearm_racing_close`), because an arm re-issued here is un-raced and a
+      // stalled source would pin the owner with nothing left to interrupt it.
       None => match self.source.arm(key).await {
         Ok(armed) => self.adopt_armed(armed),
         Err(err) => Err(err.into()),
@@ -2853,8 +3805,9 @@ where
 
   /// The post-arm half of the choke point: liveness validation, the
   /// generation-unique handle tripwire, and adoption of the source's canonical
-  /// key. Shared by both of [`arm`](Self::arm)'s issue paths so the choke point
-  /// stays single even though the arm is raced.
+  /// key. Shared by both of [`arm`](Self::arm)'s issue paths — and by the restore's own
+  /// [`rearm_racing_close`](Self::rearm_racing_close) — so the choke point stays single (invariant
+  /// I2 holds for every arming path) even though the arm is raced in two places.
   fn adopt_armed(
     &mut self,
     armed: crate::source::Armed<C, S::Handle>,
@@ -2960,20 +3913,33 @@ where
     // suppression: exactly one of `Cleanup::Claim`/`Cleanup::DropOrphan` fires per grant, and this is
     // the `DropOrphan` side.
     self.retire_sub_state(sub);
-    self.needs_rescan.remove(&sub);
-    self.suppressed_rescan.remove(&sub);
+    // The parked entry is the CALLER's twice over — the key it would have re-enumerated and the
+    // value baked onto it at park time — so both leave by the one disposal route. This runs from
+    // the teardown tail's queued grant cleanup, where destroying either here would put a caller
+    // destructor in front of the bounded wait and the acknowledgement.
+    let salvage = self.needs_rescan.take(sub);
+    self.retire_salvage(salvage);
+    let salvage = self.suppressed_rescan.take(sub);
+    self.retire_salvage(salvage);
     self.unclaimed.remove(&sub);
     self.loss_serial.remove(&sub);
     if let Some(coalescer) = self.coalescer.as_mut() {
       // FORGET, not drop: the subscription is ending, so its registered debounce policy
       // goes with its buffered deltas — unlike the still-live shed paths (a widen/restore
       // re-point, an overflow park), which purge buffers but keep the policy.
-      coalescer.forget_subscription(sub);
+      let salvage = coalescer.forget_subscription(sub);
+      self.retire_salvage(salvage);
     }
     // Now consult the subsumer. An already-retired sub is `Unknown` (its owner-local cleanup above
     // has already run); a live one reports whether its root emptied — or, on the non-emptied path,
     // whether the departure left the root OVER-BROAD (the set-cover design).
-    let Some(outcome) = self.subsumer.plan_unwatch(sub) else {
+    let (outcome, salvage) = self.subsumer.plan_unwatch(sub);
+    // The departure's caller-owned removals go straight to the one disposal route, BEFORE the
+    // source requests below: on a live path that releases them here exactly as the mutator used to,
+    // and on the terminal path (this runs from the teardown tail's queued grant cleanup too) it
+    // holds them behind the bounded wait and the acknowledgement.
+    self.retire_salvage(salvage);
+    let Some(outcome) = outcome else {
       return Err(UnwatchError::UnknownSubscription);
     };
     match outcome {
@@ -2982,7 +3948,37 @@ where
         // fire-and-forget [`Source::disarm`] (the source queues any async teardown and applies it at
         // its next arm or `Drop`). Nothing is awaited, so no teardown path blocks the owner (and
         // shutdown rides its own channel regardless).
-        self.source.disarm(fs_root);
+        //
+        // CONTAINED, because this release primitive is reached from the TEARDOWN TAIL: the tail's
+        // grant-cleanup drain applies each queued [`Cleanup`], and a `Cleanup::DropOrphan` lands
+        // here. `disarm` is a public extension point that cannot be required to be panic-free, and an
+        // unwind out of it there leaves `run` itself — skipping the REMAINING queued cleanups, the
+        // bounded [`join_close`](Source::join_close), and the acknowledgement carrying its verdict,
+        // neither of which the destructor that runs next can make (it cannot await, and it is not
+        // given the reply). `close()` would then read the dropped sender as `Stopped` over a source
+        // teardown nobody waited for — the same downgrade the tail's own reap is contained against,
+        // reached through a different `Source` method.
+        //
+        // Contained HERE, at the one call, rather than around the drain loop: a boundary around the
+        // loop would catch the same panic and still abandon every cleanup queued behind this one,
+        // exactly as a boundary around the tail's reap loop would abandon the cookies behind the
+        // first. The engine is already consistent by this point — `plan_unwatch` has committed the
+        // removal and its salvage is placed — so resuming past a panicking `disarm` leaves nothing
+        // half-applied; the root is merely still armed in a source that has been told to stop, which
+        // is a state `disarm`'s own tolerance clause already covers.
+        //
+        // Unconditional rather than gated on the teardown latch: the site is shared with the LIVE
+        // paths (a caller `unwatch`, an orphaned `watch` grant), and there an escaping panic takes
+        // the whole owner down — every unrelated subscription with it — which is the same
+        // blast-radius bound `Owner::drop` and the filter gate already document. The terminal path is
+        // what makes the boundary owed; the live path is why it costs nothing to keep uniform.
+        //
+        // Containment does not SILENCE the panic — the hook reports it the moment it is raised. All
+        // the boundary decides is how far the unwind travels. Through
+        // [`contain`](tributary_proto::unwind::contain) rather than a bare `catch_unwind` because
+        // disposing of the caught PAYLOAD runs the panicking source's own `Drop`.
+        let source = &mut self.source;
+        let _ = tributary_proto::unwind::contain(move || source.disarm(fs_root));
       }
       UnwatchOutcome::Dropped {
         shrink: Some((handle, retained)),
@@ -3002,7 +3998,8 @@ where
         // `Covered` newcomer under the now-pruned region is classified `outside_cover` and gets its
         // awaited grow.
         self.source.set_cover(handle, &retained);
-        self.subsumer.set_retained_cover(handle, Some(retained));
+        let salvage = self.subsumer.set_retained_cover(handle, Some(retained));
+        self.retire_salvage(salvage);
       }
       // Nothing reclaimable: the root is exactly as wide as a live subscriber still needs it.
       UnwatchOutcome::Dropped { shrink: None } => {}
@@ -3031,7 +4028,12 @@ where
   ///   post-retire is correct: the consumer re-enumerates the sub's key and learns its root
   ///   is gone.
   fn retire_sub_state(&mut self, sub: Subscription) {
-    self.filters.remove(&sub);
+    // The gate holds the caller's [`Filter`], whose boxed predicate may own anything at all — so it
+    // goes back through the one disposal route rather than being destroyed here. Both retire paths
+    // reach this on the terminal side of the teardown seam (the failed widen's unwind, and the
+    // tail's queued grant cleanup), ahead of everything that teardown still owes.
+    let salvage = self.filters.take(sub);
+    self.retire_salvage(salvage);
     self.epochs.remove(sub);
     self.loss_serial.remove(&sub);
   }
@@ -3056,24 +4058,50 @@ where
   ///   stranded an *unrelated live* root), replaced by the arm choke point's `debug_assert`
   ///   tripwire — whose live-index half covers every still-recorded root exhaustively — which
   ///   fires loudly on a contract-violating source without corrupting release builds.
+  /// - if the re-arm is **refused on capacity** — a source budget exhausted, not a dead root —
+  ///   offer it again, paced, until the whole restore's [`RESTORE_RETRY_BUDGET`] runs out (see
+  ///   [`rearm_disarmed_root`](Self::rearm_disarmed_root)). Reading that refusal as death is the
+  ///   defect this exists for: it retired *healthy established* roots because an unrelated
+  ///   resource bound happened to be hit mid-widen.
   /// - if the re-arm **fails** (the root is genuinely dead) or its committed key **diverged** (a
   ///   canonicalization race we cannot cleanly rebind), **retire** the root through the shared
   ///   [`retire_root_with_terminal_rescan`](Self::retire_root_with_terminal_rescan): a durable
   ///   dominating terminal Rescan per subscriber, then free its index / filter / epoch and drop it
   ///   from the view.
   ///
-  /// Either way no subscription is left recorded-live-but-disarmed-and-published-watched.
+  /// Either way no subscription is left recorded-live-but-disarmed-and-published-watched — the
+  /// invariant is QUIESCENT ("left"), so the retry preserves it: it lengthens the window the
+  /// widen already opened at its disarm, and every exit from it either rebinds the root or
+  /// retires it before this returns to the [`run`] loop.
   ///
-  /// Returns the [`CloseReply`] a close won from a re-arm, if one did. The re-arms run through the
-  /// close-raced [`arm`](Self::arm) choke point, so a close during this restore consumes the
-  /// dedicated close signal — and a consumed reply that were merely dropped here would leave
-  /// `close()` pending forever, the exact wedge the race exists to remove. The restore stops at
-  /// that point: the remaining subsumed roots are retired with their terminal `Rescan`s (no
-  /// subscription is left bound to a released handle) and the reply is handed back to drive
-  /// teardown, which drops the source and reclaims everything the abandoned re-arms would have
-  /// restored.
-  async fn restore_disarmed_roots(&mut self, unwatch: &[S::Handle]) -> Option<CloseReply> {
+  /// Returns the restore's [`RestoreTerminal`] outcome, if one ended it. Both of its conditions are
+  /// read ATOMICALLY WITH every re-arm, by [`rearm_racing_close`](Self::rearm_racing_close) — the
+  /// restore's own arm race, which never re-issues an arm past either — and again at each retry's
+  /// [`pace`](Self::pace_restore_retry); the per-root
+  /// [`probe_close_signal`](Self::probe_close_signal) ends the restore earlier still, where a root
+  /// may not even reach an arm. Either condition stops the restore where it is found: every root
+  /// still awaiting restoration is retired with its terminal `Rescan` (no subscription is left bound
+  /// to a released handle) and the outcome is handed back rather than dropped — a consumed reply
+  /// because dropping it tells `close()` the owner STOPPED while this unwind is still running, and a
+  /// gone signal because only the [`run`] loop can break to teardown (see
+  /// [`RestoreTerminal::into_stop`]). Teardown then drops the source and reclaims everything the
+  /// abandoned re-arms would have restored.
+  async fn restore_disarmed_roots(&mut self, unwatch: &[S::Handle]) -> Option<RestoreTerminal> {
+    // ONE budget for the whole restore (see `RESTORE_RETRY_BUDGET`), so a widen that subsumed many
+    // roots cannot multiply the owner's stall by their count; a root reached after it is spent
+    // takes exactly the single attempt it always took.
+    let retry_until = Into::<Instant>::into(R::now()) + RESTORE_RETRY_BUDGET;
     for &old in unwatch {
+      // Both terminal conditions at the earliest point in the iteration — before even the
+      // `root_view` read below, and the only reading for a root this loop goes on to skip. It is a
+      // fast path, NOT the ordering guarantee: a closure landing after this snapshot is caught by
+      // the attempt's own race (`rearm_racing_close`), which is what keeps an arm from being issued
+      // under either condition (see `RestoreTerminal`). Both end the restore here, with every root
+      // still awaiting restoration retired.
+      if let Some(terminal) = self.probe_close_signal() {
+        self.begin_close_then_retire_disarmed_roots(unwatch);
+        return Some(terminal);
+      }
       // The subsumed root is still recorded (the widen never committed); recover its key
       // and subscribers before any re-arm/retire mutates the subsumer.
       let Some((root_key, subscribers)) = self
@@ -3083,8 +4111,8 @@ where
       else {
         continue;
       };
-      match self.arm(&root_key).await {
-        Ok((new_handle, fs_key)) if fs_key == root_key => {
+      match self.rearm_disarmed_root(&root_key, retry_until).await {
+        RearmStep::Armed(new_handle, fs_key) if fs_key == root_key => {
           // The re-arm returns a GENERATION-UNIQUE handle by contract (see `Source::Handle`), so it
           // aliases neither `old` nor any not-yet-restored sibling still recorded here — a fresh
           // value is absent from the reverse index, so `rebind_root` cannot overwrite another root's
@@ -3102,7 +4130,8 @@ where
           //
           // Re-armed at the same coordinate with a fresh handle: rebind onto it and re-point each
           // subscriber (raw epochs restarted at zero) with a dominating Rescan.
-          self.subsumer.rebind_root(old, new_handle);
+          let salvage = self.subsumer.rebind_root(old, new_handle);
+          self.retire_salvage(salvage);
           let mut rescans = Vec::with_capacity(subscribers.len());
           for &sub in &subscribers {
             // As in the widen path: the restore re-point Rescan dominates the subscriber's
@@ -3111,7 +4140,8 @@ where
             // above the new root's raw-0 (the coalescer sibling of the re-point-epoch calibration).
             // DROP, not forget: the re-bound subscription stays live and keeps its policy.
             if let Some(coalescer) = self.coalescer.as_mut() {
-              coalescer.drop_subscription(sub);
+              let salvage = coalescer.drop_subscription(sub);
+              self.retire_salvage(salvage);
             }
             let rescan = self.epochs.repoint(sub);
             // Scoped to the subscription's own key, like every other per-subscription
@@ -3132,29 +4162,328 @@ where
             self.dominate_syncs_of_subscription(sub);
           }
         }
-        Ok((new_handle, _diverged)) => {
+        RearmStep::Armed(new_handle, _diverged) => {
           // Re-armed, but at a divergent key we cannot cleanly rebind: request release of the stray
           // new handle (synchronous, fire-and-forget) and retire the old root so its subs
           // re-enumerate and it leaves the view.
           self.source.disarm(new_handle);
           self.retire_root_with_terminal_rescan(old);
         }
-        Err(ReconcileStop::Failed(_)) => self.retire_root_with_terminal_rescan(old),
-        Err(ReconcileStop::CloseRequested(close_reply)) => {
-          // Close won this re-arm. Retire every root still awaiting restoration —
-          // this one included — so none is left recorded live on a released
-          // handle, then hand the reply back rather than dropping it.
-          self.retire_root_with_terminal_rescan(old);
-          for &pending in unwatch {
-            if pending != old {
-              self.retire_root_with_terminal_rescan(pending);
-            }
-          }
-          return Some(close_reply);
+        // Genuinely dead, or refused past the retry budget: retire, exactly as before the retry
+        // existed. This is the residual the split leaves deliberately — an expired budget must
+        // report the same thing a single attempt did, never something softer.
+        RearmStep::Refused => self.retire_root_with_terminal_rescan(old),
+        RearmStep::Terminal(terminal) => {
+          // Terminal for the whole restore, wherever it was found (this re-arm's own close race, or
+          // its pace). Enter the teardown seam, then retire every root still awaiting restoration —
+          // this one included — so none is left recorded live on a released handle; then hand the
+          // outcome back rather than dropping it. The seam goes first because the retirement itself
+          // reaches `Source::end_sync` for a root with a pending sync, and it must not do so while a
+          // cancelled `Source::arm` is still unreclaimed.
+          self.begin_close_then_retire_disarmed_roots(unwatch);
+          return Some(terminal);
         }
       }
     }
     None
+  }
+
+  /// **Enters the teardown seam, then** retires every root still awaiting restoration — the shared
+  /// tail of a failed widen's [`RestoreTerminal`] exits, and of the widen's own arm-lost-the-race
+  /// exit. The order in the name is the guarantee.
+  ///
+  /// # Why the seam is entered HERE rather than at the end of the teardown tail
+  ///
+  /// The retirement is not owner-local, and believing it was is what this exists to fix. Traced:
+  ///
+  /// ```text
+  /// begin_close_then_retire_disarmed_roots
+  ///   → retire_root_with_terminal_rescan → rescan_live_root
+  ///     → dominate_syncs_of_root → reap_cookie → Source::end_sync
+  /// ```
+  ///
+  /// A retired root carrying a pending sync therefore CALLS the source, and the caller reaches this
+  /// immediately after a [`Source::arm`] future was cancelled by the close signal — the one call whose
+  /// cancellation can leave the source holding a watch the owner has no handle for, nameable again
+  /// only when the source is dropped. Nothing about that chain is going to become owner-local: it is
+  /// the shared no-silent-loss primitive, and the same reachability turns up again in the tail
+  /// (`reap_all_pending_syncs`, and `drain_pending_cleanup`'s orphan release with its
+  /// [`disarm`](Source::disarm)/[`set_cover`](Source::set_cover)/`end_sync`).
+  ///
+  /// So the seam MOVES to meet them instead. Entering [`Source::begin_close`] as the first statement
+  /// of the terminal unwind makes "no [`Source`] call between the cancelled arm and the seam" a
+  /// property of ONE line rather than of a call graph that keeps growing — and every one of those
+  /// reaps and releases then lands on the far side of the seam, where a fire-and-forget request is
+  /// exactly what each of them already promises to be (their contracts are idempotent, tolerant and
+  /// best-effort at an abnormal teardown; the stock fs binding's `begin_close` is a no-op, with the
+  /// real close issued by [`join_close`](Source::join_close), so for it the observable order does not
+  /// change at all).
+  ///
+  /// # What is retired
+  ///
+  /// Every root `unwatch` names: none is left recorded-live-but-disarmed-and-published-watched
+  /// (invariant I3) for the teardown to find. A root the restore already rebound is no longer
+  /// recorded under the handle `unwatch` names, so
+  /// [`retire_root_with_terminal_rescan`](Self::retire_root_with_terminal_rescan) is a documented
+  /// no-op for it — "still awaiting" needs no cursor of its own.
+  ///
+  /// SYNCHRONOUS throughout: no [`arm`](Self::arm) and no await. That is the other half of what makes
+  /// a terminal outcome terminal — nothing more is REQUESTED of a source that may never answer, on a
+  /// signal that can no longer interrupt it.
+  ///
+  /// Every caller is terminal, and terminality is what licenses the seam entry: each returns a
+  /// [`ReconcileStop::CloseRequested`]/[`ReconcileStop::HandlesGone`] (directly, or via
+  /// [`RestoreTerminal::into_stop`]), which [`dispatch_command`](Self::dispatch_command) turns into
+  /// the [`Flow::Break`] that leaves the [`run`] loop. So the seam is never entered by a reconcile
+  /// that goes on to settle.
+  fn begin_close_then_retire_disarmed_roots(&mut self, unwatch: &[S::Handle]) {
+    // FIRST — before the retirement below reaches `Source::end_sync` through a retired root's
+    // pending sync (the trace above).
+    self.begin_source_close();
+    for &pending in unwatch {
+      self.retire_root_with_terminal_rescan(pending);
+    }
+  }
+
+  /// The NON-BLOCKING read of the dedicated close signal that a failed widen's restore takes at the
+  /// TOP of each root's iteration: the [`RestoreTerminal`] the signal already holds, if it holds one.
+  /// Exactly the [`run`] loop's own top-of-iteration `try_recv`, for the same reason — a reconcile is
+  /// awaited inside one selected command branch, so nothing else observes that signal until this
+  /// returns.
+  ///
+  /// It ends the restore at the earliest point there is, before even the subsumer read — and for a
+  /// root the loop goes on to SKIP (no longer recorded) it is the only reading taken, there being no
+  /// arm to race. What it is NOT is the ordering argument: its answer is a snapshot, and a closure
+  /// landing one instruction later would find the arm already issued. That is
+  /// [`rearm_racing_close`](Self::rearm_racing_close)'s job, and the reason a probe cannot be made
+  /// sufficient by running it earlier or more often (see [`RestoreTerminal`]).
+  ///
+  /// A queued reply is CONSUMED, which it must be: leaving it would let the very next re-arm's race
+  /// take it after this restore had already committed to arming, and dropping it would answer
+  /// `close()` `Stopped` over an owner still mid-unwind (see
+  /// [`RestoreTerminal::into_stop`]). `Empty` is the only non-terminal answer, and it is why this
+  /// cannot be an `is_closed` test: a signal closed while still holding a queued reply owes that
+  /// reply an answer, and `try_recv` hands it over instead of reporting the channel gone.
+  fn probe_close_signal(&self) -> Option<RestoreTerminal> {
+    match self.closes.try_recv() {
+      Ok(close_reply) => Some(RestoreTerminal::Closed(close_reply)),
+      Err(async_channel::TryRecvError::Closed) => Some(RestoreTerminal::HandlesGone),
+      Err(async_channel::TryRecvError::Empty) => None,
+    }
+  }
+
+  /// One disarmed root's re-arm through the restore's OWN close race
+  /// ([`rearm_racing_close`](Self::rearm_racing_close)), re-offered — paced, and only until
+  /// `retry_until` passes — on the one fault kind that means *ask again shortly* rather than *this
+  /// root is dead*: the source's capacity refusal ([`is_capacity_refusal`]).
+  ///
+  /// Reading a refusal as death is the whole defect: the widen releases healthy established roots
+  /// before arming the wider one, so a resource bound hit anywhere in that window (the fs
+  /// binding's watch-instance limit — no wedged mount required — or its teardown backlog) made
+  /// the restore conclude every one of them had died and retired the lot.
+  ///
+  /// Its three [`RearmStep`] outcomes are exactly what the restore owes each case: rebind, retire
+  /// this root, or stop entirely. A refusal that outlives the budget arrives as the same `Refused` a
+  /// single attempt produced and is retired identically; a close reply or a gone signal read at
+  /// EITHER awaited step — the arm race or the pace — is a [`RestoreTerminal`], a state of the WHOLE
+  /// restore, reported as such rather than laundered into a per-root failure the outer loop would arm
+  /// past. `retry_until` is the whole restore's shared deadline, passed by value: nothing here has to
+  /// mutate it, because the one condition that used to (every handle gone) now ends the restore
+  /// instead of shortening it.
+  ///
+  /// **Every attempt goes through that one race** — the first and each post-pace retry, since the
+  /// loop's only arm site is this call. So the retry cannot widen the window the generic
+  /// [`arm`](Self::arm) leaves open (see [`RestoreTerminal`]): there is no attempt whose closed
+  /// signal is answered by an un-raced re-issue, and no gap between the loop's close readings and
+  /// its arms for a closure to land in.
+  ///
+  /// The retry needs no new root state. Its window is architecturally the one the widen already
+  /// opened between its disarm and this restore, only longer: no other arm of the owner's `select`
+  /// can run inside a reconcile, the subsumer still records each root untouched, and the read
+  /// plane shows only committed snapshots — so the quiescent invariant that no subscription is
+  /// *left* recorded-live-but-disarmed is unaffected, since every exit here either rebinds or
+  /// retires before returning to the loop.
+  async fn rearm_disarmed_root(
+    &mut self,
+    root_key: &[C],
+    retry_until: Instant,
+  ) -> RearmStep<C, S::Handle> {
+    loop {
+      match self.rearm_racing_close(root_key).await {
+        // Armed, at its own key or a divergent one — which of the two it is stays the caller's to
+        // decide, exactly as it was.
+        RearmAttempt::Armed(handle, fs_key) => return RearmStep::Armed(handle, fs_key),
+        // The close signal answered this attempt's own race: terminal for the whole restore, and
+        // terminal WITHOUT a re-issued arm — which is the reason the restore races the arm itself
+        // rather than delegating to `arm` (see `RestoreTerminal`).
+        RearmAttempt::Terminal(terminal) => return RearmStep::Terminal(terminal),
+        RearmAttempt::Refused(err) => {
+          // Refused for a reason no wait can clear — see `is_capacity_refusal` for why every other
+          // kind is fatal here — so the root's verdict is the one a single attempt always produced.
+          if !is_capacity_refusal(&err) {
+            return RearmStep::Refused;
+          }
+        }
+      }
+      // The budget is the WHOLE restore's, so a refusal reaching it after an earlier root spent it
+      // takes exactly the single attempt the pre-retry restore took.
+      let now: Instant = R::now().into();
+      if now >= retry_until {
+        return RearmStep::Refused;
+      }
+      // Clamp the pace to the budget so the last wait cannot overshoot it.
+      match self
+        .pace_restore_retry((now + RESTORE_RETRY_PACE).min(retry_until))
+        .await
+      {
+        // The pace elapsed: offer the re-arm again.
+        None => {}
+        Some(terminal) => return RearmStep::Terminal(terminal),
+      }
+    }
+  }
+
+  /// ONE re-arm attempt of a failed widen's restore, raced against the dedicated close signal — the
+  /// restore's OWN arm race, deliberately not the generic [`arm`](Self::arm) choke point, whose
+  /// closed-channel behaviour is right for its other callers and wrong for this one.
+  ///
+  /// [`arm`](Self::arm) answers a signal that CLOSED mid-arm by re-issuing [`Source::arm`] un-raced,
+  /// because an ordinary reconcile still owes its caller a verdict and no one is left to hand a close
+  /// reply to. A restore owes something else: the [`run`] loop a prompt return, so this reading can
+  /// break it to teardown ([`Teardown::HandlesGone`]) before one more buffered command is dispatched
+  /// or one more [`Source`] call issued. Re-issuing there hands a possibly-stalled source an arm that
+  /// NOTHING can interrupt — the roots the widen already released stay merely recorded-and-disarmed
+  /// while the owner and its native resources are pinned — so here the closed signal maps straight to
+  /// [`RestoreTerminal::HandlesGone`], in the same race as the arm.
+  ///
+  /// Both close readings are therefore ATOMIC with the attempt, which is what a probe — however
+  /// early, however often — cannot be. The three ways a closure could otherwise outrun a check land
+  /// on this one race:
+  ///
+  /// - it arrives after the caller's non-blocking probe read `Empty`. The close arm is polled FIRST
+  ///   (biased, as in every owner race), so the signal is re-read here before [`Source::arm`] is
+  ///   issued at all: a closure in that window costs ZERO source calls.
+  /// - it arrives after a retry's [`pace`](Self::pace_restore_retry) resolved on its TIMER rather
+  ///   than on its own close arm. The next attempt is this same race — the retry loop has no other
+  ///   arm site — so the fresh reading covers it.
+  /// - it arrives while the raced arm is already PENDING. This is the one an un-raced re-issue turns
+  ///   into an arm nobody can preempt; here the close arm resolves `Err`, the pending
+  ///   [`Source::arm`] future is dropped (safe for the same reason [`arm`](Self::arm)'s is — a
+  ///   teardown follows immediately and reclaims an in-flight arm), and the restore stops.
+  ///
+  /// It keeps the choke point's post-arm half: an admitted arm still goes through
+  /// [`adopt_armed`](Self::adopt_armed) — liveness validation, the generation-unique handle
+  /// tripwire, canonical-key adoption — so a re-arm is no less validated for being raced here
+  /// (invariant I2 holds for every arming path, this one included).
+  ///
+  /// It wraps a [`Source`] future, so the conditional-`Send` seam
+  /// [`replace_racing_close`](Self::replace_racing_close) documents DOES bind here — and is satisfied
+  /// the same way [`arm`](Self::arm) satisfies it, this being the same `select_biased!` over the same
+  /// two futures: an `async_channel` `recv` is unconditionally `Send`, so the combined future is
+  /// `Send` exactly when [`Source::arm`]'s is. Nothing is spawned or boxed, and nothing is held
+  /// across the race but the two split borrows and the arm future's own stack slot — whose `Send` is
+  /// the arm future's own, so it conditions nothing further — so [`parts`](Tributaries::parts)'
+  /// promise still proves out (`assert_generic_owner_send`) and
+  /// [`parts_local`](Tributaries::parts_local) still withholds it.
+  async fn rearm_racing_close(&mut self, key: &[C]) -> RearmAttempt<C, S::Handle> {
+    let raced_out = {
+      // Split-borrow so the two arms stay disjoint, exactly as `arm` and `replace_racing_close` do:
+      // the close arm reads `&self.closes` while the arm reborrows `&mut self.source`. Both futures
+      // are released with this block, and only OWNED data leaves it — the raw arm result, adopted
+      // below rather than in place — so the winner is used against a fully released `self`, the
+      // discipline every other owner race keeps.
+      let closes = &self.closes;
+      let source = &mut self.source;
+      // Held in a slot the race only BORROWS, for the reason `retire_raced_source_future` gives:
+      // the `select` destroys what it owns ahead of the winning handler, and destroying a source
+      // future runs caller code.
+      let mut raced = core::pin::pin!(Some(source.arm(key)));
+      let raced_out = {
+        let arm = raced
+          .as_mut()
+          .as_pin_mut()
+          .expect("the arm future is placed in the slot immediately above");
+        futures_util::select_biased! {
+          // Close is polled FIRST — a requested shutdown wins over everything, so an arm not yet
+          // started is never issued at all. UNLIKE `arm`, a closed signal is not an abandon to be
+          // re-issued past: for a restore it is the terminal condition itself.
+          close = closes.recv().fuse() => Err(match close {
+            Ok(close_reply) => RestoreTerminal::Closed(close_reply),
+            Err(_) => RestoreTerminal::HandlesGone,
+          }),
+          res = arm.fuse() => Ok(res),
+        }
+      };
+      // BOTH close readings are terminal here — the restore's caller breaks the [`run`] loop on
+      // either — so the containment covers the whole close arm, which is what makes this site differ
+      // from `arm`'s. The boundary bounds how far a caller destructor's unwind travels; the hook
+      // still reports it.
+      retire_raced_source_future(raced_out.is_err(), raced);
+      raced_out
+    };
+    let armed = match raced_out {
+      Err(terminal) => return RearmAttempt::Terminal(terminal),
+      Ok(res) => res,
+    };
+    match armed {
+      Ok(armed) => match self.adopt_armed(armed) {
+        Ok((handle, fs_key)) => RearmAttempt::Armed(handle, fs_key),
+        // Dead on arrival: a per-attempt refusal like any other, and one no wait can cure, so the
+        // loop's triage retires the root on it.
+        Err(ReconcileStop::Failed(err)) => RearmAttempt::Refused(err),
+        // `adopt_armed` reads the close signal not at all, so it can produce neither of these.
+        // Mapped rather than dismissed all the same, each onto the terminal it IS: a `CloseReply` in
+        // hand is a caller owed an answer, and a gone signal is the whole restore's exit — the two
+        // shapes that never drop the one nor launder the other into a per-root failure.
+        Err(ReconcileStop::CloseRequested(close_reply)) => {
+          RearmAttempt::Terminal(RestoreTerminal::Closed(close_reply))
+        }
+        Err(ReconcileStop::HandlesGone) => RearmAttempt::Terminal(RestoreTerminal::HandlesGone),
+      },
+      Err(err) => RearmAttempt::Refused(err),
+    }
+  }
+
+  /// Waits out one retry pace, RACED against the dedicated close signal for the same reason every
+  /// other owner await is: this runs inside the [`run`] loop's selected command branch, so an
+  /// unraced sleep would leave an already-queued close unpolled for its whole duration. Racing it
+  /// keeps `close()` bounded by ONE pace plus one re-arm (itself close-raced, by
+  /// [`rearm_racing_close`](Self::rearm_racing_close)), however large [`RESTORE_RETRY_BUDGET`] is —
+  /// the retry lengthens the widen's unwind, never the teardown contract.
+  ///
+  /// Returns the [`RestoreTerminal`] the close signal reported, or `None` when the pace simply
+  /// elapsed and the re-arm is to be offered again. Both terminal readings carry only OWNED data out
+  /// of the `select` (the discipline [`SyncStep`] and [`ReplaceStep`] keep), and both are the SAME
+  /// two conditions the per-root [`probe_close_signal`](Self::probe_close_signal) reads — one
+  /// vocabulary for the one signal, so neither reading can end the restore differently.
+  ///
+  /// Only a bare timer is raced here, never a [`Source`] future, so the conditional-`Send` seam
+  /// [`replace_racing_close`](Self::replace_racing_close) documents does not bind: this sleep is
+  /// the same [`R::sleep_until`](RuntimeLite::sleep_until) the [`run`] loop's own settle timer
+  /// uses, and it conditions the combined future's `Send` on nothing the loop does not already
+  /// require.
+  ///
+  /// It takes `&mut self` although it only READS the close receiver, for the same reason
+  /// [`arm`](Self::arm) and [`grow`](Self::grow) do: the borrow is held across an await inside the
+  /// [`run`] future, and a shared `&Owner` there would make that future `Send` only if `Owner` were
+  /// `Sync` — a bound the owner does not have and the [`parts`](Tributaries::parts) `Send` proof
+  /// does not carry.
+  async fn pace_restore_retry(&mut self, wake_at: Instant) -> Option<RestoreTerminal> {
+    // Borrow only the close receiver: the caller holds no other borrow across this await.
+    let closes = &self.closes;
+    futures_util::select_biased! {
+      // Close is polled FIRST, as in every owner race: a shutdown queued while the previous
+      // attempt ran ends the retry before the pace is even started.
+      close = closes.recv().fuse() => Some(match close {
+        Ok(close_reply) => RestoreTerminal::Closed(close_reply),
+        // The signal closed: every handle is gone, and a retry that keeps looping never returns to
+        // the [`run`] loop — the only place this reading can break to teardown.
+        Err(_) => RestoreTerminal::HandlesGone,
+      }),
+      _ = async {
+        R::sleep_until(wake_at.into()).await;
+      }.fuse() => None,
+    }
   }
 
   /// The single **park-terminal-Rescan-then-retire** primitive (invariant I4, no silent loss):
@@ -3191,9 +4520,12 @@ where
     // subscriber's per-sub filter + epoch state (the parked `needs_rescan` entry is kept). FORGET
     // each sub's coalescer policy too — `rescan_live_root` only DROPPED its buffered deltas (keeping
     // the policy for the live-root path), and terminal retirement ends the subscription.
-    for sub in self.subsumer.force_remove_root(handle) {
+    let (subscribers, salvage) = self.subsumer.force_remove_root(handle);
+    self.retire_salvage(salvage);
+    for sub in subscribers {
       if let Some(coalescer) = self.coalescer.as_mut() {
-        coalescer.forget_subscription(sub);
+        let salvage = coalescer.forget_subscription(sub);
+        self.retire_salvage(salvage);
       }
       self.retire_sub_state(sub);
     }
@@ -3226,6 +4558,11 @@ where
     else {
       return;
     };
+    // The root's key was cloned out of the index to scope each subscriber's re-enumeration, and it
+    // outlives every one of them — so the clone is placed at the end of this loop rather than
+    // destroyed by the frame exit. Both retirement paths reach here with the teardown seam already
+    // entered, so this frame stands in front of everything that teardown still owes.
+    let mut salvage = Salvage::new();
     for &sub in &subscribers {
       // Route the park through the ONE loss choke point (like every other park), so both loss clocks
       // move: this is a genuine coverage loss — a root death, or a rollback whose preserved stream
@@ -3246,13 +4583,15 @@ where
       } else {
         &mut self.needs_rescan
       };
-      merge_max(target, sub, key, epoch, value);
+      salvage.absorb(target.merge_max(sub, key, epoch, value));
       // DROP (not forget) the buffered deltas: the sub stays live here, so its registered debounce
       // policy must keep governing later events. A retiring caller forgets the policy afterward.
       if let Some(coalescer) = self.coalescer.as_mut() {
-        coalescer.drop_subscription(sub);
+        salvage.absorb(coalescer.drop_subscription(sub));
       }
     }
+    salvage.keep_key(root_key);
+    self.retire_salvage(salvage);
     self.dominate_syncs_of_root(root);
   }
 
@@ -3433,7 +4772,15 @@ where
           self.park_rescan(sub);
         }
       }
-      Err(async_channel::TrySendError::Closed(_)) => {}
+      // The consumer is gone, so this delivery reaches nobody — and it owns the caller key it was
+      // located at and the value baked onto it. Nothing is owed a re-enumeration here (a closed
+      // stream can carry none), but the delivery still has to be PLACED: `try_emit` is what the
+      // teardown's own drains push through.
+      Err(async_channel::TrySendError::Closed(refused)) => {
+        let mut salvage = Salvage::new();
+        salvage.keep_event(refused);
+        self.retire_salvage(salvage);
+      }
     }
   }
 
@@ -3512,9 +4859,11 @@ where
     } else {
       &mut self.needs_rescan
     };
-    merge_max(target, sub, key, epoch, value);
+    let salvage = target.merge_max(sub, key, epoch, value);
+    self.retire_salvage(salvage);
     if let Some(coalescer) = self.coalescer.as_mut() {
-      coalescer.drop_subscription(sub);
+      let salvage = coalescer.drop_subscription(sub);
+      self.retire_salvage(salvage);
     }
   }
 
@@ -3573,18 +4922,17 @@ where
     let sub = ev.subscription();
     self.note_loss(sub);
     let epoch = self.epochs.shed_rescan(sub);
+    // A whole `Moved` has two affected endpoints, and the debt must cover both — the
+    // subscription that lost it saw the object leave one key and arrive at another.
+    let mut salvage = Salvage::new();
     for target in [&mut self.needs_rescan, &mut self.suppressed_rescan] {
-      let Some(parked) = target.get_mut(&sub) else {
-        continue;
-      };
-      widen_to_cover(&mut parked.key, ev.key());
-      // A whole `Moved` has two affected endpoints, and the debt must cover both — the
-      // subscription that lost it saw the object leave one key and arrive at another.
-      if let Some(from) = ev.move_from() {
-        widen_to_cover(&mut parked.key, from);
-      }
-      parked.epoch = parked.epoch.max(epoch);
+      salvage.absorb(target.widen_debt(
+        sub,
+        core::iter::once(ev.key()).chain(ev.move_from()),
+        epoch,
+      ));
     }
+    self.retire_salvage(salvage);
   }
 
   /// Parks an already-minted synthetic [`Rescan`](crate::EventKind::Rescan) that overflowed
@@ -3613,13 +4961,12 @@ where
     } else {
       &mut self.needs_rescan
     };
-    merge_max(
-      target,
-      sub,
-      ev.key().to_vec(),
-      ev.epoch(),
-      ev.value().cloned(),
-    );
+    let mut salvage = target.merge_max(sub, ev.key().to_vec(), ev.epoch(), ev.value().cloned());
+    // The `Rescan` was CONSUMED to park it — the entry holds copies of its key and value, and the
+    // event itself is now surplus. It is caller-owned surplus, and the teardown's own drains reach
+    // this park, so it is placed rather than destroyed by this frame.
+    salvage.keep_event(ev);
+    self.retire_salvage(salvage);
   }
 
   /// Re-offers every parked per-subscription overflow `Rescan` at the top of each loop
@@ -3679,17 +5026,11 @@ where
         self.last_flush_visited += 1;
       }
       let bound = match (&resume, exclusive) {
-        (Some(at), false) => (std::ops::Bound::Included(*at), std::ops::Bound::Unbounded),
-        (Some(at), true) => (std::ops::Bound::Excluded(*at), std::ops::Bound::Unbounded),
-        (None, _) => (std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
+        (Some(at), false) => (Bound::Included(*at), Bound::Unbounded),
+        (Some(at), true) => (Bound::Excluded(*at), Bound::Unbounded),
+        (None, _) => (Bound::Unbounded, Bound::Unbounded),
       };
-      let next = self
-        .needs_rescan
-        .range(bound)
-        .next()
-        .or_else(|| self.needs_rescan.iter().next())
-        .map(|(&sub, _)| sub);
-      let Some(sub) = next else {
+      let Some(sub) = self.needs_rescan.first_from(bound) else {
         break;
       };
       resume = Some(sub);
@@ -3706,8 +5047,15 @@ where
       };
       // Mint the owed Rescan carrying the value captured at park time (design §3): the sub or its
       // root may already be retired, so the value cannot be re-resolved here — it rides the entry.
+      //
+      // Both halves are DEEP clones of caller state, and so is the entry the delivery clears, so
+      // every exit below owes them a placement: an accepted offer leaves the consumer holding the
+      // clone and this pass holding the entry, and a refused one leaves this pass holding the
+      // clone. Neither is bookkeeping — a `Vec<C>` destroyed here runs the caller's own component
+      // destructors, and this pass runs from the teardown tail ahead of the bounded wait.
       let mut event = Event::rescan(sub, parked.key.clone(), parked.epoch);
       event.set_value(parked.value.clone());
+      let mut salvage = Salvage::new();
       match self.events.try_send(event) {
         Ok(()) => {
           // The PUBLISH half of the same invariant `note_domination` enforces at the
@@ -3719,16 +5067,23 @@ where
           // falsely resolve `Delivered` for a pre-call re-enumeration this publish just handed it.
           // Advancing the shared generation here is the only trace that survives the clear.
           self.note_domination();
-          self.needs_rescan.remove(&sub);
+          salvage.absorb(self.needs_rescan.take(sub));
+          self.retire_salvage(salvage);
         }
-        Err(async_channel::TrySendError::Closed(_)) => {
+        Err(async_channel::TrySendError::Closed(refused)) => {
           // Teardown: the consumer is gone, so nothing was published — clear the entry WITHOUT
           // dominating (no re-enumeration reached any barrier).
-          self.needs_rescan.remove(&sub);
+          salvage.keep_event(refused);
+          salvage.absorb(self.needs_rescan.take(sub));
+          self.retire_salvage(salvage);
         }
-        Err(async_channel::TrySendError::Full(_)) => {
+        Err(async_channel::TrySendError::Full(refused)) => {
           // The channel filled: retry THIS key (inclusive) next tick. Not published, so no
-          // domination.
+          // domination — and the parked entry STAYS, so only the refused offer is surplus. At most
+          // one per pass: a pass that starts against an already-full channel returns before minting
+          // anything, so a mint can only be refused by a channel this same pass filled.
+          salvage.keep_event(refused);
+          self.retire_salvage(salvage);
           self.flush_cursor = Some(sub);
           return;
         }
@@ -3909,15 +5264,15 @@ where
   /// registered debounce policy must keep governing its later events.
   fn quarantine_filters(&mut self, poisoned: &[Subscription]) {
     for &sub in poisoned {
-      let Some(gate) = self.filters.get_mut(&sub) else {
+      if !self.filters.quarantine(sub) {
         continue;
-      };
-      gate.quarantined = true;
+      }
       let Some(key) = self.subsumer.subscription_key(sub).map(<[C]>::to_vec) else {
         continue;
       };
       if let Some(coalescer) = self.coalescer.as_mut() {
-        coalescer.drop_subscription(sub);
+        let salvage = coalescer.drop_subscription(sub);
+        self.retire_salvage(salvage);
       }
       self.note_loss(sub);
       let value = self.subsumer.subscription_value(sub).cloned();
@@ -3927,7 +5282,8 @@ where
       } else {
         &mut self.needs_rescan
       };
-      merge_max(target, sub, key, epoch, value);
+      let salvage = target.merge_max(sub, key, epoch, value);
+      self.retire_salvage(salvage);
       self.dominate_syncs_of_subscription(sub);
     }
   }
@@ -4170,25 +5526,44 @@ where
       // block, once the cancellation future's borrow of it is released.
       let closes = &self.closes;
       let source = &mut self.source;
-      futures_util::select_biased! {
-        // The write is polled FIRST so a result that is ALREADY ready wins over a simultaneously-ready
-        // cancellation or close: the fs driver may have buffered its `Ok(path)` (its own
-        // `reply.send(Ok)` already succeeded, so its send-failure self-reap will NOT run), and dropping
-        // that ready result unread would strand the cookie it names. Taking it here means an abandoned
-        // caller's cookie is reaped deterministically below, never orphaned. A still-PENDING write (a
-        // hung mount) is not ready, so close and cancellation below still win and free the owner — the
-        // bias only decides a tie, and only a completed write can tie.
-        res = source.begin_sync(root, &dir_key, token).fuse() => SyncStep::Began(res),
-        // Close outranks cancellation: a requested shutdown abandons a still-in-flight write. A CLOSED
-        // close channel means every handle is gone (the caller with them), so it lands as an abandon,
-        // not a threaded close — no one is left to acknowledge, and the command channel drives teardown.
-        close = closes.recv().fuse() => match close {
-          Ok(close_reply) => SyncStep::Close(close_reply),
-          Err(_) => SyncStep::Canceled,
-        },
-        // The caller timed out or dropped its `sync()` wait: its receiver is gone.
-        () = reply.cancellation().fuse() => SyncStep::Canceled,
-      }
+      // Held in a slot the race only BORROWS, for the reason `retire_raced_source_future` gives:
+      // the `select` destroys what it owns ahead of the winning handler, and destroying a source
+      // future runs caller code.
+      let mut raced = core::pin::pin!(Some(source.begin_sync(root, &dir_key, token)));
+      let step = {
+        let write = raced
+          .as_mut()
+          .as_pin_mut()
+          .expect("the write future is placed in the slot immediately above");
+        futures_util::select_biased! {
+          // The write is polled FIRST so a result that is ALREADY ready wins over a
+          // simultaneously-ready cancellation or close: the fs driver may have buffered its
+          // `Ok(path)` (its own `reply.send(Ok)` already succeeded, so its send-failure self-reap
+          // will NOT run), and dropping that ready result unread would strand the cookie it names.
+          // Taking it here means an abandoned caller's cookie is reaped deterministically below,
+          // never orphaned. A still-PENDING write (a hung mount) is not ready, so close and
+          // cancellation below still win and free the owner — the bias only decides a tie, and only
+          // a completed write can tie.
+          res = write.fuse() => SyncStep::Began(res),
+          // Close outranks cancellation: a requested shutdown abandons a still-in-flight write. A
+          // CLOSED close channel means every handle is gone (the caller with them), so it lands as
+          // an abandon, not a threaded close — no one is left to acknowledge, and the command
+          // channel drives teardown.
+          close = closes.recv().fuse() => match close {
+            Ok(close_reply) => SyncStep::Close(close_reply),
+            Err(_) => SyncStep::Canceled,
+          },
+          // The caller timed out or dropped its `sync()` wait: its receiver is gone.
+          () = reply.cancellation().fuse() => SyncStep::Canceled,
+        }
+      };
+      // Contained on the CONSUMED-reply reading alone — the same predicate the terminal arm below
+      // enters the seam on. A caller's own timeout is the LIVE reading here: the loop keeps serving
+      // every other subscription, nothing is owed an acknowledgement, and the abandoned write's
+      // cancellation is destroyed bare exactly as it was before. The boundary bounds how far a
+      // caller destructor's unwind travels; the hook still reports it.
+      retire_raced_source_future(matches!(step, SyncStep::Close(_)), raced);
+      step
     };
 
     match step {
@@ -4200,7 +5575,25 @@ where
         // self-reap will NOT run) is reaped, and one still in the pool tombstones so its claim
         // self-reaps. The owner never learned the cookie key here (only a completed `begin_sync`
         // returns it), so this token-cancel is the only thing that can free the file.
-        self.source.cancel_sync(root, token);
+        //
+        // The reply is CONSUMED, so this arm is a terminal mint like the reconcile races': enter the
+        // seam here, ahead of the reclamation, so `source_closing` is a truthful reading of "the
+        // owner is on its terminal path" at every mint rather than at all but this one — which is
+        // what [`retire_salvage`](Self::retire_salvage) reads to decide whether caller-owned state is
+        // released at the call site or held behind the bounded wait and the acknowledgement. Today
+        // the break is immediate and nothing between here and the tail hands anything back; making
+        // the latch true here is what keeps that from being a fact a later change has to rediscover.
+        //
+        // The reclamation on the far side of the initiation is exactly where [`Source::begin_close`]
+        // documents it may be: `cancel_sync` is one of the four fire-and-forget requests it names as
+        // still arriving after the seam and before [`join_close`](Source::join_close), each already
+        // idempotent, tolerant and best-effort at an abnormal teardown. What ordering it here does
+        // NOT rest on is the argument the reconcile races need — a cancelled `Source::arm` is
+        // reclaimed by nothing short of the source's own teardown, whereas a cancelled `begin_sync`
+        // has this by-name pair — so the seam is entered for the latch's sake, not to bound an
+        // unnameable cancellation.
+        self.begin_source_close();
+        self.abandon_sync(root, token);
         SyncAdmit::CloseRequested(close_reply)
       }
       // Abandon: drop `reply` without parking or writing further. The caller is gone (timeout, drop,
@@ -4210,7 +5603,9 @@ where
       SyncStep::Canceled => {
         // Same as the close arm: the caller is gone and never received the cookie key, so cancel
         // by token — the only handle on a write that may have landed after this arm won the race.
-        self.source.cancel_sync(root, token);
+        // No seam entry, because this arm is deliberately NOT terminal: no reply was consumed, the
+        // owner keeps looping, and the command channel remains the dropped-handles signal.
+        self.abandon_sync(root, token);
         SyncAdmit::Done
       }
       SyncStep::Began(Ok(cookie_key)) => {
@@ -4242,7 +5637,10 @@ where
     reply: futures_channel::oneshot::Sender<Result<SyncOutcome, SyncError>>,
   ) {
     if reply.is_canceled() {
-      self.source.end_sync(root, &cookie_key);
+      // Through the one reaping funnel like every other prune, although this one is a LIVE path with
+      // no teardown behind it: the act is the same act, and a site that reaches `Source::end_sync`
+      // around the funnel is a site that has to re-derive the boundary for itself.
+      self.reap_cookie(root, &cookie_key);
       return;
     }
     let loss_serial_at_install = self.loss_serial.get(&sub).copied().unwrap_or(0);
@@ -4417,6 +5815,7 @@ where
     S::Handle: PartialEq,
   {
     self.note_domination();
+    let mut salvage = Salvage::new();
     let mut i = 0;
     while i < self.pending_syncs.len() {
       if self.pending_syncs[i].root == root {
@@ -4425,10 +5824,15 @@ where
         // Best-effort reap even on a dead root: the file may linger (the
         // directory outlived the watch), and `remove_cookie` is idempotent.
         self.reap_cookie(pending.root, &pending.cookie_key);
+        // The resolved entry carries the CALLER's cookie key (`Vec<C>`), so releasing it here would
+        // run caller destructors inside a prune whose terminal callers still owe the remaining
+        // reaps, the bounded wait and the acknowledgement. It leaves by the one disposal route.
+        salvage.keep_key(pending.cookie_key);
       } else {
         i += 1;
       }
     }
+    self.retire_salvage(salvage);
   }
 
   /// Resolves every barrier of `sub` as `Dominated` and reaps its cookie —
@@ -4438,33 +5842,48 @@ where
   /// under it.
   fn dominate_syncs_of_subscription(&mut self, sub: Subscription) {
     self.note_domination();
+    let mut salvage = Salvage::new();
     let mut i = 0;
     while i < self.pending_syncs.len() {
       if self.pending_syncs[i].sub == sub {
         let pending = self.pending_syncs.swap_remove(i);
         let _ = pending.reply.send(Ok(SyncOutcome::Dominated));
         self.reap_cookie(pending.root, &pending.cookie_key);
+        // The caller's cookie key leaves by the one disposal route — see `dominate_syncs_of_root`.
+        salvage.keep_key(pending.cookie_key);
       } else {
         i += 1;
       }
     }
+    self.retire_salvage(salvage);
   }
 
   /// Fails every barrier of `sub` typed — the CALLER unwatched it, which owes
   /// no `Rescan`, so the barrier cannot be met honestly. (Asymmetric with a
   /// root death, which resolves `Dominated`.)
   fn retire_syncs_of_subscription(&mut self, sub: Subscription) {
+    let mut salvage = Salvage::new();
     let mut i = 0;
     while i < self.pending_syncs.len() {
       if self.pending_syncs[i].sub == sub {
         let pending = self.pending_syncs.swap_remove(i);
         let _ = pending.reply.send(Err(SyncError::Retired));
-        // The root lives on — the cookie is a real file that must not leak.
+        // The root lives on — the cookie is a real file that must not leak. Through the one reaping
+        // funnel, whose own per-cookie containment covers this prune: it sits on the release
+        // primitive the teardown tail's grant-cleanup drain reaches
+        // ([`release_subscription`](Self::release_subscription)), so a panicking `end_sync` left
+        // uncontained would carry off the cookies behind it, the rest of the release, the remaining
+        // queued cleanups, the bounded wait and the acknowledgement alike.
         self.reap_cookie(pending.root, &pending.cookie_key);
+        // The caller's cookie key leaves by the one disposal route — see `dominate_syncs_of_root`.
+        // This prune is reached from the teardown tail's queued grant cleanup, where the bounded
+        // wait and the acknowledgement are both still owed.
+        salvage.keep_key(pending.cookie_key);
       } else {
         i += 1;
       }
     }
+    self.retire_salvage(salvage);
   }
 
   /// Drops barriers whose caller went away (timed out, or dropped the future):
@@ -4472,30 +5891,109 @@ where
   /// — so the entry is simply reaped, keeping the map bounded by LIVE waiters
   /// rather than by total syncs ever issued.
   fn prune_abandoned_syncs(&mut self) {
+    let mut salvage = Salvage::new();
     let mut i = 0;
     while i < self.pending_syncs.len() {
       if self.pending_syncs[i].reply.is_canceled() {
         let pending = self.pending_syncs.swap_remove(i);
         self.reap_cookie(pending.root, &pending.cookie_key);
+        // The caller's cookie key leaves by the one disposal route — see `dominate_syncs_of_root`.
+        // Only the run loop prunes, so the latch is unset and this releases at once; it goes through
+        // the route anyway, so a future terminal caller inherits the placement rather than the bug.
+        salvage.keep_key(pending.cookie_key);
       } else {
         i += 1;
       }
     }
+    self.retire_salvage(salvage);
   }
 
   /// Reaps a resolved (or abandoned) cookie — fire-and-forget, in the `disarm`
   /// mold. Its unlink event is suppressed by the namespace, never by the
   /// pending map (which no longer holds it).
+  ///
+  /// # The containment is the funnel's, not the caller's
+  ///
+  /// [`Source::end_sync`] is a public extension point that cannot be required to be panic-free, and
+  /// several of the prunes that reach this are on a TERMINAL path: a failed widen's retirement
+  /// arrives through [`dominate_syncs_of_root`](Self::dominate_syncs_of_root) with the reconcile
+  /// already unwinding, and [`retire_syncs_of_subscription`](Self::retire_syncs_of_subscription)
+  /// sits on the release primitive [`run`]'s tail drains its queued grant cleanup into. An unwind out
+  /// of one reap there leaves `run` itself: every cookie behind it, the rest of the prune, the
+  /// bounded [`join_close`](Source::join_close) and the acknowledgement carrying its verdict are all
+  /// skipped, and the last two are unreachable from [`Owner::drop`] (it cannot await, and it is not
+  /// given the reply), so `close()` reads a dropped sender as
+  /// [`Stopped`](crate::error::CloseError::Stopped) over a source teardown nobody waited for.
+  ///
+  /// The boundary therefore belongs HERE rather than at whichever prune happens to be terminal
+  /// today: this is the one act, five prunes perform it, and a boundary chosen per call site is one
+  /// each new caller must know to write. Per COOKIE by construction, because the funnel is per
+  /// cookie — a boundary around a prune's loop would catch the identical panic and still leave every
+  /// marker file behind it on the caller's filesystem.
+  ///
+  /// Unconditional rather than gated on the teardown latch: the LIVE prunes
+  /// ([`prune_abandoned_syncs`](Self::prune_abandoned_syncs), a caller `unwatch`) otherwise let one
+  /// misbehaving `end_sync` take the whole owner down with every unrelated subscription on it, which
+  /// is the same blast-radius bound the filter gate and [`Owner::drop`] already keep.
+  ///
+  /// Containment does not SILENCE the panic — the hook reports it the moment it is raised. All the
+  /// boundary decides is how far the unwind travels. Through
+  /// [`contain`](tributary_proto::unwind::contain) rather than a bare `catch_unwind` because
+  /// disposing of the caught PAYLOAD runs the panicking source's own `Drop`, which would escape at
+  /// the same place to the same effect.
+  ///
+  /// [`Owner::drop`]'s reap cannot route through this — the destructor's impl carries only
+  /// `S: LocalSource<C>`, not this block's bounds — so it keeps a boundary of its own, written for
+  /// the sharper reason that it may itself be running on an unwind.
   fn reap_cookie(&mut self, root: S::Handle, cookie_key: &[C]) {
-    self.source.end_sync(root, cookie_key);
+    let source = &mut self.source;
+    let _ = tributary_proto::unwind::contain(move || source.end_sync(root, cookie_key));
+  }
+
+  /// Abandons an IN-FLIGHT [`Source::begin_sync`] by the token the owner minted — the by-name pair
+  /// of the future [`on_sync`](Self::on_sync) just dropped, and the only thing that can free a
+  /// cookie whose completed write the owner never read.
+  ///
+  /// # The containment is the funnel's, for the same reason [`reap_cookie`](Self::reap_cookie)'s is
+  ///
+  /// [`Source::cancel_sync`] is a public extension point that cannot be required to be panic-free,
+  /// and one of its two callers is TERMINAL: the close-win arm has already consumed the
+  /// [`CloseReply`] and is holding it, so an unwind out of the reclamation drops that sender —
+  /// `close()` answers [`Stopped`](crate::error::CloseError::Stopped) — and escapes `run` ahead of
+  /// every cookie reap, the bounded [`join_close`](Source::join_close) and the acknowledgement,
+  /// neither of the last two reachable from [`Owner::drop`]. The other caller is a LIVE path, where
+  /// an escaping panic instead takes the whole owner down with every unrelated subscription on it.
+  /// Both want the boundary, so it belongs at the act rather than at whichever arm is terminal
+  /// today.
+  ///
+  /// Containment does not SILENCE the panic — the hook reports it the moment it is raised. All the
+  /// boundary decides is how far the unwind travels. Through
+  /// [`contain`](tributary_proto::unwind::contain) rather than a bare `catch_unwind` because
+  /// disposing of the caught PAYLOAD runs the panicking source's own `Drop`, which would escape at
+  /// the same place to the same effect.
+  fn abandon_sync(&mut self, root: S::Handle, token: SyncToken) {
+    let source = &mut self.source;
+    let _ = tributary_proto::unwind::contain(move || source.cancel_sync(root, token));
   }
 
   /// Reaps every still-pending cookie at owner teardown — the marker files must
   /// not outlive the owner.
   fn reap_all_pending_syncs(&mut self) {
+    let mut salvage = Salvage::new();
     for pending in std::mem::take(&mut self.pending_syncs) {
-      self.source.end_sync(pending.root, &pending.cookie_key);
+      // Through the one reaping funnel, whose per-cookie containment is what this tail needs: an
+      // `end_sync` that unwound here would leave `run` itself — ahead of every remaining cookie's
+      // marker file, the bounded `join_close`, and the acknowledgement carrying its verdict, none of
+      // which anything downstream can redo (the destructor that runs next cannot await, and is not
+      // given the reply). Per cookie by construction, because the funnel is per cookie.
+      self.reap_cookie(pending.root, &pending.cookie_key);
+      // The reaped entry carries the CALLER's cookie key (`Vec<C>`). Releasing it at the end of this
+      // iteration put a caller destructor between one reap and the next, and in front of the bounded
+      // wait and the acknowledgement this tail has not made yet — so it leaves by the one disposal
+      // route instead, and the reaps behind it complete whatever the caller's `Drop` does.
+      salvage.keep_key(pending.cookie_key);
     }
+    self.retire_salvage(salvage);
   }
 
   /// Emits everything the debounce is holding for ONE subscription, in
@@ -4538,7 +6036,8 @@ where
     if !raw.kind().is_rescan() {
       return;
     }
-    self.subsumer.degrade_retained_cover(raw.handle());
+    let salvage = self.subsumer.degrade_retained_cover(raw.handle());
+    self.retire_salvage(salvage);
   }
 
   fn retire_if_dead(&mut self, raw: &SourceEvent<C, S::Handle>) -> bool {
@@ -4632,15 +6131,29 @@ where
   /// [`drain_owed_before_shutdown`](Self::drain_owed_before_shutdown) does exactly that.
   fn drain_owed_once(&mut self) {
     let mut tail = Vec::new();
+    // The flush delivers its events through `tail`, but the two indexes keyed on them are
+    // caller-owned copies it can only give back — see [`Coalescer::flush_all`].
+    let mut flushed = Salvage::new();
     if let Some(coalescer) = self.coalescer.as_mut() {
-      coalescer.flush_all(&mut tail);
+      flushed = coalescer.flush_all(&mut tail);
     }
+    self.retire_salvage(flushed);
     // Drop parked subs' tail deltas — their owed dominating Rescan (delivered next) dominates
-    // and re-enumerates them; a non-parked sub's tail is kept.
-    tail.retain(|event| {
+    // and re-enumerates them; a non-parked sub's tail is kept. "Drop" as in "not delivered": each
+    // one owns a caller key and a caller value, and this runs from the teardown tail, so the
+    // superseded deliveries leave by the one disposal route rather than by a `retain` closure.
+    let mut superseded = Salvage::new();
+    let mut kept = Vec::with_capacity(tail.len());
+    for event in tail {
       let sub = event.subscription();
-      !self.needs_rescan.contains_key(&sub) && !self.suppressed_rescan.contains_key(&sub)
-    });
+      if self.needs_rescan.contains_key(&sub) || self.suppressed_rescan.contains_key(&sub) {
+        superseded.keep_event(event);
+      } else {
+        kept.push(event);
+      }
+    }
+    self.retire_salvage(superseded);
+    let tail = kept;
     // Owed Rescans first, then the non-parked tail through the suppress-safe funnel.
     self.flush_pending_rescans();
     for event in tail {
@@ -4672,7 +6185,7 @@ where
   /// sub's Rescan before exiting), and a post-teardown claim holds a dead subscription exactly like any
   /// subscription after teardown (the read plane is already empty). The owner **never awaits the event
   /// sender** (invariant III preserved even at teardown) — only the close receiver, the cleanup
-  /// receiver, the command receiver, and the retry timer.
+  /// receiver, and the retry timer.
   ///
   /// The retry **stays responsive to shutdown** (invariant II): a blind sleep would let a close
   /// request wait forever while the drain spins — behind a full channel a held-but-not-draining
@@ -4684,16 +6197,58 @@ where
   /// [`drain_pending_cleanup`](Self::drain_pending_cleanup) at the top of each iteration AND the second
   /// `select!` arm. A close interrupting the drain is returned to the caller (which does a non-blocking
   /// best-effort teardown and acks it) so `close()` always completes even mid-drain — no matter how
-  /// deep the command backlog is. The command receiver is `select!`ed too so a dropped last handle (its
-  /// `Err`) also stops the retry; a `watch`/`unwatch` arriving mid-teardown is failed fast (the owner
-  /// is quiescing) and the owed-`Rescan` drain continues.
+  /// deep the command backlog is.
+  ///
+  /// # The public mailbox is CUT before the first pass
+  ///
+  /// This drain used to keep accepting `watch`/`unwatch` for as long as it ran, failing each one
+  /// fast. Failing them fast is still what happens; what changed is WHERE. A refused request's key,
+  /// value and filter are the caller's, so they are placed rather than destroyed
+  /// ([`handle_teardown_command`](Self::handle_teardown_command)) — and placed means HELD, for a
+  /// loop whose length is the consumer's to decide. The mailbox bounds only what is queued at once,
+  /// so a handle that keeps sending refills it as fast as this loop drains it and the held total has
+  /// no bound at all.
+  ///
+  /// So the receive end is closed at entry. A send that has not been admitted by then fails in the
+  /// CALLER's frame with the same [`WatchError::Closed`]/[`UnwatchError::Closed`] the owner's own
+  /// refusal produces, and takes its request back with it; what remains is the already-queued
+  /// backlog, bounded by [`command_capacity`](crate::TributariesOptions::command_capacity) and
+  /// unrefillable, drained and answered at the top of each pass. Every public handle going away is
+  /// then read off the event channel (`events.is_closed()`) rather than off the mailbox's `Err`:
+  /// one handle owns the command sender and the event receiver together, so the two facts are the
+  /// same fact.
   ///
   /// Returns the [`CloseReply`] if a close interrupted the drain, else [`None`].
   async fn drain_owed_before_shutdown(&mut self) -> Option<CloseReply> {
+    // THE PUBLIC MAILBOX CUT, and the first thing this drain does. Everything below keeps SERVICING
+    // that mailbox for as long as the owed delivery takes, and every request it services is
+    // refused-and-RETAINED ([`handle_teardown_command`](Self::handle_teardown_command)) — so
+    // ACCEPTANCE is what decides how much caller-owned state one teardown holds. The mailbox bounds
+    // the instantaneous backlog, never the cumulative total: a live handle whose sends are still
+    // accepted refills it as fast as this loop drains it, and behind a full event channel the loop
+    // runs until the consumer resumes — so an accepting drain retains arbitrarily many caller keys,
+    // values and filters on its way out. Closing the RECEIVER moves the refusal OUTSIDE the owner:
+    // a later `send` fails in the caller's own frame, where the request it hands back is the
+    // caller's to destroy and nothing of the owner's stands behind it.
+    //
+    // What is left is exactly the backlog already queued at this instant — bounded by the mailbox's
+    // own capacity ([`command_capacity`](crate::TributariesOptions::command_capacity)) and
+    // unrefillable — so the retention below is a fixed number no caller can influence. Those queued
+    // requests are still ANSWERED, each with its explicit `Closed` reply, rather than left to
+    // resolve off a dropped sender at owner drop.
+    //
+    // The caller-visible change is which side of the channel produces the error, never which error:
+    // a submission not yet admitted by now fails at the send and surfaces
+    // [`WatchError::Closed`]/[`UnwatchError::Closed`] — the same values the owner's own refusal
+    // sends, and the ones the documented contract already names for "the owner is gone". It arrives
+    // sooner, and without first waiting out admission to a full mailbox.
+    //
+    // A close is untouched: it rides its own dedicated signal, checked at the top priority below.
+    self.commands.close();
     // Whether the dedicated close channel is still open (see [`closes`](Self::closes)). A closed
-    // channel is NOT a teardown signal here either — the command channel's `Err` is — so on close the
-    // arm just disables itself and the drain keeps going until the command channel closes or the debt
-    // is delivered.
+    // channel is NOT a teardown signal here either — every public handle going away is, and that is
+    // read off [`events`](Self::events) in the exit predicate below — so on close the arm just
+    // disables itself and the drain keeps going until the consumer is gone or the debt is delivered.
     let mut close_open = true;
     // Disabled once the atomic cut closes the cleanup channel: a closed,
     // drained channel's recv errors immediately — an enabled arm would spin the select.
@@ -4719,6 +6274,15 @@ where
       // makes progress every iteration. (It is NOT the suppression boundary — owner state is — it
       // only makes the EXIT PREDICATE read post-claim state.)
       self.drain_pending_cleanup();
+      // The pre-cut public backlog, THIRD: a full non-blocking drain of what was already queued
+      // when the mailbox was cut above, so each of those callers gets its explicit `Closed` reply
+      // instead of waiting for the owner's drop to hand it a dropped sender. The cut makes this
+      // unrefillable, so it is one bounded pass however long the loop runs; it stays in the loop
+      // rather than ahead of it because a `try_send` that had claimed its slot before the cut can
+      // still surface a moment after it, and the next iteration picks that straggler up.
+      while let Ok(command) = self.commands.try_recv() {
+        self.handle_teardown_command(command);
+      }
       self.drain_owed_once();
       // Exit once nothing is owed to a CLAIMED subscription AND no grant resolution is still pending —
       // the linearization point: a claim observable by now was drained above and its
@@ -4761,9 +6325,9 @@ where
       }
       let sleep = R::sleep(RETRY).fuse();
       futures_util::pin_mut!(sleep);
-      // The dedicated close arm, borrowing ONLY the close receiver (disjoint from the cleanup/commands
-      // borrows the next arms take). It is the FIRST arm so a close always wins over a queued cleanup or
-      // command; on a closed channel it resolves `None` (→ disable) and on disable it parks.
+      // The dedicated close arm, borrowing ONLY the close receiver (disjoint from the cleanup
+      // borrow the next arm takes). It is the FIRST arm so a close always wins over a queued
+      // cleanup; on a closed channel it resolves `None` (→ disable) and on disable it parks.
       let closes = &self.closes;
       let close_arm = async move {
         if close_open {
@@ -4773,7 +6337,7 @@ where
           futures_util::future::pending::<Option<CloseReply>>().await
         }
       };
-      // The dedicated cleanup arm (SECOND, below close, above commands): wakes the drain
+      // The dedicated cleanup arm (SECOND, below close): wakes the drain
       // when a grant resolves mid-retry so its `Cleanup::Claim` lifts suppression / `Cleanup::DropOrphan`
       // purges before the next owed pass. Never errors while the owner lives (it holds `cleanup_tx`).
       let cleanup_rx = &self.cleanup_rx;
@@ -4789,8 +6353,8 @@ where
           // A close interrupted the drain: hand its reply back so the caller acks it — `close()`
           // completes even mid-drain.
           Some(reply) => return Some(reply),
-          // The close channel closed (every handle dropped): disable the arm; the command channel's
-          // own `Err` (below) remains the dropped-handles stop signal.
+          // The close channel closed (every handle dropped): disable the arm; the exit predicate's
+          // `events.is_closed()` remains the dropped-handles stop signal.
           None => close_open = false,
         },
         cleanup = cleanup_arm.fuse() => match cleanup {
@@ -4801,34 +6365,54 @@ where
           // every pre-cut claim, and later grants poison at their own try_send.
           None => cleanup_open = false,
         },
-        cmd = self.commands.recv().fuse() => match cmd {
-          // A queued PUBLIC command mid-drain — a `watch`/`unwatch` — failed fast (the owner is
-          // quiescing). A close never arrives here (its own arm above); grant resolution never arrives
-          // here (the cleanup arm above).
-          Ok(command) => self.handle_teardown_command(command),
-          // Every handle dropped: nobody is left to receive the owed Rescans — stop and tear
-          // down (the caller's best-effort final pass runs next).
-          Err(_) => return None,
-        },
+        // No public-command arm: the mailbox was CUT at entry, so it can only ever hold the
+        // pre-cut backlog the loop top drains, and a `recv` on a closed-and-drained channel errors
+        // at once — an arm here would spin the select rather than wait for anything. The stop it
+        // used to carry (every public handle gone) is the same fact the exit predicate reads off
+        // `events.is_closed()`, since a handle owns the command SENDER and the event RECEIVER
+        // together and drops them together. The stop is then observed on the next pass instead of
+        // the same instant, which is one `RETRY` at worst.
         _ = sleep => {}
       }
     }
   }
 
-  /// Handles one PUBLIC command won by the
-  /// [`drain_owed_before_shutdown`](Self::drain_owed_before_shutdown) `select!` while the owner is
+  /// Handles one PUBLIC command out of the pre-cut backlog
+  /// [`drain_owed_before_shutdown`](Self::drain_owed_before_shutdown) drains while the owner is
   /// quiescing: a [`Watch`](Command::Watch)/[`Unwatch`](Command::Unwatch) is **failed fast** — the
   /// owner is stopping, so the caller's handle surfaces `Closed`.
   ///
-  /// The mailbox now carries ONLY these two caller-reply commands; grant resolution
+  /// Every request this sees was queued BEFORE that drain cut the mailbox, so how many times it can
+  /// run over one teardown is bounded by
+  /// [`command_capacity`](crate::TributariesOptions::command_capacity) and not by how long the
+  /// teardown takes or how hard a live handle pushes. That bound is what makes the placement below
+  /// affordable: each refusal HOLDS its request until the tail's release, and an unbounded number of
+  /// them would be an unbounded retention.
+  ///
+  /// The mailbox carries ONLY these two caller-reply commands; grant resolution
   /// ([`Cleanup::Claim`]/[`Cleanup::DropOrphan`]) rides the dedicated cleanup channel, handled by
   /// [`apply_cleanup`](Self::apply_cleanup). A close is **never** one of these either:
   /// shutdown rides the dedicated [`closes`](Self::closes) signal, handled by its own arm. This awaits
   /// nothing, so it can never park teardown (invariant II).
   fn handle_teardown_command(&mut self, cmd: Command<C, V>) {
     match cmd {
-      Command::Watch { reply, .. } => {
+      Command::Watch {
+        key,
+        value,
+        options,
+        reply,
+      } => {
         let _ = reply.send(Err(WatchError::Closed));
+        // The refused request is still the CALLER's: its key, the value it wanted attributed, and
+        // the admission filter it configured. This runs from the source-drain teardown, where the
+        // bounded wait and the acknowledgement are both still owed, so all three are placed rather
+        // than destroyed by this frame. The interest and debounce are plain configuration.
+        let mut salvage = Salvage::new();
+        salvage.keep_key(key);
+        salvage.keep_value(value);
+        let (_, filter, _) = options.into_parts();
+        salvage.keep_filter(filter);
+        self.retire_salvage(salvage);
       }
       Command::Unwatch { reply, .. } => {
         let _ = reply.send(Err(UnwatchError::Closed));
@@ -4853,60 +6437,326 @@ struct ParkedRescan<C, V> {
   value: Option<V>,
 }
 
-/// Merges a parked overflow [`Rescan`](crate::EventKind::Rescan) into the dirty-set,
-/// keeping the `key`, the max `epoch`, and the baked `value` (design backpressure doc, checklist
-/// #3/#4; design §3 for the value).
+/// The driver's two caller-owned per-subscription planes, behind a privacy boundary.
 ///
-/// The load-bearing effect is the epoch `max`: repeated sheds of one subscription collapse to
-/// a single dominating `Rescan` at the greatest
-/// [`shed_rescan`](epoch::EpochLedger::shed_rescan) epoch (that mint is strictly increasing,
-/// so the newest shed already carries it; the `max` states the dominance intent regardless).
-/// The `key` **and** `value` overwrites are both **defensive no-ops**: a subscription's own key
-/// and its caller value are each invariant across its lifetime — `commit_watch` repoints only
-/// which root a widened sub *rides*, never its own key, and a value is set once at `watch` and
-/// never re-assigned — so every shed of a given `sub` carries the same
-/// `subscription_key(sub)`/`subscription_value(sub)`. They uphold the "keys only ever widen"
-/// invariant without ever needing to exercise it (a widen's own synthetic `Rescan` for an
-/// already-parked sub is suppressed by `try_emit`, so it never reaches this merge).
-fn merge_max<C: PartialEq, V>(
-  needs_rescan: &mut BTreeMap<Subscription, ParkedRescan<C, V>>,
-  sub: Subscription,
-  key: Vec<C>,
-  epoch: Epoch,
-  value: Option<V>,
-) {
-  use std::collections::btree_map::Entry;
-  match needs_rescan.entry(sub) {
-    Entry::Occupied(mut occupied) => {
-      let parked = occupied.get_mut();
-      // Widen the parked key so the single parked `Rescan` covers BOTH re-enumeration debts
-      // (see [`widen_to_cover`]).
-      widen_to_cover(&mut parked.key, &key);
-      parked.epoch = parked.epoch.max(epoch);
-      parked.value = value;
+/// # Why a module, and not just two structs
+///
+/// Both planes hold values whose destructors are the CALLER's code, and both are mutated from a
+/// dozen sites across a long file. The whole point of wrapping them is that a removal must hand its
+/// caller-owned payload back in a `#[must_use]` [`Salvage`] instead of destroying it — and a
+/// wrapper whose inner map is merely a private FIELD does not buy that inside its own module,
+/// where `self.needs_rescan.entries.remove(&sub)` is still spelled and still compiles. Here the map
+/// is private to THIS module, so the only way to take an entry out anywhere else is through one of
+/// the methods below, every one of which returns a bundle the compiler will not let a site drop.
+///
+/// That is the mechanism, stated once: the next site of this shape does not compile.
+mod planes {
+  use std::{
+    collections::{BTreeMap, HashMap},
+    ops::Bound,
+    vec::Vec,
+  };
+
+  use tributary_proto::Epoch;
+
+  use super::{ParkedRescan, SubscriptionFilter};
+  use crate::{filter::Filter, subscription::Subscription, subsume::Salvage};
+
+  /// The driver's **parked re-enumeration plane**: each subscription's owed dominating
+  /// [`Rescan`](crate::EventKind::Rescan), held until it can be delivered. Two instances exist —
+  /// [`needs_rescan`](Owner::needs_rescan) for a claimed subscription's offerable debt and
+  /// [`suppressed_rescan`](Owner::suppressed_rescan) for an unclaimed one's.
+  ///
+  /// # Why it is not a bare `BTreeMap`
+  ///
+  /// Every entry is caller-owned twice over: a key of caller `C` components and the subscription's
+  /// baked caller `V`. `BTreeMap`'s own API destroys both silently — `remove` discards its return
+  /// unremarked, an `entry().get_mut()` lets a merge truncate a key and overwrite a value in place —
+  /// and each of those runs a caller destructor wherever the call happens to be, which on the
+  /// teardown path is in front of the bounded [`join_close`](Source::join_close) and the
+  /// acknowledgement carrying its verdict.
+  ///
+  /// So the map is private and every mutator here hands its removals back in a
+  /// [`Salvage`] instead, exactly as a [`Subsumer`] mutator does. That is not a
+  /// convention: `Salvage` is `#[must_use]`, so a site that calls one of these and drops the result
+  /// on the floor does not compile under `-D warnings`. The reads stay plain forwards — a shared
+  /// borrow can destroy nothing.
+  ///
+  /// Marking [`ParkedRescan`] itself `#[must_use]` would NOT have bought this, which is why the
+  /// wrapper exists: the lint does not descend through the `Option` a map removal returns, so
+  /// `map.remove(&sub);` stays silent no matter how the payload is annotated.
+  pub(super) struct ParkedRescans<C, V> {
+    entries: BTreeMap<Subscription, ParkedRescan<C, V>>,
+  }
+
+  impl<C, V> ParkedRescans<C, V> {
+    /// An empty plane — nothing owed to anyone.
+    pub(super) fn new() -> Self {
+      Self {
+        entries: BTreeMap::new(),
+      }
     }
-    Entry::Vacant(vacant) => {
-      vacant.insert(ParkedRescan { key, epoch, value });
+
+    /// Whether any subscription is owed a re-enumeration here.
+    pub(super) fn is_empty(&self) -> bool {
+      self.entries.is_empty()
+    }
+
+    /// How many subscriptions are owed one — the flush's per-pass visit bound.
+    pub(super) fn len(&self) -> usize {
+      self.entries.len()
+    }
+
+    /// Whether `sub` is owed one.
+    pub(super) fn contains_key(&self, sub: &Subscription) -> bool {
+      self.entries.contains_key(sub)
+    }
+
+    /// `sub`'s parked entry, for minting the offer from.
+    pub(super) fn get(&self, sub: &Subscription) -> Option<&ParkedRescan<C, V>> {
+      self.entries.get(sub)
+    }
+
+    /// Every owed subscription, in order.
+    pub(super) fn keys(&self) -> impl Iterator<Item = &Subscription> {
+      self.entries.keys()
+    }
+
+    /// The least owed subscription at or after `bound` — the flush's lazy round-robin probe, which
+    /// takes one range hit at a time rather than materializing a snapshot of the plane.
+    pub(super) fn first_from(
+      &self,
+      bound: (Bound<Subscription>, Bound<Subscription>),
+    ) -> Option<Subscription> {
+      self
+        .entries
+        .range(bound)
+        .next()
+        .or_else(|| self.entries.iter().next())
+        .map(|(&sub, _)| sub)
+    }
+
+    /// Takes `sub`'s parked entry out and hands its caller-owned halves back: the key it would have
+    /// re-enumerated and the value baked onto it. The epoch is the driver's own bookkeeping and stays
+    /// here.
+    pub(super) fn take<H>(&mut self, sub: Subscription) -> Salvage<C, V, H> {
+      let mut salvage = Salvage::new();
+      if let Some(parked) = self.entries.remove(&sub) {
+        salvage.keep_key(parked.key);
+        if let Some(value) = parked.value {
+          salvage.keep_value(value);
+        }
+      }
+      salvage
+    }
+
+    /// Moves `sub`'s entry from `from` into `to`, merging it with whatever `to` already holds — the
+    /// claim that lifts an unclaimed subscription's suppression, turning withheld debt into offerable
+    /// debt. Nothing is destroyed on the way: the moved entry is decomposed and re-merged, and the
+    /// merge's own displacements travel back in the bundle.
+    pub(super) fn promote<H>(from: &mut Self, to: &mut Self, sub: Subscription) -> Salvage<C, V, H>
+    where
+      C: PartialEq,
+    {
+      match from.entries.remove(&sub) {
+        Some(parked) => to.merge_max(sub, parked.key, parked.epoch, parked.value),
+        None => Salvage::new(),
+      }
+    }
+
+    /// Merges a parked overflow [`Rescan`](crate::EventKind::Rescan) into the plane,
+    /// keeping the `key`, the max `epoch`, and the baked `value` (design backpressure doc, checklist
+    /// #3/#4; design §3 for the value).
+    ///
+    /// The load-bearing effect is the epoch `max`: repeated sheds of one subscription collapse to
+    /// a single dominating `Rescan` at the greatest
+    /// [`shed_rescan`](epoch::EpochLedger::shed_rescan) epoch (that mint is strictly increasing,
+    /// so the newest shed already carries it; the `max` states the dominance intent regardless).
+    /// The `key` **and** `value` overwrites are both **defensive no-ops**: a subscription's own key
+    /// and its caller value are each invariant across its lifetime — `commit_watch` repoints only
+    /// which root a widened sub *rides*, never its own key, and a value is set once at `watch` and
+    /// never re-assigned — so every shed of a given `sub` carries the same
+    /// `subscription_key(sub)`/`subscription_value(sub)`. They uphold the "keys only ever widen"
+    /// invariant without ever needing to exercise it (a widen's own synthetic `Rescan` for an
+    /// already-parked sub is suppressed by `try_emit`, so it never reaches this merge).
+    ///
+    /// Defensive or not, the occupied arm SUPERSEDES three caller-owned values — the components the
+    /// widen truncates off the parked key, the value it displaces, and the incoming key itself, which
+    /// the merge does not need once the parked one covers it — and every one of them leaves in the
+    /// bundle rather than by this frame's exit.
+    pub(super) fn merge_max<H>(
+      &mut self,
+      sub: Subscription,
+      key: Vec<C>,
+      epoch: Epoch,
+      value: Option<V>,
+    ) -> Salvage<C, V, H>
+    where
+      C: PartialEq,
+    {
+      use std::collections::btree_map::Entry;
+      let mut salvage = Salvage::new();
+      match self.entries.entry(sub) {
+        Entry::Occupied(mut occupied) => {
+          let parked = occupied.get_mut();
+          // Widen the parked key so the single parked `Rescan` covers BOTH re-enumeration debts
+          // (see [`widen_to_cover`]).
+          widen_to_cover(&mut parked.key, &key, &mut salvage);
+          parked.epoch = parked.epoch.max(epoch);
+          if let Some(displaced) = core::mem::replace(&mut parked.value, value) {
+            salvage.keep_value(displaced);
+          }
+          salvage.keep_key(key);
+        }
+        Entry::Vacant(vacant) => {
+          vacant.insert(ParkedRescan { key, epoch, value });
+        }
+      }
+      salvage
+    }
+
+    /// Grows `sub`'s parked key until it covers every key in `covers`, and lifts its epoch to
+    /// `epoch` — the repair a later suppressed event demands of the debt standing in front of it.
+    /// A subscription with no entry here is untouched.
+    pub(super) fn widen_debt<'a, H>(
+      &mut self,
+      sub: Subscription,
+      covers: impl IntoIterator<Item = &'a [C]>,
+      epoch: Epoch,
+    ) -> Salvage<C, V, H>
+    where
+      C: PartialEq + 'a,
+    {
+      let mut salvage = Salvage::new();
+      let Some(parked) = self.entries.get_mut(&sub) else {
+        return salvage;
+      };
+      for cover in covers {
+        widen_to_cover(&mut parked.key, cover, &mut salvage);
+      }
+      parked.epoch = parked.epoch.max(epoch);
+      salvage
     }
   }
-}
 
-/// Widens `parked` — a parked [`Rescan`](crate::EventKind::Rescan)'s key — in place until it
-/// also covers `key`: truncates it to the two keys' longest common prefix.
-///
-/// Overwriting with `key` would be correct only when `key` is an ancestor of `parked`. Two
-/// independent losses under one subscription (say `/a/x` then `/a/y`) are siblings, and
-/// dropping either's coverage is silent loss; their common prefix (`/a`) re-enumerates a
-/// superset of both. Where `key` *is* an ancestor of `parked` the common prefix is exactly
-/// `key`, so the ancestor case is unchanged. The result is always an ancestor-or-equal of the
-/// previous `parked` key, so coverage only ever grows — the "keys only ever widen" invariant.
-fn widen_to_cover<C: PartialEq>(parked: &mut Vec<C>, key: &[C]) {
-  let common = key
-    .iter()
-    .zip(parked.iter())
-    .take_while(|(a, b)| a == b)
-    .count();
-  parked.truncate(common);
+  /// Widens `parked` — a parked [`Rescan`](crate::EventKind::Rescan)'s key — in place until it
+  /// also covers `key`: truncates it to the two keys' longest common prefix.
+  ///
+  /// Overwriting with `key` would be correct only when `key` is an ancestor of `parked`. Two
+  /// independent losses under one subscription (say `/a/x` then `/a/y`) are siblings, and
+  /// dropping either's coverage is silent loss; their common prefix (`/a`) re-enumerates a
+  /// superset of both. Where `key` *is* an ancestor of `parked` the common prefix is exactly
+  /// `key`, so the ancestor case is unchanged. The result is always an ancestor-or-equal of the
+  /// previous `parked` key, so coverage only ever grows — the "keys only ever widen" invariant.
+  ///
+  /// The truncated tail is CALLER components, so it is split off and placed in `salvage` rather than
+  /// destroyed by the truncation. An already-covering key sheds nothing and adds nothing to the
+  /// bundle: the widen is the common case on a suppressing hot path, and an empty placement per
+  /// suppressed event would be a bundle allocation bought for no caller value at all.
+  fn widen_to_cover<C: PartialEq, V, H>(
+    parked: &mut Vec<C>,
+    key: &[C],
+    salvage: &mut Salvage<C, V, H>,
+  ) {
+    let common = key
+      .iter()
+      .zip(parked.iter())
+      .take_while(|(a, b)| a == b)
+      .count();
+    if common < parked.len() {
+      salvage.keep_key(parked.split_off(common));
+    }
+  }
+
+  /// The driver's **admission plane**: one [`SubscriptionFilter`] per live subscription.
+  ///
+  /// # Why it is not a bare `HashMap`
+  ///
+  /// A gate holds the caller's [`Filter`], and a `Filter` boxes caller code that may own anything
+  /// the caller likes — so retiring a subscription runs a caller destructor, and a `remove` whose
+  /// return is discarded runs it wherever the retirement happens to be. On the teardown path that is
+  /// in front of the bounded [`join_close`](Source::join_close) and the acknowledgement carrying its
+  /// verdict.
+  ///
+  /// So the map is private and both mutators hand the gate's caller half back in a `#[must_use]`
+  /// [`Salvage`], the same door every other caller-owned removal leaves by. The
+  /// quarantine verdict is NOT handed over: it is this owner's reading of the subscription, not
+  /// caller state, and it dies with the entry (see [`SubscriptionFilter`] for why it lives here
+  /// rather than in the caller's slot).
+  pub(super) struct Filters<C> {
+    gates: HashMap<Subscription, SubscriptionFilter<C>>,
+  }
+
+  impl<C> Filters<C> {
+    /// An empty plane — no subscription is gated yet.
+    pub(super) fn new() -> Self {
+      Self {
+        gates: HashMap::new(),
+      }
+    }
+
+    /// `sub`'s gate, for evaluating its admission.
+    pub(super) fn get(&self, sub: &Subscription) -> Option<&SubscriptionFilter<C>> {
+      self.gates.get(sub)
+    }
+
+    /// Whether `sub` is gated here at all.
+    #[cfg(all(test, feature = "tokio"))]
+    pub(super) fn contains_key(&self, sub: &Subscription) -> bool {
+      self.gates.contains_key(sub)
+    }
+
+    /// Whether no subscription is gated here.
+    #[cfg(all(test, feature = "tokio"))]
+    pub(super) fn is_empty(&self) -> bool {
+      self.gates.is_empty()
+    }
+
+    /// How many subscriptions are gated here.
+    #[cfg(all(test, feature = "tokio"))]
+    pub(super) fn len(&self) -> usize {
+      self.gates.len()
+    }
+
+    /// Retires `sub`'s gate **fail-open** after its predicate unwound, and reports whether there was
+    /// a gate to retire. Writes the owner's own verdict only — the caller's slot is never touched,
+    /// so a filter value shared with another subscription keeps gating that one exactly as
+    /// configured.
+    pub(super) fn quarantine(&mut self, sub: Subscription) -> bool {
+      match self.gates.get_mut(&sub) {
+        Some(gate) => {
+          gate.quarantined = true;
+          true
+        }
+        None => false,
+      }
+    }
+
+    /// Registers `sub`'s gate. A commit installs one gate per NEW subscription, so nothing is
+    /// displaced in practice — but "in practice" is not a guarantee the compiler checks, and an
+    /// overwrite here would destroy a caller [`Filter`] by plain assignment, so the displaced gate
+    /// travels back like any other removal.
+    pub(super) fn install<V, H>(
+      &mut self,
+      sub: Subscription,
+      filter: Filter<C>,
+    ) -> Salvage<C, V, H> {
+      let mut salvage = Salvage::new();
+      if let Some(displaced) = self.gates.insert(sub, SubscriptionFilter::new(filter)) {
+        salvage.keep_filter(displaced.filter);
+      }
+      salvage
+    }
+
+    /// Takes `sub`'s gate out and hands the caller's filter back.
+    pub(super) fn take<V, H>(&mut self, sub: Subscription) -> Salvage<C, V, H> {
+      let mut salvage = Salvage::new();
+      if let Some(gate) = self.gates.remove(&sub) {
+        salvage.keep_filter(gate.filter);
+      }
+      salvage
+    }
+  }
 }
 
 /// The pure `RoutableEvent<C>` adapter over one raw [`SourceEvent`] (design §5): it

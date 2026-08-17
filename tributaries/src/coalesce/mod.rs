@@ -94,6 +94,7 @@ use crate::{
   event::{Event, EventKind},
   options::{Debounce, DebounceConfig},
   subscription::Subscription,
+  subsume::Salvage,
 };
 
 // Buffered entries INSPECTED by a deadline query (`next_deadline` / `drain_ready`) — the
@@ -280,9 +281,11 @@ where
   /// still-live paths (a widen/restore re-point, an overflow park) call
   /// [`drop_subscription`](Self::drop_subscription) instead, keeping the policy: the
   /// subscription keeps delivering and must keep its posture.
-  pub(crate) fn forget_subscription(&mut self, sub: Subscription) {
-    self.drop_subscription(sub);
+  pub(crate) fn forget_subscription<H>(&mut self, sub: Subscription) -> Salvage<C, V, H> {
+    let salvage = self.drop_subscription(sub);
+    // The policy is a `Copy` configuration this crate owns, not caller state — nothing to place.
     self.policies.remove(&sub);
+    salvage
   }
 
   /// The effective settle policy for `sub`: its registered override — `Some(config)` =
@@ -488,20 +491,38 @@ where
   /// For stream close: once the source is drained no further change can arrive to
   /// settle a buffered burst, so the driver force-emits the coalesced tail rather than
   /// silently dropping it (no-silent-loss).
-  pub(crate) fn flush_all(&mut self, out: &mut Vec<Event<C, V>>) {
+  ///
+  /// The EVENTS leave through `out` — they are delivered, not destroyed — but the two indexes
+  /// keyed on them do not: a buffer key and a deadline key are each a deep copy of the caller's own
+  /// components, and this runs on the driver's terminal path, ahead of the bounded
+  /// [`join_close`](crate::source::Source::join_close) and the acknowledgement carrying its
+  /// verdict. So both copies come back in the [`Salvage`] every caller-owned removal in this crate
+  /// leaves by, rather than dying inside a `clear()` and an iterator's discarded key.
+  pub(crate) fn flush_all<H>(&mut self, out: &mut Vec<Event<C, V>>) -> Salvage<C, V, H> {
+    let mut salvage = Salvage::new();
     out.extend(self.ready.drain(..).map(|(_, event)| event));
+    // The deadline index's own copies. `clear()` destroys every one of them where it stands, so the
+    // set is TAKEN and walked instead — the same `take`-not-`remove` reasoning
+    // [`drop_subscription`](Self::drop_subscription) applies per entry, done wholesale.
+    for (_, (_, path)) in core::mem::take(&mut self.deadlines) {
+      salvage.keep_key(path);
+    }
     // The buffered tail in (subscription, admission-sequence) order — the same
     // per-subscription epoch order `drain_ready` keeps, so a teardown flush cannot deliver
-    // a subscription's epochs out of order (design §8).
-    self.deadlines.clear();
-    let mut tail: Vec<(Subscription, u64, Event<C, V>)> = std::mem::take(&mut self.buffer)
-      .into_iter()
-      .map(|((sub, _path), b)| (sub, b.seq, b.event))
-      .collect();
+    // a subscription's epochs out of order (design §8). Consuming the map by value hands each
+    // MAP-OWNED key over with its entry, and it is placed here rather than discarded by the
+    // destructuring: the event carries its own copy of that key, so dropping this one silently is
+    // exactly the removal shape no `#[must_use]` can see.
+    let mut tail: Vec<(Subscription, u64, Event<C, V>)> = Vec::with_capacity(self.buffer.len());
+    for ((sub, path), buffered) in core::mem::take(&mut self.buffer) {
+      salvage.keep_key(path);
+      tail.push((sub, buffered.seq, buffered.event));
+    }
     tail.sort_by_key(|(sub, seq, _)| (*sub, *seq));
     out.extend(tail.into_iter().map(|(_, _, event)| event));
     // The whole buffer is gone, so every fresh-entry count reconciles to zero.
     self.per_sub_len.clear();
+    salvage
   }
 
   /// Buffers a lifecycle event under its subscription's effective `config`, collapsing
@@ -730,13 +751,40 @@ where
   /// **still live** — an overflow park, a widen/restore re-point — and its later events
   /// must keep their registered posture. A subscription that is genuinely ending takes
   /// [`forget_subscription`](Self::forget_subscription) instead.
-  pub(crate) fn drop_subscription(&mut self, sub: Subscription) {
+  ///
+  /// Everything discarded is CALLER-owned — a buffered delivery owns the key it was located at and
+  /// the value baked onto it, and both index keys are deep copies of the caller's components — so
+  /// none of it is destroyed here. It travels back in a `#[must_use]` [`Salvage`], the
+  /// one door every caller-owned removal in this crate leaves by, because every caller of this
+  /// method is reachable on the driver's terminal path: destroying a caller `C` or `V` here would
+  /// put its destructor in front of the teardown's bounded quiescence wait and the acknowledgement
+  /// carrying its verdict.
+  pub(crate) fn drop_subscription<H>(&mut self, sub: Subscription) -> Salvage<C, V, H> {
+    let mut salvage = Salvage::new();
     let entries = self.subscription_entries(sub);
     let dropped = entries.len();
     for (_, key) in entries {
-      if let Some(entry) = self.buffer.remove(&key) {
-        self.deadlines.remove(&(entry.emit_at, key));
+      // `remove_entry` rather than `remove`: a map removal hands back its VALUE and destroys the
+      // key it was filed under, and this map's key owns a deep copy of the caller's components. It
+      // is the one shape neither `#[must_use]` nor a private-map wrapper can catch — the removal
+      // does return something, and the site does use it, while the key dies unmentioned inside the
+      // call. THREE copies exist here and each leaves by the same door: the map's own, the deadline
+      // index's, and the scan's.
+      let Some((owned, entry)) = self.buffer.remove_entry(&key) else {
+        // Nothing buffered under this key, so only the scan's own copy is in hand.
+        salvage.keep_key(key.1);
+        continue;
+      };
+      salvage.keep_key(owned.1);
+      salvage.keep_event(entry.event);
+      // `take` rather than `remove`, for the same reason one line up: the deadline index owns a
+      // copy of the key, and `remove` would destroy it where it stands. The query tuple owns the
+      // scan's, which outlives the lookup and is placed after it.
+      let query = (entry.emit_at, key);
+      if let Some(indexed) = self.deadlines.take(&query) {
+        salvage.keep_key(indexed.1.1);
       }
+      salvage.keep_key(query.1.1);
     }
     // Every buffered entry of `sub` is gone: its fresh-entry count reconciles to zero —
     // the counter zeroing behind the shed path's "purge frees the cap" guarantee.
@@ -745,7 +793,16 @@ where
       counted == dropped,
       "fresh-entry count drifted from the buffer: counted {counted}, dropped {dropped}"
     );
-    self.ready.retain(|(_, event)| event.subscription() != sub);
+    let mut kept = VecDeque::with_capacity(self.ready.len());
+    for (at, event) in std::mem::take(&mut self.ready) {
+      if event.subscription() == sub {
+        salvage.keep_event(event);
+      } else {
+        kept.push_back((at, event));
+      }
+    }
+    self.ready = kept;
+    salvage
   }
 
   /// The buffered `(admission-sequence, key)` pairs belonging to `sub`, in BTreeMap key

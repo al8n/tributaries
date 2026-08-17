@@ -23,6 +23,19 @@ WHICH="${1:-all}"
 # wherever an instrumented build runs the integration binaries.
 SANITIZER_SKIP=(-- --skip close_quiesces_under_sustained_traffic)
 
+# A destructor that UNWINDS abandons every deallocation standing behind it: the frames between the
+# panicking `Drop` and whatever contains it never reach their `Arc` frees, so the nodes on that path
+# are unreachable for the rest of the process. That is a property of the language, not a defect, and
+# `owner_teardown_enters_the_seam_although_releasing_the_displaced_plane_unwinds` drives it
+# deliberately — a caller value whose destructor unwinds while the owner's teardown releases the read
+# plane that last owned it — to pin that the teardown still enters the source seam and still reaps
+# its cookies. LSan reports the handful of abandoned radix nodes as leaks, so the LEAK pass alone
+# skips it. Every other instrument still runs it (ASan/TSan here, MSan via `--lib`, and the native
+# suites), and the payload-disposal cells stay under LSan because their retained payloads are
+# zero-sized by construction — see `ForgottenPayload`.
+LEAK_SKIP=("${SANITIZER_SKIP[@]}"
+  --skip owner_teardown_enters_the_seam_although_releasing_the_displaced_plane_unwinds)
+
 run_asan_lsan() {
   # Run address sanitizer
   RUSTFLAGS="-Z sanitizer=address" \
@@ -30,7 +43,7 @@ run_asan_lsan() {
 
   # Run leak sanitizer
   RUSTFLAGS="-Z sanitizer=leak" \
-  cargo test --tests --target "$TARGET" --all-features "${SANITIZER_SKIP[@]}"
+  cargo test --tests --target "$TARGET" --all-features "${LEAK_SKIP[@]}"
 }
 
 run_msan() {

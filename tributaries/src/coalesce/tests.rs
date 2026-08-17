@@ -610,7 +610,7 @@ fn flush_all_drains_everything_for_stream_close() {
 
   // On stream close no further change can settle the bursts — flush the tail.
   let mut out = Vec::new();
-  c.flush_all(&mut out);
+  c.flush_all::<u32>(&mut out).release();
   assert_eq!(
     out.len(),
     2,
@@ -645,7 +645,7 @@ fn drop_subscription_discards_only_that_subscriptions_entries() {
   );
 
   // Drop s1: its buffered (/a/h) AND ready (/a/f, the Rescan) entries all vanish.
-  c.drop_subscription(s1);
+  c.drop_subscription::<u32>(s1).release();
 
   let out = drain(&mut c, clk.at(1000));
   assert_eq!(out.len(), 1, "only s2's entry survives the drop of s1");
@@ -814,7 +814,7 @@ fn per_sub_cap_sheds_and_counter_zeroes_after_the_purge() {
   );
 
   // The driver's park path purges the shed subscription — the counter zeroes with it.
-  c.drop_subscription(s);
+  c.drop_subscription::<u32>(s).release();
   assert!(
     !c.per_sub_len.contains_key(&s),
     "the purge zeroes the fresh-entry counter"
@@ -888,7 +888,7 @@ fn per_sub_counter_tracks_every_removal_path() {
   // flush_all: the teardown flush clears every count.
   assert!(c.admit(modified(s, "/e", 7), clk.at(22)).is_none());
   let mut out = Vec::new();
-  c.flush_all(&mut out);
+  c.flush_all::<u32>(&mut out).release();
   assert_eq!(out.len(), 1);
   assert!(
     c.per_sub_len.is_empty(),
@@ -908,7 +908,7 @@ fn forget_clears_the_policy_drop_retains_it() {
   c.set_policy(s, Debounce::Custom(config()));
 
   assert!(c.admit(modified(s, "/a/f", 1), clk.at(0)).is_none());
-  c.drop_subscription(s);
+  c.drop_subscription::<u32>(s).release();
   assert!(
     c.has_policy(s),
     "drop_subscription keeps the policy — the subscription is still live"
@@ -921,7 +921,7 @@ fn forget_clears_the_policy_drop_retains_it() {
   );
   assert_eq!(drain(&mut c, clk.at(20)).len(), 1);
 
-  c.forget_subscription(s);
+  c.forget_subscription::<u32>(s).release();
   assert!(!c.has_policy(s), "forget_subscription retires the policy");
   // Back to inheriting the (disabled) default: pass-through.
   assert!(c.admit(modified(s, "/a/h", 3), clk.at(21)).is_none());
@@ -1015,7 +1015,7 @@ fn flush_all_emits_buffered_in_epoch_order_not_path_order() {
 
   // Force-emit the still-settling tail (as a stream close would), regardless of deadline.
   let mut out = Vec::new();
-  c.flush_all(&mut out);
+  c.flush_all::<u32>(&mut out).release();
   assert_eq!(out.len(), 2);
   assert_eq!(
     out[0].path(),
@@ -1183,7 +1183,7 @@ mod proptests {
         c.drain_ready(clk.at(t), &mut emitted);
       }
       // Flush the settling tail (as a stream close would).
-      c.flush_all(&mut emitted);
+      c.flush_all::<u32>(&mut emitted).release();
 
       // Every emitted event is a real, well-formed delivery for our subscription.
       for e in &emitted {
@@ -1219,7 +1219,7 @@ mod proptests {
           assert!(c.admit(event_for(s, step, epoch), clk.at(t)).is_none());
           c.drain_ready(clk.at(t), &mut out);
         }
-        c.flush_all(&mut out);
+        c.flush_all::<u32>(&mut out).release();
         out
           .into_iter()
           .map(|e| (e.path().to_path_buf(), e.kind().as_str(), e.epoch()))
@@ -1249,7 +1249,7 @@ mod proptests {
         assert!(c.admit(event_for(s, step, epoch), clk.at(t)).is_none());
         c.drain_ready(clk.at(t), &mut emitted);
       }
-      c.flush_all(&mut emitted);
+      c.flush_all::<u32>(&mut emitted).release();
 
       // Walk the emission order; track the highest epoch of any immediate emission
       // (Rescan or Moved) seen so far. Because each flushes its subscription's whole
