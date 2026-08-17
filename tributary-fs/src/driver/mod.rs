@@ -2803,6 +2803,17 @@ pub(crate) enum Command {
     scope: ScopeId,
     reply: futures_channel::oneshot::Sender<usize>,
   },
+  /// A test-only reading of whether `scope` still carries a coverage-fence
+  /// ENTRY — the loss memory a fence opened right now would inherit, which
+  /// [`DebugPendingCoverFences`](Command::DebugPendingCoverFences) cannot see
+  /// (an entry holding no pending fence reads zero there). A staging helper
+  /// waits on this to hand its cells a scope whose registration window is not
+  /// merely closed but SPENT.
+  #[cfg(all(test, feature = "tokio"))]
+  DebugCoverFenceEntry {
+    scope: ScopeId,
+    reply: futures_channel::oneshot::Sender<bool>,
+  },
   /// A test-only count of the cookies the driver still OWNS, so a suite can
   /// prove that a failed write, an abandoned reply, a retired scope, and a
   /// completed-cookie reap each leave the registry exactly as they found it — a
@@ -7439,6 +7450,10 @@ pub(crate) async fn run<R, F>(
         #[cfg(all(test, feature = "tokio"))]
         Ok(Command::DebugPendingCoverFences { scope, reply }) => {
           let _ = reply.send(core.pending_cover_fences(scope));
+        }
+        #[cfg(all(test, feature = "tokio"))]
+        Ok(Command::DebugCoverFenceEntry { scope, reply }) => {
+          let _ = reply.send(core.holds_cover_fence_entry(scope));
         }
         #[cfg(all(test, feature = "tokio"))]
         Ok(Command::DebugCookieReapMarks { reply }) => {

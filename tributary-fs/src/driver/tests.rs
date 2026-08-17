@@ -2951,14 +2951,43 @@ mod descending {
         .count()
     }
 
-    /// A live descending rig over `/r` with the given child directories,
-    /// whose birth crawl has FULLY quiesced (every child's read landed) — so a
-    /// later grow can never coalesce into an in-flight read and degrade a window
-    /// these cells expect clean. That crawl is now the registration's own
-    /// re-arm-flavored one (42-10) rather than a cold discovery; what the helper
-    /// waits on — every child's read having been issued — is unchanged, and so is
-    /// why it waits.
+    /// A live descending rig over `/r` with the given child directories (at
+    /// least one), whose registration window is not merely closed but SPENT — so
+    /// the first fence a cell opens inherits nothing and a window these cells
+    /// expect clean really is one.
+    ///
+    /// Three waits, and each covers a distinct hazard the next cannot:
+    ///
+    /// 1. **Every child's read ISSUED.** A later grow that coalesced into an
+    ///    in-flight read rides an obligation the settle counter does not see and
+    ///    is born lossy.
+    /// 2. **The window's closing `Rescan` DELIVERED.** That crawl is the
+    ///    registration's own re-arm-flavored one (42-10): it suppresses its
+    ///    `Created`s and pays for them with one closing `Rescan` at the first
+    ///    coverage settle. Issuing a read is not landing it, so wait (1) leaves
+    ///    that `Rescan` in flight — and a `Rescan` routed inside a fence's window
+    ///    degrades it, which is the loss signal working, not a defect. The
+    ///    channel is only PEEKED (never drained), so a cell's own event
+    ///    expectations are untouched, and this is the scope's first delivery by
+    ///    construction — the suppressed crawl announces nothing before it.
+    /// 3. **The loss it left SPENT.** Routing the `Rescan` marks the scope's
+    ///    fence entry lossy, and that memory outlives the delivery: it is cleared
+    ///    only by a settle observation, which for a per-directory scope must
+    ///    first buy an ordering proof over a control round trip. A fence opened
+    ///    inside that gap INHERITS the mark (see `CoverFence`'s lossy-window
+    ///    rule) and settles `Degraded`. Waiting for the entry itself to go is
+    ///    what makes the baseline clean rather than merely likely — the gap is
+    ///    a round trip wide, and a loaded or instrumented runner walks straight
+    ///    into it.
+    ///
+    /// Wait (3) is sound only behind wait (2): the entry is ABSENT both before
+    /// the `Rescan` creates it and after the observation spends it, so the
+    /// delivery is the edge that makes the emptiness mean the second one.
     async fn covered_rig(children: &[(&str, u64)]) -> (Rig, ScopeId) {
+      assert!(
+        !children.is_empty(),
+        "the helper's staging rests on the registration window installing at least one child"
+      );
       let fs = FakeFs::new(1);
       for (path, ino) in children {
         fs.put(path, FileKind::Dir, *ino);
@@ -2974,7 +3003,37 @@ mod descending {
         })
       })
       .await;
+      assert!(
+        settle(|| !rig.events.is_empty()).await,
+        "the registration window's closing `Rescan` reached the consumer"
+      );
+      assert!(
+        cover_fence_entry_spent(&rig, scope).await,
+        "and a settle observation spent the loss memory that `Rescan` left standing"
+      );
       (rig, scope)
+    }
+
+    /// Waits for `scope` to hold no coverage-fence entry at all — no pending
+    /// fence AND no accrued loss memory — so the next fence opened on it starts
+    /// clean. Reports whether it got there, for a caller that is staging.
+    #[must_use = "an expired budget leaves the baseline lossy, which is a staging failure"]
+    async fn cover_fence_entry_spent(rig: &Rig, scope: ScopeId) -> bool {
+      for _ in 0..200 {
+        let (reply, on_reply) = futures_channel::oneshot::channel();
+        rig
+          .commands
+          .send(Command::DebugCoverFenceEntry { scope, reply })
+          .await
+          .unwrap();
+        if !on_reply.await.expect("the driver answers a debug probe") {
+          return true;
+        }
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        std::thread::sleep(settle_round_slice());
+      }
+      false
     }
 
     /// The sync cookie's write is parked on the SAME settle fence a cover ack
