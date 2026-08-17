@@ -1910,6 +1910,26 @@ impl DriverCore {
       .map_or(0, |entry| entry.pending.len())
   }
 
+  /// Whether `scope` still carries a coverage-fence ENTRY at all — the memory a
+  /// fence opened right now would inherit.
+  ///
+  /// [`pending_cover_fences`](Self::pending_cover_fences) cannot answer this: an
+  /// entry holding no pending fence reads zero there while still carrying the
+  /// scope's accrued `lossy` memory, and that is exactly the state a routed
+  /// `Rescan` leaves behind until a settle observation spends it (see
+  /// [`CoverFence`]). A registration window's closing `Rescan` therefore stands
+  /// across the gap between its routing and the ordering-proof round trip that
+  /// lets the observation clear the entry, and a fence opened inside that gap
+  /// inherits the loss and settles `Degraded` — honestly for the product, and
+  /// fatally for a cell staging a clean baseline. Staging that means "this scope
+  /// has nothing accrued" waits on the ENTRY going, not on the pending count.
+  ///
+  /// Test-only, gated to the driver suite that consumes it.
+  #[cfg(all(test, feature = "tokio"))]
+  pub(crate) fn holds_cover_fence_entry(&self, scope: ScopeId) -> bool {
+    self.cover_fences.contains_key(&scope)
+  }
+
   /// Drops the pending records of `abandoned` fences — callers that cancelled their
   /// `set_cover` await before the settle. Only the per-fence records go: the scope's
   /// loss memory, its settle-floor bookkeeping, and every still-awaited fence stay
