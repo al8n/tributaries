@@ -7,6 +7,14 @@ const WINDOW: Duration = Duration::from_millis(100);
 /// this far, so it is inert everywhere except the fanotify liveness-tick suite.
 const LIVENESS: Duration = Duration::from_secs(30);
 
+/// The scope's delivery lane, for cells whose transport never swaps.
+fn lane_zero(_: ScopeId) -> u64 {
+  0
+}
+/// The lane the cells above hand the seal latch; a cell that swaps transports
+/// names its lanes itself.
+const LANE_ZERO: fn(ScopeId) -> u64 = lane_zero;
+
 /// No scope holds counted-but-unread lane items, which is what every cell that
 /// is not about the residue deferral means by "the driver polls".
 static NO_RESIDUE: BTreeSet<ScopeId> = BTreeSet::new();
@@ -18,6 +26,15 @@ const DRAINED: SettlePass<'static> = SettlePass::Live {
 
 fn at(ms: u64) -> Instant {
   Instant::from_origin(Duration::from_millis(ms))
+}
+
+/// The driver's adoption-seal fence in one step, on lane `lane`: offer, latch,
+/// answer, resolve. Cells that are not ABOUT the fence use this to get past it;
+/// the fence's own cells drive the four calls apart.
+fn seal_adoptions(core: &mut DriverCore, scope: ScopeId, lane: u64, token: u64) {
+  core.mark_adoption_cut_inflight(scope, lane, token);
+  core.prove_adoption_cut(scope, lane, token);
+  core.resolve_adoption_seals(&|_| lane, &NO_RESIDUE);
 }
 
 fn ev(path: &str, flags: FsEventFlags, event_id: u64, file_id: u64) -> RawOsEvent {
@@ -11053,7 +11070,17 @@ mod root_widened {
       );
       let _ = drain(&mut core);
     }
-    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(0));
+    // The birth refresh reports the root ALIVE at the identity this scope was
+    // spawned with — `alive_refresh` hard-codes inode 1, which reads as a root
+    // replacement for any other `ino` and would tear the scope down.
+    core.on_mounts_refreshed(
+      scope,
+      MountRefresh {
+        root: RootLiveness::Present(crate::os::RootIdentity::new(1, ino)),
+        ..alive_refresh(Vec::new(), true)
+      },
+      at(0),
+    );
     let _ = drain(&mut core);
     (core, scope, root_watch, req)
   }
@@ -11128,21 +11155,89 @@ mod root_widened {
     assert_eq!(delivered.1.epoch(), pre.epoch(), "no generation bump");
   }
 
+  /// W13 — the old root sits more than one segment below the new one. The splice
+  /// would mint intermediate connectors whose edges no marker names, no read
+  /// re-proves, and no `MoveSelf` of the already-watched old root invalidates
+  /// (moving an ANCESTOR of that root emits none), so `Monitor::widen_root`
+  /// serves depth one only. Screened at the chain, that is a LEGITIMATE fallback
+  /// rather than the loud driver-bug channel — the widen was well-formed and the
+  /// window was clean, the shape is simply one no proof covers — and the window
+  /// is spent HERE, because the driver's tainted arm deliberately does not close
+  /// it and a leaked entry would poison a later widen's reservation if the
+  /// fallback's own spawn then failed.
   #[test]
-  fn a_deep_widen_arms_the_connecting_chain() {
-    let (mut core, scope, _root_watch, _boot) = live_at("/r/a/b", 1, true);
+  fn widen_of_a_deep_root_spends_the_window_and_falls_back() {
+    let (mut core, scope, root_watch, _boot) = live_at("/r/a/b", 1, true);
+    let reserved = open_window(&mut core, scope);
+    assert_eq!(
+      core.on_root_widened(scope, meta("/r", 9), reserved, at(2)),
+      WidenCommit::TaintedWindow(WidenTaint {
+        cause: TaintCause::UnprovableChain,
+        benign: 0,
+      }),
+      "a two-segment chain falls back, it does not commit — and NOT through \
+       `Refused`, the driver-bug channel whose `debug_assert!` this build would \
+       have tripped"
+    );
+    assert!(
+      core
+        .scopes
+        .get(&scope)
+        .expect("scope lives")
+        .pending_widen
+        .is_none(),
+      "the disposal SPENDS the window — nothing downstream closes it"
+    );
 
-    let reserved = widen(&mut core, scope, meta("/r", 9), at(1));
+    // No splice landed and no watch was armed for one: the old world is exactly
+    // where it was, still delivering on its own watch.
+    assert_eq!(
+      core.root_path(scope).expect("scope lives").as_path(),
+      Path::new("/r/a/b"),
+      "no splice landed"
+    );
     let effects = drain(&mut core);
     assert!(
-      effects.iter().any(|e| matches!(
-        e,
-        Effect::AddWatch { parent, path, .. }
-          if *parent == reserved && path.as_path() == Path::new("/r/a")
-      )),
-      "the connector arms under the new root at its absolute path: {effects:?}"
+      !effects
+        .iter()
+        .any(|e| matches!(e, Effect::AddWatch { parent, .. } if *parent == reserved)),
+      "and nothing was armed beneath a root that was never spliced: {effects:?}"
     );
-    let _ = scope;
+    core.on_batch(
+      scope,
+      BatchPayload::detached(vec![SourceEvent::Linux(inotify(
+        &[root_watch],
+        IN_CREATE,
+        b"after.txt",
+      ))]),
+      at(3),
+    );
+    let effects = drain(&mut core);
+    let change = emits(&effects)
+      .first()
+      .cloned()
+      .cloned()
+      .expect("the old coverage never blinked");
+    assert_eq!(change.location(), &loc(&["after.txt"]));
+
+    // And the fallback the caller owes lands: the general stream replace re-roots
+    // to the SAME distant ancestor the splice declined, through a fresh spawn
+    // barrier — so the depth cap costs the widen its zero-gap shortcut and not
+    // the capability. The scope settles on the new root rather than wedging.
+    core.on_root_replaced(scope, meta("/r", 9), at(4));
+    let _ = drain(&mut core);
+    assert_eq!(
+      core.root_path(scope).expect("scope lives").as_path(),
+      Path::new("/r"),
+      "the stream replace carries the widen the splice refused, at any depth"
+    );
+    let effects = drain(&mut core);
+    assert!(
+      !effects
+        .iter()
+        .any(|e| matches!(e, Effect::TeardownStream { scope: s } if *s == scope)),
+      "and the scope is live on it, not torn down: {effects:?}"
+    );
   }
 
   #[test]
@@ -11423,6 +11518,7 @@ mod root_widened {
       },
     );
     let _ = drain(&mut core);
+    seal_adoptions(&mut core, scope, 0, 9);
     assert_eq!(
       core.barrier_settled(scope),
       core.monitor.coverage_settled(scope),
@@ -11435,6 +11531,378 @@ mod root_widened {
       settled,
       vec![(fence, CoverSettle::Applied)],
       "a clean widen window certifies without the refresh"
+    );
+  }
+
+  /// A live descending scope widened from `/r/sub` to `/r`, its new root armed
+  /// and its confirming listing ingested: the adoption marker STANDS, staged,
+  /// with its ordering fence still to come.
+  fn staged_widen() -> (DriverCore, ScopeId, WatchId, WatchId) {
+    let (mut core, scope, root_watch, _boot) = live_at("/r/sub", 1, true);
+    let reserved = widen(&mut core, scope, meta("/r", 1), at(2));
+    core.on_watch_installed(
+      reserved,
+      core.arm_attempt(reserved),
+      crate::os::linux::WatchOutcome::Installed(2),
+    );
+    let effects = drain(&mut core);
+    let req = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, .. } => Some(*req),
+        _ => None,
+      })
+      .expect("the widened root cold-reads");
+    core.on_enumerated(
+      req,
+      RawEnumerate::Listed {
+        entries: vec![RawDirEntry {
+          name: b"sub".to_vec(),
+          kind: FileKind::Dir,
+          dev: 1,
+          ino: 1,
+          mnt_id: None,
+        }],
+        complete: true,
+      },
+    );
+    let _ = drain(&mut core);
+    (core, scope, root_watch, reserved)
+  }
+
+  /// The fence's whole purpose, at the seam that owns the ingest order: the
+  /// adopted object's `MoveSelf` is still kernel-side when the confirming listing
+  /// lands, and the cut is what puts it on the lane ahead of the verdict. Fed in
+  /// that order it spends the marker, and the seal that follows is inert.
+  ///
+  /// Mutation witness: take the verdict at the listing (never stage) and the
+  /// record below arrives after a certificate that already covered its interval.
+  #[test]
+  fn the_cut_puts_a_lagging_move_ahead_of_the_seal() {
+    let (mut core, scope, root_watch, _reserved) = staged_widen();
+    assert!(
+      !core.monitor.coverage_settled(scope),
+      "the staged marker holds the barrier"
+    );
+
+    // The record the listing could not see, ingested by the drain the cut's
+    // reply is ordered behind.
+    core.on_batch(
+      scope,
+      BatchPayload::detached(vec![SourceEvent::Linux(self_event(
+        root_watch,
+        IN_MOVE_SELF,
+      ))]),
+      at(3),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).iter().any(|c| c.kind().is_rescan()),
+      "the spend stands its counted cover: {effects:?}"
+    );
+    assert!(
+      !core.monitor.coverage_settled(scope),
+      "and the barrier rests on that cover's rebuild, never on nothing"
+    );
+
+    // The answered cut lands afterwards, on a marker that is already resolved.
+    core.mark_adoption_cut_inflight(scope, 0, 1);
+    core.prove_adoption_cut(scope, 0, 1);
+    core.resolve_adoption_seals(&LANE_ZERO, &NO_RESIDUE);
+    assert!(
+      emits(&drain(&mut core)).is_empty(),
+      "the seal is inert over a spent marker"
+    );
+  }
+
+  /// **The wedge.** Three ordinary API calls — widen, non-widening replace, widen
+  /// — retire the transport the first seal's batch was addressed to. Its
+  /// completion can no longer prove anything, and the second marker must still be
+  /// offered a cut of its own.
+  ///
+  /// Both of the latch's escapes run here at once, deliberately: the replace bumps
+  /// the lane the latch is stamped with, AND its rebind releases the marker whose
+  /// staging the latch existed for.
+  ///
+  /// Mutation witness: drop the lane stamp and the clear-on-empty sweep, and the
+  /// orphaned request answers for the second staging forever — `coverage_settled`
+  /// false for the rest of the scope's life.
+  #[test]
+  fn a_transport_swap_under_a_staged_marker_does_not_strand_the_next_one() {
+    let (mut core, scope, _root_watch, _reserved) = staged_widen();
+    let lane_zero = |_: ScopeId| 0;
+    let lane_one = |_: ScopeId| 1;
+    assert_eq!(
+      core.adoptions_awaiting_cut(&lane_zero),
+      vec![scope],
+      "the staged marker owes a cut"
+    );
+    core.mark_adoption_cut_inflight(scope, 0, 1);
+    assert!(
+      core.adoptions_awaiting_cut(&lane_zero).is_empty(),
+      "one round trip at a time — a successor would only orphan this one"
+    );
+
+    // The non-widening replace: the lane moves and the rebind releases the marker
+    // the batch's token was bought for. The scope LIVES.
+    let _ = core.on_root_replaced(scope, meta("/elsewhere/sub", 5), at(3));
+    assert!(
+      core.scopes.contains_key(&scope),
+      "the scope survives its own transport swap"
+    );
+    // The orphaned batch answers under the retired generation.
+    core.prove_adoption_cut(scope, 0, 1);
+    core.resolve_adoption_seals(&lane_one, &NO_RESIDUE);
+
+    let _ = drain(&mut core);
+
+    // The third call: widen again, on the lane the replace minted.
+    let second = widen(&mut core, scope, meta("/elsewhere", 6), at(4));
+    core.on_watch_installed(
+      second,
+      core.arm_attempt(second),
+      crate::os::linux::WatchOutcome::Installed(4),
+    );
+    let effects = drain(&mut core);
+    let req = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, .. } => Some(*req),
+        _ => None,
+      })
+      .expect("the second widened root cold-reads");
+    core.on_enumerated(
+      req,
+      RawEnumerate::Listed {
+        entries: vec![RawDirEntry {
+          name: b"sub".to_vec(),
+          kind: FileKind::Dir,
+          dev: 1,
+          ino: 5,
+          mnt_id: None,
+        }],
+        complete: true,
+      },
+    );
+    let _ = drain(&mut core);
+
+    assert_eq!(
+      core.adoptions_awaiting_cut(&lane_one),
+      vec![scope],
+      "THE WEDGE: the second staging must be offered a cut of its own"
+    );
+    core.mark_adoption_cut_inflight(scope, 1, 2);
+    core.prove_adoption_cut(scope, 1, 2);
+    core.resolve_adoption_seals(&lane_one, &NO_RESIDUE);
+    assert_eq!(
+      core.monitor.adoption_staging_high_water(scope),
+      None,
+      "and it seals rather than wedging"
+    );
+    // The choke point runs every pass, and the next one sweeps a latch whose
+    // obligation is gone — which is what keeps it from outliving one.
+    core.resolve_adoption_seals(&lane_one, &NO_RESIDUE);
+    assert!(
+      core.adoption_seals.is_empty(),
+      "leaving no latch behind for the next widen to trip over"
+    );
+  }
+
+  /// The latch's SECOND escape, held apart from the first on purpose. A request
+  /// or a proof taken on a lane the scope has stopped reading orders nothing
+  /// about the one it does — so it answers for nothing, licenses nothing, and the
+  /// scope is offered a successor on the live lane.
+  ///
+  /// It is exercised alone here because in the tree as it stands the two escapes
+  /// always fire together: every lane bump comes with a rebind or a teardown, and
+  /// both release every marker of the scope. That makes this leg defence in depth
+  /// rather than a live path — which is exactly why it needs a cell of its own,
+  /// since the release leg would otherwise mask its absence.
+  ///
+  /// Mutation witness: drop the lane comparison from `answers_for` and
+  /// `licenses_through`, and a stale request answers for the live lane while a
+  /// proof taken on a retired queue licenses a confirm over it.
+  #[test]
+  fn a_seal_latch_speaks_only_for_the_lane_it_was_taken_on() {
+    let (mut core, scope, _root_watch, _reserved) = staged_widen();
+    let live = |_: ScopeId| 1;
+    core.mark_adoption_cut_inflight(scope, 0, 1);
+    assert!(
+      core.adoptions_awaiting_cut(&LANE_ZERO).is_empty(),
+      "one round trip at a time on the lane the request was taken on"
+    );
+    assert_eq!(
+      core.adoptions_awaiting_cut(&live),
+      vec![scope],
+      "and none at all on a lane it never cut"
+    );
+
+    core.prove_adoption_cut(scope, 0, 1);
+    core.resolve_adoption_seals(&live, &NO_RESIDUE);
+    assert!(
+      !core.monitor.coverage_settled(scope),
+      "a proof of a retired queue licenses no confirm on the live one"
+    );
+    assert_eq!(
+      core.adoptions_awaiting_cut(&live),
+      vec![scope],
+      "so the scope is still owed a cut it can actually use"
+    );
+
+    // On the lane it WAS taken on, the same proof is exactly what it says.
+    core.resolve_adoption_seals(&LANE_ZERO, &NO_RESIDUE);
+    assert!(core.monitor.coverage_settled(scope), "and it seals there");
+  }
+
+  /// Only the request actually out closes this latch, and only by its own token
+  /// — which is what makes every stale completion inert. A predecessor batch's
+  /// cut was taken before the live request existed, so licensing a staging with
+  /// it would spend an ordering the cut never bought.
+  ///
+  /// The demand side is the same rule from the other end: a successor asked for
+  /// while a request is travelling would only orphan it, so it is refused and the
+  /// latch keeps the token it already holds.
+  ///
+  /// Mutation witness: close whatever is in flight regardless of token, and the
+  /// foreign completion below seals a staging no answered cut of this scope's
+  /// ever reached.
+  #[test]
+  fn only_the_seal_request_actually_out_closes_the_latch() {
+    let (mut core, scope, _root_watch, _reserved) = staged_widen();
+    core.mark_adoption_cut_inflight(scope, 0, 1);
+    // Refused: the latch already answers for everything staged.
+    core.mark_adoption_cut_inflight(scope, 0, 2);
+
+    core.prove_adoption_cut(scope, 0, 2);
+    core.resolve_adoption_seals(&LANE_ZERO, &NO_RESIDUE);
+    assert!(
+      !core.monitor.coverage_settled(scope),
+      "a completion carrying a token this latch never issued closes nothing"
+    );
+
+    core.prove_adoption_cut(scope, 0, 1);
+    core.resolve_adoption_seals(&LANE_ZERO, &NO_RESIDUE);
+    assert!(
+      core.monitor.coverage_settled(scope),
+      "and the request that was actually out does"
+    );
+  }
+
+  /// The seal releases the barrier INSIDE the driver's choke point, which is the
+  /// one release that does not ride an ingest of its own. Whatever the pass does
+  /// with the barrier afterwards must therefore see it — so a fence waiting on
+  /// that release is owed its cut at the very instant the seal takes it.
+  ///
+  /// Mutation witness: release at the listing rather than staging, and the fence
+  /// below is offered its cut before the sync that opens it can exist. The
+  /// ORDERING this property constrains — that the driver resolves the seals above
+  /// its cover-fence demand — is a property of the loop, and is pinned end to end
+  /// by `a_sync_opened_under_a_staged_adoption_still_answers`; this cell pins the
+  /// core-side fact that loop depends on.
+  #[test]
+  fn a_fence_opened_under_a_staged_marker_is_owed_its_cut_when_the_seal_lands() {
+    let (mut core, scope, _root_watch, _reserved) = staged_widen();
+    core.mark_adoption_cut_inflight(scope, 0, 1);
+
+    // The sync arrives while the seal's cut is out: its fence opens over a
+    // barrier the marker still holds down, so it is offered nothing yet.
+    let fence = core.open_cover_fence(scope);
+    assert!(
+      core.covers_awaiting_cut().is_empty(),
+      "a fence under a standing marker owes nothing — the barrier is not settled"
+    );
+
+    core.prove_adoption_cut(scope, 0, 1);
+    core.resolve_adoption_seals(&LANE_ZERO, &NO_RESIDUE);
+    assert_eq!(
+      core.covers_awaiting_cut(),
+      vec![scope],
+      "the release and the demand are one instant, or the loop parks between them"
+    );
+    core.mark_cut_inflight(scope, 2);
+    core.prove_cut(scope, 2);
+    assert_eq!(
+      core.poll_cover_settlements(DRAINED),
+      vec![(fence, CoverSettle::Applied)],
+      "and the fence answers its caller"
+    );
+  }
+
+  /// A cut whose batch can never prove it — the reader died under the current
+  /// generation — fails CLOSED. The teardown that answers everything the scope is
+  /// owed releases the marker with the tree, and the latch goes with it.
+  ///
+  /// Mutation witness: keep the latch past its obligation and a torn-down scope
+  /// still holds a request nothing can close.
+  #[test]
+  fn an_unanswerable_seal_cut_folds_into_the_scopes_teardown() {
+    let (mut core, scope, _root_watch, _reserved) = staged_widen();
+    core.mark_adoption_cut_inflight(scope, 0, 1);
+
+    core.on_source_fatal(scope, at(3));
+    let _ = drain(&mut core);
+    assert!(
+      core.monitor.coverage_settled(scope),
+      "the teardown releases the marker with the tree"
+    );
+    core.resolve_adoption_seals(&LANE_ZERO, &NO_RESIDUE);
+    assert!(
+      core.adoption_seals.is_empty(),
+      "and the latch is dropped with the obligation it stood for"
+    );
+    assert!(
+      core.adoptions_awaiting_cut(&|_: ScopeId| 0).is_empty(),
+      "nothing hangs"
+    );
+  }
+
+  /// A loss ingested while the marker is staged is the reader's own conservative
+  /// exit from an unprovable cut, and it precedes the reply by construction. The
+  /// seal must not jump it: the loss's epoch-bumped `Rescan` and counted re-arm
+  /// stand first, and the barrier releases onto that rebuild.
+  ///
+  /// The withholding below is the other half of the same rule, and the one a
+  /// mutation can reach: a lane the drain did not finish may still hold exactly
+  /// the record the round trip was bought to surface, so no verdict may be taken
+  /// over it.
+  ///
+  /// Mutation witness: drop the unspent filter from `resolve_adoption_seals` and
+  /// the seal resolves over a lane nobody finished reading.
+  #[test]
+  fn a_loss_under_a_staged_marker_stands_before_the_seal() {
+    let (mut core, scope, _root_watch, _reserved) = staged_widen();
+    core.mark_adoption_cut_inflight(scope, 0, 1);
+
+    // The unprovable cut's conservative exit: one whole-instance loss, enqueued
+    // ahead of the reply that carries the token.
+    core.on_root_overflow(scope, at(3));
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).iter().any(|c| c.kind().is_rescan()),
+      "the loss stands its own covering Rescan first: {effects:?}"
+    );
+    assert!(
+      !core.monitor.coverage_settled(scope),
+      "on counted re-arm work, so nothing settles over the loss"
+    );
+
+    core.prove_adoption_cut(scope, 0, 1);
+    let residue = BTreeSet::from([scope]);
+    core.resolve_adoption_seals(&LANE_ZERO, &residue);
+    assert!(
+      core.monitor.adoption_staging_high_water(scope).is_some(),
+      "a lane the drain did not finish may still hold the record the cut forwarded"
+    );
+
+    core.resolve_adoption_seals(&LANE_ZERO, &NO_RESIDUE);
+    assert!(
+      core.monitor.adoption_staging_high_water(scope).is_none(),
+      "and the verdict is taken once that lane is spent"
+    );
+    assert!(
+      !core.monitor.coverage_settled(scope),
+      "with the seal's outcome postdating the loss either way — the rebuild is \
+       still counted"
     );
   }
 
@@ -11810,6 +12278,72 @@ mod root_widened {
         .iter()
         .any(|e| matches!(e, Effect::TeardownStream { scope: s } if *s == scope)),
       "the widened stream tears down honestly: {effects:?}"
+    );
+  }
+
+  /// W12 — the OLD root's identity does not fit the Monitor's enumerate-mint
+  /// space (a synthesized `ino == 0`; a ReFS file id past `u64` behaves the
+  /// same). The splice would install no expected object at the adopted edge,
+  /// so its dark-window tripwire would have nothing to re-prove against and
+  /// `Monitor::widen_root` refuses outright. Screened at the mint, that is a
+  /// LEGITIMATE fallback rather than the loud driver-bug channel — and the
+  /// window is spent HERE, because the driver's tainted arm deliberately does
+  /// not close it and a leaked entry would poison a later widen's reservation
+  /// if the fallback's own spawn then failed.
+  #[test]
+  fn widen_unmintable_old_identity_spends_the_window_and_falls_back() {
+    let (mut core, scope, root_watch, _boot) = live_at("/r/sub", 0, true);
+    let reserved = open_window(&mut core, scope);
+    assert_eq!(
+      core.on_root_widened(scope, meta("/r", 9), reserved, at(2)),
+      WidenCommit::TaintedWindow(WidenTaint {
+        cause: TaintCause::UnmintableIdentity,
+        benign: 0,
+      }),
+      "an unprovable adoption edge falls back, it does not commit"
+    );
+    assert!(
+      core
+        .scopes
+        .get(&scope)
+        .expect("scope lives")
+        .pending_widen
+        .is_none(),
+      "the disposal SPENDS the window — nothing downstream closes it"
+    );
+
+    // The old world is untouched and still delivering on its own watch.
+    assert_eq!(
+      core.root_path(scope).expect("scope lives").as_path(),
+      Path::new("/r/sub"),
+      "no splice landed"
+    );
+    core.on_batch(
+      scope,
+      BatchPayload::detached(vec![SourceEvent::Linux(inotify(
+        &[root_watch],
+        IN_CREATE,
+        b"after.txt",
+      ))]),
+      at(3),
+    );
+    let effects = drain(&mut core);
+    let change = emits(&effects)
+      .first()
+      .cloned()
+      .cloned()
+      .expect("the old coverage never blinked");
+    assert_eq!(change.location(), &loc(&["after.txt"]));
+
+    // And the fallback the caller owes lands: the general stream replace
+    // re-establishes the binding from a fresh spawn barrier, needing no
+    // identity of the old root to do it.
+    core.on_root_replaced(scope, meta("/r", 9), at(4));
+    let _ = drain(&mut core);
+    assert_eq!(
+      core.root_path(scope).expect("scope lives").as_path(),
+      Path::new("/r"),
+      "the stream replace carries the widen the splice refused"
     );
   }
 

@@ -324,6 +324,135 @@ enum DeficitDischarge {
   UnsubscribedPrune,
 }
 
+/// One unverified same-transport adoption edge — what
+/// [`pending_adoptions`](Monitor::pending_adoptions) stands against the chain
+/// parent that owes its re-proof.
+///
+/// **The obligation is to an IDENTITY, never to a coordinate.** A marker that
+/// stored only the slot name would make every disposal resolve
+/// [`child_watch`](Monitor::child_watch)`(parent, name)` — whichever child
+/// occupies that slot at the moment of the release — and the dark window this
+/// marker exists to catch is exactly the window in which that stops being the
+/// adopted object. Before the first complete proof a `MovedFrom` can DETACH the
+/// adopted watch — freeing the slot while the parent link, and so the
+/// containment invariant, stay intact — and a replacement can grow into the
+/// vacated name, with no marker update and no check of what was expected there;
+/// a name-resolved disposal then retires that REPLACEMENT (or, on a slot still
+/// empty, merely re-scans it) while the original unproven subtree survives, still
+/// reconstructing its descendants' paths through an edge nothing ever confirmed,
+/// and [`coverage_settled`](Monitor::coverage_settled) free to go true over it.
+///
+/// So the marker carries the adopted [`WatchId`] itself, and every
+/// [`AdoptionDisposal`] acts on THAT watch rather than on the slot's current
+/// occupant. The name is kept for the one question that really is about the
+/// coordinate — which listing entry a proof must read — and the two are then
+/// checked TOGETHER, which is what keeps a replacement from paying the
+/// original's debt: the entry must carry the expected identity AND the adopted
+/// watch must still hold the slot.
+#[derive(Debug, Clone)]
+struct AdoptionMarker {
+  /// The slot name the old root was re-keyed under at the chain parent: the
+  /// listing entry a proof reads, and the location a recorded death re-scans.
+  /// A COORDINATE — never what a disposal resolves.
+  name: Segment,
+  /// The adopted watch: the scope's old root, re-keyed under the chain parent
+  /// by the widen. The identity of the obligation, so a rename before the
+  /// proof moves the debt with the object instead of leaving it at the slot.
+  adopted: WatchId,
+  /// The identity the widen NAMED the adopted object by
+  /// ([`widen_root`](Monitor::widen_root)'s `old_identity`, which it refuses to
+  /// splice without). The proof compares the listing entry against this stored
+  /// value rather than against the adopted node's current `identity` field, so
+  /// what is re-proven is the object the widen claimed to adopt and no later
+  /// write to that field can turn an unprovable edge into a confirmed one.
+  identity: Identity,
+}
+
+/// What becomes of the ADOPTED CHILD when a widen's adoption marker is
+/// released — named at every release site so the invariant is auditable in one
+/// place: **a marker is released only together with a disposal of the child it
+/// adopted — a proof, a counted retirement, or the child's already-completed
+/// destruction — never on its own.**
+///
+/// The marker is the only record that a widen's commit→arm window was never
+/// verified, and releasing it is what lets the adoptions conjunct of
+/// [`coverage_settled`](Monitor::coverage_settled) go true. A release that
+/// leaves the unproven subtree standing hands a STRICT proof's leftovers to
+/// the machinery every later reconciliation of that slot runs — which is
+/// PERMISSIVE by design (pruning an incumbent on ignorance would un-cover a
+/// live directory) and therefore RETAINS what it cannot positively displace.
+/// The unproven subtree then keeps delivering at reconstructed-stale paths
+/// with the barrier reading settled: the exact failure the marker exists to
+/// prevent, reached through the marker's own release.
+///
+/// This is a rule about a class, not about one site. Three separate releases
+/// have been written as bare removals whose covering story lived only in a
+/// comment beside them, and a comment cannot be checked for being INERT on the
+/// path it claims to cover — the retry-cap site's named cover (a located
+/// `Rescan` plus an interior deficit) is suppressed in full on the held path
+/// that reaches it. Naming the disposal as an ARGUMENT is what makes it
+/// unskippable, and performing it inside
+/// [`release_adoption_marker`](Monitor::release_adoption_marker) is what keeps
+/// the name and the act from drifting: there is no way to spell the release
+/// without choosing a variant here, and no variant whose cover is merely
+/// asserted in prose. A `let _ =` on the result discards only EVIDENCE — that a
+/// marker stood — never the disposal, which has already happened.
+#[derive(Debug, Clone, Copy)]
+enum AdoptionDisposal {
+  /// The caller holds the proof that RESOLVES the edge and takes the verdict on
+  /// the returned marker itself — the one disposal that leaves the act to its
+  /// caller. Two sites own a proof, and they are the two halves of one:
+  /// [`resolve_adoption`](Monitor::resolve_adoption) reads the confirming
+  /// listing and answers a refutation or a recorded death immediately, and
+  /// [`seal_staged_adoptions`](Monitor::seal_staged_adoptions) takes the
+  /// CONFIRM once an ordering fence has put every record that could refute it
+  /// ahead of the verdict.
+  Verdict,
+  /// No read can prove the edge. Either none is left — the bounded retries are
+  /// spent ([`handle_incomplete_enumerate`](Monitor::handle_incomplete_enumerate))
+  /// — or the adopted object has been seen to MOVE, which spends the proof a
+  /// listing could still appear to give
+  /// ([`on_move_self`](Monitor::on_move_self): its final occupancy and identity
+  /// cannot distinguish an edge that never moved from one that left and came
+  /// back). Either way, retire the adopted child INSIDE a counted covering
+  /// `Rescan`:
+  /// [`stand_counted_cover`](Monitor::stand_counted_cover) first, then a
+  /// [`CoveringRescan`](DeficitDischarge::CoveringRescan) drop of the subtree.
+  /// Root-anchored and counted so that it covers and releases on the HELD path
+  /// too, where a located `Rescan` would name the vacated pre-move path and
+  /// the interior deficit is not recorded at all.
+  CountedRetirement,
+  /// The adopted child is being destroyed by the very walk that is releasing
+  /// this marker ([`drop_subtree`](Monitor::drop_subtree)): the marker keys on
+  /// the dying node, so a child still UNDER it is already on the walk's stack.
+  /// Erasing an unverified edge is erased COVERAGE all the same, which the walk
+  /// reports as [`ErasedCover::Discharge`] and discharges under its own
+  /// [`DeficitDischarge`] reason.
+  ///
+  /// "Still under it" is the whole content of that claim, and it is the
+  /// CONTAINMENT INVARIANT rather than a hope: the one parent-rewrite site
+  /// refuses to reparent an unproven adopted edge (see
+  /// [`pending_adoptions`](Monitor::pending_adoptions)), so the adopted watch is a
+  /// direct child of the marker's own node for as long as both live, and the walk
+  /// that pops that node pushes the child in the same step. The release states it
+  /// as a `debug_assert!` here, read through the CHILD's parent link — the dying
+  /// node is already out of `nodes`, while the child still names it, so the check
+  /// works mid-walk.
+  ///
+  /// That it is an invariant is what keeps this a single walk: a child free to be
+  /// reparented out would have to be verified and then retired by a SECOND walk,
+  /// destroying nodes outside the subtree the caller handed in.
+  DiesWithTheWalk,
+  /// The adopted child was already dropped, before this release
+  /// ([`rebind_root`](Monitor::rebind_root) drops every child of the surviving
+  /// root, and a depth-one widen keys its marker on that root). Checked rather
+  /// than claimed: the release debug-asserts the adopted WATCH is gone — not
+  /// merely that its old slot is empty, which a rename would satisfy while the
+  /// child stood elsewhere — so a child that outlived the drop fails loudly
+  /// instead of becoming a fourth silent release.
+  ChildAlreadyDropped,
+}
+
 /// Declares a fieldless enum together with its `ALL` slice from ONE
 /// written-out variant list, so the enum and `ALL` cannot drift apart: both
 /// are expansions of the same input tokens rather than two hand-synced
@@ -682,6 +811,10 @@ type PendingKey = (ScopeId, MoveCookie);
 /// The least cookie any backend can mint, and so the lower bound of a scope's
 /// contiguous range of [`PendingKey`]s.
 const FIRST_COOKIE: MoveCookie = MoveCookie::new(NonZeroU64::MIN);
+
+/// The low end of a scope-major [`WatchId`] range — the range start for
+/// [`staged_adoptions`](Monitor::staged_adoptions)' per-scope lookups.
+const FIRST_WATCH: WatchId = WatchId::new(NonZeroU64::MIN);
 
 /// How many half-resolved renames ONE scope may park in
 /// [`pending_moves`](Monitor::pending_moves) at once.
@@ -1102,17 +1235,99 @@ pub struct Monitor {
   /// [`pending_enumerate`](Self::pending_enumerate) removal exactly.
   latent_cold: BTreeMap<ReqId, ScopeId>,
   /// Unverified same-transport adoption edges: a widen re-keyed the scope's
-  /// OLD root under this NAME at a freshly-minted chain parent whose kernel
-  /// watch was not yet armed at the re-key, so a slot mutation in that window
-  /// is recorded by nobody. Keyed by the chain parent, whose first complete
-  /// read must positively re-confirm the edge (the adopted node's own
-  /// `identity` carries the expected object). Consumed by
-  /// [`resolve_adoption`](Self::resolve_adoption); an entry also dies with its
-  /// keyed node (`drop_subtree`) and with a root rebind
+  /// OLD root under a name at a freshly-minted chain parent whose kernel watch
+  /// was not yet armed at the re-key, so a slot mutation in that window is
+  /// recorded by nobody. Keyed by the chain parent, whose first complete read
+  /// must positively re-confirm the edge; the [`AdoptionMarker`] value carries
+  /// WHICH watch was adopted and the identity it was named by, so the debt is
+  /// owed by an object rather than by a slot (see the type — this is what keeps
+  /// a rename in the dark window from handing the proof to a replacement).
+  /// Consumed by [`resolve_adoption`](Self::resolve_adoption) — immediately on a
+  /// refutation or a recorded death, and one ordering fence later on a confirm
+  /// ([`seal_staged_adoptions`](Self::seal_staged_adoptions), the only site that
+  /// releases a marker as verified) — or by the retry cap when no read is left
+  /// to reach it
+  /// ([`handle_incomplete_enumerate`](Self::handle_incomplete_enumerate)), or by
+  /// the adopted object's own [`RecordKind::MoveSelf`], which proves the
+  /// window held a movement no listing can see afterwards
+  /// ([`on_move_self`](Self::on_move_self)); an entry also
+  /// dies with its keyed node (`drop_subtree`) and with a root rebind
   /// ([`rebind_root`](Self::rebind_root) — the depth-one widen keys the marker
   /// on the surviving root itself). Every removal funnels through
-  /// `take_adoption_marker` so the settle counter below cannot drift.
-  pending_adoptions: BTreeMap<WatchId, Segment>,
+  /// [`release_adoption_marker`](Self::release_adoption_marker), so the settle
+  /// counter below cannot drift and no release can go without disposing of the
+  /// child it adopted ([`AdoptionDisposal`]).
+  ///
+  /// **CONTAINMENT INVARIANT.** For every entry `K → (name, adopted, identity)`:
+  /// `adopted` is not a live node, or `nodes[adopted].parent == Some(K)`. An
+  /// unproven adopted edge is IMMOVABLE.
+  ///
+  /// Three kinds of site can touch it, and no others. BIRTH constructs exactly
+  /// this shape — the widen re-keys the adopted watch as a DIRECT child of the
+  /// chain tail it then stands the marker at. Every DROP only moves an entry to
+  /// the first disjunct, or removes the marker with its key. And `node.parent` is
+  /// rewritten in exactly ONE place ([`reparent`](Self::reparent)), whose two
+  /// callers are that widen splice and [`on_moved_to`](Self::on_moved_to)'s
+  /// pairing arm — which REFUSES an unproven adopted watch
+  /// ([`reparentable_adoption`](Self::reparentable_adoption)) and disposes of it
+  /// where it stands, restoring the invariant by its first disjunct rather than
+  /// compensating for a relocation.
+  ///
+  /// What it buys is LOCALITY: `drop_subtree(x)` mutates only `subtree(x)` plus
+  /// scope-level bookkeeping, because the one disposal that resolves a node the
+  /// caller did not name — retiring the adopted watch of a marker the walk erases
+  /// — provably resolves a node INSIDE it. Every caller's continuation is written
+  /// on that, and the alternative is threading a collateral fate through the
+  /// hottest reconcile paths in the monitor.
+  pending_adoptions: BTreeMap<WatchId, AdoptionMarker>,
+  /// The adoption markers whose confirming listing has been ingested but whose
+  /// CONFIRM has not been released yet, keyed scope-major by the marker's own
+  /// chain parent, valued with the staging generation the listing was ingested
+  /// at ([`adoption_staging_seq`](Self::adoption_staging_seq)).
+  ///
+  /// **Staging is not a release.** A staged marker still stands in
+  /// [`pending_adoptions`](Self::pending_adoptions), still counts in
+  /// [`adopting_by_scope`](Self::adopting_by_scope), and still refuses the one
+  /// reparent site — everything the marker did before the listing, it goes on
+  /// doing. What staging records is that the CONFIRMING direction of the proof
+  /// has been read and now waits for its ordering fence
+  /// ([`seal_staged_adoptions`](Self::seal_staged_adoptions)); the refuting
+  /// directions never stage at all, because failing conservatively needs no
+  /// fence.
+  ///
+  /// Why the wait. The confirm inspects the dark window's END state, and an
+  /// end-state inspection certifies an interval only if every record of that
+  /// interval which could refute it was ingested first. The listing's own
+  /// trigger does not guarantee that: it completes on the blocking pool and is
+  /// reported on the op channel, which the driver polls ahead of the source
+  /// lane, so a `MoveSelf` that the kernel committed BEFORE the listing could
+  /// still be unread when the listing's verdict runs. Waiting for a reader
+  /// queue cut requested after the listing closes exactly that gap — the cut
+  /// forwards everything the kernel held onto the source lane ahead of its own
+  /// reply, so by the time the seal runs the refuting record has already spent
+  /// this marker through [`on_move_self`](Self::on_move_self).
+  ///
+  /// Scope-major so the fence's two questions — does this scope owe a seal, and
+  /// which of its markers does an answered cut reach — are one `O(log n)` range
+  /// over a range of one or two entries.
+  ///
+  /// Mirrors nothing: it is a strict subset of `pending_adoptions`, maintained
+  /// by [`stage_adoption`](Self::stage_adoption) and cleared by the single
+  /// release funnel, so a marker cannot leave the map while an entry for it
+  /// survives here (asserted by the test invariant checker).
+  staged_adoptions: BTreeMap<(ScopeId, WatchId), u64>,
+  /// Monotone staging counter — the order a marker's confirming listing was
+  /// ingested in, against which a cut's reach is compared.
+  ///
+  /// Global rather than per-scope, and never reset: the comparison is only ever
+  /// made between a scope's own markers and a cut requested for that scope, and
+  /// one counter shared by every scope is as valid an order for each of them as
+  /// a private one would be — with no per-scope entry to be born, reset, or
+  /// reclaimed. A cut earns the right to seal markers staged at or before the
+  /// value read when its request was committed to, so a marker staged AFTER
+  /// that instant — whose listing the cut cannot have ordered — is left
+  /// standing for a successor.
+  adoption_staging_seq: u64,
   /// Per-scope count of unverified adoption edges — the O(1) backing for the
   /// adoptions conjunct of [`coverage_settled`](Self::coverage_settled). An
   /// unverified edge is coverage the barrier must not certify: until the
@@ -1202,6 +1417,8 @@ impl Monitor {
       held_by_scope: BTreeMap::new(),
       latent_cold: BTreeMap::new(),
       pending_adoptions: BTreeMap::new(),
+      staged_adoptions: BTreeMap::new(),
+      adoption_staging_seq: 0,
       adopting_by_scope: BTreeMap::new(),
       coverage_work_epochs: BTreeMap::new(),
       loss_gens: BTreeMap::new(),
@@ -1880,9 +2097,24 @@ impl Monitor {
     }
     // A depth-one widen keys its adoption marker on the ROOT itself, which this
     // rebind keeps — purge it, or a stale marker would fire on the rebound
-    // root's next cold read. Chain-keyed markers died with the children above.
-    // The rebind's own commit `Rescan` (the caller emits it) owns coverage.
-    let _ = self.take_adoption_marker(root, scope);
+    // root's next cold read. Chain-keyed markers died with the children above,
+    // through the drop walk's own release.
+    //
+    // The ADOPTED CHILD is already gone here, and by construction rather than
+    // by argument: whatever depth the widen had, the marker names a WATCH of
+    // this scope other than the root (a widen adopts the old root under a
+    // freshly minted one), every such node is a descendant of the root wherever
+    // a later rename put it, and the loop above dropped every one of the root's
+    // children whole — the adjacency set it walks holds detached-and-held
+    // sources too. The disposal below asserts exactly that, of the adopted
+    // watch itself rather than of its old slot, so a child that outlived the
+    // drop — or merely moved out of the slot — is a loud failure rather than a
+    // comment that stopped being true. The rebind's own commit `Rescan` (the
+    // caller emits it) owns coverage for the erased world.
+    // The evidence is discarded, never the disposal: this release destroys
+    // nothing (the child is already gone) and `root` is the node it is keyed at,
+    // which this method's whole contract is that it SURVIVES.
+    let _ = self.release_adoption_marker(root, scope, AdoptionDisposal::ChildAlreadyDropped);
     self.settle_bridges();
     // The reset arm is the driver's already-executed new-transport arm: rebind
     // it to a fresh attempt and hand the token back, so the replayed outcome
@@ -1909,46 +2141,82 @@ impl Monitor {
   /// Commits a same-transport WIDEN of `scope`'s root: mints `reserved` (a
   /// [`reserve_watch_id`](Self::reserve_watch_id) handle the driver has ALREADY
   /// armed on the live transport) as the scope's new root ABOVE the current
-  /// one, mints the connecting chain named by `chain` (the old root's location
-  /// relative to the new root, top-down, non-empty), and ADOPTS the old root
-  /// node at the chain's tail — a single O(depth) edge splice that touches no
-  /// old-subtree node, disarms nothing, purges nothing, bumps no epoch, and
+  /// one and ADOPTS the old root node under it at the name `chain` gives (the
+  /// old root's location relative to the new root, which must be EXACTLY ONE
+  /// segment — see the depth cap below) — a single O(1) edge splice that touches
+  /// no old-subtree node, disarms nothing, purges nothing, bumps no epoch, and
   /// emits no change. That is the zero-gap half of the descending widen: every
   /// old watch keeps recording on the unchanged transport, and every delivery
-  /// reconstructs through the new chain at its unchanged absolute path.
+  /// reconstructs through the new root at its unchanged absolute path.
   ///
-  /// What changes, exhaustively: the new root and chain nodes are inserted
-  /// (each chain node an ordinary cold pending-arm child with its
-  /// `Action::Watch` queued; the new root queues NOTHING — the caller
-  /// replays its pre-arm outcome under the returned attempt via
+  /// What changes, exhaustively: the new root is inserted (queueing NOTHING —
+  /// the caller replays its pre-arm outcome under the returned attempt via
   /// [`on_watch_result`](Self::on_watch_result),
   /// whose post-arm COLD enumerate discovers the newly covered ground as
-  /// `Created`s), the old root's `parent`/`name` re-key under the tail, its
-  /// node identity becomes `old_identity` (the replaced world's root identity —
-  /// children carry identities, and the first read of the tail verifies the
-  /// edge against it), and `roots` re-points. Everything else — the old
-  /// subtree's states and children, pending enumerates, pending move halves,
+  /// `Created`s), the old root's `parent`/`name` re-key under it, its
+  /// node identity becomes `old_identity` (the replaced world's root identity,
+  /// REQUIRED — children carry identities, and the new root's first read
+  /// re-proves the edge against this one), and `roots` re-points. Everything
+  /// else — the
+  /// old subtree's states and children, pending enumerates, pending move halves,
   /// held sources, the deficit book, the bridge window, the scope's epoch,
   /// interest, and profile — is deliberately untouched: the old world did not
   /// end, so nothing of it may be discharged.
   ///
-  /// The chain's kernel watches arm strictly AFTER this splice, so a slot
-  /// mutation in that window is recorded by nobody; the adoption marker minted
-  /// here makes the tail's first complete read re-confirm the adopted edge and
-  /// escalate loudly on any mismatch (`resolve_adoption`) rather than trust a
-  /// silently stale reconstruction.
+  /// Nothing observes the adopted slot across this splice — the new root's
+  /// records are dropped by the unknown-watch guard until the commit and its
+  /// first listing lands only after the replayed arm — so a slot mutation in
+  /// that window is recorded by nobody; the adoption marker minted
+  /// here makes the tail's first complete read re-confirm the adopted edge
+  /// POSITIVELY — the listing must name the slot as a directory whose identity
+  /// EQUALS `old_identity` — and escalate loudly on anything short of that
+  /// (`resolve_adoption`) rather than trust a silently stale reconstruction. A
+  /// confirming listing STAGES the marker rather than releasing it, so the
+  /// certifying release is taken only behind a reader queue cut requested after
+  /// that listing (`seal_staged_adoptions`) — which is what makes the reading a
+  /// statement about the whole window instead of about its end, for the adopted
+  /// OBJECT: the mount stack over its slot is sampled by the listing rather than
+  /// witnessed, so a stack raised and dropped inside the window reads as no
+  /// change at all.
+  /// That re-proof is the whole payment for the dark window, which is why
+  /// `old_identity` is a precondition rather than a hint: a widen that cannot
+  /// name the object it is adopting has nothing to re-prove, and the only
+  /// honest answer to an unprovable edge is to refuse the splice (the caller
+  /// falls back to a replace that rebuilds the binding from scratch), never to
+  /// commit it and let the tripwire confirm on ignorance.
+  ///
+  /// The same demand for a real proof caps `chain` at EXACTLY ONE segment: a
+  /// longer chain is refused for the identical reason an unnameable adoption is.
+  /// At depth one the marker's parent IS the new root — the node whose pre-armed
+  /// outcome the caller replays — the adopted edge is the only edge the splice
+  /// creates, and the one listing that resolves it inspects the very slot the
+  /// dark window could have mutated. Every deeper shape breaks all three of
+  /// those. The splice would mint INTERMEDIATE connectors as unidentified cold
+  /// nodes, so each of their edges is an adoption no marker names and no read
+  /// re-proves: a connector can move out of its slot and back inside the window
+  /// with nobody recording it, movement further down the chain can go entirely
+  /// unobserved, and a rename of an ANCESTOR of the old root produces no
+  /// `MoveSelf` for the already-watched old root, so the invalidation that pays
+  /// for a moved adoption never fires. The lone tail marker then confirms an
+  /// edge whose ground it never looked at. There is no honest proof to build at
+  /// depth two or deeper, so the splice is declined and the caller falls back to
+  /// the stream replace — which rebuilds the whole binding through a fresh spawn
+  /// barrier and needs no window proof at all.
   ///
   /// Returns the new root's id (`reserved`) together with the [`ArmAttempt`]
   /// its replayed pre-arm outcome must be reported under, or `None` for an
   /// unknown scope, a
   /// [`kernel_recursive`](Capabilities::kernel_recursive) one (a KR widen has
-  /// no per-directory book — the stream swap owns it), an empty `chain`, or a
-  /// `reserved` id that already names a node (all driver bugs, refused rather
-  /// than corrupting the tree). Every `None` is decided strictly BEFORE the
-  /// first mutation, so a refused widen leaves the Monitor bit-identical and
-  /// the caller free to fall back to the stream replace; past that point the
-  /// splice is infallible by construction and any broken invariant panics
-  /// loudly rather than committing a partial tree.
+  /// no per-directory book — the stream swap owns it), an empty `chain`, a
+  /// `chain` longer than one segment, a `reserved` id that already names a node,
+  /// or a `None` `old_identity`. The last two are driver bugs, refused rather
+  /// than corrupting the tree; the others are shapes this splice does not serve,
+  /// and a caller that can reach them screens them itself so its own fallback
+  /// stays a legitimate outcome rather than a bug report. Every `None` is
+  /// decided strictly BEFORE the first mutation, so a refused widen leaves the
+  /// Monitor bit-identical and the caller free to fall back to the stream
+  /// replace; past that point the splice is infallible by construction and any
+  /// broken invariant panics loudly rather than committing a partial tree.
   pub fn widen_root(
     &mut self,
     scope: ScopeId,
@@ -1962,10 +2230,30 @@ impl Monitor {
     }
     // An empty chain would make old and new the same node — not a widen.
     let (last, connectors) = chain.split_last()?;
+    // Depth ONE only (see the doc): a deeper chain's intermediate connector
+    // edges have no proof and no invalidation, so the splice is not offered at
+    // that shape at all. Refused HERE — before the new root is minted, which is
+    // the first mutation this method makes — so the Monitor is bit-identical and
+    // the caller's stream-replace fallback starts from an untouched tree. This
+    // sits with the other shape refusals rather than with the driver-bug asserts
+    // below on purpose: a caller asking for a deep widen is asking for something
+    // reasonable that this splice declines to do, not misusing the API.
+    if !connectors.is_empty() {
+      return None;
+    }
     if self.nodes.contains_key(&reserved) {
       debug_assert!(false, "a reserved widen id is never a live node");
       return None;
     }
+    // The adopted object must be NAMEABLE. A root's identity has exactly one
+    // source — this parameter (a root is never discovered through a listing,
+    // and every other write clears it), so an absent one is absent for the
+    // adopted node's whole life: the tail's re-proof would then be comparing
+    // against nothing and would confirm the edge on ignorance, certifying a
+    // dark-window swap the marker exists to catch. Refuse instead, with the
+    // tree untouched — and carry the identity out of the `Option` here, so the
+    // marker below stores what the re-proof needs rather than a maybe.
+    let adopted_identity = old_identity?;
     // The new root: a plain parentless directory node, cold-arming. Born
     // through the standard funnel (non-re-arm: no counter, no bridge bit) and
     // WITHOUT a queued watch action — the driver already holds its arm outcome.
@@ -1996,6 +2284,14 @@ impl Monitor {
     // announcements with no covering `Rescan` standing — silent loss).
     // Top-down order also lets the driver derive each child's absolute path
     // from a parent already recorded in the same drain.
+    //
+    // VACUOUS as of the depth-one cap above: `connectors` is empty on every path
+    // that reaches here, so this loop never runs and `tail` stays `reserved` —
+    // the adopted edge hangs directly off the new root, which is exactly what
+    // makes the marker provable. Kept rather than deleted so the cap stays the
+    // single place that decides the supported depth: the splice mechanics for a
+    // longer chain are still correct in themselves, and the reason a deep widen
+    // is refused is the unprovable WINDOW, not a hole here.
     let mut tail = reserved;
     for seg in connectors {
       self.install_child(tail, scope, seg.clone(), true, None);
@@ -2022,16 +2318,22 @@ impl Monitor {
       "both splice endpoints are live by construction"
     );
     if let Some(node) = self.nodes.get_mut(&old_root) {
-      node.identity = old_identity;
+      node.identity = Some(adopted_identity);
     }
     self.roots.insert(scope, reserved);
     // The dark-window tripwire: the tail's first complete read must
     // re-confirm the adopted edge (see the type doc and `resolve_adoption`).
+    // The tail IS `reserved` under the depth-one cap, so the read that pays for
+    // the window is the new root's own post-replay cold read.
+    // It records WHICH watch was adopted and the identity naming it, not just
+    // the slot: from this instant the tail is unarmed, so a rename can move
+    // the object off `last` with nobody recording it, and a marker that named
+    // only the slot would let the proof be paid by whoever turned up there.
     // The marker also holds [`coverage_settled`](Self::coverage_settled) down
     // from this instant, so a sync cookie cannot dispatch over the unverified
-    // window — the connecting arms and reads are deliberately cold and would
+    // window — the tail's arm and read are deliberately cold and would
     // otherwise leave the barrier nothing to wait on.
-    self.record_adoption_marker(tail, last.clone(), scope);
+    self.record_adoption_marker(tail, last.clone(), old_root, adopted_identity, scope);
     self.settle_bridges();
     Some((reserved, attempt))
   }
@@ -2211,20 +2513,97 @@ impl Monitor {
     !self.adopting_by_scope.contains_key(&scope)
   }
 
-  /// Records the widen's unverified adoption edge at its chain parent — the
-  /// one insert site, paired with [`take_adoption_marker`](Self::take_adoption_marker).
-  fn record_adoption_marker(&mut self, parent: WatchId, name: Segment, scope: ScopeId) {
-    let evicted = self.pending_adoptions.insert(parent, name);
+  /// Records the widen's unverified adoption edge at its chain parent — the one
+  /// insert site, paired with
+  /// [`release_adoption_marker`](Self::release_adoption_marker).
+  ///
+  /// `adopted` and `identity` are captured HERE, at the instant the marker is
+  /// stood, because that is the last instant at which the slot and the object
+  /// provably agree: from the commit onward the chain is unarmed and a rename
+  /// can separate them behind the monitor's back (see [`AdoptionMarker`]).
+  fn record_adoption_marker(
+    &mut self,
+    parent: WatchId,
+    name: Segment,
+    adopted: WatchId,
+    identity: Identity,
+    scope: ScopeId,
+  ) {
+    let evicted = self.pending_adoptions.insert(
+      parent,
+      AdoptionMarker {
+        name,
+        adopted,
+        identity,
+      },
+    );
     debug_assert!(evicted.is_none(), "widen tails are freshly minted");
     *self.adopting_by_scope.entry(scope).or_insert(0) += 1;
     self.acquired_coverage_work(scope);
   }
 
+  /// Retires the ADOPTED WATCH of a released marker: the subtree goes, inside
+  /// whatever cover the release already stood. The one act every retirement
+  /// disposal performs, so the name and the deed cannot drift apart between
+  /// them.
+  ///
+  /// Resolved by [`WatchId`], never by slot: a child a `MovedFrom` detached
+  /// before the proof is still exactly the one that dies, and a replacement
+  /// that took its vacated slot keeps its own (properly discovered) coverage. A
+  /// watch already destroyed leaves nothing to do — the edge cannot outlive its
+  /// object.
+  ///
+  /// `parent` is the marker's own key, and is passed SOLELY to be asserted —
+  /// after the drop, which is where the claim has content. The containment
+  /// invariant ([`pending_adoptions`](Self::pending_adoptions)) makes `adopted` a
+  /// direct child of it, so a retirement reaching an ANCESTOR of `parent` is the
+  /// non-local destruction every caller's continuation is written against.
+  fn retire_adopted(&mut self, adopted: WatchId, parent: WatchId) {
+    if self.nodes.contains_key(&adopted) {
+      self.drop_subtree(adopted, DeficitDischarge::CoveringRescan);
+    }
+    debug_assert!(
+      self.nodes.contains_key(&parent),
+      "adoption retirement is subtree-local"
+    );
+  }
+
   /// Removes the adoption marker keyed at `parent` (if any), keeping the
-  /// per-scope settle counter in lockstep — the ONE removal funnel, so no
-  /// path can release the barrier conjunct without going through it.
-  fn take_adoption_marker(&mut self, parent: WatchId, scope: ScopeId) -> Option<Segment> {
-    let name = self.pending_adoptions.remove(&parent)?;
+  /// per-scope settle counter in lockstep, and DISPOSES of the child it adopted
+  /// per `disposal` — the ONE removal funnel, so no path can release the
+  /// barrier conjunct without going through it, and no release can go without a
+  /// disposal (see [`AdoptionDisposal`] for why that is structural rather than
+  /// a convention).
+  ///
+  /// Returns the released [`AdoptionMarker`], or `None` when no marker stood.
+  /// Only [`Verdict`](AdoptionDisposal::Verdict) hands back a marker its caller
+  /// must still act on; every other disposal is PERFORMED here, and its marker
+  /// says nothing more than that one was standing.
+  ///
+  /// No caller is told anything about `parent`'s fate, because there is nothing
+  /// to tell: the containment invariant
+  /// ([`pending_adoptions`](Self::pending_adoptions)) makes the adopted watch a
+  /// direct CHILD of `parent`, so no disposal here can reach it.
+  ///
+  /// Every disposal resolves the marker's own
+  /// [`adopted`](AdoptionMarker::adopted) watch. None of them re-derives it
+  /// from `(parent, name)`: that lookup answers "who holds the slot NOW", and
+  /// the marker exists precisely because the interval since it was stood is one
+  /// in which the answer can have changed without the monitor recording it — a
+  /// held detach frees the slot and a replacement may take it, both with the
+  /// parent link (and so the invariant) intact.
+  fn release_adoption_marker(
+    &mut self,
+    parent: WatchId,
+    scope: ScopeId,
+    disposal: AdoptionDisposal,
+  ) -> Option<AdoptionMarker> {
+    let marker = self.pending_adoptions.remove(&parent)?;
+    // A staged marker is one still standing, so its staging entry leaves with
+    // it here and at no other site — which is what makes the fence's latch
+    // outlive nothing: the scope stops owing a seal the instant its last marker
+    // goes, whichever of the seven exits took it.
+    self.staged_adoptions.remove(&(scope, parent));
     match self.adopting_by_scope.get_mut(&scope) {
       Some(count) if *count > 1 => *count -= 1,
       Some(_) => {
@@ -2232,7 +2611,198 @@ impl Monitor {
       }
       None => debug_assert!(false, "the adoption counter mirrors the marker map"),
     }
-    Some(name)
+    match disposal {
+      // The caller's own read is the disposal; the marker below is its input.
+      AdoptionDisposal::Verdict => {}
+      AdoptionDisposal::CountedRetirement => {
+        // The cover FIRST, then the coverage it covers ends — a `Rescan` that
+        // postdates the disarm instructs nobody about the interval between.
+        // Counted, so the barrier this release just took its conjunct off has
+        // the cover's own re-arm to rest on rather than nothing.
+        self.stand_counted_cover(scope);
+        // A watch already destroyed is already the disposal: the edge this
+        // marker stood for has no subtree left to keep addressing at a path
+        // nothing proved, and the cover above still stands for the dark window
+        // it opened.
+        self.retire_adopted(marker.adopted, parent);
+      }
+      // The containment invariant, stated at the one site that rests on it: the
+      // adopted child dies with this walk BECAUSE it is still under the node the
+      // walk is destroying. Read through the CHILD's parent link, which is what
+      // makes it checkable mid-walk — `parent` is already out of `nodes`, while a
+      // child the walk has not reached yet still names it.
+      AdoptionDisposal::DiesWithTheWalk => debug_assert!(
+        self
+          .nodes
+          .get(&marker.adopted)
+          .is_none_or(|node| node.parent == Some(parent)),
+        "an unproven adopted edge is immovable, so it dies with its marker's walk"
+      ),
+      AdoptionDisposal::ChildAlreadyDropped => debug_assert!(
+        !self.nodes.contains_key(&marker.adopted),
+        "a ChildAlreadyDropped release must have nothing left to dispose of"
+      ),
+    }
+    Some(marker)
+  }
+
+  /// Stages the marker keyed at `parent`: its confirming listing has been
+  /// ingested, and its release now waits for the ordering fence — the ONE site
+  /// that puts a marker into [`staged_adoptions`](Self::staged_adoptions),
+  /// paired with the clear inside
+  /// [`release_adoption_marker`](Self::release_adoption_marker).
+  ///
+  /// No coverage work is acquired and no epoch moves: the marker was already
+  /// holding the adoptions conjunct of
+  /// [`coverage_settled`](Self::coverage_settled) down and goes on holding it,
+  /// so nothing about the barrier changed and a proof taken over the scope's
+  /// coverage work is still speaking for the same window.
+  ///
+  /// Re-staging is refused rather than re-stamped. A second confirming listing
+  /// says nothing the first did not — the marker's readings are one-way while
+  /// it stands — and moving the stamp forward would push the marker past the
+  /// reach of a cut already out for it, buying a needless round trip for a
+  /// window that never re-opened.
+  fn stage_adoption(&mut self, parent: WatchId, scope: ScopeId) {
+    debug_assert!(
+      self.pending_adoptions.contains_key(&parent),
+      "staging names a standing marker"
+    );
+    if self.staged_adoptions.contains_key(&(scope, parent)) {
+      return;
+    }
+    self.adoption_staging_seq += 1;
+    self
+      .staged_adoptions
+      .insert((scope, parent), self.adoption_staging_seq);
+  }
+
+  /// The staging generation of `scope`'s newest staged marker, or `None` when
+  /// the scope owes no seal. O(log n) plus the scope's own (one or two) staged
+  /// entries; allocates nothing.
+  ///
+  /// This is what a fence asks for when it decides whether the ordering proof
+  /// it holds already speaks for everything the scope owes.
+  #[must_use]
+  pub fn adoption_staging_high_water(&self, scope: ScopeId) -> Option<u64> {
+    self
+      .staged_adoptions
+      .range((scope, FIRST_WATCH)..)
+      .take_while(|((staged, _), _)| *staged == scope)
+      .map(|(_, staged_at)| *staged_at)
+      .max()
+  }
+
+  /// Whether `scope` has a staged marker a cut reaching `through` would seal.
+  /// O(log n) plus the scope's own staged entries; allocates nothing.
+  #[must_use]
+  pub fn adoption_staged_through(&self, scope: ScopeId, through: u64) -> bool {
+    self
+      .staged_adoptions
+      .range((scope, FIRST_WATCH)..)
+      .take_while(|((staged, _), _)| *staged == scope)
+      .any(|(_, staged_at)| *staged_at <= through)
+  }
+
+  /// Every scope that owes a seal, with the staging generation of its newest
+  /// staged marker. Allocates only when some marker is staged.
+  #[must_use]
+  pub fn staged_adoption_scopes(&self) -> std::vec::Vec<(ScopeId, u64)> {
+    let mut out: std::vec::Vec<(ScopeId, u64)> = std::vec::Vec::new();
+    for ((scope, _), staged_at) in &self.staged_adoptions {
+      match out.last_mut() {
+        Some((last, high)) if last == scope => *high = (*high).max(*staged_at),
+        _ => out.push((*scope, *staged_at)),
+      }
+    }
+    out
+  }
+
+  /// Releases every marker of `scope` staged at or before `through` — the ONE
+  /// site at which a widen's adoption edge is released as CONFIRMED, and the
+  /// only consumer of the staging book.
+  ///
+  /// **The caller owes the ordering, and it is the whole content of the call.**
+  /// `through` must be the reach of a reader-queue cut that was requested after
+  /// the staged listings were ingested and whose answer has itself been
+  /// ingested, with the scope's source lane drained to that answer. Given that,
+  /// every record the kernel had committed by the listing is already fed —
+  /// because one scope's records are FIFO from one kernel queue, and because a
+  /// rename's records are committed before any listing of either of its parent
+  /// directories that reflects it, which is exactly the listing a depth-one
+  /// widen's proof reads. So an excursion the listing could have concealed has
+  /// already spent its marker through the move-record path, and
+  /// a marker that survives to here certifies the whole splice-to-listing
+  /// interval rather than its end state.
+  ///
+  /// **The interval it certifies is the adopted OBJECT's, not the PATH's.**
+  /// Every reading the proof rests on — the marker's survival, the listing's
+  /// identity match, the occupancy check below — is about an inode, its parent
+  /// link, and its filesystem, and so are the records that spend a marker. A
+  /// mount stacked over the adopted slot and unmounted again before the listing
+  /// touches none of them: the object neither moved nor lost its superblock, so
+  /// no record is emitted for the ordering fence to carry, and by the listing
+  /// the overlay is gone and the slot reads exactly as the widen left it. The
+  /// proof then matches across an interval in which the path named a different
+  /// tree. A stack STILL standing at the listing is caught — the enumerate's
+  /// mount fence lowers it non-directory and the identity conjunct rejects it —
+  /// so what stays uncovered is specifically a change that reverts inside the
+  /// window, which a second mount-id reading would not see either: it reads
+  /// clean at both ends.
+  ///
+  /// Nothing is re-read: the world is not stat-ed, listed, or asked for an
+  /// identity again. The three readings the seal takes are the ones that only
+  /// ever degrade while the marker stands, so taking them late is taking them
+  /// safely and matching one cannot be an ABA:
+  ///
+  /// - the marker still stands — every spend, death, walk and rebind removes it
+  ///   from the map this iterates, so a released marker is simply not here;
+  /// - the adopted WATCH is alive — its death is one-way, and a recorded death
+  ///   answers with the located `Rescan` the read-time verdict gives it;
+  /// - the adopted watch still holds the slot — `detach_child` can vacate it and
+  ///   nothing can restore it, since a fresh install mints a new id and the one
+  ///   reparent site refuses an unproven adopted edge.
+  ///
+  /// A marker staged after `through` is left standing for its own cut: its
+  /// listing was ingested after this cut was requested, so this cut orders
+  /// nothing about it.
+  pub fn seal_staged_adoptions(&mut self, scope: ScopeId, through: u64) {
+    let due: std::vec::Vec<WatchId> = self
+      .staged_adoptions
+      .range((scope, FIRST_WATCH)..)
+      .take_while(|((staged, _), _)| *staged == scope)
+      .filter(|(_, staged_at)| **staged_at <= through)
+      .map(|((_, parent), _)| *parent)
+      .collect();
+    for parent in due {
+      let Some(marker) = self.pending_adoptions.get(&parent).cloned() else {
+        debug_assert!(false, "a staged entry names a standing marker");
+        self.staged_adoptions.remove(&(scope, parent));
+        continue;
+      };
+      // The obligation is owed by the adopted WATCH, so that is what is looked
+      // up — never whoever holds the slot now. A watch already destroyed is the
+      // recorded-death case, whose vacated slot the consumer re-reads.
+      if !self.nodes.contains_key(&marker.adopted) {
+        let _ = self.release_adoption_marker(parent, scope, AdoptionDisposal::Verdict);
+        self.emit_rescan(scope, self.location_of(parent).child(marker.name));
+        continue;
+      }
+      if self.child_watch(parent, &marker.name) == Some(marker.adopted) {
+        // Confirmed, and SILENTLY: no `Rescan`, no epoch bump, no re-arm. A
+        // widen nothing interfered with pays the fence one round trip and
+        // nothing else, so a barrier across it still resolves by delivery.
+        let _ = self.release_adoption_marker(parent, scope, AdoptionDisposal::Verdict);
+        continue;
+      }
+      // The slot parted from the object between the listing and this call, with
+      // the marker still standing — so no listing ever proved the edge and the
+      // adopted subtree would go on reconstructing paths through it. The cover
+      // FIRST, then the coverage it covers ends, exactly as the read-time
+      // stale-edge branch does it.
+      let _ = self.release_adoption_marker(parent, scope, AdoptionDisposal::CountedRetirement);
+    }
+    self.settle_bridges();
   }
 
   /// Whether `scope` has no in-flight cold read carrying a coalesced re-arm
@@ -2829,7 +3399,22 @@ impl Monitor {
   /// ([`defer_stat_descent`](Self::defer_stat_descent)), which is also what lets
   /// a later read's stronger obligation reach a stat this dedup already
   /// coalesced onto.
+  ///
+  /// Never at a parent that is gone, for the same reason
+  /// [`install_child`](Self::install_child) installs nothing there: the row's own
+  /// reclamation is the parent's death ([`reclaim_node_marker`](Self::reclaim_node_marker)),
+  /// which has already happened, so nothing would ever take it back — and inside
+  /// the registration window it carries the settlement-loss stamp that degrades
+  /// every later fence until it is discharged. A tripwire on the containment
+  /// invariant, like `install_child`'s: loud in tests, wedge-proof in release.
   fn queue_stat(&mut self, parent: WatchId, scope: ScopeId, name: Segment) {
+    debug_assert!(
+      self.nodes.contains_key(&parent),
+      "a slot stat is only ever queued at a live parent"
+    );
+    if !self.nodes.contains_key(&parent) {
+      return;
+    }
     if self.stat_slots.contains_key(&(parent, name.clone())) {
       return;
     }
@@ -3032,8 +3617,18 @@ impl Monitor {
 
     // A pending same-transport adoption edge resolves on this — the parent's
     // first complete read (an incomplete or dirtied read returned above with
-    // the marker intact, so the bounded retries keep re-checking).
-    self.resolve_adoption(dir, scope, kind, held.is_some(), &res);
+    // the marker intact, so the bounded retries keep re-checking, and the
+    // retry's own completion is a re-arm the verdict is owed on just the same).
+    // Strictly ABOVE the dispatch below: a refused edge is retired right here,
+    // and the reconcile of that very name is the next thing to run — so it
+    // meets an empty slot and installs, instead of finding the refused subtree
+    // and reusing it.
+    //
+    // `dir` survives it by construction, not by check: the retirement resolves
+    // the adopted WATCH, which the containment invariant keeps a direct CHILD of
+    // `dir` (see `pending_adoptions`), and the dispatch below addresses `dir` at
+    // every step.
+    self.resolve_adoption(dir, scope, held.is_some(), &res);
 
     match kind {
       // A cold read on a held dir is coverage-only; route it as a re-arm (no
@@ -3182,15 +3777,41 @@ impl Monitor {
       self.queue_enumerate(dir, EnumKind::Rearm { reprove }, attempts + 1);
       return;
     }
-    // Retries exhausted with an adoption edge still unverified: hand the
-    // marker to the deficit machinery rather than wedge the barrier — the
-    // standing `Rescan` above plus the interior deficit recorded below ARE
-    // the edge's covering signal now (every later sync re-signals the
-    // darkness before its cookie), whereas a marker kept past the bounded
-    // retries would hold `coverage_settled` down with no read left to ever
-    // release it. A held dir routes the same way: the hold's own pairing
-    // resolution re-scans and re-arms the destination.
-    let _ = self.take_adoption_marker(dir, scope);
+    // Retries exhausted with an adoption edge still unverified, and no read
+    // left that could ever prove it. The marker cannot simply be kept — past
+    // the bounded retries it would hold `coverage_settled` down with nothing
+    // remaining to release it — so it is released together with the one
+    // disposal that is not inert here: the adopted subtree is RETIRED inside a
+    // counted covering `Rescan` anchored at the scope root.
+    //
+    // This site's own two signals are not that cover. On the HELD path — the
+    // one a widen tail's incomplete reads actually take, since a hold costs a
+    // listing its evidence status and routes every completion here — the
+    // `Rescan` above is suppressed (it would name the vacated pre-move path)
+    // AND the interior deficit below is skipped with it (the `if deliver`
+    // gate), so both halves of "the standing `Rescan` plus the interior
+    // deficit" are absent exactly where the release happens. What would remain
+    // is the hold's pairing re-arm, which reconciles PERMISSIVELY: a name it
+    // cannot classify is not diffed at all and defers to the slot's stat, whose
+    // `Dir`-without-identity answer is no positive difference and so KEEPS the
+    // incumbent. The edge no read ever confirmed would survive its own release,
+    // its descendants delivering at reconstructed-stale paths with the barrier
+    // settled — the same shape `resolve_adoption`'s stale-edge branch refuses,
+    // reached by exhaustion instead of by refutation, so it takes the same
+    // disposition.
+    //
+    // The scope ROOT is what the cover names because it is the only anchor that
+    // works on both paths: it is locatable under a hold, and it is an ancestor
+    // of the adopted object and of everything the retirement disarms. Its re-arm is
+    // COUNTED, so the released barrier rests on the rebuild rather than on
+    // nothing, and it is bounded — the marker is gone, so a re-exhaustion of
+    // this very read stands no second cover.
+    //
+    // `dir` — the very directory whose exhausted read this is — survives it: the
+    // containment invariant keeps the adopted watch a direct CHILD of `dir` (see
+    // `pending_adoptions`), so the drop cannot climb to it, and the interior
+    // deficit booked below stays a claim about a LIVE directory.
+    let _ = self.release_adoption_marker(dir, scope, AdoptionDisposal::CountedRetirement);
     if deliver {
       // Retries exhausted — the node stays `Live` and the `Rescan` stands. It is
       // re-attempted the next time a reconciliation trigger for its scope re-arms it (a
@@ -3541,19 +4162,63 @@ impl Monitor {
   /// Resolves a pending same-transport adoption edge against `dir`'s first
   /// COMPLETE read: the adopted slot's only unwatched window is the widen's
   /// commit→arm gap, so this one verification closes the no-silent-loss hole
-  /// that gap opens. Every complete read consumes the marker; the outcomes:
+  /// that gap opens for the OBJECT the widen adopted — what the slot's path
+  /// resolved to across the gap is a separate assumption, stated under
+  /// **confirmed** below. Every complete read decides the marker; the outcomes:
   ///
-  /// - **confirmed** — the adopted node still occupies the slot, the listing
-  ///   names it as a directory, and identity does not POSITIVELY differ
-  ///   (absent identity is never "differs", matching every other reconcile):
-  ///   the edge is verified, silently.
-  /// - **stale edge** — the node occupies the slot but the name vanished from
-  ///   the complete listing or its identity positively differs: the adopted
-  ///   subtree's true path is unknowable (the moved-root problem — its
-  ///   descendants would keep delivering at reconstructed-stale paths), so
-  ///   escalate the scope root: one epoch-bumped covering `Rescan` plus a
-  ///   counted re-arm, whose identity-diffing rebuild replaces the stale edge.
-  ///   Loud, D1-equivalent, never silent. It runs through
+  /// - **confirmed** — the ADOPTED WATCH still occupies the slot, the listing
+  ///   names that slot as a directory, and the entry's identity POSITIVELY
+  ///   equals the one the widen adopted it under
+  ///   ([`AdoptionMarker::identity`]): the edge reads verified, and the marker
+  ///   is STAGED rather than released. Strict, not permissive: this is a
+  ///   re-proof, not a discovery, so ignorance confirms nothing — the same
+  ///   polarity `rearm_enumerate` re-proves its survivors under, where an
+  ///   identity-less backend can confirm NO child. The expected side is known by
+  ///   construction ([`widen_root`](Self::widen_root) refuses an identityless
+  ///   widen), so what this rejects is a LISTING that cannot name what it found
+  ///   — and, through the occupancy conjunct, a listing that names a REPLACEMENT
+  ///   perfectly well. An object that merely inherited the name discharges
+  ///   nothing.
+  ///
+  ///   A SNAPSHOT of the window's END is admissible as a proof about the WHOLE
+  ///   window only once every record of the window that could refute it has been
+  ///   ingested — and *this listing's completion is not that moment*. Both
+  ///   conjuncts are restored by an object that leaves the adopted slot and
+  ///   returns before the read (the link is only rewritten by an observed move,
+  ///   and the identity comes back with the object), so what refutes the
+  ///   interval is the object's own [`RecordKind::MoveSelf`]
+  ///   ([`on_move_self`](Self::on_move_self) spends the marker on it) — and that
+  ///   record may still be sitting unread in the kernel's queue when this
+  ///   listing lands, because the listing is taken off the reader entirely and
+  ///   its completion is reported on a channel the driver polls ahead of the
+  ///   source lane. The trigger structurally outruns the evidence.
+  ///
+  ///   So the confirming direction — and only it, since a refutation needs no
+  ///   fence — waits: the marker stands STAGED
+  ///   ([`staged_adoptions`](Self::staged_adoptions)) and its verdict is taken
+  ///   by [`seal_staged_adoptions`](Self::seal_staged_adoptions) behind a reader
+  ///   queue cut requested after this listing was ingested. Everything the
+  ///   kernel held is then on the lane ahead of the cut's own reply, and one
+  ///   scope's records are FIFO from one queue, so by the seal the refuting
+  ///   record has already spent this marker. A marker that survives to the seal
+  ///   therefore says the adopted OBJECT held the slot throughout, not merely
+  ///   that it holds it now — with a `MoveSelf` lost to an overflow healed by
+  ///   that overflow's scope-wide `Rescan` and counted re-arm, as every lost
+  ///   record is. What it does not say is that the PATH named that object
+  ///   throughout: a mount raised over the slot and dropped again inside the
+  ///   window moves no inode and unmounts no filesystem, so it emits no record
+  ///   to spend the marker and leaves the slot reading unchanged
+  ///   ([`seal_staged_adoptions`](Self::seal_staged_adoptions)).
+  /// - **stale edge** — the adopted watch is alive but the proof fails: the
+  ///   name vanished from the complete listing, or the listing cannot
+  ///   positively match it (a different object, or no identity at all), or the
+  ///   watch is no longer in that slot at all (a `MovedFrom` detached it, or a
+  ///   replacement took the vacated name). Its true path is then unknowable to
+  ///   the proof (the moved-root problem — its descendants would keep delivering
+  ///   at reconstructed paths nothing confirmed), so escalate the scope root —
+  ///   one epoch-bumped covering
+  ///   `Rescan` plus a counted re-arm — and, INSIDE that cover, DROP the
+  ///   adopted subtree. Loud, D1-equivalent, never silent. It runs through
   ///   [`stand_counted_cover`](Self::stand_counted_cover) rather than the bare
   ///   rescan-and-rearm because THIS read is what released the adoption
   ///   conjunct that was holding
@@ -3561,45 +4226,143 @@ impl Monitor {
   ///   own state can refuse — a widen's spliced root is `Arming` until its
   ///   pre-arm outcome is replayed, and a chain tail can complete its first
   ///   read before that — would leave the released barrier resting on nothing
-  ///   while the stale edge still stands.
-  /// - **recorded death** — the adopted node is GONE (its own self-events tore
+  ///   while the stale edge still stands. Retiring the edge is likewise this
+  ///   branch's own work and not the re-arm's to inherit: every later
+  ///   reconciliation of that slot is PERMISSIVE where this proof is strict, so
+  ///   an edge handed on would be retained rather than replaced (see the drop
+  ///   below).
+  /// - **recorded death** — the adopted WATCH is gone (its own self-events tore
   ///   it down mid-window) with no parent watch armed to mint the parent-side
   ///   `Removed`: stand a located `Rescan` at the vacated slot so the
-  ///   consumer's re-read converges the ghost. A re-occupied slot additionally
-  ///   installs through the caller's ordinary reconcile.
+  ///   consumer's re-read converges the ghost. Nothing unproven survives — the
+  ///   edge cannot outlive its object — so no retirement is owed. A re-occupied
+  ///   slot additionally installs through the caller's ordinary reconcile.
   ///
-  /// A re-arm-flavored (or held, hence re-arm-routed) completion consumes the
-  /// marker as HANDLED: `rearm_enumerate` prunes a vanished name and
-  /// identity-diffs a survivor itself, which resolves the edge through the
-  /// crawl-rebuild machinery and its own coverage story.
-  fn resolve_adoption(
-    &mut self,
-    dir: WatchId,
-    scope: ScopeId,
-    kind: EnumKind,
-    held: bool,
-    res: &EnumerateResult,
-  ) {
-    let Some(name) = self.take_adoption_marker(dir, scope) else {
+  /// The reading is taken on every complete read, whatever flavor queued it —
+  /// a re-arm crawl is coverage machinery, never a substitute proof. It
+  /// re-proves only what its listing CLASSIFIES: a name reported `Unknown`
+  /// retires nothing (pruning on ignorance would un-cover a live directory)
+  /// and defers to the slot's stat, which answers through the permissive
+  /// reconcile and so KEEPS an incumbent it cannot positively displace — as
+  /// does a stat that fails, and as does one no driver ever answers. An edge
+  /// handed to that machinery is therefore retained rather than replaced,
+  /// while the marker this read spent has already released the barrier
+  /// conjunct that was holding [`coverage_settled`](Self::coverage_settled)
+  /// down. So the decision is made HERE, and made BEFORE the crawl runs: the
+  /// crawl then reconciles that name against an EMPTIED slot and installs into
+  /// it, rather than meeting the subtree this read just refused to confirm.
+  ///
+  /// A HELD completion takes no verdict — and that arm is a standing guard, not
+  /// a live path. A hold already costs the listing its evidence status
+  /// (`Lowering::is_evidence`), so such a read never reaches here at all: it
+  /// routes to the incomplete handler, which KEEPS the marker and re-reads, and
+  /// only the bounded retries' exhaustion releases it. The guard states what
+  /// the verdict would be if a held listing were ever admitted, and why it is
+  /// none: that listing came from the path the subtree has LEFT, so it
+  /// describes whatever now stands there and could confirm or refute the
+  /// adopted edge only by accident.
+  ///
+  /// It is written as a DISPOSAL rather than a bare return
+  /// ([`CountedRetirement`](AdoptionDisposal::CountedRetirement), the same one
+  /// the exhaustion site takes) because a guard whose failure mode is a silent
+  /// release is not a guard. Neither of the covers a hold does carry can be
+  /// borrowed here: the hold's own barrier conjunct
+  /// ([`holds_settled`](Self::holds_settled)) is released by the pairing
+  /// without ever looking at this edge, and the destination `Rescan` and re-arm
+  /// that reading under a hold books against that pairing
+  /// ([`fence_lowering`](Self::fence_lowering)) reconcile PERMISSIVELY — they
+  /// retain an incumbent they cannot classify, which is precisely the unproven
+  /// edge. Only a counted cover that also EMPTIES the slot answers a released
+  /// marker no read ever proved.
+  ///
+  /// Only the confirm waits. The refuting outcomes release the marker at this
+  /// completion, unfenced and unchanged, because an ordering proof buys nothing
+  /// for a conservative answer: a late record that would have refuted an edge
+  /// this read already refused costs work, never correctness, whereas the
+  /// confirm is the one direction whose match must mean the interval was clean.
+  ///
+  /// `dir` — the directory whose read this is, and the caller's next several
+  /// steps' only subject — is untouched by every outcome: the one destructive
+  /// outcome retires the adopted WATCH, which the containment invariant keeps a
+  /// direct CHILD of `dir` (see [`pending_adoptions`](Self::pending_adoptions)).
+  fn resolve_adoption(&mut self, dir: WatchId, scope: ScopeId, held: bool, res: &EnumerateResult) {
+    if held {
+      let _ = self.release_adoption_marker(dir, scope, AdoptionDisposal::CountedRetirement);
+      return;
+    }
+    let Some(marker) = self.pending_adoptions.get(&dir).cloned() else {
       return;
     };
-    if matches!(kind, EnumKind::Rearm { .. }) || held {
+    // The proof is owed by the ADOPTED WATCH, so that is what is looked up —
+    // never "whoever holds the slot now". A watch already destroyed is the
+    // recorded-death case below; a live one is proven or retired, wherever a
+    // rename has since put it.
+    if !self.nodes.contains_key(&marker.adopted) {
+      let _ = self.release_adoption_marker(dir, scope, AdoptionDisposal::Verdict);
+      self.emit_rescan(scope, self.location_of(dir).child(marker.name));
       return;
     }
-    let entry = res.entries().iter().find(|entry| *entry.name() == name);
-    match self.child_watch(dir, &name) {
-      Some(adopted) => {
-        let confirmed = entry
-          .is_some_and(|entry| entry.is_dir() && !self.identity_differs(adopted, entry.node()));
-        if confirmed {
-          return;
-        }
-        self.stand_counted_cover(scope);
-      }
-      None => {
-        self.emit_rescan(scope, self.location_of(dir).child(name));
-      }
+    let entry = res
+      .entries()
+      .iter()
+      .find(|entry| *entry.name() == marker.name);
+    // Three conjuncts, and a replacement fails the first of them: the adopted
+    // watch must STILL hold the slot the listing is about, the entry must be a
+    // directory, and its identity must be the one the widen named. Confirming
+    // on the slot's current occupant would let an object that merely inherited
+    // the name discharge another object's debt — which is the whole shape of a
+    // dark-window substitution.
+    let confirmed = self.child_watch(dir, &marker.name) == Some(marker.adopted)
+      && entry.is_some_and(|entry| entry.is_dir() && entry.node() == Some(marker.identity));
+    if confirmed {
+      // STAGED, not released: the confirming direction is the one that needs an
+      // ordering fence behind it, and the marker keeps standing — holding the
+      // barrier, refusing the reparent, spendable by the very record that would
+      // refute it — until [`seal_staged_adoptions`](Self::seal_staged_adoptions)
+      // takes the verdict behind an answered cut.
+      //
+      // A read meeting a marker already staged reaches here too, and leaves the
+      // stamp where it is (see [`stage_adoption`](Self::stage_adoption)). Only
+      // the FIRST confirming listing is ever the confirm — the cut requested
+      // behind it is the one that orders its window — so a later listing can
+      // refute (above), and can add nothing.
+      self.stage_adoption(dir, scope);
+      return;
     }
+    let _ = self.release_adoption_marker(dir, scope, AdoptionDisposal::Verdict);
+    // The cover FIRST, then the coverage it covers ends — a `Rescan` that
+    // postdates the disarm instructs nobody about the interval between.
+    self.stand_counted_cover(scope);
+    // The retirement is not optional and not deferrable. Leaving the unproven
+    // edge standing for a later reconciliation to replace asks a PERMISSIVE
+    // decision to finish a STRICT one, and it does not: a name the re-arm
+    // crawl cannot classify is deliberately not diffed at all (pruning an
+    // incumbent on ignorance would un-cover a live directory), so it
+    // defers to the slot's stat — whose `Dir` answer without an identity is
+    // no positive difference and therefore KEEPS the incumbent, exactly as
+    // a stat that fails or never arrives keeps it. The edge this branch
+    // just refused to confirm would then survive its own escalation, its
+    // descendants still delivering at reconstructed-stale paths with the
+    // barrier settled. A retired subtree has no such ambiguity: every one of
+    // those paths installs fresh.
+    //
+    // And it retires the ADOPTED WATCH, not the slot's current occupant. When
+    // the two have parted — a rename in the window, with something else grown
+    // into the name — retiring the occupant would disarm an object with a
+    // perfectly good coverage story while leaving the unproven one alive
+    // under its new path, which is the failure inverted rather than fixed.
+    //
+    // `CoveringRescan` for the erased darkness, like every other drop whose
+    // object may well still exist: the structural signals are interest- and
+    // filter-subject, so the window's closing `Rescan` is what covers the
+    // dark interval. No located `Rescan` of its own — the root one stood
+    // just above already re-instructs this slot, and the same read's
+    // ordinary reconcile is the next thing to touch it.
+    //
+    // And it is SUBTREE-LOCAL: the adopted watch is a direct child of `dir`
+    // by the containment invariant, so this drop leaves `dir` — the directory
+    // the caller goes on reconciling this very listing into — standing.
+    self.retire_adopted(marker.adopted, dir);
   }
 
   /// Handles the result of an [`Action::Watch`].
@@ -4704,7 +5467,12 @@ impl Monitor {
               self.held_by_scope_dec(scope);
             }
             let dirtied = self.dirtied_holds.remove(&src);
+            // Asked BEFORE the re-key: an adopted watch whose edge no read has
+            // proven yet does not move. The only `reparent` that relocates an
+            // existing edge, so this is the whole enforcement of the containment
+            // invariant (see `pending_adoptions`).
             if self.can_reparent(src, rec.watch())
+              && self.reparentable_adoption(src)
               && self.reparent(src, rec.watch(), name.clone(), Reparent::Moved)
             {
               self.emit_pair(scope, to.clone(), &pending, class, paired);
@@ -4762,11 +5530,21 @@ impl Monitor {
                 self.apply_descent(src, descent);
               }
             } else {
-              // Not reparentable: a dead or cyclic held source, or a reparent that
+              // Not reparentable: a dead or cyclic held source, a reparent that
               // aborted because the held source sat inside the (now torn-down)
-              // destination. Tear down any surviving held subtree; reconcile the
-              // destination as a fresh move-in if its parent survived, else escalate
-              // with a `Rescan` — never a `Moved` into a path we no longer cover.
+              // destination, or an UNPROVEN ADOPTED EDGE, which is immovable
+              // (`reparentable_adoption`). Tear down any surviving held subtree;
+              // reconcile the destination as a fresh move-in if its parent survived,
+              // else escalate with a `Rescan` — never a `Moved` into a path we no
+              // longer cover.
+              //
+              // The third reason needs nothing written for it, because this route
+              // already IS the disposition an unprovable adoption is owed: the drop
+              // below is subtree-local (the invariant makes the source a direct
+              // child of the marker's node), the pair is still emitted, the
+              // destination is re-scanned at its REAL location, and its rebuild is
+              // COUNTED. The marker is left standing on purpose — with its adopted
+              // watch now dead it resolves through machinery that already exists.
               if self.is_watched(src) {
                 self.drop_subtree(src, DeficitDischarge::CoveringRescan);
               }
@@ -5158,6 +5936,59 @@ impl Monitor {
     true
   }
 
+  /// The KEY of the marker whose still-unproven adopted watch is `watch` — the
+  /// chain parent that owes its re-proof — or `None` when `watch` owes no
+  /// adoption proof.
+  ///
+  /// Asked through `watch`'s OWN parent link, which the containment invariant
+  /// ([`pending_adoptions`](Self::pending_adoptions)) makes exact rather than
+  /// merely likely: an unproven adopted watch is a direct child of the marker
+  /// that names it, so the single candidate is the marker keyed at that parent,
+  /// and one `O(log n)` pair of lookups decides it. That is what pays for having
+  /// no reverse index — a second map to keep in lockstep with the first would be
+  /// one more thing that could drift out of it.
+  ///
+  /// Both places the answer matters read it here, so "is this watch an unproven
+  /// adopted edge" has one definition: the reparent refusal
+  /// ([`reparentable_adoption`](Self::reparentable_adoption)) and the invalidation
+  /// a moved adopted watch's own [`RecordKind::MoveSelf`] triggers
+  /// ([`on_move_self`](Self::on_move_self)).
+  fn unproven_adoption_of(&self, watch: WatchId) -> Option<WatchId> {
+    let parent = self.nodes.get(&watch)?.parent?;
+    match self.pending_adoptions.get(&parent) {
+      Some(marker) if marker.adopted == watch => Some(parent),
+      _ => None,
+    }
+  }
+
+  /// Whether `src` may be reparented AT ALL: whether it is anything other than
+  /// the still-unproven adopted watch of the marker standing at its own parent.
+  ///
+  /// The enforcement half of the containment invariant
+  /// ([`pending_adoptions`](Self::pending_adoptions)), and the whole of it: this
+  /// is asked at the only [`reparent`](Self::reparent) call that relocates an
+  /// existing edge, so refusing here refuses everywhere.
+  ///
+  /// Permitting the move is what costs. Two ordinary paired renames can put the
+  /// adopted watch ABOVE the node that owes its proof, from which point retiring
+  /// the edge destroys the very directory whose in-flight enumerate asked for the
+  /// retirement, and every continuation holding coordinates under it emits,
+  /// installs or books against a node that is gone. One `O(log n)` lookup per
+  /// paired DIRECTORY move is cheaper than a collateral fate threaded through
+  /// `reconcile_slot` and both enumerate loops.
+  ///
+  /// And a refusal is not a loss: the caller's not-reparentable route already IS
+  /// the disposition an unprovable adopted edge is owed, taken at the rename
+  /// instead of at the proof.
+  ///
+  /// Refusing the move is only half of what the proof needs, and the half that
+  /// can only speak for a move the monitor OBSERVED. Its other half is
+  /// [`on_move_self`](Self::on_move_self): an adopted watch that moved with no
+  /// parent-side record to refuse spends its proof instead.
+  fn reparentable_adoption(&self, src: WatchId) -> bool {
+    self.unproven_adoption_of(src).is_none()
+  }
+
   /// Whether `child`'s subtree may be reparented under `new_parent`: both must be
   /// live and the move must be acyclic — `new_parent` may be neither `child` itself
   /// nor any node within `child`'s subtree, or path reconstruction would loop.
@@ -5399,14 +6230,62 @@ impl Monitor {
       // register), exactly as for any lost watch.
       self.emit_rescan(scope, Location::new());
       self.invalidate_root(scope, rec.watch());
+      return;
     }
-    // A NON-root MoveSelf is deliberately a no-op. In-queue kernel order (the same
-    // contract the cookie window depends on — see `RecordKind::MoveSelf`) means the
-    // parent-side records have already run: the node is either detached-and-held (its
-    // stale path is fenced; dropping it here would break the pending reparent) or
-    // already reparented (its path is CURRENT; dropping it would destroy the coverage
-    // the O(1) carry-over just preserved). A parent-side record lost to an overflow is
-    // healed by the overflow Rescan + re-arm, which prunes the vacated slot.
+    // A non-root that owes a widen's adoption proof is the ONE exception, because
+    // this record is the only thing left that can refute that proof. The proof is a
+    // SNAPSHOT of the chain parent's first complete listing — the adopted watch
+    // still holds the slot, the entry is a directory, its identity is the one the
+    // widen named — and an object that leaves the slot and returns before the read
+    // restores every conjunct of it. Occupancy and identity describe the END of the
+    // dark window; neither says the edge was continuous ACROSS it, and the window is
+    // one nothing else records — a rename out of the adopted slot and back raises no
+    // parent-side half for `reparentable_adoption` to refuse, because the parent that
+    // would have raised one either had no watch yet (a minted connector arms strictly
+    // after the splice) or had its pre-commit records dropped by the unknown-watch
+    // guard (a depth-one widen keys the marker on the reserved root itself). The
+    // `(parent, name)` link is therefore never rewritten — nothing observed a move —
+    // and still names the very watch the listing then finds: the proof would confirm
+    // on an ABA.
+    //
+    // What that confirmation would certify is not nothing. The adopted subtree's own
+    // watches kept recording throughout, and every one of those deliveries
+    // reconstructed its path through an edge that did not exist while the object was
+    // away — no `Rescan` covering the interval, and the barrier free to settle over
+    // it the instant the snapshot confirmed.
+    //
+    // So the object's own record spends the proof: the same `CountedRetirement`
+    // every unprovable adopted edge takes, the cover FIRST and the coverage it ends
+    // after, root-anchored because a subtree that has just moved leaves no located
+    // path this call may address. And it spends it in time, which is the fence's
+    // whole contribution: a confirming listing only STAGES its marker, and the
+    // cut requested after that listing puts every record the kernel held ahead of
+    // the seal — so an excursion the listing could have concealed reaches this
+    // spend while the marker still stands, instead of arriving after a verdict
+    // had already been taken and finding nothing to spend. Subtree-LOCAL, as at every other disposal — the
+    // containment invariant makes the adopted watch a direct CHILD of the marker it
+    // owes, so the chain parent survives to reconcile its own listing, which now
+    // meets an emptied slot and installs into it. And the adoptions conjunct is
+    // released onto that cover's counted re-arm rather than onto nothing, which is
+    // what keeps a spent proof from wedging the scope.
+    if let Some(parent) = self.unproven_adoption_of(rec.watch()) {
+      let _ = self.release_adoption_marker(parent, scope, AdoptionDisposal::CountedRetirement);
+    }
+    // A NON-root MoveSelf is otherwise deliberately a no-op. In-queue kernel order
+    // (the same contract the cookie window depends on — see `RecordKind::MoveSelf`)
+    // means the parent-side records have already run: the node is either
+    // detached-and-held (its stale path is fenced; dropping it here would break the
+    // pending reparent) or already reparented (its path is CURRENT; dropping it would
+    // destroy the coverage the O(1) carry-over just preserved). A parent-side record
+    // lost to an overflow is healed by the overflow Rescan + re-arm, which prunes the
+    // vacated slot.
+    //
+    // Neither reason survives the exception above, which is what lets the exception
+    // be taken without qualifying either of them: the pending reparent a HELD adopted
+    // watch waits on is one the invariant refuses outright, so retiring it breaks
+    // nothing that was going to happen, and an already-reparented adopted watch does
+    // not exist — that refusal dropped it, so the lookup answers `None` and this is
+    // all that is left to do.
   }
 
   /// Invalidates a scope's root after an OS-driven teardown (a moved, deleted, ignored,
@@ -5730,6 +6609,26 @@ impl Monitor {
     is_dir: bool,
     identity: Option<Identity>,
   ) {
+    // No child under a parent that is not there — a TRIPWIRE, not the mechanism.
+    // Every install runs inside some directory's reconcile, and what keeps that
+    // directory alive is the containment invariant (see
+    // [`pending_adoptions`](Self::pending_adoptions)).
+    //
+    // Loud in tests, silent in release, because the two failure modes are not
+    // comparable. An orphan would be born with a parent link nothing resolves —
+    // in no adjacency set, so no drop reaches it, rearm-counted the moment the
+    // caller continues the re-arm, and its `Watch` naming a parent the consumer
+    // rejects, so NO result can ever release the count: the scope's
+    // [`coverage_settled`](Self::coverage_settled) false for the rest of the
+    // process. A wedge is the one unacceptable outcome, so a future change that
+    // broke locality must not reach it.
+    debug_assert!(
+      self.nodes.contains_key(&parent),
+      "a child is only ever installed under a live parent"
+    );
+    if !self.nodes.contains_key(&parent) {
+      return;
+    }
     // Descent is idempotent: a cold enumerate racing a live `Created` (or
     // duplicate create records) must not mint a second watch for one path, or
     // every record under it would be delivered twice. Reuse any pending-or-live
@@ -5802,6 +6701,13 @@ impl Monitor {
   /// whose exhaustive match makes stating the cover a condition of being
   /// reclaimed at all — see [`NodeMarker`] for why that is structural rather
   /// than a convention.
+  ///
+  /// One of those covers is a claim about this walk itself: an erased adoption
+  /// marker discharges on the ground that the child it adopted is dying here too
+  /// ([`DiesWithTheWalk`](AdoptionDisposal::DiesWithTheWalk)). That is the
+  /// containment invariant rather than an assumption, and it is what makes this
+  /// ONE walk: this destroys `subtree(root)` and nothing else, which is what every
+  /// caller's continuation is written on.
   fn drop_subtree(&mut self, root: WatchId, discharge: DeficitDischarge) {
     // The dropped subtree's scope, and — for a re-anchor — the dropped
     // child's surviving-parent slot: both captured BEFORE the walk erases
@@ -6026,10 +6932,17 @@ impl Monitor {
       // wholly unrecorded (the dark window's mutation had no armed parent to
       // record it, and the drop's driving signal — a cold listing's slot
       // reconcile — delivers no re-read instruction of its own).
-      NodeMarker::Adoption => match self.take_adoption_marker(id, node.scope) {
-        Some(_) => ErasedCover::Discharge,
-        None => ErasedCover::Nothing,
-      },
+      //
+      // No separate disposal of the adopted watch is owed: the containment
+      // invariant makes it a direct child of THIS node, so the walk that popped
+      // this node has already pushed it — which
+      // [`DiesWithTheWalk`](AdoptionDisposal::DiesWithTheWalk) asserts.
+      NodeMarker::Adoption => {
+        match self.release_adoption_marker(id, node.scope, AdoptionDisposal::DiesWithTheWalk) {
+          Some(_) => ErasedCover::Discharge,
+          None => ErasedCover::Nothing,
+        }
+      }
       // Its deficit anchors die with it; report a real erasure so the one
       // caller with no coverage story of its own can carry the loss (see
       // `drop_node_deficits` / `drop_subtree_for_crawl_rebuild`).
@@ -6447,8 +7360,27 @@ impl Monitor {
   /// The hole's edge `Rescan` already stands (emitted at the arm failure,
   /// or when the re-anchored deficit was originally recorded); this carries
   /// the level-persistent fact past it.
+  ///
+  /// Never beneath a parent that is gone. A hole is a COORDINATE, and the
+  /// re-signal reconstructs it from the parent's own location: with the parent
+  /// dead that reconstruction truncates to whatever prefix survives, so the entry
+  /// would degrade every later fence of the scope and then re-instruct a path the
+  /// hole was never about. A dead parent's own darkness is discharged by the drop
+  /// that killed it, under that drop's [`DeficitDischarge`].
+  ///
+  /// A tripwire on the containment invariant, like
+  /// [`install_child`](Self::install_child)'s: every caller books against a
+  /// coordinate it holds live, and the one act that could have invalidated one
+  /// mid-continuation is refused at its source.
   fn record_slot_deficit(&mut self, scope: ScopeId, parent: WatchId, name: Segment) {
     if !self.scope_descends(scope) {
+      return;
+    }
+    debug_assert!(
+      self.nodes.contains_key(&parent),
+      "a slot hole is only ever booked beneath a live parent"
+    );
+    if !self.nodes.contains_key(&parent) {
       return;
     }
     let book = self.deficits.entry(scope).or_default();
@@ -6461,8 +7393,20 @@ impl Monitor {
 
   /// Records an exhausted-read interior hole for `dir` in `scope`'s book
   /// (see [`DeficitBook::interiors`]).
+  ///
+  /// Never for a `dir` that is gone, on the same grounds as
+  /// [`record_slot_deficit`](Self::record_slot_deficit): the claim is about the
+  /// unreconciled interior of a LIVE directory, re-signalled at that directory's
+  /// location, and a dead one has neither. Same tripwire, same reason.
   fn record_interior_deficit(&mut self, scope: ScopeId, dir: WatchId) {
     if !self.scope_descends(scope) {
+      return;
+    }
+    debug_assert!(
+      self.nodes.contains_key(&dir),
+      "an interior hole is only ever booked for a live directory"
+    );
+    if !self.nodes.contains_key(&dir) {
       return;
     }
     let book = self.deficits.entry(scope).or_default();
@@ -6840,8 +7784,14 @@ impl Monitor {
     // at once — back-to-back widens splice a fresh tail above the previous one
     // before its first read resolves — but never two on one parent (widen
     // tails are freshly minted; the map keying enforces it structurally).
+    //
+    // And the CONTAINMENT invariant (see [`Monitor::pending_adoptions`]): the
+    // adopted watch is dead, or still a direct child of the marker's own key. It
+    // is what makes every `drop_subtree` local to the subtree its caller named,
+    // enforced by refusing to reparent an unproven adopted edge — so it is
+    // checked here, over the whole map, after every input the storms drive.
     let mut adopting: BTreeMap<ScopeId, usize> = BTreeMap::new();
-    for parent in self.pending_adoptions.keys() {
+    for (parent, marker) in &self.pending_adoptions {
       let node = self
         .nodes
         .get(parent)
@@ -6851,12 +7801,35 @@ impl Monitor {
         self.scope_descends(node.scope),
         "an adoption marker's scope descends"
       );
+      assert!(
+        self
+          .nodes
+          .get(&marker.adopted)
+          .is_none_or(|adopted| adopted.parent == Some(*parent)),
+        "a live adopted watch is still a direct child of the marker it owes"
+      );
       *adopting.entry(node.scope).or_insert(0) += 1;
     }
     assert_eq!(
       adopting, self.adopting_by_scope,
       "the adoption settle counter mirrors the marker map exactly"
     );
+    // Staging is a SUBSET of the standing markers, keyed under the marker's own
+    // scope — the property the seal's latch rests on, because a staged entry
+    // that outlived its marker would keep a scope owing a seal nothing can
+    // answer. The single release funnel is what maintains it.
+    for (scope, parent) in self.staged_adoptions.keys() {
+      let marker_scope = self
+        .pending_adoptions
+        .get(parent)
+        .and_then(|_| self.nodes.get(parent))
+        .map(|node| node.scope);
+      assert_eq!(
+        marker_scope,
+        Some(*scope),
+        "a staged adoption names a standing marker of its own scope"
+      );
+    }
     // The reprove-stamp map mirrors `Arming { reprove: true }` membership
     // exactly: every outstanding reproof is stamped, no stamp outlives its
     // arm, and a reproof is always re-arm-flavored.

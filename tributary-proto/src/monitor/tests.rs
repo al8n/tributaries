@@ -10825,7 +10825,10 @@ fn a_collapsed_book_resignal_counts_its_heal_under_an_arming_root() {
   // world did not end, so its darkness rides across — under a root whose pre-arm
   // outcome the driver has not replayed yet.
   let reserved = m.reserve_watch_id();
-  assert!(m.widen_root(s, reserved, vec![seg("b")], None).is_some());
+  assert!(
+    m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)))
+      .is_some()
+  );
   let _ = drain_actions(&mut m);
   let _ = drain_events(&mut m);
   assert!(
@@ -11947,6 +11950,18 @@ fn arm_named_child(m: &mut Monitor, parent: WatchId, name: &str) -> WatchId {
   id
 }
 
+/// The ordering fence a confirming listing now stages behind, in one call: the
+/// driver requests a reader-queue cut after the listing, and the answered cut
+/// licenses every marker staged at or before the instant it was asked for. The
+/// cells drive the reach directly, because the reach IS what the driver reads
+/// off the monitor when it commits to the batch.
+fn seal_adoptions(m: &mut Monitor, s: ScopeId) {
+  let Some(reach) = m.adoption_staging_high_water(s) else {
+    return;
+  };
+  m.seal_staged_adoptions(s, reach);
+}
+
 /// The outstanding enumerate request reading `dir`.
 fn read_of(m: &mut Monitor, dir: WatchId) -> ReqId {
   drain_actions(m)
@@ -12015,8 +12030,9 @@ fn widen_root_depth_one_splices_without_touching_the_old_subtree() {
     "no reconciliation generation bump"
   );
 
-  // The replayed pre-arm brings the new root live and starts its COLD read;
-  // its confirming completion releases the barrier.
+  // The replayed pre-arm brings the new root live and starts its COLD read; its
+  // confirming completion STAGES the edge, and the fence behind it releases the
+  // barrier.
   m.ack_watch(reserved, Ok(WatchAck::Installed));
   let req = read_of(&mut m, reserved);
   m.on_enumerate(
@@ -12025,6 +12041,11 @@ fn widen_root_depth_one_splices_without_touching_the_old_subtree() {
       DirEntry::new(seg("b"), FileKind::Dir).with_node(ident(1)),
     ]),
   );
+  assert!(
+    !m.coverage_settled(s),
+    "the confirming listing alone does not release it"
+  );
+  seal_adoptions(&mut m, s);
   assert!(
     m.coverage_settled(s),
     "positive verification releases the barrier"
@@ -12122,13 +12143,27 @@ fn a_widen_keeps_an_in_flight_read_valid_across_an_unrelated_scopes_rename() {
   m.assert_invariants();
 }
 
+/// The DEPTH CAP. A chain longer than one segment would splice intermediate
+/// connectors as unidentified cold nodes — edges no marker names, no read
+/// re-proves, and no `MoveSelf` of the already-watched old root invalidates, since
+/// moving an ANCESTOR of that root emits none. The lone tail marker would confirm
+/// over ground nothing inspected, so the splice is not offered at that shape.
+///
+/// Refused with the whole monitor bit-identical, like its siblings, so the
+/// driver's fallback replace starts from an untouched world — and asserted as
+/// BIT-identity rather than as a handful of fields, because the claim is that
+/// nothing at all happened, not that four counters agree.
 #[test]
-fn widen_root_deep_chain_arms_top_down_and_adopts_at_the_tail() {
+fn widen_refuses_a_chain_longer_than_one_segment() {
   let mut m = per_dir();
   let s = scope(1);
-  let (old_root, _kid) = widen_base(&mut m, s);
+  let (old_root, kid) = widen_base(&mut m, s);
 
+  // Reserve FIRST: minting an id is the caller's act, not the splice's, and the
+  // snapshot must not carry it.
   let reserved = m.reserve_watch_id();
+  let before = std::format!("{m:?}");
+
   assert_eq!(
     m.widen_root(
       s,
@@ -12137,36 +12172,51 @@ fn widen_root_deep_chain_arms_top_down_and_adopts_at_the_tail() {
       Some(ident(1))
     )
     .map(|(id, _)| id),
-    Some(reserved)
+    None,
+    "a three-segment chain is refused"
+  );
+  assert_eq!(
+    m.widen_root(s, reserved, vec![seg("b"), seg("c")], Some(ident(1)))
+      .map(|(id, _)| id),
+    None,
+    "and so is the shortest chain past the cap"
+  );
+  assert_eq!(
+    std::format!("{m:?}"),
+    before,
+    "the refusal is decided before the first mutation, so the monitor is \
+     bit-identical"
+  );
+  assert!(drain_actions(&mut m).is_empty(), "nothing was queued");
+  assert!(drain_events(&mut m).is_empty(), "and nothing was announced");
+  assert!(
+    m.coverage_settled(s),
+    "the barrier was never taken down either"
   );
   m.assert_invariants();
 
-  // Exactly the two connector arms, top-down: (reserved, "b") then (b, "c").
-  let actions = drain_actions(&mut m);
-  let watches: Vec<_> = actions.iter().filter_map(|a| a.as_watch()).collect();
-  assert_eq!(watches.len(), 2, "{actions:?}");
-  let b = watches[0].id();
-  assert!(
-    watches[0]
-      .target()
-      .as_child()
-      .is_some_and(|ch| ch.parent() == reserved && ch.name().as_str() == "b")
+  // And NO WEDGE: the reservation is still spendable at the depth the splice does
+  // serve, on the very scope that was just refused.
+  assert_eq!(
+    m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)))
+      .map(|(id, _)| id),
+    Some(reserved),
+    "the refused scope still widens at depth one"
   );
-  assert!(
-    watches[1]
-      .target()
-      .as_child()
-      .is_some_and(|ch| ch.parent() == b && ch.name().as_str() == "c")
+  m.ack_watch(reserved, Ok(WatchAck::Installed));
+  let req = read_of(&mut m, reserved);
+  m.on_enumerate(
+    req,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("b"), FileKind::Dir).with_node(ident(1)),
+    ]),
   );
-  assert!(drain_events(&mut m).is_empty());
-
-  // The adopted edge sits at the tail: deliveries reconstruct the full chain.
-  m.on_os_record(
-    OsRecord::new(old_root, RecordKind::Created).with_name(seg("f")),
-    at(2),
-  );
-  let events = drain_events(&mut m);
-  assert_eq!(events[0].location(), &loc(&["b", "c", "d", "f"]));
+  seal_adoptions(&mut m, s);
+  assert!(m.adoptions_settled(s), "and proves its adopted edge");
+  assert_eq!(m.child_watch(reserved, &seg("b")), Some(old_root));
+  assert!(m.is_watched(old_root) && m.is_watched(kid));
+  quiesce(&mut m);
+  assert!(m.coverage_settled(s), "and settles");
   m.assert_invariants();
 }
 
@@ -12259,9 +12309,10 @@ fn adoption_identity_mismatch_escalates_the_scope_root() {
 }
 
 /// The stale-edge escalation under a root whose pre-arm outcome has NOT been
-/// replayed. A widen's spliced root sits in `Arming` until it is, and a chain
-/// deeper than one segment puts the marker on a CONNECTOR whose own arm and read
-/// do not wait for it — so the tail can resolve the edge first. This read is what
+/// replayed. A widen's spliced root sits in `Arming` until it is, and a widen OVER
+/// a widen puts a marker on the node the second splice demoted, whose own arm and
+/// read do not wait for the new root's — so the tail can resolve the edge first.
+/// This read is what
 /// RELEASED the adoption conjunct that had been holding the barrier down, and a
 /// re-arm the root's state refuses leaves that release resting on nothing while
 /// the stale edge still stands.
@@ -12270,22 +12321,17 @@ fn a_stale_adoption_edge_counts_its_escalation_under_an_arming_root() {
   let mut m = per_dir();
   let s = scope(1);
   let (_old_root, _kid) = widen_base(&mut m, s);
-  let reserved = m.reserve_watch_id();
+  let mid = m.reserve_watch_id();
   assert!(
-    m.widen_root(s, reserved, vec![seg("mid"), seg("b")], Some(ident(1)))
+    m.widen_root(s, mid, vec![seg("b")], Some(ident(1)))
       .is_some()
   );
-  // Only the CONNECTOR is armed and read; `reserved` stays pending.
-  let mid = drain_actions(&mut m)
-    .iter()
-    .filter_map(|a| a.as_watch())
-    .find(|c| {
-      c.target()
-        .as_child()
-        .is_some_and(|ch| ch.parent() == reserved && ch.name().as_str() == "mid")
-    })
-    .map(|c| c.id())
-    .expect("the connecting chain arms");
+  let reserved = m.reserve_watch_id();
+  assert!(
+    m.widen_root(s, reserved, vec![seg("mid")], Some(ident(2)))
+      .is_some()
+  );
+  // Only the DEMOTED root is armed and read; `reserved` stays pending.
   m.ack_watch(mid, Ok(WatchAck::Installed));
   let req = read_of(&mut m, mid);
   let _ = drain_events(&mut m);
@@ -12525,6 +12571,542 @@ fn widen_refuses_kr_unknown_and_empty_chains() {
   assert_ne!(reserved, other, "reservations are never reused");
 }
 
+/// The fifth refusal: an adoption the caller cannot NAME. A root's identity has
+/// exactly one source — this parameter — so an absent one is absent for the
+/// adopted node's whole life, and the tail's re-proof would confirm the dark
+/// window on ignorance. Refused with the tree bit-identical, like its four
+/// siblings, so the driver's fallback replace starts from an untouched world.
+#[test]
+fn widen_refuses_an_adoption_it_cannot_name() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, kid) = widen_base(&mut m, s);
+
+  let before_root = m.roots.get(&s).copied();
+  let before_nodes = m.nodes.len();
+  let before_edges = m.child_index.len();
+  let before_markers = m.pending_adoptions.len();
+  let before_adopting = m.adopting_by_scope.get(&s).copied();
+
+  let reserved = m.reserve_watch_id();
+  assert_eq!(
+    m.widen_root(s, reserved, vec![seg("b")], None)
+      .map(|(id, _)| id),
+    None
+  );
+
+  assert_eq!(
+    m.roots.get(&s).copied(),
+    before_root,
+    "the root never moved"
+  );
+  assert_eq!(m.nodes.len(), before_nodes, "no node was minted");
+  assert_eq!(m.child_index.len(), before_edges, "no edge was spliced");
+  assert_eq!(
+    m.pending_adoptions.len(),
+    before_markers,
+    "no marker stands over a splice that did not happen"
+  );
+  assert_eq!(m.adopting_by_scope.get(&s).copied(), before_adopting);
+  assert!(m.is_watched(old_root) && m.is_watched(kid));
+  assert!(
+    m.coverage_settled(s),
+    "and the barrier was never taken down"
+  );
+  assert!(drain_actions(&mut m).is_empty());
+  assert!(drain_events(&mut m).is_empty());
+  m.assert_invariants();
+}
+
+/// The re-proof is STRICT: a listing that names the right slot with the right
+/// kind but no object at all proves nothing, so it escalates rather than
+/// certifying the commit→arm window. Same polarity `rearm_enumerate` re-proves
+/// its survivors under — an identity-less backend confirms no adopted edge.
+#[test]
+fn an_identityless_listing_cannot_confirm_the_adopted_edge() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (_old_root, _kid) = widen_base(&mut m, s);
+  let reserved = m.reserve_watch_id();
+  let _ = m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)));
+  m.ack_watch(reserved, Ok(WatchAck::Installed));
+  let req = read_of(&mut m, reserved);
+
+  m.on_enumerate(
+    req,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("b"), FileKind::Dir)]),
+  );
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &Location::new()),
+    "an unprovable edge escalates at the scope root: {events:?}"
+  );
+  assert!(
+    !m.coverage_settled(s),
+    "and the released marker leaves a counted re-arm holding the barrier"
+  );
+  m.assert_invariants();
+}
+
+/// The full dark-window swap, end to end: inside the commit→arm gap the adopted
+/// directory is renamed away and a new one takes its name, and the cold read
+/// that discovers it cannot name what it found. A confirming re-proof would
+/// have left the old subtree's changes delivered at the new object's path
+/// forever, invisibly, with the barrier reading settled — and no later
+/// reconcile of that slot would have repaired it, since an unknown identity
+/// never forces a replace and each of them REUSES whatever incumbent it finds.
+/// The escalation repairs it by emptying the slot: the very listing that failed
+/// to prove the edge then installs its occupant fresh, and the counted crawl
+/// re-diffs that install once an identity is finally available.
+#[test]
+fn a_dark_window_swap_installs_the_new_object_instead_of_re_addressing_the_old() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, kid) = widen_base(&mut m, s);
+  let reserved = m.reserve_watch_id();
+  let _ = m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)));
+  m.ack_watch(reserved, Ok(WatchAck::Installed));
+
+  let req = read_of(&mut m, reserved);
+  m.on_enumerate(
+    req,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("b"), FileKind::Dir)]),
+  );
+  assert!(
+    !m.is_watched(old_root) && !m.is_watched(kid),
+    "the escalation retires the unproven edge itself — a reconcile handed one \
+     would have reused it"
+  );
+  let installed = m
+    .child_watch(reserved, &seg("b"))
+    .expect("and the same listing fills the emptied slot");
+  assert_ne!(installed, old_root, "with a NEW watch, not the adopted one");
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &Location::new()),
+    "{events:?}"
+  );
+  assert!(!m.coverage_settled(s));
+
+  // The counted re-arm's own read finally names the occupant: a different
+  // object, so the stale edge is rebuilt.
+  let crawl = read_of(&mut m, reserved);
+  m.on_enumerate(
+    crawl,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("b"), FileKind::Dir).with_node(ident(2)),
+    ]),
+  );
+  assert!(
+    !m.is_watched(old_root) && !m.is_watched(kid),
+    "the renamed-away subtree stops being addressed as `b`"
+  );
+  let fresh = m
+    .child_watch(reserved, &seg("b"))
+    .expect("the new object occupies the slot");
+  assert_ne!(fresh, old_root, "and it is a NEW watch, not the reused one");
+  assert_ne!(
+    fresh, installed,
+    "the identity-less install is itself re-diffed, never confirmed on ignorance"
+  );
+  assert_eq!(m.node_identity(fresh), Some(ident(2)));
+  m.assert_invariants();
+}
+
+/// Widens `s` and answers the tail's first COMPLETE read with an adopted name
+/// the listing cannot CLASSIFY. That is the one entry kind no later
+/// reconciliation of the slot decides strictly — the crawl refuses to diff it
+/// and the stat it defers to answers permissively — so it is the shape in which
+/// a retained stale edge would survive its own escalation. Returns the adopted
+/// subtree's two watches and the new root.
+fn unclassifiable_adopted_name(m: &mut Monitor, s: ScopeId) -> (WatchId, WatchId, WatchId) {
+  let (old_root, kid) = widen_base(m, s);
+  let reserved = m.reserve_watch_id();
+  let _ = m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)));
+  m.ack_watch(reserved, Ok(WatchAck::Installed));
+  let req = read_of(m, reserved);
+  m.on_enumerate(
+    req,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("b"), FileKind::Unknown)]),
+  );
+  (old_root, kid, reserved)
+}
+
+/// The escalation must retire the unproven edge ITSELF, because the stat that
+/// settles an unclassifiable slot answers through the ORDINARY reconcile, where
+/// a `Dir` carrying no identity is no positive difference: handed an incumbent,
+/// it would KEEP the very edge the re-proof just refused, and the widen's dark
+/// window would end certified by a reuse. Emptied first, the same answer
+/// installs.
+#[test]
+fn an_unprovable_adopted_edge_is_gone_before_an_identityless_dir_stat_lands() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, kid, reserved) = unclassifiable_adopted_name(&mut m, s);
+  assert!(
+    !m.is_watched(old_root) && !m.is_watched(kid),
+    "the refused edge is retired at the escalation"
+  );
+  assert!(
+    m.child_watch(reserved, &seg("b")).is_none(),
+    "leaving the slot empty for whatever the stat finds"
+  );
+
+  let stat = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_stat()
+        .filter(|c| c.of() == &StatTarget::child(reserved, seg("b")))
+        .map(|c| c.req())
+    })
+    .expect("the unclassifiable slot is asked about");
+  m.on_stat_result(stat, StatResult::Ok(StatEntry::new(FileKind::Dir)));
+
+  let fresh = m
+    .child_watch(reserved, &seg("b"))
+    .expect("and the answer installs into the empty slot");
+  assert_ne!(fresh, old_root, "a FRESH watch, never the adopted one");
+  assert!(!m.is_watched(old_root), "which stays retired");
+  assert!(!m.has_coverage_deficit(s), "and the slot's darkness heals");
+  m.assert_invariants();
+}
+
+/// The same edge with the stat FAILING: nothing settles the slot, so nothing
+/// would ever have displaced a retained incumbent — the degrade re-books the
+/// darkness behind a located `Rescan` and never re-asks. That degrade is honest
+/// only because the unproven edge is already gone; with it standing, the slot
+/// would read as covered by a watch the proof refused.
+#[test]
+fn a_failing_stat_cannot_leave_the_refused_adoption_standing() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, kid, reserved) = unclassifiable_adopted_name(&mut m, s);
+
+  let stat = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_stat()
+        .filter(|c| c.of() == &StatTarget::child(reserved, seg("b")))
+        .map(|c| c.req())
+    })
+    .expect("the unclassifiable slot is asked about");
+  m.on_stat_result(stat, StatResult::Failed(IoClass::Permission));
+
+  assert!(!m.is_watched(old_root) && !m.is_watched(kid));
+  assert!(
+    m.child_watch(reserved, &seg("b")).is_none(),
+    "an unresolvable answer occupies nothing"
+  );
+  assert!(
+    m.has_coverage_deficit(s),
+    "the darkness stands, re-signalled"
+  );
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&["b"])),
+    "behind its own located Rescan: {events:?}"
+  );
+  m.assert_invariants();
+}
+
+/// And with the stat NEVER answered — the case the uncounted booking is written
+/// for (an outstanding stat is deliberately no conjunct of `coverage_settled`,
+/// so a silent driver degrades a verdict instead of wedging the scope). The
+/// escalation's own crawl still cannot classify the name, and the scope settles
+/// with the slot booked dark and the adopted subtree gone. A retained edge would
+/// have settled here too — but silently, and under a slot no deficit even
+/// covers, since a slot an incumbent occupies books none.
+#[test]
+fn an_unanswered_stat_leaves_darkness_rather_than_a_stale_adopted_edge() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, kid, reserved) = unclassifiable_adopted_name(&mut m, s);
+
+  let crawl = read_of(&mut m, reserved);
+  m.on_enumerate(
+    crawl,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("b"), FileKind::Unknown)]),
+  );
+
+  assert!(!m.is_watched(old_root) && !m.is_watched(kid));
+  assert!(m.child_watch(reserved, &seg("b")).is_none());
+  assert!(m.has_coverage_deficit(s), "the slot is booked dark");
+  assert!(
+    m.coverage_settled(s),
+    "and the barrier resolves degraded rather than wedging on the silence"
+  );
+  m.assert_invariants();
+}
+
+/// The same unclassifiable adopted name reached through a RE-ARM-flavored
+/// complete read. An incomplete first cold read proves nothing, so it keeps the
+/// marker and queues a bounded retry — and that retry is `Rearm`-flavored, which
+/// is the ONLY flavor a complete first read of a widen tail can arrive in. The
+/// verdict is owed on it exactly as on a cold one: the crawl it runs is coverage
+/// machinery, and against a name it cannot classify that machinery decides
+/// nothing at all. Returns the adopted subtree's two watches and the new root.
+fn unclassifiable_adopted_name_on_a_retry(
+  m: &mut Monitor,
+  s: ScopeId,
+) -> (WatchId, WatchId, WatchId) {
+  let (old_root, kid) = widen_base(m, s);
+  let reserved = m.reserve_watch_id();
+  let _ = m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)));
+  m.ack_watch(reserved, Ok(WatchAck::Installed));
+  let first = read_of(m, reserved);
+  m.on_enumerate(first, EnumerateResult::Partial(Vec::new()));
+  let retry = read_of(m, reserved);
+  m.on_enumerate(
+    retry,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("b"), FileKind::Unknown)]),
+  );
+  (old_root, kid, reserved)
+}
+
+/// The re-arm-flavored retry owes the verdict itself. Handing the edge to its
+/// crawl instead loses it twice over: the crawl refuses to diff an
+/// unclassifiable name, and the stat it defers to answers through the ordinary
+/// reconcile, where a `Dir` with no identity is no positive difference and so
+/// KEEPS the incumbent. With the marker already spent on the retry, that
+/// retained edge would then be certified by a barrier reading settled.
+#[test]
+fn a_retrys_unprovable_adopted_edge_is_gone_before_an_identityless_dir_stat_lands() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, kid, reserved) = unclassifiable_adopted_name_on_a_retry(&mut m, s);
+  assert!(
+    !m.is_watched(old_root) && !m.is_watched(kid),
+    "a re-arm-flavored complete read retires the refused edge like a cold one"
+  );
+  assert!(
+    m.child_watch(reserved, &seg("b")).is_none(),
+    "leaving the slot empty for whatever the stat finds"
+  );
+  assert!(
+    !m.coverage_settled(s),
+    "and the released marker leaves a counted re-arm holding the barrier"
+  );
+
+  // One drain: the escalation's counted re-arm and the slot's stat are both
+  // outstanding, and the settle assertion below needs the read the stat would
+  // otherwise wash away.
+  let actions = drain_actions(&mut m);
+  let stat = actions
+    .iter()
+    .find_map(|a| {
+      a.as_stat()
+        .filter(|c| c.of() == &StatTarget::child(reserved, seg("b")))
+        .map(|c| c.req())
+    })
+    .expect("the unclassifiable slot is asked about");
+  let crawl = actions
+    .iter()
+    .find_map(|a| {
+      a.as_enumerate()
+        .filter(|e| e.dir() == reserved)
+        .map(|e| e.req())
+    })
+    .expect("the escalation re-reads the scope root");
+
+  m.on_stat_result(stat, StatResult::Ok(StatEntry::new(FileKind::Dir)));
+  let fresh = m
+    .child_watch(reserved, &seg("b"))
+    .expect("and the answer installs into the empty slot");
+  assert_ne!(fresh, old_root, "a FRESH watch, never the adopted one");
+  assert!(!m.is_watched(old_root), "which stays retired");
+  assert!(
+    !m.coverage_settled(s),
+    "an uncounted stat releases no barrier; the escalation still owes its read"
+  );
+  assert_eq!(arm_named_child(&mut m, reserved, "b"), fresh);
+
+  // The escalation's read finally names the occupant. The identity-less install
+  // the stat made is itself re-diffed rather than confirmed on ignorance, and
+  // only once THAT rebuild arms does the barrier come back.
+  m.on_enumerate(
+    crawl,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("b"), FileKind::Dir).with_node(ident(2)),
+    ]),
+  );
+  let rebuilt = arm_named_child(&mut m, reserved, "b");
+  assert_ne!(rebuilt, fresh);
+  assert_ne!(rebuilt, old_root);
+  assert!(!m.is_watched(old_root));
+  assert_eq!(m.node_identity(rebuilt), Some(ident(2)));
+  assert!(m.coverage_settled(s), "the escalation resolved");
+  m.assert_invariants();
+}
+
+/// The same retry with the stat FAILING: nothing settles the slot, so nothing
+/// would ever displace a retained incumbent. The degrade re-books the darkness
+/// behind a located `Rescan` and never re-asks — honest only because the
+/// unproven edge is already gone.
+#[test]
+fn a_failing_stat_cannot_leave_a_retrys_refused_adoption_standing() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, kid, reserved) = unclassifiable_adopted_name_on_a_retry(&mut m, s);
+
+  let stat = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_stat()
+        .filter(|c| c.of() == &StatTarget::child(reserved, seg("b")))
+        .map(|c| c.req())
+    })
+    .expect("the unclassifiable slot is asked about");
+  m.on_stat_result(stat, StatResult::Failed(IoClass::Permission));
+
+  assert!(!m.is_watched(old_root) && !m.is_watched(kid));
+  assert!(
+    m.child_watch(reserved, &seg("b")).is_none(),
+    "an unresolvable answer occupies nothing"
+  );
+  assert!(
+    m.has_coverage_deficit(s),
+    "the darkness stands, re-signalled"
+  );
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&["b"])),
+    "behind its own located Rescan: {events:?}"
+  );
+  m.assert_invariants();
+}
+
+/// And the retry with the stat NEVER answered — the silent driver the uncounted
+/// booking is written for. The escalation's own crawl still cannot classify the
+/// name, so the scope settles with the slot booked dark and the adopted subtree
+/// gone. A retained edge would have settled here too, silently, and under a slot
+/// no deficit even covers: a slot an incumbent occupies books none.
+#[test]
+fn an_unanswered_stat_after_a_retry_leaves_darkness_rather_than_a_stale_edge() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, kid, reserved) = unclassifiable_adopted_name_on_a_retry(&mut m, s);
+  assert!(
+    !m.is_watched(old_root) && !m.is_watched(kid),
+    "the retry retires the refused edge before anything can defer it"
+  );
+
+  let crawl = read_of(&mut m, reserved);
+  m.on_enumerate(
+    crawl,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("b"), FileKind::Unknown)]),
+  );
+
+  assert!(!m.is_watched(old_root) && !m.is_watched(kid));
+  assert!(m.child_watch(reserved, &seg("b")).is_none());
+  assert!(m.has_coverage_deficit(s), "the slot is booked dark");
+  assert!(
+    m.coverage_settled(s),
+    "and the barrier resolves degraded rather than wedging on the silence"
+  );
+  m.assert_invariants();
+}
+
+/// A DIRTIED first cold read is the other way a widen tail's first COMPLETE read
+/// arrives re-arm-flavored: a slot-changing record raced the read, so its listing
+/// is a possibly-stale snapshot that may not be trusted — including about the
+/// adopted name. The marker rides the retry, and the retry owes the verdict.
+#[test]
+fn a_dirtied_first_cold_read_still_owes_the_adoption_verdict_on_its_retry() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, kid) = widen_base(&mut m, s);
+  let reserved = m.reserve_watch_id();
+  let _ = m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)));
+  m.ack_watch(reserved, Ok(WatchAck::Installed));
+  let first = read_of(&mut m, reserved);
+
+  // A record for an unrelated slot races the cold read: the snapshot is stale,
+  // never incomplete — so the whole listing (the adopted name included) is
+  // re-read rather than trusted, exactly as an unfinished one would be.
+  m.on_os_record(
+    OsRecord::new(reserved, RecordKind::Removed)
+      .with_name(seg("x"))
+      .with_is_dir(true),
+    at(3),
+  );
+  m.on_enumerate(
+    first,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("b"), FileKind::Dir).with_node(ident(1)),
+    ]),
+  );
+  assert!(
+    m.is_watched(old_root),
+    "a dirtied read decides nothing either way"
+  );
+
+  let retry = read_of(&mut m, reserved);
+  m.on_enumerate(
+    retry,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("b"), FileKind::Unknown)]),
+  );
+  assert!(
+    !m.is_watched(old_root) && !m.is_watched(kid),
+    "the retry's unprovable edge is retired, not handed to its own crawl"
+  );
+  assert!(m.child_watch(reserved, &seg("b")).is_none());
+  assert!(!m.coverage_settled(s));
+  m.assert_invariants();
+}
+
+/// The strict path did not become unconditionally destructive: a retry whose
+/// listing POSITIVELY matches the adopted identity confirms the edge silently,
+/// keeping the subtree and its interior. This is what the drop above is measured
+/// against — a re-proof that retires a proven edge would cost the widen the O(1)
+/// splice it exists for.
+#[test]
+fn a_retry_that_matches_the_adopted_identity_still_confirms_silently() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, kid) = widen_base(&mut m, s);
+  let reserved = m.reserve_watch_id();
+  let _ = m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)));
+  m.ack_watch(reserved, Ok(WatchAck::Installed));
+  let first = read_of(&mut m, reserved);
+  m.on_enumerate(first, EnumerateResult::Partial(Vec::new()));
+  let _ = drain_events(&mut m);
+
+  let retry = read_of(&mut m, reserved);
+  m.on_enumerate(
+    retry,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("b"), FileKind::Dir).with_node(ident(1)),
+    ]),
+  );
+  assert_eq!(
+    m.child_watch(reserved, &seg("b")),
+    Some(old_root),
+    "the proven edge keeps its watch — no rebuild"
+  );
+  assert!(m.is_watched(kid), "and its interior is untouched");
+  seal_adoptions(&mut m, s);
+  let events = drain_events(&mut m);
+  assert!(
+    !events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &Location::new()),
+    "a confirmed edge escalates nothing: {events:?}"
+  );
+  assert!(
+    m.adoptions_settled(s),
+    "the conjunct is released by the proof, not by a cover"
+  );
+  m.assert_invariants();
+}
+
 #[test]
 fn rebind_after_a_depth_one_widen_purges_the_marker() {
   let mut m = per_dir();
@@ -12709,6 +13291,7 @@ fn an_unverified_adoption_holds_the_barrier_through_retries() {
     ]),
   );
   assert!(m.is_watched(old_root), "the confirmed survivor is kept");
+  seal_adoptions(&mut m, s);
   assert!(
     !m.coverage_settled(s),
     "the survivor's cascaded re-arm is still counted"
@@ -12752,14 +13335,24 @@ fn a_mismatch_releases_the_barrier_only_with_its_escalation_standing() {
   m.assert_invariants();
 }
 
+/// The connector role, at the one depth the splice serves: a widen OVER a widen
+/// leaves the previous root as an intermediate node between the current root and
+/// the adopted tree — carrying its own unresolved marker — and it is that node the
+/// dark window replaces.
 #[test]
 fn a_connector_reconciled_away_stands_the_closing_rescan() {
   let mut m = per_dir();
   let s = scope(1);
   let (old_root, kid) = widen_base(&mut m, s);
+  let mid = m.reserve_watch_id();
+  assert_eq!(
+    m.widen_root(s, mid, vec![seg("b")], Some(ident(1)))
+      .map(|(id, _)| id),
+    Some(mid)
+  );
   let reserved = m.reserve_watch_id();
   assert_eq!(
-    m.widen_root(s, reserved, vec![seg("a"), seg("b")], Some(ident(1)))
+    m.widen_root(s, reserved, vec![seg("a")], Some(ident(2)))
       .map(|(id, _)| id),
     Some(reserved)
   );
@@ -12769,7 +13362,7 @@ fn a_connector_reconciled_away_stands_the_closing_rescan() {
 
   // The dark window replaced the connector with a FILE: the widened root's
   // cold listing reconciles the slot, which tears down the connector, the
-  // adopted old tree, and the pending marker in one drop — an erased
+  // adopted old tree, and BOTH pending markers in one drop — an erased
   // UNVERIFIED adoption, discharged like an erased deficit: the settle
   // flush's closing root Rescan stands, loudly, where silence would have
   // disarmed every old watch with no signal at all.
@@ -12777,7 +13370,7 @@ fn a_connector_reconciled_away_stands_the_closing_rescan() {
     req,
     EnumerateResult::Ok(vec![DirEntry::new(seg("a"), FileKind::File)]),
   );
-  assert!(!m.is_watched(old_root) && !m.is_watched(kid));
+  assert!(!m.is_watched(mid) && !m.is_watched(old_root) && !m.is_watched(kid));
   let events = drain_events(&mut m);
   assert!(
     events
@@ -12786,8 +13379,25 @@ fn a_connector_reconciled_away_stands_the_closing_rescan() {
     "the erased adoption owes the closing root Rescan: {events:?}"
   );
   assert!(
+    m.adoptions_settled(s),
+    "and both markers are released, not left resting on the erasure"
+  );
+
+  // Two obligations came out of the one listing, and neither is silent: the OUTER
+  // edge was refuted, so its verdict stood a COUNTED cover over the ground it
+  // retired, and the inner marker was erased by the same walk, which owes the
+  // closing `Rescan` asserted above. The barrier releases when the counted cover's
+  // own re-arm completes — never before it.
+  assert!(
+    !m.rearm_settled(s),
+    "the refuted outer edge's cover is counted, so the barrier is held down"
+  );
+  quiesce(&mut m);
+  assert!(
     m.coverage_settled(s),
-    "with the signal standing, the barrier honestly settles"
+    "with the signal standing and the cover's re-arm answered, the barrier \
+     honestly settles: rearm_settled={}",
+    m.rearm_settled(s)
   );
   m.assert_invariants();
 }
@@ -12830,17 +13440,24 @@ fn an_exhausted_tail_read_hands_the_marker_to_the_deficit() {
   );
   // The incomplete completions cascaded COUNTED re-arms into the adopted
   // subtree — bounded, completable work (the adopted dirs are readable);
-  // drain it. The marker itself is gone: nothing un-completable remains.
+  // drain it. The tail keeps answering Partial here exactly as it does above:
+  // it is the PERMANENTLY unreadable directory this cell is about, and a read
+  // of it that completed clean would heal the very interior asserted below.
+  // The marker itself is gone: nothing un-completable remains.
   for _ in 0..8 {
-    let reads: Vec<ReqId> = drain_actions(&mut m)
+    let reads: Vec<(ReqId, WatchId)> = drain_actions(&mut m)
       .iter()
-      .filter_map(|a| a.as_enumerate().map(|e| e.req()))
+      .filter_map(|a| a.as_enumerate().map(|e| (e.req(), e.dir())))
       .collect();
     if reads.is_empty() {
       break;
     }
-    for req in reads {
-      m.on_enumerate(req, EnumerateResult::Ok(Vec::new()));
+    for (req, dir) in reads {
+      if dir == reserved {
+        m.on_enumerate(req, EnumerateResult::Partial(Vec::new()));
+      } else {
+        m.on_enumerate(req, EnumerateResult::Ok(Vec::new()));
+      }
     }
   }
   let _ = drain_events(&mut m);
@@ -12853,6 +13470,2243 @@ fn an_exhausted_tail_read_hands_the_marker_to_the_deficit() {
   assert!(
     m.has_coverage_deficit(s),
     "the darkness is booked for the dispatch re-signal"
+  );
+  m.assert_invariants();
+}
+
+/// Widens `s` TWICE, each splice at the one depth
+/// [`Monitor::widen_root`] serves, so the marker that is left standing keys on a
+/// node that is NO LONGER the root — the shape whose tail can be held (a root is
+/// nobody's child and so is never a move source).
+///
+/// Back-to-back widens are the only producer of that shape now that the splice
+/// is capped at one segment, and they produce it exactly: the first splice makes
+/// `mid` the root and marks the `mid/b → old_root` edge; the second splices
+/// `reserved` above `mid`, which re-keys `mid` as an ordinary child and marks the
+/// `reserved/mid → mid` edge; that OUTER marker is then discharged by the new
+/// root's own cold listing, which names `mid` with the identity the splice
+/// adopted it under. What survives is one standing marker owned by `mid`, a
+/// non-root node — the same object the deep-chain connector used to be, reached
+/// the only way that remains.
+///
+/// Arms both new nodes and settles the new root's own cold read, leaving the
+/// tail's read as the only outstanding one. Returns `(old_root, kid, new_root, tail)`.
+fn widen_with_a_chain_tail(m: &mut Monitor, s: ScopeId) -> (WatchId, WatchId, WatchId, WatchId) {
+  let (old_root, kid) = widen_base(m, s);
+  // Widen one: `mid` becomes the root and owes the proof of `mid/b → old_root`.
+  let mid = m.reserve_watch_id();
+  let _ = m
+    .widen_root(s, mid, vec![seg("b")], Some(ident(1)))
+    .expect("a depth-one widen splices");
+  // Widen two, BEFORE `mid` is acknowledged: nothing of the old world is armed
+  // or read by the splice, so `mid`'s own arm outcome is still the caller's to
+  // replay and its cold read is still unqueued — which is what lets the drain
+  // below capture the NEW root's read alone.
+  let reserved = m.reserve_watch_id();
+  let _ = m
+    .widen_root(s, reserved, vec![seg("mid")], Some(ident(2)))
+    .expect("a widen over a widen splices");
+  m.ack_watch(reserved, Ok(WatchAck::Installed));
+  let root_read = drain_actions(m)
+    .iter()
+    .find_map(|a| {
+      a.as_enumerate()
+        .filter(|e| e.dir() == reserved)
+        .map(|e| e.req())
+    })
+    .expect("the new root's cold read was queued");
+  m.ack_watch(mid, Ok(WatchAck::Installed));
+  // The OUTER edge is proven positively — `mid`, a directory, at the identity
+  // the second splice adopted it under — so the outer marker stages, its fence
+  // releases it, and only the tail's own stands.
+  m.on_enumerate(
+    root_read,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("mid"), FileKind::Dir).with_node(ident(2)),
+    ]),
+  );
+  seal_adoptions(m, s);
+  let _ = drain_events(m);
+  (old_root, kid, reserved, mid)
+}
+
+/// Answers every outstanding read with a clean empty listing until none is left,
+/// draining the counted work an escalation stood. Bounded, so work that never
+/// quiesces fails here instead of hanging.
+fn drain_reads_clean(m: &mut Monitor) {
+  for _ in 0..8 {
+    let reads: Vec<ReqId> = drain_actions(m)
+      .iter()
+      .filter_map(|a| a.as_enumerate().map(|e| e.req()))
+      .collect();
+    if reads.is_empty() {
+      let _ = drain_events(m);
+      return;
+    }
+    for req in reads {
+      m.on_enumerate(req, EnumerateResult::Ok(Vec::new()));
+    }
+  }
+  panic!("the counted work never quiesced");
+}
+
+/// Retry exhaustion on the HELD path — the path a widen tail's incomplete reads
+/// actually take, since a hold costs a listing its evidence status and routes
+/// every completion, even a complete one, to the incomplete handler.
+///
+/// This is where the site's own covering story is INERT: the located `Rescan` is
+/// suppressed (it would name the vacated pre-move path) and the interior deficit
+/// is skipped with it, so a bare release would leave the unproven edge standing
+/// with only the hold's pairing re-arm to meet it — and that re-arm reconciles
+/// permissively, retaining an incumbent it cannot classify. The release must
+/// therefore retire the adopted subtree itself, under a cover anchored at the
+/// scope ROOT, the one locatable anchor a hold leaves.
+#[test]
+fn an_exhausted_held_tail_retires_the_adopted_edge_under_a_root_cover() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, kid, reserved, mid) = widen_with_a_chain_tail(&mut m, s);
+
+  // The chain tail moves away and is held for the pairing window.
+  m.on_os_record(
+    OsRecord::new(reserved, RecordKind::MovedFrom)
+      .with_name(seg("mid"))
+      .with_cookie(cookie(7))
+      .with_is_dir(true),
+    at(20),
+  );
+  let _ = drain_events(&mut m);
+  assert!(
+    m.held_sources.contains(&mid),
+    "the tail is held, not dropped"
+  );
+
+  // Spend the bounded retries. Each answer is COMPLETE and each proves nothing:
+  // it describes the path the subtree has left.
+  for _ in 0..=REARM_MAX_RETRIES {
+    assert!(
+      !m.adoptions_settled(s),
+      "the edge is unverified while retries remain"
+    );
+    let req = read_of(&mut m, mid);
+    m.on_enumerate(req, EnumerateResult::Ok(Vec::new()));
+  }
+
+  assert!(
+    m.adoptions_settled(s),
+    "the exhausted marker is released — kept, it would hold the barrier down \
+     with no read left to release it"
+  );
+  assert!(
+    !m.is_watched(old_root) && !m.is_watched(kid),
+    "and the adopted subtree is retired with it: no later reconciliation of that \
+     slot decides strictly, so an edge handed on would be RETAINED"
+  );
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &Location::new()),
+    "the retirement stands its cover at the scope root: {events:?}"
+  );
+  assert!(
+    !events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&["mid"])),
+    "never at the vacated pre-move path — the held suppression is intact: {events:?}"
+  );
+  assert!(
+    !m.has_coverage_deficit(s),
+    "and the interior deficit really is skipped here, which is why it could \
+     never have been the cover"
+  );
+
+  // The barrier is covered, not wedged: the hold resolves, the counted work
+  // drains, and the scope settles.
+  assert!(
+    !m.coverage_settled(s),
+    "the cover is COUNTED while it stands"
+  );
+  m.handle_timeout(at(20) + DEFAULT_MOVE_WINDOW);
+  drain_reads_clean(&mut m);
+  assert!(
+    m.coverage_settled(s),
+    "and it releases: rearm_settled={} holds={} adoptions={}",
+    m.rearm_settled(s),
+    m.holds_settled(s),
+    m.adoptions_settled(s),
+  );
+  m.assert_invariants();
+}
+
+/// The same exhaustion on the NON-HELD path. Here the site's located `Rescan`
+/// and interior deficit do both stand — and neither one retires anything, so the
+/// unproven edge would survive them just the same. The retirement and its
+/// counted root cover are owed beside them, not instead of them.
+#[test]
+fn an_exhausted_tail_retires_the_adopted_edge_beside_its_located_rescan() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, kid, _reserved, mid) = widen_with_a_chain_tail(&mut m, s);
+
+  for _ in 0..=REARM_MAX_RETRIES {
+    let req = read_of(&mut m, mid);
+    m.on_enumerate(req, EnumerateResult::Partial(Vec::new()));
+  }
+
+  assert!(m.adoptions_settled(s), "the exhausted marker is released");
+  assert!(
+    !m.is_watched(old_root) && !m.is_watched(kid),
+    "and the unproven edge is retired rather than handed to a permissive rebuild"
+  );
+  assert!(
+    m.child_watch(mid, &seg("b")).is_none(),
+    "leaving an EMPTY slot, which is what makes the later rebuild unambiguous"
+  );
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&["mid"])),
+    "the unreadable interior keeps its own located Rescan: {events:?}"
+  );
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &Location::new()),
+    "and the retirement adds the counted root cover: {events:?}"
+  );
+  assert!(
+    m.has_coverage_deficit(s),
+    "the unreconciled interior is still booked for the dispatch re-signal"
+  );
+
+  drain_reads_clean(&mut m);
+  assert!(
+    m.coverage_settled(s),
+    "the counted cover releases: rearm_settled={}",
+    m.rearm_settled(s)
+  );
+  assert!(!m.is_watched(old_root), "with the edge still retired");
+  m.assert_invariants();
+}
+
+/// The wedge negative, on a tail that NEVER completes: the counted cover the
+/// retirement stands re-reads the very directory whose retries just exhausted,
+/// so it must not be able to renew itself. It cannot — the marker is spent, so
+/// the second exhaustion stands no second cover — and the scope reaches a
+/// settled, honestly-degraded rest: the darkness booked, the adopted subtree
+/// gone, the barrier free.
+#[test]
+fn a_tail_that_never_completes_settles_with_the_adopted_edge_retired() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, kid) = widen_base(&mut m, s);
+  let reserved = m.reserve_watch_id();
+  let _ = m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)));
+  m.ack_watch(reserved, Ok(WatchAck::Installed));
+
+  // Every read of the widened root fails forever; everything else answers clean.
+  let mut rounds = 0;
+  for _ in 0..12 {
+    let reads: Vec<(ReqId, WatchId)> = drain_actions(&mut m)
+      .iter()
+      .filter_map(|a| a.as_enumerate().map(|e| (e.req(), e.dir())))
+      .collect();
+    if reads.is_empty() {
+      break;
+    }
+    rounds += 1;
+    for (req, dir) in reads {
+      if dir == reserved {
+        m.on_enumerate(req, EnumerateResult::Partial(Vec::new()));
+      } else {
+        m.on_enumerate(req, EnumerateResult::Ok(Vec::new()));
+      }
+    }
+  }
+  let _ = drain_events(&mut m);
+  assert!(rounds < 12, "the escalation is one-shot, not self-renewing");
+  assert!(
+    !m.is_watched(old_root) && !m.is_watched(kid),
+    "the edge no read ever confirmed is retired, not left standing"
+  );
+  assert!(m.adoptions_settled(s));
+  assert!(
+    m.coverage_settled(s),
+    "the barrier resolves degraded rather than wedging: rearm_settled={}",
+    m.rearm_settled(s)
+  );
+  assert!(
+    m.has_coverage_deficit(s),
+    "over darkness the dispatch re-signal still owes a cookie"
+  );
+  m.assert_invariants();
+}
+
+/// Vacates the tail's `b` slot WITHOUT relocating the adopted watch: a cookied
+/// `MovedFrom` detaches it and holds its subtree for a pairing that has not
+/// arrived yet.
+///
+/// This is the whole distance a rename may put between the marker's COORDINATE
+/// and its OBJECT under the containment invariant, and it is why the marker
+/// stores a `WatchId`: `detach_child` clears the `(tail, "b")` index entry but
+/// PRESERVES the parent link, so the adopted watch stays a direct child of the
+/// node that owes its proof — reachable by that node's drop walk and by every
+/// disposal — while the slot the marker names stands empty and open to a
+/// replacement.
+fn detach_the_adopted_watch(m: &mut Monitor, tail: WatchId) {
+  m.on_os_record(
+    OsRecord::new(tail, RecordKind::MovedFrom)
+      .with_name(seg("b"))
+      .with_cookie(cookie(7))
+      .with_is_dir(true),
+    at(20),
+  );
+  let _ = drain_events(m);
+}
+
+/// ATTEMPTS the paired rename the containment invariant refuses: the adopted
+/// watch itself, out of the tail's `b` slot and on to `(dest_parent, dest_name)`,
+/// as one complete pairing.
+///
+/// Nothing here is a dark window — both halves are recorded in full — and the
+/// arm's own acyclicity precondition is satisfied. What declines it is
+/// `reparentable_adoption`, asked before the re-key, so what this leaves behind
+/// is the not-reparentable route's disposition rather than a moved subtree.
+///
+/// Returns the pairing's own delivery, because half of what the refusal owes is
+/// stated in it.
+fn move_the_adopted_watch(
+  m: &mut Monitor,
+  tail: WatchId,
+  dest_parent: WatchId,
+  dest_name: &str,
+) -> Vec<Change> {
+  m.on_os_record(
+    OsRecord::new(tail, RecordKind::MovedFrom)
+      .with_name(seg("b"))
+      .with_cookie(cookie(7))
+      .with_is_dir(true),
+    at(20),
+  );
+  m.on_os_record(
+    OsRecord::new(dest_parent, RecordKind::MovedTo)
+      .with_name(seg(dest_name))
+      .with_cookie(cookie(7))
+      .with_is_dir(true),
+    at(20),
+  );
+  drain_events(m)
+}
+
+/// The reviewer's sequence, and the one a marker keyed on a COORDINATE cannot
+/// survive: inside the widen's dark window the adopted directory is renamed
+/// away and another object takes its name, and the monitor learns both only
+/// afterwards, from the tail's own post-arm records. The adopted watch is
+/// detached from `mid/b` and held for its pairing, a replacement grows into the
+/// vacated `mid/b` carrying its own identity, and the tail's first complete read
+/// then lists `b` as exactly that replacement.
+///
+/// Resolved by NAME the proof reads the slot, finds the replacement, matches
+/// the replacement's identity against the replacement's own entry — and
+/// CONFIRMS, silently, while the object the widen actually adopted is alive
+/// under a path nothing ever proved, its descendants reconstructing through an
+/// edge no read ever verified and the barrier free to settle over all of it.
+/// Resolved by IDENTITY the occupancy conjunct fails first: the watch that owes
+/// the proof no longer holds the slot the listing describes, so nothing the
+/// replacement can show discharges it.
+///
+/// A DETACH is what separates the slot from the object here, not a relocation:
+/// the containment invariant keeps the adopted watch parented at the tail (an
+/// unproven adopted edge is immovable), and this is exactly the gap it still
+/// leaves open — the index entry is free, the parent link is not. The
+/// retirement is therefore subtree-local, which is why the tail is still there
+/// to reconcile its own listing afterwards.
+#[test]
+fn a_replacement_in_the_adopted_slot_cannot_pay_the_original_watchs_proof() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, kid, _reserved, mid) = widen_with_a_chain_tail(&mut m, s);
+  // Captured before the records: the tail's first read is the proof, and
+  // draining actions later would wash it away.
+  let tail_read = read_of(&mut m, mid);
+
+  detach_the_adopted_watch(&mut m, mid);
+  m.on_os_record(
+    OsRecord::new(mid, RecordKind::Created)
+      .with_name(seg("b"))
+      .with_is_dir(true)
+      .with_node(ident(2)),
+    at(21),
+  );
+  let replacement = arm_named_child(&mut m, mid, "b");
+  let _ = drain_events(&mut m);
+  assert!(
+    m.is_watched(old_root),
+    "the adopted watch survives the window, held for its pairing"
+  );
+  assert_eq!(
+    m.child_watch(mid, &seg("b")),
+    Some(replacement),
+    "while a different object holds the adopted slot"
+  );
+  assert_ne!(replacement, old_root);
+
+  // Those records raced the tail's first read, so it is DIRTY: a possibly-stale
+  // snapshot decides nothing either way, and the marker rides the bounded retry
+  // (the flavor a widen tail's first COMPLETE read arrives in once anything at
+  // all has happened at its slot). That retry is the proof.
+  m.on_enumerate(tail_read, EnumerateResult::Ok(Vec::new()));
+  assert!(m.is_watched(old_root), "a dirtied read decides nothing");
+  let reads: Vec<(ReqId, WatchId)> = drain_actions(&mut m)
+    .iter()
+    .filter_map(|a| a.as_enumerate().map(|e| (e.req(), e.dir())))
+    .collect();
+  let proof = reads
+    .iter()
+    .find(|(_, dir)| *dir == mid)
+    .map(|(req, _)| *req)
+    .expect("the dirtied read queues the bounded retry");
+
+  // The completion of the adoption read. The listing is the true one: the
+  // replacement really is what stands at the adopted name. It describes that
+  // replacement perfectly and proves nothing whatever about the object the widen
+  // adopted — and, crucially, it gives the re-arm crawl no reason to prune that
+  // object either, so nothing downstream will do this proof's work for it.
+  m.on_enumerate(
+    proof,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("b"), FileKind::Dir).with_node(ident(2)),
+    ]),
+  );
+  assert!(
+    !m.is_watched(old_root) && !m.is_watched(kid),
+    "the unproven edge is retired — a replacement's identity is not its proof"
+  );
+  assert!(
+    m.is_watched(replacement),
+    "and the replacement keeps the coverage it was properly discovered with: \
+     retiring the OCCUPANT would be the same failure inverted"
+  );
+  assert!(
+    m.is_watched(mid),
+    "the retirement is subtree-local: the reading tail is still there"
+  );
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &Location::new()),
+    "under the escalation's counted root cover: {events:?}"
+  );
+
+  // Gone BEFORE settlement, which is the whole point: a barrier that settles
+  // first has already certified the window.
+  assert!(
+    !m.coverage_settled(s),
+    "the cover is counted while it stands"
+  );
+  for (req, dir) in reads {
+    if dir != mid {
+      m.on_enumerate(req, EnumerateResult::Ok(Vec::new()));
+    }
+  }
+  // The unpaired half's window elapses: its `Removed` for a subtree already
+  // retired is the only thing left holding the moves conjunct.
+  m.handle_timeout(at(20) + DEFAULT_MOVE_WINDOW);
+  drain_reads_clean(&mut m);
+  assert!(
+    m.coverage_settled(s),
+    "and it releases rather than wedging: rearm_settled={}",
+    m.rearm_settled(s)
+  );
+  assert!(
+    !m.is_watched(old_root),
+    "with the adopted watch still retired"
+  );
+  m.assert_invariants();
+}
+
+/// The one site that could have relocated an unproven adopted edge, refusing to:
+/// [`on_moved_to`](Monitor::on_moved_to)'s pairing arm, the monitor's only
+/// rewrite of an existing parent link.
+///
+/// The refusal needs no path of its own and gets none — it takes the arm's
+/// EXISTING not-reparentable route, which already pays both halves of the
+/// coverage rule and, taken here, is exactly the disposition an unprovable
+/// adopted edge is owed: the source dropped (subtree-LOCAL, since the invariant
+/// makes it a direct child of the marker's own node, so the marker's node
+/// survives), the pair still emitted, the destination `Rescan`ed at the object's
+/// REAL location, and its rebuild COUNTED behind that edge.
+///
+/// The marker is deliberately left standing. Its adopted watch is now dead, and
+/// that is a state the machinery already handles: the tail's first complete read
+/// takes the recorded-death branch and re-scans the vacated slot.
+#[test]
+fn a_paired_move_cannot_relocate_an_unproven_adopted_watch() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, kid, _reserved, mid) = widen_with_a_chain_tail(&mut m, s);
+  let tail_read = read_of(&mut m, mid);
+
+  let events = move_the_adopted_watch(&mut m, mid, mid, "elsewhere");
+  assert!(
+    !m.is_watched(old_root) && !m.is_watched(kid),
+    "the refused edge is dropped where it stood, not carried to a new slot"
+  );
+  assert!(
+    m.is_watched(mid),
+    "and the drop is LOCAL: the node that owes the proof is a direct parent of \
+     what was dropped, never a descendant of it"
+  );
+  let fresh = m
+    .child_watch(mid, &seg("elsewhere"))
+    .expect("the destination is reconciled as a fresh move-in");
+  assert_ne!(fresh, old_root, "by a new watch, not the refused subtree");
+  assert!(
+    !m.adoptions_settled(s),
+    "the marker is left standing, to resolve through the machinery a dead \
+     adopted watch already has"
+  );
+
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_moved() && e.location() == &loc(&["mid", "elsewhere"])),
+    "the pairing is still delivered: {events:?}"
+  );
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&["mid", "elsewhere"])),
+    "and the opening loss edge names the object's REAL location, never the \
+     vacated one: {events:?}"
+  );
+  assert!(
+    !m.coverage_settled(s),
+    "the destination's rebuild is COUNTED behind that edge, so the barrier waits"
+  );
+
+  // Dirtied by the move records, so the retry carries the verdict — and the
+  // verdict finds the adopted watch already gone: the recorded-death branch,
+  // which re-scans the slot it vacated and owes no second retirement.
+  m.on_enumerate(tail_read, EnumerateResult::Ok(Vec::new()));
+  let reads: Vec<(ReqId, WatchId)> = drain_actions(&mut m)
+    .iter()
+    .filter_map(|a| a.as_enumerate().map(|e| (e.req(), e.dir())))
+    .collect();
+  let proof = reads
+    .iter()
+    .find(|(_, dir)| *dir == mid)
+    .map(|(req, _)| *req)
+    .expect("the dirtied read queues the bounded retry");
+  m.on_enumerate(
+    proof,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("elsewhere"), FileKind::Dir).with_node(ident(1)),
+    ]),
+  );
+  assert!(m.adoptions_settled(s), "the marker resolves");
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&["mid", "b"])),
+    "at the vacated slot the recorded-death branch mourns: {events:?}"
+  );
+
+  for (req, dir) in reads {
+    if dir != mid {
+      m.on_enumerate(req, EnumerateResult::Ok(Vec::new()));
+    }
+  }
+  // The counted rebuild is the destination's own arm. The proof read's own crawl
+  // re-proves that survivor as well and mints it afresh where it cannot match an
+  // identity, so acknowledge whatever now holds the slot and answer its read: the
+  // barrier's last conjunct falls with it.
+  let armed = m
+    .child_watch(mid, &seg("elsewhere"))
+    .expect("the destination stays covered throughout");
+  m.ack_watch(armed, Ok(WatchAck::Installed));
+  drain_reads_clean(&mut m);
+  assert!(
+    m.coverage_settled(s),
+    "and the whole sequence settles rather than wedging: rearm_settled={}",
+    m.rearm_settled(s)
+  );
+  m.assert_invariants();
+}
+
+/// The wedge negative for the interception, on the path where NOTHING ever
+/// completes. The refusal deliberately leaves the marker standing, and a marker
+/// nothing releases is the one unacceptable outcome: `coverage_settled` false for
+/// the rest of the process.
+///
+/// Every read of the tail fails forever, so the recorded-death branch is never
+/// reached and the release comes from the bounded retries' own cap. It finds
+/// nothing left to retire — the refusal already disposed of the adopted watch —
+/// and its counted cover cannot renew itself, because the marker is spent by the
+/// time the cover's own re-read could exhaust again. The scope reaches a settled,
+/// honestly-degraded rest: the darkness booked, the unproven edge gone, the
+/// barrier free.
+#[test]
+fn an_intercepted_move_still_settles_when_the_tail_never_completes() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, kid, reserved, mid) = widen_with_a_chain_tail(&mut m, s);
+
+  let _ = move_the_adopted_watch(&mut m, mid, mid, "elsewhere");
+  assert!(!m.is_watched(old_root) && !m.is_watched(kid));
+  assert!(
+    !m.adoptions_settled(s),
+    "the marker is left standing, with no read that will ever prove it"
+  );
+
+  // Every read of the tail is incomplete forever; everything else answers clean
+  // and every arm is acknowledged, so nothing but the marker can hold the
+  // barrier down.
+  let mut rounds = 0;
+  for _ in 0..16 {
+    let arming: Vec<WatchId> = m
+      .nodes
+      .iter()
+      .filter(|(_, node)| matches!(node.state, NodeState::Arming { .. }))
+      .map(|(id, _)| *id)
+      .collect();
+    for id in &arming {
+      m.ack_watch(*id, Ok(WatchAck::Installed));
+    }
+    let reads: Vec<(ReqId, WatchId)> = drain_actions(&mut m)
+      .iter()
+      .filter_map(|a| a.as_enumerate().map(|e| (e.req(), e.dir())))
+      .collect();
+    if arming.is_empty() && reads.is_empty() {
+      break;
+    }
+    rounds += 1;
+    for (req, dir) in reads {
+      if dir == mid {
+        m.on_enumerate(req, EnumerateResult::Partial(Vec::new()));
+      } else if dir == reserved {
+        // The counted cover re-reads the ROOT, whose listing must keep naming
+        // the tail: an empty one would retire it through the ordinary crawl and
+        // decide nothing about the marker.
+        m.on_enumerate(
+          req,
+          EnumerateResult::Ok(vec![DirEntry::new(seg("mid"), FileKind::Dir)]),
+        );
+      } else {
+        m.on_enumerate(req, EnumerateResult::Ok(Vec::new()));
+      }
+    }
+  }
+  let _ = drain_events(&mut m);
+  assert!(rounds < 16, "the escalation is one-shot, not self-renewing");
+  assert!(
+    m.adoptions_settled(s),
+    "the retry cap releases the marker the refusal left standing"
+  );
+  assert!(
+    m.child_watch(reserved, &seg("mid")).is_some(),
+    "with the tail's slot still covered — the counted cover's crawl rebuilds \
+     what it re-proves, so nothing is left unwatched"
+  );
+  assert!(
+    m.coverage_settled(s),
+    "and the barrier resolves degraded rather than wedging: rearm_settled={} \
+     adoptions={}",
+    m.rearm_settled(s),
+    m.adoptions_settled(s)
+  );
+  m.assert_invariants();
+}
+
+/// The same double depth-one widen as [`widen_with_a_chain_tail`], with the TAIL
+/// left unarmed — the widen's dark window at its widest. `mid` owes the proof and
+/// its own pre-arm outcome was never replayed, so its kernel watch does not exist:
+/// a mutation of the adopted slot `mid/b` in this window mints no parent-side half
+/// for anything to refuse, and the adopted object's own self-events are the entire
+/// record of it. Arming the NEW root does not change that — its watch speaks for
+/// its own children, of which the adopted slot is not one — and is what discharges
+/// the outer marker, so the tail's is the only one the scope is still holding.
+///
+/// Returns `(old_root, kid, new_root, tail)`.
+fn widen_into_an_unarmed_chain(
+  m: &mut Monitor,
+  s: ScopeId,
+) -> (WatchId, WatchId, WatchId, WatchId) {
+  let (old_root, kid) = widen_base(m, s);
+  let mid = m.reserve_watch_id();
+  assert!(
+    m.widen_root(s, mid, vec![seg("b")], Some(ident(1)))
+      .is_some()
+  );
+  let reserved = m.reserve_watch_id();
+  assert!(
+    m.widen_root(s, reserved, vec![seg("mid")], Some(ident(2)))
+      .is_some(),
+    "the demoting splice lands — and `mid` is never acknowledged, so the node \
+     that owes the proof has no kernel watch at all"
+  );
+  m.ack_watch(reserved, Ok(WatchAck::Installed));
+  let root_read = drain_actions(m)
+    .iter()
+    .find_map(|a| {
+      a.as_enumerate()
+        .filter(|e| e.dir() == reserved)
+        .map(|e| e.req())
+    })
+    .expect("the new root's cold read was queued");
+  m.on_enumerate(
+    root_read,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("mid"), FileKind::Dir).with_node(ident(2)),
+    ]),
+  );
+  seal_adoptions(m, s);
+  let _ = drain_events(m);
+  (old_root, kid, reserved, mid)
+}
+
+/// A depth-one widen whose new root is live and whose confirming listing has
+/// been ingested: the marker STANDS, staged, with its fence still to come.
+/// Returns `(old_root, kid, new_root)`.
+fn widen_staged(m: &mut Monitor, s: ScopeId) -> (WatchId, WatchId, WatchId) {
+  let (old_root, kid) = widen_base(m, s);
+  let reserved = m.reserve_watch_id();
+  let _ = m
+    .widen_root(s, reserved, vec![seg("b")], Some(ident(1)))
+    .expect("a depth-one widen splices");
+  m.ack_watch(reserved, Ok(WatchAck::Installed));
+  let req = read_of(m, reserved);
+  m.on_enumerate(
+    req,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("b"), FileKind::Dir).with_node(ident(1)),
+    ]),
+  );
+  let _ = drain_events(m);
+  (old_root, kid, reserved)
+}
+
+/// The confirming listing is not the verdict. Its three conjuncts all match, and
+/// they all match again after an excursion that left and returned — so a release
+/// taken at the completion certifies an interval it never looked at. The listing
+/// therefore STAGES, and the record that refutes the interval is still free to
+/// arrive and spend the marker while it stands.
+///
+/// Mutation witness: release at the completion (drop the staging) and the
+/// `MoveSelf` below finds no marker, stands no cover, and the barrier reads
+/// settled over an undelivered transition.
+#[test]
+fn a_confirming_listing_stages_the_marker_instead_of_releasing_it() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, kid, reserved) = widen_staged(&mut m, s);
+
+  assert!(
+    !m.adoptions_settled(s),
+    "the marker stands: the listing read the window's END, not the window"
+  );
+  assert!(!m.coverage_settled(s), "so the barrier is still held");
+  assert_eq!(
+    m.adoption_staging_high_water(s),
+    Some(1),
+    "staged, and stamped against the cuts the scope may be offered"
+  );
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "and nothing is escalated by staging itself"
+  );
+  assert!(m.is_watched(old_root) && m.is_watched(kid));
+
+  // A cut requested BEFORE this staging licenses nothing here.
+  m.seal_staged_adoptions(s, 0);
+  assert!(
+    !m.adoptions_settled(s),
+    "a cut that predates the staging cannot seal it"
+  );
+
+  // The excursion's own record, arriving on the lane the fence exists to drain
+  // first. It finds the marker still standing, which is the whole point.
+  m.on_os_record(OsRecord::new(old_root, RecordKind::MoveSelf), at(20));
+  assert!(
+    m.adoptions_settled(s),
+    "and spends it: the edge no listing can prove is retired, not confirmed"
+  );
+  assert!(
+    !m.is_watched(old_root) && !m.is_watched(kid),
+    "inside a counted cover, with the unprovable subtree retired"
+  );
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &Location::new()),
+    "the root cover stands: {events:?}"
+  );
+  assert!(!m.rearm_settled(s), "counted, not a bare edge");
+
+  // The fence lands afterwards on a marker that is already gone.
+  m.seal_staged_adoptions(s, 1);
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "a seal over a spent marker is inert"
+  );
+  assert!(m.is_watched(reserved), "and touches nothing else");
+  m.assert_invariants();
+}
+
+/// A SECOND complete read of the chain parent meets a marker already staged, and
+/// its confirming reading adds nothing: only the FIRST confirming listing is the
+/// confirm, because the cut requested behind it is the one that orders its
+/// window. Re-stamping would push the marker past the reach of the cut already
+/// out for it — and under a repeating re-arm crawl the stamp would outrun every
+/// round trip, so the marker would be re-offered a cut it never reaches the end
+/// of.
+///
+/// Mutation witness: re-stamp on every confirming listing and the staging
+/// generation below moves, stranding the request already in flight.
+#[test]
+fn a_second_complete_read_leaves_a_staged_marker_to_its_fence() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, _kid, reserved) = widen_staged(&mut m, s);
+
+  // A re-arm read of the same directory, listing the same matching entry.
+  assert!(m.rearm_watch_subtree(reserved).is_started());
+  let again = read_of(&mut m, reserved);
+  m.on_enumerate(
+    again,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("b"), FileKind::Dir).with_node(ident(1)),
+    ]),
+  );
+  assert!(
+    !m.adoptions_settled(s),
+    "the staged marker still stands — this completion is not its verdict"
+  );
+  assert_eq!(
+    m.adoption_staging_high_water(s),
+    Some(1),
+    "and its stamp did not move, so the cut already out still reaches it"
+  );
+  assert_eq!(
+    m.child_watch(reserved, &seg("b")),
+    Some(old_root),
+    "the read reconciles its slots as it always did"
+  );
+  m.assert_invariants();
+}
+
+/// The quiet path stays quiet. A widen nothing interfered with pays the fence one
+/// round trip and nothing else: no `Rescan`, no epoch bump, no re-arm, and the
+/// barrier releases on the confirmation.
+///
+/// Mutation witness: make the seal retire unconditionally and this cell reports
+/// the covering `Rescan` a silent widen must never emit.
+#[test]
+fn a_sealed_confirm_releases_the_barrier_silently() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, kid, reserved) = widen_staged(&mut m, s);
+  let before = m.coverage_work_epoch(s);
+
+  m.seal_staged_adoptions(s, 1);
+  assert!(m.adoptions_settled(s), "the confirm is released");
+  assert!(m.coverage_settled(s), "and the barrier with it");
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "silently: no `Rescan` of any kind"
+  );
+  assert!(m.rearm_settled(s), "and no counted cover");
+  assert_eq!(
+    m.coverage_work_epoch(s),
+    before,
+    "a release acquires no work, so a proof taken over this scope survives it"
+  );
+  assert_eq!(
+    m.child_watch(reserved, &seg("b")),
+    Some(old_root),
+    "the adopted watch is REUSED — nothing retired, nothing rebuilt"
+  );
+  assert!(m.is_watched(kid), "and its interior is untouched");
+  assert_eq!(
+    m.adoption_staging_high_water(s),
+    None,
+    "the scope owes no seal, which is what lets its latch be dropped"
+  );
+  m.assert_invariants();
+}
+
+/// The occupancy reading is one-way while the marker stands, so the seal may take
+/// it late — and must. A `MovedFrom` detaches the adopted watch after the listing
+/// confirmed; the slot reading has degraded and cannot come back, so the seal
+/// refuses.
+///
+/// Mutation witness: drop the seal's occupancy re-check and a detached adopted
+/// edge is confirmed.
+#[test]
+fn the_seal_refuses_an_adopted_watch_that_left_its_slot_after_the_listing() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, kid, reserved) = widen_staged(&mut m, s);
+
+  m.on_os_record(
+    OsRecord::new(reserved, RecordKind::MovedFrom)
+      .with_name(seg("b"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(20),
+  );
+  assert_eq!(
+    m.child_watch(reserved, &seg("b")),
+    None,
+    "the slot is vacated, and nothing can restore this watch to it"
+  );
+
+  m.seal_staged_adoptions(s, 1);
+  assert!(m.adoptions_settled(s), "the marker resolves");
+  assert!(
+    !m.is_watched(old_root) && !m.is_watched(kid),
+    "as a RETIREMENT, not a confirm"
+  );
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &Location::new()),
+    "under a counted root cover: {events:?}"
+  );
+  assert!(!m.rearm_settled(s), "counted, so the barrier rests on it");
+  m.assert_invariants();
+}
+
+/// The adopted WATCH dies after the listing confirmed it. The edge cannot outlive
+/// its object, so there is nothing to retire — but the vacated slot owes the
+/// consumer a re-read, which is the located `Rescan` the read-time verdict gives
+/// the same case.
+///
+/// Mutation witness: seal a dead adopted watch as a confirm and the slot converges
+/// on nothing.
+#[test]
+fn the_seal_answers_an_adopted_watch_that_died_after_the_listing() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, _kid, reserved) = widen_staged(&mut m, s);
+
+  m.on_os_record(
+    OsRecord::new(reserved, RecordKind::Removed)
+      .with_name(seg("b"))
+      .with_is_dir(true),
+    at(20),
+  );
+  assert!(!m.is_watched(old_root), "the adopted object is gone");
+  let _ = drain_events(&mut m);
+
+  m.seal_staged_adoptions(s, 1);
+  assert!(m.adoptions_settled(s), "the marker resolves");
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&["b"])),
+    "at the vacated slot, so the consumer's re-read converges the ghost: {events:?}"
+  );
+  m.assert_invariants();
+}
+
+/// The staging-generation discipline: a cut licenses the stagings that existed
+/// when it was asked for, and no others. Two back-to-back widens stage two
+/// markers; a cut reaching only the first seals only the first.
+///
+/// Mutation witness: license the whole staged set from any answered cut and the
+/// second marker is sealed by a cut whose request PREDATES its listing — the
+/// ordering the seal exists to buy, spent on a window it never covered.
+#[test]
+fn a_cut_seals_only_the_stagings_it_reaches() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, _kid, first) = widen_staged(&mut m, s);
+  assert_eq!(m.adoption_staging_high_water(s), Some(1));
+
+  // A second widen over the first, staged by its own confirming listing.
+  let second = m.reserve_watch_id();
+  let _ = m
+    .widen_root(s, second, vec![seg("mid")], Some(ident(2)))
+    .expect("a widen over a widen splices");
+  m.ack_watch(second, Ok(WatchAck::Installed));
+  let req = read_of(&mut m, second);
+  m.on_enumerate(
+    req,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("mid"), FileKind::Dir).with_node(ident(2)),
+    ]),
+  );
+  let _ = drain_events(&mut m);
+  assert_eq!(
+    m.adoption_staging_high_water(s),
+    Some(2),
+    "both markers are staged, in the order their listings were ingested"
+  );
+
+  m.seal_staged_adoptions(s, 1);
+  assert!(
+    !m.adoptions_settled(s),
+    "the newer staging waits for its own cut"
+  );
+  assert_eq!(
+    m.child_watch(first, &seg("b")),
+    Some(old_root),
+    "while the older one is confirmed silently — its subtree is reused"
+  );
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "and neither seal escalates anything"
+  );
+
+  m.seal_staged_adoptions(s, 2);
+  assert!(m.adoptions_settled(s), "the successor seals the rest");
+  assert!(m.coverage_settled(s));
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "still silently: two quiet widens pay two round trips and no cover"
+  );
+  m.assert_invariants();
+}
+
+/// The ingest order the whole design turns on, staged at the seam that owns it.
+/// The parent-side half of the rename is consumed pre-commit as benign churn, the
+/// object leaves and returns before the chain parent is ever read, and the
+/// listing then matches all three conjuncts — so the LISTING cannot tell this
+/// window from a quiet one.
+///
+/// What separates them is only when the verdict is taken. The fence puts the
+/// object's own `MoveSelf` — kernel-committed before that listing, because the
+/// rename holds the chain parent's lock across the record it emits — ahead of the
+/// seal, so no discontinuous edge settles without a covering rescan.
+///
+/// Mutation witness: take the verdict at the listing and this cell settles with
+/// the transition undelivered and no `Rescan` standing for the interval.
+#[test]
+fn a_change_and_return_inside_the_window_never_settles_uncovered() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, kid) = widen_base(&mut m, s);
+  let reserved = m.reserve_watch_id();
+  let _ = m
+    .widen_root(s, reserved, vec![seg("b")], Some(ident(1)))
+    .expect("a depth-one widen splices");
+  m.ack_watch(reserved, Ok(WatchAck::Installed));
+
+  // The listing the excursion cannot be told from a quiet window by: the adopted
+  // watch still holds the slot (nothing observed a move, so nothing rewrote the
+  // link) and the identity came back with the object.
+  let req = read_of(&mut m, reserved);
+  m.on_enumerate(
+    req,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("b"), FileKind::Dir).with_node(ident(1)),
+    ]),
+  );
+  let _ = drain_events(&mut m);
+  assert_eq!(
+    m.child_watch(reserved, &seg("b")),
+    Some(old_root),
+    "every conjunct the proof reads is restored by the return trip"
+  );
+  assert!(
+    !m.coverage_settled(s),
+    "and the barrier is still held, because no verdict has been taken"
+  );
+
+  // The record still kernel-side at the listing, which the cut forwards ahead of
+  // its own reply and the drain feeds before the seal.
+  m.on_os_record(OsRecord::new(old_root, RecordKind::MoveSelf), at(20));
+  m.seal_staged_adoptions(s, 1);
+
+  assert!(
+    !m.is_watched(old_root) && !m.is_watched(kid),
+    "the discontinuous edge is retired rather than certified"
+  );
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &Location::new()),
+    "with a covering rescan standing for the interval: {events:?}"
+  );
+  assert!(
+    !m.coverage_settled(s),
+    "and the barrier releases onto the cover's counted rebuild, never onto nothing"
+  );
+  m.assert_invariants();
+}
+
+/// The sequence a SNAPSHOT proof cannot survive: inside the widen's dark window
+/// the adopted directory is renamed out of `mid/b` and back, and the connector
+/// that owes the proof records neither half of either rename — its watch arms
+/// only afterwards. The one trace is the adopted object's own `MoveSelf`.
+///
+/// The return trip restores every conjunct the proof reads. The link still names
+/// the adopted watch (nothing observed a move, so nothing rewrote it), and the
+/// identity comes back with the object, so the tail's listing is
+/// INDISTINGUISHABLE from a listing over a window in which nothing happened. A
+/// verdict left to that listing confirms — and what it certifies is an interval in
+/// which the adopted subtree's own watches went on delivering at a path the object
+/// had left, uncovered, with the barrier free to settle over it.
+///
+/// So final occupancy and identity are not the proof. They are admissible only
+/// because a movement of the adopted watch reaches the marker FIRST, which is what
+/// this cell drives.
+#[test]
+fn an_adopted_watch_seen_to_move_is_not_reproven_by_its_returning_identity() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, kid, reserved, mid) = widen_into_an_unarmed_chain(&mut m, s);
+  assert_eq!(
+    m.child_watch(mid, &seg("b")),
+    Some(old_root),
+    "the occupancy conjunct holds going in — and an ABA hands it back intact"
+  );
+
+  // The rename out. No parent-side half exists to refuse it: the connector has no
+  // kernel watch yet, and the adopted watch is no longer the root, so the moved-root
+  // invalidation does not speak for it either.
+  m.on_os_record(OsRecord::new(old_root, RecordKind::MoveSelf), at(20));
+  assert!(
+    m.adoptions_settled(s),
+    "the MOVE spends the proof — not a later listing that cannot see it"
+  );
+  assert!(
+    !m.is_watched(old_root) && !m.is_watched(kid),
+    "and the edge nothing can prove any more is retired with it"
+  );
+  assert!(
+    m.is_watched(mid) && m.is_watched(reserved),
+    "subtree-locally: the chain that owes the proof stands, so its own read is \
+     still to come"
+  );
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &Location::new()),
+    "under the counted root cover, standing BEFORE the coverage it ends: {events:?}"
+  );
+  assert!(
+    !m.rearm_settled(s),
+    "which is counted work, not a bare edge"
+  );
+
+  // The rename back names a watch the first record already retired, so it dies at
+  // the unknown-watch guard: one sighting is all the proof needs to be spent.
+  m.on_os_record(OsRecord::new(old_root, RecordKind::MoveSelf), at(21));
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "the return trip adds nothing to escalate"
+  );
+
+  // The listing that WOULD have confirmed: the adopted name, a directory, and the
+  // very identity the widen named. There is no marker left for it to pay, and the
+  // slot it describes is rebuilt from scratch rather than reused.
+  m.ack_watch(mid, Ok(WatchAck::Installed));
+  let req = read_of(&mut m, mid);
+  m.on_enumerate(
+    req,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("b"), FileKind::Dir).with_node(ident(1)),
+    ]),
+  );
+  assert!(
+    !m.is_watched(old_root),
+    "a returning identity does not resurrect the edge it could not prove"
+  );
+  let fresh = m
+    .child_watch(mid, &seg("b"))
+    .expect("the connector's own reconcile re-covers the slot");
+  assert_ne!(fresh, old_root, "as a fresh discovery, never a reused edge");
+  m.assert_invariants();
+}
+
+/// The control, through the SAME unarmed window: with no movement in it the proof
+/// still confirms, and still silently. The invalidation answers evidence of a
+/// move; it is not a tax on the window itself — which every multi-segment widen
+/// has, by construction, since the connector that owes the proof is minted unarmed.
+#[test]
+fn an_unmoved_adopted_watch_is_confirmed_silently_through_the_same_window() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, kid, _reserved, mid) = widen_into_an_unarmed_chain(&mut m, s);
+
+  m.ack_watch(mid, Ok(WatchAck::Installed));
+  let req = read_of(&mut m, mid);
+  m.on_enumerate(
+    req,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("b"), FileKind::Dir).with_node(ident(1)),
+    ]),
+  );
+  seal_adoptions(&mut m, s);
+  assert!(m.adoptions_settled(s), "the edge is verified");
+  assert_eq!(
+    m.child_watch(mid, &seg("b")),
+    Some(old_root),
+    "by REUSING the adopted watch — nothing was retired and nothing rebuilt"
+  );
+  assert!(m.is_watched(old_root) && m.is_watched(kid));
+  let events = drain_events(&mut m);
+  assert!(
+    events.iter().all(|e| e.kind().is_created()),
+    "silently: the cold read announces its new ground and escalates nothing \
+     — no `Rescan` of any kind: {events:?}"
+  );
+  assert!(
+    m.rearm_settled(s),
+    "and stands no counted cover: rearm_settled={}",
+    m.rearm_settled(s)
+  );
+  assert!(
+    m.coverage_settled(s),
+    "so the barrier releases on the confirmation itself"
+  );
+  m.assert_invariants();
+}
+
+/// The same invalidation where the marker keys on the scope ROOT — a DEPTH-ONE
+/// widen, whose marker parent is the pre-armed reserved root rather than a minted
+/// connector. The blind window is a different one (records attributed to the
+/// reserved id before the commit are dropped by the unknown-watch guard, so a
+/// rename of the adopted object in that interval raises no parent-side half the
+/// monitor ever sees either), and the retirement's locality claim is at its
+/// sharpest here: the node it must not reach is the root itself.
+#[test]
+fn a_depth_one_widens_moved_adoption_is_retired_without_reaching_the_root() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, kid) = widen_base(&mut m, s);
+  let reserved = m.reserve_watch_id();
+  assert!(
+    m.widen_root(s, reserved, vec![seg("b")], Some(ident(1)))
+      .is_some()
+  );
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(OsRecord::new(old_root, RecordKind::MoveSelf), at(20));
+  assert!(m.adoptions_settled(s), "the move spends the proof here too");
+  assert!(
+    !m.is_watched(old_root) && !m.is_watched(kid),
+    "and retires the edge it can no longer prove"
+  );
+  assert!(
+    m.is_watched(reserved) && m.roots.get(&s) == Some(&reserved),
+    "while the marker's own key — the scope root — survives its child's \
+     retirement, which is the whole content of subtree-locality"
+  );
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &Location::new()),
+    "under the same counted root cover: {events:?}"
+  );
+
+  // And it settles: the root's replayed pre-arm outcome carries the cover's
+  // counted re-arm, whose read rebuilds the vacated slot.
+  m.ack_watch(reserved, Ok(WatchAck::Installed));
+  let req = read_of(&mut m, reserved);
+  m.on_enumerate(
+    req,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("b"), FileKind::Dir).with_node(ident(1)),
+    ]),
+  );
+  quiesce(&mut m);
+  assert!(
+    m.coverage_settled(s),
+    "rather than wedging: rearm_settled={} adoptions={}",
+    m.rearm_settled(s),
+    m.adoptions_settled(s)
+  );
+  let rebuilt = m
+    .child_watch(reserved, &seg("b"))
+    .expect("with the adopted slot covered again");
+  assert_ne!(rebuilt, old_root, "by a fresh watch, not the retired edge");
+  m.assert_invariants();
+}
+
+/// The signal is about the ADOPTED WATCH, and about nothing else that moved. A
+/// rename INSIDE the adopted subtree moves no edge the marker speaks for, and a
+/// rename of the connector's OTHER child moves an object that owes no proof at
+/// all — the marker's key is its parent, which is exactly why the disposal is
+/// resolved by the stored `WatchId` and not by "a child of the node that owes a
+/// proof moved".
+///
+/// Neither may spend the marker, and this cell is what separates the two possible
+/// over-broad shapes — an ancestor walk, and a parent lookup with no check of
+/// WHICH child it names — from the one the proof actually needs.
+#[test]
+fn a_move_beside_or_beneath_the_adopted_watch_leaves_the_proof_standing() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, kid, _reserved, mid) = widen_into_an_unarmed_chain(&mut m, s);
+  m.ack_watch(mid, Ok(WatchAck::Installed));
+  let first_read = read_of(&mut m, mid);
+
+  // A second child grows in the connector, beside the adopted slot.
+  m.on_os_record(
+    OsRecord::new(mid, RecordKind::Created)
+      .with_name(seg("other"))
+      .with_is_dir(true)
+      .with_node(ident(5)),
+    at(20),
+  );
+  let other = arm_named_child(&mut m, mid, "other");
+  let _ = drain_events(&mut m);
+
+  // One rename beneath the adopted watch, one beside it. Neither is the adopted
+  // watch's own move, so both take the ordinary non-root no-op.
+  m.on_os_record(OsRecord::new(kid, RecordKind::MoveSelf), at(21));
+  m.on_os_record(OsRecord::new(other, RecordKind::MoveSelf), at(21));
+  assert!(
+    !m.adoptions_settled(s),
+    "the marker still stands: neither object owes its proof"
+  );
+  assert!(
+    m.is_watched(old_root) && m.is_watched(kid) && m.is_watched(other),
+    "nothing is retired"
+  );
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "and nothing is escalated: a no-op stays silent"
+  );
+
+  // The `Created` raced the connector's first read, so that read decides nothing;
+  // the bounded retry carries the verdict, and the verdict CONFIRMS.
+  m.on_enumerate(first_read, EnumerateResult::Ok(Vec::new()));
+  let proof = read_of(&mut m, mid);
+  m.on_enumerate(
+    proof,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("b"), FileKind::Dir).with_node(ident(1)),
+      DirEntry::new(seg("other"), FileKind::Dir).with_node(ident(5)),
+    ]),
+  );
+  seal_adoptions(&mut m, s);
+  assert!(m.adoptions_settled(s), "the edge is verified");
+  assert_eq!(
+    m.child_watch(mid, &seg("b")),
+    Some(old_root),
+    "and reused: the adopted watch never moved"
+  );
+  m.assert_invariants();
+}
+
+/// The wedge negative for the invalidation. The release takes the barrier's
+/// adoptions conjunct off, and a scope that cannot settle afterwards is the one
+/// unacceptable outcome — so the cover it stands is counted, holds the barrier
+/// down through the rebuild, and comes back up ON that rebuild: the adopted slot
+/// re-covered by a watch the crawl armed and read, rather than by the edge the
+/// move refuted.
+#[test]
+fn a_move_invalidated_adoption_settles_over_the_slot_it_rebuilds() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, _kid, reserved, _mid) = widen_into_an_unarmed_chain(&mut m, s);
+
+  m.on_os_record(OsRecord::new(old_root, RecordKind::MoveSelf), at(20));
+  assert!(
+    !m.coverage_settled(s),
+    "the cover is COUNTED while it stands, so nothing settles inside it"
+  );
+  let _ = drain_events(&mut m);
+
+  // Every arm is acknowledged and every read answered, with each surviving
+  // directory naming its real children: the widened root holds the connector, and
+  // the connector holds the object that came back.
+  //
+  // The connector is resolved by NAME each round, never by the id captured above,
+  // because the cover's own crawl re-proves it too and cannot identity-match it —
+  // a widen's chain nodes are minted with no identity — so the first re-armed root
+  // listing retires and rebuilds it. That is the escalation's ordinary cost, the
+  // same one every other adoption escalation on this path pays, and the slot it
+  // has to end up covering is `mid/b`.
+  let mut rounds = 0;
+  for _ in 0..16 {
+    let arming: Vec<WatchId> = m
+      .nodes
+      .iter()
+      .filter(|(_, node)| matches!(node.state, NodeState::Arming { .. }))
+      .map(|(id, _)| *id)
+      .collect();
+    for id in &arming {
+      m.ack_watch(*id, Ok(WatchAck::Installed));
+    }
+    let reads: Vec<(ReqId, WatchId)> = drain_actions(&mut m)
+      .iter()
+      .filter_map(|a| a.as_enumerate().map(|e| (e.req(), e.dir())))
+      .collect();
+    if arming.is_empty() && reads.is_empty() {
+      break;
+    }
+    rounds += 1;
+    for (req, dir) in reads {
+      let entries = if dir == reserved {
+        vec![DirEntry::new(seg("mid"), FileKind::Dir).with_node(ident(3))]
+      } else if Some(dir) == m.child_watch(reserved, &seg("mid")) {
+        vec![DirEntry::new(seg("b"), FileKind::Dir).with_node(ident(1))]
+      } else {
+        Vec::new()
+      };
+      m.on_enumerate(req, EnumerateResult::Ok(entries));
+    }
+  }
+  let _ = drain_events(&mut m);
+  assert!(
+    rounds < 16,
+    "the invalidation is one-shot, not self-renewing"
+  );
+  assert!(
+    m.coverage_settled(s),
+    "and the barrier resolves rather than wedging: rearm_settled={} adoptions={}",
+    m.rearm_settled(s),
+    m.adoptions_settled(s)
+  );
+  let connector = m
+    .child_watch(reserved, &seg("mid"))
+    .expect("the chain is covered end to end");
+  let rebuilt = m
+    .child_watch(connector, &seg("b"))
+    .expect("with the adopted slot covered again");
+  assert_ne!(
+    rebuilt, old_root,
+    "by a watch the crawl armed and read itself"
+  );
+  assert!(
+    !m.is_watched(old_root),
+    "the unprovable edge staying retired throughout"
+  );
+  m.assert_invariants();
+}
+
+/// The third disposal, [`AdoptionDisposal::DiesWithTheWalk`], rests on a claim
+/// about the walk itself: the adopted child is on its stack. The containment
+/// invariant is what makes the claim true, and this is the case that shows the
+/// claim is about the PARENT LINK and not about the slot — because the slot is
+/// the one thing a rename can still take away.
+///
+/// The adopted watch is detached and held: out of `(tail, "b")` in the index,
+/// still parented at the tail. The tail then dies with its marker unresolved.
+/// The walk descends through its adjacency set, which a detached-and-held child
+/// never left, so the child dies with it — and the release's `debug_assert!`
+/// states exactly that, read through the child's own parent link.
+#[test]
+fn a_detached_adopted_watch_still_dies_with_its_markers_walk() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, kid, reserved, mid) = widen_with_a_chain_tail(&mut m, s);
+
+  detach_the_adopted_watch(&mut m, mid);
+  assert!(
+    m.child_watch(mid, &seg("b")).is_none(),
+    "the slot the marker names is vacated"
+  );
+  assert!(
+    m.is_watched(old_root),
+    "while the adopted watch itself is alive, held for its pairing"
+  );
+  assert!(
+    !m.adoptions_settled(s),
+    "with its marker still standing at the tail"
+  );
+
+  // The tail is removed, taking the unresolved marker with it.
+  m.on_os_record(
+    OsRecord::new(reserved, RecordKind::Removed).with_name(seg("mid")),
+    at(30),
+  );
+  assert!(!m.is_watched(mid), "the tail dies");
+  assert!(m.adoptions_settled(s), "and releases its marker");
+  assert!(
+    !m.is_watched(old_root) && !m.is_watched(kid),
+    "the edge it never proved dies WITH the walk — the parent link the detach \
+     preserved is what kept it on the stack"
+  );
+
+  let _ = drain_events(&mut m);
+  m.handle_timeout(at(20) + DEFAULT_MOVE_WINDOW);
+  drain_reads_clean(&mut m);
+  assert!(
+    m.coverage_settled(s),
+    "the walk's own discharge covers rather than wedges: rearm_settled={}",
+    m.rearm_settled(s)
+  );
+  assert!(!m.is_watched(old_root));
+  m.assert_invariants();
+}
+
+/// And the fourth disposal, [`AdoptionDisposal::CountedRetirement`], on the
+/// separation the invariant still permits: the bounded retries exhaust while the
+/// adopted watch stands DETACHED — alive, still parented at the tail, and out of
+/// the slot the marker names. The retirement is what pays for a marker no read
+/// will ever prove, so it must reach the OBJECT; resolved by slot it reaches an
+/// EMPTY one, calls that the disposal, and leaves the unproven subtree armed with
+/// its conjunct already released.
+#[test]
+fn an_exhausted_tail_retires_the_detached_adopted_watch_not_its_vacated_slot() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, kid, _reserved, mid) = widen_with_a_chain_tail(&mut m, s);
+
+  detach_the_adopted_watch(&mut m, mid);
+  assert!(m.is_watched(old_root));
+  assert!(
+    m.child_watch(mid, &seg("b")).is_none(),
+    "the adopted slot the marker names is vacated"
+  );
+
+  // No read is left that could ever prove the edge.
+  for _ in 0..=REARM_MAX_RETRIES {
+    let req = read_of(&mut m, mid);
+    m.on_enumerate(req, EnumerateResult::Partial(Vec::new()));
+  }
+  assert!(m.adoptions_settled(s), "the exhausted marker is released");
+  assert!(
+    !m.is_watched(old_root) && !m.is_watched(kid),
+    "and its retirement resolves the WATCH — not the slot the watch left"
+  );
+  assert!(
+    m.is_watched(mid),
+    "subtree-locally, so the exhausted reader is still there to book its own \
+     interior darkness"
+  );
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &Location::new()),
+    "under the counted root cover the release stands: {events:?}"
+  );
+
+  m.handle_timeout(at(20) + DEFAULT_MOVE_WINDOW);
+  drain_reads_clean(&mut m);
+  assert!(
+    m.coverage_settled(s),
+    "which releases rather than wedging: rearm_settled={}",
+    m.rearm_settled(s)
+  );
+  assert!(!m.is_watched(old_root), "with the edge still retired");
+  m.assert_invariants();
+}
+
+/// Moves the child of `from_parent` named `from_name` to `(to_parent, to_name)`
+/// as one COMPLETE pairing under `cookie_n`, so the moved subtree is live and
+/// unheld at its new place when this returns.
+fn move_child(
+  m: &mut Monitor,
+  from_parent: WatchId,
+  from_name: &str,
+  to_parent: WatchId,
+  to_name: &str,
+  cookie_n: u64,
+) {
+  m.on_os_record(
+    OsRecord::new(from_parent, RecordKind::MovedFrom)
+      .with_name(seg(from_name))
+      .with_cookie(cookie(cookie_n))
+      .with_is_dir(true),
+    at(20),
+  );
+  m.on_os_record(
+    OsRecord::new(to_parent, RecordKind::MovedTo)
+      .with_name(seg(to_name))
+      .with_cookie(cookie(cookie_n))
+      .with_is_dir(true),
+    at(20),
+  );
+  let _ = drain_events(m);
+}
+
+/// Whether `action` is addressed to `dir` — as the parent of a child arm or a
+/// slot stat, or as the directory of a read. What a result must issue none of
+/// once the node it was reconciling has been destroyed underneath it.
+fn addresses(action: &Action, dir: WatchId) -> bool {
+  action
+    .as_watch()
+    .and_then(|c| c.target().as_child().map(|ch| ch.parent()))
+    == Some(dir)
+    || action.as_enumerate().is_some_and(|e| e.dir() == dir)
+    || action
+      .as_stat()
+      .and_then(|c| c.of().as_child().map(|ch| ch.parent()))
+      == Some(dir)
+}
+
+/// Acknowledges every queued arm and answers every queued read clean until the
+/// scope quiesces — the wedge negative's driver, for sequences whose covers
+/// rebuild coverage the monitor must arm before it can settle. Bounded, so work
+/// that never quiesces fails here rather than hanging.
+fn quiesce(m: &mut Monitor) {
+  for _ in 0..16 {
+    // Off the TREE rather than off the action queue: an arm a cell drained
+    // earlier while collecting reads is still outstanding on its node, and it is
+    // the node's state that holds the counter down.
+    let arming: Vec<WatchId> = m
+      .nodes
+      .iter()
+      .filter(|(_, node)| matches!(node.state, NodeState::Arming { .. }))
+      .map(|(id, _)| *id)
+      .collect();
+    for id in &arming {
+      m.ack_watch(*id, Ok(WatchAck::Installed));
+    }
+    let reads: Vec<ReqId> = drain_actions(m)
+      .iter()
+      .filter_map(|a| a.as_enumerate().map(|e| e.req()))
+      .collect();
+    if arming.is_empty() && reads.is_empty() {
+      let _ = drain_events(m);
+      return;
+    }
+    for req in reads {
+      m.on_enumerate(req, EnumerateResult::Ok(Vec::new()));
+    }
+  }
+  panic!("the scope never quiesced");
+}
+
+/// ATTEMPTS the two paired renames that would BURY the tail: the adopted
+/// directory out of the tail's `b` slot and into a slot of the widened root, then
+/// the tail in UNDER the adopted directory.
+///
+/// Both are ordinary complete pairings the monitor records in full — nothing here
+/// is a dark window — and together they would make the node that owes the
+/// adoption proof a DESCENDANT of the object it owes it for. From there a
+/// retirement resolving the adopted WATCH destroys the tail as collateral, and
+/// every remaining step of the tail's in-flight read addresses a node the tree no
+/// longer holds.
+///
+/// The containment invariant removes that class at the FIRST step: the rename of
+/// an unproven adopted watch is refused, its edge disposed of where it stood, and
+/// the second rename then has no destination left to move the tail under.
+/// Returns the refusal's own delivery, which is where half of what it owes is
+/// stated.
+fn attempt_to_bury_the_tail(
+  m: &mut Monitor,
+  new_root: WatchId,
+  tail: WatchId,
+  adopted: WatchId,
+) -> Vec<Change> {
+  let events = move_the_adopted_watch(m, tail, new_root, "c");
+  assert!(
+    !m.is_watched(adopted),
+    "the burying rename is refused, and the refused edge disposed of locally"
+  );
+  assert_eq!(
+    m.nodes.get(&tail).and_then(|node| node.parent),
+    Some(new_root),
+    "so the tail stays put: there is nothing left for it to be moved under"
+  );
+  events
+}
+
+/// The collateral that no longer exists, on the CLEAN verdict path: the read
+/// whose completion refutes the edge is the read of the node a retirement
+/// following a RELOCATED adopted watch would have destroyed.
+///
+/// `resolve_adoption` runs strictly above the dispatch — a refused edge must be
+/// retired before the crawl can reuse its subtree — so a retirement that reached
+/// an ancestor of the reading directory would leave the dispatch crawling a
+/// directory no longer in the tree. Reconciled anyway, a listing entry installs a
+/// child whose parent link resolves to nothing: it sits in no adjacency set, so no
+/// later drop can reach it, it is rearm-counted the moment the crawl continues the
+/// re-arm into it, and its `Watch` names a parent the consumer does not know —
+/// which the consumer rejects, leaving NO result that could ever release the
+/// count. `coverage_settled` would then be false for the rest of the process: the
+/// one outcome this whole design treats as unacceptable.
+///
+/// So the burial is made impossible instead of survivable, and what is asserted is
+/// the POSITIVE: the reading directory is still there, and its listing is
+/// reconciled INTO it — armed, stat'd and booked at the coordinate it really
+/// occupies.
+#[test]
+fn a_verdict_cannot_bury_the_reading_directory_it_goes_on_reconciling() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, kid, reserved, mid) = widen_with_a_chain_tail(&mut m, s);
+  let tail_read = read_of(&mut m, mid);
+
+  let refusal = attempt_to_bury_the_tail(&mut m, reserved, mid, old_root);
+  assert!(!m.is_watched(kid), "the refused subtree goes whole");
+  assert!(
+    refusal
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&["c"])),
+    "the destination's cover stands at the object's REAL location: {refusal:?}"
+  );
+  assert!(
+    !m.rearm_settled(s),
+    "and its rebuild is counted behind that edge"
+  );
+  assert!(!m.adoptions_settled(s), "with the marker still standing");
+
+  // The moves raced the tail's first read, so it decides nothing; the retry
+  // carries the proof, stamped after the moves so its listing is evidence.
+  m.on_enumerate(tail_read, EnumerateResult::Ok(Vec::new()));
+  let reads: Vec<(ReqId, WatchId)> = drain_actions(&mut m)
+    .iter()
+    .filter_map(|a| a.as_enumerate().map(|e| (e.req(), e.dir())))
+    .collect();
+  let proof = reads
+    .iter()
+    .find(|(_, dir)| *dir == mid)
+    .map(|(req, _)| *req)
+    .expect("the fenced read queues the bounded retry");
+
+  // The clean completion. The adopted watch is already gone — the refusal
+  // disposed of it — so the verdict takes the recorded-death branch and owes no
+  // second retirement. The listing carries one entry of each kind the crawl acts
+  // on: a directory to install, and a name it cannot classify.
+  m.on_enumerate(
+    proof,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("orphan"), FileKind::Dir).with_node(ident(8)),
+      DirEntry::new(seg("mystery"), FileKind::Unknown),
+    ]),
+  );
+  assert!(m.adoptions_settled(s), "the verdict resolves the marker");
+  assert!(
+    m.is_watched(mid),
+    "and the reading directory is still there — nothing the verdict does can \
+     reach an ancestor of it"
+  );
+  let installed = m
+    .child_watch(mid, &seg("orphan"))
+    .expect("its listing is reconciled INTO it, not into a hole");
+  let actions = drain_actions(&mut m);
+  assert!(
+    actions.iter().any(|a| addresses(a, mid)),
+    "arms and stats are addressed to it: {actions:?}"
+  );
+  assert!(
+    m.has_coverage_deficit(s),
+    "and the name it could not classify is booked at a coordinate that exists"
+  );
+
+  // The wedge negative: every cover this sequence stood releases.
+  m.ack_watch(installed, Ok(WatchAck::Installed));
+  for req in actions
+    .iter()
+    .filter_map(|a| a.as_enumerate().map(|e| e.req()))
+  {
+    m.on_enumerate(req, EnumerateResult::Ok(Vec::new()));
+  }
+  quiesce(&mut m);
+  assert!(
+    m.rearm_settled(s),
+    "the counted rebuilds all land: rearm_pending={:?}",
+    m.rearm_pending
+  );
+  assert!(m.adoptions_settled(s));
+  m.assert_invariants();
+}
+
+/// The same on the EXHAUSTION path, where what follows the release is not a crawl
+/// but an interior deficit.
+///
+/// A deficit is a claim about the unreconciled interior of a LIVE directory, and
+/// the dispatch re-signal reconstructs its location from that directory. Booked
+/// against a dead one it would degrade every later fence of the scope and then
+/// re-instruct whatever prefix the truncating location walk happened to leave. So
+/// the reader must survive its own release — and it does, because the retirement
+/// can only ever reach a direct child of it. The deficit is then booked, honestly,
+/// at the directory it is about.
+#[test]
+fn an_exhausted_read_cannot_bury_its_own_directory_and_books_its_interior_at_it() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, _kid, reserved, mid) = widen_with_a_chain_tail(&mut m, s);
+
+  let _ = attempt_to_bury_the_tail(&mut m, reserved, mid, old_root);
+
+  // No read is left that could ever prove the edge.
+  for _ in 0..=REARM_MAX_RETRIES {
+    let req = read_of(&mut m, mid);
+    m.on_enumerate(req, EnumerateResult::Partial(Vec::new()));
+  }
+  assert!(m.adoptions_settled(s), "the exhausted marker is released");
+  assert!(
+    m.is_watched(mid),
+    "the exhausted reader survives its own release"
+  );
+  assert!(
+    m.has_coverage_deficit(s),
+    "so its unreconciled interior is booked at the directory it is about"
+  );
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&["mid"])),
+    "beside the located `Rescan` this site's own story names: {events:?}"
+  );
+
+  quiesce(&mut m);
+  assert!(
+    m.coverage_settled(s),
+    "which releases rather than wedging: rearm_settled={}",
+    m.rearm_settled(s)
+  );
+  m.assert_invariants();
+}
+
+/// An erased adoption marker's cover is the walk's own
+/// [`DeficitDischarge`](super::DeficitDischarge), and `UnsubscribedPrune` is where
+/// that has to be earned: it stands NO cover at all, on the ground that the
+/// set-cover proved no subscriber is under the subtree it asked to prune.
+///
+/// The containment invariant is what makes the ground cover the marker's object
+/// too: the adopted watch is a direct child of the marker's own node, so it is
+/// inside the pruned subtree by construction and the prune's silence is sound.
+/// Were it free to move into RETAINED ground, the prune would end coverage of a
+/// subscribed path standing nothing at all — and a narrowing has no broadening
+/// delta that would ever restore it, so the fence would settle clean over a
+/// retained path left unwatched. That is the silent coverage loss this campaign
+/// exists to eliminate, reached through the fix for a different one.
+#[test]
+fn a_pruned_parent_takes_its_adopted_watch_with_it_so_the_prune_stays_silent() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, kid, _reserved, mid) = widen_with_a_chain_tail(&mut m, s);
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  // Where the invariant puts the marker's object: under the marker's own node.
+  // The rename that would take it out into retained ground is refused (see
+  // `a_paired_move_cannot_relocate_an_unproven_adopted_watch`), so this is the
+  // only place a prune of `mid` can find it.
+  assert_eq!(
+    m.nodes.get(&old_root).and_then(|node| node.parent),
+    Some(mid),
+    "the adopted watch is a direct child of the node that owes its proof"
+  );
+  assert!(!m.adoptions_settled(s), "with the marker standing at `mid`");
+
+  // The shrink half of a narrowing reconcile, exactly as `on_set_cover` issues
+  // it: drop the one subtree strictly outside the retained cover.
+  assert!(m.drop_watch_subtree(mid), "the outside subtree is pruned");
+  assert!(!m.is_watched(mid));
+  assert!(m.adoptions_settled(s), "which releases the marker it held");
+  assert!(
+    !m.is_watched(old_root) && !m.is_watched(kid),
+    "and the edge no read ever proved dies inside the pruned ground, whole"
+  );
+
+  // Nothing is owed for it. The prune stands no cover and asks for no rebuild,
+  // and the fence settles clean — over ground the set-cover proved unsubscribed,
+  // which now demonstrably includes the adopted watch.
+  let actions = drain_actions(&mut m);
+  assert!(
+    !actions
+      .iter()
+      .any(|a| a.as_enumerate().is_some() || a.as_watch().is_some()),
+    "no counted rebuild is stood: {actions:?}"
+  );
+  assert!(
+    m.coverage_settled(s),
+    "and the fence settles clean: rearm_settled={} adoptions={}",
+    m.rearm_settled(s),
+    m.adoptions_settled(s)
+  );
+  assert!(
+    !m.has_coverage_deficit(s),
+    "with no darkness booked over unsubscribed ground either"
+  );
+  m.assert_invariants();
+}
+
+/// The COLD arm of the same collateral, and the one where what is at stake is a
+/// DELIVERED LIE rather than a lost obligation.
+///
+/// A widen's tail is `Arming` until its arm is acknowledged — here the previous
+/// root, demoted by a second depth-one widen whose pre-arm outcome the driver
+/// never replayed — and both burying
+/// renames can land in that interval: the monitor records them in full, and the
+/// re-key merely re-addresses the outstanding arm. The tail's first post-arm read
+/// is then an ordinary COLD one, stamped after the renames, so it completes as
+/// evidence and its verdict runs. Discovery is what a cold read announces: run on
+/// past a retirement that had destroyed the reading tail, it would emit a
+/// `Created` for every listing entry at a location rebuilt from a node no longer
+/// in the tree — which truncates to the scope ROOT and announces the tail's
+/// children as the root's.
+///
+/// It cannot: the burial's first rename is refused, so the tail is still there and
+/// its own listing is announced where it actually lives.
+#[test]
+fn a_cold_read_cannot_bury_its_own_directory_and_announces_at_its_real_location() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (old_root, kid, reserved, tail) = widen_into_an_unarmed_chain(&mut m, s);
+
+  // Both renames are attempted while the tail is still `Arming`: no read of it is
+  // in flight for them to dirty, and a re-key would merely re-address its
+  // outstanding arm.
+  let _ = attempt_to_bury_the_tail(&mut m, reserved, tail, old_root);
+  assert!(!m.is_watched(kid), "the refused subtree goes whole");
+  assert!(!m.adoptions_settled(s), "with the marker still standing");
+
+  // The acknowledgement the tail was waiting for. A non-re-arm arm's post-arm
+  // read is COLD — discovery, stamped now, so its listing is evidence.
+  m.ack_watch(tail, Ok(WatchAck::Installed));
+  let cold = read_of(&mut m, tail);
+  m.on_enumerate(
+    cold,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("orphan"), FileKind::Dir).with_node(ident(8)),
+    ]),
+  );
+  assert!(m.adoptions_settled(s), "the verdict resolves the marker");
+  assert!(m.is_watched(tail), "and the reading tail is still there");
+
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_created() && e.location() == &loc(&["mid", "orphan"])),
+    "its listing is announced at the coordinate it really occupies: {events:?}"
+  );
+  assert!(
+    !events
+      .iter()
+      .any(|e| e.kind().is_created() && e.location() == &loc(&["orphan"])),
+    "never root-relative, which is what a location rebuilt from a dead node \
+     truncates to: {events:?}"
+  );
+  m.assert_invariants();
+
+  quiesce(&mut m);
+  assert!(
+    m.coverage_settled(s),
+    "which releases rather than wedging: rearm_settled={}",
+    m.rearm_settled(s)
+  );
+  m.assert_invariants();
+}
+
+/// **Round six's sequence, end to end.** The one the whole redesign is for, and
+/// the only place the fabrication it found could ever have been observed.
+///
+/// Three depth-one widens, back to back, stack the shape a three-segment chain used
+/// to splice in one call: `root → interior → tail → adopted`, with a marker at the
+/// tail and the interior an intermediate directory left `Arming`. The root's own
+/// listing discharges the OUTERMOST marker, which is what makes the interior an
+/// ordinary movable node rather than an unproven adopted edge of its own. The
+/// adopted watch is then
+/// moved out of the tail, the interior parent is moved in UNDER whatever now holds
+/// that destination slot, and the interior's own post-arm COLD read completes with
+/// the tail listed FIRST as a non-directory.
+///
+/// Round six's finding: that first entry's `reconcile_slot` retires the tail,
+/// releasing its marker; the marker's adopted watch had been legally reparented
+/// ABOVE the interior, so the disposal that followed it destroyed the interior as
+/// a mere descendant — and `drop_subtree` returned no collateral outcome, so the
+/// COLD loop went on to its remaining entries. Each computed
+/// `child_location(interior, …)` through the deliberately lenient location walk,
+/// which TRUNCATES a dead id to the empty prefix, and emitted a **root-relative
+/// `Created`** — after the retirement's own covering `Rescan`, so nothing
+/// re-instructed it. Fabricated events, delivered, for children of a directory the
+/// consumer was never told about at that path.
+///
+/// The redesign refuses the FIRST rename instead of propagating the consequence.
+/// The destination slot is then held by a fresh watch rather than by the adopted
+/// one, so the second rename builds the same TOPOLOGY over a harmless object: the
+/// interior is a descendant of the slot, the tail is a descendant of the interior,
+/// and the tail's retirement mid-listing takes only the tail. The remaining
+/// entries reconcile into a live directory at its real location.
+///
+/// The mutation this kills: delete the `reparentable_adoption` conjunct at
+/// `on_moved_to`'s pairing arm and the first rename lands, the second one puts the
+/// adopted watch above the interior exactly as round six described, and the tail's
+/// retirement releases a marker whose adopted watch is no longer beneath it —
+/// which the containment `debug_assert!` in
+/// [`DiesWithTheWalk`](super::AdoptionDisposal::DiesWithTheWalk) reports before any
+/// of the rest can be observed.
+#[test]
+fn a_cold_reconcile_loop_cannot_lose_its_own_directory_or_fabricate_a_root_created() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let old_root = live_root_idle(&mut m, s);
+  // Three splices, innermost first: the tail adopts the old root at `b`, the
+  // interior adopts the tail at `mid`, and the final root adopts the interior at
+  // `x`. Only the tail is acknowledged — the interior is deliberately left
+  // `Arming` across both renames below, so that the read which reconciles its
+  // listing is its ordinary post-arm COLD one: the only flavor that announces
+  // `Created`s, and so the only one the fabrication could ever have ridden.
+  let tail = m.reserve_watch_id();
+  let _ = m
+    .widen_root(s, tail, vec![seg("b")], Some(ident(1)))
+    .expect("the widen splices");
+  m.ack_watch(tail, Ok(WatchAck::Installed));
+  let interior = m.reserve_watch_id();
+  let _ = m
+    .widen_root(s, interior, vec![seg("mid")], Some(ident(2)))
+    .expect("the widen over it splices");
+  let reserved = m.reserve_watch_id();
+  let _ = m
+    .widen_root(s, reserved, vec![seg("x")], Some(ident(3)))
+    .expect("and the widen over that one");
+  m.ack_watch(reserved, Ok(WatchAck::Installed));
+  let root_read = read_of(&mut m, reserved);
+  // The root's listing PROVES its own edge, which is what leaves the interior an
+  // ordinary node: an unproven adopted watch is refused a reparent, so an
+  // undischarged outer marker would refuse the second rename below for a reason
+  // that has nothing to do with what this cell measures.
+  m.on_enumerate(
+    root_read,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("x"), FileKind::Dir).with_node(ident(3)),
+    ]),
+  );
+  seal_adoptions(&mut m, s);
+  let _ = drain_events(&mut m);
+  assert_eq!(m.child_watch(tail, &seg("b")), Some(old_root));
+  assert_eq!(m.child_watch(interior, &seg("mid")), Some(tail));
+  assert_eq!(m.child_watch(reserved, &seg("x")), Some(interior));
+  assert!(
+    !m.adoptions_settled(s),
+    "two markers stand: the interior's, for the tail, and the tail's own"
+  );
+
+  // Round six's two renames. The first is the adopted watch out of the tail and
+  // into a slot of the widened root; the second is the tail's PARENT moved in
+  // under whatever now holds that slot — the adopted watch itself if the rename
+  // landed, a fresh replacement if it was refused. Either way the topology below
+  // is the same, and only one of them is a marker's escaped adopted watch.
+  let _ = move_the_adopted_watch(&mut m, tail, reserved, "c");
+  let above = m
+    .child_watch(reserved, &seg("c"))
+    .expect("the destination slot is occupied either way");
+  move_child(&mut m, reserved, "x", above, "inside", 62);
+  assert_eq!(m.child_watch(above, &seg("inside")), Some(interior));
+  assert_eq!(m.child_watch(interior, &seg("mid")), Some(tail));
+  assert!(!m.adoptions_settled(s), "the marker stands at the tail");
+
+  // The interior's post-arm COLD read, stamped after both renames so its listing
+  // is evidence. `mid` FIRST, so the retirement it triggers happens strictly
+  // before the loop reaches the entries that would announce and install.
+  m.ack_watch(interior, Ok(WatchAck::Installed));
+  let cold = read_of(&mut m, interior);
+  m.on_enumerate(
+    cold,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("mid"), FileKind::File),
+      DirEntry::new(seg("new"), FileKind::Dir).with_node(ident(9)),
+      DirEntry::new(seg("mystery"), FileKind::Unknown),
+    ]),
+  );
+  assert!(
+    !m.is_watched(tail),
+    "the non-directory entry retires the tail"
+  );
+  assert!(
+    m.adoptions_settled(s),
+    "releasing the marker it carried, whose adopted watch died with the walk"
+  );
+  assert!(
+    m.is_watched(interior),
+    "and the reading directory is UNTOUCHED: the drop was local to the tail's \
+     own subtree"
+  );
+
+  // The fabrication, absent. Every announcement of this listing names the
+  // interior's real location; none is the root-relative one a dead reader's
+  // truncated location walk would have produced.
+  let events = drain_events(&mut m);
+  let real = loc(&["c", "inside"]);
+  for change in &events {
+    if change.kind().is_created() {
+      assert!(
+        change.location().starts_with(&real),
+        "a `Created` outside the reading directory is fabricated: {change:?} \
+         (all: {events:?})"
+      );
+    }
+  }
+  assert!(
+    !events
+      .iter()
+      .any(|e| e.kind().is_created() && e.location() == &loc(&["new"])),
+    "and specifically not round six's own: {events:?}"
+  );
+  let announced = real.clone().child(seg("new"));
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_created() && e.location() == &announced),
+    "the later entries are announced where they are: {events:?}"
+  );
+
+  // And reconciled there too, rather than beneath a coordinate nothing occupies.
+  let installed = m
+    .child_watch(interior, &seg("new"))
+    .expect("the later entry installs under the parent the loop kept");
+  let actions = drain_actions(&mut m);
+  assert!(
+    actions.iter().any(|a| addresses(a, interior)),
+    "its arm and its slot stat are addressed to the interior: {actions:?}"
+  );
+  assert!(
+    m.has_coverage_deficit(s),
+    "and the unclassifiable name is booked at a coordinate that exists"
+  );
+  m.assert_invariants();
+
+  // The wedge negative.
+  m.ack_watch(installed, Ok(WatchAck::Installed));
+  for req in actions
+    .iter()
+    .filter_map(|a| a.as_enumerate().map(|e| e.req()))
+  {
+    m.on_enumerate(req, EnumerateResult::Ok(Vec::new()));
+  }
+  quiesce(&mut m);
+  assert!(
+    m.rearm_settled(s) && m.adoptions_settled(s),
+    "every cover this sequence stood releases: rearm_pending={:?}",
+    m.rearm_pending
+  );
+  m.assert_invariants();
+}
+
+/// How deep a nest of standing adoption markers the cell below builds: deep
+/// enough that ONE LIVE CALL FRAME PER LINK would overflow the test thread's
+/// stack (measured on a debug build: the per-link-frame shape aborts at 2400 links
+/// and survives 1200, so this carries margin); shallow enough under miri, where
+/// each step costs orders of magnitude more, to stay tractable. Nothing caps the
+/// marker count in the monitor, so either value is a sample of an unbounded family
+/// rather than a limit.
+const ADOPTION_NEST: u64 = if cfg!(miri) { 8 } else { 4000 };
+
+/// `ADOPTION_NEST` back-to-back widens, each adopting the previous root DIRECTLY
+/// under the new one — and nothing moving any of them, because nothing can.
+///
+/// Every marker below the final root is left standing and every adopted watch left
+/// exactly where the splice put it: a direct child of the node that owes its proof.
+/// At the one depth the splice serves, that child IS the previous root, so the
+/// result is one nested chain, `root → previous root → the one before it → …`, in
+/// which the newest adopted watch's teardown must release every marker in the nest.
+/// Returns `(final_root, newest_adopted, adopted)`, `adopted` innermost-first.
+fn nested_adoptions(m: &mut Monitor, s: ScopeId) -> (WatchId, WatchId, Vec<WatchId>) {
+  let mut root = live_root_idle(m, s);
+  let mut adopted = Vec::new();
+  let mut newest_read = None;
+  for k in 1..=ADOPTION_NEST {
+    let reserved = m.reserve_watch_id();
+    let mid = Segment::new(std::format!("mid{k}"));
+    let _ = m
+      .widen_root(s, reserved, vec![mid], Some(ident(k)))
+      .expect("each widen splices");
+    // The pre-arm outcome is replayed, as the driver does, and the cold read it
+    // queues is captured but deliberately left OUTSTANDING: at depth one the
+    // marker keys on the new root itself, so a complete listing answered inside
+    // the loop would take the verdict and release the very marker the next link
+    // is about to nest under.
+    m.ack_watch(reserved, Ok(WatchAck::Installed));
+    newest_read = drain_actions(m).iter().find_map(|a| {
+      a.as_enumerate()
+        .filter(|e| e.dir() == reserved)
+        .map(|e| e.req())
+    });
+    let _ = drain_events(m);
+    adopted.push(root);
+    root = reserved;
+  }
+  // The OUTERMOST marker alone is discharged, by the final root's own listing
+  // naming the newest adopted watch at the identity the splice adopted it under.
+  // That leaves the nest keyed strictly BELOW the surviving root — every marker
+  // an owner the teardown walk will itself destroy — which is the shape the cell
+  // measures. Left standing, it would be a marker whose key survives the walk and
+  // whose release is owed to a later read, not to the walk, and the count would
+  // say so.
+  m.on_enumerate(
+    newest_read.expect("the final root's cold read was queued"),
+    EnumerateResult::Ok(vec![
+      DirEntry::new(
+        Segment::new(std::format!("mid{ADOPTION_NEST}")),
+        FileKind::Dir,
+      )
+      .with_node(ident(ADOPTION_NEST)),
+    ]),
+  );
+  seal_adoptions(m, s);
+  let _ = drain_events(m);
+  let tail = *adopted.last().expect("ADOPTION_NEST is non-zero");
+  (root, tail, adopted)
+}
+
+/// One walk releases an arbitrarily deep nest of adoption markers, and grows the
+/// stack by nothing.
+///
+/// This is what the escapee worklist was for, and why deleting it is safe. An
+/// adopted watch that could be reparented OUT of its marker parent would have to
+/// be retired by a SECOND walk once its marker was released, whose own erased
+/// markers could free a third, and so on — one link per pending adoption marker,
+/// of which nothing caps the number. Driven by re-entering `drop_subtree` the
+/// chain spends a call frame per link and can overflow the stack; driven off a
+/// heap worklist it needs a second destructive pass whose reach is outside the
+/// subtree the caller named, which is the non-locality round six's fabrication
+/// came out of.
+///
+/// The containment invariant removes the chain rather than bounding it: each
+/// adopted watch is a direct child of its marker's node, so `ADOPTION_NEST`
+/// markers nest inside one another and ONE iterative walk destroys the lot.
+///
+/// Two claims, and [`ADOPTION_NEST`] is what makes the second testable. That every
+/// marker is released is what the assertions state; that nothing recurses per
+/// marker is what running at this depth demonstrates, since one live frame per
+/// link exhausts the test thread's stack here and aborts the process rather than
+/// failing an assertion.
+#[test]
+fn one_walk_releases_an_arbitrarily_deep_nest_of_adoption_markers() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let (root, tail, adopted) = nested_adoptions(&mut m, s);
+  assert_eq!(adopted.len(), ADOPTION_NEST as usize);
+  assert!(
+    adopted.iter().all(|a| m.is_watched(*a)),
+    "every adopted root is alive where its splice put it"
+  );
+  assert!(!m.adoptions_settled(s), "with every marker still standing");
+  m.assert_invariants();
+
+  // The newest tail dies with its marker unresolved. Its adopted watch is the
+  // next root, whose own tail holds the next marker, and so on down.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Removed)
+      .with_name(Segment::new(std::format!("mid{ADOPTION_NEST}"))),
+    at(30),
+  );
+  assert!(!m.is_watched(tail), "the tail dies");
+  assert!(
+    m.adoptions_settled(s),
+    "and one walk releases the whole nest of markers"
+  );
+  for (link, object) in adopted.iter().enumerate() {
+    assert!(
+      !m.is_watched(*object),
+      "link {link} of the nest died with the same walk — it was under it all \
+       along"
+    );
+  }
+  m.assert_invariants();
+
+  let _ = drain_events(&mut m);
+  drain_reads_clean(&mut m);
+  assert!(
+    m.coverage_settled(s),
+    "and the covers the walk stood all release: rearm_settled={}",
+    m.rearm_settled(s)
   );
   m.assert_invariants();
 }

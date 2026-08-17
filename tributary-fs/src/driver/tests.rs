@@ -7779,6 +7779,50 @@ mod descending {
       );
     }
 
+    /// The DEPTH CAP, end to end. An old root more than one segment below the new
+    /// one takes the general new-stream path: the splice would have to mint
+    /// intermediate connectors whose edges no marker proves and no `MoveSelf`
+    /// invalidates, so the commit gate declines it as a legitimate fallback rather
+    /// than a bug.
+    ///
+    /// What the cap costs is visible here and it is only the SHORTCUT: a second
+    /// spawn, the old stream retired, and the replace's covering `Rescan` instead
+    /// of a zero-gap ride. What it does not cost is the capability — the scope
+    /// still ends up rooted at the distant ancestor, and settles there.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_deep_widen_falls_back_to_the_stream_replace() {
+      let rig = inotify_rig();
+      rig.fs.put("/r/a", FileKind::Dir, 5);
+      rig.fs.put("/r/a/b", FileKind::Dir, 6);
+      let scope = watch(&rig, "/r/a/b").await;
+
+      // Two segments up (`a`, `b`) — one past the depth the splice serves.
+      assert!(replace(&rig, scope, "/r").await.is_ok());
+      settle(|| rig.fs.shutdowns() == 1).await;
+      assert_eq!(rig.fs.spawns(), 2, "the fallback took the new-stream path");
+      let (s, root, change) = next_rooted(&rig).await;
+      assert_eq!((s, root.as_path()), (scope, std::path::Path::new("/r")));
+      assert!(
+        change.kind().is_rescan(),
+        "the stream replace bridges with its covering Rescan: {change:?}"
+      );
+
+      // And it is a LIVE scope on the new root, not a wedged one: the ordinary
+      // unwatch resolves, retiring exactly the one stream the fallback spawned.
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::Unwatch {
+          scope,
+          reply: Some(reply),
+        })
+        .await
+        .unwrap();
+      assert!(on_reply.await.unwrap().is_torn());
+      settle(|| rig.fs.shutdowns() == 2).await;
+      assert_eq!(rig.fs.spawns(), 2, "and no further spawn was needed");
+    }
+
     /// Death wins mid-widen: a scope torn down while the pre-arm is parked
     /// answers `Retired`, and a parked unwatch resolves at quiescence — the
     /// widen's obligation is counted by the same fence as every other.
@@ -7907,21 +7951,29 @@ mod descending {
 
     const IN_MOVE_SELF: u32 = 0x0000_0800;
 
-    /// The Codex R1 finding-1 cell: a sync admitted after a deep widen PARKS
+    /// The Codex R1 finding-1 cell: a sync admitted after a widen PARKS
     /// until the adoption tripwire resolves. The old root moved during the
-    /// dark window (its parent was never armed, so the move is unrecorded and
-    /// its queued `MoveSelf` is the deliberate non-root no-op) — without the
+    /// dark window with nothing observing the adopted slot, so the move is
+    /// unrecorded — without the
     /// adoptions settle conjunct the cookie would dispatch immediately and
     /// resolve Delivered across the undelivered move; with it, the write
-    /// waits, the mismatch's covering root Rescan lands, and only then does
+    /// waits, the covering root Rescan lands, and only then does
     /// the barrier resolve.
+    ///
+    /// Both halves of the barrier's hold are separated here, in order, because
+    /// they are different claims. FIRST the edge is merely UNVERIFIED — no record
+    /// of the move exists yet — and the adoptions conjunct alone is what parks the
+    /// write. THEN the adopted object's own `MoveSelf` arrives and SPENDS the
+    /// proof (round eight: a non-root `MoveSelf` is otherwise a deliberate no-op,
+    /// and an unproven adopted watch is the one exception), which retires the edge
+    /// under a counted covering root `Rescan` — so the release resolves on that
+    /// rebuild and not on a listing whose restored occupancy would have confirmed.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_sync_across_an_unverified_adoption_parks_until_the_tripwire_resolves() {
       let rig = inotify_rig();
-      rig.fs.put("/r/a", FileKind::Dir, 10);
-      rig.fs.put("/r/a/b", FileKind::Dir, 11);
-      rig.fs.put("/r/a/b/deep", FileKind::Dir, 12);
-      let scope = watch(&rig, "/r/a/b").await;
+      rig.fs.put("/r/sub", FileKind::Dir, 11);
+      rig.fs.put("/r/sub/deep", FileKind::Dir, 12);
+      let scope = watch(&rig, "/r/sub").await;
       let old_watch = rig
         .fs
         .arms()
@@ -7930,21 +7982,28 @@ mod descending {
         .expect("the birth root arm")
         .0;
       // Fence the birth crawl (see the flagship cell).
-      fence_birth_crawl(&rig, scope, "/r/a/b").await;
+      fence_birth_crawl(&rig, scope, "/r/sub").await;
 
       // Freeze every post-commit read: the tripwire cannot resolve.
       let hold = rig.fs.hold_enumerates();
       assert!(replace(&rig, scope, "/r").await.is_ok());
+      assert_eq!(
+        rig.fs.spawns(),
+        1,
+        "the SPLICE committed — a fallback's spawn barrier would park this sync \
+         for reasons that have nothing to do with an unverified adoption"
+      );
 
-      // The dark-window move: `/r/a/b` renames to `/r/a/b2` with nobody armed
-      // at `/r/a`; the old root's own MoveSelf is the non-root no-op.
-      rig.fs.remove("/r/a/b/deep");
-      rig.fs.remove("/r/a/b");
-      rig.fs.put("/r/a/b2", FileKind::Dir, 11);
-      rig.fs.put("/r/a/b2/deep", FileKind::Dir, 12);
-      rig
-        .fs
-        .send_inotify_batch("/r/a/b", vec![attributed(&[old_watch], IN_MOVE_SELF, b"")]);
+      // The dark-window move: `/r/sub` renames to `/r/sub2` with nothing
+      // observing the adopted slot — the widened root's own records were dropped
+      // by the unknown-watch guard until the commit, and its first listing is
+      // held. The object's own `MoveSelf` is deliberately withheld until after the
+      // poll below, so what parks the write there is the UNVERIFIED edge itself
+      // and not a spent one.
+      rig.fs.remove("/r/sub/deep");
+      rig.fs.remove("/r/sub");
+      rig.fs.put("/r/sub2", FileKind::Dir, 11);
+      rig.fs.put("/r/sub2/deep", FileKind::Dir, 12);
 
       let (reply, mut on_reply) = futures_channel::oneshot::channel();
       rig
@@ -7972,9 +8031,43 @@ mod descending {
         "no write dispatches over the unverified window"
       );
 
-      // Release: the tail's listing lacks the adopted name — the escalation's
-      // covering root Rescan lands, the counted rebuild quiesces, and only
-      // then does the write dispatch and the barrier resolve.
+      // NOW the object's own move record lands. Round eight's exception: the old
+      // root is the widen's unproven adopted watch, so this spends the proof a
+      // later listing could still appear to give, and retires the edge under a
+      // COUNTED covering root Rescan. The barrier stays down across it — the
+      // release is owed to the rebuild, never to the move.
+      rig
+        .fs
+        .send_inotify_batch("/r/sub", vec![attributed(&[old_watch], IN_MOVE_SELF, b"")]);
+      for _ in 0..40 {
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+      }
+      assert!(
+        futures_util::poll!(&mut on_reply).is_pending(),
+        "the spent proof hands the barrier to its counted cover, not to nothing"
+      );
+      assert_eq!(
+        rig.fs.cookie_dispatches(),
+        0,
+        "and still no write over the interval the move ended"
+      );
+
+      // The invalidation's covering root Rescan, delivered BEFORE the reads are
+      // released — which is what makes this half of the cell decisive. With the
+      // `MoveSelf` exception gone the marker would simply stay unverified, every
+      // assertion above would still pass, and nothing would be signalled until a
+      // listing ran; the Rescan arriving here is the record that the object's own
+      // move is what spent the proof.
+      loop {
+        let (s, root, change) = next_rooted(&rig).await;
+        if s == scope && root.as_path() == std::path::Path::new("/r") && change.kind().is_rescan() {
+          break;
+        }
+      }
+
+      // Release: the counted rebuild quiesces, and only then does the write
+      // dispatch and the barrier resolve.
       hold.release();
       let path = tokio::time::timeout(Duration::from_secs(10), on_reply)
         .await
@@ -7982,47 +8075,40 @@ mod descending {
         .expect("the driver replies")
         .expect("the write lands");
       assert_eq!(rig.fs.cookie_writes(), vec![path]);
-      let mut saw_covering = false;
-      for _ in 0..200 {
-        if let Ok(Ok((s, root, change))) = tokio::time::timeout(Duration::from_millis(50), async {
-          Ok::<_, ()>(next_rooted(&rig).await)
-        })
-        .await
-        {
-          if s == scope && root.as_path() == std::path::Path::new("/r") && change.kind().is_rescan()
-          {
-            saw_covering = true;
-            break;
-          }
-        } else {
-          break;
-        }
-      }
-      assert!(saw_covering, "the mismatch's covering Rescan was delivered");
     }
 
-    /// The Codex R1 finding-2 cell: a connector replaced by a FILE during the
-    /// dark window. The widened root's cold listing reconciles the slot and
-    /// tears down the connector, the adopted old tree, and the pending
+    /// The Codex R1 finding-2 cell: the ADOPTED SLOT replaced by a FILE during
+    /// the dark window. The widened root's cold listing reconciles the slot and
+    /// tears down the adopted old tree and the pending
     /// tripwire in one drop — which must stand the closing covering Rescan
     /// (an erased unverified adoption is erased coverage), never disarm the
     /// old watches in silence. The scope stays serviceable: a later sync
     /// resolves.
+    ///
+    /// At the one depth the splice serves this slot IS the adopted edge, so the
+    /// finding's shape — an unverified adoption erased by a reconcile, driven by
+    /// the widened root's own first listing — is reached directly rather than
+    /// through an intermediate connector.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_connector_turned_file_tears_down_loudly() {
+    async fn an_adopted_slot_turned_file_tears_down_loudly() {
       let rig = inotify_rig();
-      rig.fs.put("/r/a", FileKind::Dir, 10);
-      rig.fs.put("/r/a/b", FileKind::Dir, 11);
-      rig.fs.put("/r/a/b/deep", FileKind::Dir, 12);
-      let scope = watch(&rig, "/r/a/b").await;
-      fence_birth_crawl(&rig, scope, "/r/a/b").await;
+      rig.fs.put("/r/sub", FileKind::Dir, 11);
+      rig.fs.put("/r/sub/deep", FileKind::Dir, 12);
+      let scope = watch(&rig, "/r/sub").await;
+      fence_birth_crawl(&rig, scope, "/r/sub").await;
 
       let hold = rig.fs.hold_enumerates();
       assert!(replace(&rig, scope, "/r").await.is_ok());
-      rig.fs.remove("/r/a/b/deep");
-      rig.fs.remove("/r/a/b");
-      rig.fs.remove("/r/a");
-      rig.fs.put("/r/a", FileKind::File, 40);
+      assert_eq!(
+        rig.fs.spawns(),
+        1,
+        "the SPLICE committed — a fallback's own covering Rescan and stream \
+         retirement would satisfy every assertion below without an adoption \
+         ever having been erased"
+      );
+      rig.fs.remove("/r/sub/deep");
+      rig.fs.remove("/r/sub");
+      rig.fs.put("/r/sub", FileKind::File, 40);
       hold.release();
 
       // The closing root Rescan is the teardown's honesty.
@@ -8055,17 +8141,22 @@ mod descending {
     }
 
     /// The ratified F-C chain extension: a resolved mount prefix covering the
-    /// old root sits ON the connecting chain, so the widen must fall back to
-    /// the stream replace — the chain crawl would `Other`-lower the connector
+    /// old root sits on the connecting chain, so the widen must fall back to
+    /// the stream replace — the chain crawl would `Other`-lower that slot
     /// and destroy the adopted coverage.
+    ///
+    /// The chain is one segment at the only depth the splice serves, so the seed
+    /// is placed at the old root itself: the SAME `old.starts_with(m)` gate, at
+    /// the only chain position that still exists. The seed must reach this gate
+    /// on its own merits, which is why the widen is depth-one — a deeper one
+    /// would be declined for its depth before the mount was ever consulted.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_mount_on_the_connecting_chain_falls_back_to_the_stream_replace() {
       let rig = inotify_rig();
-      rig.fs.put("/r/a", FileKind::Dir, 10);
-      rig.fs.put("/r/a/b", FileKind::Dir, 11);
-      let scope = watch(&rig, "/r/a/b").await;
-      // The widen target's meta resolves with a mount seeded AT the connector.
-      rig.fs.seed_mounts(vec![PathBuf::from("/r/a")]);
+      rig.fs.put("/r/sub", FileKind::Dir, 11);
+      let scope = watch(&rig, "/r/sub").await;
+      // The widen target's meta resolves with a mount seeded at the old root.
+      rig.fs.seed_mounts(vec![PathBuf::from("/r/sub")]);
 
       assert!(replace(&rig, scope, "/r").await.is_ok());
       settle(|| rig.fs.shutdowns() == 1).await;
@@ -8125,6 +8216,77 @@ mod descending {
         .expect("the write lands");
       assert_eq!(rig.fs.cookie_writes(), vec![path]);
       hold.release();
+    }
+
+    /// The adoption seal releases the coverage barrier from INSIDE the driver's
+    /// choke point — the one release in the loop that does not ride an ingest of
+    /// its own. A `sync_root` opened while the seal's cut is still in flight is
+    /// waiting on exactly that release, so the pass that takes it must also be the
+    /// pass that offers the fence its own ordering cut. Otherwise the fence is
+    /// judged against a barrier the next line settles, and with nothing left to
+    /// ingest the loop parks with the sync unanswered.
+    ///
+    /// Staged deterministically by holding the widened root's own listing on the
+    /// pool, so the marker cannot stage until the sync's fence is already open.
+    ///
+    /// Mutation witness: resolve the seals after the cover-fence demand instead of
+    /// before it, and this sync never answers.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sync_opened_under_a_staged_adoption_still_answers() {
+      let rig = inotify_rig();
+      rig.fs.put("/r/sub", FileKind::Dir, 2);
+      rig.fs.put("/r/sub/deep", FileKind::Dir, 3);
+      let scope = watch(&rig, "/r/sub").await;
+      fence_birth_crawl(&rig, scope, "/r/sub").await;
+
+      // The widened root's cold read parks on the gate, so the adoption marker
+      // stands UNSTAGED across everything below.
+      let hold = rig.fs.hold_enumerates_at("/r");
+      assert!(replace(&rig, scope, "/r").await.is_ok());
+      assert!(
+        settle(|| hold.captured() > 0).await,
+        "staging: the widened root's listing must be on the gate"
+      );
+
+      // The sync opens its fence over a barrier the standing marker holds down.
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::SyncRoot {
+          scope,
+          dir: PathBuf::from("/r"),
+          name: ".tributaries-sync-seal".to_owned(),
+          ticket: ticket(),
+          reply,
+        })
+        .await
+        .unwrap();
+      let mut opened = false;
+      for _ in 0..200 {
+        let (q, on_q) = futures_channel::oneshot::channel();
+        rig
+          .commands
+          .send(Command::DebugPendingCoverFences { scope, reply: q })
+          .await
+          .unwrap();
+        if on_q.await.unwrap() == 1 {
+          opened = true;
+          break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+      }
+      assert!(
+        opened,
+        "staging: the sync's fence must be open while the seal's cut is out"
+      );
+
+      hold.release();
+      let path = tokio::time::timeout(Duration::from_secs(10), on_reply)
+        .await
+        .expect("the sync answers on the pass the seal releases the barrier")
+        .expect("the driver replies")
+        .expect("the write lands");
+      assert_eq!(rig.fs.cookie_writes(), vec![path]);
     }
 
     /// W5/W6 end-to-end — the witnessed window's loss leg: a transport loss

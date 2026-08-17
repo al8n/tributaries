@@ -1126,17 +1126,52 @@ impl<R> Watcher<R> {
   /// to `/a`). The `RootHandle`, scope, and epoch stream survive. Two commit
   /// shapes:
   ///
-  /// - **A WIDENING replace on the descending (inotify) backend** — the old
-  ///   root strictly inside the new, same mount frame — is CONTINUOUS: the
-  ///   live stream is kept and the new root adopted above the old one, so
-  ///   coverage of the old subtree never gaps, no covering `Rescan` is
-  ///   emitted, no epoch is bumped, and every change recorded before the
-  ///   swap is still individually delivered (a
+  /// - **A WIDENING replace on the descending (inotify) backend by exactly ONE
+  ///   path segment** — the old root a direct child of the new, same mount
+  ///   frame — is CONTINUOUS: the live stream is kept and the new root adopted
+  ///   above the old one, so coverage of the old subtree never gaps, no
+  ///   covering `Rescan` is emitted, no epoch is bumped, and every change
+  ///   recorded before the swap is still individually delivered (a
   ///   [`sync_root`](Self::sync_root) barrier across the widen resolves by
   ///   delivery, not domination). The newly covered ground is announced as
   ///   `Created` discovery, exactly like a fresh watch's initial crawl.
-  /// - **Every other replace** (kernel-recursive backends, and disjoint or
-  ///   narrowing targets on the descending backend) is make-before-break:
+  ///
+  ///   The one-segment bound is where the continuity can be PAID for, not a
+  ///   limit of the splice. Between the commit and the new root's first read,
+  ///   the adopted slot is watched by nothing, so the edge into the old subtree
+  ///   has to be re-proven afterwards against the object the widen adopted —
+  ///   and at one segment the directory holding that slot is the new root
+  ///   itself, whose kernel watch went live BEFORE the commit and whose first
+  ///   listing is exactly a listing of that slot. A deeper chain would be
+  ///   connected by directories minted cold and unidentified: no watch to
+  ///   record a change at their slots, and nothing to re-prove their edges
+  ///   against. Widening by two or more segments therefore takes the second
+  ///   shape below instead — the capability is unchanged, only its zero-gap
+  ///   shortcut is.
+  ///
+  ///   That re-proof names an OBJECT at a slot, which makes the same-mount-frame
+  ///   condition above more than an endpoint test: the continuous shape ASSUMES
+  ///   the mount stack at the adopted slot does not change and change BACK
+  ///   between the commit and that first read. The frame is compared when the
+  ///   replace is admitted, and the first read fences every directory it lists
+  ///   against the root's mount — but both are SAMPLES, and nothing between them
+  ///   watches mount topology. A mount stacked over the slot moves no inode,
+  ///   breaks no parent link, and unmounts no filesystem; it changes only what
+  ///   the PATH resolves to, while the events that would spend the re-proof are
+  ///   defined against the inode and its filesystem.
+  ///
+  ///   So an overlay STILL STANDING at the first read is detected: the slot
+  ///   resolves across a mount boundary to an object the re-proof cannot match,
+  ///   the adopted edge fails, and its coverage is re-established loudly under a
+  ///   covering `Rescan`. An overlay raised and dropped entirely INSIDE the
+  ///   window is NOT detected — the slot reads exactly as the widen left it and
+  ///   the re-proof matches, so the widen certifies continuous. Changes to the
+  ///   underlying object are then delivered at a path that, for part of the
+  ///   window, named a different tree, and that part gets no covering `Rescan`.
+  ///
+  /// - **Every other replace** (kernel-recursive backends, widening by more
+  ///   than one segment, and disjoint or narrowing targets on the descending
+  ///   backend) is make-before-break:
   ///   the new stream is live before the old one is retired, and the commit
   ///   delivers one epoch-bumped full-root `Rescan` instructing the consumer
   ///   to re-read the (re-rooted) world — which covers the swap window and
