@@ -1476,8 +1476,13 @@ impl Monitor {
   /// The watch sent to the backend subscribes to a superset — the structural
   /// kinds (create/remove/move, on directories) the core's own watch tree needs —
   /// and emission narrows delivery back to `mask`. `Rescan` is never filtered.
+  ///
+  /// Answers `None` for exactly one reason — `scope` already has a registered
+  /// root — decided before the first mutation. The whole refusal contract lives
+  /// on [`register_root_with_profile`](Self::register_root_with_profile), which
+  /// holds every line of the registration this delegates to.
   #[cfg_attr(not(tarpaulin), inline)]
-  pub fn register_root(&mut self, scope: ScopeId, mask: Interest) -> WatchId {
+  pub fn register_root(&mut self, scope: ScopeId, mask: Interest) -> Option<WatchId> {
     self.register_root_with_profile(scope, mask, self.capabilities)
   }
 
@@ -1488,13 +1493,55 @@ impl Monitor {
   /// (a kernel-recursive fanotify mark on one filesystem, per-directory inotify
   /// on another) registers each root with the profile its backend satisfies.
   /// Everything else matches [`register_root`](Self::register_root).
+  ///
+  /// # Refusal
+  ///
+  /// Answers `None` for exactly ONE reason: `scope` already has a registered
+  /// root. The refusal is decided strictly BEFORE the first mutation — no handle
+  /// minted, no arm attempt consumed, no interest or profile stored, no counter
+  /// bumped, no action queued — so a refused registration leaves the Monitor
+  /// bit-identical and the caller free to unregister the live root and retry.
+  ///
+  /// It is a refusal rather than an overwrite because `roots.insert` would
+  /// ORPHAN the incumbent root: a parentless node reachable by nothing, sharing
+  /// every scope-keyed counter and pending move half with the surviving world,
+  /// reconstructing its subtree's locations against the WRONG root — and, worst,
+  /// able to un-register the LIVE root, since `drop_subtree` removes
+  /// `roots[scope]` for any parentless node it walks. The scope's whole tree
+  /// would then stand with no registered root and no signal at all. [`ScopeId`]
+  /// is caller-minted, so a duplicate is reachable from this crate's public API
+  /// rather than only from a Monitor bug.
+  ///
+  /// Liveness is judged by the registered ROOT alone, and deliberately not by
+  /// the scope's stored interest or profile: those outlive a root teardown that
+  /// was not an [`unregister_root`](Self::unregister_root) — an unmount-style
+  /// `Ignored` drops the root and leaves them — so re-registering such a scope
+  /// is the legitimate recovery path, not a duplicate. That recovery is not yet
+  /// free of hazard: `invalidate_root` removes the dead incarnation's
+  /// coverage-work epoch along with its root, so the replacement incarnation's
+  /// [`coverage_work_epoch`](Self::coverage_work_epoch) restarts from zero, and
+  /// a stamp an in-flight proof took against the retired incarnation can
+  /// compare equal against the replacement's early epoch instead of signaling
+  /// the death in between — tracked as #88, not fixed here.
+  ///
+  /// The answer is an [`Option`] and not a typed error because a single refusal
+  /// reason carries no information the absence does not, and because it matches
+  /// [`widen_root`](Self::widen_root)'s refuse-before-mutation idiom in this same
+  /// module. **A second refusal reason is the tipping point to a `Result`** —
+  /// recorded here so the next author does not have to rediscover it.
   #[cfg_attr(not(tarpaulin), inline)]
   pub fn register_root_with_profile(
     &mut self,
     scope: ScopeId,
     mask: Interest,
     caps: Capabilities,
-  ) -> WatchId {
+  ) -> Option<WatchId> {
+    // The whole guard, and it must stay exactly this probe: the scope's other
+    // books survive a non-`unregister_root` teardown by design, so reading them
+    // would refuse the legitimate re-registration a root death leaves behind.
+    if self.roots.contains_key(&scope) {
+      return None;
+    }
     let id = WatchId::new(self.watch_ids.mint());
     let attempt = self.next_arm_attempt();
     let placement = self.placement_now();
@@ -1548,7 +1595,7 @@ impl Monitor {
       crate::action::WatchTarget::Root(scope),
       Self::coverage_mask(mask),
     );
-    id
+    Some(id)
   }
 
   /// Replaces the capability profile of an already-registered root — the narrow
@@ -6652,6 +6699,25 @@ impl Monitor {
         "a pending_enumerate request maps to a live node that names it"
       );
     }
+    // Root uniqueness, the structural half of the duplicate-registration guard:
+    // a parentless node IS its scope's registered root. Both mint sites
+    // (`register_root_with_profile`, `widen_root`) re-point `roots` in the same
+    // call, and no path ever clears a `parent` afterwards — a detached move
+    // source keeps its `(parent, name)` — so this holds by construction, and
+    // that is exactly what makes `drop_subtree`'s unconditional
+    // `roots.remove(&node.scope)` on the parentless branch provably safe rather
+    // than accidentally safe. A second parentless node in one scope cannot also
+    // equal `roots[scope]`, so this one comparison carries both clauses: every
+    // parentless node is the registered root, and no scope has two of them.
+    for (id, node) in &self.nodes {
+      if node.parent.is_none() {
+        assert_eq!(
+          self.roots.get(&node.scope),
+          Some(id),
+          "a parentless node is its scope's one registered root"
+        );
+      }
+    }
     // Every registered root has a stored delivery interest and capability profile.
     for scope in self.roots.keys() {
       assert!(
@@ -6982,7 +7048,7 @@ impl Monitor {
   ///
   /// let mut monitor = Monitor::new(Capabilities::new());
   /// let scope = ScopeId::new(NonZeroU64::new(1).unwrap());
-  /// let root = monitor.register_root(scope, Interest::all());
+  /// let root = monitor.register_root(scope, Interest::all()).expect("a fresh scope");
   ///
   /// // The scope root IS a location: the empty one.
   /// assert_eq!(monitor.location_of_checked(root), Some(Location::new()));

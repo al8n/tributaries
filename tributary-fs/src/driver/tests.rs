@@ -8268,11 +8268,13 @@ mod descending {
 
       fn live_core_at(root: &str) -> (DriverCore, ScopeId) {
         let mut core = DriverCore::new(Duration::from_millis(100), Duration::ZERO);
-        let scope = core.on_watch(
-          PathBuf::from(root),
-          tributary_proto::Interest::all(),
-          BackendKind::Inotify,
-        );
+        let scope = core
+          .on_watch(
+            PathBuf::from(root),
+            tributary_proto::Interest::all(),
+            BackendKind::Inotify,
+          )
+          .expect("a fresh scope registers");
         while core.poll_effect().is_some() {}
         core.on_stream_spawned(
           scope,
@@ -8752,11 +8754,13 @@ mod descending {
 
       fn unit_core_at(root: &str) -> (DriverCore, ScopeId, tributary_proto::WatchId) {
         let mut core = DriverCore::new(Duration::from_millis(100), Duration::ZERO);
-        let scope = core.on_watch(
-          PathBuf::from(root),
-          tributary_proto::Interest::all(),
-          BackendKind::Inotify,
-        );
+        let scope = core
+          .on_watch(
+            PathBuf::from(root),
+            tributary_proto::Interest::all(),
+            BackendKind::Inotify,
+          )
+          .expect("a fresh scope registers");
         while core.poll_effect().is_some() {}
         core.on_stream_spawned(
           scope,
@@ -8913,11 +8917,13 @@ mod descending {
         root: &str,
         ino: u128,
       ) -> (ScopeId, tributary_proto::WatchId) {
-        let scope = core.on_watch(
-          PathBuf::from(root),
-          tributary_proto::Interest::all(),
-          BackendKind::Inotify,
-        );
+        let scope = core
+          .on_watch(
+            PathBuf::from(root),
+            tributary_proto::Interest::all(),
+            BackendKind::Inotify,
+          )
+          .expect("a fresh scope registers");
         while core.poll_effect().is_some() {}
         core.on_stream_spawned(
           scope,

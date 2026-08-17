@@ -74,6 +74,19 @@ pub enum WatchRootError {
   /// return, with no operator action.
   #[error("too many native streams are still winding down; retry later")]
   CleanupBacklog,
+  /// The driver minted a [`ScopeId`](crate::ScopeId) that already names a live
+  /// watched root, so the registration was refused rather than allowed to
+  /// overwrite the incumbent's bookkeeping.
+  ///
+  /// Unreachable through this watcher: its scope ids are minted from a
+  /// monotonic counter that never reuses a value, so no `watch` call can
+  /// collide. The condition is reported instead of asserted because the refusal
+  /// it carries belongs to `tributary-proto`, whose scope ids are supplied by
+  /// the driver — an out-of-tree driver CAN collide, and turning its mistake
+  /// into a panic here would deny it the one signal it can act on. Treat it as
+  /// a bug in whatever minted the id; retrying cannot clear it.
+  #[error("the minted scope already names a live watched root")]
+  ScopeInUse,
   /// The watcher's driver has already stopped.
   #[error("the watcher is closed")]
   Closed,

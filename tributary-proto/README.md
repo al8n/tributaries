@@ -74,10 +74,14 @@ let mut monitor = Monitor::new(Capabilities::new().with_kernel_recursive());
 assert!(!monitor.descends());
 
 // The layer above supplies the scope id for each disjoint root; the returned
-// `WatchId` is the handle the queued action carries.
+// `WatchId` is the handle the queued action carries. A scope that already has a
+// registered root is refused — the one reason this answers `None`.
 let scope = ScopeId::new(NonZeroU64::new(1).unwrap());
-let root = monitor.register_root(scope, Interest::all());
+let root = monitor
+  .register_root(scope, Interest::all())
+  .expect("a fresh scope registers");
 assert_eq!(monitor.scope_of(root), Some(scope));
+assert_eq!(monitor.register_root(scope, Interest::all()), None);
 
 // Drain the work the registration produced. A real driver executes each action
 // against the OS and reports the outcome back through `on_watch_result`.

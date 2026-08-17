@@ -89,6 +89,7 @@ use tributary_proto::{
 };
 
 use crate::{
+  error::WatchRootError,
   os::{
     BackendKind, BatchPayload, FsEventFlags, RawOsEvent, RootIdentity, RootMeta, SourceError,
     SourceEvent,
@@ -1554,17 +1555,27 @@ impl DriverCore {
 
   /// Registers a new watched root, returning its scope handle. Queues the
   /// [`Effect::SpawnStream`] that starts the native source.
+  ///
+  /// Fallible only because the Monitor refuses a scope that already has a
+  /// registered root. The mint below is monotonic and never reuses a value, so
+  /// the branch is dead by construction HERE — it is propagated rather than
+  /// `expect`ed because the Monitor's guard exists for out-of-tree drivers, and
+  /// an assertion in this crate's only caller would answer their mistake with a
+  /// panic instead of the refusal. Nothing is registered on the error path.
   pub(crate) fn on_watch(
     &mut self,
     root: PathBuf,
     interest: Interest,
     profile: BackendKind,
-  ) -> ScopeId {
+  ) -> Result<ScopeId, WatchRootError> {
     self.scope_seq += 1;
     let scope = ScopeId::new(NonZeroU64::new(self.scope_seq).expect("sequence starts at one"));
-    let watch = self
+    let Some(watch) = self
       .monitor
-      .register_root_with_profile(scope, interest, caps_for(profile));
+      .register_root_with_profile(scope, interest, caps_for(profile))
+    else {
+      return Err(WatchRootError::ScopeInUse);
+    };
     self.scopes.insert(
       scope,
       ScopeState {
@@ -1593,7 +1604,7 @@ impl DriverCore {
     );
     self.watch_scopes.insert(watch, scope);
     self.drain_monitor();
-    scope
+    Ok(scope)
   }
 
   /// Unregisters a watched root; its teardown effect follows.
