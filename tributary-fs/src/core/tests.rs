@@ -78,7 +78,9 @@ fn alive_refresh(mounts: Vec<PathBuf>, authoritative: bool) -> MountRefresh {
 /// fed (an authoritative empty table): event-side trust is open.
 fn live_core() -> (DriverCore, ScopeId) {
   let mut core = DriverCore::new(WINDOW, LIVENESS);
-  let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::FsEvents);
+  let scope = core
+    .on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::FsEvents)
+    .expect("a fresh scope registers");
   let effects = drain(&mut core);
   assert!(
     matches!(effects.as_slice(), [Effect::SpawnStream { root, .. }] if root == Path::new("/r")),
@@ -111,7 +113,9 @@ fn live_core() -> (DriverCore, ScopeId) {
 /// boundaries stay unknown, so event-side identity/cookie trust is refused.
 fn live_core_blind_mounts() -> (DriverCore, ScopeId) {
   let mut core = DriverCore::new(WINDOW, LIVENESS);
-  let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::FsEvents);
+  let scope = core
+    .on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::FsEvents)
+    .expect("a fresh scope registers");
   let _ = drain(&mut core);
   core.on_stream_spawned(
     scope,
@@ -1734,7 +1738,9 @@ fn rename_coalesced_with_create_and_remove_grounds_by_existence() {
 #[test]
 fn seeded_mount_blocks_pairing_before_any_probe_learns_it() {
   let mut core = DriverCore::new(WINDOW, LIVENESS);
-  let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::FsEvents);
+  let scope = core
+    .on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::FsEvents)
+    .expect("a fresh scope registers");
   let _ = drain(&mut core);
   // The volume was ALREADY mounted at spawn: only the seeded table knows —
   // and the union keeps the seed even when the birth refresh (racing an
@@ -1775,7 +1781,9 @@ fn birth_window_refuses_cookies_until_the_refresh_installs() {
   // landing in neither the seed nor the event stream — so a scope is born
   // trust-closed, and only the post-live birth refresh installs authority.
   let mut core = DriverCore::new(WINDOW, LIVENESS);
-  let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::FsEvents);
+  let scope = core
+    .on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::FsEvents)
+    .expect("a fresh scope registers");
   let _ = drain(&mut core);
   core.on_stream_spawned(
     scope,
@@ -1859,7 +1867,9 @@ fn birth_window_refuses_cookies_until_the_refresh_installs() {
 #[test]
 fn a_loss_racing_the_birth_refresh_rearms_it_once() {
   let mut core = DriverCore::new(WINDOW, LIVENESS);
-  let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::FsEvents);
+  let scope = core
+    .on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::FsEvents)
+    .expect("a fresh scope registers");
   let _ = drain(&mut core);
   core.on_stream_spawned(
     scope,
@@ -2209,7 +2219,9 @@ fn same_batch_unmount_keeps_colliding_rename_foreign() {
   // The volume was known at spawn; a rename coalesces into the SAME batch as
   // the volume's unmount, with a root-device object colliding on the fileID.
   let mut core = DriverCore::new(WINDOW, LIVENESS);
-  let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::FsEvents);
+  let scope = core
+    .on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::FsEvents)
+    .expect("a fresh scope registers");
   let _ = drain(&mut core);
   core.on_stream_spawned(
     scope,
@@ -2625,7 +2637,9 @@ fn single_partner_grant_is_probe_order_independent() {
 #[test]
 fn spawn_failure_emits_nothing_public() {
   let mut core = DriverCore::new(WINDOW, LIVENESS);
-  let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::FsEvents);
+  let scope = core
+    .on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::FsEvents)
+    .expect("a fresh scope registers");
   let _ = drain(&mut core);
   core.on_stream_spawned(scope, Err(SourceError::StartFailed));
   let effects = drain(&mut core);
@@ -2652,7 +2666,9 @@ fn spawn_failure_emits_nothing_public() {
 #[test]
 fn spawn_rejection_emits_nothing_public() {
   let mut core = DriverCore::new(WINDOW, LIVENESS);
-  let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::FsEvents);
+  let scope = core
+    .on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::FsEvents)
+    .expect("a fresh scope registers");
   let _ = drain(&mut core);
   core.on_spawn_rejected(scope);
   let effects = drain(&mut core);
@@ -2995,7 +3011,9 @@ mod lowering {
   #[test]
   fn filesystem_root_scope_grounds_descendants_located() {
     let mut core = DriverCore::new(WINDOW, LIVENESS);
-    let scope = core.on_watch(PathBuf::from("/"), Interest::all(), BackendKind::FsEvents);
+    let scope = core
+      .on_watch(PathBuf::from("/"), Interest::all(), BackendKind::FsEvents)
+      .expect("a fresh scope registers");
     let _ = drain(&mut core);
     core.on_stream_spawned(
       scope,
@@ -3293,7 +3311,9 @@ mod descending {
 
   fn live_descending_with(root_mnt_id: Option<u64>) -> (DriverCore, ScopeId, ReqId, WatchId) {
     let mut core = DriverCore::new(WINDOW, LIVENESS);
-    let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Inotify);
+    let scope = core
+      .on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Inotify)
+      .expect("a fresh scope registers");
     let effects = drain(&mut core);
     assert!(
       matches!(effects.as_slice(), [Effect::SpawnStream { root, .. }] if root == Path::new("/r")),
@@ -3814,7 +3834,9 @@ mod descending {
   /// arm — the stream is live and `root` is populated, but coverage (and the
   /// caller's deferred grant) does not begin until the root arm resolves.
   fn spawned_with_pending_root_arm_at(core: &mut DriverCore, root: &str) -> (ScopeId, WatchId) {
-    let scope = core.on_watch(PathBuf::from(root), Interest::all(), BackendKind::Inotify);
+    let scope = core
+      .on_watch(PathBuf::from(root), Interest::all(), BackendKind::Inotify)
+      .expect("a fresh scope registers");
     let _ = drain(core);
     core.on_stream_spawned(
       scope,
@@ -7935,7 +7957,9 @@ mod kernel_recursive_fanotify {
   /// watch-result, and the birth refresh installs authoritative (empty) trust.
   fn live_fanotify() -> (DriverCore, ScopeId) {
     let mut core = DriverCore::new(WINDOW, LIVENESS);
-    let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Fanotify);
+    let scope = core
+      .on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Fanotify)
+      .expect("a fresh scope registers");
     let effects = drain(&mut core);
     assert!(
       matches!(effects.as_slice(), [Effect::SpawnStream { root, .. }] if root == Path::new("/r")),
@@ -8186,7 +8210,9 @@ mod kernel_recursive_fanotify {
   /// unmount is signalled in-band (`IN_UNMOUNT`), so it must NOT arm the tick.
   fn live_inotify() -> (DriverCore, ScopeId) {
     let mut core = DriverCore::new(WINDOW, LIVENESS);
-    let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Inotify);
+    let scope = core
+      .on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Inotify)
+      .expect("a fresh scope registers");
     let _ = drain(&mut core);
     core.on_stream_spawned(
       scope,
@@ -8320,7 +8346,9 @@ mod kernel_recursive_fanotify {
   #[test]
   fn liveness_interval_zero_disables_the_tick() {
     let mut core = DriverCore::new(WINDOW, Duration::ZERO);
-    let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Fanotify);
+    let scope = core
+      .on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Fanotify)
+      .expect("a fresh scope registers");
     let _ = drain(&mut core);
     core.on_stream_spawned(
       scope,
@@ -8372,7 +8400,9 @@ mod kernel_recursive_fanotify {
   #[test]
   fn fid_only_root_death_dies_without_the_liveness_tick() {
     let mut core = DriverCore::new(WINDOW, Duration::ZERO);
-    let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Fanotify);
+    let scope = core
+      .on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Fanotify)
+      .expect("a fresh scope registers");
     let _ = drain(&mut core);
     core.on_stream_spawned(
       scope,
@@ -8466,7 +8496,9 @@ mod kernel_recursive_fanotify {
 
     // Drive that admitted event into a fanotify scope whose liveness tick is DISABLED.
     let mut core = DriverCore::new(WINDOW, Duration::ZERO);
-    let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Fanotify);
+    let scope = core
+      .on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Fanotify)
+      .expect("a fresh scope registers");
     let _ = drain(&mut core);
     core.on_stream_spawned(
       scope,
@@ -8766,7 +8798,9 @@ mod auto_selection {
   #[test]
   fn auto_provisional_inotify_adopts_probed_fanotify() {
     let mut core = DriverCore::new(WINDOW, LIVENESS);
-    let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Inotify);
+    let scope = core
+      .on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Inotify)
+      .expect("a fresh scope registers");
     let _ = drain(&mut core);
     core.on_stream_spawned(
       scope,
@@ -8825,7 +8859,9 @@ mod auto_selection {
   #[test]
   fn auto_provisional_inotify_keeps_inotify_on_fallback() {
     let mut core = DriverCore::new(WINDOW, LIVENESS);
-    let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Inotify);
+    let scope = core
+      .on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Inotify)
+      .expect("a fresh scope registers");
     let _ = drain(&mut core);
     core.on_stream_spawned(
       scope,
@@ -8888,7 +8924,9 @@ mod rdcw_lowering {
   /// The same, under a narrowed subscription — the shape an admission claim
   /// needs, since `Interest::all()` admits on any fact at all.
   fn live_scope_with(core: &mut DriverCore, interest: Interest) -> ScopeId {
-    let scope = core.on_watch(PathBuf::from("/r"), interest, BackendKind::Rdcw);
+    let scope = core
+      .on_watch(PathBuf::from("/r"), interest, BackendKind::Rdcw)
+      .expect("a fresh scope registers");
     let _ = drain(core);
     core.on_stream_spawned(
       scope,
@@ -9165,7 +9203,9 @@ mod usn_lowering {
   }
 
   fn live_scope_with(core: &mut DriverCore, interest: Interest) -> ScopeId {
-    let scope = core.on_watch(PathBuf::from("/r"), interest, BackendKind::UsnJournal);
+    let scope = core
+      .on_watch(PathBuf::from("/r"), interest, BackendKind::UsnJournal)
+      .expect("a fresh scope registers");
     let _ = drain(core);
     core.on_stream_spawned(
       scope,
@@ -10576,7 +10616,9 @@ mod root_replaced {
   }
 
   fn live_kr_scope(core: &mut DriverCore) -> ScopeId {
-    let scope = core.on_watch(PathBuf::from("/a/b"), Interest::all(), BackendKind::Rdcw);
+    let scope = core
+      .on_watch(PathBuf::from("/a/b"), Interest::all(), BackendKind::Rdcw)
+      .expect("a fresh scope registers");
     let _ = drain(core);
     core.on_stream_spawned(scope, Ok(meta("/a/b", 1, 1, BackendKind::Rdcw)));
     let _ = drain(core);
@@ -10645,11 +10687,13 @@ mod root_replaced {
   fn parked_probe_work_is_cut_never_readdressed() {
     let mut core = DriverCore::new(WINDOW, LIVENESS);
     // An FSEvents scope: its ambiguous flag words PARK batches on probes.
-    let scope = core.on_watch(
-      PathBuf::from("/a/b"),
-      Interest::all(),
-      BackendKind::FsEvents,
-    );
+    let scope = core
+      .on_watch(
+        PathBuf::from("/a/b"),
+        Interest::all(),
+        BackendKind::FsEvents,
+      )
+      .expect("a fresh scope registers");
     let _ = drain(&mut core);
     core.on_stream_spawned(scope, Ok(meta("/a/b", 1, 1, BackendKind::FsEvents)));
     let _ = drain(&mut core);
@@ -10701,7 +10745,9 @@ mod root_replaced {
   #[test]
   fn an_in_flight_refresh_across_the_commit_cannot_kill_the_swapped_scope() {
     let mut core = DriverCore::new(WINDOW, LIVENESS);
-    let scope = core.on_watch(PathBuf::from("/a/b"), Interest::all(), BackendKind::Rdcw);
+    let scope = core
+      .on_watch(PathBuf::from("/a/b"), Interest::all(), BackendKind::Rdcw)
+      .expect("a fresh scope registers");
     let _ = drain(&mut core);
     core.on_stream_spawned(scope, Ok(meta("/a/b", 1, 1, BackendKind::Rdcw)));
     // The birth refresh is dispatched and STILL OUT when the commit lands.
@@ -10774,7 +10820,9 @@ mod root_replaced {
     use crate::os::linux::WatchOutcome;
 
     let mut core = DriverCore::new(WINDOW, LIVENESS);
-    let scope = core.on_watch(PathBuf::from("/a/b"), Interest::all(), BackendKind::Inotify);
+    let scope = core
+      .on_watch(PathBuf::from("/a/b"), Interest::all(), BackendKind::Inotify)
+      .expect("a fresh scope registers");
     let _ = drain(&mut core);
     core.on_stream_spawned(scope, Ok(meta("/a/b", 1, 1, BackendKind::Inotify)));
     let effects = drain(&mut core);
@@ -10969,7 +11017,9 @@ mod root_widened {
   /// outstanding-read survival cell keeps it in flight across the widen.
   fn live_at(root: &str, ino: u128, feed_boot: bool) -> (DriverCore, ScopeId, WatchId, ReqId) {
     let mut core = DriverCore::new(WINDOW, LIVENESS);
-    let scope = core.on_watch(PathBuf::from(root), Interest::all(), BackendKind::Inotify);
+    let scope = core
+      .on_watch(PathBuf::from(root), Interest::all(), BackendKind::Inotify)
+      .expect("a fresh scope registers");
     let _ = drain(&mut core);
     core.on_stream_spawned(scope, Ok(meta(root, ino)));
     let effects = drain(&mut core);
@@ -11878,7 +11928,9 @@ mod exclusions {
   /// Registers, spawns and arms a descending root at `/r` on `core`, returning
   /// its scope, the root's cold-enumerate request and the root watch.
   fn live_descending(core: &mut DriverCore) -> (ScopeId, ReqId, WatchId) {
-    let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Inotify);
+    let scope = core
+      .on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Inotify)
+      .expect("a fresh scope registers");
     let _ = drain(core);
     core.on_stream_spawned(
       scope,
@@ -11923,7 +11975,9 @@ mod exclusions {
 
   /// A live RDCW (kernel-recursive) scope at `/r` on `core`.
   fn live_rdcw(core: &mut DriverCore) -> ScopeId {
-    let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Rdcw);
+    let scope = core
+      .on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Rdcw)
+      .expect("a fresh scope registers");
     let _ = drain(core);
     core.on_stream_spawned(
       scope,
@@ -12373,7 +12427,9 @@ mod exclusions {
   #[test]
   fn the_fence_stands_down_for_a_backend_that_enforces_exclusions_itself() {
     let mut core = excluding(&["/r/cache"]);
-    let scope = core.on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Fanotify);
+    let scope = core
+      .on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Fanotify)
+      .expect("a fresh scope registers");
     let _ = drain(&mut core);
     core.on_stream_spawned(
       scope,
@@ -13405,11 +13461,13 @@ mod exclusions {
     use crate::os::windows::usn::{UsnAdmitted, UsnTarget};
 
     let mut core = excluding(&["/r/a/cache"]);
-    let scope = core.on_watch(
-      PathBuf::from("/r"),
-      Interest::all(),
-      BackendKind::UsnJournal,
-    );
+    let scope = core
+      .on_watch(
+        PathBuf::from("/r"),
+        Interest::all(),
+        BackendKind::UsnJournal,
+      )
+      .expect("a fresh scope registers");
     let _ = drain(&mut core);
     core.on_stream_spawned(
       scope,

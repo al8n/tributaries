@@ -7101,8 +7101,18 @@ pub(crate) async fn run<R, F>(
             let _ = reply.send(Err(WatchRootError::CleanupBacklog));
           } else {
             let requested = root.clone();
-            let scope = core.on_watch(root, interest, config.profile);
-            watch_replies.insert(scope, PendingWatch { requested, reply });
+            // The scope mint is monotonic, so the refusal arm is dead here; it
+            // is answered rather than asserted so an out-of-tree driver reusing
+            // this core learns of the collision instead of taking a panic.
+            // Nothing was registered, so there is no teardown to owe.
+            match core.on_watch(root, interest, config.profile) {
+              Ok(scope) => {
+                watch_replies.insert(scope, PendingWatch { requested, reply });
+              }
+              Err(err) => {
+                let _ = reply.send(Err(err));
+              }
+            }
           }
         }
         Ok(Command::Replace {

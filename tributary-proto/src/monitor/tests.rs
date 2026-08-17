@@ -65,7 +65,9 @@ fn drain_events(m: &mut Monitor) -> Vec<Change> {
 /// registered, then confirms the new root's bootstrap Watch was queued.
 fn live_root(m: &mut Monitor, s: ScopeId) -> WatchId {
   let _ = drain_actions(m);
-  let root = m.register_root(s, Interest::all());
+  let root = m
+    .register_root(s, Interest::all())
+    .expect("a fresh scope registers");
   let actions = drain_actions(m);
   assert!(
     actions
@@ -105,7 +107,9 @@ fn new_reports_capabilities_and_descent() {
 #[test]
 fn register_root_mints_and_queues_root_watch() {
   let mut m = per_dir();
-  let root = m.register_root(scope(1), Interest::all());
+  let root = m
+    .register_root(scope(1), Interest::all())
+    .expect("a fresh scope registers");
   assert!(m.is_watched(root));
   assert_eq!(m.scope_of(root), Some(scope(1)));
 
@@ -116,10 +120,107 @@ fn register_root_mints_and_queues_root_watch() {
   assert_eq!(cmd.target(), &WatchTarget::Root(scope(1)));
 }
 
+/// A `ScopeId` that is already live is REFUSED, and refused strictly before the
+/// first mutation — the whole Monitor is bit-identical across the call, through
+/// both entry points and under a mask and profile that differ from the live
+/// registration's. `ScopeId` is caller-minted, so the duplicate is reachable
+/// from the public API rather than only from a Monitor bug.
+#[test]
+fn a_duplicate_live_scope_is_refused_without_mutating() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+  let before = std::format!("{m:?}");
+
+  assert_eq!(
+    m.register_root(scope(1), Interest::all()),
+    None,
+    "a live scope refuses a second registration"
+  );
+  assert_eq!(
+    m.register_root_with_profile(scope(1), Interest::new(), Capabilities::new()),
+    None,
+    "…and through the profile form, which is where every mutation lives"
+  );
+
+  assert_eq!(
+    std::format!("{m:?}"),
+    before,
+    "a refused registration mints no handle, consumes no attempt, queues nothing"
+  );
+  // Spelled out for the books the overwrite used to corrupt, so a regression
+  // names the damage instead of handing back two Debug dumps to diff.
+  assert_eq!(
+    m.roots.get(&scope(1)),
+    Some(&root),
+    "the scope's root is still the first one"
+  );
+  assert_eq!(m.scope_interests.get(&scope(1)), Some(&Interest::all()));
+  assert_eq!(m.scope_profiles.get(&scope(1)), Some(&m.capabilities));
+  assert_eq!(
+    m.rearm_pending.get(&scope(1)),
+    None,
+    "no re-arm-flavored birth was booked"
+  );
+  assert!(
+    drain_actions(&mut m).is_empty(),
+    "no watch was queued for the refused root"
+  );
+  m.assert_invariants();
+}
+
+/// The orphan cannot un-register the LIVE root, because the guard admits no
+/// orphan. `drop_subtree` removes `roots[scope]` for ANY parentless node it
+/// walks, so under an overwrite the first root's own teardown would take the
+/// second one's registration with it — leaving a whole live tree standing under
+/// a registration that no longer exists, with `location_of_checked` answering
+/// `None` and every coverage signal silently no-op. Here the teardown ends the
+/// scope honestly instead.
+#[test]
+fn a_refused_duplicate_leaves_no_orphan_to_unregister_the_live_root() {
+  let mut m = per_dir();
+  let first = live_root_idle(&mut m, scope(1));
+  assert_eq!(m.register_root(scope(1), Interest::all()), None);
+  assert_eq!(m.roots.get(&scope(1)), Some(&first));
+
+  // Tear down the first root — the node the overwrite would have orphaned.
+  m.on_os_record(OsRecord::new(first, RecordKind::Ignored), at(1));
+  assert_eq!(
+    m.roots.get(&scope(1)),
+    None,
+    "the scope's only root is gone with it"
+  );
+  assert!(
+    m.nodes.values().all(|node| node.scope != scope(1)),
+    "no node of the scope outlives its registration"
+  );
+  m.assert_invariants();
+}
+
+/// Invariant (B) has teeth. The duplicate is unreachable through the API now,
+/// which is the point, so the second parentless node is open-coded exactly as
+/// the overwrite produced it: `roots` re-pointed at a fresh root and the
+/// incumbent left parentless and unregistered.
+#[test]
+#[should_panic(expected = "a parentless node is its scope's one registered root")]
+fn assert_invariants_catches_a_second_parentless_root() {
+  let mut m = per_dir();
+  let first = live_root_idle(&mut m, scope(1));
+  m.assert_invariants();
+
+  let mut orphaned = m.nodes.get(&first).cloned().expect("the root is live");
+  orphaned.children = BTreeSet::new();
+  let second = m.reserve_watch_id();
+  m.nodes.insert(second, orphaned);
+  m.roots.insert(scope(1), second);
+  m.assert_invariants();
+}
+
 #[test]
 fn per_dir_watch_success_triggers_enumerate_after_arming() {
   let mut m = per_dir();
-  let root = m.register_root(scope(1), Interest::all());
+  let root = m
+    .register_root(scope(1), Interest::all())
+    .expect("a fresh scope registers");
   let _ = drain_actions(&mut m);
   m.ack_watch(root, Ok(WatchAck::Installed));
 
@@ -132,7 +233,9 @@ fn per_dir_watch_success_triggers_enumerate_after_arming() {
 #[test]
 fn kernel_recursive_watch_success_does_not_enumerate() {
   let mut m = kernel_recursive();
-  let root = m.register_root(scope(1), Interest::all());
+  let root = m
+    .register_root(scope(1), Interest::all())
+    .expect("a fresh scope registers");
   let _ = drain_actions(&mut m);
   m.ack_watch(root, Ok(WatchAck::Installed));
   assert!(
@@ -395,7 +498,9 @@ fn moved_from_without_cookie_is_removed_immediately() {
 #[test]
 fn no_space_watch_result_emits_rescan() {
   let mut m = per_dir();
-  let root = m.register_root(scope(1), Interest::all());
+  let root = m
+    .register_root(scope(1), Interest::all())
+    .expect("a fresh scope registers");
   let _ = drain_actions(&mut m);
   m.ack_watch(root, Err(WatchError::NoSpace));
 
@@ -2629,7 +2734,9 @@ fn io_watch_failure_is_coverage_loss() {
 #[test]
 fn no_space_watch_result_drops_node() {
   let mut m = per_dir();
-  let root = m.register_root(scope(1), Interest::all());
+  let root = m
+    .register_root(scope(1), Interest::all())
+    .expect("a fresh scope registers");
   let _ = drain_actions(&mut m);
   m.ack_watch(root, Err(WatchError::NoSpace));
   assert!(
@@ -4657,8 +4764,10 @@ fn random_op_storm_holds_invariants_and_terminates() {
     };
 
     let mut watches = std::vec![
-      m.register_root(scope(1), Interest::all()),
-      m.register_root(scope(2), Interest::all()),
+      m.register_root(scope(1), Interest::all())
+        .expect("a fresh scope registers"),
+      m.register_root(scope(2), Interest::all())
+        .expect("a fresh scope registers"),
     ];
     let mut reqs: std::vec::Vec<ReqId> = std::vec::Vec::new();
     let names = [seg("a"), seg("b"), seg("c")];
@@ -6292,7 +6401,9 @@ fn held_origin_enumerate_stays_coverage_only_across_pairing() {
 fn modified_only_interest_keeps_coverage_and_filters_delivery() {
   let mut m = per_dir();
   let mask = Interest::new().with_modified();
-  let root = m.register_root(scope(1), mask);
+  let root = m
+    .register_root(scope(1), mask)
+    .expect("a fresh scope registers");
   // The installed watch subscribes to the coverage superset, not the bare request.
   let installed = drain_actions(&mut m)
     .iter()
@@ -6362,7 +6473,9 @@ fn modified_only_interest_keeps_coverage_and_filters_delivery() {
 #[test]
 fn rescan_bypasses_the_delivery_filter() {
   let mut m = per_dir();
-  let root = m.register_root(scope(1), Interest::new());
+  let root = m
+    .register_root(scope(1), Interest::new())
+    .expect("a fresh scope registers");
   m.ack_watch(root, Ok(WatchAck::Installed));
   let boot = drain_actions(&mut m)
     .iter()
@@ -6388,7 +6501,9 @@ fn directory_move_deliveries_honor_ondir() {
   let mut m = per_dir();
   // Everything except dir-targeted delivery.
   let mask = Interest::all().maybe_ondir(false);
-  let root = m.register_root(scope(1), mask);
+  let root = m
+    .register_root(scope(1), mask)
+    .expect("a fresh scope registers");
   m.ack_watch(root, Ok(WatchAck::Installed));
   let boot = drain_actions(&mut m)
     .iter()
@@ -6483,7 +6598,9 @@ fn directory_move_deliveries_honor_ondir() {
 fn late_destination_uses_the_pending_halfs_class_for_ondir() {
   let mut m = per_dir();
   let mask = Interest::all().maybe_ondir(false);
-  let root = m.register_root(scope(1), mask);
+  let root = m
+    .register_root(scope(1), mask)
+    .expect("a fresh scope registers");
   m.ack_watch(root, Ok(WatchAck::Installed));
   let boot = drain_actions(&mut m)
     .iter()
@@ -6562,7 +6679,9 @@ fn late_destination_uses_the_pending_halfs_class_for_ondir() {
 fn paired_move_uses_one_class_for_delivery_and_coverage() {
   let mut m = per_dir();
   let mask = Interest::all().maybe_ondir(false);
-  let root = m.register_root(scope(1), mask);
+  let root = m
+    .register_root(scope(1), mask)
+    .expect("a fresh scope registers");
   m.ack_watch(root, Ok(WatchAck::Installed));
   let boot = drain_actions(&mut m)
     .iter()
@@ -6667,7 +6786,9 @@ fn root_delete_self_rescans_despite_a_filtered_interest() {
   let mut m = per_dir();
   // Modified-only, and no dir-target delivery at all.
   let mask = Interest::new().with_modified();
-  let root = m.register_root(scope(1), mask);
+  let root = m
+    .register_root(scope(1), mask)
+    .expect("a fresh scope registers");
   m.ack_watch(root, Ok(WatchAck::Installed));
   let boot = drain_actions(&mut m)
     .iter()
@@ -7081,7 +7202,9 @@ fn root_invalidation_purges_pending_moves_across_generations() {
   // …then the root is torn down (unmount-style Ignored) and the scope re-registered.
   m.on_os_record(OsRecord::new(root, RecordKind::Ignored), at(2));
   let _ = drain_events(&mut m);
-  let root2 = m.register_root(scope(1), Interest::all());
+  let root2 = m
+    .register_root(scope(1), Interest::all())
+    .expect("the Ignored teardown freed the scope: this re-registration is legitimate");
   m.ack_watch(root2, Ok(WatchAck::Installed));
   let boot = drain_actions(&mut m)
     .iter()
@@ -7870,8 +7993,10 @@ fn kernel_recursive_deep_storm_holds_invariants_and_terminates() {
     };
 
     let roots = [
-      m.register_root(scope(1), Interest::all()),
-      m.register_root(scope(2), Interest::all()),
+      m.register_root(scope(1), Interest::all())
+        .expect("a fresh scope registers"),
+      m.register_root(scope(2), Interest::all())
+        .expect("a fresh scope registers"),
     ];
     while m.poll_action().is_some() {}
     m.ack_watch(roots[0], Ok(WatchAck::Installed));
@@ -9182,8 +9307,12 @@ fn under_hold_suppression_alone_stays_destination_only() {
 fn mixed_profiles_descend_independently() {
   let mut m = kernel_recursive();
   let desc = Capabilities::new().with_supports_push().with_native_move();
-  let r1 = m.register_root_with_profile(scope(1), Interest::all(), desc);
-  let r2 = m.register_root(scope(2), Interest::all());
+  let r1 = m
+    .register_root_with_profile(scope(1), Interest::all(), desc)
+    .expect("a fresh scope registers");
+  let r2 = m
+    .register_root(scope(2), Interest::all())
+    .expect("a fresh scope registers");
   m.ack_watch(r1, Ok(WatchAck::Installed));
   m.ack_watch(r2, Ok(WatchAck::Installed));
   let actions = drain_actions(&mut m);
@@ -9207,8 +9336,12 @@ fn mixed_profiles_descend_independently() {
 fn per_scope_profile_gates_descent_on_records() {
   let mut m = kernel_recursive();
   let desc = Capabilities::new().with_supports_push().with_native_move();
-  let r1 = m.register_root_with_profile(scope(1), Interest::all(), desc);
-  let r2 = m.register_root(scope(2), Interest::all());
+  let r1 = m
+    .register_root_with_profile(scope(1), Interest::all(), desc)
+    .expect("a fresh scope registers");
+  let r2 = m
+    .register_root(scope(2), Interest::all())
+    .expect("a fresh scope registers");
   m.ack_watch(r1, Ok(WatchAck::Installed));
   m.ack_watch(r2, Ok(WatchAck::Installed));
   // Settle the descending root's bootstrap read so the record below is post-discovery.
@@ -9257,8 +9390,12 @@ fn per_scope_profile_gates_descent_on_records() {
 fn overflow_rearm_respects_scope_profile() {
   let mut m = kernel_recursive();
   let desc = Capabilities::new().with_supports_push().with_native_move();
-  let r1 = m.register_root_with_profile(scope(1), Interest::all(), desc);
-  let r2 = m.register_root(scope(2), Interest::all());
+  let r1 = m
+    .register_root_with_profile(scope(1), Interest::all(), desc)
+    .expect("a fresh scope registers");
+  let r2 = m
+    .register_root(scope(2), Interest::all())
+    .expect("a fresh scope registers");
   m.ack_watch(r1, Ok(WatchAck::Installed));
   m.ack_watch(r2, Ok(WatchAck::Installed));
   let boot = drain_actions(&mut m)
@@ -9312,9 +9449,13 @@ fn mixed_profile_storm_holds_invariants_and_terminates() {
     };
 
     let desc_caps = Capabilities::new().with_supports_push().with_native_move();
-    let desc_root = m.register_root_with_profile(scope(1), Interest::all(), desc_caps);
+    let desc_root = m
+      .register_root_with_profile(scope(1), Interest::all(), desc_caps)
+      .expect("a fresh scope registers");
     let mut cur_desc_root = desc_root;
-    let kr_root = m.register_root(scope(2), Interest::all());
+    let kr_root = m
+      .register_root(scope(2), Interest::all())
+      .expect("a fresh scope registers");
     let mut desc_watches = std::vec![desc_root];
     let mut reqs: std::vec::Vec<ReqId> = std::vec::Vec::new();
     while m.poll_action().is_some() {}
@@ -9464,7 +9605,9 @@ fn mixed_profile_storm_holds_invariants_and_terminates() {
       // scope with the SAME profile — tracking the CURRENT root so exactly one live
       // registration per scope exists, per the API contract.
       if m.scope_of(cur_desc_root).is_none() && rng() % 2 == 0 {
-        cur_desc_root = m.register_root_with_profile(scope(1), Interest::all(), desc_caps);
+        cur_desc_root = m
+          .register_root_with_profile(scope(1), Interest::all(), desc_caps)
+          .expect("a fresh scope registers");
         desc_watches.push(cur_desc_root);
       }
     }
@@ -9564,7 +9707,9 @@ fn the_bootstrap_crawl_is_counted_and_its_first_fence_reads_lossy() {
   let mut m = per_dir();
   let s = scope(1);
 
-  let root = m.register_root(s, Interest::all());
+  let root = m
+    .register_root(s, Interest::all())
+    .expect("a fresh scope registers");
   assert!(
     !m.rearm_settled(s),
     "the registration's crawl is counted from the grant"
@@ -9731,7 +9876,9 @@ fn rearm_kickoff_refusal_cases() {
 
   let mut kr = kernel_recursive();
   let s = scope(7);
-  let root = kr.register_root(s, Interest::all());
+  let root = kr
+    .register_root(s, Interest::all())
+    .expect("a fresh scope registers");
   kr.ack_watch(root, Ok(WatchAck::Installed));
   assert!(kr.rearm_watch_subtree(root).is_refused());
   assert!(kr.rearm_settled(s));
@@ -10466,7 +10613,9 @@ fn a_removed_record_over_a_slot_hole_stands_a_covering_rescan() {
 fn a_removed_over_a_hole_reaches_a_modified_only_subscription() {
   let mut m = per_dir();
   let mask = Interest::new().with_modified();
-  let root = m.register_root(scope(1), mask);
+  let root = m
+    .register_root(scope(1), mask)
+    .expect("a fresh scope registers");
   m.ack_watch(root, Ok(WatchAck::Installed));
   let boot = drain_actions(&mut m)
     .iter()
@@ -12344,7 +12493,9 @@ fn widen_preserves_the_deficit_book_and_its_resignal_addressing() {
 fn widen_refuses_kr_unknown_and_empty_chains() {
   let mut m = kernel_recursive();
   let s = scope(1);
-  let root = m.register_root(s, Interest::all());
+  let root = m
+    .register_root(s, Interest::all())
+    .expect("a fresh scope registers");
   m.ack_watch(root, Ok(WatchAck::Installed));
   let _ = drain_actions(&mut m);
   let reserved = m.reserve_watch_id();
@@ -13716,7 +13867,13 @@ fn reproving_storm_settles_only_over_postdating_acks() {
     let scopes = [scope(1), scope(2)];
     let mut roots: std::collections::BTreeMap<ScopeId, WatchId> = scopes
       .iter()
-      .map(|&sc| (sc, m.register_root(sc, Interest::all())))
+      .map(|&sc| {
+        (
+          sc,
+          m.register_root(sc, Interest::all())
+            .expect("a fresh scope registers"),
+        )
+      })
       .collect();
     // The outside mirror of the ACK-postdates-loss stamp.
     let mut loss_count: std::collections::BTreeMap<ScopeId, u64> =
@@ -13784,7 +13941,9 @@ fn reproving_storm_settles_only_over_postdating_acks() {
       for &sc in &scopes {
         let root = roots.get_mut(&sc).expect("both scopes are tracked");
         if !m.is_watched(*root) {
-          *root = m.register_root(sc, Interest::all());
+          *root = m
+            .register_root(sc, Interest::all())
+            .expect("a fresh scope registers");
         }
       }
 
@@ -14179,7 +14338,7 @@ fn a_parked_rename_half_advances_the_coverage_work_epoch() {
 /// bootstrap read — the precondition for every admission witness.
 fn live_root_idle_with(m: &mut Monitor, s: ScopeId, mask: Interest) -> WatchId {
   let _ = drain_actions(m);
-  let root = m.register_root(s, mask);
+  let root = m.register_root(s, mask).expect("a fresh scope registers");
   let _ = drain_actions(m);
   m.ack_watch(root, Ok(WatchAck::Installed));
   let boot = drain_actions(m)
@@ -14428,7 +14587,9 @@ fn a_superseded_arm_failure_does_not_invalidate_the_current_binding() {
   let mut m = per_dir();
   let s = scope(1);
   let _ = drain_actions(&mut m);
-  let root = m.register_root(s, Interest::all());
+  let root = m
+    .register_root(s, Interest::all())
+    .expect("a fresh scope registers");
   let stale = drain_actions(&mut m)
     .iter()
     .find_map(|a| a.as_watch().filter(|c| c.id() == root).map(|c| c.attempt()))
