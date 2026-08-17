@@ -1393,6 +1393,163 @@ mod integration {
   }
 }
 
+/// `FsSource` resolves a coordinate with the BLOCKING `std::fs::canonicalize`, which against a
+/// stalled FUSE/NFS export returns no sooner than the mount does. Running it inline on the thread
+/// polling the future parks an executor worker unrelated tasks share — and defeats the owner's
+/// close race outright, since nothing can preempt a plain call on its own thread. So the
+/// resolution must reach the runtime's BLOCKING POOL.
+///
+/// Proved WITHOUT a hung mount, and without timing: the probe runtime's blocking pool is capped at
+/// one thread and that thread is held, so an offloaded resolution provably cannot have run — the
+/// first poll is `Pending`, and the coordinate only arrives once the occupant releases the pool.
+/// An inline `std::fs::canonicalize` is immune to that saturation and answers `Ready` on the very
+/// first poll, having already burned the polling thread on the syscall.
+///
+/// The source is built on a SEPARATE runtime so the watcher's own detached blocking work never
+/// competes for the capped pool this cell reasons about.
+///
+/// FAIL-ON-REVERT: restore the synchronous body (`std::fs::canonicalize(&supplied)` inline, no
+/// `R::spawn_blocking`) and the `is_pending` assertion below fires.
+#[cfg(all(feature = "tokio", not(miri)))]
+#[test]
+fn fs_canonicalization_never_resolves_on_the_polling_thread() {
+  use agnostic_lite::tokio::TokioRuntime;
+  use futures_util::poll;
+  use tributary_fs::WatcherOptions;
+
+  use crate::{Source, event::path_components, source::FsSource};
+
+  let host = tokio::runtime::Builder::new_current_thread()
+    .enable_all()
+    .build()
+    .expect("the host runtime builds");
+  let source = host.block_on(async {
+    FsSource::<TokioRuntime>::new(WatcherOptions::new()).expect("build FsSource")
+  });
+
+  // A real path with real resolution work to do (the temp root is a symlink on macOS).
+  let supplied = std::env::temp_dir();
+  let expected =
+    path_components(&std::fs::canonicalize(&supplied).expect("the temp root canonicalizes"));
+  let key = path_components(&supplied);
+
+  let probe = tokio::runtime::Builder::new_current_thread()
+    .max_blocking_threads(1)
+    .enable_all()
+    .build()
+    .expect("the probe runtime builds");
+  probe.block_on(async {
+    // Hold the pool's only thread until this cell releases it.
+    let (occupied_tx, occupied_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    tokio::task::spawn_blocking(move || {
+      occupied_tx
+        .send(())
+        .expect("the occupancy signal is received");
+      let _ = release_rx.recv();
+    });
+    occupied_rx.recv().expect("the blocking pool is saturated");
+
+    let mut resolving = core::pin::pin!(source.canonicalize_key(&key));
+    assert!(
+      poll!(resolving.as_mut()).is_pending(),
+      "the resolution is queued behind the saturated blocking pool — it did not run on this thread"
+    );
+
+    release_tx.send(()).expect("the occupant is released");
+    let resolved = resolving
+      .await
+      .expect("the temp root canonicalizes once the pool is free");
+    assert_eq!(
+      resolved, expected,
+      "the offloaded resolution still answers the fs-canonical coordinate"
+    );
+  });
+
+  // Tear the watcher down on the runtime that spawned it.
+  host.block_on(async move { drop(source) });
+}
+
+/// Reaching the blocking pool is only half of it: a resolution the owner's close race ABANDONS must
+/// not leave its job behind. On tokio — the stock hosting runtime — dropping a join handle DETACHES,
+/// so the job stays queued and runs later; the very failure this offload exists for (a close winning
+/// against a wedged mount) would strand work, and repeated watcher create/probe/close cycles would
+/// pile queued jobs onto a pool whose threads that mount already holds. The abandoned wait must
+/// ABORT instead, which cancels a job the pool has not begun running.
+///
+/// Deterministic, with no timing anywhere: the probe runtime's blocking pool is capped at ONE
+/// thread and that thread is held, so the job provably has not started when the wait is dropped.
+/// Releasing the occupant drains the pool in FIFO order, and a marker queued BEHIND the abandoned
+/// job proves the pool reached and disposed of it — only then is the flag read.
+///
+/// The offload under test is the one `FsSource::canonicalize_key` uses — the same
+/// [`on_blocking_pool`](super::on_blocking_pool), with an observable closure standing in for
+/// `std::fs::canonicalize`, whose read-only syscall leaves nothing a cell could watch. That the
+/// resolution reaches that pool at all is
+/// [`fs_canonicalization_never_resolves_on_the_polling_thread`]'s job.
+///
+/// The RESIDUAL this cell does NOT claim, because the code does not deliver it: a job the pool has
+/// already STARTED runs to completion and holds its worker until the kernel returns. An in-progress
+/// blocking syscall cannot be interrupted; abort removes the queued growth and nothing more.
+///
+/// FAIL-ON-REVERT: await the handle bare in `on_blocking_pool` (`R::spawn_blocking(job).await`,
+/// i.e. detach on drop) and the queued closure runs as the pool frees — the flag is set and the
+/// final assertion fires.
+#[cfg(all(feature = "tokio", not(miri)))]
+#[test]
+fn an_abandoned_blocking_resolution_aborts_its_queued_job() {
+  use core::sync::atomic::{AtomicBool, Ordering};
+  use std::sync::Arc;
+
+  use agnostic_lite::tokio::TokioRuntime;
+  use futures_util::poll;
+
+  let probe = tokio::runtime::Builder::new_current_thread()
+    .max_blocking_threads(1)
+    .enable_all()
+    .build()
+    .expect("the probe runtime builds");
+
+  let ran = Arc::new(AtomicBool::new(false));
+  probe.block_on(async {
+    // Hold the pool's only thread, so nothing queued behind it can start.
+    let (occupied_tx, occupied_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    tokio::task::spawn_blocking(move || {
+      occupied_tx
+        .send(())
+        .expect("the occupancy signal is received");
+      let _ = release_rx.recv();
+    });
+    occupied_rx.recv().expect("the blocking pool is saturated");
+
+    {
+      let job = Arc::clone(&ran);
+      let mut resolving = core::pin::pin!(super::on_blocking_pool::<TokioRuntime, _, _>(
+        move || job.store(true, Ordering::SeqCst)
+      ));
+      assert!(
+        poll!(resolving.as_mut()).is_pending(),
+        "staging: the job is QUEUED behind the saturated pool, not running"
+      );
+      // ABANDON the wait — precisely what the owner's biased close race does to the loser of its
+      // `select_biased!`.
+    }
+
+    // Queued BEHIND the abandoned job. The pool is one FIFO-served thread, so the marker joining
+    // proves the pool already reached and disposed of that job — no sleep, no polling loop.
+    let marker = tokio::task::spawn_blocking(|| ());
+    release_tx.send(()).expect("the occupant is released");
+    marker.await.expect("the marker job joins");
+
+    assert!(
+      !ran.load(Ordering::SeqCst),
+      "the abandoned resolution's closure was ABORTED, never run — a detached job would have run \
+       right here as the pool drained"
+    );
+  });
+}
+
 /// The reserved namespace is the binding's business: it renders a cookie's
 /// name from the owner's token and classifies EVERY leaf matching a shape this
 /// binding has minted as an artifact — ours, another instance's, or a crashed
@@ -1891,8 +2048,12 @@ mod the_invalid_uid_sentinel {
   impl Source<OsString> for FsClassified {
     type Handle = u32;
 
-    fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
-      Ok(key.to_vec())
+    fn canonicalize_key(
+      &self,
+      key: &[OsString],
+    ) -> impl Future<Output = Result<Vec<OsString>, WatchError>> + Send {
+      let canonical = key.to_vec();
+      async move { Ok(canonical) }
     }
 
     async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {

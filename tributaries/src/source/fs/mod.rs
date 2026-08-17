@@ -14,7 +14,7 @@ use std::{
   vec::Vec,
 };
 
-use agnostic_lite::RuntimeLite;
+use agnostic_lite::{JoinHandle, RuntimeLite};
 use tributary_fs::{
   CloseError as FsCloseError, CoverOutcome, Event as FsEvent, EventKind as FsEventKind,
   ReplaceRootError, RequestOutcome, RootHandle, SkipReason, SourceError, SyncRootDenied,
@@ -164,9 +164,9 @@ impl<R: RuntimeLite> FsSource<R> {
   }
 }
 
-// The deferral queue and the Source seam below are channel and registry work:
-// no method names an `R` item (the runtime bound lives on `new`, the one
-// place the watcher driver is spawned).
+// The deferral queue below is pure channel and registry work: no method names an `R` item, so it
+// carries no runtime bound. (The `Source` seam does — `canonicalize_key` hands its blocking
+// resolution to `R`'s blocking pool — as does `new`, where the watcher driver is spawned.)
 impl<R> FsSource<R> {
   /// Queues a prune the control channel refused (momentarily full), **latest-wins per handle**
   /// ([`Source::set_cover`] contract clause 6): a newer request for the same handle replaces the
@@ -222,10 +222,103 @@ impl<R> FsSource<R> {
 /// (later arms, the conflict-triggered path, or `Drop` take the rest).
 const OPPORTUNISTIC_RELEASE_HANDOFFS: usize = 2;
 
-impl<R> Source<OsString> for FsSource<R> {
+/// An RAII claim on ONE in-flight blocking job: the runtime's [`JoinHandle`] lives here instead of
+/// being awaited bare, so a wait the caller ABANDONS **aborts** its job rather than detaching it.
+///
+/// A bare `.await` leaves cancellation to the handle's own `Drop`, which is runtime-dependent and
+/// wrong exactly where it matters: on tokio — the stock hosting runtime — dropping a `JoinHandle`
+/// DETACHES, so a resolution the umbrella's close race abandons against a wedged mount stays
+/// queued and runs later, and repeated create/probe/close cycles pile jobs onto a pool whose
+/// threads that same mount is already holding. (On smol the handle's drop already cancels; there it
+/// is the explicit [`detach`](JoinHandle::detach) that keeps a task running.) Naming the intent
+/// makes the behaviour the same on both.
+///
+/// [`abort`](JoinHandle::abort) removes exactly that growth: it cancels a job the pool has **not
+/// begun running** (the worker pops it, sees the cancelled mark, and drops the closure without
+/// ever calling it).
+///
+/// What it does NOT do, stated plainly rather than papered over: a job already RUNNING keeps its
+/// worker until the kernel returns, because an in-progress blocking syscall cannot be interrupted.
+/// That bound belongs to the syscall, not to this crate; what survives an abort is one job per
+/// abandoned wait that had already started, and the runtime's own blocking-pool ceiling is what
+/// bounds the pool against them.
+struct AbortOnDrop<O, H: JoinHandle<O>> {
+  /// The live claim, released by whichever comes first: the join resolving (the job is over — there
+  /// is nothing left to abort) or [`Drop`] (the abort).
+  handle: Option<H>,
+  /// `O` appears only in `H`'s trait bound, so it needs a marker here. `fn() -> O` keeps the claim
+  /// `Send`/`Sync` on `H` alone, exactly as the underlying handle is.
+  _output: core::marker::PhantomData<fn() -> O>,
+}
+
+impl<O, H: JoinHandle<O>> AbortOnDrop<O, H> {
+  fn new(handle: H) -> Self {
+    Self {
+      handle: Some(handle),
+      _output: core::marker::PhantomData,
+    }
+  }
+}
+
+impl<O, H: JoinHandle<O>> Future for AbortOnDrop<O, H> {
+  type Output = Result<O, H::JoinError>;
+
+  fn poll(
+    self: core::pin::Pin<&mut Self>,
+    cx: &mut core::task::Context<'_>,
+  ) -> core::task::Poll<Self::Output> {
+    // Every field is `Unpin` — [`JoinHandle`] requires it of the handle — so the pin projects
+    // trivially.
+    let this = self.get_mut();
+    let handle = this
+      .handle
+      .as_mut()
+      .expect("AbortOnDrop polled after its join already resolved");
+    match core::pin::Pin::new(handle).poll(cx) {
+      core::task::Poll::Ready(joined) => {
+        // Joined: the job is over and its result is in hand. Release the claim so the `Drop` below
+        // cannot "abort" a job whose output was already consumed, and so a stray re-poll trips the
+        // `expect` above instead of polling a completed handle (which some runtimes panic on).
+        this.handle = None;
+        core::task::Poll::Ready(joined)
+      }
+      core::task::Poll::Pending => core::task::Poll::Pending,
+    }
+  }
+}
+
+impl<O, H: JoinHandle<O>> Drop for AbortOnDrop<O, H> {
+  fn drop(&mut self) {
+    if let Some(handle) = self.handle.take() {
+      // Dropped with the job unjoined: the awaiting future was abandoned. ABORT, never detach.
+      handle.abort();
+    }
+  }
+}
+
+/// Hands `job` to `R`'s blocking pool and awaits it through an [`AbortOnDrop`] claim — the single
+/// offload site for this binding's blocking filesystem work, so the abort-not-detach discipline
+/// holds wherever a caller can abandon the wait.
+fn on_blocking_pool<R, F, O>(job: F) -> impl Future<Output = Result<O, std::io::Error>> + Send
+where
+  R: RuntimeLite,
+  F: FnOnce() -> O + Send + 'static,
+  O: Send + 'static,
+{
+  let claim = AbortOnDrop::new(R::spawn_blocking(job));
+  // A join failure means the job could not be run to completion — it panicked, or the pool is
+  // shutting down. Fold it into `io::Error` (the conversion every runtime's join error provides)
+  // so the caller keeps ONE classification site and the cause is preserved in the box.
+  async move { claim.await.map_err(Into::into) }
+}
+
+impl<R: RuntimeLite> Source<OsString> for FsSource<R> {
   type Handle = RootHandle;
 
-  fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
+  fn canonicalize_key(
+    &self,
+    key: &[OsString],
+  ) -> impl Future<Output = Result<Vec<OsString>, WatchError>> + Send {
     // Resolve the path with the SAME canonicalization `arm` applies (via
     // `tributary_fs::Watcher::watch`, which `std::fs::canonicalize`s its root before spawning the
     // stream), so the umbrella classifies and commits on the coordinate events arrive under. A
@@ -233,23 +326,47 @@ impl<R> Source<OsString> for FsSource<R> {
     // no real location, rather than accepting it silently and then never delivering an event.
     // Idempotent on an already-canonical path (`canonicalize` is a fixed point there), as the
     // trait's idempotence contract requires.
+    //
+    // `std::fs::canonicalize` BLOCKS, and against a stalled FUSE/NFS export it blocks without
+    // bound — so it runs on the runtime's BLOCKING POOL, never on the thread polling this future.
+    // Two things depend on that: the owner's biased close race can only win against a future that
+    // returns `Pending` (nothing preempts a plain call on its own thread), and an executor worker
+    // shared with unrelated tasks must not be parked on one mount. The future owns everything it
+    // needs and borrows neither `self` nor `key`.
+    //
+    // A close that abandons this future ABORTS the offloaded job rather than detaching it (see
+    // [`AbortOnDrop`]) — dropping a join handle is the runtime's detach, so awaiting it bare would
+    // leave a still-queued resolution to run later, and the create/probe/close cycles this race
+    // exists for would accumulate them. What abort cannot reach, stated exactly: a resolution the
+    // pool has ALREADY STARTED holds one blocking worker until the kernel returns, because an
+    // in-progress blocking syscall cannot be interrupted. That is a property of the syscall, not
+    // of this crate, and the runtime's own blocking-pool ceiling is what bounds what is left.
     let supplied = key_to_path(key);
-    let canonical = std::fs::canonicalize(&supplied).map_err(|source| {
-      // Classify by the io error's kind — the two cases a caller can act on distinctly
-      // (a missing path vs a permission wall) — and fold the rest to `Other`; the whole
-      // io error is preserved in the box either way. The key's display form is this
-      // binding's own rendering (the neutral error is not path-typed).
-      let kind = match source.kind() {
-        std::io::ErrorKind::NotFound => FaultKind::NotFound,
-        std::io::ErrorKind::PermissionDenied => FaultKind::PermissionDenied,
-        _ => FaultKind::Other,
-      };
-      WatchError::canonicalize(
-        supplied.display().to_string(),
-        SourceFault::new(kind).with_source(source),
-      )
-    })?;
-    Ok(path_components(&canonical))
+    async move {
+      // The key's display form is this binding's own rendering (the neutral error is not
+      // path-typed); it is captured before `supplied` moves onto the pool.
+      let displayed = supplied.display().to_string();
+      let resolved =
+        match on_blocking_pool::<R, _, _>(move || std::fs::canonicalize(supplied)).await {
+          Ok(resolved) => resolved,
+          // The blocking call could not be joined — it panicked, or the pool is shutting down. No
+          // coordinate was resolved, so this is a canonicalization failure like any other; folding
+          // it into the io path keeps one classification site and preserves the cause in the box.
+          Err(join) => Err(join),
+        };
+      let canonical = resolved.map_err(|source| {
+        // Classify by the io error's kind — the two cases a caller can act on distinctly
+        // (a missing path vs a permission wall) — and fold the rest to `Other`; the whole
+        // io error is preserved in the box either way.
+        let kind = match source.kind() {
+          std::io::ErrorKind::NotFound => FaultKind::NotFound,
+          std::io::ErrorKind::PermissionDenied => FaultKind::PermissionDenied,
+          _ => FaultKind::Other,
+        };
+        WatchError::canonicalize(displayed, SourceFault::new(kind).with_source(source))
+      })?;
+      Ok(path_components(&canonical))
+    }
   }
 
   async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, RootHandle>, WatchError> {

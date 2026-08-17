@@ -160,11 +160,15 @@ impl<R: RuntimeLite> IndexerSource<R> {
 impl<R: RuntimeLite> Source<Comp> for IndexerSource<R> {
   type Handle = RootHandle;
 
-  fn canonicalize_key(&self, key: &[Comp]) -> Result<Vec<Comp>, WatchError> {
+  fn canonicalize_key(
+    &self,
+    key: &[Comp],
+  ) -> impl Future<Output = Result<Vec<Comp>, WatchError>> + Send {
     // The indexer coordinate is already canonical (a volume id + volume-relative `Seg`s, no
     // symlink/`..` to resolve), so canonicalization is the identity — mirroring any source whose
-    // key space is canonical by construction.
-    Ok(key.to_vec())
+    // key space is canonical by construction, and needing no blocking pool to resolve it.
+    let canonical = key.to_vec();
+    async move { Ok(canonical) }
   }
 
   async fn arm(&mut self, key: &[Comp]) -> Result<Armed<Comp, RootHandle>, WatchError> {

@@ -1310,25 +1310,50 @@ enum SyncStep<C> {
   Began(Result<Vec<C>, SyncError>),
 }
 
-/// [`Owner::reconcile_watch`]'s early exit. The in-place widen's retarget
-/// ([`Source::replace`]) and its rollback are awaited under a race against the owner's close signal —
-/// exactly as the cookie write is in [`Owner::on_sync`] — so a backend retarget that never returns (a
-/// hung FUSE/NFS mount) can no longer wedge the loop: a close during a held replace tears down at once
-/// instead of waiting the retarget out.
+/// [`Owner::reconcile_watch`]'s early exit. Every source call the reconcile awaits — the key
+/// canonicalization ([`Source::canonicalize_key`]), the arm, the covered-outside grow, and the
+/// in-place widen's retarget ([`Source::replace`]) with its rollback — is awaited under a race
+/// against the owner's close signal, exactly as the cookie write is in [`Owner::on_sync`]. So a
+/// backend call that never returns (a hung FUSE/NFS mount) cannot wedge the loop: a close arriving
+/// while one is held tears down at once instead of waiting it out.
 ///
 /// It rides the `Err` channel because every variant ABANDONS the reconcile, leaving the committing
 /// paths (`Ok(sub)`) untouched: [`Failed`](Self::Failed) is the ordinary [`WatchError`] each
-/// pre-existing exit already returned — a [`From`] impl keeps those sites, and `canonicalize_key`'s
-/// `?`, verbatim — and [`CloseRequested`](Self::CloseRequested) diverts to teardown.
+/// pre-existing exit already returned — a [`From`] impl keeps those sites verbatim —
+/// [`CloseRequested`](Self::CloseRequested) diverts to teardown, and
+/// [`HandlesGone`](Self::HandlesGone) hands control back to the loop so its already-closed command
+/// channel drives the dropped-handles teardown it always has.
+///
+/// [`CloseRequested`](Self::CloseRequested) and [`HandlesGone`](Self::HandlesGone) share that one
+/// `Err` channel deliberately: each caller's unwind is written once, over the whole `Err`, so a
+/// close that WON a race and a close channel that CLOSED under one cannot reclaim different state
+/// at the same site.
 #[derive(Debug)]
 enum ReconcileStop {
   /// The reconcile failed: the error for the `watch()` caller.
   Failed(WatchError),
-  /// A close won the race while an in-place widen `replace` was in flight: its consumed
+  /// A close won the race against one of the reconcile's awaited source calls: its consumed
   /// [`CloseReply`] rides back so [`Owner::dispatch_command`] hands the [`run`] loop the same
-  /// [`Flow::Break`] its own close arm produces. The widen is abandoned and the `watch()` caller's
-  /// dropped reply surfaces `Closed`.
+  /// [`Flow::Break`] its own close arm produces. The reconcile is abandoned — whatever it had
+  /// reserved is unwound at the losing site — and the `watch()` caller's dropped reply surfaces
+  /// `Closed`.
   CloseRequested(CloseReply),
+  /// The dedicated close channel CLOSED under one of those races: every public handle is gone.
+  ///
+  /// Like [`ReplaceStep::HandlesGone`] this is an ABANDON rather than a threaded close — no one is
+  /// left to acknowledge, so no [`CloseReply`] rides back and none is owed. The reconcile is
+  /// abandoned exactly as [`CloseRequested`](Self::CloseRequested) abandons it, unwinding the same
+  /// reservation at the same site (both ride this one `Err` channel, so every caller's unwind is
+  /// literally the same code), and control returns to the [`run`] loop, where the command channel
+  /// — whose sender drops in lockstep with the close sender — remains the dropped-handles teardown
+  /// signal. The `watch()` caller's dropped reply surfaces `Closed`, as it does for a threaded
+  /// close.
+  ///
+  /// What it must NOT do is what its two sites used to: re-issue the source call it just lost and
+  /// await the fresh, UNRACED one. Against a source that never returns, that second await never
+  /// hands control back to the loop, so the closed command channel is never observed and the
+  /// owner, the source, every live watch and the read plane are retained forever.
+  HandlesGone,
 }
 
 impl From<WatchError> for ReconcileStop {
@@ -1356,7 +1381,8 @@ enum ReplaceStep<C, H> {
 /// The owner's single `select!` loop (design driver-golden doc): reconcile a command,
 /// fan out a raw source event, or drain the coalescer's due entries — whichever is ready, each to
 /// completion. The only source calls it awaits are [`next`](LocalSource::next) (one cancel-safe
-/// `select!` arm) and, inside a caller-bounded `Watch` reconcile, [`arm`](LocalSource::arm),
+/// `select!` arm) and, inside a caller-bounded `Watch` reconcile,
+/// [`canonicalize_key`](LocalSource::canonicalize_key), [`arm`](LocalSource::arm),
 /// [`grow`](LocalSource::grow) and [`replace`](LocalSource::replace); releasing a root is the
 /// **synchronous** [`disarm`](LocalSource::disarm) request, so **no** loop path awaits it.
 ///
@@ -1368,15 +1394,17 @@ enum ReplaceStep<C, H> {
 /// A queued close being at the top of the `select!` is necessary but NOT sufficient, and that gap is
 /// the reason every awaited source call above is itself a biased race against the same close
 /// receiver. The loop selects a command and then awaits the entire reconcile INSIDE that branch, so
-/// while a `Source::arm` or `grow` against a hung mount is pending the loop never returns to its
-/// `select!` at all — the dedicated lane exists but nothing polls it, and `close()` stays pending for
-/// as long as the mount does. Racing each awaited call means a close arriving mid-reconcile abandons
+/// while a `Source::canonicalize_key`, `arm` or `grow` against a hung mount is pending the loop
+/// never returns to its `select!` at all — the dedicated lane exists but nothing polls it, and
+/// `close()` stays pending for as long as the mount does. Racing each awaited call means a close
+/// arriving mid-reconcile abandons
 /// the reconcile (its `watch()` caller's dropped reply reads as `Closed`) and drives teardown, which
 /// drops the source. Close-responsiveness therefore holds against a source that violates its own
-/// bounded-progress requirement — but only for the AWAITED surface: a source's synchronous
-/// callbacks ([`canonicalize_key`](LocalSource::canonicalize_key)) and a subscription's
-/// [`Filter`](crate::Filter) predicate run on this thread with nothing to race against, and the
-/// [`LocalSource`] contract says so plainly rather than promising what an actor cannot do. Grant resolution rides the dedicated
+/// bounded-progress requirement — but only against code that YIELDS: a subscription's
+/// [`Filter`](crate::Filter) predicate, and any source future that blocks its poll instead of
+/// returning `Pending`, run on this thread with nothing to race against. The [`LocalSource`]
+/// contract says so plainly, and requires a source with blocking work to hand it to a blocking pool,
+/// rather than promising what an actor cannot do. Grant resolution rides the dedicated
 /// [`cleanup_rx`](Owner::cleanup_rx) channel at the **second** priority (below close, above the
 /// mailbox): a top-of-iteration full [`drain_pending_cleanup`](Owner::drain_pending_cleanup)
 /// AND a `select!` arm between close and commands. The command mailbox is otherwise biased above the
@@ -1985,8 +2013,13 @@ where
   /// It breaks to teardown on two signals, neither of them a close command (a close is never a
   /// command — it rides the dedicated [`closes`](Self::closes) channel): the dropped-last-handle
   /// `Err`, and a close that [`on_watch`](Self::on_watch) THREADED back after winning the race
-  /// inside an in-flight in-place widen [`replace`](Source::replace) — that reply was consumed off
-  /// the close channel mid-reconcile, so this break is the one path that delivers it to teardown.
+  /// against one of the reconcile's awaited source calls — that reply was consumed off the close
+  /// channel mid-reconcile, so this break is the one path that delivers it to teardown.
+  ///
+  /// A reconcile abandoned because every handle went away ([`ReconcileStop::HandlesGone`]) is
+  /// deliberately NOT a third break: it consumed no reply and owes none, so `on_watch` resolves
+  /// `None` and the loop keeps going — straight into the dropped-last-handle `Err` above, which is
+  /// the teardown signal handle-loss has always used.
   async fn dispatch_command(
     &mut self,
     cmd: Result<Command<C, V>, async_channel::RecvError>,
@@ -1999,9 +2032,9 @@ where
         reply,
       }) => match self.on_watch(key, value, options, reply).await {
         None => Flow::Continue,
-        // A close won the race inside an in-flight in-place widen `replace`: break to teardown
-        // carrying its reply, exactly as the dedicated close arm — and `on_sync`'s threaded close —
-        // does. Consumer-initiated, so it owes no source-drain pass.
+        // A close won the race against one of the reconcile's awaited source calls: break to
+        // teardown carrying its reply, exactly as the dedicated close arm — and `on_sync`'s threaded
+        // close — does. Consumer-initiated, so it owes no source-drain pass.
         Some(close_reply) => Flow::Break {
           closing: Some(close_reply),
           drain_owed: false,
@@ -2096,10 +2129,12 @@ where
   /// the reply" orphan branch) is gone: the owner is running this reconcile, so it is alive, and the
   /// cleanup channel it keeps is open.
   ///
-  /// Returns the [`CloseReply`] of a close that won the race inside an in-flight in-place widen
-  /// [`replace`](Source::replace) (see [`replace_racing_close`](Self::replace_racing_close)), for
+  /// Returns the [`CloseReply`] of a close that won the race against one of the reconcile's awaited
+  /// source calls (see [`replace_racing_close`](Self::replace_racing_close)), for
   /// [`dispatch_command`](Self::dispatch_command) to turn into the [`Flow::Break`] the [`run`] loop's
-  /// own close arm produces — and [`None`] whenever the reconcile settled, which is every other case.
+  /// own close arm produces — and [`None`] otherwise: the reconcile settled, it failed, or every
+  /// public handle went away ([`ReconcileStop::HandlesGone`], which owes no reply and defers to the
+  /// closed command channel).
   async fn on_watch(
     &mut self,
     key: Vec<C>,
@@ -2148,6 +2183,22 @@ where
       Err(ReconcileStop::CloseRequested(close_reply)) => {
         drop(reply);
         Some(close_reply)
+      }
+      // Every public handle went away mid-reconcile. There is no subscription to grant, no grant to
+      // orphan, and — unlike the threaded close above — no reply to hand up: nobody asked for the
+      // shutdown, so nobody is owed its acknowledgement. DROP the caller's reply (a dropped sender
+      // is what `watch()` reads as `Closed`) and resolve `None`, which
+      // [`dispatch_command`](Self::dispatch_command) turns into [`Flow::Continue`].
+      //
+      // Continuing rather than breaking is the point: the dropped-handles teardown signal is the
+      // COMMAND channel closing, exactly as the run loop's own close arm treats it (its `None`
+      // disables the arm and defers), and the loop reaches that signal on its very next iteration.
+      // So handle-loss keeps the one existing teardown path — including its `drain_owed: false`
+      // (nobody is left to receive an owed Rescan; only a SOURCE drain owes one) — instead of
+      // opening a second one that would skip the commands already queued behind this reconcile.
+      Err(ReconcileStop::HandlesGone) => {
+        drop(reply);
+        None
       }
     }
   }
@@ -2241,7 +2292,11 @@ where
     // (a generic component key) canonicalizes as the identity. The arm path still re-keys onto
     // `Armed::canonical_key` and guards it with `fs_path_preserves_plan`, closing the residual
     // TOCTOU where the coordinate changes between this canonicalization and the arm.
-    let canonical_key = self.source.canonicalize_key(key)?;
+    //
+    // Awaited through the close-raced choke point ([`Owner::canonicalize_key`]): the stock binding
+    // resolves a real path here, so a stalled mount must not hold the dedicated close lane
+    // unpolled. Nothing is committed yet, so a close that wins simply abandons the reconcile.
+    let canonical_key = self.canonicalize_key(key).await?;
     let key = canonical_key.as_slice();
     // Plan the watch, **re-planning past any dead covering root** so no subscription ever binds a
     // source-forgotten handle (the structural close of the dead-root-coverage class).
@@ -2803,6 +2858,59 @@ where
     }
   }
 
+  /// Canonicalizes the caller's key at the top of the reconcile, RACED against the dedicated close
+  /// receiver for the same reason [`arm`](Self::arm) and [`grow`](Self::grow) are: the run loop
+  /// selects a command and awaits the whole reconcile inside that branch, so an unraced
+  /// canonicalization against a hung mount leaves the already-queued close receiver unpolled and
+  /// `close()` pending forever. The stock binding resolves a real path here, so a stalled
+  /// FUSE/NFS root reaches this with no hostile source involved.
+  ///
+  /// A close that wins here wins at the CHEAPEST abort point the reconcile has. Nothing is
+  /// committed yet and nothing needs unwinding: this runs before `plan_watch`, so no subsumer
+  /// reservation exists to [`abort_watch`](crate::subsume::Subsumer::abort_watch) (the abort that
+  /// [`arm`](Self::arm)'s and [`grow`](Self::grow)'s losers each owe), no handle has been adopted,
+  /// no filter or debounce is registered, and no [`WatchGrant`] has been minted. Only the caller's
+  /// reply sender is live, and dropping it is exactly what `watch()` reads as `Closed`. So the
+  /// early exit is the bare [`ReconcileStop::CloseRequested`] the later abort points reach by a
+  /// longer road — or its reply-less twin [`ReconcileStop::HandlesGone`], when the channel CLOSED
+  /// instead of delivering — and it reaches teardown through the identical
+  /// [`on_watch`](Self::on_watch) arms.
+  ///
+  /// Dropping a pending canonicalization is safe for a STRICTLY WEAKER reason than dropping a
+  /// pending `arm`: this is a read-only probe that acquires no watch, no stream and no handle, so
+  /// there is no umbrella-visible resource for a `Drop` reclamation to hand back (the trait's
+  /// cancellation clause). What a binding owes its OWN machinery on that drop is the binding's
+  /// business, and the trait states it there: the stock one ABORTS the blocking job the abandoned
+  /// probe queued rather than detaching it.
+  async fn canonicalize_key(&mut self, key: &[C]) -> Result<Vec<C>, ReconcileStop> {
+    let canonical = {
+      // Split-borrow so the two arms stay disjoint: the close arm reads `&self.closes` while
+      // `canonicalize_key` reborrows `&self.source`.
+      let closes = &self.closes;
+      let source = &self.source;
+      futures_util::select_biased! {
+        // Close is polled FIRST — a requested shutdown wins over everything, so a resolution not
+        // yet started is never issued at all. Every handle being gone is an ABANDON rather than a
+        // threaded close (`None`): nobody is left to acknowledge, so the stop carries no reply.
+        close = closes.recv().fuse() => close.ok(),
+        res = source.canonicalize_key(key).fuse() => return res.map_err(Into::into),
+      }
+    };
+    match canonical {
+      Some(close_reply) => Err(ReconcileStop::CloseRequested(close_reply)),
+      // The close channel closed mid-probe: every public handle is gone. ABANDON here, issuing NO
+      // further source call — the reconcile owes its verdict to a caller that cannot exist (a live
+      // `watch()` future borrows a handle, so a closed close channel proves every `watch()` wait is
+      // already dropped), and its reply sender dropping is what `watch()` reads as `Closed`.
+      //
+      // Re-issuing the probe unraced — what this used to do — is the wedge itself: against a source
+      // that never returns, that second await never hands control back to the run loop, so the
+      // already-closed command channel is never observed and the owner, the source, every live
+      // watch and the read-plane state are retained forever.
+      None => Err(ReconcileStop::HandlesGone),
+    }
+  }
+
   /// The arm itself is RACED against the dedicated close receiver, exactly as
   /// [`replace`](Self::replace_racing_close) and `on_sync`'s cookie write are.
   /// Without that race the owner's advertised close lane is not a lane at all:
@@ -2816,10 +2924,11 @@ where
   /// the run loop and the [`Source`] contract both promise.
   ///
   /// Dropping a pending `arm` is safe for the same reason dropping a pending
-  /// `replace` is: only a close can drop it, and a close tears down at once —
-  /// the source's own `Drop` reclamation covers an in-flight arm, and an
-  /// already-created stream the abandoned future would have reported is
-  /// reclaimed by the lower driver's close sweep.
+  /// `replace` is: only a close — or the loss of every handle, which the run
+  /// loop's closed command channel turns into the same teardown — can drop it,
+  /// and either tears down at once. The source's own `Drop` reclamation covers
+  /// an in-flight arm, and an already-created stream the abandoned future would
+  /// have reported is reclaimed by the lower driver's close sweep.
   async fn arm(&mut self, key: &[C]) -> Result<(S::Handle, Vec<C>), ReconcileStop> {
     let armed = {
       // Split-borrow so the two arms stay disjoint: the close arm reads
@@ -2829,9 +2938,8 @@ where
       futures_util::select_biased! {
         // Close is polled FIRST — a requested shutdown wins over everything, so an
         // arm not yet started is never issued at all. Every handle being gone is an
-        // ABANDON rather than a threaded close (`None`): the command channel remains
-        // the dropped-handles teardown signal, so the arm is left to finish rather
-        // than inventing a reply nobody is waiting for.
+        // ABANDON rather than a threaded close (`None`): nobody is left to
+        // acknowledge, so the stop carries no reply.
         close = closes.recv().fuse() => close.ok(),
         res = source.arm(key).fuse() => return match res {
           Ok(armed) => self.adopt_armed(armed),
@@ -2841,20 +2949,28 @@ where
     };
     match armed {
       Some(close_reply) => Err(ReconcileStop::CloseRequested(close_reply)),
-      // The close channel closed mid-arm. Re-issue against the source: this is
-      // the abandon case above, and the reconcile still owes its caller a
-      // verdict.
-      None => match self.source.arm(key).await {
-        Ok(armed) => self.adopt_armed(armed),
-        Err(err) => Err(err.into()),
-      },
+      // The close channel closed mid-arm: every public handle is gone. ABANDON,
+      // issuing NO further arm — the stop rides the SAME `Err` channel the close
+      // rides, so each caller's unwind (a `Disjoint`/`Widen` plan's `abort_watch`,
+      // a restore's retirement of the roots it released) is literally the same code
+      // for both, and no handle can be adopted that the imminent teardown would
+      // then have to reclaim.
+      //
+      // Re-issuing the arm unraced — what this used to do — is the wedge itself:
+      // against a source that never returns, that second await never hands control
+      // back to the run loop, so the already-closed command channel is never
+      // observed and the owner, the source, every live watch and the read-plane
+      // state are retained forever.
+      None => Err(ReconcileStop::HandlesGone),
     }
   }
 
   /// The post-arm half of the choke point: liveness validation, the
   /// generation-unique handle tripwire, and adoption of the source's canonical
-  /// key. Shared by both of [`arm`](Self::arm)'s issue paths so the choke point
-  /// stays single even though the arm is raced.
+  /// key. Lifted out of [`arm`](Self::arm) so the `select_biased!` arm that wins
+  /// carries only the source call, leaving the choke point one named place even
+  /// though the arm is raced. The race's other outcomes issue no arm at all, so
+  /// nothing else reaches here.
   fn adopt_armed(
     &mut self,
     armed: crate::source::Armed<C, S::Handle>,
@@ -3072,6 +3188,11 @@ where
   /// subscription is left bound to a released handle) and the reply is handed back to drive
   /// teardown, which drops the source and reclaims everything the abandoned re-arms would have
   /// restored.
+  ///
+  /// A re-arm that instead finds that signal CLOSED ([`ReconcileStop::HandlesGone`] — every public
+  /// handle is gone) stops the restore the same way and retires the same roots, through the same
+  /// [`retire_unrestored_roots`](Self::retire_unrestored_roots), but returns [`None`]: no reply was
+  /// consumed and nobody is left to acknowledge one.
   async fn restore_disarmed_roots(&mut self, unwatch: &[S::Handle]) -> Option<CloseReply> {
     for &old in unwatch {
       // The subsumed root is still recorded (the widen never committed); recover its key
@@ -3140,21 +3261,48 @@ where
           self.retire_root_with_terminal_rescan(old);
         }
         Err(ReconcileStop::Failed(_)) => self.retire_root_with_terminal_rescan(old),
+        // The two ABANDONING stops owe the IDENTICAL unwind — every root still awaiting
+        // restoration is retired through the one shared
+        // [`retire_unrestored_roots`](Self::retire_unrestored_roots), so neither can drift from
+        // the other — and differ in exactly one thing: whether a reply exists to hand back.
         Err(ReconcileStop::CloseRequested(close_reply)) => {
-          // Close won this re-arm. Retire every root still awaiting restoration —
-          // this one included — so none is left recorded live on a released
-          // handle, then hand the reply back rather than dropping it.
-          self.retire_root_with_terminal_rescan(old);
-          for &pending in unwatch {
-            if pending != old {
-              self.retire_root_with_terminal_rescan(pending);
-            }
-          }
+          // Close won this re-arm, and its reply was CONSUMED off the dedicated signal: dropping
+          // it here would leave `close()` pending forever, so it rides back to drive teardown.
+          self.retire_unrestored_roots(old, unwatch);
           return Some(close_reply);
+        }
+        Err(ReconcileStop::HandlesGone) => {
+          // Every public handle is gone. Nothing was consumed and nobody is owed an
+          // acknowledgement, so no reply rides back — and the remaining re-arms are pointless
+          // (each would lose to the same closed channel). The run loop's own closed command
+          // channel drives the teardown that drops the source and reclaims what they would have
+          // restored.
+          self.retire_unrestored_roots(old, unwatch);
+          return None;
         }
       }
     }
     None
+  }
+
+  /// Retires `old` and every root in `unwatch` still awaiting restoration, each through the shared
+  /// park-terminal-Rescan-then-retire primitive — the unwind BOTH abandoning stops of
+  /// [`restore_disarmed_roots`](Self::restore_disarmed_roots) owe.
+  ///
+  /// It exists so [`ReconcileStop::CloseRequested`] and [`ReconcileStop::HandlesGone`] cannot drift
+  /// apart at that site: they abandon the restore for different reasons (a requested shutdown vs.
+  /// every handle dropped) but leave IDENTICAL state behind, and both must, because the hazard is
+  /// the same one — a subsumed root the widen already `disarm`ed staying recorded live on a
+  /// released handle, published watched yet backed by no source watch. An already-restored sibling
+  /// was rebound onto a fresh handle, so its old handle is no longer recorded and retiring it is
+  /// the no-op it should be.
+  fn retire_unrestored_roots(&mut self, old: S::Handle, unwatch: &[S::Handle]) {
+    self.retire_root_with_terminal_rescan(old);
+    for &pending in unwatch {
+      if pending != old {
+        self.retire_root_with_terminal_rescan(pending);
+      }
+    }
   }
 
   /// The single **park-terminal-Rescan-then-retire** primitive (invariant I4, no silent loss):
@@ -5056,7 +5204,7 @@ fn assert_fs_owner_send() {
 
 /// Compile-time proof that the owner future is `Send` for **any** `Send` source (not just
 /// [`FsSource`]) — the guarantee that a generic `S: Source<C>` owner is structurally
-/// spawnable, since [`Source`]'s three futures are all `Send`. Never invoked.
+/// spawnable, since [`Source`]'s futures are all `Send`. Never invoked.
 #[allow(dead_code)]
 fn assert_generic_owner_send<C, V, R, S>(owner: Owner<C, V, R, S>)
 where
@@ -5088,8 +5236,12 @@ fn assert_rc_local_source_constructs<R: RuntimeLite>() {
   impl LocalSource<OsString> for RcSource {
     type Handle = u32;
 
-    fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
-      Ok(key.to_vec())
+    fn canonicalize_key(
+      &self,
+      key: &[OsString],
+    ) -> impl Future<Output = Result<Vec<OsString>, WatchError>> {
+      let canonical = key.to_vec();
+      async move { Ok(canonical) }
     }
 
     fn arm(
