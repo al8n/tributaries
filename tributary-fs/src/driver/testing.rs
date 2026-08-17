@@ -2283,9 +2283,17 @@ struct NonFifoInner {
   open: bool,
   /// Submitted jobs, popped newest-first (LIFO).
   stack: Vec<Box<dyn FnOnce() + Send>>,
+  /// Set by [`NonFifoPool::stop`]. A worker checks this only once it finds no
+  /// job to pop, so a stop signalled while jobs are still queued (gate open)
+  /// drains them first — but a worker parked with nothing to do exits instead
+  /// of waiting on `cv` again, which is what lets a joining `Drop` never block
+  /// on a parked worker.
+  stop: bool,
 }
 
 impl NonFifoPool {
+  /// Runs until [`NonFifoPool::stop`] wakes it with no job left to pop — the
+  /// shutdown path [`NonFifoPoolHandle`]'s `Drop` joins on.
   fn run_worker(&self) {
     loop {
       let job = {
@@ -2296,6 +2304,9 @@ impl NonFifoPool {
           {
             break job;
           }
+          if inner.stop {
+            return;
+          }
           inner = self.cv.wait(inner).unwrap();
         }
       };
@@ -2303,6 +2314,17 @@ impl NonFifoPool {
       // here in a predecessor's receiver), and it must not hold the pool lock.
       job();
     }
+  }
+
+  /// Wakes every parked worker and tells it to exit once it finds no job to
+  /// pop. Pairs with [`run_worker`](Self::run_worker)'s post-pop check: a
+  /// worker mid-job simply finishes it and exits on its next empty pop, so
+  /// this never has to interrupt work in flight, only stop workers from
+  /// waiting on more.
+  fn stop(&self) {
+    let mut inner = self.inner.lock().unwrap();
+    inner.stop = true;
+    self.cv.notify_all();
   }
 }
 
@@ -2321,9 +2343,15 @@ fn submit_to_non_fifo_pool(job: Box<dyn FnOnce() + Send>) {
   pool.cv.notify_one();
 }
 
-/// A test's handle to the installed [`NonFifoPool`]'s start gate.
+/// A test's handle to the installed [`NonFifoPool`]'s start gate AND its
+/// workers' lifetime. `Drop` stops and joins every worker thread this handle
+/// started, so none outlives the test: Miri hard-errors a test whose main
+/// thread returns while a thread it spawned is still running, and a plain
+/// `std::thread::spawn` with no retained `JoinHandle` (the pool's old shape)
+/// is exactly that.
 pub(crate) struct NonFifoPoolHandle {
   pool: Arc<NonFifoPool>,
+  workers: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl NonFifoPoolHandle {
@@ -2341,23 +2369,43 @@ impl NonFifoPoolHandle {
   }
 }
 
-/// Installs a fresh bounded LIFO pool with `workers` worker threads (open), and
-/// returns a handle to its gate. The worker threads are detached and outlive
-/// the call; the process reaps them at exit (one install per test binary).
+impl Drop for NonFifoPoolHandle {
+  fn drop(&mut self) {
+    // Signal before joining, and in that order: `stop` takes the pool's own
+    // lock to set the flag and `notify_all` on the same `cv` a parked worker
+    // waits on, so every worker blocked with nothing to do wakes, observes
+    // `stop`, and returns instead of the joins below waiting on a thread that
+    // would otherwise never wake on its own. A worker mid-job is unaffected
+    // here — it finishes that job, pops again, finds `stop` set, and returns
+    // — so this can only wait as long as in-flight work takes, never forever.
+    self.pool.stop();
+    for worker in self.workers.drain(..) {
+      let _ = worker.join();
+    }
+  }
+}
+
+/// Installs a fresh bounded LIFO pool with `workers` worker threads (open),
+/// and returns a handle to its gate. The returned handle's `Drop` stops and
+/// joins every one of these threads, so none outlives the caller's test (one
+/// install per test binary).
 pub(crate) fn install_non_fifo_pool(workers: usize) -> NonFifoPoolHandle {
   let pool = Arc::new(NonFifoPool {
     inner: Mutex::new(NonFifoInner {
       open: true,
       stack: Vec::new(),
+      stop: false,
     }),
     cv: Condvar::new(),
   });
-  for _ in 0..workers {
-    let pool = Arc::clone(&pool);
-    std::thread::spawn(move || pool.run_worker());
-  }
+  let workers = (0..workers)
+    .map(|_| {
+      let pool = Arc::clone(&pool);
+      std::thread::spawn(move || pool.run_worker())
+    })
+    .collect();
   *NON_FIFO_POOL.lock().unwrap() = Some(Arc::clone(&pool));
-  NonFifoPoolHandle { pool }
+  NonFifoPoolHandle { pool, workers }
 }
 
 /// `TokioRuntime`'s blocking spawner — the source for every associated type and

@@ -841,6 +841,21 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
     runs-on: ${{ matrix.os }}
+    # Sized from the shards themselves, not from the 6 h default a job inherits
+    # by saying nothing. All seven interpreted on one host, tree borrows then
+    # stacked: `fs-descending` ~38/~24 min for 93 cells, `fs-rest` ~33/~20 for
+    # 684, `rest` ~28/~23 for 229, `proto-monitor-head` ~18/~12 for 219,
+    # `fs-driver` ~17/~10 for 75, `proto-monitor-tail` ~11/~8 for 146,
+    # `fs-cookie` ~8/~6 for 76. Tree borrows costs 1.2-1.7x its stacked
+    # counterpart and reorders the middle of the table, so the bound is sized
+    # from it; both jobs share it because both run this same matrix. Add the
+    # toolchain install, `cargo miri setup` and a cold build, and even the
+    # longest tree-borrows job lands inside an hour, which leaves headroom for
+    # a slow runner or a cache miss. What it buys is the failure mode: a shard
+    # that wedges — the one thing an interpreter makes easy, since a cell can
+    # spin without ever being wrong — now reports in 90 minutes instead of
+    # burning six hours of a concurrency slot before anyone hears about it.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
       - name: Cache cargo build and registry
@@ -904,6 +919,21 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
     runs-on: ${{ matrix.os }}
+    # Sized from the shards themselves, not from the 6 h default a job inherits
+    # by saying nothing. All seven interpreted on one host, tree borrows then
+    # stacked: `fs-descending` ~38/~24 min for 93 cells, `fs-rest` ~33/~20 for
+    # 684, `rest` ~28/~23 for 229, `proto-monitor-head` ~18/~12 for 219,
+    # `fs-driver` ~17/~10 for 75, `proto-monitor-tail` ~11/~8 for 146,
+    # `fs-cookie` ~8/~6 for 76. Tree borrows costs 1.2-1.7x its stacked
+    # counterpart and reorders the middle of the table, so the bound is sized
+    # from it; both jobs share it because both run this same matrix. Add the
+    # toolchain install, `cargo miri setup` and a cold build, and even the
+    # longest tree-borrows job lands inside an hour, which leaves headroom for
+    # a slow runner or a cache miss. What it buys is the failure mode: a shard
+    # that wedges — the one thing an interpreter makes easy, since a cell can
+    # spin without ever being wrong — now reports in 90 minutes instead of
+    # burning six hours of a concurrency slot before anyone hears about it.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
       - name: Cache cargo build and registry

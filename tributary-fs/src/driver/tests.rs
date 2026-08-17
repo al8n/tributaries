@@ -178,14 +178,14 @@ fn renamed() -> FsEventFlags {
 
 /// `next_event` plus the delivery's canonical root.
 async fn next_rooted(rig: &Rig) -> (ScopeId, Arc<PathBuf>, Change) {
-  tokio::time::timeout(Duration::from_secs(5), rig.events.recv())
+  tokio::time::timeout(interpreted_secs(5), rig.events.recv())
     .await
     .expect("an event arrives")
     .expect("the stream is open")
 }
 
 async fn next_event(rig: &Rig) -> (ScopeId, Change) {
-  let (scope, _root, change) = tokio::time::timeout(Duration::from_secs(5), rig.events.recv())
+  let (scope, _root, change) = tokio::time::timeout(interpreted_secs(5), rig.events.recv())
     .await
     .expect("an event arrives")
     .expect("the stream is open");
@@ -266,6 +266,70 @@ async fn settle(done: impl FnMut() -> bool) -> bool {
   settle_within(200, done).await
 }
 
+/// The same wait, in the round budget an INTERPRETER needs for it.
+///
+/// A round is a fixed slice of real time and stays one under an interpreter.
+/// What changes is the distance to the observable: a gate waiting on a command
+/// the driver only reaches after chewing through a mailbox of wide reconciles is
+/// waiting on microseconds of instructions and minutes of interpretation, while
+/// its rounds still tick at their own fixed rate. So the round COUNT is the side
+/// that has to grow.
+///
+/// This can neither cost a passing run nor hide a failing one. A budget is spent
+/// to the end only when it EXPIRES, which is already a staging failure; and every
+/// condition waited on here is eventually-true, so a longer wait can only prevent
+/// a spurious failure, never mask a defect — the same reasoning that lets a
+/// caller choose a wider budget natively. A caller that reads the verdict as a
+/// NEGATIVE — proof that something has not happened — is strengthened by it, not
+/// weakened.
+fn interpreted_rounds(rounds: usize) -> usize {
+  if cfg!(miri) { rounds * 4 } else { rounds }
+}
+
+/// The wall-clock ceiling a `timeout` gets when the work it bounds is INTERPRETED
+/// rather than executed.
+///
+/// [`interpreted_rounds`] rescues the budgets counted in ROUNDS, and those need
+/// only a wider count because a round costs whatever a round costs. A `timeout`
+/// is denominated in wall clock and cannot stretch itself: the driver reply that
+/// resolves in milliseconds natively takes seconds under an interpreter, a cell
+/// that awaits a whole cohort of them waits out every one, and the clock ticks at
+/// its own fixed rate throughout. Measured under the interpreter on a fast host,
+/// the tightest of these waits already spends three quarters of its native
+/// budget, which leaves it no margin at all on a host that is merely ordinary.
+///
+/// One flat ceiling rather than a per-site multiple, because there is nothing
+/// here to tune: a deadline is only ever SPENT when the cell is already failing,
+/// so sizing it far above the measured need costs a passing run nothing. What it
+/// does cost is the failure mode — a cell that genuinely hangs burns this before
+/// it reports — which is why it is minutes rather than hours, with the job's own
+/// `timeout-minutes` as the outer bound behind it.
+const INTERPRETED_DEADLINE: Duration = Duration::from_secs(900);
+
+/// A whole-second `timeout` budget, in the wall clock an INTERPRETER needs for it.
+///
+/// Every seconds-denominated deadline in this suite bounds a POSITIVE wait: its
+/// result is `.expect`ed or asserted `is_ok`, so expiry is the cell's own failure
+/// and a wider budget can only prevent a spurious one — the same reasoning that
+/// lets a caller pick a wider budget natively. That is why the widening is
+/// blanket rather than a per-site judgement. (One site drains a reply whose
+/// result it never reads; there a wider budget can only spend time the cell did
+/// not need, and the interpreted run measures that it does not.)
+///
+/// The sub-second budgets are deliberately NOT routed through here, and the
+/// difference is one of kind rather than degree. Each of those is a drain loop or
+/// a negative assertion — "and nothing else arrives", "keep taking while events
+/// keep coming" — where the budget EXPIRING is the observation the cell is
+/// making. Widening one would change what its cell proves, not how long it waits
+/// to prove it.
+fn interpreted_secs(native: u64) -> Duration {
+  if cfg!(miri) {
+    INTERPRETED_DEADLINE
+  } else {
+    Duration::from_secs(native)
+  }
+}
+
 /// [`settle`] with a caller-chosen budget: staging under a fully loaded parallel
 /// suite can legitimately need longer than the shared 2 s, and every condition
 /// waited on here is eventually-true, so a longer wait can never mask a failure
@@ -297,7 +361,7 @@ async fn settle(done: impl FnMut() -> bool) -> bool {
 /// deliberately.
 #[must_use = "an expired settle budget is a staging failure unless the caller's own next assertion re-reads the same observable"]
 async fn settle_within(rounds: usize, mut done: impl FnMut() -> bool) -> bool {
-  for _ in 0..rounds {
+  for _ in 0..interpreted_rounds(rounds) {
     if done() {
       return true;
     }
@@ -798,7 +862,7 @@ async fn deliveries_carry_the_canonical_root() {
     .fs
     .send_batch("/r", vec![ev("/r/carried.txt", created(), 1, 10)]);
 
-  let (got_scope, root, change) = tokio::time::timeout(Duration::from_secs(5), rig.events.recv())
+  let (got_scope, root, change) = tokio::time::timeout(interpreted_secs(5), rig.events.recv())
     .await
     .expect("an event arrives")
     .expect("the stream is open");
@@ -1218,7 +1282,7 @@ async fn close_waits_for_an_in_flight_spawn_and_tears_it_down() {
   );
 
   gate.release();
-  tokio::time::timeout(Duration::from_secs(5), on_close)
+  tokio::time::timeout(interpreted_secs(5), on_close)
     .await
     .expect("close resolves once the late spawn settles")
     .expect("the driver confirms the close");
@@ -1265,7 +1329,7 @@ async fn close_settles_an_in_flight_spawn_failure() {
   // The root vanishes while the spawn is parked: releasing the gate fails it.
   rig.fs.remove("/r");
   gate.release();
-  tokio::time::timeout(Duration::from_secs(5), on_close)
+  tokio::time::timeout(interpreted_secs(5), on_close)
     .await
     .expect("close resolves once the failed spawn settles")
     .expect("the driver confirms the close");
@@ -1301,7 +1365,7 @@ async fn close_grace_bounds_a_wedged_spawn_and_drop_reclaims_it() {
     .await
     .unwrap();
 
-  let pending = tokio::time::timeout(Duration::from_secs(5), on_close)
+  let pending = tokio::time::timeout(interpreted_secs(5), on_close)
     .await
     .expect("close resolves at the grace boundary")
     .expect("the driver replied");
@@ -1371,7 +1435,7 @@ async fn close_counts_a_post_live_wedged_spawn_as_non_quiescent() {
     .await
     .unwrap();
 
-  let pending = tokio::time::timeout(Duration::from_secs(5), on_close)
+  let pending = tokio::time::timeout(interpreted_secs(5), on_close)
     .await
     .expect("close resolves at the grace boundary")
     .expect("the driver replied");
@@ -1414,7 +1478,7 @@ async fn close_reports_a_wedged_teardown_instead_of_quiescence() {
     .await
     .unwrap();
 
-  let pending = tokio::time::timeout(Duration::from_secs(5), on_close)
+  let pending = tokio::time::timeout(interpreted_secs(5), on_close)
     .await
     .expect("close resolves at the grace boundary")
     .expect("the driver replied");
@@ -2935,7 +2999,7 @@ mod descending {
     async fn resolved(
       ack: impl std::future::Future<Output = Result<CoverOutcome, futures_channel::oneshot::Canceled>>,
     ) -> CoverOutcome {
-      tokio::time::timeout(Duration::from_secs(10), ack)
+      tokio::time::timeout(interpreted_secs(10), ack)
         .await
         .expect("the fence settles within the deadline")
         .expect("the driver answers the parked reply")
@@ -3659,7 +3723,7 @@ mod descending {
         .send(Command::DebugLaneCount { reply })
         .await
         .unwrap();
-      tokio::time::timeout(Duration::from_secs(10), on_reply)
+      tokio::time::timeout(interpreted_secs(10), on_reply)
         .await
         .expect("the driver answers a debug probe with the pool frozen")
         .expect("the driver replies");
@@ -4259,12 +4323,14 @@ mod descending {
       use std::sync::atomic::{AtomicBool, Ordering};
 
       // A scope wide enough that every spam reconcile's watch-table walk has
-      // real cost: keep + drop + 30 filler directories. The registration is
-      // silent now (42-10 — it announces no inventory, only its closing
+      // real cost: keep + drop + [`flood_rig_width`] filler directories. The
+      // registration is silent now (42-10 — it announces no inventory, only its closing
       // `Rescan`), so the rig's 64-slot event channel has even more headroom
       // than the 32 `Created`s this budget was sized for: no lag Rescan can
       // pollute the fence verdict.
-      let filler: Vec<String> = (0..30).map(|i| format!("/r/d{i:02}")).collect();
+      let filler: Vec<String> = (0..flood_rig_width())
+        .map(|i| format!("/r/d{i:02}"))
+        .collect();
       let mut children: Vec<(&str, u64)> = vec![("/r/keep", 11), ("/r/drop", 12)];
       children.extend(
         filler
@@ -4341,9 +4407,36 @@ mod descending {
       }
     }
 
-    /// The wide starved-settle rig: keep + drop + 30 filler directories,
-    /// cold discovery quiesced, `/r/drop` pruned clean, then grown back with
-    /// the arms HELD — the awaited ack now parks on exactly one re-install.
+    /// How many filler directories the wide flood rigs carry beside `keep` and
+    /// `drop`.
+    ///
+    /// The width is what makes a spam reconcile cost more than PRODUCING one,
+    /// which is the property every flood in this module stands on. A reconcile
+    /// walks each of the scope's watches against each retained prefix, so its
+    /// cost grows with the SQUARE of the width, while producing a command — one
+    /// cover clone — grows linearly with it. Thirty sizes that margin for a real
+    /// machine, where it has to survive a filler thread losing the CPU.
+    ///
+    /// Interpreted, the same shape stops being microseconds and becomes minutes:
+    /// one full-width reconcile runs longer than a caller's entire staging
+    /// budget, and a cell that needs `Close` queued BEHIND one mailbox of spam
+    /// has to wait out sixteen of them in a row. No budget covers that — the
+    /// wait grows quadratically with a width the budget cannot see, and on a
+    /// 32-bit target the same window is what walks the address space.
+    ///
+    /// Narrowing it there cuts the wait quadratically and leaves the margin it
+    /// exists for intact: an interpreted reconcile still outweighs an
+    /// interpreted cover clone by orders of magnitude. Nothing rests on that
+    /// being taken on trust — every caller stages on
+    /// [`flood_starves_the_source`], which reads the mailbox FULL and fails the
+    /// cell if the flood ever stops outpacing the driver.
+    fn flood_rig_width() -> usize {
+      if cfg!(miri) { 6 } else { 30 }
+    }
+
+    /// The wide starved-settle rig: keep + drop + [`flood_rig_width`] filler
+    /// directories, cold discovery quiesced, `/r/drop` pruned clean, then grown
+    /// back with the arms HELD — the awaited ack now parks on exactly one re-install.
     /// The width is load-bearing for the flood the callers start: each spam
     /// reconcile's watch-table walk must cost more than producing it, or the
     /// command branch reads not-ready often enough for the stream to slip in.
@@ -4362,7 +4455,9 @@ mod descending {
       ReleasedOnDrop,
       futures_channel::oneshot::Receiver<CoverOutcome>,
     ) {
-      let filler: Vec<String> = (0..30).map(|i| format!("/r/d{i:02}")).collect();
+      let filler: Vec<String> = (0..flood_rig_width())
+        .map(|i| format!("/r/d{i:02}"))
+        .collect();
       let mut children: Vec<(&str, u64)> = vec![("/r/keep", 11), ("/r/drop", 12)];
       children.extend(
         filler
@@ -4397,10 +4492,36 @@ mod descending {
     async fn resolved_under_flood(
       ack: impl std::future::Future<Output = Result<CoverOutcome, futures_channel::oneshot::Canceled>>,
     ) -> CoverOutcome {
-      tokio::time::timeout(Duration::from_secs(45), ack)
+      tokio::time::timeout(interpreted_secs(45), ack)
         .await
         .expect("the fence settles within the deadline")
         .expect("the driver answers the parked reply")
+    }
+
+    /// How many filler threads a [`flood_commands`] flood runs.
+    ///
+    /// Four is what a real machine needs. The fillers must keep the lane
+    /// GAPLESS, and on an oversubscribed host a single one can be descheduled
+    /// between two of its own sends for long enough that the mailbox drains and
+    /// the select reaches the source arm — the one thing every caller pins off.
+    /// The other three cover that gap.
+    ///
+    /// An interpreter has no such gap to cover, because it has no parallelism to
+    /// lose: every thread is interleaved onto the one interpreter, so a second
+    /// filler cannot put a command into the mailbox any sooner than the first
+    /// does. One saturates it outright — it takes all sixteen slots before the
+    /// staging gate below returns, and across the whole flooded settle that
+    /// follows the driver consumes only a handful of them, so the mailbox is
+    /// never within reach of draining.
+    ///
+    /// The other three are not free there. Each parks on a short poll timeout
+    /// and re-polls its registered send on every wake, and that cycle is
+    /// interpreted work drawn from the SAME interpreter as the settle the caller
+    /// is waiting on — enough of it to roughly double how long a flooded settle
+    /// takes. So the interpreter runs the smallest flood that still starves the
+    /// source, and the native lane keeps its gap insurance.
+    fn flood_filler_threads() -> usize {
+      if cfg!(miri) { 1 } else { 4 }
     }
 
     /// Saturates the 16-slot command channel with reply-less same-cover
@@ -4421,11 +4542,14 @@ mod descending {
     fn flood_commands(rig: &Rig, scope: ScopeId, cover: &[String]) -> CommandFlood {
       let stop = std::sync::Arc::new(AtomicBool::new(false));
       let spam_cover: Vec<PathBuf> = cover.iter().map(PathBuf::from).collect();
-      let spammers = spawn_command_fillers(&rig.commands, &stop, 4, move || Command::SetCover {
-        scope,
-        retained: spam_cover.clone(),
-        reply: None,
-      });
+      let spammers =
+        spawn_command_fillers(&rig.commands, &stop, flood_filler_threads(), move || {
+          Command::SetCover {
+            scope,
+            retained: spam_cover.clone(),
+            reply: None,
+          }
+        });
       CommandFlood { stop, spammers }
     }
 
@@ -4535,7 +4659,7 @@ mod descending {
       );
 
       let wind_down = tokio::task::spawn_blocking(move || drop(flood));
-      let bounded = tokio::time::timeout(Duration::from_secs(5), wind_down).await;
+      let bounded = tokio::time::timeout(interpreted_secs(5), wind_down).await;
       // Free the fillers before the verdict: a regression that wedged the join
       // above would otherwise wedge the runtime's own shutdown too, and the
       // report would be lost to a hang.
@@ -4927,7 +5051,7 @@ mod descending {
       // Release the fence: the SAME record transitions to the pool and its write
       // lands. Dispatch is a transition, not a birth.
       hold.release();
-      let dispatched = tokio::time::timeout(Duration::from_secs(10), on_reply).await;
+      let dispatched = tokio::time::timeout(interpreted_secs(10), on_reply).await;
       let settled = debug_census(&rig).await;
 
       let (census, live) = parked;
@@ -4976,7 +5100,7 @@ mod descending {
       // pool drains, and nothing more can dispatch — BEFORE anything is read out:
       // an assertion that jumped over the release would leave a pool job parked
       // on the gate and hang the runtime's shutdown instead of reporting.
-      let answered = tokio::time::timeout(Duration::from_secs(5), on_reply).await;
+      let answered = tokio::time::timeout(interpreted_secs(5), on_reply).await;
       settle_count(&rig, 0).await;
       let (census, live) = debug_census(&rig).await;
       let writes = rig.fs.cookie_writes();
@@ -5109,7 +5233,7 @@ mod descending {
       // the runtime's shutdown and hang instead of reporting the failure. Neither
       // wind-down step can move a verdict: the fence is resolved, the scope is
       // dead, and the cookie left `parked_cookies` in the very step under test.
-      let answered = tokio::time::timeout(Duration::from_secs(10), on_reply).await;
+      let answered = tokio::time::timeout(interpreted_secs(10), on_reply).await;
       let writes = rig.fs.cookie_writes();
       hold.release();
       flood.stop_and_join();
@@ -5170,13 +5294,13 @@ mod descending {
       // unwatch reply drained — before a single verdict is read out: the hold
       // parks a blocking-pool job, and an assertion that jumped over its release
       // would hang the runtime's shutdown instead of reporting the failure.
-      let answered = tokio::time::timeout(Duration::from_secs(5), on_reply).await;
+      let answered = tokio::time::timeout(interpreted_secs(5), on_reply).await;
       settle_count(&rig, 0).await;
       let (census, live) = debug_census(&rig).await;
       let writes = rig.fs.cookie_writes();
       let removes = rig.fs.cookie_removes();
       hold.release();
-      let _ = tokio::time::timeout(Duration::from_secs(5), on_unwatch).await;
+      let _ = tokio::time::timeout(interpreted_secs(5), on_unwatch).await;
 
       assert!(
         matches!(
@@ -5226,8 +5350,8 @@ mod descending {
       // a blocking-pool job that an assertion jumping over the release would
       // leave parked, hanging the runtime's shutdown instead of reporting. The
       // release cannot move a verdict — close has already answered both callers.
-      let answered = tokio::time::timeout(Duration::from_secs(5), on_reply).await;
-      let closed = tokio::time::timeout(Duration::from_secs(5), on_close).await;
+      let answered = tokio::time::timeout(interpreted_secs(5), on_reply).await;
+      let closed = tokio::time::timeout(interpreted_secs(5), on_close).await;
       let writes = rig.fs.cookie_writes();
       let removes = rig.fs.cookie_removes();
       hold.release();
@@ -5384,8 +5508,8 @@ mod descending {
 
       // Bounded on both legs: the defect this pins is a barrier that waits forever,
       // so an unanswered caller must surface as an expiring timeout.
-      let cover = tokio::time::timeout(Duration::from_secs(10), ack.as_mut()).await;
-      let synced = tokio::time::timeout(Duration::from_secs(10), on_sync.as_mut()).await;
+      let cover = tokio::time::timeout(interpreted_secs(10), ack.as_mut()).await;
+      let synced = tokio::time::timeout(interpreted_secs(10), on_sync.as_mut()).await;
 
       // Named first and together, because "neither caller was ever answered" is the
       // whole defect and a per-leg expect below would report only half of it.
@@ -5460,7 +5584,7 @@ mod descending {
       // And close is not left holding the scope's debts.
       let (reply, on_close) = futures_channel::oneshot::channel();
       rig.commands.send(Command::Close { reply }).await.unwrap();
-      let outstanding = tokio::time::timeout(Duration::from_secs(10), on_close)
+      let outstanding = tokio::time::timeout(interpreted_secs(10), on_close)
         .await
         .expect("close returns within grace rather than wedging on the dead scope")
         .expect("the driver replies");
@@ -5570,8 +5694,8 @@ mod descending {
       // Bounded on both legs: a proof that is withheld without the fail-closed
       // terminal strands both callers, which must surface as an expiring timeout
       // rather than a hung binary.
-      let cover = tokio::time::timeout(Duration::from_secs(10), ack.as_mut()).await;
-      let synced = tokio::time::timeout(Duration::from_secs(10), on_sync.as_mut()).await;
+      let cover = tokio::time::timeout(interpreted_secs(10), ack.as_mut()).await;
+      let synced = tokio::time::timeout(interpreted_secs(10), on_sync.as_mut()).await;
       let leg = |ok: bool| if ok { "answered" } else { "TIMED OUT" };
       assert!(
         cover.is_ok() && synced.is_ok(),
@@ -5721,7 +5845,7 @@ mod descending {
         .await
         .unwrap();
       assert!(
-        tokio::time::timeout(Duration::from_secs(10), on_reply)
+        tokio::time::timeout(interpreted_secs(10), on_reply)
           .await
           .expect("the replace commits within the deadline")
           .expect("the driver replies")
@@ -5916,7 +6040,7 @@ mod descending {
           .await
           .unwrap();
         assert!(
-          tokio::time::timeout(Duration::from_secs(10), on_reply)
+          tokio::time::timeout(interpreted_secs(10), on_reply)
             .await
             .expect("the replace commits within the deadline")
             .expect("the driver replies")
@@ -6086,7 +6210,7 @@ mod descending {
           .await
           .unwrap();
         assert!(
-          tokio::time::timeout(Duration::from_secs(10), on_reply)
+          tokio::time::timeout(interpreted_secs(10), on_reply)
             .await
             .expect("the replace commits within the deadline")
             .expect("the driver replies")
@@ -6221,7 +6345,7 @@ mod descending {
         .await
         .unwrap();
       assert!(
-        tokio::time::timeout(Duration::from_secs(10), on_reply)
+        tokio::time::timeout(interpreted_secs(10), on_reply)
           .await
           .expect("the replace commits within the deadline")
           .expect("the driver replies")
@@ -6984,7 +7108,7 @@ mod descending {
     async fn sync_ok(rig: &Rig, scope: ScopeId, dir: &str, name: &str) -> PathBuf {
       for _ in 0..400 {
         let pending = sync_pending(rig, scope, dir, name).await;
-        let outcome = tokio::time::timeout(Duration::from_secs(10), pending)
+        let outcome = tokio::time::timeout(interpreted_secs(10), pending)
           .await
           .expect("the sync resolves in bounded time — never parked forever")
           .expect("the driver replies");
@@ -7112,7 +7236,7 @@ mod descending {
       // Release: the rebuild settles, the closing Rescan is queued, and only
       // then does the write dispatch.
       hold.release();
-      let path = tokio::time::timeout(Duration::from_secs(10), pending)
+      let path = tokio::time::timeout(interpreted_secs(10), pending)
         .await
         .expect("the sync resolves once the rebuild settles")
         .expect("the driver replies")
@@ -7370,7 +7494,7 @@ mod descending {
           },
         }],
       );
-      let path = tokio::time::timeout(Duration::from_secs(10), pending)
+      let path = tokio::time::timeout(interpreted_secs(10), pending)
         .await
         .expect("the sync resolves once the hold pairs")
         .expect("the driver replies")
@@ -7410,7 +7534,7 @@ mod descending {
       // retry), the suppressed re-walk closes with the closing Rescan, and
       // only then does the write dispatch.
       hold.release();
-      let path = tokio::time::timeout(Duration::from_secs(10), pending)
+      let path = tokio::time::timeout(interpreted_secs(10), pending)
         .await
         .expect("the sync resolves once the escalation drains")
         .expect("the driver replies")
@@ -7539,7 +7663,7 @@ mod descending {
       );
 
       let wind_down = tokio::task::spawn_blocking(move || drop(flood));
-      let bounded = tokio::time::timeout(Duration::from_secs(5), wind_down).await;
+      let bounded = tokio::time::timeout(interpreted_secs(5), wind_down).await;
       // Free the fillers before the verdict, so a regression reports as a failed
       // assertion instead of wedging the runtime's shutdown on the stuck join.
       drop(receiver);
@@ -8069,7 +8193,7 @@ mod descending {
       // Release: the counted rebuild quiesces, and only then does the write
       // dispatch and the barrier resolve.
       hold.release();
-      let path = tokio::time::timeout(Duration::from_secs(10), on_reply)
+      let path = tokio::time::timeout(interpreted_secs(10), on_reply)
         .await
         .expect("the sync resolves once the tripwire settled")
         .expect("the driver replies")
@@ -8132,7 +8256,7 @@ mod descending {
         })
         .await
         .unwrap();
-      let path = tokio::time::timeout(Duration::from_secs(10), on_reply)
+      let path = tokio::time::timeout(interpreted_secs(10), on_reply)
         .await
         .expect("the sync resolves after the loud teardown")
         .expect("the driver replies")
@@ -8209,7 +8333,7 @@ mod descending {
         .unwrap();
       // The refreshes stay HELD: the clean window's commit is the whole
       // verification, so the sync certifies without one.
-      let path = tokio::time::timeout(Duration::from_secs(10), on_reply)
+      let path = tokio::time::timeout(interpreted_secs(10), on_reply)
         .await
         .expect("a clean widen window certifies without the refresh")
         .expect("the driver replies")
@@ -8281,7 +8405,7 @@ mod descending {
       );
 
       hold.release();
-      let path = tokio::time::timeout(Duration::from_secs(10), on_reply)
+      let path = tokio::time::timeout(interpreted_secs(10), on_reply)
         .await
         .expect("the sync answers on the pass the seal releases the barrier")
         .expect("the driver replies")
@@ -8333,7 +8457,7 @@ mod descending {
       // The tainted commit falls back: the caller still resolves Ok — through
       // the stream replace's commit — on a SECOND spawn, with the first
       // stream retired and the pre-armed descriptor disarmed.
-      let resolved = tokio::time::timeout(Duration::from_secs(10), on_reply)
+      let resolved = tokio::time::timeout(interpreted_secs(10), on_reply)
         .await
         .expect("the fallback replace resolves the caller")
         .expect("the driver replies");
@@ -8586,7 +8710,7 @@ mod descending {
       // First await: the loop wakes with BOTH ready; the op arm wins the
       // biased select and snapshots the loss into `remaining`; the source arm
       // taints the window before the catch-up commit reads it.
-      let resolved = tokio::time::timeout(Duration::from_secs(10), on_reply)
+      let resolved = tokio::time::timeout(interpreted_secs(10), on_reply)
         .await
         .expect("the fallback replace resolves the caller")
         .expect("the driver replies");
@@ -8657,7 +8781,7 @@ mod descending {
       );
 
       spawns_hold.release();
-      let resolved = tokio::time::timeout(Duration::from_secs(10), on_reply)
+      let resolved = tokio::time::timeout(interpreted_secs(10), on_reply)
         .await
         .expect("the fallback resolves")
         .expect("the driver replies");
@@ -8718,7 +8842,7 @@ mod descending {
       // registry never adopted a root nobody covers.
       rig.fs.remove("/r");
       spawns_hold.release();
-      let resolved = tokio::time::timeout(Duration::from_secs(10), on_reply)
+      let resolved = tokio::time::timeout(interpreted_secs(10), on_reply)
         .await
         .expect("the failed fallback resolves")
         .expect("the driver replies");
@@ -8796,7 +8920,7 @@ mod descending {
       assert!(rig.fs.probes() > probes_before, "the bracket probe ran");
       std::thread::sleep(Duration::from_millis(50));
 
-      let resolved = tokio::time::timeout(Duration::from_secs(10), on_reply)
+      let resolved = tokio::time::timeout(interpreted_secs(10), on_reply)
         .await
         .expect("the dead-lane widen resolves")
         .expect("the driver replies");
@@ -8889,7 +9013,7 @@ mod descending {
 
       // The pin: the reply is PROMPT — the catch-up waited on a finite prefix
       // snapshot, not "until the flood pauses".
-      let resolved = tokio::time::timeout(Duration::from_secs(10), on_reply)
+      let resolved = tokio::time::timeout(interpreted_secs(10), on_reply)
         .await
         .expect("a hot lane must not starve the widen reply")
         .expect("the driver replies");
@@ -9400,7 +9524,7 @@ mod descending {
       }
 
       // The commit fired only after the whole prefix — the reply resolves now.
-      let resolved = tokio::time::timeout(Duration::from_secs(10), on_reply)
+      let resolved = tokio::time::timeout(interpreted_secs(10), on_reply)
         .await
         .expect("the catch-up commit resolves the caller")
         .expect("the driver replies");
@@ -9514,7 +9638,7 @@ mod descending {
         "source unprefixed: {change:?}"
       );
 
-      let resolved = tokio::time::timeout(Duration::from_secs(10), on_reply)
+      let resolved = tokio::time::timeout(interpreted_secs(10), on_reply)
         .await
         .expect("the catch-up commit resolves the caller")
         .expect("the driver replies");
@@ -9603,7 +9727,7 @@ mod descending {
         "{change:?}"
       );
 
-      let resolved = tokio::time::timeout(Duration::from_secs(10), on_reply)
+      let resolved = tokio::time::timeout(interpreted_secs(10), on_reply)
         .await
         .expect("the dead-scope widen resolves")
         .expect("the driver replies");
@@ -9711,7 +9835,7 @@ mod descending {
 
       // The pin: the widen resolves while the flood runs — only the
       // fairness poll can have drained the prefix.
-      let resolved = tokio::time::timeout(Duration::from_secs(10), on_reply)
+      let resolved = tokio::time::timeout(interpreted_secs(10), on_reply)
         .await
         .expect("the catch-up commit is never starved by a command flood")
         .expect("the driver replies");
@@ -9792,7 +9916,7 @@ mod descending {
         .send(Command::Close { reply: close_reply })
         .await
         .unwrap();
-      let wedged = tokio::time::timeout(Duration::from_secs(15), on_close)
+      let wedged = tokio::time::timeout(interpreted_secs(15), on_close)
         .await
         .expect("Close is never starved by a source flood during catch-up")
         .expect("the close reply resolves");
@@ -9800,7 +9924,7 @@ mod descending {
       flood.stop_and_join();
       // The widen resolved one way or the other — committed before the
       // close won the command lane, or swept by it — never left dangling.
-      let resolved = tokio::time::timeout(Duration::from_secs(5), on_reply).await;
+      let resolved = tokio::time::timeout(interpreted_secs(5), on_reply).await;
       assert!(
         resolved.is_ok(),
         "the widen reply resolved (committed or swept at close)"
@@ -9863,7 +9987,7 @@ mod descending {
       rig.fs.disconnect("/r/sub");
       hold.release();
 
-      let resolved = tokio::time::timeout(Duration::from_secs(10), on_reply)
+      let resolved = tokio::time::timeout(interpreted_secs(10), on_reply)
         .await
         .expect("a dead-lane retire is never starved by a command flood")
         .expect("the driver replies");
@@ -9947,7 +10071,7 @@ mod descending {
       assert!(change.kind().is_created(), "{change:?}");
       assert_eq!(change.location(), &loc(&["last.txt"]));
 
-      let resolved = tokio::time::timeout(Duration::from_secs(10), on_reply)
+      let resolved = tokio::time::timeout(interpreted_secs(10), on_reply)
         .await
         .expect("the poll consumes the end marker past remaining == 0")
         .expect("the driver replies");
@@ -12543,7 +12667,7 @@ mod sync_cookie {
       .send(Command::Close { reply: close_reply })
       .await
       .unwrap();
-    let pending = tokio::time::timeout(Duration::from_secs(5), on_close)
+    let pending = tokio::time::timeout(interpreted_secs(5), on_close)
       .await
       .expect("close resolves at the grace boundary, not an indefinite hang")
       .expect("the driver replied");
@@ -12590,7 +12714,7 @@ mod sync_cookie {
       .send(Command::Close { reply: close_reply })
       .await
       .unwrap();
-    let pending = tokio::time::timeout(Duration::from_secs(5), on_close)
+    let pending = tokio::time::timeout(interpreted_secs(5), on_close)
       .await
       .expect("close returns within the grace, never wedged on a hung unlink")
       .expect("the driver replied");
@@ -12628,7 +12752,7 @@ mod sync_cookie {
     // block on the unlink.
     let hold = rig.fs.hold_cookie_removes();
     driver.abort();
-    let joined = tokio::time::timeout(Duration::from_secs(5), driver).await;
+    let joined = tokio::time::timeout(interpreted_secs(5), driver).await;
     assert!(
       joined.is_ok(),
       "Drop dispatched its unlink detached — the unwind was never blocked on the hung remove"
@@ -13554,7 +13678,7 @@ mod sync_cookie {
       .send(Command::Close { reply: close_reply })
       .await
       .unwrap();
-    let pending = tokio::time::timeout(Duration::from_secs(5), on_close)
+    let pending = tokio::time::timeout(interpreted_secs(5), on_close)
       .await
       .expect("close returns within the grace")
       .expect("the driver replied");
@@ -13562,6 +13686,57 @@ mod sync_cookie {
       pending >= 1,
       "the still-owned, unremovable cookie holds close in NotQuiesced"
     );
+  }
+
+  /// The real-clock window [`a_wedged_teardown_does_not_stop_the_close_drain`]
+  /// gives ONE drain cycle, in milliseconds — wider under an interpreter, because
+  /// the wall clock is what the window is denominated in and an interpreter buys
+  /// far less of the drain with it.
+  ///
+  /// What the measurement needs is a SHARE of the driver's one-second close grace
+  /// big enough to hold one drain cycle — a landed completion consumed, then the
+  /// retry deadline that completion scheduled serviced — and ending strictly
+  /// before the grace does. The grace is the driver's own constant, so the share
+  /// is the only side that can move. Natively a cycle costs a few milliseconds
+  /// and 400 ms of it carries twenty-odd cycles of headroom. Under an interpreter
+  /// the cycle costs interpreted WORK that no wall clock scales, and how much
+  /// depends on the borrow model: a cycle that stacked borrows finishes in
+  /// 150–450 ms takes up to 750 ms under tree borrows, which consults far more
+  /// aliasing state per access. Hence a window that looks far less generous than
+  /// the native one beside it while proving the same thing.
+  ///
+  /// The window is anchored at the sweep's OWN unlink dispatch rather than at the
+  /// close send, and under an interpreter that anchor is what makes it fit. The
+  /// command hop and the sweep ahead of the cycle cost 150–650 ms of
+  /// interpretation between them — as much as the cycle they precede — so
+  /// charging them to the window left under half of it for the thing being
+  /// measured, which the tree-borrows cycle did not fit in. They are staging, and
+  /// [`close_drain_setup_ms`] bounds them on their own.
+  ///
+  /// Ending strictly inside the grace is what keeps the cell's witness true. The
+  /// mutation spends the grace inside ONE synchronous wait anchored on the real
+  /// clock, so its first retry cannot land before that second is up however
+  /// slowly the interpreter runs — while this window is a share of that same
+  /// second, started where the driver starts counting it, so it closes first
+  /// whatever the interpreter costs.
+  fn close_drain_window_ms() -> u64 {
+    if cfg!(miri) { 900 } else { 400 }
+  }
+
+  /// How long [`a_wedged_teardown_does_not_stop_the_close_drain`] waits for the
+  /// close sweep's own unlink dispatch, in milliseconds, before it starts timing
+  /// the drain cycle that follows.
+  ///
+  /// This bounds STAGING rather than the measurement. The sweep dispatches
+  /// unconditionally, so the budget is only ever SPENT when the cell is already
+  /// failing, and sizing it many times over the 150–650 ms an interpreter needs
+  /// costs a passing run nothing while still reporting a sweep that never
+  /// dispatches in seconds rather than minutes. Nor can it hide a slow cycle: the
+  /// window above starts when this dispatch LANDS, so a late sweep moves the
+  /// measurement rather than shortening it, and the driver anchors its own grace
+  /// at the same point and moves with it.
+  fn close_drain_setup_ms() -> u64 {
+    if cfg!(miri) { 4_000 } else { 200 }
   }
 
   /// A teardown wedged for the whole grace must not stop close from draining.
@@ -13614,11 +13789,24 @@ mod sync_cookie {
       .await
       .unwrap();
 
-    // Well inside the one-second grace. Reaching two dispatches takes BOTH halves
-    // of the drain the wedge would otherwise hold: the sweep's failed attempt has
-    // to be consumed off the result channel, and the retry deadline it schedules
-    // has to be serviced.
-    let window = closed_at + Duration::from_millis(400);
+    // Staging: the close sweep's own unlink attempt, which parks `RemoveFailed`.
+    // It is not what this cell measures — the drain cycle after it is — so it
+    // gets its own budget and the window below starts where it lands.
+    let swept_by = closed_at + Duration::from_millis(close_drain_setup_ms());
+    while rig.fs.cookie_remove_dispatches() < 1 && std::time::Instant::now() < swept_by {
+      tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    assert!(
+      rig.fs.cookie_remove_dispatches() >= 1,
+      "staging: the close sweep dispatched the unlink it parks"
+    );
+
+    // Inside the one-second grace, by the share [`close_drain_window_ms`] sizes.
+    // Reaching a SECOND dispatch takes both halves of the drain the wedge would
+    // otherwise hold: the sweep's failed attempt has to be consumed off the
+    // result channel, and the retry deadline it schedules has to be serviced.
+    let window_ms = close_drain_window_ms();
+    let window = std::time::Instant::now() + Duration::from_millis(window_ms);
     let mut serviced = false;
     while std::time::Instant::now() < window {
       if rig.fs.cookie_remove_dispatches() >= 2 {
@@ -13629,15 +13817,15 @@ mod sync_cookie {
     }
     assert!(
       serviced,
-      "close serviced no cookie-retry deadline in 400 ms of its grace while a teardown was \
-       wedged (unlink dispatches: {})",
+      "close serviced no cookie-retry deadline in {window_ms} ms of its grace while a teardown \
+       was wedged (unlink dispatches: {})",
       rig.fs.cookie_remove_dispatches()
     );
 
     // And what the slicing must not cost: close still observes the teardown, and
     // still reports the residue it cannot clear.
     wedged.release();
-    let pending = tokio::time::timeout(Duration::from_secs(5), on_close)
+    let pending = tokio::time::timeout(interpreted_secs(5), on_close)
       .await
       .expect("close resolves at the grace boundary")
       .expect("the driver replied");
@@ -13725,7 +13913,7 @@ mod sync_cookie {
       .send(Command::Close { reply: close_reply })
       .await
       .unwrap();
-    let pending = tokio::time::timeout(Duration::from_secs(5), on_close)
+    let pending = tokio::time::timeout(interpreted_secs(5), on_close)
       .await
       .expect("close returns within the grace, never wedged")
       .expect("the driver replied");
@@ -13763,7 +13951,7 @@ mod sync_cookie {
       .send(Command::Close { reply: close_reply })
       .await
       .unwrap();
-    let pending = tokio::time::timeout(Duration::from_secs(5), on_close)
+    let pending = tokio::time::timeout(interpreted_secs(5), on_close)
       .await
       .expect("close returns within the grace")
       .expect("the driver replied");
@@ -13963,7 +14151,7 @@ mod sync_cookie {
       .send(Command::Close { reply: close_reply })
       .await
       .unwrap();
-    let pending = tokio::time::timeout(Duration::from_secs(5), on_close)
+    let pending = tokio::time::timeout(interpreted_secs(5), on_close)
       .await
       .expect("close returns within the grace, never wedged on a hung unlink")
       .expect("the driver replied");
@@ -14032,7 +14220,7 @@ mod sync_cookie {
       .send(Command::Close { reply: close_reply })
       .await
       .unwrap();
-    let pending = tokio::time::timeout(Duration::from_secs(5), on_close)
+    let pending = tokio::time::timeout(interpreted_secs(5), on_close)
       .await
       .expect("close returns within the grace")
       .expect("the driver replied");
@@ -14090,7 +14278,7 @@ mod sync_cookie {
       .send(Command::Close { reply: close_reply })
       .await
       .unwrap();
-    let pending = tokio::time::timeout(Duration::from_secs(5), on_close)
+    let pending = tokio::time::timeout(interpreted_secs(5), on_close)
       .await
       .expect("close returns within the grace")
       .expect("the driver replied");
@@ -14262,7 +14450,7 @@ mod sync_cookie {
       .send(Command::Close { reply: close_reply })
       .await
       .unwrap();
-    let pending = tokio::time::timeout(Duration::from_secs(5), on_close)
+    let pending = tokio::time::timeout(interpreted_secs(5), on_close)
       .await
       .expect("close returns within the grace, never wedged on the hung unlink")
       .expect("the driver replied");
@@ -15142,7 +15330,7 @@ mod sync_cookie {
     // = 3 ≥ cap → refused PROMPTLY, never queued behind the hold.
     let (root4, scope4) = &scopes[3];
     let r4_reply = sync_root_pending(&rig, *scope4, root4, ".tributaries-sync-hung-4").await;
-    let r4 = tokio::time::timeout(Duration::from_secs(3), r4_reply)
+    let r4 = tokio::time::timeout(interpreted_secs(3), r4_reply)
       .await
       .expect("the 4th admission refusal resolves promptly, never pends behind the write hold")
       .expect("the driver replies");
@@ -15237,7 +15425,7 @@ mod sync_cookie {
       ".tributaries-sync-distinct-last",
     )
     .await;
-    let last = tokio::time::timeout(Duration::from_secs(3), last_reply)
+    let last = tokio::time::timeout(interpreted_secs(3), last_reply)
       .await
       .expect("the (cap+1)-th refusal resolves promptly, never pends behind the write hold")
       .expect("the driver replies");
@@ -15951,7 +16139,7 @@ mod sync_cookie {
       .send(Command::Close { reply })
       .await
       .expect("the close command lands");
-    let outstanding = tokio::time::timeout(Duration::from_secs(10), on_reply)
+    let outstanding = tokio::time::timeout(interpreted_secs(10), on_reply)
       .await
       .expect("close returns within its grace despite the flood")
       .expect("the driver replies");
@@ -16990,7 +17178,7 @@ mod retention {
       .await
       .unwrap();
     assert!(
-      tokio::time::timeout(Duration::from_secs(10), on_first)
+      tokio::time::timeout(interpreted_secs(10), on_first)
         .await
         .expect("the unwound teardown still retires its obligation")
         .expect("the waiter is answered, never dropped")
@@ -17012,7 +17200,7 @@ mod retention {
       .await
       .unwrap();
     assert!(
-      tokio::time::timeout(Duration::from_secs(10), on_second)
+      tokio::time::timeout(interpreted_secs(10), on_second)
         .await
         .expect("a healthy teardown after a panic still completes")
         .expect("the waiter is answered")
@@ -17028,7 +17216,7 @@ mod retention {
     // and it never reports `Ok` over a teardown whose quiescence was not proven.
     let (reply, on_close) = futures_channel::oneshot::channel();
     rig.commands.send(Command::Close { reply }).await.unwrap();
-    let pending = tokio::time::timeout(Duration::from_secs(10), on_close)
+    let pending = tokio::time::timeout(interpreted_secs(10), on_close)
       .await
       .expect("close resolves — the phantom obligation is gone")
       .expect("the driver replies");
@@ -17098,7 +17286,7 @@ mod retention {
     // discharged when the terminal landed.
     let (reply, on_close) = futures_channel::oneshot::channel();
     rig.commands.send(Command::Close { reply }).await.unwrap();
-    let pending = tokio::time::timeout(Duration::from_secs(10), on_close)
+    let pending = tokio::time::timeout(interpreted_secs(10), on_close)
       .await
       .expect("close resolves — nothing is still owed")
       .expect("the driver replies");
@@ -17120,7 +17308,7 @@ mod retention {
       })
       .await
       .unwrap();
-    let outcome = tokio::time::timeout(Duration::from_secs(10), on_reply)
+    let outcome = tokio::time::timeout(interpreted_secs(10), on_reply)
       .await
       .expect("the watch resolves")
       .expect("the driver replies");
@@ -17188,7 +17376,7 @@ mod retention {
 
     let (reply, on_close) = futures_channel::oneshot::channel();
     rig.commands.send(Command::Close { reply }).await.unwrap();
-    let pending = tokio::time::timeout(Duration::from_secs(10), on_close)
+    let pending = tokio::time::timeout(interpreted_secs(10), on_close)
       .await
       .expect("close resolves — the obligation is discharged, only unproven")
       .expect("the driver replies");
@@ -17268,7 +17456,7 @@ mod retention {
       .send(Command::DebugTeardownPressure { reply })
       .await
       .unwrap();
-    tokio::time::timeout(Duration::from_secs(10), on_reply)
+    tokio::time::timeout(interpreted_secs(10), on_reply)
       .await
       .expect("the driver answers")
       .expect("the driver replies")
@@ -17329,7 +17517,7 @@ mod retention {
     }
     hold.release();
     for on_reply in queued {
-      let outcome = tokio::time::timeout(Duration::from_secs(30), on_reply)
+      let outcome = tokio::time::timeout(interpreted_secs(30), on_reply)
         .await
         .expect("every staged watch is answered")
         .expect("the driver never drops a watch reply");
@@ -17443,7 +17631,7 @@ mod retention {
     // The driver retires a surrendered stream BEFORE it answers the caller, so
     // once the last reply is in, every rollback this burst produced is counted.
     for on_reply in admitted {
-      let outcome = tokio::time::timeout(Duration::from_secs(30), on_reply)
+      let outcome = tokio::time::timeout(interpreted_secs(30), on_reply)
         .await
         .expect("every admitted watch is answered")
         .expect("the driver never drops a watch reply");
@@ -17595,7 +17783,7 @@ mod retention {
     }
     arms.release();
     for on_reply in queued {
-      let outcome = tokio::time::timeout(Duration::from_secs(30), on_reply)
+      let outcome = tokio::time::timeout(interpreted_secs(30), on_reply)
         .await
         .expect("every staged watch is answered")
         .expect("the driver never drops a watch reply");
@@ -17702,7 +17890,7 @@ mod retention {
 
   async fn unwatch_ack(rig: &Rig, scope: ScopeId) -> crate::driver::UnwatchAck {
     let on_reply = request_unwatch(rig, scope).await;
-    tokio::time::timeout(Duration::from_secs(10), on_reply)
+    tokio::time::timeout(interpreted_secs(10), on_reply)
       .await
       .expect("the unwatch resolves")
       .expect("the waiter is answered, never dropped")
@@ -17723,7 +17911,7 @@ mod retention {
         .send(Command::DebugUnprovenTeardowns { reply })
         .await
         .unwrap();
-      let seen = tokio::time::timeout(Duration::from_secs(10), on_reply)
+      let seen = tokio::time::timeout(interpreted_secs(10), on_reply)
         .await
         .expect("the driver answers")
         .expect("the driver replies");
@@ -17767,7 +17955,7 @@ mod retention {
     rig.fs.panic_teardowns(1);
     hold.release();
     assert!(
-      tokio::time::timeout(Duration::from_secs(10), parked)
+      tokio::time::timeout(interpreted_secs(10), parked)
         .await
         .expect("the parked waiter is answered")
         .expect("never dropped")
@@ -17825,7 +18013,7 @@ mod retention {
       })
       .await
       .unwrap();
-    tokio::time::timeout(Duration::from_secs(10), on_replace)
+    tokio::time::timeout(interpreted_secs(10), on_replace)
       .await
       .expect("the replace resolves")
       .expect("the driver replies")
@@ -17859,7 +18047,7 @@ mod retention {
     successor.release();
     for (waiter, arm) in [(on_live_arm, "live"), (on_dead_arm, "already-dead")] {
       assert!(
-        tokio::time::timeout(Duration::from_secs(10), waiter)
+        tokio::time::timeout(interpreted_secs(10), waiter)
           .await
           .expect("the waiter is answered")
           .expect("never dropped")
@@ -17909,7 +18097,7 @@ mod retention {
         })
         .await
         .unwrap();
-      match tokio::time::timeout(Duration::from_secs(10), on_reply)
+      match tokio::time::timeout(interpreted_secs(10), on_reply)
         .await
         .expect("the replace resolves")
         .expect("the driver replies")
@@ -17945,7 +18133,7 @@ mod retention {
       .unwrap();
     assert!(
       matches!(
-        tokio::time::timeout(Duration::from_secs(10), on_watch)
+        tokio::time::timeout(interpreted_secs(10), on_watch)
           .await
           .expect("the watch resolves")
           .expect("the driver replies"),
@@ -17994,7 +18182,7 @@ mod retention {
       .await
       .unwrap();
     assert_eq!(
-      tokio::time::timeout(Duration::from_secs(10), on_close)
+      tokio::time::timeout(interpreted_secs(10), on_close)
         .await
         .expect("close resolves at its grace boundary")
         .expect("the driver replies"),
@@ -18237,7 +18425,7 @@ mod abnormal_exit {
     );
     // The runtime this task was cancelled on is untouched by that wedge.
     tokio::time::timeout(
-      Duration::from_secs(5),
+      interpreted_secs(5),
       tokio::time::sleep(Duration::from_millis(1)),
     )
     .await
@@ -18306,14 +18494,14 @@ mod abnormal_exit {
     // The unwind happens between the handle's storage and the grant, so this
     // caller sees a dropped sender rather than a reply.
     assert!(
-      tokio::time::timeout(Duration::from_secs(10), on_reply)
+      tokio::time::timeout(interpreted_secs(10), on_reply)
         .await
         .expect("the driver dies rather than replying")
         .is_err(),
       "staging: the registry call unwound before the grant was sent"
     );
     assert!(
-      tokio::time::timeout(Duration::from_secs(10), driver)
+      tokio::time::timeout(interpreted_secs(10), driver)
         .await
         .expect("the task ends")
         .is_err(),
@@ -18527,14 +18715,14 @@ mod abnormal_exit {
       .await
       .unwrap();
     assert!(
-      tokio::time::timeout(Duration::from_secs(10), on_reply)
+      tokio::time::timeout(interpreted_secs(10), on_reply)
         .await
         .expect("the driver dies rather than replying")
         .is_err(),
       "staging: the conflict check unwound before the grant was sent"
     );
     assert!(
-      tokio::time::timeout(Duration::from_secs(10), driver)
+      tokio::time::timeout(interpreted_secs(10), driver)
         .await
         .expect("the task ends")
         .is_err(),
@@ -18596,7 +18784,7 @@ mod abnormal_exit {
       .await
       .unwrap();
     assert!(
-      tokio::time::timeout(Duration::from_secs(10), driver)
+      tokio::time::timeout(interpreted_secs(10), driver)
         .await
         .expect("the task ends")
         .is_err(),
@@ -18687,7 +18875,7 @@ mod abnormal_exit {
       .await
       .unwrap();
     assert!(
-      tokio::time::timeout(Duration::from_secs(10), driver)
+      tokio::time::timeout(interpreted_secs(10), driver)
         .await
         .expect("the task ends")
         .is_err(),
