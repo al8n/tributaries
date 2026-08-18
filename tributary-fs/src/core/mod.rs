@@ -873,6 +873,186 @@ impl CutProof {
   }
 }
 
+/// The ordering proof one scope's STAGED adoption markers wait on — the same
+/// reader-queue cut [`CutProof`] buys, consumed for the one certifying verdict
+/// that used to resolve on the op lane instead.
+///
+/// # What it is bought for
+///
+/// A widen's adoption marker is discharged by the chain parent's first complete
+/// listing, and the confirming direction of that listing is a claim about an
+/// INTERVAL — the splice-to-listing window — read off the interval's end state.
+/// That is admissible only if every record which could refute it has already
+/// been fed to the Monitor, and the listing's own completion does not establish
+/// it: the listing runs on the blocking pool, its completion is reported on the
+/// op channel, and the driver polls that channel ahead of the source lane. So
+/// the record which refutes the window — the adopted object's own `MoveSelf` —
+/// can be committed by the kernel BEFORE the listing and still unread when the
+/// listing's verdict runs.
+///
+/// The reader's pre-reply cut is exactly the missing edge. A control batch
+/// requested after the listing is answered only behind a drain of everything the
+/// kernel had committed to the instance's queue, forwarded onto the source lane
+/// AHEAD of the reply. One scope is one instance is one FIFO queue, so a
+/// refuting record committed before the listing is on the lane before that
+/// reply, and the choke point's drain feeds it before the seal takes any
+/// verdict.
+///
+/// The interval the claim is about is the ADOPTED OBJECT's occupancy of its
+/// slot. A cut orders records, and every reading behind the verdict — the
+/// marker's survival, the listing's identity match, the occupancy check — is
+/// about an inode, its parent link, and its filesystem. A mount stacked over the
+/// slot and unmounted again before the listing disturbs none of those and emits
+/// no record for a cut to order, so it leaves the end state reading exactly as
+/// the widen left it (see [`Monitor::seal_staged_adoptions`]).
+///
+/// # Why it is not [`CutProof`]
+///
+/// Same primitive, different window, and two differences that matter.
+///
+/// A cover fence's proof is stamped with the scope's coverage-work epoch,
+/// because what it must not outlive is the barrier re-opening. A seal's window
+/// is pinned by the markers themselves — a staged marker holds
+/// [`Monitor::coverage_settled`] down, so the fence's own arming predicate
+/// (`barrier_settled`) is false for exactly as long as a seal is owed, and the
+/// two can never be offered a cut in the same pass. What a seal must not
+/// outlive is the TRANSPORT: a cut taken on a queue the scope no longer reads
+/// orders nothing about the one it does. So the latch is stamped with the
+/// delivery lane instead, and a lane it does not name answers for nothing.
+///
+/// And a cover fence's in-flight request licenses its whole tranche including
+/// fences opened behind it, because a fence is a question about the window the
+/// cut already ordered. A staging is not: a marker staged after the request was
+/// committed to had its listing ingested after the cut was requested, so the cut
+/// says nothing about it. The reach is therefore compared at the VERDICT
+/// ([`licenses_through`](AdoptionSeal::licenses_through)), and a later staging
+/// waits for its own successor rather than being swept into a proof that never
+/// covered it.
+///
+/// # Why it cannot strand a scope
+///
+/// A token stops being provable in exactly four ways, and each of them clears
+/// this latch by a different edge:
+///
+/// - the batch carrying it never proves — it unwound, or its reader died under
+///   the current generation. Both fail closed to `on_source_fatal`, whose
+///   teardown releases every marker of the scope, so the staged set empties and
+///   [`resolve_adoption_seals`](DriverCore::resolve_adoption_seals) drops the
+///   entry;
+/// - the completion arrives under a generation the scope has swapped away from,
+///   so the driver's in-flight mark no longer names it and the proof is dropped
+///   silently. The lane stamp catches that with no help from anyone: the latch
+///   stops answering the moment the scope's lane moves, and the scope is offered
+///   a fresh cut. (The swap also rebinds the root, which releases the markers —
+///   so the entry is dropped as well. Two independent escapes, deliberately, for
+///   the same reason [`CutProof`] has two.)
+/// - the scope is torn down. Its markers die with its tree and the entry is
+///   dropped with them;
+/// - the batch is still QUEUED when a later request for the same scope discards
+///   it ([`queue_cut_proof`](crate::driver::queue_cut_proof)'s coalesce rule).
+///   Only two things mint a later request here: this latch itself, which does so
+///   only after rebuilding on a moved lane and so no longer names the discarded
+///   token, and a cover fence, which is offered a cut only once every marker of
+///   the scope has been released — the very condition that drops this entry.
+///
+/// What it CAN do is defer: a scope whose source lane never finishes draining
+/// holds its seal over pass after pass. That is the deferral a cover fence
+/// already carries, bounded per pass by the drain's own per-lane budget, and the
+/// marker keeps every one of its other exits — the spend, the retry cap, the
+/// walk, the rebind — throughout.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct AdoptionSeal {
+  /// The delivery lane everything below was taken on. A latch read under any
+  /// other lane answers for nothing and is rebuilt.
+  lane: u64,
+  /// The staging generation an answered cut has proven through: every marker
+  /// staged at or before it may be sealed. `None` until one lands. Kept as a
+  /// PREFIX rather than consumed, so a seal the drain defers costs no second
+  /// round trip.
+  proven: Option<u64>,
+  /// The request out, and the newest staging it will license. At most one is
+  /// ever out: a staging that opens behind it waits for a successor rather than
+  /// displacing it, so a scope widening steadily cannot cancel every request
+  /// before its reply lands.
+  in_flight: Option<SealRequest>,
+}
+
+/// A seal cut that has been asked for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct SealRequest {
+  /// Identifies the request, so only the completion of the batch that actually
+  /// carried it can close this one.
+  token: u64,
+  /// The staging generation this request's answer earns — the newest staging at
+  /// the instant it was committed to, never the newest when the reply lands.
+  reach: u64,
+}
+
+impl AdoptionSeal {
+  /// A latch on `lane` with nothing proven and nothing out.
+  const fn new(lane: u64) -> Self {
+    Self {
+      lane,
+      proven: None,
+      in_flight: None,
+    }
+  }
+
+  /// Whether this latch already owes no fresh cut for a scope on `lane` whose
+  /// newest staging is `high_water`.
+  ///
+  /// A request still out answers whatever has staged behind it — asking again
+  /// would only orphan it, and the successor the later staging needs is offered
+  /// the moment this one lands. A proven prefix answers only as far as it
+  /// reaches. Anything stamped on another lane answers for nothing at all,
+  /// request included: its reply can only ever prove an ordering of a queue the
+  /// scope has stopped reading.
+  const fn answers_for(self, lane: u64, high_water: u64) -> bool {
+    if self.lane != lane {
+      return false;
+    }
+    if self.in_flight.is_some() {
+      return true;
+    }
+    match self.proven {
+      Some(proven) => proven >= high_water,
+      None => false,
+    }
+  }
+
+  /// The staging generation a CONFIRM is licensed through on `lane`, which the
+  /// caller must read off the scope's CURRENT transport rather than off this
+  /// latch — a stamp compared against itself proves nothing.
+  ///
+  /// Only the proven prefix licenses anything: a request still out has ordered
+  /// nothing yet, and a prefix earned on another lane orders nothing here.
+  const fn licenses_through(self, lane: u64) -> Option<u64> {
+    match self.proven {
+      Some(proven) if self.lane == lane => Some(proven),
+      _ => None,
+    }
+  }
+
+  /// Puts `token`'s request out for the stagings through `reach`. The proven
+  /// prefix is left as it stands — a successor is a claim about stagings this
+  /// latch has not ordered yet, never evidence against the ones it has.
+  const fn latch(&mut self, token: u64, reach: u64) {
+    self.in_flight = Some(SealRequest { token, reach });
+  }
+
+  /// Retires the request in flight into the proven prefix — but only for the
+  /// token actually out, so every other completion is inert.
+  fn prove(&mut self, token: u64) {
+    let Some(request) = self.in_flight.take_if(|request| request.token == token) else {
+      return;
+    };
+    self.proven = Some(match self.proven {
+      Some(proven) => proven.max(request.reach),
+      None => request.reach,
+    });
+  }
+}
+
 /// A planned Monitor input, compiled from one raw event.
 #[derive(Debug)]
 enum Planned {
@@ -1226,8 +1406,15 @@ impl PendingWiden {
   }
 }
 
-/// Why a witnessed widen window tainted (INV-ROOT) — the diagnostic the
-/// fallback carries, mirroring the transport `Fatal`'s carried class.
+/// Why a widen's witnessed window was spent without committing (INV-ROOT) —
+/// the diagnostic the fallback carries, mirroring the transport `Fatal`'s
+/// carried class. The first two causes are WITNESS verdicts: the window saw
+/// something that costs it the proof its own binding is live. The last two are
+/// not witnessed at all — they are the commit gate finding the splice
+/// unprovable on its face, one because the adopted OBJECT cannot be named and
+/// one because the adopted PATH is too deep to prove — but each spends the
+/// window and takes the same fallback, so they travel the same channel rather
+/// than inventing a parallel one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TaintCause {
   /// The reserved root's own death record: `Ignored` (⊇ unmount), `MoveSelf`,
@@ -1237,6 +1424,29 @@ pub(crate) enum TaintCause {
   /// refusal) — the window may have lost the death records themselves, so it
   /// can no longer witness their absence.
   Loss,
+  /// The OLD root's identity does not fit the Monitor's enumerate-mint space
+  /// (a synthesized or unreadable `ino == 0`, or a 128-bit file id past
+  /// `u64` — ReFS), so the splice could install no expected object at the
+  /// adopted edge and its dark-window tripwire would have nothing to re-prove
+  /// against. Not a witness verdict: nothing went wrong in the window, the
+  /// commit is simply not provable, and the fallback's fresh spawn barrier
+  /// rebuilds the binding without needing the identity at all.
+  UnmintableIdentity,
+  /// The old root sits more than one segment below the new one, so the splice
+  /// would have to mint INTERMEDIATE connectors — unidentified cold nodes whose
+  /// own edges no adoption marker names and no read re-proves. A connector could
+  /// move out of its slot and back inside the dark window unrecorded, movement
+  /// deeper down the chain could go unobserved entirely, and a rename of an
+  /// ANCESTOR of the old root emits no `MoveSelf` for the already-watched old
+  /// root, so the invalidation that spends a moved adoption's proof never fires;
+  /// the single tail marker would confirm regardless.
+  /// [`Monitor::widen_root`] therefore serves depth one only. Like
+  /// [`UnmintableIdentity`](Self::UnmintableIdentity) this is not a witness
+  /// verdict and not a driver bug — the widen was well-formed and the window was
+  /// clean, the shape is simply one no proof covers — and the fallback replace
+  /// re-establishes the binding over an arbitrarily deep widen without needing a
+  /// window proof at all.
+  UnprovableChain,
 }
 
 /// A tainted window's diagnostics, carried on the commit refusal.
@@ -1258,13 +1468,18 @@ pub(crate) enum WidenCommit {
   /// under — the splice mints it, so an outcome naming any other attempt is a
   /// superseded arm's and is discarded.
   Committed(ArmAttempt),
-  /// The witnessed window tainted (INV-ROOT): a reserved death record or a
-  /// scope loss signal landed between the reservation and this commit, so
-  /// the binding cannot be proven live. Core and Monitor are untouched
-  /// except that the spent window is consumed; the caller disarms the
-  /// pre-armed descriptor and falls back to the general stream replace,
-  /// whose spawn barrier re-establishes the binding from scratch. A
-  /// LEGITIMATE outcome, never a driver bug.
+  /// The commit is not provable, for one of the [`TaintCause`]s: the
+  /// witnessed window tainted (a reserved death record or a scope loss signal
+  /// landed between the reservation and this commit, so the binding cannot be
+  /// proven live), the old root carried no mintable identity for the
+  /// adopted edge's re-proof, or it sat more than one segment down so the
+  /// splice's intermediate connector edges would have no proof at all. Core
+  /// and Monitor are untouched except that the
+  /// spent window is consumed; the caller disarms the pre-armed descriptor
+  /// and falls back to the general stream replace, whose spawn barrier
+  /// re-establishes the binding from scratch. A LEGITIMATE outcome, never a
+  /// driver bug — and because the window is consumed HERE, the caller must
+  /// not close it again.
   TaintedWindow(WidenTaint),
   /// A violated precondition on a path the driver's gates make unreachable —
   /// core and Monitor bit-identical (the window entry included), the caller
@@ -1337,6 +1552,13 @@ pub(crate) struct DriverCore {
   /// profile, so exempting it left a real queue overflow invisible to a
   /// pending sync fence.
   cover_fences: BTreeMap<ScopeId, CoverFence>,
+  /// Per-scope adoption-seal latch — the ordering proof a STAGED adoption
+  /// marker waits on (see [`AdoptionSeal`]). An entry is minted when the scope
+  /// is first offered a cut for a staged marker and dropped by
+  /// [`resolve_adoption_seals`](Self::resolve_adoption_seals) as soon as the
+  /// scope has no staged marker left, so it never outlives the obligation and
+  /// never outlives its scope.
+  adoption_seals: BTreeMap<ScopeId, AdoptionSeal>,
   /// Fences a scope teardown resolved (always [`CoverSettle::Dead`] — the
   /// terminal `Rescan` covers the caller, and the verdict carries the death
   /// itself because the `TeardownStream` that clears the driver's liveness
@@ -1400,6 +1622,7 @@ impl DriverCore {
       effects: VecDeque::new(),
       dying: BTreeMap::new(),
       cover_fences: BTreeMap::new(),
+      adoption_seals: BTreeMap::new(),
       settled_covers: Vec::new(),
       scope_seq: 0,
       probe_seq: 0,
@@ -2142,6 +2365,141 @@ impl DriverCore {
     }
   }
 
+  /// The scopes whose staged adoption markers have not yet forced the source to
+  /// surface what the kernel holds — see [`AdoptionSeal`].
+  ///
+  /// `lane_of` reports a scope's CURRENT delivery lane, which the latch is
+  /// stamped with: a latch naming any other lane speaks for a queue the scope
+  /// has stopped reading, and is re-offered rather than waited on. The driver
+  /// owns that number, so it is asked for it here rather than mirroring it.
+  ///
+  /// Reporting does NOT latch, for the same reason
+  /// [`covers_awaiting_cut`](Self::covers_awaiting_cut) does not: the caller may
+  /// decline a scope whose stream is already gone, and a request spent on a
+  /// batch nobody sends could only ever be closed by a reply that never comes.
+  /// A declined scope simply reappears next pass.
+  ///
+  /// The offer and [`mark_adoption_cut_inflight`](Self::mark_adoption_cut_inflight)
+  /// share one predicate, so the caller can always latch what it was offered.
+  pub(crate) fn adoptions_awaiting_cut(&self, lane_of: &impl Fn(ScopeId) -> u64) -> Vec<ScopeId> {
+    self
+      .monitor
+      .staged_adoption_scopes()
+      .into_iter()
+      .filter(|(scope, high_water)| {
+        self.cut_proof_required(*scope)
+          && !self
+            .adoption_seals
+            .get(scope)
+            .is_some_and(|seal| seal.answers_for(lane_of(*scope), *high_water))
+      })
+      .map(|(scope, _)| scope)
+      .collect()
+  }
+
+  /// Latches `scope`'s seal as having the ordering-proof request `token` in
+  /// flight on `lane`, so it is asked for exactly one however many passes the
+  /// reply takes. Called only once the caller has committed to sending that
+  /// batch.
+  ///
+  /// The request is stamped with the newest staging the scope currently holds —
+  /// the stagings this proof will be able to license — which its proof inherits
+  /// and the seal is checked against, so the caller needs no bookkeeping of its
+  /// own. A latch on a lane the scope has left is rebuilt from nothing rather
+  /// than extended: neither its prefix nor its request orders the queue the
+  /// scope now reads.
+  pub(crate) fn mark_adoption_cut_inflight(&mut self, scope: ScopeId, lane: u64, token: u64) {
+    let Some(high_water) = self.monitor.adoption_staging_high_water(scope) else {
+      return;
+    };
+    let seal = self
+      .adoption_seals
+      .entry(scope)
+      .or_insert_with(|| AdoptionSeal::new(lane));
+    if seal.lane != lane {
+      *seal = AdoptionSeal::new(lane);
+    }
+    if !seal.answers_for(lane, high_water) {
+      seal.latch(token, high_water);
+    }
+  }
+
+  /// Records that `scope`'s source answered, on `lane`, a control batch carrying
+  /// the seal request `token` — whose reply the reader's pre-reply cut precedes,
+  /// so anything the kernel held is now on the lane, ahead of this.
+  ///
+  /// Only the request actually in flight is closed, and only by its OWN token
+  /// and its OWN lane, which is what makes every stale completion inert: a
+  /// predecessor batch's cut was taken before this request existed, and a batch
+  /// answered on a retired transport cut a queue this scope no longer reads.
+  pub(crate) fn prove_adoption_cut(&mut self, scope: ScopeId, lane: u64, token: u64) {
+    if let Some(seal) = self.adoption_seals.get_mut(&scope)
+      && seal.lane == lane
+    {
+      seal.prove(token);
+    }
+  }
+
+  /// Whether the next [`resolve_adoption_seals`](Self::resolve_adoption_seals)
+  /// would release at least one staged marker — some scope holding a proven
+  /// prefix that reaches a marker still staged.
+  ///
+  /// The driver consults this to arm the same source drain a cover settlement
+  /// arms, and for the same reason: the verdict may only be taken over a lane
+  /// nobody is still reading. Free for a scope that owes no seal — the latch map
+  /// is empty outside a widen's confirm window.
+  pub(crate) fn adoption_seal_due(&self, lane_of: &impl Fn(ScopeId) -> u64) -> bool {
+    self.adoption_seals.iter().any(|(scope, seal)| {
+      seal
+        .licenses_through(lane_of(*scope))
+        .is_some_and(|through| self.monitor.adoption_staged_through(*scope, through))
+    })
+  }
+
+  /// Releases every staged adoption marker an answered cut has ordered, at the
+  /// driver's one choke point — after the drain that fed the lane to spent, and
+  /// never for a scope the drain did not finish.
+  ///
+  /// The withholding is the same rule a cover settlement takes and it is owed
+  /// for a stronger reason: the whole point of the cut is to put a refuting
+  /// record on the lane, so a verdict taken while that lane still holds unread
+  /// items would resolve over exactly the record the round trip was bought to
+  /// surface.
+  ///
+  /// Sweeping first is the seal latch's clear-on-empty edge: a scope with no
+  /// staged marker owes no seal, so its latch — proven prefix and request in
+  /// flight alike — is dropped where it stands rather than left to answer for an
+  /// obligation that no longer exists. That is what keeps a request whose reply
+  /// can never arrive from being mistaken for one that still might.
+  pub(crate) fn resolve_adoption_seals(
+    &mut self,
+    lane_of: &impl Fn(ScopeId) -> u64,
+    unspent: &std::collections::BTreeSet<ScopeId>,
+  ) {
+    let monitor = &self.monitor;
+    self
+      .adoption_seals
+      .retain(|scope, _| monitor.adoption_staging_high_water(*scope).is_some());
+    let due: Vec<(ScopeId, u64)> = self
+      .adoption_seals
+      .iter()
+      .filter(|(scope, _)| !unspent.contains(*scope))
+      .filter_map(|(scope, seal)| {
+        seal
+          .licenses_through(lane_of(*scope))
+          .filter(|through| monitor.adoption_staged_through(*scope, *through))
+          .map(|through| (*scope, through))
+      })
+      .collect();
+    if due.is_empty() {
+      return;
+    }
+    for (scope, through) in due {
+      self.monitor.seal_staged_adoptions(scope, through);
+    }
+    self.drain_monitor();
+  }
+
   /// Resolves every settled fence the [`SettlePass`] entitles this boundary to
   /// mint, and holds the rest over WITH THEIR ENTRIES INTACT — a deferred
   /// window is retried, never degraded and never lost.
@@ -2848,14 +3206,25 @@ impl DriverCore {
   /// `Created`s — a birth-equivalent window, dominated by nothing.
   ///
   /// Returns how the commit was disposed of ([`WidenCommit`]).
-  /// [`TaintedWindow`](WidenCommit::TaintedWindow) is the witnessed-window
-  /// gate (INV-ROOT): a reserved death record or a scope loss signal landed
-  /// between the reservation and this commit, so the reserved binding cannot
-  /// be proven live — the splice is refused with the core and Monitor
-  /// untouched except for the spent window, and the caller (which owes no
-  /// loudness — this is a legitimate outcome) disarms the pre-armed
-  /// descriptor and falls back to the general stream replace, re-establishing
-  /// the binding through a fresh spawn barrier.
+  /// [`TaintedWindow`](WidenCommit::TaintedWindow) collects the three
+  /// unprovable-commit gates. The witnessed-window one (INV-ROOT): a reserved
+  /// death record or a scope loss signal landed between the reservation and
+  /// this commit, so the reserved binding cannot be proven live. The
+  /// adopted-object one: the OLD root's identity does not fit the Monitor's
+  /// enumerate-mint space, so the widen's dark-window tripwire would have no
+  /// expected object to re-prove the adopted edge against. The adopted-path
+  /// one: the old root sits more than one segment down, so the splice's
+  /// intermediate connectors would carry edges no marker proves and no
+  /// `MoveSelf` invalidates. `Monitor::widen_root` refuses both of the latter
+  /// two shapes outright — screened HERE so neither refusal reaches the
+  /// driver-bug channel below. Any of the three refuses the
+  /// splice with the core and Monitor untouched except for the
+  /// spent window, and the caller (which owes no loudness — this is a
+  /// legitimate outcome, and it must NOT close the window again) disarms the
+  /// pre-armed descriptor and falls back to the general stream replace,
+  /// re-establishing the binding through a fresh spawn barrier. Only the widen's
+  /// zero-gap SHORTCUT is depth-capped: the stream replace re-roots to an
+  /// arbitrarily distant ancestor, so no reachable root becomes unwatchable.
   /// [`Refused`](WidenCommit::Refused) — a violated precondition on a path
   /// the driver's gates make unreachable — leaves the core and the Monitor
   /// bit-identical, the window entry included (every refusal is decided
@@ -2946,6 +3315,30 @@ impl DriverCore {
       debug_assert!(false, "the driver refuses an equal-root widen");
       return WidenCommit::Refused;
     }
+    // DEPTH ONE only. Past one segment the splice would mint intermediate
+    // connectors whose edges nothing proves and nothing invalidates
+    // ([`TaintCause::UnprovableChain`]), and `Monitor::widen_root` refuses that
+    // shape outright — screened HERE, in the Monitor's own order (chain shape
+    // before identity), so that refusal never reaches the driver-bug channel
+    // below, exactly as the unmintable-identity screen does. A well-formed,
+    // clean-window widen of a deep root is a LEGITIMATE fallback: the stream
+    // replace re-roots to an arbitrary ancestor through a fresh spawn barrier,
+    // paying a covering `Rescan` and a re-crawl instead of a window proof, so
+    // the capability survives the refusal and only its zero-gap shortcut does
+    // not. Spending the window is part of the disposal — the caller's
+    // `TaintedWindow` arm deliberately does not close it, and a leaked entry
+    // would poison a future widen's reservation on this scope if the fallback's
+    // spawn then failed.
+    if chain.len() > 1 {
+      let spent = state
+        .pending_widen
+        .take()
+        .expect("the taint gate above proved the window live");
+      return WidenCommit::TaintedWindow(WidenTaint {
+        cause: TaintCause::UnprovableChain,
+        benign: spent.benign,
+      });
+    }
     // The adopted node's identity, in the enumerate-mint space (the bare inode
     // — see `mint`): the old root sits on the scope's own device by the widen
     // predicate, so the device-trust gate is satisfied by construction.
@@ -2954,9 +3347,29 @@ impl DriverCore {
       .and_then(|id| u64::try_from(id.ino()).ok())
       .and_then(NonZeroU64::new)
       .map(Identity::new);
+    // No mintable identity, no adoption. `widen_root` requires one — it is the
+    // only thing the tail's first read can re-prove the adopted edge against,
+    // and confirming that edge on ignorance would certify a dark-window swap.
+    // Screen it here so the Monitor's refusal stays what the assert below says
+    // it is (a driver bug), and dispose it as the window's own legitimate
+    // spend: the fallback replace rebuilds the binding from a fresh spawn
+    // barrier, which needs no identity to be correct. Consuming the window is
+    // part of that disposal — the caller's `TaintedWindow` arm deliberately
+    // does not close it, and a leaked entry would poison a future widen's
+    // reservation on this scope if the fallback's spawn then failed.
+    let Some(old_identity) = old_identity else {
+      let spent = state
+        .pending_widen
+        .take()
+        .expect("the taint gate above proved the window live");
+      return WidenCommit::TaintedWindow(WidenTaint {
+        cause: TaintCause::UnmintableIdentity,
+        benign: spent.benign,
+      });
+    };
     let Some((_, attempt)) = self
       .monitor
-      .widen_root(scope, reserved, chain, old_identity)
+      .widen_root(scope, reserved, chain, Some(old_identity))
     else {
       debug_assert!(false, "a live descending scope accepts its widen splice");
       return WidenCommit::Refused;

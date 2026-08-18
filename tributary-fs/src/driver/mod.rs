@@ -2436,21 +2436,23 @@ enum ReplaceMode<H> {
   SameFd { phase: SameFdPhase },
 }
 
-/// A widen commit's applied shape: committed, or fallen back — a TAINTED
-/// witnessed window (INV-ROOT, the legitimate refusal) or the core's
-/// pre-mutation guards (the impossible path made visible instead of a silent
-/// `Ok`). Either fallback leaves the core, the Monitor, AND the registry
-/// untouched — the widened entry publishes only at a commit (Golden-2), so
-/// the OLD entry keeps naming the live truth through the whole fallback and
-/// through a fallback failure. The caller converts the obligation to the
-/// general stream replace: its commit overwrites the entry with spawn-minted
-/// truth and its failure taxonomy answers the caller.
+/// A widen commit's applied shape: committed, or fallen back — an unprovable
+/// commit (INV-ROOT's tainted witnessed window, an old root with no mintable
+/// identity for the adopted edge's re-proof, or an old root more than one
+/// segment down, whose connector edges no proof covers: the legitimate refusals)
+/// or the core's pre-mutation guards (the impossible path made visible instead
+/// of a silent `Ok`). Either fallback leaves the core, the Monitor, AND the
+/// registry untouched — the widened entry publishes only at a commit
+/// (Golden-2), so the OLD entry keeps naming the live truth through the whole
+/// fallback and through a fallback failure. The caller converts the obligation
+/// to the general stream replace: its commit overwrites the entry with
+/// spawn-minted truth and its failure taxonomy answers the caller.
 enum WidenOutcome {
   /// The core and Monitor spliced; the widen is live on the same transport.
   Committed,
   /// Fall back to the new-stream replace under the caller's original
-  /// reservation. `Some` carries a tainted window's witness diagnostics (the
-  /// taint cause plus the benign reserved records the latch consumed) — read
+  /// reservation. `Some` carries an unprovable commit's diagnostics (the
+  /// cause plus the benign reserved records the latch consumed) — read
   /// only by the env-gated widen diagnostic today, mirroring the transport
   /// `Fatal`'s carried class; `None` is the impossible-path core refusal.
   FallBack(Option<WidenTaint>),
@@ -5952,27 +5954,49 @@ pub(crate) async fn run<R, F>(
     // deferral touches. The snapshot is retaken every pass, so the deferral cannot
     // outlive the residue that caused it.
     let mut source_unspent = BTreeSet::new();
-    let observed_over_drained_source = core.cover_settlement_due() && {
-      let mut snapshot = SourceSnapshot::taken(&lanes, &source_taps);
-      let mut drained = false;
-      while !snapshot.spent() {
-        let core::task::Poll::Ready(Some(item)) = futures_util::poll!(os.next()) else {
-          break;
-        };
-        snapshot.consume(item.0, item.1);
-        ingest_source_item::<F>(
-          &mut core,
-          &lanes,
-          &mut streams.replace_states,
-          &streams.handles,
-          item,
-          &now,
-        );
-        drained = true;
-      }
-      source_unspent = snapshot.unspent_scopes();
-      drained
-    };
+    // The adoption seal arms the same fence for a stronger reason than the
+    // settle observation does. A cover settlement guards against resolving over
+    // a queued loss; the seal's entire purpose is to take its verdict AFTER a
+    // record the cut has just forwarded onto this lane, so a seal resolved over
+    // an undrained lane would resolve over exactly the evidence its round trip
+    // was bought to surface.
+    let lane_of = |scope: ScopeId| lanes.get(&scope).copied().unwrap_or(u64::MAX);
+    let observed_over_drained_source =
+      (core.cover_settlement_due() || core.adoption_seal_due(&lane_of)) && {
+        let mut snapshot = SourceSnapshot::taken(&lanes, &source_taps);
+        let mut drained = false;
+        while !snapshot.spent() {
+          let core::task::Poll::Ready(Some(item)) = futures_util::poll!(os.next()) else {
+            break;
+          };
+          snapshot.consume(item.0, item.1);
+          ingest_source_item::<F>(
+            &mut core,
+            &lanes,
+            &mut streams.replace_states,
+            &streams.handles,
+            item,
+            &now,
+          );
+          drained = true;
+        }
+        source_unspent = snapshot.unspent_scopes();
+        drained
+      };
+
+    // The adoption seal resolves ABOVE both demand loops, because it is the one
+    // thing in this pass that can RELEASE the coverage barrier. Every other
+    // release happens at an ingest, whose own select arm re-tops the loop and
+    // brings the demand below back around; this one happens here, so a fence
+    // offered before it would be judged against a barrier the very next line was
+    // about to settle — and with nothing left to ingest, the loop would then park
+    // with the fence owing a cut nobody had asked for.
+    //
+    // Resolving first costs the settlement below nothing: a seal can only fire
+    // when `adoption_seal_due` armed the drain above, so the per-lane withholding
+    // the settlement reads was computed under exactly the fence a release-in-this-
+    // pass needs.
+    core.resolve_adoption_seals(&lane_of, &source_unspent);
 
     // Set-cover settlements resolve at this one choke point — after the
     // previous arm's results fed the core and their effects drained, BEFORE
@@ -6018,6 +6042,36 @@ pub(crate) async fn run<R, F>(
       let token = cut_token_seq;
       queue_cut_proof(&mut pending_control, scope, lane, token);
       core.mark_cut_inflight(scope, token);
+      kick_control_queue::<R, F>(
+        &ops,
+        &op_tx,
+        &mut pending_control,
+        &mut control_inflight,
+        &lanes,
+        scope,
+      );
+    }
+    // The adoption seal's own demand, on the same primitive and the same empty
+    // batch. It never collides with the fence's demand above: a staged marker
+    // holds `Monitor::coverage_settled` down, and `covers_awaiting_cut` offers
+    // only a scope whose barrier has settled — so no scope can be offered both
+    // in one pass, and the two latches never contend for one token. Nor can this
+    // enqueue discard a cover fence's still-live queued proof: a marker can only
+    // have been recorded since that proof was queued (a standing marker would
+    // have kept the fence from being offered), and recording one ACQUIRES
+    // coverage work, whose epoch bump has already retired the fence's latch —
+    // which is precisely the condition under which `queue_cut_proof` calls a
+    // queued entry obsolete.
+    for scope in core.adoptions_awaiting_cut(&lane_of) {
+      // A stream that is already gone has nothing to ask, exactly as above.
+      if !streams.handles.contains_key(&scope) {
+        continue;
+      }
+      let lane = lane_of(scope);
+      cut_token_seq += 1;
+      let token = cut_token_seq;
+      queue_cut_proof(&mut pending_control, scope, lane, token);
+      core.mark_adoption_cut_inflight(scope, lane, token);
       kick_control_queue::<R, F>(
         &ops,
         &op_tx,
@@ -7040,6 +7094,11 @@ pub(crate) async fn run<R, F>(
                 // about the one it does.
                 if let Some(token) = cut_token {
                   core.prove_cut(scope, token);
+                  // The same round trip proves the same thing for a staged
+                  // adoption, and the two latches take it by token: only one of
+                  // them ever has a request out for a scope at a time, so the
+                  // other's `prove` is inert.
+                  core.prove_adoption_cut(scope, generation, token);
                 }
                 kick_control_queue::<R, F>(
                   &ops,
@@ -10018,13 +10077,20 @@ where
       Ok(WidenOutcome::Committed)
     }
     WidenCommit::TaintedWindow(taint) => {
-      // The witnessed window tainted (INV-ROOT): a reserved death record or a
-      // scope loss landed between the reservation and this commit, so the
-      // pre-armed binding cannot be proven live — a LEGITIMATE refusal, never
-      // a bug. Disarm the descriptor (mirroring the conflict path above: the
-      // live stream keeps running until the fallback retires it) and hand the
-      // obligation to the general stream replace, whose fresh spawn barrier
-      // re-establishes the binding the window could not prove.
+      // The commit is not provable — the witnessed window tainted (INV-ROOT:
+      // a reserved death record or a scope loss landed between the
+      // reservation and this commit, so the pre-armed binding cannot be
+      // proven live), the old root had no mintable identity for the
+      // adopted edge's re-proof, or it sat more than one segment down, where
+      // the splice's connector edges carry no proof at all. Each is a
+      // LEGITIMATE refusal, never a bug.
+      // The core CONSUMED the window on this path (unlike `Refused` below,
+      // which leaves it bit-identical), so there is nothing left for
+      // `abort_widen_watch` to close. Disarm the descriptor (mirroring the
+      // conflict path above: the live stream keeps running until the fallback
+      // retires it) and hand the obligation to the general stream replace,
+      // whose fresh spawn barrier re-establishes the binding the commit could
+      // not prove.
       let ops = ops.clone();
       R::spawn_blocking_detach(move || ops.remove_watch(scope, reserved));
       Ok(WidenOutcome::FallBack(Some(taint)))

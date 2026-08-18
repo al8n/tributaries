@@ -1322,6 +1322,185 @@ async fn a_sync_barrier_across_a_widen_resolves_by_delivery() {
   let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The world half of the adoption seal's proof, and the one stratum no in-process
+/// harness can represent: a rename's records are committed before any listing of
+/// either of its parent directories that reflects it. The widen's proof lists the
+/// CHAIN PARENT, which is that rename's `old_dir` and `new_dir`, so an excursion
+/// a confirming listing could conceal has its `IN_MOVE_SELF` already on the
+/// instance queue when the post-listing cut is taken — and the cut forwards it
+/// ahead of its own reply, so the marker is spent before any verdict.
+///
+/// A CANARY, not a proof — and a canary for that WORLD ordering, not for the
+/// fence built on it (see below). It races an excursion of the adopted directory
+/// against the widen and asserts the one ending the ordering forbids: a barrier
+/// that certifies with the interval's change neither delivered nor dominated. A
+/// kernel that reordered `fsnotify_move` against `iterate_dir` would show up here
+/// as a bare cookie over an undelivered change; every other ending — a refused
+/// widen, a denied sync, a dominating `Rescan`, a degraded settle whose covering
+/// `Rescan` stands in for the cookie's own lost record — is legal, and each is
+/// recognised and returned from rather than folded into the assertion.
+///
+/// # The change bears two names, and neither is the weaker fact
+///
+/// An event's path is the object's place in the Monitor's tree AS THAT TREE
+/// STOOD when the record was ingested, and the rename that carries the directory
+/// home is a LATER record on the same queue. So the delivery that discharges
+/// this barrier normally names `z/while-away.txt` — where the file was when it
+/// was created — and only a re-arm crawl that cold-discovers the file after the
+/// return names `y/while-away.txt`. Demanding the second alone demands that a
+/// committed record be re-labelled with a name its object acquired afterwards,
+/// which nothing promises; the relocation is reported instead, in order, by the
+/// `Moved` behind it (`moved_directory_keeps_coverage` pins the same rule from
+/// the quiet side).
+///
+/// # What this does not cover
+///
+/// It cannot force the interleaving, and it is not a differential canary for the
+/// seal. The excursion runs on a watch that is already armed, so its records sit
+/// on the very queue the cookie's record rides behind and the barrier resolves
+/// honestly whether or not the adopted edge's verdict was fenced — measured both
+/// ways, over rounds that provably overlapped the widen and rounds that did not.
+/// What the seal decides is whether that edge CONFIRMS or is refuted into a
+/// covering `Rescan`, and no predicate this cell can evaluate from outside the
+/// process says which of those a given round was owed. That verdict is pinned
+/// deterministically by the Monitor's own
+/// `a_change_and_return_inside_the_window_never_settles_uncovered`. What is left
+/// here is the world stratum: against a real kernel, and whatever the round
+/// staged, the barrier never certifies over an interval nothing stood for. The
+/// reported staging says which round was which.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_widen_racing_an_excursion_never_certifies_a_dark_interval() {
+  let root = scratch_root("widen-excursion");
+  let adopted = root.join("y");
+  let away = root.join("z");
+  std::fs::create_dir_all(&adopted).expect("create tree");
+  let mut w = inotify_watcher();
+  let handle = w.watch(&adopted, Interest::all()).await.expect("watch");
+  assert!(
+    coverage_becomes_live(&mut w, &adopted, "birth").await,
+    "the birth crawl settles"
+  );
+
+  // The excursion, racing the commit from another thread: the adopted directory
+  // leaves its slot, CHANGES while it is away, and comes back to the same name
+  // with the same identity — so the chain parent's first listing cannot tell this
+  // window from a quiet one, and only the object's own record can.
+  let raced_at = std::time::Instant::now();
+  let excursion = {
+    let (adopted, away) = (adopted.clone(), away.clone());
+    std::thread::spawn(move || {
+      std::thread::sleep(Duration::from_millis(2));
+      let left_at = raced_at.elapsed();
+      if std::fs::rename(&adopted, &away).is_err() {
+        return (left_at, false);
+      }
+      let _ = std::fs::write(away.join("while-away.txt"), b"x");
+      if std::fs::rename(&away, &adopted).is_err() {
+        return (left_at, false);
+      }
+      (left_at, true)
+    })
+  };
+
+  let widened = w.replace_root(handle, &root).await.is_ok();
+  let widened_for = raced_at.elapsed();
+  let (left_at, excursed) = excursion.join().expect("the excursion thread finishes");
+  // The staging, reported on every round: a rename-out that lands after the
+  // widen has already returned is an excursion no widen window contained, so the
+  // round exercises the barrier over a live stream rather than over the dark
+  // interval this cell is named for. Both are honest; only one samples the
+  // window, and a run that never samples it must say so rather than look like a
+  // run that did.
+  eprintln!(
+    "NOTE: the adopted directory left its slot {left_at:?} into a widen that returned after \
+     {widened_for:?} — a round whose departure lands later than that samples a live stream, \
+     not the widen's own window"
+  );
+
+  // A widen that refused, or a scope the racing rename tore down, is a legitimate
+  // ending: the fallback replace and the root invalidation each carry their own
+  // covering `Rescan`. There is nothing left for this cell to canary.
+  if !excursed || !widened {
+    eprintln!(
+      "NOTE: this round staged no interval to certify (the excursion completed: {excursed}, \
+       the widen committed: {widened}) — the fallback replace and the root invalidation each \
+       carry their own cover"
+    );
+    let _ = w.close().await;
+    let _ = std::fs::remove_dir_all(&root);
+    return;
+  }
+
+  let (admission, _ticket) = w.mint_sync_ticket();
+  let Ok(cookie) = w
+    .sync_root(
+      handle,
+      root.clone(),
+      ".tributaries-sync-excursion",
+      admission,
+    )
+    .await
+  else {
+    // A denied sync answers its caller; it certifies nothing, so it cannot lie.
+    eprintln!("NOTE: this round's sync was denied, so no barrier was consulted");
+    let _ = w.close().await;
+    let _ = std::fs::remove_dir_all(&root);
+    return;
+  };
+
+  // The one change, under both names it can honestly bear (see above). Only
+  // DELIVERY takes both: a record names where its object was, so either name is
+  // that record. DOMINATION takes the name the object holds NOW, because a
+  // `Rescan` is an instruction to re-enumerate a path and the caller obeys it
+  // after the excursion has ended — a cover located at the slot the directory
+  // has since left sends the re-read at ground the change is no longer on, which
+  // is a coverage hole this cell should fail on rather than accept. Every cover
+  // the design stands for a spent or unproven adoption is at the scope root or
+  // at the marker's own name in the chain parent, and both reach that name.
+  let dark_away = away.join("while-away.txt");
+  let dark_home = adopted.join("while-away.txt");
+  let barrier_honest = tokio::time::timeout(scaled(DEADLINE), async {
+    let (mut saw_dark, mut dominated) = (false, false);
+    while let Some(event) = w.next().await {
+      if event.is_rescan() && dark_home.starts_with(event.path()) {
+        dominated = true;
+      }
+      if event.path() == dark_away || event.path() == dark_home {
+        saw_dark = true;
+      }
+      if event.path() == cookie {
+        return Some(saw_dark || dominated);
+      }
+      // The degraded settle `sync_root` writes over: the loss stood its covering
+      // `Rescan` ahead of the cookie, and the cookie's own record is then one
+      // more change that loss covers — the reserved directory it lands in is
+      // itself mid-re-arm, so nothing need ever report it. The barrier resolves
+      // on the domination instead, and it is read exactly as strictly: a cover
+      // that reaches the cookie without reaching the interval is the bare cookie
+      // this cell forbids, not an escape from it.
+      if event.is_rescan() && cookie.starts_with(event.path()) {
+        return Some(saw_dark || dominated);
+      }
+    }
+    None
+  })
+  .await
+  .ok()
+  .flatten();
+  assert_eq!(
+    barrier_honest,
+    Some(true),
+    "the barrier resolves honestly across an excursion the confirming listing \
+     could not see: the change made while the adopted directory was away is \
+     DELIVERED before the cookie, or a `Rescan` dominates it — never a bare \
+     cookie over an interval nothing stood for (`None` means the stream ended or \
+     the barrier never resolved either way, so this round decided nothing)"
+  );
+
+  let _ = w.close().await;
+  let _ = std::fs::remove_dir_all(&root);
+}
+
 /// The move-out barrier: a `sync_root` cookie must never overtake a rename half
 /// the monitor is still holding.
 ///
