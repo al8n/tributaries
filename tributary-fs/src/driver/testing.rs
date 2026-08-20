@@ -304,6 +304,10 @@ struct FakeState {
   /// root-binding verification cells hold the widen's commit-armed refresh so
   /// the barrier's unverified window is observable.
   refresh_hold: Mutex<Option<HoldGate>>,
+  /// When set, `probe` parks until the gate releases — the settlement-loss
+  /// cells hold a slot's classification stat so the window between the queue
+  /// and the answer is observable.
+  probe_hold: Mutex<Option<HoldGate>>,
   /// A node swapped in AFTER a `preflight_arm` executes but BEFORE its
   /// post-arm re-stat — the deterministic model of a root replaced between
   /// the kernel arm and the stale-Installed bracket's probe.
@@ -379,6 +383,7 @@ impl Default for FakeState {
       arm_hold: Mutex::default(),
       prearm_hold: Mutex::default(),
       refresh_hold: Mutex::default(),
+      probe_hold: Mutex::default(),
       prearm_swap: Mutex::default(),
       wd_seq: AtomicUsize::new(0),
     }
@@ -793,6 +798,15 @@ impl FakeFs {
     let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new(), AtomicUsize::new(0)));
     *self.state.enumerate_exec_hold.lock().unwrap() =
       Some((path.as_ref().to_path_buf(), Arc::clone(&gate)));
+    HoldRelease { gate }
+  }
+
+  /// Holds every subsequent classification `probe` until released, so a slot
+  /// whose kind a listing could not name stays unanswered for as long as the
+  /// cell needs the window open.
+  pub(crate) fn hold_probes(&self) -> HoldRelease {
+    let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new(), AtomicUsize::new(0)));
+    *self.state.probe_hold.lock().unwrap() = Some(Arc::clone(&gate));
     HoldRelease { gate }
   }
 
@@ -1656,6 +1670,7 @@ impl FsOps for FakeFs {
   }
 
   fn probe(&self, path: &Path) -> ProbeOutcome {
+    self.park_on(&self.state.probe_hold);
     self.state.probes.fetch_add(1, Ordering::SeqCst);
     match self.state.nodes.lock().unwrap().get(path) {
       Some(node) => ProbeOutcome::Present {

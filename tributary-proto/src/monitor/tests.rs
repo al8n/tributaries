@@ -20452,13 +20452,13 @@ fn a_bootstrap_stat_answered_after_the_settle_edge_installs_suppressed() {
 /// A driver that never answers must cost a degraded verdict, never a wedge:
 /// [`Monitor::coverage_settled`] reads true here and keeps reading true however
 /// much the scope is pumped, while
-/// [`Monitor::bootstrap_stat_outstanding`] reports the window honestly. Both
+/// [`Monitor::stat_loss_outstanding`] reports the window honestly. Both
 /// halves are asserted together because either alone is satisfiable by a
 /// mistake — a signal that never stands is silent, and a signal that also gates
 /// the barrier trades this design's silent-loss hole for a liveness one.
 ///
 /// Mutation that kills it: make the outstanding stamped stat a conjunct of
-/// `coverage_settled` (`&& !self.bootstrap_stat_outstanding(scope)`). The scope
+/// `coverage_settled` (`&& !self.stat_loss_outstanding(scope)`). The scope
 /// then never settles at all, and every barrier built on it waits for an answer
 /// nobody owes.
 #[test]
@@ -20476,7 +20476,7 @@ fn a_never_answered_bootstrap_stat_stands_as_loss_without_wedging_the_barrier() 
     .expect("the unclassifiable slot is stat'd");
 
   assert!(
-    m.bootstrap_stat_outstanding(s),
+    m.stat_loss_outstanding(s),
     "the registration window owes an answer for a slot it never covered"
   );
   assert!(
@@ -20503,7 +20503,7 @@ fn a_never_answered_bootstrap_stat_stands_as_loss_without_wedging_the_barrier() 
       "the barrier stays settled across the whole wait"
     );
     assert!(
-      m.bootstrap_stat_outstanding(s),
+      m.stat_loss_outstanding(s),
       "and the loss stays standing for exactly as long"
     );
   }
@@ -20520,7 +20520,7 @@ fn a_never_answered_bootstrap_stat_stands_as_loss_without_wedging_the_barrier() 
 ///
 /// Mutation that kills it: release the loss only in `ingest_stat_result`'s
 /// resolving `Ok` arm instead of at the request's removal — the failing shapes
-/// then leave `bootstrap_stat_outstanding` standing with nothing owed.
+/// then leave `stat_loss_outstanding` standing with nothing owed.
 #[test]
 fn every_answer_shape_releases_the_bootstrap_stat_loss() {
   for answer in [
@@ -20542,13 +20542,13 @@ fn every_answer_shape_releases_the_bootstrap_stat_loss() {
       .find_map(|a| a.as_stat().map(|c| c.req()))
       .expect("the unclassifiable slot is stat'd");
     assert!(
-      m.bootstrap_stat_outstanding(s),
+      m.stat_loss_outstanding(s),
       "staging: the loss stands before the answer ({answer:?})"
     );
 
     m.on_stat_result(stat, answer);
     assert!(
-      !m.bootstrap_stat_outstanding(s),
+      !m.stat_loss_outstanding(s),
       "the answer releases the loss whatever it says: {answer:?}"
     );
     m.assert_invariants();
@@ -20556,7 +20556,7 @@ fn every_answer_shape_releases_the_bootstrap_stat_loss() {
     // A duplicate answer for a request already spent releases nothing a second
     // time — the counter would otherwise underflow on a driver that re-reports.
     m.on_stat_result(stat, answer);
-    assert!(!m.bootstrap_stat_outstanding(s));
+    assert!(!m.stat_loss_outstanding(s));
     m.assert_invariants();
   }
 }
@@ -20590,14 +20590,14 @@ fn a_parent_teardown_releases_an_outstanding_bootstrap_stat_loss() {
     .expect("the unclassifiable slot under sub is stat'd");
   let _ = drain_events(&mut m);
   assert!(
-    m.bootstrap_stat_outstanding(s),
+    m.stat_loss_outstanding(s),
     "staging: the crawl stamped the stat inside the registration window"
   );
 
   // The consumer prunes `sub` — the slot, and with it the request, are gone.
   assert!(m.drop_watch_subtree(sub), "the prune drops the subtree");
   assert!(
-    !m.bootstrap_stat_outstanding(s),
+    !m.stat_loss_outstanding(s),
     "the parent's teardown releases the loss its request was standing for"
   );
   m.assert_invariants();
@@ -20607,6 +20607,2012 @@ fn a_parent_teardown_releases_an_outstanding_bootstrap_stat_loss() {
     stat,
     StatResult::Ok(StatEntry::new(FileKind::Dir).with_node(ident(7))),
   );
-  assert!(!m.bootstrap_stat_outstanding(s));
+  assert!(!m.stat_loss_outstanding(s));
+  m.assert_invariants();
+}
+
+// ---------------------------------------------------------------------------
+// The EMPTY-SLOT classification stat's settlement loss. Same signal as the
+// registration window's, different trigger and different blast radius: a read
+// that covered the slot with NOTHING owes it in any window, and the routes that
+// reach it — a pure grow, a record-driven cold read — stand no `Rescan` of
+// their own, so the loss is all there is between a fence and a certified
+// window.
+// ---------------------------------------------------------------------------
+
+/// The re-arm read `dir`'s grow just queued.
+fn grow_read(m: &mut Monitor, dir: WatchId) -> ReqId {
+  drain_actions(m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == dir).map(|e| e.req()))
+    .expect("the grow re-arm-enumerates the directory")
+}
+
+/// A PURE grow of `dir` whose listing names one entry no kind could be read for,
+/// at a slot nothing occupies. Returns the outstanding stat's request.
+///
+/// This is the route the whole suite turns on: `rearm_watch_subtree` stands no
+/// `Rescan`, and a crawl that retires nothing emits none either, so the window
+/// this opens is covered by whatever the stat itself stands and by nothing else.
+fn pure_grow_listing_unknown(m: &mut Monitor, s: ScopeId, dir: WatchId) -> ReqId {
+  assert!(
+    !m.in_bootstrap_window(s),
+    "staging: the registration window closed at the scope's first settle"
+  );
+  assert!(m.rearm_watch_subtree(dir).is_started());
+  let rearm = grow_read(m, dir);
+  m.on_enumerate(
+    rearm,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("mystery"), FileKind::Unknown)]),
+  );
+  let stat = drain_actions(m)
+    .iter()
+    .find_map(|a| a.as_stat().map(|c| c.req()))
+    .expect("the unclassifiable slot is stat'd");
+  assert!(
+    drain_events(m).is_empty(),
+    "and the route delivers nothing: no Rescan of any kind stands for the hole"
+  );
+  stat
+}
+
+/// An empty-slot `Unknown` stands its scope's settlement loss with the
+/// registration window long closed.
+///
+/// `mystery` may be a directory, and until the stat says so nothing watches it:
+/// the crawl reconciled no watch into the slot, booked the darkness, and stood
+/// no `Rescan`. The deficit alone does not close that window — it re-signals at
+/// a sync cookie's DISPATCH, which an ordinary set-cover reply passes nowhere
+/// near.
+///
+/// Mutation that kills it: narrow `queue_stat`'s loss predicate back to the
+/// registration stamp (`let stands_loss = bootstrap;`). The post-window hole
+/// then stands nothing at all.
+#[test]
+fn an_empty_slot_unknown_outside_the_registration_window_stands_the_scope_loss() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  assert!(
+    !m.stat_loss_outstanding(s),
+    "staging: a quiesced scope owes no loss"
+  );
+
+  let _stat = pure_grow_listing_unknown(&mut m, s, root);
+
+  assert!(
+    m.stat_loss_outstanding(s),
+    "the scope covers `mystery` with nothing until the stat answers"
+  );
+  assert!(
+    m.has_coverage_deficit(s),
+    "the darkness is booked too, so the dispatch re-signal keeps covering it"
+  );
+  assert!(
+    m.coverage_settled(s),
+    "and the barrier settles regardless: the stat is uncounted"
+  );
+  m.assert_invariants();
+}
+
+/// The cover a settling verdict's standing stat loss owes — and the two things
+/// standing it must not do.
+///
+/// [`Monitor::cover_stat_loss`] stands ONE root-covering `Rescan`: the slot's
+/// kind is exactly what nobody knows, so there is nothing to locate the cover
+/// at, and a registration-stamped request stands the loss over ground the crawl
+/// announced nothing for anywhere under the root. What it must not do is acquire
+/// counted coverage work. A heal kick here — the one thing
+/// [`Monitor::resignal_coverage_deficits`] does that this does not — re-opens
+/// the barrier and moves the coverage-work epoch, so the fence that asked for
+/// the cover would find its ordering proof retired and its scope unsettled, and
+/// a scope whose stat never answers would be covered, re-opened, re-settled and
+/// covered again without ever reporting the verdict the loss exists to produce.
+///
+/// Both halves are asserted together because either alone is satisfiable by a
+/// mistake: a call that stands nothing is silent, and one that stands a cover by
+/// re-opening the barrier trades the silent-loss hole for a liveness one.
+///
+/// The loss is LEVEL-persistent, so the call discharges nothing — the second
+/// verdict over the same standing request stands its own cover.
+///
+/// Mutation that kills it: heal-kick the scope as the deficit re-signal does.
+/// The barrier re-opens, the epoch moves, and the fence waiting on both never
+/// resolves.
+#[test]
+fn covering_a_standing_stat_loss_stands_a_root_rescan_and_acquires_no_work() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  assert!(
+    !m.cover_stat_loss(s),
+    "a scope standing no loss has nobody to instruct"
+  );
+  assert!(drain_events(&mut m).is_empty(), "and so stands nothing");
+
+  let _stat = pure_grow_listing_unknown(&mut m, s, root);
+  assert!(m.stat_loss_outstanding(s), "staging: the loss stands");
+  assert!(m.coverage_settled(s), "staging: and the barrier is settled");
+  let epoch = m.coverage_work_epoch(s);
+
+  assert!(
+    m.cover_stat_loss(s),
+    "the settling verdict's cover is stood"
+  );
+  let emitted = drain_events(&mut m);
+  assert_eq!(emitted.len(), 1, "{emitted:?}");
+  assert!(
+    emitted[0].kind().is_rescan() && emitted[0].location() == &loc(&[]),
+    "and it covers the whole root: {emitted:?}"
+  );
+  assert!(
+    drain_actions(&mut m).is_empty(),
+    "nothing is kicked: a counted heal would re-open the very barrier the \
+     verdict resolves against"
+  );
+  assert!(m.coverage_settled(s), "so the barrier stays settled");
+  assert_eq!(
+    m.coverage_work_epoch(s),
+    epoch,
+    "and the ordering proof the settling fence holds is not retired"
+  );
+  assert!(
+    m.stat_loss_outstanding(s),
+    "the cover instructs the consumer; it does not discharge the darkness"
+  );
+
+  assert!(
+    m.cover_stat_loss(s),
+    "so the next verdict over the same request stands its own"
+  );
+  let emitted = drain_events(&mut m);
+  assert_eq!(emitted.len(), 1, "{emitted:?}");
+  assert!(emitted[0].kind().is_rescan(), "{emitted:?}");
+  m.assert_invariants();
+}
+
+/// The liveness property that is the whole reason this is a loss signal rather
+/// than a barrier conjunct, on the post-window trigger.
+///
+/// A driver that never answers must cost a degraded verdict, never a wedge:
+/// [`Monitor::coverage_settled`] reads true here and keeps reading true however
+/// much the scope is pumped, while [`Monitor::stat_loss_outstanding`] reports
+/// the window honestly. Both halves are asserted together because either alone
+/// is satisfiable by a mistake — a signal that never stands is silent, and a
+/// signal that also gates the barrier trades this design's silent-loss hole for
+/// a liveness one.
+///
+/// Mutation that kills it: make the outstanding stat a conjunct of
+/// `coverage_settled` (`&& !self.stat_loss_outstanding(scope)`). The scope then
+/// never settles at all, and every barrier built on it waits for an answer
+/// nobody owes.
+#[test]
+fn a_never_answered_empty_slot_stat_stands_as_loss_without_wedging_the_barrier() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  let _stat = pure_grow_listing_unknown(&mut m, s, root);
+
+  // Pump the scope past the settle edge repeatedly. Nothing here can answer the
+  // stat, so a barrier that has taken the answer as a precondition would never
+  // recover from it.
+  for tick in 0..8 {
+    m.on_os_record(
+      OsRecord::new(root, RecordKind::Created).with_name(seg("noise.txt")),
+      at(tick + 10),
+    );
+    let _ = drain_events(&mut m);
+    let _ = drain_actions(&mut m);
+    assert!(
+      m.coverage_settled(s),
+      "the barrier stays settled across the whole wait"
+    );
+    assert!(
+      m.stat_loss_outstanding(s),
+      "and the loss stays standing for exactly as long"
+    );
+  }
+  m.assert_invariants();
+}
+
+/// …and an OCCUPIED slot stands none. The counterpart the cells above need to
+/// mean anything: a signal raised by every unclassifiable entry would degrade
+/// every fence of every scope that ever meets a `DT_UNKNOWN` file, which is
+/// indistinguishable from the fix working and strictly worse than the defect.
+///
+/// An incumbent watch is live coverage whatever the listing failed to name — the
+/// same occupation check that decides whether the darkness is booked at all —
+/// so the window it spans is covered, and the stat only decides whether to keep
+/// or retire it.
+///
+/// Mutation that kills it: stand the loss unconditionally in `queue_stat`
+/// (`let stands_loss = true;`). Every scope with an outstanding slot stat then
+/// reads lossy, answered or not, covered or not.
+#[test]
+fn an_occupied_slot_unknown_stands_no_loss() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  let sub = live_child_dir(&mut m, root, "sub");
+
+  assert!(m.rearm_watch_subtree(root).is_started());
+  let rearm = grow_read(&mut m, root);
+  m.on_enumerate(
+    rearm,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("sub"), FileKind::Unknown)]),
+  );
+  let _stat = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_stat().map(|c| c.req()))
+    .expect("the unclassifiable name is stat'd whether or not it is covered");
+  let _ = drain_events(&mut m);
+
+  assert!(m.is_watched(sub), "the unsettled name keeps its incumbent");
+  assert!(
+    !m.stat_loss_outstanding(s),
+    "a slot a live watch covers is not a window a fence may not certify"
+  );
+  assert!(
+    !m.has_coverage_deficit(s),
+    "and nothing books darkness over it either"
+  );
+  m.assert_invariants();
+}
+
+/// The empty-slot loss is released by the ANSWER ARRIVING, whatever the answer
+/// says — a directory, a file, a kind still nobody can read, a vanish, or a bare
+/// I/O failure. Each of those terminals either covers the slot or re-books its
+/// darkness in the deficit book behind a `Rescan` of its own, and none of them
+/// leaves a request outstanding; a release keyed on the resolving answers alone
+/// would strand the loss forever on the failing ones, degrading the scope's
+/// every later fence for the rest of its life.
+///
+/// Mutation that kills it: release the loss only in `ingest_stat_result`'s
+/// resolving `Ok` arm instead of at the request's removal — the failing shapes
+/// then leave `stat_loss_outstanding` standing with nothing owed.
+#[test]
+fn every_answer_shape_releases_the_empty_slot_stat_loss() {
+  for answer in [
+    StatResult::Ok(StatEntry::new(FileKind::Dir).with_node(ident(7))),
+    StatResult::Ok(StatEntry::new(FileKind::File)),
+    StatResult::Ok(StatEntry::new(FileKind::Unknown)),
+    StatResult::Failed(IoClass::NotFound),
+    StatResult::Failed(IoClass::Io),
+  ] {
+    let mut m = per_dir();
+    let s = scope(1);
+    let root = live_root_idle(&mut m, s);
+    let stat = pure_grow_listing_unknown(&mut m, s, root);
+    assert!(
+      m.stat_loss_outstanding(s),
+      "staging: the loss stands before the answer ({answer:?})"
+    );
+
+    m.on_stat_result(stat, answer);
+    assert!(
+      !m.stat_loss_outstanding(s),
+      "the answer releases the loss whatever it says: {answer:?}"
+    );
+    m.assert_invariants();
+
+    // A duplicate answer for a request already spent releases nothing a second
+    // time — the counter would otherwise underflow on a driver that re-reports.
+    m.on_stat_result(stat, answer);
+    assert!(!m.stat_loss_outstanding(s));
+    m.assert_invariants();
+  }
+}
+
+/// …and the one release the answer cannot perform: the stat's PARENT dies while
+/// the request is still in flight. No answer can ever settle a slot that no
+/// longer exists, so the parent's own teardown is the release — the same
+/// `NodeMarker::StatSlots` walk that reclaims the request itself.
+///
+/// Mutation that kills it: release the loss only in `ingest_stat_result` and not
+/// at the `StatSlots` marker. The pruned parent's hole then outlives every
+/// object it described and degrades the scope's fences forever.
+#[test]
+fn a_parent_teardown_releases_an_outstanding_empty_slot_stat_loss() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  let sub = live_child_dir(&mut m, root, "sub");
+  let stat = pure_grow_listing_unknown(&mut m, s, sub);
+  assert!(
+    m.stat_loss_outstanding(s),
+    "staging: the grow under `sub` covered `sub/mystery` with nothing"
+  );
+
+  // The consumer prunes `sub` — the slot, and with it the request, are gone.
+  assert!(m.drop_watch_subtree(sub), "the prune drops the subtree");
+  assert!(
+    !m.stat_loss_outstanding(s),
+    "the parent's teardown releases the loss its request was standing for"
+  );
+  m.assert_invariants();
+
+  // And a late answer for the reclaimed request releases nothing twice.
+  m.on_stat_result(
+    stat,
+    StatResult::Ok(StatEntry::new(FileKind::Dir).with_node(ident(7))),
+  );
+  assert!(!m.stat_loss_outstanding(s));
+  m.assert_invariants();
+}
+
+/// The dedup does not escape the loss. A stat is coalesced across every read
+/// that re-encounters the name, so a slot that was OCCUPIED when the first read
+/// asked — and is emptied under the standing request — books its darkness at the
+/// next read with only that older request left to stand for it.
+///
+/// The loss therefore RISES on a coalesced queue, exactly as a deferred descent
+/// upgrades. Returning silently from the dedup would leave this second read's
+/// hole covered by nothing at all, which is the original defect one indirection
+/// further along.
+///
+/// Mutation that kills it: return from `queue_stat`'s dedup without calling
+/// `raise_stat_loss`. The emptied slot's window is then certified `Applied`
+/// again.
+#[test]
+fn a_re_list_of_an_emptied_slot_raises_the_standing_stat_loss() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  let sub = live_child_dir(&mut m, root, "sub");
+
+  // Read one finds the slot OCCUPIED, so its stat stands no loss.
+  assert!(m.rearm_watch_subtree(root).is_started());
+  let first = grow_read(&mut m, root);
+  m.on_enumerate(
+    first,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("sub"), FileKind::Unknown)]),
+  );
+  let stat = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_stat().map(|c| c.req()))
+    .expect("the unclassifiable name is stat'd");
+  let _ = drain_events(&mut m);
+  assert!(
+    !m.stat_loss_outstanding(s),
+    "staging: an occupied slot degrades nothing"
+  );
+
+  // The incumbent leaves under the standing request. That retirement stands its
+  // own counted cover and re-arms the root, so the window it opens is spent
+  // here — the hole read two books below must be covered by nothing of its own.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Removed)
+      .with_name(seg("sub"))
+      .with_is_dir(true),
+    at(20),
+  );
+  let cover = grow_read(&mut m, root);
+  m.on_enumerate(cover, EnumerateResult::Ok(vec![]));
+  assert!(
+    drain_events(&mut m).iter().any(|e| e.kind().is_rescan()),
+    "the retirement's window closes with its covering Rescan"
+  );
+  let _ = drain_actions(&mut m);
+  assert!(!m.is_watched(sub), "the removal empties the slot");
+  assert!(
+    !m.has_coverage_deficit(s),
+    "an emptied slot is not yet darkness — nothing has claimed the name back"
+  );
+  assert!(
+    !m.stat_loss_outstanding(s),
+    "and the standing request still describes the slot as it found it: occupied"
+  );
+
+  // Read two lists the same name unclassifiable at the now-EMPTY slot: it books
+  // the hole, and its stat coalesces onto the request already outstanding.
+  assert!(m.rearm_watch_subtree(root).is_started());
+  let second = grow_read(&mut m, root);
+  m.on_enumerate(
+    second,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("sub"), FileKind::Unknown)]),
+  );
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "a pure grow over an empty slot delivers nothing at all"
+  );
+  assert!(
+    m.has_coverage_deficit(s),
+    "the second read books the hole it covered with nothing"
+  );
+  assert!(
+    m.stat_loss_outstanding(s),
+    "and the coalesced request must stand for it"
+  );
+  m.assert_invariants();
+
+  // One request, one release: the raised loss clears exactly once.
+  m.on_stat_result(stat, StatResult::Failed(IoClass::Io));
+  assert!(!m.stat_loss_outstanding(s));
+  m.assert_invariants();
+}
+
+// ---------------------------------------------------------------------------
+// The RELEASE's replacement. Releasing the settlement loss ENDS an obligation,
+// so it owes a cover wherever nothing else stood one — and the fine deficit
+// entry whose heal is that cover everywhere else is exactly what a book
+// collapsed past `DEFICIT_CAP` does not have.
+// ---------------------------------------------------------------------------
+
+/// `DEFICIT_CAP` + 1 unclassifiable names at empty slots under `dir`, delivered
+/// by a PURE grow so no read, no record and no arm stands a `Rescan` of its own
+/// for any of them. The book collapses to the whole-scope marker and keeps no
+/// fine entry, so each returned request stands a loss with no heal behind it.
+/// Returns every slot's name paired with the request that owes it.
+fn collapsing_grow_listing_unknown(
+  m: &mut Monitor,
+  s: ScopeId,
+  dir: WatchId,
+) -> Vec<(Segment, ReqId)> {
+  assert!(
+    !m.in_bootstrap_window(s),
+    "staging: the registration window closed at the scope's first settle"
+  );
+  assert!(m.rearm_watch_subtree(dir).is_started());
+  let rearm = grow_read(m, dir);
+  let unknown: Vec<DirEntry> = (0..=DEFICIT_CAP)
+    .map(|i| DirEntry::new(seg(&std::format!("u{i:02}")), FileKind::Unknown))
+    .collect();
+  m.on_enumerate(rearm, EnumerateResult::Ok(unknown));
+  let stats: Vec<(Segment, ReqId)> = drain_actions(m)
+    .iter()
+    .filter_map(|a| a.as_stat())
+    .filter_map(|cmd| {
+      cmd
+        .of()
+        .as_child()
+        .map(|child| (child.name().clone(), cmd.req()))
+    })
+    .collect();
+  assert_eq!(
+    stats.len(),
+    1 + DEFICIT_CAP,
+    "every unclassifiable slot is stat'd"
+  );
+  assert!(
+    drain_events(m).is_empty(),
+    "and the route delivers nothing: no Rescan of any kind stands for the holes"
+  );
+  assert!(
+    m.has_coverage_deficit(s),
+    "the mass darkness is booked — as the whole-scope marker"
+  );
+  assert!(
+    !m.slot_deficit_booked(s, dir, &stats[0].0),
+    "and the collapse keeps NO fine entry for any settlement to heal"
+  );
+  stats
+}
+
+/// An empty slot that turns out to be a DIRECTORY, answered outside the
+/// registration window over a COLLAPSED book: the released loss is transferred
+/// to a covering `Rescan` rather than released into silence.
+///
+/// Every other cover this shape could rest on is absent by construction. The
+/// grow is pure, so the read that listed the slot stood no `Rescan`. The install
+/// is a cold `install_child`, so `remove_slot_deficit` is the only heal on the
+/// path — and the collapse left it nothing to remove, so it sets neither bridge
+/// bit. The request is not registration-stamped, so the suppressed-install
+/// detour (which stands its own loss half) does not run. `settle_stat_slot`
+/// covers what a RETIREMENT ended and there was no incumbent to retire. Until
+/// this answer the window was covered by the settlement loss alone; the answer
+/// releases it, so the answer owes the replacement.
+///
+/// Mutation that kills it: drop the transfer (return
+/// `false` from `ingest_stat_result`'s resolving arm instead of
+/// `stands_loss && dark_interval && !healed && …`). The directory is then
+/// armed behind nothing at all, and the next fence certifies the interval its
+/// contents went unrecorded in.
+#[test]
+fn a_collapsed_book_directory_answer_transfers_the_released_loss_to_a_rescan() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  let stats = collapsing_grow_listing_unknown(&mut m, s, root);
+  let (name, stat) = stats[0].clone();
+  assert!(m.stat_loss_outstanding(s), "staging: the loss stands");
+
+  m.on_stat_result(
+    stat,
+    StatResult::Ok(StatEntry::new(FileKind::Dir).with_node(ident(7))),
+  );
+
+  assert!(
+    m.child_watch(root, &name).is_some(),
+    "the answer arms the directory the listing could not name"
+  );
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&["u00"])),
+    "and the released loss becomes the slot's covering Rescan: {events:?}"
+  );
+  m.assert_invariants();
+}
+
+/// The same shape once the slot is proven to hold NO directory — a file, or a
+/// vanish. The interval is the same interval: the slot may have been a directory
+/// for all of it, and a replacement's `Removed`/`Created` records are interest-
+/// and filter-subject, so a `Modified`-only subscription is told nothing by them.
+/// The transfer is owed by the terminal that ends the darkness, not by the one
+/// that ends it a particular way.
+///
+/// Mutation that kills it: restrict the transfer to answers that INSTALLED a
+/// directory — `&& installed.is_some()` in the resolving arm, `false` in the
+/// vanish arm. The file and the vanish then release the loss over a book with no
+/// entry to heal, and the next fence certifies their interval.
+#[test]
+fn a_collapsed_book_non_directory_answer_transfers_the_released_loss_too() {
+  for answer in [
+    StatResult::Ok(StatEntry::new(FileKind::File)),
+    StatResult::Failed(IoClass::NotFound),
+  ] {
+    let mut m = per_dir();
+    let s = scope(1);
+    let root = live_root_idle(&mut m, s);
+    let stats = collapsing_grow_listing_unknown(&mut m, s, root);
+    let (name, stat) = stats[0].clone();
+
+    m.on_stat_result(stat, answer);
+
+    assert!(
+      m.child_watch(root, &name).is_none(),
+      "nothing is watched there ({answer:?})"
+    );
+    let events = drain_events(&mut m);
+    assert!(
+      events
+        .iter()
+        .any(|e| e.kind().is_rescan() && e.location() == &loc(&["u00"])),
+      "the released loss still becomes a covering Rescan ({answer:?}): {events:?}"
+    );
+    m.assert_invariants();
+  }
+}
+
+/// …and the transfer does NOT fire where a heal already stands the cover. The
+/// counterpart the cells above need to mean anything: a second `Rescan` over
+/// every ordinary empty-slot answer would double every heal's instruction and be
+/// indistinguishable from the fix working (A2 overreach).
+///
+/// An UNCOLLAPSED book holds the slot's fine entry, and `install_child`'s
+/// `remove_slot_deficit` turns it into both bridge bits — the window's closing
+/// `Rescan`, one instruction, at the root that dominates the slot.
+///
+/// Mutation that kills it: drop the `!healed` conjunct from the transfer. Every
+/// healed empty-slot answer then stands a located `Rescan` on top of the closing
+/// one it already earned.
+#[test]
+fn a_booked_empty_slot_answer_leaves_the_cover_to_its_heal() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  let stat = pure_grow_listing_unknown(&mut m, s, root);
+  assert!(
+    m.slot_deficit_booked(s, root, &seg("mystery")),
+    "staging: an uncollapsed book records the hole finely"
+  );
+
+  m.on_stat_result(
+    stat,
+    StatResult::Ok(StatEntry::new(FileKind::Dir).with_node(ident(7))),
+  );
+
+  let events = drain_events(&mut m);
+  assert!(
+    !events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&["mystery"])),
+    "the heal's cover is not doubled at the slot: {events:?}"
+  );
+  assert!(
+    !m.has_coverage_deficit(s),
+    "and the heal consumed the entry it covered for"
+  );
+  m.assert_invariants();
+}
+
+/// …and a slot a live watch already covers earns no transfer either, however the
+/// loss came to stand. A registration-stamped request over an OCCUPIED slot
+/// stands the loss for the window's sake ([`StatSlot::stands_loss`]) and books
+/// no darkness at all: the incumbent covered the slot for the whole interval, so
+/// there is no dark interval to hand off. Standing one anyway would degrade
+/// every registration that ever meets a `DT_UNKNOWN` name over ground it already
+/// watches.
+///
+/// Mutation that kills it: drop the `incumbent.is_none()` conjunct from the
+/// transfer. Every covered registration-window slot then stands a `Rescan` for a
+/// window nothing was ever dark in.
+#[test]
+fn an_occupied_slot_answer_stands_no_transfer() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root(&mut m, s);
+  let boot = read_of(&mut m, root);
+  m.on_enumerate(
+    boot,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("sub"), FileKind::Dir)]),
+  );
+  let sub = m
+    .child_watch(root, &seg("sub"))
+    .expect("the crawl arms sub");
+  m.ack_watch(sub, Ok(WatchAck::Installed));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  // A re-list inside the still-open registration window cannot name `sub`'s
+  // kind. The slot is OCCUPIED, so nothing books darkness — but the stamp
+  // stands the loss regardless, which is the whole shape under test.
+  assert!(
+    m.in_bootstrap_window(s),
+    "staging: the window is still open"
+  );
+  assert!(m.rearm_watch_subtree(root).is_started());
+  let relist = grow_read(&mut m, root);
+  m.on_enumerate(
+    relist,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("sub"), FileKind::Unknown)]),
+  );
+  let stat = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_stat().map(|c| c.req()))
+    .expect("the unclassifiable name is stat'd whether or not it is covered");
+  let _ = drain_events(&mut m);
+  assert!(m.stat_loss_outstanding(s), "staging: the stamp stands it");
+  assert!(
+    !m.slot_deficit_booked(s, root, &seg("sub")),
+    "and an occupied slot books no darkness to heal"
+  );
+
+  m.on_stat_result(
+    stat,
+    StatResult::Ok(StatEntry::new(FileKind::Dir).with_node(ident(1))),
+  );
+
+  let events = drain_events(&mut m);
+  assert!(
+    !events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&["sub"])),
+    "a slot that was never dark is handed nothing: {events:?}"
+  );
+  assert!(m.is_watched(sub), "and its incumbent is kept");
+  m.assert_invariants();
+}
+
+/// The racing install: a `Created` names `(parent, name)` a directory of `node`
+/// while that slot's stat is still outstanding, returning the watch it fills the
+/// slot with.
+///
+/// The occupation every route to a filled slot reduces to, and the one whose
+/// cover depends entirely on the book: `install_child`'s `remove_slot_deficit`
+/// stands both bridge bits when it removes a real entry, and stands NOTHING
+/// where the collapse left it no entry to remove.
+fn install_racing_the_stat(
+  m: &mut Monitor,
+  parent: WatchId,
+  name: &str,
+  node: Identity,
+) -> WatchId {
+  m.on_os_record(
+    OsRecord::new(parent, RecordKind::Created)
+      .with_name(seg(name))
+      .with_is_dir(true)
+      .with_node(node),
+    at(2),
+  );
+  let child = m
+    .child_watch(parent, &seg(name))
+    .expect("the created directory occupies the slot");
+  let _ = drain_actions(m);
+  let _ = drain_events(m);
+  child
+}
+
+/// …but an OCCUPIED slot at the answer is not the same claim as a slot that was
+/// never dark, and no reading taken at the answer can tell the two apart.
+///
+/// The book is collapsed, so the empty slot's `Unknown` books no fine entry and
+/// the request's settlement loss is the only thing covering it. A `Created` then
+/// installs the directory before the answer returns: that occupation's one cover
+/// is `remove_slot_deficit`, which finds nothing to remove and stands neither
+/// bridge bit. When the answer lands, the slot holds a live watch — of the very
+/// directory the answer is about to confirm — while the interval BEFORE the
+/// install is covered by nothing at all. Reading the fill as proof that no
+/// darkness ever stood there passes the fence from degraded to certified over
+/// exactly that interval.
+///
+/// Mutation that kills it: decide the transfer from the live slot again
+/// (`incumbent.is_none()` in place of `dark_interval`). The racing install then
+/// silences the answer that owes the cover.
+#[test]
+fn a_racing_install_over_a_collapsed_book_still_transfers_the_released_loss() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  let stats = collapsing_grow_listing_unknown(&mut m, s, root);
+  let (name, stat) = stats[0].clone();
+  assert_eq!(
+    name,
+    seg("u00"),
+    "staging: the first collapsed slot is `u00`"
+  );
+
+  let racing = install_racing_the_stat(&mut m, root, "u00", ident(7));
+  assert!(
+    !m.slot_deficit_booked(s, root, &name),
+    "staging: the collapse left the occupation's heal nothing to remove"
+  );
+  assert!(
+    m.stat_loss_outstanding(s),
+    "so the standing loss is still the whole of what covers the interval"
+  );
+
+  m.on_stat_result(
+    stat,
+    StatResult::Ok(StatEntry::new(FileKind::Dir).with_node(ident(7))),
+  );
+
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&["u00"])),
+    "the released loss still becomes the slot's covering Rescan: {events:?}"
+  );
+  assert_eq!(
+    m.child_watch(root, &name),
+    Some(racing),
+    "and the answer confirms the racing install rather than replacing it"
+  );
+  m.assert_invariants();
+}
+
+/// …and the same race over an UNCOLLAPSED book leaves the cover to the heal that
+/// stood it. The counterpart the cell above needs: a transfer that fired over
+/// every filled slot would double every ordinary occupation's instruction, which
+/// is indistinguishable from the fix working (A2 overreach).
+///
+/// The install here removes a REAL entry, so it stands both bridge bits and the
+/// window closes with its `Rescan` — the cover the request's darkness was
+/// waiting for, and the answer must not stand a second at the slot.
+///
+/// Mutation that kills it: drop `remove_slot_deficit`'s discharge of the
+/// outstanding request's darkness. The heal then stands its cover and the answer
+/// stands another one on top of it.
+#[test]
+fn a_racing_install_that_heals_the_hole_leaves_the_cover_to_its_heal() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  let stat = pure_grow_listing_unknown(&mut m, s, root);
+  assert!(
+    m.slot_deficit_booked(s, root, &seg("mystery")),
+    "staging: an uncollapsed book records the hole finely"
+  );
+
+  let racing = install_racing_the_stat(&mut m, root, "mystery", ident(7));
+  assert!(
+    !m.slot_deficit_booked(s, root, &seg("mystery")),
+    "the racing install heals the hole, which is what stands its cover"
+  );
+
+  m.on_stat_result(
+    stat,
+    StatResult::Ok(StatEntry::new(FileKind::Dir).with_node(ident(7))),
+  );
+
+  let events = drain_events(&mut m);
+  assert!(
+    !events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&["mystery"])),
+    "the heal's cover is not doubled at the slot: {events:?}"
+  );
+  assert_eq!(
+    m.child_watch(root, &seg("mystery")),
+    Some(racing),
+    "and the answer confirms the racing install"
+  );
+  m.assert_invariants();
+}
+
+/// …and the occupation that never touches `install_child` at all is covered by
+/// the same carried fact, with nothing written for it.
+///
+/// A paired `MovedFrom`/`MovedTo` re-keys a held subtree straight onto the dark
+/// slot ([`Monitor::reparent`]): a second occupation path, which consults no
+/// deficit and heals no hole whatever the book holds. Deciding the transfer at
+/// the occupation instead would have had to name this site too — and the next
+/// one after it.
+///
+/// Mutation that kills it: decide the transfer from the live slot again
+/// (`incumbent.is_none()` in place of `dark_interval`). The move-in then
+/// silences the answer exactly as the install does.
+#[test]
+fn a_move_in_occupation_still_transfers_the_released_loss() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  let stats = collapsing_grow_listing_unknown(&mut m, s, root);
+  let (name, stat) = stats[0].clone();
+  assert_eq!(
+    name,
+    seg("u00"),
+    "staging: the first collapsed slot is `u00`"
+  );
+
+  // A live directory elsewhere under the root, for the move to carry in.
+  let d = discovered_child_dir(&mut m, root, "d");
+  let read = armed_read(&mut m, d);
+  m.on_enumerate(read, EnumerateResult::Ok(std::vec::Vec::new()));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("d"))
+      .with_cookie(cookie(3))
+      .with_is_dir(true),
+    at(10),
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("u00"))
+      .with_cookie(cookie(3))
+      .with_is_dir(true),
+    at(11),
+  );
+  assert_eq!(
+    m.child_watch(root, &name),
+    Some(d),
+    "the move-in occupies the slot without passing through install_child"
+  );
+  assert!(
+    !m.slot_deficit_booked(s, root, &name),
+    "staging: and the collapsed book holds no entry it could have healed"
+  );
+  let _ = drain_events(&mut m);
+
+  m.on_stat_result(stat, StatResult::Ok(StatEntry::new(FileKind::Dir)));
+
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&["u00"])),
+    "the released loss still becomes the slot's covering Rescan: {events:?}"
+  );
+  assert_eq!(
+    m.child_watch(root, &name),
+    Some(d),
+    "and the moved-in subtree keeps the slot"
+  );
+  m.assert_invariants();
+}
+
+/// …and the same move-in over an UNCOLLAPSED book is what a reading of the book
+/// gets wrong. The entry IS recorded here, so "this hole is booked" predicts a
+/// heal — and the settlement performs none: `reconcile_slot` finds the slot
+/// occupied and reuses what the move-in put there, `install_child` returns at its
+/// occupation check without reaching `remove_slot_deficit`, and
+/// `settle_stat_slot` covers nothing for a retained incumbent. The entry is left
+/// standing for a sync cookie's DISPATCH to re-signal, which an ordinary
+/// set-cover reply passes nowhere near, while the loss that was covering the
+/// pre-move interval has already been released.
+///
+/// Which is why the transfer is decided from the cover this call OBSERVED being
+/// stood rather than from the book it read beforehand: a booked entry says the
+/// darkness was recorded, never that anything has since covered it.
+///
+/// Run over every way the reconcile comes to reuse what it finds — identities
+/// that MATCH, and an identity absent on either side — because the three reach
+/// the same occupation check by the same `replace == false` and not one of them
+/// heals. One decision covers all three.
+///
+/// Mutation that kills it: decide the transfer from the book again (`!booked`,
+/// read before the reconcile, in place of `!healed`). The move-in then silences
+/// every answer whose slot the book still holds an entry for.
+#[test]
+fn a_move_in_over_a_booked_hole_still_transfers_the_released_loss() {
+  for (installed, answered) in [
+    (Some(ident(7)), Some(ident(7))),
+    (None, Some(ident(7))),
+    (Some(ident(7)), None),
+  ] {
+    let mut m = per_dir();
+    let s = scope(1);
+    let root = live_root_idle(&mut m, s);
+    let stat = pure_grow_listing_unknown(&mut m, s, root);
+    assert!(
+      m.slot_deficit_booked(s, root, &seg("mystery")),
+      "staging: an uncollapsed book records the hole finely ({installed:?})"
+    );
+
+    // A live directory elsewhere under the root, for the move to carry in. Its
+    // identity is the cell's parameter: the answer below either matches it or
+    // cannot be compared with it.
+    let mut created = OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("d"))
+      .with_is_dir(true);
+    if let Some(node) = installed {
+      created = created.with_node(node);
+    }
+    m.on_os_record(created, at(1));
+    let d = m
+      .child_watch(root, &seg("d"))
+      .expect("the created directory occupies its own slot");
+    let read = armed_read(&mut m, d);
+    m.on_enumerate(read, EnumerateResult::Ok(std::vec::Vec::new()));
+    let _ = drain_actions(&mut m);
+    let _ = drain_events(&mut m);
+
+    m.on_os_record(
+      OsRecord::new(root, RecordKind::MovedFrom)
+        .with_name(seg("d"))
+        .with_cookie(cookie(3))
+        .with_is_dir(true),
+      at(10),
+    );
+    m.on_os_record(
+      OsRecord::new(root, RecordKind::MovedTo)
+        .with_name(seg("mystery"))
+        .with_cookie(cookie(3))
+        .with_is_dir(true),
+      at(11),
+    );
+    assert_eq!(
+      m.child_watch(root, &seg("mystery")),
+      Some(d),
+      "the move-in occupies the slot without passing through install_child"
+    );
+    assert!(
+      m.slot_deficit_booked(s, root, &seg("mystery")),
+      "and the entry it consulted no book for is still standing, healed by nobody"
+    );
+    let paired = drain_events(&mut m);
+    assert!(
+      !paired
+        .iter()
+        .any(|e| e.kind().is_rescan() && e.location() == &loc(&["mystery"])),
+      "staging: and the pairing itself covers the slot with nothing: {paired:?}"
+    );
+
+    let mut answer = StatEntry::new(FileKind::Dir);
+    if let Some(node) = answered {
+      answer = answer.with_node(node);
+    }
+    m.on_stat_result(stat, StatResult::Ok(answer));
+
+    let events = drain_events(&mut m);
+    assert!(
+      events
+        .iter()
+        .any(|e| e.kind().is_rescan() && e.location() == &loc(&["mystery"])),
+      "the released loss becomes the slot's covering Rescan ({installed:?} vs \
+       {answered:?}): {events:?}"
+    );
+    assert_eq!(
+      m.child_watch(root, &seg("mystery")),
+      Some(d),
+      "and the answer keeps the moved-in subtree it had no grounds to replace"
+    );
+    m.assert_invariants();
+  }
+}
+
+/// The dedup's own escape hatch, which the loss half is allowed to take and the
+/// darkness half is not.
+///
+/// A registration-stamped request over an OCCUPIED slot already stands the
+/// scope's loss with no darkness behind it. Its incumbent then dies, and the
+/// next read to list the name unclassifiable coalesces onto that same request —
+/// reporting an EMPTY slot to a row whose loss is already standing. Returning at
+/// the loss's idempotence would drop that report, and the answer would then
+/// meet a slot a racing install had refilled with a carried fact saying the slot
+/// was never dark: the release lands on nothing, over an interval no watch and
+/// no book covered.
+///
+/// The collapse is what strips every other cover from the sequence: no fine
+/// entry is booked for the emptied slot, so the refill heals nothing and the
+/// answer has no heal to defer to either.
+///
+/// Mutation that kills it: raise the darkness BELOW the loss's early return in
+/// `raise_stat_darkness`. The second read's emptiness is then lost and the
+/// answer stands nothing.
+#[test]
+fn an_emptied_slot_raises_its_darkness_past_an_already_standing_loss() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root(&mut m, s);
+  let boot = read_of(&mut m, root);
+
+  // One armed directory plus enough unclassifiable names to COLLAPSE the book.
+  let mut entries = vec![DirEntry::new(seg("sub"), FileKind::Dir)];
+  entries.extend(
+    (0..=DEFICIT_CAP).map(|i| DirEntry::new(seg(&std::format!("u{i:02}")), FileKind::Unknown)),
+  );
+  m.on_enumerate(boot, EnumerateResult::Ok(entries));
+  let sub = m
+    .child_watch(root, &seg("sub"))
+    .expect("the crawl arms sub");
+  m.ack_watch(sub, Ok(WatchAck::Installed));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+  assert!(
+    m.in_bootstrap_window(s),
+    "staging: sub's own unanswered read keeps the registration window open"
+  );
+  assert!(
+    !m.slot_deficit_booked(s, root, &seg("u00")),
+    "staging: and the book collapsed, so it keeps no fine entry for any slot"
+  );
+
+  // The stamped request, queued over a slot `sub` covers: the loss stands on the
+  // stamp alone and the darkness half is false.
+  assert!(m.rearm_watch_subtree(root).is_started());
+  let relist = grow_read(&mut m, root);
+  m.on_enumerate(
+    relist,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("sub"), FileKind::Unknown)]),
+  );
+  let stat = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_stat().map(|c| c.req()))
+    .expect("the unclassifiable name is stat'd whether or not it is covered");
+  let _ = drain_events(&mut m);
+  assert!(
+    m.stat_loss_outstanding(s),
+    "staging: the stamp stands the loss"
+  );
+
+  // The incumbent dies under the standing request. Nothing books the darkness —
+  // the book is collapsed — and the drop erased no entry, so it stood no cover.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Removed)
+      .with_name(seg("sub"))
+      .with_is_dir(true),
+    at(3),
+  );
+  assert!(
+    m.child_watch(root, &seg("sub")).is_none(),
+    "staging: the slot is empty from here"
+  );
+  let _ = drain_events(&mut m);
+
+  // The read that reports it: it coalesces onto the request already standing the
+  // loss, which is the return the darkness must be raised ahead of.
+  assert!(m.rearm_watch_subtree(root).is_started());
+  let relist = grow_read(&mut m, root);
+  m.on_enumerate(
+    relist,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("sub"), FileKind::Unknown)]),
+  );
+  assert!(
+    drain_actions(&mut m).iter().all(|a| a.as_stat().is_none()),
+    "staging: the re-list coalesced onto the standing request rather than queuing a second"
+  );
+  let _ = drain_events(&mut m);
+
+  let racing = install_racing_the_stat(&mut m, root, "sub", ident(9));
+
+  m.on_stat_result(
+    stat,
+    StatResult::Ok(StatEntry::new(FileKind::Dir).with_node(ident(9))),
+  );
+
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&["sub"])),
+    "the emptied-then-refilled slot still earns the released loss's cover: {events:?}"
+  );
+  assert_eq!(
+    m.child_watch(root, &seg("sub")),
+    Some(racing),
+    "and the answer confirms the refill"
+  );
+  m.assert_invariants();
+}
+
+/// …and the direction the emptiness reading fails in on its own: a vacancy some
+/// other path has ALREADY covered.
+///
+/// A `File`/`Gone` reconcile arriving from outside the request removes the
+/// slot's fine entry — which stands the covering `Rescan` for exactly this
+/// vacancy and discharges the request's carried darkness — and leaves the slot
+/// EMPTY, because that is what those occupants mean. An answer that read "empty,
+/// therefore uncovered" would then stand a second cover over the interval the
+/// first already took: a redundant epoch bump, a degraded cover state, and a
+/// consumer enumeration nothing asked for. Which is why the live term asks about
+/// the CURRENT VACANCY ([`StatSlot::vacancy_covered`]) rather than about
+/// emptiness.
+///
+/// Run over every answer shape, because the question is about the vacancy and
+/// not about how the answer describes it — including the DIRECTORY the answer
+/// may still install, whose own arm is counted work no fence passes anyway.
+///
+/// Mutation that kills it: decide the live term from emptiness again
+/// (`incumbent.is_none()` in place of `incumbent.is_none() && !vacancy_covered`).
+/// The already-covered vacancy then earns a second `Rescan` at the slot.
+#[test]
+fn a_covered_vacancy_answer_stands_no_second_cover() {
+  for answer in [
+    StatResult::Ok(StatEntry::new(FileKind::File)),
+    StatResult::Failed(IoClass::NotFound),
+    StatResult::Ok(StatEntry::new(FileKind::Dir)),
+  ] {
+    let mut m = per_dir();
+    let s = scope(1);
+    let root = live_root_idle(&mut m, s);
+    let stat = pure_grow_listing_unknown(&mut m, s, root);
+    assert!(
+      m.slot_deficit_booked(s, root, &seg("mystery")),
+      "staging: an uncollapsed book records the hole finely ({answer:?})"
+    );
+
+    // The external settlement. It heals the hole, which is the one act that
+    // stands the slot's cover, and it settles the slot as EMPTY.
+    m.on_os_record(
+      OsRecord::new(root, RecordKind::Removed).with_name(seg("mystery")),
+      at(3),
+    );
+    assert!(
+      !m.slot_deficit_booked(s, root, &seg("mystery")),
+      "the reconcile healed the hole, which is what stood its cover ({answer:?})"
+    );
+    assert!(
+      m.child_watch(root, &seg("mystery")).is_none(),
+      "and the slot reads empty for the rest of the request ({answer:?})"
+    );
+    let stood = drain_events(&mut m);
+    assert!(
+      stood.iter().any(|e| e.kind().is_rescan()),
+      "staging: the heal's cover is the one instruction the window earns \
+       ({answer:?}): {stood:?}"
+    );
+
+    m.on_stat_result(stat, answer);
+
+    let events = drain_events(&mut m);
+    assert!(
+      !events
+        .iter()
+        .any(|e| e.kind().is_rescan() && e.location() == &loc(&["mystery"])),
+      "a vacancy already handed to a cover is not covered twice ({answer:?}): {events:?}"
+    );
+    m.assert_invariants();
+  }
+}
+
+/// …and the darkness NO read and NO cover ever touched still transfers, which is
+/// the case the live term exists for and the one a narrowing to the carried fact
+/// alone would lose.
+///
+/// A registration-stamped request over an OCCUPIED slot books no darkness — the
+/// stamp is what stands its loss — and its incumbent then dies under it with
+/// nothing re-listing the name. No read observes the emptiness, so the carried
+/// fact stays silent; the drop erased no deficit and the emptied slot had none
+/// booked, so no cover was stood for the SLOT. The slot is dark from the drop to
+/// the answer and the released loss is all that was covering it.
+///
+/// It is also the boundary of what a teardown may be credited with. The drop
+/// erases the descent this request's read booked against the dying incumbent,
+/// which is a COUNTED debt, so it does emit a root `Rescan` here
+/// ([`Monitor::stand_counted_cover`]) — a cover stood on a claim about an object
+/// that survives somewhere unnameable, not on anything the walk did to this slot.
+/// Reading it as this vacancy's cover is exactly the inference the answer is not
+/// entitled to make: a walk can owe that debt having emptied nothing at all.
+///
+/// Two mutations kill it. Narrow the interval to the carried fact alone
+/// (`dark_uncovered` in place of the disjunction) and the silently emptied slot
+/// releases its loss into silence. Fold the counted debt's cover into
+/// `drop_subtree`'s answer and the teardown's raise swallows this transfer too.
+#[test]
+fn a_silently_dropped_incumbent_still_transfers_the_released_loss() {
+  for answer in [
+    StatResult::Ok(StatEntry::new(FileKind::File)),
+    StatResult::Failed(IoClass::NotFound),
+  ] {
+    let mut m = per_dir();
+    let s = scope(1);
+    let root = live_root(&mut m, s);
+    let boot = read_of(&mut m, root);
+    m.on_enumerate(
+      boot,
+      EnumerateResult::Ok(vec![DirEntry::new(seg("sub"), FileKind::Dir)]),
+    );
+    let sub = m
+      .child_watch(root, &seg("sub"))
+      .expect("the crawl arms sub");
+    m.ack_watch(sub, Ok(WatchAck::Installed));
+    let _ = drain_actions(&mut m);
+    let _ = drain_events(&mut m);
+
+    // The stamped request, queued over a slot `sub` covers: the loss stands on
+    // the stamp alone and the darkness half is false.
+    assert!(
+      m.in_bootstrap_window(s),
+      "staging: sub's own unanswered read keeps the registration window open \
+       ({answer:?})"
+    );
+    assert!(m.rearm_watch_subtree(root).is_started());
+    let relist = grow_read(&mut m, root);
+    m.on_enumerate(
+      relist,
+      EnumerateResult::Ok(vec![DirEntry::new(seg("sub"), FileKind::Unknown)]),
+    );
+    let stat = drain_actions(&mut m)
+      .iter()
+      .find_map(|a| a.as_stat().map(|c| c.req()))
+      .expect("the unclassifiable name is stat'd whether or not it is covered");
+    let _ = drain_events(&mut m);
+    assert!(
+      m.stat_loss_outstanding(s),
+      "staging: the stamp stands the loss ({answer:?})"
+    );
+    assert!(
+      !m.slot_deficit_booked(s, root, &seg("sub")),
+      "staging: and an occupied slot books no darkness ({answer:?})"
+    );
+
+    // The incumbent dies under the standing request. Nothing re-lists the name
+    // afterwards, so no read reports the emptiness to the request at all.
+    m.on_os_record(
+      OsRecord::new(root, RecordKind::Removed)
+        .with_name(seg("sub"))
+        .with_is_dir(true),
+      at(3),
+    );
+    assert!(
+      m.child_watch(root, &seg("sub")).is_none(),
+      "staging: the slot is empty from here ({answer:?})"
+    );
+    assert!(
+      !m.slot_deficit_booked(s, root, &seg("sub")),
+      "staging: with no hole booked for anything to heal ({answer:?})"
+    );
+    let dropped = drain_events(&mut m);
+    assert!(
+      !dropped
+        .iter()
+        .any(|e| e.kind().is_rescan() && e.location() == &loc(&["sub"])),
+      "staging: and nothing stood a cover addressed at the vacancy ({answer:?}): \
+       {dropped:?}"
+    );
+
+    m.on_stat_result(stat, answer);
+
+    let events = drain_events(&mut m);
+    assert!(
+      events
+        .iter()
+        .any(|e| e.kind().is_rescan() && e.location() == &loc(&["sub"])),
+      "the released loss becomes the emptied slot's covering Rescan ({answer:?}): \
+       {events:?}"
+    );
+    m.assert_invariants();
+  }
+}
+
+/// …and a cover stood for one vacancy covers exactly that one. The edge the
+/// suppressor above needs to be safe: a stale cover left standing over a FRESH
+/// darkness is a missed cover, which is the expensive direction.
+///
+/// The slot is emptied and covered, RE-OCCUPIED — which ends the vacancy the
+/// cover was stood for, healing nothing, since the entry it would have healed is
+/// already gone — and then emptied again. The second vacancy is nobody's: no
+/// read reports it, no removal covers it. So the answer owes it the transfer,
+/// and the fact recorded for the first vacancy must not speak for it.
+///
+/// Mutation that kills it: drop `vacate_child_slot`'s clear (leave the raw
+/// `child_index` removal). The first vacancy's cover then silences every later
+/// darkness at the same slot for as long as the request stands.
+#[test]
+fn a_re_emptied_slot_is_a_fresh_vacancy_the_old_cover_does_not_reach() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  let stat = pure_grow_listing_unknown(&mut m, s, root);
+  assert!(
+    m.slot_deficit_booked(s, root, &seg("mystery")),
+    "staging: an uncollapsed book records the hole finely"
+  );
+
+  // The first vacancy, and the removal that covers it.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Removed).with_name(seg("mystery")),
+    at(3),
+  );
+  assert!(
+    !m.slot_deficit_booked(s, root, &seg("mystery")),
+    "staging: the heal stood the first vacancy's cover"
+  );
+  let _ = drain_events(&mut m);
+
+  // Re-occupied, then emptied again. The install heals nothing — the entry it
+  // would have removed went with the cover above — so neither edge stands
+  // anything for the darkness the second emptying opens.
+  let refilled = install_racing_the_stat(&mut m, root, "mystery", ident(7));
+  assert!(
+    m.is_watched(refilled),
+    "staging: the slot is occupied again"
+  );
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Removed)
+      .with_name(seg("mystery"))
+      .with_is_dir(true),
+    at(4),
+  );
+  assert!(
+    m.child_watch(root, &seg("mystery")).is_none(),
+    "staging: and empty again, on a vacancy of its own"
+  );
+  assert!(
+    !m.slot_deficit_booked(s, root, &seg("mystery")),
+    "staging: with no hole booked for anything to heal"
+  );
+  let reopened = drain_events(&mut m);
+  assert!(
+    !reopened
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&["mystery"])),
+    "staging: and nothing covered the fresh darkness: {reopened:?}"
+  );
+
+  m.on_stat_result(stat, StatResult::Failed(IoClass::NotFound));
+
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&["mystery"])),
+    "the released loss covers the vacancy the earlier cover never reached: {events:?}"
+  );
+  m.assert_invariants();
+}
+
+/// The racing install of [`install_racing_the_stat`], brought live and given an
+/// INTERIOR deficit of its own: a child slot the kernel refused to arm, booked
+/// against the racing directory rather than against the slot under test.
+///
+/// What it stages is the parting of the two acts. The install spent the slot's
+/// own fine entry, so the settlement that later empties the slot finds nothing
+/// there to turn — while its TEARDOWN erases this interior hole, which is real
+/// coverage and stands the scope's covering `Rescan`.
+fn racing_install_carrying_a_deficit(
+  m: &mut Monitor,
+  s: ScopeId,
+  parent: WatchId,
+  name: &str,
+) -> WatchId {
+  let child = install_racing_the_stat(m, parent, name, ident(9));
+  m.ack_watch(child, Ok(WatchAck::Installed));
+  let read = read_of(m, child);
+  m.on_enumerate(
+    read,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("deep"), FileKind::Dir)]),
+  );
+  let deep = m
+    .child_watch(child, &seg("deep"))
+    .expect("the racing directory's own read arms its interior");
+  m.ack_watch(deep, Err(WatchError::NoSpace));
+  assert!(
+    m.slot_deficit_booked(s, child, &seg("deep")),
+    "staging: the refusal books an interior hole the teardown will have to erase"
+  );
+  assert!(
+    !m.slot_deficit_booked(s, parent, &seg(name)),
+    "staging: and the install spent the slot's own entry, so the removal stands nothing"
+  );
+  let _ = drain_actions(m);
+  let _ = drain_events(m);
+  child
+}
+
+/// …and the act that stands a vacancy's cover is not always the removal. The
+/// emptying settlement has TWO of them, and the request must hear from either.
+///
+/// A directory races into the slot and spends its fine entry, then acquires an
+/// interior deficit of its own. The external `File`/`Gone` reconcile that empties
+/// the slot again therefore turns no entry at all — its `remove_slot_deficit`
+/// answers `false` — while the TEARDOWN inside the same reconcile erases the
+/// interior hole and discharges it as the scope's covering `Rescan`, root-located
+/// and so dominating this slot. Read off the removal alone, the answer sees an
+/// empty slot with no cover recorded and stands a second one: another epoch, and
+/// a consumer enumeration the closing `Rescan` already asked for.
+///
+/// The vacancy is genuinely covered: the walk that stands the `Rescan` is the
+/// walk that empties the slot, and a `Removed` proves the object is gone, so
+/// nothing survives the cover to go on being dark.
+///
+/// Mutation that kills it: bind the raise to the removal again — call
+/// `drop_subtree` directly from `reconcile_slot`'s `File`/`Gone` arm in place of
+/// `drop_departed_occupant`.
+#[test]
+fn a_covering_teardown_stands_the_vacancys_cover_the_removal_cannot() {
+  for answer in [
+    StatResult::Ok(StatEntry::new(FileKind::File)),
+    StatResult::Failed(IoClass::NotFound),
+  ] {
+    let mut m = per_dir();
+    let s = scope(1);
+    let root = live_root_idle(&mut m, s);
+    let stat = pure_grow_listing_unknown(&mut m, s, root);
+    let racing = racing_install_carrying_a_deficit(&mut m, s, root, "mystery");
+    assert!(
+      m.stat_loss_outstanding(s),
+      "staging: the request still stands its loss ({answer:?})"
+    );
+
+    m.on_os_record(
+      OsRecord::new(root, RecordKind::Removed)
+        .with_name(seg("mystery"))
+        .with_is_dir(true),
+      at(6),
+    );
+    assert!(
+      !m.is_watched(racing),
+      "staging: the teardown ran ({answer:?})"
+    );
+    assert!(
+      m.child_watch(root, &seg("mystery")).is_none(),
+      "and the slot reads empty for the rest of the request ({answer:?})"
+    );
+    let stood = drain_events(&mut m);
+    assert!(
+      stood
+        .iter()
+        .any(|e| e.kind().is_rescan() && e.location().is_empty()),
+      "staging: the teardown's discharge stands the scope's cover ({answer:?}): {stood:?}"
+    );
+    let epoch = m.epoch_of(s);
+
+    m.on_stat_result(stat, answer);
+
+    let events = drain_events(&mut m);
+    assert!(
+      !events
+        .iter()
+        .any(|e| e.kind().is_rescan() && e.location() == &loc(&["mystery"])),
+      "a vacancy the teardown already covered is not covered twice ({answer:?}): {events:?}"
+    );
+    assert_eq!(
+      m.epoch_of(s),
+      epoch,
+      "and the consumer is charged no second enumeration ({answer:?})"
+    );
+    m.assert_invariants();
+  }
+}
+
+/// …and the same teardown reached through the object's OWN deletion. The
+/// parent-side `Removed` and the child-side `DeleteSelf` describe one departure,
+/// the driver may deliver either first, and whichever arrives first performs the
+/// teardown — so a raise wired only to the reconcile leaves this door open: by
+/// the time the `Removed` follows, the watch is already gone and its settlement
+/// finds neither a subtree to tear down nor an entry to turn.
+///
+/// Mutation that kills it: call `drop_subtree` directly from `on_delete_self` in
+/// place of `drop_departed_occupant`.
+#[test]
+fn a_delete_self_teardown_stands_the_vacancys_cover_too() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  let stat = pure_grow_listing_unknown(&mut m, s, root);
+  let racing = racing_install_carrying_a_deficit(&mut m, s, root, "mystery");
+
+  m.on_os_record(OsRecord::new(racing, RecordKind::DeleteSelf), at(6));
+  assert!(
+    m.child_watch(root, &seg("mystery")).is_none(),
+    "staging: the object's own deletion empties the slot"
+  );
+  let stood = drain_events(&mut m);
+  assert!(
+    stood
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location().is_empty()),
+    "staging: and its teardown stands the scope's cover: {stood:?}"
+  );
+  let epoch = m.epoch_of(s);
+
+  m.on_stat_result(stat, StatResult::Failed(IoClass::NotFound));
+
+  let events = drain_events(&mut m);
+  assert!(
+    !events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&["mystery"])),
+    "the vacancy the deletion covered is not covered twice: {events:?}"
+  );
+  assert_eq!(m.epoch_of(s), epoch);
+  m.assert_invariants();
+}
+
+/// …and through the third door: an unpairable move-out. A `MovedFrom` the monitor
+/// cannot remember — no cookie, or a bound that refused the half — tears the
+/// source subtree down where it stands and degrades to a `Removed`. The object
+/// has left the slot, which is the same proof the two doors above carry, and the
+/// teardown's discharge is the same covering `Rescan`.
+///
+/// Mutation that kills it: call `drop_subtree` directly from `on_moved_from`'s
+/// unpairable arm in place of `drop_departed_occupant`.
+#[test]
+fn an_unpairable_move_out_teardown_stands_the_vacancys_cover_too() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  let stat = pure_grow_listing_unknown(&mut m, s, root);
+  let racing = racing_install_carrying_a_deficit(&mut m, s, root, "mystery");
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("mystery"))
+      .with_is_dir(true),
+    at(6),
+  );
+  assert!(
+    !m.is_watched(racing),
+    "staging: a half that can never pair is torn down where it stands"
+  );
+  let stood = drain_events(&mut m);
+  assert!(
+    stood
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location().is_empty()),
+    "staging: and its teardown stands the scope's cover: {stood:?}"
+  );
+  let epoch = m.epoch_of(s);
+
+  m.on_stat_result(stat, StatResult::Failed(IoClass::NotFound));
+
+  let events = drain_events(&mut m);
+  assert!(
+    !events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&["mystery"])),
+    "the vacancy the move-out covered is not covered twice: {events:?}"
+  );
+  assert_eq!(m.epoch_of(s), epoch);
+  m.assert_invariants();
+}
+
+/// …and the overreach guard the three cells above need to mean anything: a
+/// teardown that erased NOTHING stands nothing, so the vacancy it opens is still
+/// the answer's to cover.
+///
+/// The same race, minus the interior deficit. The install spent the slot's fine
+/// entry, so the removal turns none; the torn-down directory anchored no coverage,
+/// so its walk discharges nothing (A2) and the `Removed` that drove it is
+/// interest- and filter-subject. Nothing at all covered the emptying, and the
+/// released loss is all the interval ever had.
+///
+/// Mutation that kills it: raise unconditionally in `drop_departed_occupant` —
+/// drop the `stood` guard and mark every teardown's vacancy covered. The
+/// uncovered emptying then releases its loss into silence.
+#[test]
+fn a_teardown_that_erased_nothing_leaves_the_vacancy_to_the_answer() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  let stat = pure_grow_listing_unknown(&mut m, s, root);
+  let racing = install_racing_the_stat(&mut m, root, "mystery", ident(9));
+  assert!(
+    !m.slot_deficit_booked(s, root, &seg("mystery")),
+    "staging: the install spent the slot's own entry"
+  );
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Removed)
+      .with_name(seg("mystery"))
+      .with_is_dir(true),
+    at(6),
+  );
+  assert!(!m.is_watched(racing), "staging: the teardown ran");
+  let quiet = drain_events(&mut m);
+  assert!(
+    !quiet.iter().any(|e| e.kind().is_rescan()),
+    "staging: and it erased no coverage, so it stood nothing: {quiet:?}"
+  );
+
+  m.on_stat_result(stat, StatResult::Failed(IoClass::NotFound));
+
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location() == &loc(&["mystery"])),
+    "the released loss becomes the uncovered vacancy's Rescan: {events:?}"
+  );
+  m.assert_invariants();
+}
+
+/// The sibling shape the transfer deliberately does not reach, and why it is not
+/// the same defect: a slot whose answer lands under a HOLD.
+///
+/// The degrade re-books the darkness and stands no `Rescan` — the
+/// reconstruction is the vacated pre-move path, so a cover addressed there would
+/// send the consumer to the slot the subtree has LEFT — and the release still
+/// happens, so on the collapsed book's reasoning this too would be a release
+/// with nothing behind it. It is not, and the difference is the hold itself: a
+/// detached-and-held move source holds [`Monitor::coverage_settled`] DOWN for
+/// exactly as long as it stands — twice over, through the held source
+/// ([`Monitor::holds_settled`]) and through the parked rename half that detached
+/// it ([`Monitor::moves_settled`]) — so there is no window between the release
+/// and the pairing in which any fence could certify anything. The pairing then
+/// stands the destination's covering `Rescan`, which the answer itself booked by
+/// dirtying the hold.
+///
+/// Both halves are pinned together because either alone is satisfiable by a
+/// mistake: a barrier that never reopens is a wedge, and a cover that never
+/// stands is the defect.
+///
+/// Mutation that kills it: make the hold invisible to the barrier — drop BOTH
+/// the `holds_settled` and `moves_settled` conjuncts of `coverage_settled`.
+/// Either alone leaves the window closed, which is the redundancy this cell
+/// records; with neither, the scope reads settled across the whole held window
+/// and a fence resolved inside it certifies an interval whose recovery has not
+/// been emitted yet.
+#[test]
+fn a_held_answer_hands_its_released_loss_to_a_barrier_the_hold_holds_down() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  let w_d = held_move_source(&mut m, root, "d");
+
+  // A re-arm read of the held source lists an unclassifiable name at a slot
+  // nothing occupies: darkness booked, stat queued, loss stood. The read is
+  // ANSWERED, so the counted work it opened is spent and the hold is the only
+  // thing left holding the barrier down.
+  assert!(m.rearm_watch_subtree(w_d).is_started());
+  let unknown = vec![DirEntry::new(seg("u"), FileKind::Unknown)];
+  let mut queued = None;
+  loop {
+    let actions = drain_actions(&mut m);
+    if queued.is_none() {
+      queued = actions.iter().find_map(|a| a.as_stat().map(|c| c.req()));
+    }
+    let Some(req) = actions
+      .iter()
+      .find_map(|a| a.as_enumerate().filter(|e| e.dir() == w_d).map(|e| e.req()))
+    else {
+      break;
+    };
+    m.on_enumerate(req, EnumerateResult::Ok(unknown.clone()));
+  }
+  let stat = queued.expect("the unclassifiable slot under the held source is stat'd");
+  let _ = drain_events(&mut m);
+  assert!(
+    m.stat_loss_outstanding(s),
+    "staging: the empty slot stands the loss"
+  );
+  assert!(
+    m.rearm_settled(s),
+    "staging: no counted work is outstanding — the stat is uncounted"
+  );
+  assert!(
+    !m.coverage_settled(s),
+    "staging: so the hold's own conjuncts are all that hold the barrier down"
+  );
+
+  // The answer settles nothing and may be addressed nowhere: it releases the
+  // loss and stands no `Rescan` of its own.
+  m.on_stat_result(stat, StatResult::Failed(IoClass::Permission));
+  let events = drain_events(&mut m);
+  assert!(
+    events.is_empty(),
+    "nothing is addressed at the vacated pre-move path: {events:?}"
+  );
+  assert!(
+    !m.stat_loss_outstanding(s),
+    "the answer released the loss, as every answer shape does"
+  );
+  assert!(
+    !m.coverage_settled(s),
+    "and the release hands off to a barrier the hold is still holding down"
+  );
+
+  // The pairing is what reopens it, and it stands the destination's cover first.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("e"))
+      .with_cookie(cookie(1))
+      .with_is_dir(true),
+    at(12),
+  );
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .filter(|e| e.kind().is_rescan())
+      .any(|e| e.location() == &loc(&["e"])),
+    "the dirtied hold's recovery lands at the destination: {events:?}"
+  );
+  m.assert_invariants();
+}
+
+// ---------------------------------------------------------------------------
+// The RELEASE-side twin. A settlement loss leaves `pending_stat` at exactly two
+// sites — the answer's arrival and the PARENT'S DEATH — and both end the same
+// obligation over the same interval, so both owe the same replacement. The
+// cells above pin the answer's; these pin the reclamation's, which every
+// discharge table already calls discharged because the COUNTER is released
+// there. The counter is not the obligation.
+// ---------------------------------------------------------------------------
+
+/// A loss-standing stat under `dir` whose booked darkness the DISPATCH
+/// RE-SIGNAL has already spent — the second way the fine entry can be missing
+/// when the request's parent dies, and the one no collapse is needed for.
+///
+/// The re-signal's `Rescan` covers changes up to itself and no further: the slot
+/// is still dark behind it, the request is still outstanding, and the entry a
+/// later erasure could have discharged is gone. Its heal kick is completed and
+/// its window spent here, so nothing it stood is left for a later drop to ride.
+fn resignalled_grow_listing_unknown(m: &mut Monitor, s: ScopeId, dir: WatchId) -> ReqId {
+  let stat = pure_grow_listing_unknown(m, s, dir);
+  assert!(
+    m.slot_deficit_booked(s, dir, &seg("mystery")),
+    "staging: an uncollapsed book records the hole finely"
+  );
+  assert!(
+    m.resignal_coverage_deficits(s),
+    "the dispatch re-signal fires the hole's Rescan and clears the entry"
+  );
+  let heal = grow_read(m, dir);
+  m.on_enumerate(heal, EnumerateResult::Ok(vec![]));
+  let _ = drain_actions(m);
+  let _ = drain_events(m);
+  assert!(
+    !m.has_coverage_deficit(s),
+    "staging: the book now holds nothing for any erasure to discharge"
+  );
+  assert!(
+    m.stat_loss_outstanding(s),
+    "while the request — and the darkness it carries — still stands"
+  );
+  stat
+}
+
+/// The parent of an unanswered loss-standing stat DEPARTS, over a book that
+/// collapsed past `DEFICIT_CAP` and so kept no fine entry to erase.
+///
+/// The reclamation releases the loss — no answer can ever reach a slot that no
+/// longer exists — and a release owes the darkness a cover. Every other
+/// candidate is absent by construction: the `Deficits` marker erases nothing (a
+/// collapsed book holds no fine entry), the parent-side removal turns none
+/// either, the grow that opened the window was pure, and the `Removed` that drove
+/// the teardown is interest- and filter-subject. Until this record the interval
+/// was covered by the settlement loss alone.
+///
+/// Mutation that kills it: answer `ErasedCover::Nothing` from the `StatSlots`
+/// reclaim. The scope then reads settled and unlossy over an interval in which
+/// `sub/u00` may have been a directory nothing watched and nothing announced.
+#[test]
+fn a_departing_parent_transfers_a_collapsed_books_released_stat_loss() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  let sub = live_child_dir(&mut m, root, "sub");
+  let _stats = collapsing_grow_listing_unknown(&mut m, s, sub);
+  assert!(
+    m.stat_loss_outstanding(s),
+    "staging: the mass darkness is covered by the standing requests alone"
+  );
+  assert!(
+    m.coverage_settled(s),
+    "staging: and nothing counted holds the barrier down meanwhile"
+  );
+
+  // The parent leaves. Its slots die with it, so no answer can ever arrive.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Removed)
+      .with_name(seg("sub"))
+      .with_is_dir(true),
+    at(20),
+  );
+
+  assert!(!m.is_watched(sub), "the removal tears the parent down");
+  assert!(
+    !m.stat_loss_outstanding(s),
+    "and reclaims every request it was holding, releasing the loss with them"
+  );
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location().is_empty()),
+    "so the released loss becomes the scope's covering Rescan: {events:?}"
+  );
+  m.assert_invariants();
+}
+
+/// …and the same departure over an UNCOLLAPSED book whose entry a dispatch
+/// re-signal already spent. The two shapes are one defect: what the reclamation
+/// can lean on is not "a deficit was booked" but "an erasure happened here", and
+/// an entry cleared optimistically at a cookie's dispatch leaves the walk
+/// nothing to erase while the slot stays exactly as dark as it was.
+///
+/// Mutation that kills it: answer `ErasedCover::Nothing` from the `StatSlots`
+/// reclaim. The interval AFTER the re-signal — which its `Rescan` does not
+/// reach, and which the request was still standing for — passes from a degraded
+/// fence to a certified one at the teardown.
+#[test]
+fn a_departing_parent_transfers_a_released_stat_loss_the_resignal_already_spent() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  let sub = live_child_dir(&mut m, root, "sub");
+  let _stat = resignalled_grow_listing_unknown(&mut m, s, sub);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Removed)
+      .with_name(seg("sub"))
+      .with_is_dir(true),
+    at(20),
+  );
+
+  assert!(!m.is_watched(sub), "the removal tears the parent down");
+  assert!(!m.stat_loss_outstanding(s), "releasing the standing loss");
+  let events = drain_events(&mut m);
+  assert!(
+    events
+      .iter()
+      .any(|e| e.kind().is_rescan() && e.location().is_empty()),
+    "which the reclamation hands to the scope's covering Rescan: {events:?}"
+  );
+  m.assert_invariants();
+}
+
+/// …and the overreach guard the two cells above need to mean anything: a
+/// reclaimed request whose darkness was already COVERED hands over nothing.
+///
+/// The transfer is owed for the interval the slot spent dark, never for the
+/// counter's release as such — so the question at the reclamation is the answer's
+/// question, asked of the same two facts the request carries. Here a racing
+/// `Created` healed the booked hole, which stood the window's closing `Rescan`
+/// and discharged the request's claim; the slot has held a live watch ever since.
+/// Standing a second cover would charge the scope an epoch and a full
+/// re-enumeration for an interval already handed to the first — the cost every
+/// spurious cover carries, and the reason the release-side test is not merely
+/// "did a loss stand".
+///
+/// Mutation that kills it: discharge every reclaimed loss-standing row
+/// (`ErasedCover::Discharge` whenever `standing > 0`). The healed slot then
+/// re-covers on every teardown that meets it.
+#[test]
+fn a_departing_parents_covered_darkness_stands_no_second_cover() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  let sub = live_child_dir(&mut m, root, "sub");
+  let _stat = pure_grow_listing_unknown(&mut m, s, sub);
+  let racing = install_racing_the_stat(&mut m, sub, "mystery", ident(7));
+  assert!(
+    !m.slot_deficit_booked(s, sub, &seg("mystery")),
+    "staging: the racing install healed the hole, which is what stood its cover"
+  );
+  assert!(
+    m.stat_loss_outstanding(s),
+    "staging: the loss stands on until the answer or the parent releases it"
+  );
+  let epoch = m.epoch_of(s);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Removed)
+      .with_name(seg("sub"))
+      .with_is_dir(true),
+    at(20),
+  );
+
+  assert!(!m.is_watched(sub), "the removal tears the parent down");
+  assert!(!m.is_watched(racing), "and the racing install with it");
+  assert!(
+    !m.stat_loss_outstanding(s),
+    "releasing the loss the request was standing"
+  );
+  let events = drain_events(&mut m);
+  assert!(
+    !events.iter().any(|e| e.kind().is_rescan()),
+    "an interval the heal already covered is not covered twice: {events:?}"
+  );
+  assert_eq!(
+    m.epoch_of(s),
+    epoch,
+    "and the consumer is charged no second enumeration"
+  );
+  m.assert_invariants();
+}
+
+/// The erasure is REPORTED, never placed: the walk's own [`DeficitDischarge`]
+/// decides what it is worth, and a terminal reason stands nothing.
+///
+/// Both terminal reasons, over the shape that has nothing BUT the reclaimed
+/// darkness to discharge. A proven-unsubscribed prune has no subscriber to lie
+/// to, and an unregistered scope has no barrier left at all — the caller's own
+/// terminal `Rescan` and whole-book wipe own coverage from there. Forcing a cover
+/// onto either would be a `Rescan` for a scope nobody is watching, which is the
+/// failure the reason argument exists to prevent.
+///
+/// Mutation that kills it: emit the covering `Rescan` at the `StatSlots` reclaim
+/// itself instead of returning `ErasedCover::Discharge` for the discharge to
+/// place.
+#[test]
+fn a_terminal_reason_stands_nothing_for_the_reclaimed_darkness() {
+  // The proven-unsubscribed prune.
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  let sub = live_child_dir(&mut m, root, "sub");
+  let _stat = resignalled_grow_listing_unknown(&mut m, s, sub);
+
+  assert!(m.drop_watch_subtree(sub), "the prune drops the subtree");
+  assert!(
+    !m.stat_loss_outstanding(s),
+    "which releases the loss the same way"
+  );
+  let events = drain_events(&mut m);
+  assert!(
+    !events.iter().any(|e| e.kind().is_rescan()),
+    "but coverage outside every committed subscription is owed nothing: {events:?}"
+  );
+  m.assert_invariants();
+
+  // The scope's own teardown.
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, s);
+  let sub = live_child_dir(&mut m, root, "sub");
+  let _stat = resignalled_grow_listing_unknown(&mut m, s, sub);
+
+  m.unregister_root(s);
+  assert!(!m.stat_loss_outstanding(s), "the teardown releases it too");
+  let events = drain_events(&mut m);
+  assert!(
+    !events.iter().any(|e| e.kind().is_rescan()),
+    "and a scope that is gone has no barrier left to hand anything to: {events:?}"
+  );
+  m.assert_invariants();
+}
+
+/// …and the third reason CARRIES it instead of covering it. A crawl rebuild's
+/// non-survivor branch has no coverage story of its own, so what it does with an
+/// erased cover is re-anchor it as a slot hole at the SURVIVING parent — the same
+/// coarser coordinate every deficit erased inside the dropped subtree lands on.
+///
+/// The listing omits `sub`, so the crawl retires it and rebuilds nothing there:
+/// the hole stays booked for the dispatch re-signal until the vanish's `Removed`
+/// converges it, which is exactly what the darkness of a slot beneath `sub`
+/// needs. The crawl's own opening `Rescan` covers the retirement; it does not
+/// cover a dark interval that outlives it, and the book is what does.
+///
+/// Mutation that kills it: answer `ErasedCover::Nothing` from the `StatSlots`
+/// reclaim. The re-anchor then fires only for subtrees that happened to still
+/// hold a fine entry, and this darkness leaves no trace at all.
+#[test]
+fn a_crawl_rebuild_re_anchors_the_reclaimed_darkness_at_the_surviving_parent() {
+  let mut m = per_dir();
+  let s = scope(1);
+  let root = live_root_idle(&mut m, s);
+  let sub = live_child_dir(&mut m, root, "sub");
+  let _stat = resignalled_grow_listing_unknown(&mut m, s, sub);
+
+  // A grow of the ROOT whose listing no longer names `sub`: the crawl retires it
+  // through the rebuild branch rather than through any record.
+  assert!(m.rearm_watch_subtree(root).is_started());
+  let crawl = grow_read(&mut m, root);
+  m.on_enumerate(crawl, EnumerateResult::Ok(vec![]));
+
+  assert!(!m.is_watched(sub), "the crawl retires the vanished name");
+  assert!(!m.stat_loss_outstanding(s), "releasing the standing loss");
+  assert!(
+    m.slot_deficit_booked(s, root, &seg("sub")),
+    "and the darkness it was standing for is re-anchored at the surviving parent"
+  );
   m.assert_invariants();
 }

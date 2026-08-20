@@ -2036,11 +2036,18 @@ mod descending {
   }
 
   fn inotify_rig_fs(fs: FakeFs) -> Rig {
+    inotify_rig_fs_capacity(fs, 64)
+  }
+
+  /// [`inotify_rig_fs`] with the consumer's event channel sized by the caller: a
+  /// cell that must observe a REFUSED delivery needs a capacity it can fill and
+  /// keep full.
+  fn inotify_rig_fs_capacity(fs: FakeFs, event_capacity: usize) -> Rig {
     fs.put("/r", FileKind::Dir, 1);
     fs.spawn_backend(BackendKind::Inotify);
     let (cmd_tx, cmd_rx) = async_channel::bounded(16);
     let (cleanup, cookie_wake) = cookie_ingress();
-    let (ev_tx, ev_rx) = async_channel::bounded(64);
+    let (ev_tx, ev_rx) = async_channel::bounded(event_capacity);
     tokio::spawn(run::<TokioRuntime, FakeFs>(
       inotify_config(),
       fs.clone(),
@@ -3048,6 +3055,20 @@ mod descending {
     /// the `Rescan` creates it and after the observation spends it, so the
     /// delivery is the edge that makes the emptiness mean the second one.
     async fn covered_rig(children: &[(&str, u64)]) -> (Rig, ScopeId) {
+      covered_rig_capacity(children, 64).await
+    }
+
+    /// [`covered_rig`] with the consumer's event channel sized by the caller.
+    ///
+    /// At capacity ONE the staging leaves the channel FULL: the registration
+    /// window's closing `Rescan` is the slot's occupant (wait (2) above proves it
+    /// arrived, and nothing here drains it), so the very next change the scope
+    /// produces is REFUSED. That is the state the backpressure cells need, and it
+    /// is reached without injecting a single filler event.
+    async fn covered_rig_capacity(
+      children: &[(&str, u64)],
+      event_capacity: usize,
+    ) -> (Rig, ScopeId) {
       assert!(
         !children.is_empty(),
         "the helper's staging rests on the registration window installing at least one child"
@@ -3056,7 +3077,7 @@ mod descending {
       for (path, ino) in children {
         fs.put(path, FileKind::Dir, *ino);
       }
-      let rig = inotify_rig_fs(fs);
+      let rig = inotify_rig_fs_capacity(fs, event_capacity);
       let scope = watch(&rig, "/r").await;
       settle(|| {
         let enumerates = rig.fs.enumerates();
@@ -3159,6 +3180,247 @@ mod descending {
         CoverOutcome::Applied,
         "a prune-only reconcile settles clean"
       );
+    }
+
+    /// THE PUBLIC CONTRACT for the one loss that arrives with no cover of its
+    /// own: an awaited reply over a standing classification stat reports
+    /// `Degraded`, and the covering `Rescan` that verdict promises is ALREADY on
+    /// the consumer's stream when it does.
+    ///
+    /// Every cover such a window could otherwise ride is absent by construction.
+    /// The reconcile is a PURE grow — `/r/drop` is re-armed at the surviving
+    /// `/r`, and a re-arm read stands no `Rescan` at all — and `/r/mystery`
+    /// holds no watch, so the read that could not name its kind reconciled
+    /// nothing for it: it booked the darkness and asked. The probe is held on
+    /// the pool for the whole fence, so the answer that would end the loss never
+    /// lands; and the deficit re-signal that eventually covers such a slot fires
+    /// at a sync cookie's DISPATCH, which this reply passes nowhere near.
+    ///
+    /// The ORDERING is the assertion, and the non-blocking take is how it is
+    /// made: the stream is emptied before the reconcile, and read again with
+    /// `try_recv` the instant the ack resolves. A `Rescan` merely queued behind
+    /// the answer is not on the stream yet, so the cell fails where a `recv`
+    /// would have waited for it and passed.
+    ///
+    /// Mutation that kills it: resolve the tranche where it stands — drop the
+    /// `stat_covered` hold in `poll_cover_settlements`, or the `cover_flush_due`
+    /// re-top that flushes it. The reply still says `Degraded`, and the consumer
+    /// is told to re-enumerate by nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stat_loss_degrade_reaches_its_caller_behind_the_cover_it_promises() {
+      let (rig, scope) = covered_rig(&[("/r/keep", 11), ("/r/drop", 12)]).await;
+      shrunk_to_keep(&rig, scope).await;
+
+      // An unclassifiable name at a slot the shrink left uncovered, with its
+      // kind held unanswered for the whole fence.
+      let probes = rig.fs.hold_probes();
+      rig.fs.put("/r/mystery", FileKind::Unknown, 13);
+
+      // Empty the stream, so a cover read off it below is this window's.
+      while rig.events.try_recv().is_ok() {}
+
+      let ack = send_set_cover(&rig, scope, &["/r/keep", "/r/drop"]).await;
+      assert_eq!(
+        resolved(ack).await,
+        CoverOutcome::Degraded,
+        "an unanswered kind over a slot the root covers with nothing is a loss"
+      );
+      let mut delivered = Vec::new();
+      while let Ok((_, _, change)) = rig.events.try_recv() {
+        delivered.push(change);
+      }
+      assert!(
+        delivered
+          .iter()
+          .any(|change| change.kind().is_rescan() && change.location() == &loc(&[])),
+        "the covering `Rescan` precedes the verdict that promises it: {delivered:?}"
+      );
+      assert_eq!(
+        rig.fs.probes(),
+        0,
+        "staging: and nothing answered the stat, so the loss stood throughout"
+      );
+
+      probes.release();
+    }
+
+    /// Stages a standing empty-slot stat over a FULL consumer channel: the
+    /// registration `Rescan` holds the rig's one slot, the grow re-arms the
+    /// pruned subtree and lists an unclassifiable name whose kind never comes
+    /// back, and the settlement that follows stands its covering `Rescan` into a
+    /// channel that refuses it.
+    ///
+    /// Hands back the parked acknowledgement and the held probe gate. The wait is
+    /// two-part on purpose: the re-arm is waited for on its own observable (so
+    /// the window's counted work is provably done and the cover is the only thing
+    /// left between the fence and its verdict), and the rounds after it are what
+    /// a resolution would need — under a hold spent on the enqueue the reply is
+    /// already sent by the end of them.
+    async fn stat_loss_over_a_full_channel(
+      rig: &Rig,
+      scope: ScopeId,
+    ) -> (
+      futures_channel::oneshot::Receiver<CoverOutcome>,
+      HoldRelease,
+    ) {
+      shrunk_to_keep(rig, scope).await;
+      let probes = rig.fs.hold_probes();
+      rig.fs.put("/r/mystery", FileKind::Unknown, 13);
+      let ack = send_set_cover(rig, scope, &["/r/keep", "/r/drop"]).await;
+      assert!(
+        settle(|| arms_at(rig, "/r/drop") >= 2).await,
+        "staging: the grow re-armed the pruned subtree, so the window's counted work is done"
+      );
+      for _ in 0..40 {
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+      }
+      assert_eq!(
+        rig.events.len(),
+        1,
+        "staging: the channel never had room, so nothing this window stood was delivered"
+      );
+      assert_eq!(
+        rig.fs.probes(),
+        0,
+        "staging: and nothing answered the stat, so the loss stood throughout"
+      );
+      (ack, probes)
+    }
+
+    /// THE PUBLIC CONTRACT UNDER BACKPRESSURE, for BOTH consumers of the
+    /// ordering. Queuing the covering `Rescan` is not delivering it: a full
+    /// consumer channel REFUSES the loop-top send and parks the instruction, and
+    /// a verdict answered over that tells a consumer to re-enumerate by nothing —
+    /// which is the whole of what `Degraded` promises.
+    ///
+    /// So neither consumer moves while the channel stays full: the awaited
+    /// `set_cover` reply stays parked, AND the sync cookie fenced on the same
+    /// tranche writes nothing. Both ride one hold in the core, which is why one
+    /// cell can pin them together — the reply and the cookie dispatch are the two
+    /// arms of the same settlement report.
+    ///
+    /// Freeing the single slot is what releases them, and the order is the
+    /// assertion: the `Rescan` is read off the stream with a NON-BLOCKING take
+    /// the instant the ack resolves, so an instruction still parked behind the
+    /// answer fails the cell where a blocking read would have waited for it and
+    /// passed.
+    ///
+    /// Mutation that kills it: resolve the tranche over a refused cover — infer
+    /// the delivery from the effect queue in `DriverCore::stat_cover_landed`
+    /// instead of reading the scope's delivery watermark. A refusal purges the
+    /// queued cover into the parked instruction, so the queue reads empty of it,
+    /// and both consumers then proceed while the channel is still full and the
+    /// instruction still parked.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stat_loss_degrade_waits_out_a_full_consumer_channel() {
+      let (rig, scope) = covered_rig_capacity(&[("/r/keep", 11), ("/r/drop", 12)], 1).await;
+      assert_eq!(
+        rig.events.len(),
+        1,
+        "staging: the registration `Rescan` fills the one slot the consumer has"
+      );
+      let (mut ack, probes) = stat_loss_over_a_full_channel(&rig, scope).await;
+
+      // The second consumer of the same ordering: a sync cookie parked on this
+      // scope's fence, whose write dispatches out of the same settlement report.
+      let (reply, mut on_cookie) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::SyncRoot {
+          scope,
+          dir: PathBuf::from("/r"),
+          name: ".tributaries-sync-9-9-9".to_owned(),
+          ticket: ticket(),
+          reply,
+        })
+        .await
+        .unwrap();
+      for _ in 0..40 {
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+      }
+      assert!(
+        futures_util::poll!(&mut ack).is_pending(),
+        "the reply waits for the cover it promises to reach the consumer"
+      );
+      assert!(
+        futures_util::poll!(&mut on_cookie).is_pending(),
+        "and so does the sync fenced on the same tranche"
+      );
+      assert!(
+        rig.fs.cookie_writes().is_empty(),
+        "with nothing written, so no record can be routed ahead of the instruction"
+      );
+
+      // Free the slot. The lane's delivery retry lands the parked instruction,
+      // and only then does the settlement report.
+      let (_, _, occupant) = rig
+        .events
+        .try_recv()
+        .expect("the registration `Rescan` is the slot's occupant");
+      assert!(occupant.kind().is_rescan(), "{occupant:?}");
+      let floor = occupant.epoch();
+
+      assert_eq!(
+        resolved(ack).await,
+        CoverOutcome::Degraded,
+        "an unanswered kind over a slot the root covers with nothing is a loss"
+      );
+      let mut delivered = Vec::new();
+      while let Ok((_, _, change)) = rig.events.try_recv() {
+        delivered.push(change);
+      }
+      assert!(
+        delivered.iter().any(|change| change.kind().is_rescan()
+          && change.location() == &loc(&[])
+          && change.epoch() > floor),
+        "the covering `Rescan` precedes the verdict that promises it: {delivered:?}"
+      );
+      let path = tokio::time::timeout(interpreted_secs(10), on_cookie)
+        .await
+        .expect("the parked sync resolves once its tranche does")
+        .expect("the driver answers the parked reply")
+        .expect("the write lands behind the cover");
+      assert_eq!(path, PathBuf::from("/r/.tributaries-sync-9-9-9"));
+
+      probes.release();
+    }
+
+    /// …and the hold is TERMINAL where no offer can ever land. A consumer that
+    /// DROPPED its stream reports no delivery outcome at all — a closed channel
+    /// yields neither an acceptance nor a refusal — so the lagged lane's parked
+    /// instruction is offered once and never released. Waiting on that is exactly
+    /// the wedge a standing stat is a loss signal, and not a barrier conjunct, to
+    /// avoid: the verdict degrades, and the caller is answered.
+    ///
+    /// Mutation that kills it: stop recording the closure — leave the driver's
+    /// `TrySendError::Closed` arm empty, or drop the `consumer_gone`
+    /// short-circuit from `DriverCore::stat_cover_landed`. The reply is then
+    /// stranded forever and the cell spends its deadline. This is a LIVENESS
+    /// failure, where the cell above pins an ORDERING one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stat_loss_degrade_answers_a_consumer_that_dropped_its_stream() {
+      let (rig, scope) = covered_rig_capacity(&[("/r/keep", 11), ("/r/drop", 12)], 1).await;
+      let (ack, probes) = stat_loss_over_a_full_channel(&rig, scope).await;
+
+      // The consumer drops its stream. The command channel stays open, so the
+      // driver keeps running and this is not a close.
+      let Rig {
+        fs: _fs,
+        commands: _commands,
+        cleanup: _cleanup,
+        events,
+      } = rig;
+      drop(events);
+
+      assert_eq!(
+        resolved(ack).await,
+        CoverOutcome::Degraded,
+        "a cover nobody can ever be given degrades the verdict rather than wedging the scope"
+      );
+
+      probes.release();
     }
 
     /// A reprove re-add racing a set-cover prune's disarm of the SAME watch —
