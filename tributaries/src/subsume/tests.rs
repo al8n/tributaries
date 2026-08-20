@@ -53,7 +53,7 @@ fn watch(s: &mut S, handles: &mut Handles, path: &str, interest: Interest) -> (u
     WatchOutcome::Covered { fs_root, sub, .. } => (*fs_root, *sub),
     WatchOutcome::Widen { sub, .. } | WatchOutcome::Disjoint { sub, .. } => (handles.mint(), *sub),
   };
-  s.commit_watch(&outcome, fs_root, &k);
+  s.commit_watch(&outcome, fs_root, &k).release();
   (fs_root, sub)
 }
 
@@ -104,7 +104,7 @@ fn descendant_is_covered() {
     }
     other => panic!("expected Covered by /a, got {other:?}"),
   };
-  s.commit_watch(&outcome, ra, &key("/a/b"));
+  s.commit_watch(&outcome, ra, &key("/a/b")).release();
 
   assert_eq!(root_keys(&s), BTreeSet::from([key("/a")]));
   assert_eq!(s.subscribers(ra), vec![sa, sb]);
@@ -124,12 +124,10 @@ fn ancestor_widens_and_repoints() {
   let outcome = s.plan_watch(&key("/a"), (), Interest::all());
   let s_wide = match &outcome {
     WatchOutcome::Widen {
-      new_root_key,
       repointed,
       unwatch,
       sub,
     } => {
-      assert_eq!(new_root_key, &key("/a"));
       assert_eq!(
         repointed,
         &vec![s_narrow],
@@ -141,7 +139,7 @@ fn ancestor_widens_and_repoints() {
     other => panic!("expected Widen, got {other:?}"),
   };
   let wide = h.mint();
-  s.commit_watch(&outcome, wide, &key("/a"));
+  s.commit_watch(&outcome, wide, &key("/a")).release();
 
   assert_ne!(wide, narrow);
   assert_eq!(root_keys(&s), BTreeSet::from([key("/a")]));
@@ -149,6 +147,9 @@ fn ancestor_widens_and_repoints() {
   assert!(s.entry(narrow).is_none());
   assert_eq!(s.subscribers(wide), vec![s_narrow, s_wide]);
   assert_eq!(s.entry(wide).unwrap().key, key("/a"));
+  // The wider root's key IS the widening subscription's own registered key — the source of truth
+  // the plan never needed to carry a second copy of.
+  assert_eq!(s.subscription_key(s_wide), Some(key("/a").as_slice()));
 }
 
 #[test]
@@ -163,21 +164,21 @@ fn unwatch_last_subscriber_empties_root() {
   // the departing sub's key (/a/b) is narrower than the root (/a), so its departure widens no gap —
   // the root's own /a subscriber still pins it.
   assert!(matches!(
-    s.plan_unwatch(sb),
+    s.test_plan_unwatch(sb),
     Some(UnwatchOutcome::Dropped { shrink: None })
   ));
   assert_eq!(s.subscribers(ra), vec![sa]);
 
   // Dropping the last subscriber empties (and removes) the root.
   assert!(matches!(
-    s.plan_unwatch(sa),
+    s.test_plan_unwatch(sa),
     Some(UnwatchOutcome::RootEmptied { fs_root, .. }) if fs_root == ra,
   ));
   assert!(s.entry(ra).is_none());
   assert!(root_keys(&s).is_empty());
 
   // Unknown / already-dropped subscriptions report nothing.
-  assert!(s.plan_unwatch(sa).is_none());
+  assert!(s.test_plan_unwatch(sa).is_none());
 }
 
 /// Each subscription records its own interest in the side table (design §4): the root
@@ -267,11 +268,11 @@ fn stale_broad_root_does_not_over_report_is_watched() {
     other => panic!("expected Widen, got {other:?}"),
   };
   let wide = h.mint();
-  s.commit_watch(&outcome, wide, &key("/a"));
+  s.commit_watch(&outcome, wide, &key("/a")).release();
   // Unwatch the widening /a watch: the root /a lives on for /a/b, now broader than it — exactly the
   // over-broad case shrink-in-place reclaims (the set-cover design). The departing key /a equals the root key
   // and no survivor is at /a, so the drop reports a shrink to the /a/b survivor cover.
-  match s.plan_unwatch(s_wide) {
+  match s.test_plan_unwatch(s_wide) {
     Some(UnwatchOutcome::Dropped {
       shrink: Some((handle, retained)),
     }) => {
@@ -313,7 +314,7 @@ fn stale_broad_root_does_not_over_report_is_watched() {
     matches!(re, WatchOutcome::Covered { .. }),
     "re-installing /a/c is Covered under the still-armed broad root — no re-arm",
   );
-  s.commit_watch(&re, wide, &key("/a/c"));
+  s.commit_watch(&re, wide, &key("/a/c")).release();
   assert!(
     view.is_watched(&key("/a/c")),
     "after re-install /a/c is watched again (self-healing, no silent loss)"
@@ -329,7 +330,7 @@ fn stale_broad_root_does_not_over_report_is_watched() {
   assert_eq!(_covered, rx, "/x/y is covered by the /x root (no new arm)");
   // Unwatch /x's own watch: the root /x lives on for /x/y, now broader than it — over-broad, so the
   // drop reports a shrink to the /x/y survivor cover.
-  match s.plan_unwatch(s_x) {
+  match s.test_plan_unwatch(s_x) {
     Some(UnwatchOutcome::Dropped {
       shrink: Some((handle, retained)),
     }) => {
@@ -374,11 +375,11 @@ fn over_broad_drop_reports_survivor_antichain() {
     other => panic!("expected Widen, got {other:?}"),
   };
   let wide = h.mint();
-  s.commit_watch(&outcome, wide, &key("/a"));
+  s.commit_watch(&outcome, wide, &key("/a")).release();
 
   // Unwatch the widening /a: departing key /a == root key /a and no survivor is at /a, so the root is
   // over-broad and shrinks to the {/a/b, /a/c} survivor cover.
-  match s.plan_unwatch(s_a) {
+  match s.test_plan_unwatch(s_a) {
     Some(UnwatchOutcome::Dropped {
       shrink: Some((handle, retained)),
     }) => {
@@ -410,7 +411,7 @@ fn drop_with_survivor_at_root_key_is_not_over_broad() {
 
   assert!(
     matches!(
-      s.plan_unwatch(s_a1),
+      s.test_plan_unwatch(s_a1),
       Some(UnwatchOutcome::Dropped { shrink: None })
     ),
     "a survivor still at the root key keeps it legitimately watched — not over-broad"
@@ -435,9 +436,9 @@ fn over_broad_antichain_collapses_nested_survivors() {
     other => panic!("expected Widen, got {other:?}"),
   };
   let wide = h.mint();
-  s.commit_watch(&outcome, wide, &key("/a"));
+  s.commit_watch(&outcome, wide, &key("/a")).release();
 
-  match s.plan_unwatch(s_a) {
+  match s.test_plan_unwatch(s_a) {
     Some(UnwatchOutcome::Dropped {
       shrink: Some((handle, retained)),
     }) => {
@@ -471,14 +472,15 @@ fn narrowed_cover_non_root_unwatch_reprunes() {
     other => panic!("expected Widen, got {other:?}"),
   };
   let wide = h.mint();
-  s.commit_watch(&outcome, wide, &key("/a"));
-  s.plan_unwatch(s_a).expect("unwatch the widening /a");
+  s.commit_watch(&outcome, wide, &key("/a")).release();
+  s.test_plan_unwatch(s_a).expect("unwatch the widening /a");
   // Record the source's narrowed coverage exactly as the driver would (narrow-on-prune-issue).
-  s.set_retained_cover(wide, Some(vec![key("/a/b"), key("/a/c")]));
+  s.set_retained_cover(wide, Some(vec![key("/a/b"), key("/a/c")]))
+    .release();
 
   // Drop the NON-ROOT /a/c survivor: the survivor antichain {/a/b} is STRICTLY narrower than the
   // recorded {/a/b, /a/c}, so the drop reports a re-prune to {/a/b}.
-  match s.plan_unwatch(s_c) {
+  match s.test_plan_unwatch(s_c) {
     Some(UnwatchOutcome::Dropped {
       shrink: Some((handle, retained)),
     }) => {
@@ -514,16 +516,17 @@ fn equal_survivor_antichain_reports_no_reprune() {
     other => panic!("expected Widen, got {other:?}"),
   };
   let wide = h.mint();
-  s.commit_watch(&outcome, wide, &key("/a"));
-  s.plan_unwatch(s_a).expect("unwatch the widening /a");
+  s.commit_watch(&outcome, wide, &key("/a")).release();
+  s.test_plan_unwatch(s_a).expect("unwatch the widening /a");
   // The narrowed cover the driver would record: the minimal antichain {/a/b, /a/c}.
-  s.set_retained_cover(wide, Some(vec![key("/a/b"), key("/a/c")]));
+  s.set_retained_cover(wide, Some(vec![key("/a/b"), key("/a/c")]))
+    .release();
 
   // Drop /a/b/deep — already covered by the shallower /a/b survivor — so the survivor antichain is
   // unchanged: {/a/b, /a/c} still, EQUAL to the recorded cover → no re-prune.
   assert!(
     matches!(
-      s.plan_unwatch(s_deep),
+      s.test_plan_unwatch(s_deep),
       Some(UnwatchOutcome::Dropped { shrink: None })
     ),
     "a survivor covered by a shallower sibling reclaims nothing — no re-prune"
@@ -549,26 +552,26 @@ fn retained_cover_for_tracks_current_membership() {
     other => panic!("expected Widen, got {other:?}"),
   };
   let wide = h.mint();
-  s.commit_watch(&outcome, wide, &key("/a"));
+  s.commit_watch(&outcome, wide, &key("/a")).release();
 
   // The /a subscriber still pins the wide root at its own key → not over-broad → None.
   assert_eq!(
-    s.retained_cover_for(wide, None),
+    s.test_retained_cover_for(wide, None),
     None,
     "a subscriber at the root key pins it — not over-broad, so the re-issue is the cancel-equivalent"
   );
 
   // Drop the /a subscriber: the wide root now serves only the narrower /a/b, /a/c → over-broad.
-  s.plan_unwatch(s_a).expect("unwatch the widening /a");
+  s.test_plan_unwatch(s_a).expect("unwatch the widening /a");
   assert_eq!(
-    s.retained_cover_for(wide, None),
+    s.test_retained_cover_for(wide, None),
     Some(vec![key("/a/b"), key("/a/c")]),
     "the recomputed cover is the CURRENT survivor antichain"
   );
 
   // An unknown handle names no live root → nothing to reclaim.
   assert_eq!(
-    s.retained_cover_for(9999, None),
+    s.test_retained_cover_for(9999, None),
     None,
     "an unknown handle has no cover"
   );
@@ -589,11 +592,11 @@ fn retained_cover_for_collapses_nested_survivors() {
     other => panic!("expected Widen, got {other:?}"),
   };
   let wide = h.mint();
-  s.commit_watch(&outcome, wide, &key("/a"));
-  s.plan_unwatch(s_a).expect("unwatch the widening /a");
+  s.commit_watch(&outcome, wide, &key("/a")).release();
+  s.test_plan_unwatch(s_a).expect("unwatch the widening /a");
 
   assert_eq!(
-    s.retained_cover_for(wide, None),
+    s.test_retained_cover_for(wide, None),
     Some(vec![key("/a/b")]),
     "nested survivors /a/b and /a/b/c collapse to the single cover /a/b"
   );
@@ -615,10 +618,10 @@ fn retained_cover_for_includes_a_newly_covered_subscriber() {
     other => panic!("expected Widen, got {other:?}"),
   };
   let wide = h.mint();
-  s.commit_watch(&outcome, wide, &key("/a"));
-  s.plan_unwatch(s_a).expect("unwatch the widening /a");
+  s.commit_watch(&outcome, wide, &key("/a")).release();
+  s.test_plan_unwatch(s_a).expect("unwatch the widening /a");
   assert_eq!(
-    s.retained_cover_for(wide, None),
+    s.test_retained_cover_for(wide, None),
     Some(vec![key("/a/b")]),
     "before the covered newcomer, the cover is just the /a/b survivor"
   );
@@ -627,7 +630,7 @@ fn retained_cover_for_includes_a_newly_covered_subscriber() {
   let (rc, _s_c) = watch(&mut s, &mut h, "/a/c", Interest::all());
   assert_eq!(rc, wide, "the covered /a/c rides the wide root");
   assert_eq!(
-    s.retained_cover_for(wide, None),
+    s.test_retained_cover_for(wide, None),
     Some(vec![key("/a/b"), key("/a/c")]),
     "the covered /a/c JOINS the recomputed cover — the fresh membership, not the stale {{/a/b}}"
   );
@@ -652,30 +655,30 @@ fn retained_cover_for_joins_the_explicit_newcomer_before_commit() {
     other => panic!("expected Widen, got {other:?}"),
   };
   let wide = h.mint();
-  s.commit_watch(&outcome, wide, &key("/a"));
-  s.plan_unwatch(s_a).expect("unwatch the widening /a");
+  s.commit_watch(&outcome, wide, &key("/a")).release();
+  s.test_plan_unwatch(s_a).expect("unwatch the widening /a");
 
   // An uncommitted newcomer under a pruned region joins the cover explicitly.
   assert_eq!(
-    s.retained_cover_for(wide, Some(&key("/a/c"))),
+    s.test_retained_cover_for(wide, Some(&key("/a/c"))),
     Some(vec![key("/a/b"), key("/a/c")]),
     "the pre-commit newcomer's key joins the survivors' antichain"
   );
   // A newcomer nested under a survivor collapses into it (antichain minimality).
   assert_eq!(
-    s.retained_cover_for(wide, Some(&key("/a/b/deep"))),
+    s.test_retained_cover_for(wide, Some(&key("/a/b/deep"))),
     Some(vec![key("/a/b")]),
     "a newcomer under a survivor prefix collapses into the existing cover"
   );
   // A newcomer at the root's own key pins the root: the driver grows the cancel-equivalent.
   assert_eq!(
-    s.retained_cover_for(wide, Some(&key("/a"))),
+    s.test_retained_cover_for(wide, Some(&key("/a"))),
     None,
     "a newcomer at the root key reports None — grow back to full coverage"
   );
   // The query is pure: the committed membership (and its cover) is unchanged.
   assert_eq!(
-    s.retained_cover_for(wide, None),
+    s.test_retained_cover_for(wide, None),
     Some(vec![key("/a/b")]),
     "the explicit-newcomer query committed nothing"
   );
@@ -697,14 +700,15 @@ fn retained_cover_bookkeeping_round_trips() {
     "a fresh root is never narrowed — full coverage"
   );
 
-  s.set_retained_cover(ra, Some(vec![key("/a/b"), key("/a/c")]));
+  s.set_retained_cover(ra, Some(vec![key("/a/b"), key("/a/c")]))
+    .release();
   assert_eq!(
     s.retained_cover_of(ra),
     Some(vec![key("/a/b"), key("/a/c")]),
     "the issued cover round-trips through the bookkeeping"
   );
 
-  s.set_retained_cover(ra, None);
+  s.set_retained_cover(ra, None).release();
   assert_eq!(
     s.retained_cover_of(ra),
     None,
@@ -739,10 +743,10 @@ fn plan_watch_flags_covered_outside_the_narrowed_cover() {
     ),
     other => panic!("expected Covered, got {other:?}"),
   }
-  s.abort_watch(&outcome);
+  s.abort_watch(&outcome).release();
 
   // Narrow the recorded cover to {/a/b}: the source pruned everything else under /a.
-  s.set_retained_cover(ra, Some(vec![key("/a/b")]));
+  s.set_retained_cover(ra, Some(vec![key("/a/b")])).release();
 
   // A newcomer OUTSIDE {/a/b} → flagged.
   let outcome = s.plan_watch(&key("/a/c"), (), Interest::all());
@@ -760,7 +764,7 @@ fn plan_watch_flags_covered_outside_the_narrowed_cover() {
     }
     other => panic!("expected Covered, got {other:?}"),
   }
-  s.abort_watch(&outcome);
+  s.abort_watch(&outcome).release();
 
   // A newcomer INSIDE the retained prefix /a/b → not flagged.
   let outcome = s.plan_watch(&key("/a/b/deep"), (), Interest::all());
@@ -771,7 +775,7 @@ fn plan_watch_flags_covered_outside_the_narrowed_cover() {
     ),
     other => panic!("expected Covered, got {other:?}"),
   }
-  s.abort_watch(&outcome);
+  s.abort_watch(&outcome).release();
 
   // A newcomer whose key EQUALS a retained prefix → not flagged (an ancestor-or-equal is covered).
   let outcome = s.plan_watch(&key("/a/b"), (), Interest::all());
@@ -782,7 +786,7 @@ fn plan_watch_flags_covered_outside_the_narrowed_cover() {
     ),
     other => panic!("expected Covered, got {other:?}"),
   }
-  s.abort_watch(&outcome);
+  s.abort_watch(&outcome).release();
 }
 
 // ---------------------------------------------------------------------------
@@ -840,7 +844,7 @@ fn run(ops: &[Op]) -> (S, HashMap<Subscription, PathBuf>) {
         }
         let (sub, _) = live.remove(idx % live.len());
         assert!(
-          s.plan_unwatch(sub).is_some(),
+          s.test_plan_unwatch(sub).is_some(),
           "a live subscription must be dropped",
         );
       }
@@ -966,12 +970,12 @@ fn cohort_retirement_clones_values_linearly() {
       }
     };
     let _ = i;
-    s.commit_watch(&outcome, fs_root, &k);
+    s.commit_watch(&outcome, fs_root, &k).release();
   }
 
   // Count ONLY the retirement's clones.
   clones.store(0, Ordering::Relaxed);
-  let retired = s.force_remove_root(root_handle);
+  let retired = s.test_force_remove_root(root_handle);
   assert_eq!(retired.len(), COHORT, "the whole cohort retired");
   let spent = clones.load(Ordering::Relaxed);
   assert!(
@@ -1015,7 +1019,7 @@ fn cohort_construction_clones_values_linearly() {
       WatchOutcome::Covered { fs_root, .. } => *fs_root,
       WatchOutcome::Widen { .. } | WatchOutcome::Disjoint { .. } => 1,
     };
-    s.commit_watch(&outcome, fs_root, &k);
+    s.commit_watch(&outcome, fs_root, &k).release();
   }
 
   let spent = clones.load(Ordering::Relaxed);
@@ -1054,7 +1058,7 @@ fn per_event_attribution_does_not_scan_the_cohort() {
         WatchOutcome::Covered { fs_root, sub, .. } => (*fs_root, *sub),
         WatchOutcome::Widen { sub, .. } | WatchOutcome::Disjoint { sub, .. } => (1, *sub),
       };
-      s.commit_watch(&outcome, fs_root, &k);
+      s.commit_watch(&outcome, fs_root, &k).release();
       subs.push(sub);
     }
     COHORT_VISITS.with(|visits| visits.set(0));

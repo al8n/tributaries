@@ -108,7 +108,14 @@ pub enum FaultKind {
   /// The source was not permitted to inspect or watch the keyed object.
   PermissionDenied,
   /// A source resource budget is exhausted (for the fs source, the per-user
-  /// watch-instance limit).
+  /// watch-instance limit, and its bound on native streams still winding down).
+  ///
+  /// The one kind the umbrella treats as **retryable**: the request was declined
+  /// without touching anything, so the caller's existing coverage is intact and
+  /// the same call succeeds once the budget frees. A widen refused on it is
+  /// failed rather than unwound, and a re-arm refused on it during a failed
+  /// widen's restore is re-offered for a bounded while rather than read as a
+  /// dead root. Report it honestly, and only for a genuinely transient bound.
   Capacity,
   /// The source rejected the watch as conflicting with one it already holds. Never an
   /// overlap between this watcher's own subscriptions — those are subsumed away before

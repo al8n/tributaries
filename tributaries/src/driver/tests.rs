@@ -1,5 +1,5 @@
 use std::{
-  collections::{BTreeMap, HashMap, VecDeque},
+  collections::{HashMap, VecDeque},
   ffi::OsString,
   io,
   marker::PhantomData,
@@ -11,7 +11,7 @@ use std::{
 use agnostic_lite::tokio::TokioRuntime;
 use tributary_proto::{ChangeId, Epoch, Location};
 
-use super::{Owner, epoch::EpochLedger};
+use super::{Filters, Owner, ParkedRescans, epoch::EpochLedger};
 use crate::{
   coalesce::Coalescer,
   error::{FaultKind, SourceFault, UnwatchError, WatchError},
@@ -62,6 +62,78 @@ enum Call {
   /// the driver awaited (the set-cover design v3). Applied-before-return, mirroring the fs source's acked
   /// `Watcher::set_cover`.
   Grow(u32, Vec<Vec<OsString>>),
+}
+
+/// One call against the fake on its **SEAM ledger** — a second, independent ordered ledger
+/// alongside [`Call`], and unlike [`Call`] a TOTAL one: every method of the [`Source`] trait is
+/// recorded here, the synchronous read probes and the lifecycle seam included, so a cell asserting
+/// "not one `Source` call happened in this window" is making a claim about the whole trait rather than
+/// about a curated subset of it.
+///
+/// It is deliberately NOT folded into [`Call`]. Dozens of existing cells assert [`Call`] as an exact
+/// sequence, and many of them drive a teardown or a cookie reap, so adding
+/// [`BeginClose`](Self::BeginClose) or [`EndSync`](Self::EndSync) there would rewrite every one of
+/// those ledgers without changing a single behaviour they pin. This ledger is read only by the cells
+/// that care about the seam, which assert it in full — establishing traffic included — so nothing can
+/// be hidden by a window boundary; where a cell only needs the teardown, it splits the sequence at
+/// [`BeginClose`](Self::BeginClose) and asserts BOTH halves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SourceCall {
+  CanonicalizeKey(Vec<OsString>),
+  Arm(PathBuf),
+  Disarm(u32),
+  Grow(u32),
+  SetCover(u32),
+  Next,
+  Replace(u32),
+  BeginSync(u32),
+  EndSync(Vec<OsString>),
+  CancelSync(u32),
+  IsSyncArtifact(Vec<OsString>),
+  RootKey(u32),
+  /// The teardown seam's SYNCHRONOUS initiation. Its position in this ledger is the whole point: it
+  /// must precede every fire-and-forget request a teardown issues, and it must appear exactly once.
+  BeginClose,
+  /// The teardown seam's bounded wait, which stays LAST.
+  JoinClose,
+}
+
+/// A CLONEABLE handle on a [`FakeSource`]'s [`SourceCall`] ledger.
+///
+/// Shared rather than owned because every teardown cell must read the ledger AFTER the owner — and
+/// with it the source — has been moved into [`run`] and dropped: the seam is the last thing that
+/// happens, so a ledger reachable only through `h.owner.source` could never testify about it. A
+/// `Mutex` (not a `RefCell`) so the source stays `Sync` alongside `Send`, and an `AtomicUsize` for the
+/// lifetime `begin_close` count, which is kept apart from the call list because "exactly once" is a
+/// claim about the owner's whole life.
+#[derive(Clone)]
+struct SeamLedger {
+  calls: std::sync::Arc<std::sync::Mutex<Vec<SourceCall>>>,
+  begin_closes: std::sync::Arc<core::sync::atomic::AtomicUsize>,
+}
+
+impl SeamLedger {
+  fn new() -> Self {
+    Self {
+      calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+      begin_closes: std::sync::Arc::new(core::sync::atomic::AtomicUsize::new(0)),
+    }
+  }
+
+  fn note(&self, call: SourceCall) {
+    self.calls.lock().expect("seam ledger").push(call);
+  }
+
+  /// Every `Source` call this source has received, in order — the whole life of the source, no
+  /// window: a teardown claim is about where the seam sits among ALL of them.
+  fn calls(&self) -> Vec<SourceCall> {
+    self.calls.lock().expect("seam ledger").clone()
+  }
+
+  /// How many [`Source::begin_close`] calls the source received, ever.
+  fn begin_closes(&self) -> usize {
+    self.begin_closes.load(core::sync::atomic::Ordering::SeqCst)
+  }
 }
 
 /// One step of a scripted [`FakeSource::begin_sync`] poll: consumed one-per-poll of the
@@ -169,6 +241,89 @@ struct FakeSource {
   fs_delivered: Vec<Vec<OsString>>,
   /// How many of the next `arm` calls to fail, decremented on each failed arm.
   fail_arms: u32,
+  /// Arm-path → how many more arms of THAT path refuse with [`FaultKind::Capacity`] — the
+  /// source's retryable resource-budget refusal (the fs binding's watch-instance limit, and its
+  /// teardown-backlog bound), decremented per refusal. Keyed by path rather than counted globally
+  /// because the failed-widen restore's retry is per-root: a flat counter cannot express "refuse
+  /// each root's FIRST re-arm and admit its second", which is what proves the retry runs for every
+  /// root rather than only the one that happens to be reached first. Checked BEFORE
+  /// [`fail_arms`](Self::fail_arms), so a cell can drive a capacity-refused wider arm whose
+  /// restore re-arms then fail FATALLY.
+  capacity_refusals: HashMap<PathBuf, u32>,
+  /// Arm-paths whose `arm` NEVER resolves — a re-arm against a hung mount, the state the close race
+  /// exists for. The ORDERING probe a call count alone cannot make: a source call the restore must
+  /// not issue past a terminal outcome is one it CANNOT issue, because such a call has no close
+  /// signal left able to preempt it and never comes back. The request is recorded on the ledger
+  /// BEFORE it parks, so a violation shows up as both an extra call and a reconcile that never
+  /// completes — a count says "fewer", this says "none, and here is why it must be none".
+  wedge_arms: std::collections::HashSet<PathBuf>,
+  /// Arm-path → how many more arms of THAT path are served normally before every later one parks
+  /// FOREVER: the COUNTED [`wedge_arms`](Self::wedge_arms), for the mount that hangs partway through
+  /// a restore. A cell driving one reconcile by hand cannot install a wedge between two polls — the
+  /// reconcile future holds the owner borrowed for its whole life — so the mid-flight wedge has to be
+  /// scripted up front and armed by the call count instead. Decremented per served arm, counting from
+  /// wherever the cell installs it.
+  wedge_arms_after: HashMap<PathBuf, u32>,
+  /// Arm-paths whose `arm` PANICS rather than returning — a caller-provided extension point that
+  /// unwinds through the whole [`run`](super::run) future instead of answering it. The request is
+  /// recorded on the ledger BEFORE the unwind, so a cell can still say which call the owner was
+  /// inside when its task died. The counterpart to [`wedge_arms`](Self::wedge_arms): a wedged arm and
+  /// a panicking one are the two ways a `run` future terminates WITHOUT reaching its teardown tail
+  /// (dropped, and panicked), which is exactly the pair of paths the owner's destructor covers alone.
+  panic_arms: std::collections::HashSet<PathBuf>,
+  /// Every `arm` of these paths parks FOREVER holding a [`PanicsWhenCancelled`] guard, so the arm
+  /// future the owner's close race CANCELS unwinds out of its own destructor. The counterpart to
+  /// [`panic_arms`](Self::panic_arms), which unwinds out of the CALL: a `Source` call and the
+  /// cancellation of a `Source`-returned future are two different pieces of implementor code, and a
+  /// boundary proven against one has been proven against neither.
+  boom_on_cancel_arms: std::collections::HashSet<PathBuf>,
+  /// `replace` parks FOREVER holding a [`PanicsWhenCancelled`] guard — the retarget future the
+  /// in-place widen's close race cancels.
+  boom_on_cancel_replace: bool,
+  /// `grow` parks FOREVER holding a [`PanicsWhenCancelled`] guard — the coverage-widening future the
+  /// covered-outside watch's close race cancels.
+  boom_on_cancel_grow: bool,
+  /// `begin_sync` parks FOREVER holding a [`PanicsWhenCancelled`] guard — the cookie write
+  /// [`Owner::on_sync`]'s close race cancels.
+  boom_on_cancel_begin_sync: bool,
+  /// Whether [`Source::begin_close`] PANICS after recording itself — the teardown seam's own
+  /// extension point misbehaving, as opposed to a reap behind it. Recorded first, and the lifetime
+  /// counter bumped first, so a cell can still say the seam was entered exactly once across an
+  /// initiation that unwound.
+  panic_begin_close: bool,
+  /// Root handles whose [`Source::disarm`] PANICS. The release is recorded and APPLIED before the
+  /// unwind — the fake's modelled coverage is left exactly as a successful disarm leaves it — so a
+  /// cell's claim is about where the unwind travels and not about a source left half-torn-down.
+  panic_disarms: std::collections::HashSet<u32>,
+  /// Whether [`Source::cancel_sync`] PANICS after recording itself — the by-name reclamation of an
+  /// abandoned in-flight write misbehaving, which on the close-win arm runs while the owner holds a
+  /// CONSUMED [`CloseReply`]. Recorded and applied first, so the ledger still attributes the unwind
+  /// to a reclamation the source did perform.
+  panic_cancel_sync: bool,
+  /// How many of the next `replace` calls refuse with [`FaultKind::Capacity`] — the in-place
+  /// retarget's admission refusal (`ReplaceRootError::CleanupBacklog`), which the widen must
+  /// triage BEFORE it disarms anything.
+  refuse_replaces: u32,
+  /// `replace` calls served so far, counted only for
+  /// [`close_signal_after_replace`](Self::close_signal_after_replace) below.
+  replace_calls: u32,
+  /// A clone of the owner's close SENDER, CLOSED from inside the `replace` whose ordinal this names —
+  /// every [`Tributaries`](super::Tributaries) handle going away while THAT retarget is in flight —
+  /// after which the call PARKS FOREVER and never answers.
+  ///
+  /// It exists because a cell cannot retire the handles mid-retarget from outside: the reconcile future
+  /// holds the owner borrowed for its whole life, so nothing else runs between the two polls that
+  /// bracket the event (the same reason [`wedge_arms_after`](Self::wedge_arms_after) is counted rather
+  /// than installed between polls). Scripting it by call count reaches either of the widen's two
+  /// retargets — the initial one at ordinal 1, and the divergence ROLLBACK at ordinal 2.
+  ///
+  /// The park is the load-bearing half. Closing the signal and RETURNING would let the race resolve on
+  /// its own ready result, so `HandlesGone` would only ever be read off a signal that was already
+  /// closed before the retarget was issued — and the hazard is the opposite case: a `replace` the owner
+  /// POLLED and then dropped, which [`Source::replace`] does not abort, so the binding may still commit
+  /// the retarget this reconcile is abandoning. Parking leaves exactly that future in flight when the
+  /// close arm reads the signal gone on the next poll.
+  close_signal_during_replace: Option<(u32, async_channel::Sender<super::CloseReply>)>,
   /// How many of the next `grow` calls to fail with [`WatchError::CoverageIncomplete`],
   /// decremented on each failed grow — drives the grow-before-commit failure path (ratified R1:
   /// the watch fails, the record does not broaden). A failed grow applies NO coverage change
@@ -207,6 +362,12 @@ struct FakeSource {
   /// The next raw epoch a `replace`-emitted `Rescan` carries — bumped per replace so each commit's
   /// full-root Rescan is "epoch-bumped" like the real source's.
   next_replace_epoch: u64,
+  /// The TOTAL ordered [`SourceCall`] ledger, behind a [`SeamLedger`] handle so a cell can still read
+  /// it once the owner has been dropped (see [`SourceCall`] for why it is separate from
+  /// [`calls`](Self::calls), and [`SeamLedger`] for why it is shared). Interior mutability because
+  /// three `Source` methods — `canonicalize_key`, `is_sync_artifact`, `root_key` — take `&self`, and
+  /// leaving them out is exactly the curation this ledger exists to avoid.
+  seam: SeamLedger,
 }
 
 impl FakeSource {
@@ -226,6 +387,20 @@ impl FakeSource {
       sync_script: VecDeque::new(),
       fs_delivered: Vec::new(),
       fail_arms: 0,
+      capacity_refusals: HashMap::new(),
+      wedge_arms: std::collections::HashSet::new(),
+      wedge_arms_after: HashMap::new(),
+      panic_arms: std::collections::HashSet::new(),
+      boom_on_cancel_arms: std::collections::HashSet::new(),
+      boom_on_cancel_replace: false,
+      boom_on_cancel_grow: false,
+      boom_on_cancel_begin_sync: false,
+      panic_begin_close: false,
+      panic_disarms: std::collections::HashSet::new(),
+      panic_cancel_sync: false,
+      refuse_replaces: 0,
+      replace_calls: 0,
+      close_signal_during_replace: None,
       fail_grows: 0,
       dead_on_arrival_arms: 0,
       retarget: HashMap::new(),
@@ -234,7 +409,20 @@ impl FakeSource {
       actual_cover: HashMap::new(),
       pending_events: VecDeque::new(),
       next_replace_epoch: 1,
+      seam: SeamLedger::new(),
     }
+  }
+
+  /// Records one call on the TOTAL [`SourceCall`] ledger. Every `Source` method the fake implements
+  /// funnels through here, so the ledger cannot silently lose a method as the trait grows.
+  fn note(&self, call: SourceCall) {
+    self.seam.note(call);
+  }
+
+  /// A handle on this source's seam ledger that OUTLIVES it — taken before the owner is moved into
+  /// [`run`], read after the run future has completed and dropped both.
+  fn seam(&self) -> SeamLedger {
+    self.seam.clone()
   }
 
   /// Whether the fake's modelled ACTUAL kernel coverage for `handle` includes `key`: a
@@ -315,6 +503,96 @@ impl FakeSource {
     self.fail_arms = n;
   }
 
+  /// The next `n` arms of `path` refuse with [`FaultKind::Capacity`] — a resource budget
+  /// exhausted, the request declined without touching anything, retryable the moment it frees
+  /// (`EMFILE`/the inotify instance limit; the watcher's teardown backlog). Per-path so a cell can
+  /// script "refuse this root's first re-arm, admit its second" independently for each root.
+  fn refuse_capacity(&mut self, path: &str, n: u32) {
+    self.capacity_refusals.insert(PathBuf::from(path), n);
+  }
+
+  /// The next `n` `replace` calls refuse with [`FaultKind::Capacity`] — the in-place retarget
+  /// declined at admission, with the old root's coverage untouched.
+  fn refuse_next_replaces(&mut self, n: u32) {
+    self.refuse_replaces = n;
+  }
+
+  /// Every `arm` of `path` from now on parks FOREVER — the hung-mount arm. Set on the roots a
+  /// terminal restore outcome must never touch, so issuing one is not a countable slip but a
+  /// reconcile that cannot return.
+  fn wedge_arm(&mut self, path: &str) {
+    self.wedge_arms.insert(PathBuf::from(path));
+  }
+
+  /// The next `served` arms of `path` behave normally; every arm after them parks FOREVER. The
+  /// counted [`wedge_arm`](Self::wedge_arm), for a wedge that must appear PARTWAY through one
+  /// hand-polled reconcile — which cannot be installed between polls, the reconcile future holding
+  /// the owner borrowed throughout. Counting starts here, so an already-established root's own arm is
+  /// not among the `served`.
+  fn wedge_arms_after(&mut self, path: &str, served: u32) {
+    self.wedge_arms_after.insert(PathBuf::from(path), served);
+  }
+
+  /// Every `arm` of `path` from now on PANICS — the misbehaving extension point whose unwind leaves
+  /// the [`run`](super::run) future through its `poll`, so the owner is dropped by a task destruction
+  /// rather than by its own teardown tail.
+  fn panic_arm(&mut self, path: &str) {
+    self.panic_arms.insert(PathBuf::from(path));
+  }
+
+  /// Every `arm` of `path` from now on parks FOREVER, and unwinds when the arm future is
+  /// CANCELLED — the wedged mount whose abandoned request takes its caller's destructor with it.
+  fn boom_on_cancel_arm(&mut self, path: &str) {
+    self.boom_on_cancel_arms.insert(PathBuf::from(path));
+  }
+
+  /// `replace` parks FOREVER and unwinds when the retarget future is CANCELLED.
+  fn boom_on_cancel_replace(&mut self) {
+    self.boom_on_cancel_replace = true;
+  }
+
+  /// `grow` parks FOREVER and unwinds when the coverage-widening future is CANCELLED.
+  fn boom_on_cancel_grow(&mut self) {
+    self.boom_on_cancel_grow = true;
+  }
+
+  /// `begin_sync` parks FOREVER and unwinds when the cookie write is CANCELLED.
+  fn boom_on_cancel_begin_sync(&mut self) {
+    self.boom_on_cancel_begin_sync = true;
+  }
+
+  /// [`Source::begin_close`] PANICS from now on — the teardown seam's initiation as a misbehaving
+  /// extension point, which is the ONE `Source` call that stands ahead of every reap, the bounded
+  /// wait and the acknowledgement in [`run`](super::run)'s tail.
+  fn panic_begin_close(&mut self) {
+    self.panic_begin_close = true;
+  }
+
+  /// [`Source::disarm`] of `handle` PANICS from now on — the fire-and-forget release the teardown
+  /// tail's queued grant cleanup issues, misbehaving after it has already been applied.
+  fn panic_disarm(&mut self, handle: u32) {
+    self.panic_disarms.insert(handle);
+  }
+
+  /// [`Source::cancel_sync`] PANICS from now on — the by-name reclamation of an abandoned in-flight
+  /// [`Source::begin_sync`], misbehaving on the one arm that issues it while holding a consumed
+  /// [`CloseReply`].
+  fn panic_cancel_sync(&mut self) {
+    self.panic_cancel_sync = true;
+  }
+
+  /// CLOSE `closes` from inside the `during`-th `replace` (1-based) and then PARK that call forever —
+  /// every handle retired while that retarget is in flight. See
+  /// [`close_signal_during_replace`](Self::close_signal_during_replace) for why the fake has to be the
+  /// one to do it, and why it must park rather than return.
+  fn close_signal_during_replace(
+    &mut self,
+    during: u32,
+    closes: async_channel::Sender<super::CloseReply>,
+  ) {
+    self.close_signal_during_replace = Some((during, closes));
+  }
+
   /// Model the canonicalization TOCTOU: an `arm(planned)` reports `fs` as the handle's
   /// canonical key, diverging from what was planned.
   fn retarget(&mut self, planned: &str, fs: &str) {
@@ -348,6 +626,7 @@ impl Source<OsString> for FakeSource {
   type Handle = u32;
 
   fn canonicalize_key(&self, k: &[OsString]) -> Result<Vec<OsString>, WatchError> {
+    self.note(SourceCall::CanonicalizeKey(k.to_vec()));
     match self.canonicalize.get(k) {
       // Re-key onto the modelled canonical coordinate.
       Some(Some(canonical)) => Ok(canonical.clone()),
@@ -365,6 +644,44 @@ impl Source<OsString> for FakeSource {
   async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
     let path: PathBuf = key.iter().collect();
     self.calls.push(Call::Arm(path.clone()));
+    self.note(SourceCall::Arm(path.clone()));
+    // The hung mount, checked first because it composes with nothing: this arm never returns, so
+    // whatever the other injectors would have said is unreachable. The ledger already records the
+    // request, so a cell can still attribute the wedge to the exact call that must not have happened.
+    if self.wedge_arms.contains(&path) {
+      core::future::pending::<()>().await;
+    }
+    // The panicking extension point, checked beside the wedge because it composes with nothing
+    // either: this arm never answers, it unwinds. The ledger already holds the request.
+    if self.panic_arms.contains(&path) {
+      panic!("injected arm panic for {}", path.display());
+    }
+    // The wedge whose CANCELLATION unwinds: the guard is held across the park, so the owner's close
+    // race destroying this future runs it. Checked beside the two above because it composes with
+    // nothing either — this arm never answers, and the ledger already holds the request.
+    if self.boom_on_cancel_arms.contains(&path) {
+      let _boom = PanicsWhenCancelled;
+      core::future::pending::<()>().await;
+    }
+    // Its counted form: the mount that hangs only from this path's Nth arm onwards, so a cell can
+    // wedge a RETRIED re-arm while the reconcile future still holds the owner borrowed.
+    if let Some(served) = self.wedge_arms_after.get_mut(&path) {
+      if *served == 0 {
+        core::future::pending::<()>().await;
+      }
+      *served -= 1;
+    }
+    // The retryable refusal, checked FIRST so it composes with the fatal injector below: a
+    // resource budget is exhausted and nothing was touched, so the caller may ask again.
+    if let Some(remaining) = self.capacity_refusals.get_mut(&path)
+      && *remaining > 0
+    {
+      *remaining -= 1;
+      return Err(WatchError::source(
+        SourceFault::new(FaultKind::Capacity)
+          .with_source(io::Error::other("injected capacity refusal")),
+      ));
+    }
     if self.fail_arms > 0 {
       self.fail_arms -= 1;
       return Err(WatchError::source(
@@ -419,6 +736,7 @@ impl Source<OsString> for FakeSource {
   }
 
   fn is_sync_artifact(&self, key: &[OsString]) -> bool {
+    self.note(SourceCall::IsSyncArtifact(key.to_vec()));
     // The fake's reserved namespace carries BOTH of the grounds `FsSource::is_sync_artifact`
     // does, because an endpoint classifier proven against one of them has been proven
     // against neither: the grounds read different components of the key, so a suppression
@@ -448,28 +766,46 @@ impl Source<OsString> for FakeSource {
   }
 
   fn end_sync(&mut self, _handle: u32, cookie_key: &[OsString]) {
+    self.note(SourceCall::EndSync(cookie_key.to_vec()));
     self.ended_syncs.push(cookie_key.to_vec());
-    // The reserved leaf a source-misbehaviour cell writes: the reap is recorded and then
-    // unwinds carrying a payload whose own disposal unwinds too.
-    if cookie_key.last().and_then(|leaf| leaf.to_str()) == Some("cookie-boom") {
-      BOOM_COOKIES_REAPED.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
-      std::panic::panic_any(PanicsOnDrop);
+    // The reserved leaves a source-misbehaviour cell writes: the reap is recorded and then unwinds
+    // carrying a payload whose own disposal unwinds too. A leaf per REAPING SITE — the owner's
+    // destructor and `run`'s tail contain their reaps for different reasons and are asserted apart —
+    // so neither cell can move the other's ledger.
+    match cookie_key.last().and_then(|leaf| leaf.to_str()) {
+      Some("cookie-boom") => {
+        BOOM_COOKIES_REAPED.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        std::panic::panic_any(PanicsOnDrop);
+      }
+      Some("cookie-tail-boom") => std::panic::panic_any(PanicsOnDrop),
+      Some("cookie-cleanup-boom") => std::panic::panic_any(PanicsOnDrop),
+      Some("cookie-widen-boom") => std::panic::panic_any(PanicsOnDrop),
+      _ => {}
     }
   }
 
-  fn cancel_sync(&mut self, _handle: u32, token: SyncToken) {
+  fn cancel_sync(&mut self, handle: u32, token: SyncToken) {
+    self.note(SourceCall::CancelSync(handle));
     // The abandon-arm ledger: an `on_sync` timeout or close hands the token here, and only
     // this call can free a cookie whose delivered-but-unread write the owner never got a path
     // for. Overrides the seam's defaulted no-op.
     self.cancelled_syncs.push(token);
+    // Recorded AND applied before the unwind, exactly as `disarm` is: the reclamation happened and
+    // then the source blew up in its own bookkeeping, so a cell's claim stays about how far the
+    // unwind travels. The payload is hostile ([`PanicsOnDrop`]) because a boundary that catches this
+    // must dispose of the payload inside a boundary too.
+    if self.panic_cancel_sync {
+      std::panic::panic_any(PanicsOnDrop);
+    }
   }
 
   async fn begin_sync(
     &mut self,
-    _handle: u32,
+    handle: u32,
     dir_key: &[OsString],
     token: SyncToken,
   ) -> Result<Vec<OsString>, crate::error::SyncError> {
+    self.note(SourceCall::BeginSync(handle));
     if !self.supports_sync {
       return Err(crate::error::SyncError::Unsupported);
     }
@@ -478,6 +814,13 @@ impl Source<OsString> for FakeSource {
     // names EXACTLY the sync that began (the nonce is owner-random, so the token cannot be
     // reconstructed from outside).
     self.begun_token = Some(token);
+    // The write that parks and unwinds on CANCELLATION, for the reason `arm`'s counterpart gives.
+    // Placed AFTER the token is recorded, so the close arm's by-name reclamation still names exactly
+    // the sync that began.
+    if self.boom_on_cancel_begin_sync {
+      let _boom = PanicsWhenCancelled;
+      core::future::pending::<()>().await;
+    }
     // A deterministic cookie key under the sub's directory: `<dir>/cookie-<seq>`. The seq makes it
     // predictable so a test can deliver the matching artifact event; `is_sync_artifact` (a `cookie-`
     // leaf) both suppresses that event and resolves the barrier on it.
@@ -509,6 +852,34 @@ impl Source<OsString> for FakeSource {
     }
     let path: PathBuf = new_key.iter().collect();
     self.calls.push(Call::Replace(handle, path.clone()));
+    self.note(SourceCall::Replace(handle));
+    self.replace_calls += 1;
+    // Every handle retired while THIS retarget is in flight: close the signal, then never answer. The
+    // race's close arm reads the signal gone on its next poll and drops this polled-but-unfinished
+    // `replace` — the abandoned-retarget state the handles-gone reading has to be terminal for.
+    if self
+      .close_signal_during_replace
+      .as_ref()
+      .is_some_and(|(during, _)| *during == self.replace_calls)
+      && let Some((_, closes)) = self.close_signal_during_replace.take()
+    {
+      closes.close();
+      core::future::pending::<()>().await;
+    }
+    // The retarget that parks and unwinds on CANCELLATION, for the reason `arm`'s counterpart gives.
+    if self.boom_on_cancel_replace {
+      let _boom = PanicsWhenCancelled;
+      core::future::pending::<()>().await;
+    }
+    // An admission REFUSAL: the request was made and declined, so the call is on the ledger, and
+    // `replace` is atomic on failure — the old root's coverage is exactly as it was.
+    if self.refuse_replaces > 0 {
+      self.refuse_replaces -= 1;
+      return Err(WatchError::source(
+        SourceFault::new(FaultKind::Capacity)
+          .with_source(io::Error::other("injected replace capacity refusal")),
+      ));
+    }
     // The canonical key honors the retarget override (mirroring `arm`), so a
     // test can model an fs-side canonicalization race the `fs_path_preserves_plan`
     // guard must catch — the divergent-widen rollback path.
@@ -546,8 +917,17 @@ impl Source<OsString> for FakeSource {
     // subsequent arm never sees it. Immediate application trivially satisfies the
     // release-before-subsequent-arm ordering.
     self.calls.push(Call::Disarm(handle));
+    self.note(SourceCall::Disarm(handle));
     self.canonical.remove(&handle);
     self.live.remove(&handle);
+    // The reserved handles a source-misbehaviour cell arms: the release is recorded AND applied, and
+    // only then does the call unwind — so the fake models a source that did the work and then blew
+    // up in its own bookkeeping, keeping the cell's claim about the unwind's reach. The payload is
+    // hostile ([`PanicsOnDrop`]) because a boundary that catches this must dispose of the payload
+    // inside a boundary too.
+    if self.panic_disarms.contains(&handle) {
+      std::panic::panic_any(PanicsOnDrop);
+    }
   }
 
   fn set_cover(&mut self, handle: u32, retained: &[Vec<OsString>]) {
@@ -558,6 +938,7 @@ impl Source<OsString> for FakeSource {
     // QUEUES and drains opportunistically), the fake APPLIES immediately, so `actual_covers` reflects
     // the source's true coverage right away.
     self.calls.push(Call::SetCover(handle, retained.to_vec()));
+    self.note(SourceCall::SetCover(handle));
     self.apply_cover(handle, retained);
   }
 
@@ -571,7 +952,13 @@ impl Source<OsString> for FakeSource {
     // retained keys (the conservative model) — and reports the fs binding's degraded-fence error,
     // driving the grow-before-commit abort (R1).
     self.calls.push(Call::Grow(handle, retained.to_vec()));
+    self.note(SourceCall::Grow(handle));
     if self.grow_pending {
+      core::future::pending::<()>().await;
+    }
+    // The grow that parks and unwinds on CANCELLATION, for the reason `arm`'s counterpart gives.
+    if self.boom_on_cancel_grow {
+      let _boom = PanicsWhenCancelled;
       core::future::pending::<()>().await;
     }
     if self.fail_grows > 0 {
@@ -583,13 +970,38 @@ impl Source<OsString> for FakeSource {
   }
 
   async fn next(&mut self) -> Option<SourceEvent<OsString, u32>> {
+    self.note(SourceCall::Next);
     // Drain the handle's raw event stream (a `replace`-emitted full-root `Rescan`), or `None` once
     // empty — the source-drained signal every existing cell already relied on.
     self.pending_events.pop_front()
   }
 
   fn root_key(&self, handle: u32) -> Option<Vec<OsString>> {
+    self.note(SourceCall::RootKey(handle));
     self.canonical.get(&handle).cloned()
+  }
+
+  fn begin_close(&mut self) {
+    // Counted TWO ways, because the two answer different questions: the ordered seam ledger says WHERE
+    // this landed relative to every fire-and-forget request a teardown issues, and the counter says it
+    // landed exactly once — which a sequence containing one `BeginClose` also says, so the counter is
+    // the redundancy that survives a cell asserting only a prefix.
+    self
+      .seam
+      .begin_closes
+      .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    self.note(SourceCall::BeginClose);
+    // Counted and recorded BEFORE the unwind, so a cell can assert that an initiation which panicked
+    // still latched exactly one entry — the property the owner's `source_closing` latch owes, since
+    // it is set ahead of this call and the destructor's own entry reads it afterwards.
+    if self.panic_begin_close {
+      std::panic::panic_any(PanicsOnDrop);
+    }
+  }
+
+  async fn join_close(&mut self) -> Result<(), crate::error::SourceCloseError> {
+    self.note(SourceCall::JoinClose);
+    Ok(())
   }
 }
 
@@ -627,6 +1039,25 @@ fn modified_event(sub: Subscription, path: &str, epoch: u64) -> Event<OsString, 
 /// A legal [`panic_any`](std::panic::panic_any) payload whose own disposal unwinds — the only
 /// shape that makes a containment boundary's `Err` dangerous, and so the instrument every
 /// payload-disposal cell reaches for.
+/// A guard the fake holds ACROSS a park, so cancelling the future it is parked in runs its
+/// destructor.
+///
+/// The instrument for the one piece of implementor code no `Source`-call injector can reach: what
+/// runs when the owner wins a race against a `Source`-returned future and DESTROYS it. An `async fn`
+/// future keeps whatever its body parked with, so a guard placed before the park is exactly the
+/// caller `Drop` a cancellation is obliged to run — and the [`Source`] contract no more requires it
+/// to be panic-free than it requires a [`Filter`] predicate to be.
+///
+/// The payload is hostile ([`PanicsOnDrop`]) for the reason every other misbehaviour injector's is:
+/// a boundary that catches this must dispose of the payload inside a boundary too.
+struct PanicsWhenCancelled;
+
+impl Drop for PanicsWhenCancelled {
+  fn drop(&mut self) {
+    std::panic::panic_any(PanicsOnDrop);
+  }
+}
+
 struct PanicsOnDrop;
 
 impl Drop for PanicsOnDrop {
@@ -728,33 +1159,51 @@ impl Harness {
   }
 
   fn with_coalescer(coalescer: Option<Coalescer<OsString, ()>>) -> Self {
-    Self::build(coalescer, None)
+    Self::build(coalescer, None, None)
   }
 
   /// A harness whose owner→consumer event channel is **bounded** at `capacity` — for the
   /// backpressure tests, where a stalled consumer fills the channel and the owner sheds the
   /// affected subscription to a parked dominating `Rescan` (design backpressure doc).
   fn bounded(capacity: usize) -> Self {
-    Self::build(None, Some(capacity))
+    Self::build(None, Some(capacity), None)
   }
 
-  fn build(coalescer: Option<Coalescer<OsString, ()>>, capacity: Option<usize>) -> Self {
+  /// A harness whose event channel is bounded at `capacity` AND whose command mailbox is bounded
+  /// at `commands` — the real watcher's shape, where
+  /// [`command_capacity`](TributariesOptions::command_capacity) is what bounds a queued backlog.
+  /// The other constructors leave the mailbox unbounded because they drive the owner directly and
+  /// never queue one.
+  fn bounded_mailbox(capacity: usize, commands: usize) -> Self {
+    Self::build(None, Some(capacity), Some(commands))
+  }
+
+  fn build(
+    coalescer: Option<Coalescer<OsString, ()>>,
+    capacity: Option<usize>,
+    command_capacity: Option<usize>,
+  ) -> Self {
     let (event_tx, event_rx) = match capacity {
       Some(cap) => async_channel::bounded(cap),
       None => async_channel::unbounded(),
     };
-    let (command_tx, command_rx) = async_channel::unbounded();
+    let (command_tx, command_rx) = match command_capacity {
+      Some(cap) => async_channel::bounded(cap),
+      None => async_channel::unbounded(),
+    };
     let (sync_command_tx, sync_command_rx) = async_channel::unbounded::<super::SyncRequest>();
     let (close_tx, close_rx) = async_channel::bounded(1);
     let (cleanup_tx, cleanup_rx) = async_channel::unbounded();
     let owner = Owner {
       source: FakeSource::new(),
+      source_closing: false,
+      deferred: crate::subsume::Salvage::new(),
       subsumer: Subsumer::new(),
       epochs: EpochLedger::new(),
-      filters: HashMap::new(),
+      filters: Filters::new(),
       filter_payload_forgotten: false,
-      needs_rescan: BTreeMap::new(),
-      suppressed_rescan: BTreeMap::new(),
+      needs_rescan: ParkedRescans::new(),
+      suppressed_rescan: ParkedRescans::new(),
       unclaimed: std::collections::HashSet::new(),
       flush_cursor: None,
       #[cfg(test)]
@@ -802,7 +1251,7 @@ impl Harness {
   ) -> Result<Subscription, WatchError> {
     self
       .owner
-      .reconcile_watch(&key(path), (), options)
+      .reconcile_watch(&key(path), &(), options)
       .await
       .map_err(|stop| match stop {
         super::ReconcileStop::Failed(err) => err,
@@ -811,6 +1260,11 @@ impl Harness {
         super::ReconcileStop::CloseRequested(_) => {
           unreachable!("no close is sent to a directly-driven harness owner")
         }
+        // A cell MAY close the signal (the last handle dropping) and then drive a reconcile through
+        // this helper, so this one is reachable: report exactly what a real `watch()` caller reads
+        // off the reply the owner drops for it. Cells asserting on the teardown outcome ITSELF call
+        // `reconcile_watch` directly, where the [`super::ReconcileStop`] is not yet flattened.
+        super::ReconcileStop::HandlesGone => WatchError::Closed,
       })
   }
 
@@ -2118,6 +2572,2524 @@ async fn widen_arm_failure_retires_root_that_cannot_rearm() {
     by_sub.get(&sc).copied(),
     Some(Epoch::new(3)),
     "the restored sc's Rescan strictly dominates its high-water of 2"
+  );
+}
+
+/// The failed-widen restore must not read a **capacity refusal** as death. A widen releases its
+/// subsumed roots BEFORE arming the wider one, so any resource bound hit inside that window — the
+/// fs binding's watch-instance limit needs no wedged mount at all — arrives at the restore's
+/// re-arms, where "the root is genuinely dead" retired *healthy established* roots that a caller
+/// did nothing wrong to lose. A refusal means *ask again shortly*, so the restore asks again,
+/// paced, inside its budget.
+///
+/// Both roots' first re-arm is refused and their second admitted, so the retry is proven for each
+/// root rather than only the first one reached. The clock is paused: the pacing is a fact of the
+/// cell, not a race.
+///
+/// FAIL-ON-REVERT: restore `Err(ReconcileStop::Failed(_)) => retire_root_with_terminal_rescan(old)`
+/// as the sole failure arm (retire on EVERY kind) and each root is retired on its first refusal —
+/// the call ledger loses its second attempt per root, both keys leave the view, and the terminal
+/// `Rescan`s this cell asserts are absent are parked instead.
+#[tokio::test(start_paused = true)]
+async fn a_capacity_refused_widen_restore_retries_rather_than_retiring_healthy_roots() {
+  let mut h = Harness::new();
+
+  let sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b"); // handle 1
+  let sc = h.watch("/a/c", Interest::all()).await.expect("watch /a/c"); // handle 2
+  h.owner.epochs.stamp(sb, Epoch::new(4));
+  h.owner.epochs.stamp(sc, Epoch::new(2));
+
+  // The budget is exhausted for the wider arm and for each root's FIRST re-arm, then frees —
+  // exactly the shape of an instance-limit blip that the widen's own releases are already curing.
+  h.owner.source.refuse_capacity("/a", 1);
+  h.owner.source.refuse_capacity("/a/b", 1);
+  h.owner.source.refuse_capacity("/a/c", 1);
+
+  let started = tokio::time::Instant::now();
+  let result = h.watch("/a", Interest::all()).await;
+  let elapsed = started.elapsed();
+  assert!(
+    result.is_err(),
+    "the refused wider arm still fails the newcomer's watch"
+  );
+
+  assert_eq!(
+    h.owner.source.calls(),
+    vec![
+      Call::Arm(PathBuf::from("/a/b")),
+      Call::Arm(PathBuf::from("/a/c")),
+      Call::Disarm(1),
+      Call::Disarm(2),
+      Call::Arm(PathBuf::from("/a")),
+      Call::Arm(PathBuf::from("/a/b")),
+      Call::Arm(PathBuf::from("/a/b")),
+      Call::Arm(PathBuf::from("/a/c")),
+      Call::Arm(PathBuf::from("/a/c")),
+    ],
+    "every refused re-arm is OFFERED AGAIN, per root, instead of being read as a dead root"
+  );
+  assert!(
+    elapsed >= 2 * super::RESTORE_RETRY_PACE,
+    "the two retries WAITED between attempts — paced, never a hot spin against a busy source: \
+     {elapsed:?}"
+  );
+
+  // Both subsumed subscriptions are live-and-covered again, on fresh live handles.
+  let view = h.owner.subsumer.view();
+  assert!(
+    view.is_watched(&key("/a/b")) && view.is_watched(&key("/a/c")),
+    "neither healthy root was retired for a refusal that cleared"
+  );
+  let roots: Vec<(PathBuf, u32)> = h
+    .owner
+    .subsumer
+    .roots()
+    .map(|(k, handle)| (PathBuf::from_iter(k), handle))
+    .collect();
+  assert_eq!(
+    roots.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
+    vec![PathBuf::from("/a/b"), PathBuf::from("/a/c")],
+    "both roots are back, re-armed"
+  );
+  for (path, handle) in &roots {
+    assert!(
+      h.owner.source.root_key(*handle).is_some(),
+      "the retried root {path:?} is on a LIVE handle"
+    );
+  }
+  assert!(
+    h.owner.filters.contains_key(&sb) && h.owner.filters.contains_key(&sc),
+    "no per-subscription state was freed: nothing retired"
+  );
+  assert_eq!(
+    h.owner.subsumer.pending_len(),
+    0,
+    "the aborted widen leaks no pending reservation"
+  );
+
+  // No TERMINAL Rescan is owed to anyone. `retire_root_with_terminal_rescan` parks its terminal
+  // Rescan straight into `needs_rescan`/`suppressed_rescan` before freeing state, and this
+  // harness's event channel is unbounded (so no ordinary emit can park) — an empty pair is
+  // therefore exactly "no root was retired".
+  assert!(
+    h.owner.needs_rescan.is_empty() && h.owner.suppressed_rescan.is_empty(),
+    "no terminal coverage-loss Rescan was parked for either root"
+  );
+  // What the subscribers DO get is the ordinary restore re-point Rescan, as on any failed widen.
+  let by_sub: HashMap<Subscription, Epoch> = h
+    .drain()
+    .iter()
+    .map(|ev| {
+      assert!(ev.is_rescan(), "every restore signal is a Rescan");
+      (ev.subscription(), ev.epoch())
+    })
+    .collect();
+  assert_eq!(
+    by_sub.get(&sb).copied(),
+    Some(Epoch::new(5)),
+    "sb's restore Rescan strictly dominates its high-water of 4"
+  );
+  assert_eq!(
+    by_sub.get(&sc).copied(),
+    Some(Epoch::new(3)),
+    "sc's restore Rescan strictly dominates its high-water of 2"
+  );
+}
+
+/// The other half of the split, and the one that keeps it from trading one defect for another: a
+/// re-arm that fails for a reason no wait can cure is still retired on its FIRST refusal, exactly
+/// as before the retry existed. The verdict is taken from the RE-ARM's own kind, so a widen whose
+/// wider arm was refused on capacity buys its subsumed roots nothing when their own re-arms are
+/// fatal.
+///
+/// FAIL-ON-REVERT: widen the retry from `is_capacity_refusal(&err)` to every `Failed` (v1's
+/// define-the-transient-set-by-complement) and these fatal re-arms are re-offered until the budget
+/// expires — the call ledger grows a pace's worth of attempts per root and the cell spends
+/// `RESTORE_RETRY_BUDGET` reaching the same retirement.
+#[tokio::test]
+async fn a_fatal_re_arm_is_retired_on_its_first_refusal_however_the_wider_arm_failed() {
+  let mut h = Harness::new();
+
+  let sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b");
+  let sc = h.watch("/a/c", Interest::all()).await.expect("watch /a/c");
+  h.owner.epochs.stamp(sb, Epoch::new(4));
+  h.owner.epochs.stamp(sc, Epoch::new(2));
+
+  // The wider arm is refused on the RETRYABLE kind; both re-arms then fail fatally, and keep
+  // failing — so a retry that fired here would spend the whole budget before retiring anyway.
+  h.owner.source.refuse_capacity("/a", 1);
+  h.owner.source.fail_next_arms(u32::MAX);
+
+  let started = std::time::Instant::now();
+  let result = h.watch("/a", Interest::all()).await;
+  let elapsed = started.elapsed();
+  assert!(result.is_err(), "the failed widen surfaces the error");
+
+  assert_eq!(
+    h.owner.source.calls(),
+    vec![
+      Call::Arm(PathBuf::from("/a/b")),
+      Call::Arm(PathBuf::from("/a/c")),
+      Call::Disarm(1),
+      Call::Disarm(2),
+      Call::Arm(PathBuf::from("/a")),
+      Call::Arm(PathBuf::from("/a/b")),
+      Call::Arm(PathBuf::from("/a/c")),
+    ],
+    "exactly ONE re-arm attempt per root: a fatal refusal is never re-offered"
+  );
+  assert!(
+    elapsed < super::RESTORE_RETRY_BUDGET / 2,
+    "…and no budget is spent waiting on it: {elapsed:?}"
+  );
+
+  // Both roots retired, exactly as they always were: out of the view, per-sub state freed, and a
+  // durable dominating terminal Rescan parked for each subscriber before that state went away.
+  let view = h.owner.subsumer.view();
+  assert!(
+    !view.is_watched(&key("/a/b")) && !view.is_watched(&key("/a/c")),
+    "a genuinely dead root still leaves the view"
+  );
+  assert_eq!(
+    h.owner.subsumer.roots().count(),
+    0,
+    "neither root survives a fatal re-arm"
+  );
+  assert!(
+    !h.owner.filters.contains_key(&sb) && !h.owner.filters.contains_key(&sc),
+    "each retired root's subscriber state is freed (I4)"
+  );
+
+  h.owner.flush_pending_rescans();
+  let by_sub: HashMap<Subscription, Epoch> = h
+    .drain()
+    .iter()
+    .map(|ev| {
+      assert!(ev.is_rescan(), "every retirement signal is a Rescan");
+      (ev.subscription(), ev.epoch())
+    })
+    .collect();
+  assert_eq!(
+    by_sub.get(&sb).copied(),
+    Some(Epoch::new(5)),
+    "sb's terminal Rescan strictly dominates its high-water of 4"
+  );
+  assert_eq!(
+    by_sub.get(&sc).copied(),
+    Some(Epoch::new(3)),
+    "sc's terminal Rescan strictly dominates its high-water of 2"
+  );
+}
+
+/// The in-place retarget's triage: a widen subsuming exactly ONE root asks the source to retarget
+/// it, and a refusal there is answered where it lands — BEFORE the first disarm. `replace` is
+/// atomic on failure and nothing has been released yet, so failing the watch is refusal-before-
+/// mutation: no teardown, no coverage gap, no `Rescan` owed to anyone, and the caller retries when
+/// it likes. Falling through instead would release this healthy root and then ask the very budget
+/// that just refused for a fresh stream.
+///
+/// FAIL-ON-REVERT: restore `ReplaceStep::Replaced(Err(_)) => None` as the only replace-error arm
+/// (triaging nothing) and the widen falls into release-and-rearm — `Disarm(1)` and a wider
+/// `Arm(/a)` appear on the ledger, the sole root's coverage is dropped mid-flight, and the watch
+/// no longer fails at all.
+#[tokio::test]
+async fn a_retarget_refused_on_capacity_fails_the_widen_before_anything_is_disarmed() {
+  let mut h = Harness::new();
+  h.owner.source.supports_replace = true;
+
+  let sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b"); // handle 1
+  h.owner.epochs.stamp(sb, Epoch::new(4));
+  h.owner.source.refuse_next_replaces(1);
+
+  let err = h
+    .watch("/a", Interest::all())
+    .await
+    .expect_err("a refused retarget fails the watch outright");
+  assert_eq!(
+    err.fault().map(SourceFault::kind),
+    Some(FaultKind::Capacity),
+    "the caller is told it was a retryable budget refusal: {err:?}"
+  );
+
+  assert_eq!(
+    h.owner.source.calls(),
+    vec![
+      Call::Arm(PathBuf::from("/a/b")),
+      Call::Replace(1, PathBuf::from("/a")),
+    ],
+    "NOTHING was disarmed: no release, no wider arm, no rollback — the refusal is answered first"
+  );
+  assert!(
+    h.owner.subsumer.view().is_watched(&key("/a/b")),
+    "the sole subsumed root keeps reading watched"
+  );
+  assert!(
+    h.owner.source.root_key(1).is_some(),
+    "…and its source watch never stopped — the handle is untouched"
+  );
+  let roots: Vec<(PathBuf, u32)> = h
+    .owner
+    .subsumer
+    .roots()
+    .map(|(k, handle)| (PathBuf::from_iter(k), handle))
+    .collect();
+  assert_eq!(
+    roots,
+    vec![(PathBuf::from("/a/b"), 1)],
+    "the root is still recorded at its own key, on its ORIGINAL handle"
+  );
+  assert!(
+    h.owner.filters.contains_key(&sb),
+    "the subscriber's state is untouched"
+  );
+  assert_eq!(
+    h.owner.subsumer.pending_len(),
+    0,
+    "the abandoned widen leaks no pending reservation"
+  );
+  assert!(
+    h.drain().is_empty() && h.owner.needs_rescan.is_empty() && h.owner.suppressed_rescan.is_empty(),
+    "nothing was lost, so nothing is owed: not one Rescan, delivered or parked"
+  );
+}
+
+/// A close the widen's own arm ALREADY CONSUMED is TERMINAL for the unwind, not merely a posture to
+/// run it under. The wider arm can lose to the close race, and that caller's reply is then held in
+/// hand — the close signal is bounded at one slot and drains as it is consumed, so nothing is left
+/// to preempt a re-arm started in that state and every attempt would be added straight onto that
+/// caller's `close()` latency, whose bound is the contract every other owner await is raced to keep.
+///
+/// So the roots are retired synchronously and the reply handed straight back: NO re-arm is issued at
+/// all. The refusal staged here never clears, so a restore that ran would burn its whole budget; the
+/// cell proves the negative by the exact call ledger (not one re-arm after the disarms), by the
+/// elapsed time, and by acking the returned reply — `close()` is answered rather than left waiting.
+///
+/// FAIL-ON-REVERT: run the restore in a "no retry" posture instead (a zero budget: one attempt per
+/// root, then retire) and the ledger grows a re-arm per root — a source call issued after the reply
+/// was consumed, with nothing left able to interrupt it. Revert further, to a bounded budget at this
+/// call site, and each root is re-offered for the full `RESTORE_RETRY_BUDGET` while the close reply
+/// sits unsent, so the elapsed assertion fails too.
+#[tokio::test]
+async fn a_widen_holding_a_consumed_close_reply_retires_without_retrying() {
+  let mut h = Harness::new();
+
+  let sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b"); // handle 1
+  let sc = h.watch("/a/c", Interest::all()).await.expect("watch /a/c"); // handle 2
+  h.owner.epochs.stamp(sb, Epoch::new(4));
+  h.owner.epochs.stamp(sc, Epoch::new(2));
+
+  // Every re-arm the restore could issue is refused on the RETRYABLE kind, and it never clears: the
+  // only thing that can keep the restore from running is the close reply the widen is holding.
+  h.owner.source.refuse_capacity("/a/b", u32::MAX);
+  h.owner.source.refuse_capacity("/a/c", u32::MAX);
+
+  // A close is already queued on the dedicated signal, exactly as `Tributaries::close` leaves it.
+  let (reply, response) = futures_channel::oneshot::channel();
+  h.closes.try_send(reply).expect("the close signal accepts");
+
+  let started = std::time::Instant::now();
+  let stop = h
+    .owner
+    .reconcile_watch(
+      &key("/a"),
+      &(),
+      WatchOptions::new().with_interest(Interest::all()),
+    )
+    .await
+    .expect_err("the consumed close abandons the widen");
+  let elapsed = started.elapsed();
+
+  let super::ReconcileStop::CloseRequested(close_reply) = stop else {
+    panic!("the consumed close reply rides back out of the reconcile: {stop:?}");
+  };
+  assert_eq!(
+    h.owner.source.calls(),
+    vec![
+      Call::Arm(PathBuf::from("/a/b")),
+      Call::Arm(PathBuf::from("/a/c")),
+      Call::Disarm(1),
+      Call::Disarm(2),
+      // The ledger ENDS at the disarms. No `Arm(/a)`: the queued close wins the choke point's
+      // biased race before the wider arm is ever issued. And no re-arm either: the consumed reply is
+      // terminal, so both roots are retired synchronously.
+    ],
+    "a held close reply means NO further source call — not one re-arm on `close()`'s clock"
+  );
+  assert!(
+    elapsed < super::RESTORE_RETRY_BUDGET / 2,
+    "the reconcile returns promptly rather than waiting out a retry budget: {elapsed:?}"
+  );
+
+  // `close()` completes: ack the reply exactly as the run loop's teardown does, and the caller
+  // that was waiting on it is answered.
+  close_reply.send(Ok(())).expect("the close reply is live");
+  assert!(
+    matches!(response.await, Ok(Ok(()))),
+    "the close() caller is answered, never left pending behind the widen"
+  );
+
+  // Both roots retired, so nothing is left recorded-live-but-disarmed (I3) for the teardown to
+  // find — the same close-path behaviour as before the retry existed.
+  let view = h.owner.subsumer.view();
+  assert!(
+    !view.is_watched(&key("/a/b")) && !view.is_watched(&key("/a/c")),
+    "no subscription is left published-watched on a released handle"
+  );
+  assert!(
+    h.owner.needs_rescan.contains_key(&sb) && h.owner.needs_rescan.contains_key(&sc),
+    "each retirement still parked its durable dominating terminal Rescan"
+  );
+}
+
+/// Every handle dropping must END the restore, not be waited out by it. When the last handle goes,
+/// the close signal closes with the command mailbox, so nothing will ever answer a close race —
+/// and the run loop is where that closed mailbox is READ and teardown begins. A restore that keeps
+/// arming never returns there: it spins its whole budget against a source refusing for its own
+/// reasons while the watcher is already, unrecoverably, on its way out — and its re-arms run through
+/// [`Owner::arm`]'s closed-channel path, which falls through to an UN-RACED `Source::arm` nothing can
+/// interrupt.
+///
+/// The signal is already closed when this restore begins, so its per-root probe reports the terminal
+/// condition before the FIRST re-arm and every root is retired without one. The refusal staged here
+/// never clears, so nothing else could have ended the restore; the cell proves the negative by the
+/// exact call ledger (not one re-arm) and by the elapsed time.
+///
+/// FAIL-ON-REVERT: drop the per-root probe (leave handles-gone to be discovered at a pace) and the
+/// ledger grows a re-arm for every root. Fold the terminal into an ordinary per-root failure on top
+/// of that — the outer loop carrying on — and the later roots are armed too. Fold it into "the pace
+/// elapsed" instead and the pace resolves INSTANTLY on the closed channel every time, so the restore
+/// hot-spins the full `RESTORE_RETRY_BUDGET` and the elapsed assertion fails as well.
+#[tokio::test]
+async fn every_handle_gone_ends_the_restore_retry_instead_of_spinning_out_its_budget() {
+  let mut h = Harness::new();
+
+  let sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b"); // handle 1
+  let sc = h.watch("/a/c", Interest::all()).await.expect("watch /a/c"); // handle 2
+  h.owner.epochs.stamp(sb, Epoch::new(4));
+  h.owner.epochs.stamp(sc, Epoch::new(2));
+
+  // A refusal that never clears: only a terminal outcome can end the restore.
+  h.owner.source.refuse_capacity("/a", u32::MAX);
+  h.owner.source.refuse_capacity("/a/b", u32::MAX);
+  h.owner.source.refuse_capacity("/a/c", u32::MAX);
+  // The last handle drops: `Tributaries`' close signal closes in lockstep with the command
+  // mailbox the run loop takes its teardown signal from.
+  h.closes.close();
+
+  let started = std::time::Instant::now();
+  let result = h.watch("/a", Interest::all()).await;
+  let elapsed = started.elapsed();
+  assert!(result.is_err(), "the refused widen still fails the watch");
+
+  assert_eq!(
+    h.owner.source.calls(),
+    vec![
+      Call::Arm(PathBuf::from("/a/b")),
+      Call::Arm(PathBuf::from("/a/c")),
+      Call::Disarm(1),
+      Call::Disarm(2),
+      // The wider arm still reaches the source: `Owner::arm`'s closed-channel path re-issues it
+      // un-raced, which is precisely why the restore must not keep arming past this point. It does
+      // not — the ledger ends here, with no re-arm for either root.
+      Call::Arm(PathBuf::from("/a")),
+    ],
+    "the closed signal is terminal BEFORE the first re-arm, and terminal for every root still to \
+     come"
+  );
+  assert!(
+    elapsed < super::RESTORE_RETRY_BUDGET / 2,
+    "the reconcile returns to the loop — where the closed mailbox drives teardown — instead of \
+     spinning: {elapsed:?}"
+  );
+
+  // Terminal for the roots too: neither is left recorded-live-but-disarmed for the teardown.
+  let view = h.owner.subsumer.view();
+  assert!(
+    !view.is_watched(&key("/a/b")) && !view.is_watched(&key("/a/c")),
+    "no subscription is left published-watched on a released handle"
+  );
+  assert!(
+    h.owner.needs_rescan.contains_key(&sb) && h.owner.needs_rescan.contains_key(&sc),
+    "each retirement still parked its durable dominating terminal Rescan"
+  );
+}
+
+/// ORDERING, not effect. A consumed close reply must be checked BEFORE the re-arm, and the two are
+/// not the same claim: a check that runs after it still issues the call, and that call is the
+/// hazard. Nothing can preempt it — the reply came off a one-slot signal that is empty again — so a
+/// source hung on a dead mount holds the [`run`] loop with the reply undelivered, exactly the wedge
+/// every owner await is raced to avoid.
+///
+/// So this cell does not count attempts, it makes them fatal: every subsumed root's arm is WEDGED,
+/// and the reconcile is deadlined. Issue one re-arm and it never returns. THREE roots, because the
+/// claim is about all the remaining ones, not just the next.
+///
+/// FAIL-ON-REVERT: check the held reply anywhere after `self.arm` — a "no retry" posture threaded
+/// INTO the restore, per-root or otherwise — and the first re-arm parks forever: the timeout below
+/// fires, and the ledger shows the `Arm` that must not have been issued.
+#[tokio::test(start_paused = true)]
+async fn a_consumed_close_reply_ends_the_unwind_before_one_more_source_call() {
+  let mut h = Harness::new();
+
+  let sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b"); // handle 1
+  let sc = h.watch("/a/c", Interest::all()).await.expect("watch /a/c"); // handle 2
+  let sd = h.watch("/a/d", Interest::all()).await.expect("watch /a/d"); // handle 3
+  h.owner.epochs.stamp(sb, Epoch::new(4));
+  h.owner.epochs.stamp(sc, Epoch::new(2));
+  h.owner.epochs.stamp(sd, Epoch::new(6));
+
+  // Each subsumed root's re-arm would hang forever — the mount the close race exists for. Set AFTER
+  // the watches above, which needed those same arms to succeed.
+  h.owner.source.wedge_arm("/a/b");
+  h.owner.source.wedge_arm("/a/c");
+  h.owner.source.wedge_arm("/a/d");
+
+  // A close is already queued on the dedicated signal, exactly as `Tributaries::close` leaves it, so
+  // the wider arm's biased race consumes it and the reconcile carries the reply into its unwind.
+  let (reply, response) = futures_channel::oneshot::channel();
+  h.closes.try_send(reply).expect("the close signal accepts");
+
+  let stop = tokio::time::timeout(
+    Duration::from_secs(30),
+    h.owner.reconcile_watch(
+      &key("/a"),
+      &(),
+      WatchOptions::new().with_interest(Interest::all()),
+    ),
+  )
+  .await
+  .expect(
+    "the unwind returns without issuing a re-arm; a re-arm here would park on the wedged mount \
+     forever, with the consumed reply undelivered and no close left to interrupt it",
+  )
+  .expect_err("the consumed close abandons the widen");
+
+  let super::ReconcileStop::CloseRequested(close_reply) = stop else {
+    panic!("the consumed close reply rides back out of the reconcile: {stop:?}");
+  };
+  // The zero-ARM ledger: three establishing arms, three disarms, and no arm after them. Scoped to what
+  // [`Call`] records (arm/disarm/replace/cover) — the TOTAL "no `Source` call of any kind in this
+  // window" claim is the seam cells' ([`SourceCall`]), because the retirement this exit runs reaches
+  // `Source::end_sync` for a root with a pending barrier and no arm/disarm ledger can see that.
+  assert_eq!(
+    h.owner.source.calls(),
+    vec![
+      Call::Arm(PathBuf::from("/a/b")),
+      Call::Arm(PathBuf::from("/a/c")),
+      Call::Arm(PathBuf::from("/a/d")),
+      Call::Disarm(1),
+      Call::Disarm(2),
+      Call::Disarm(3),
+    ],
+    "not one source call after the reply was consumed — zero re-arms, for every remaining root"
+  );
+  assert_eq!(
+    h.owner
+      .source
+      .calls()
+      .iter()
+      .skip(6)
+      .filter(|call| matches!(call, Call::Arm(_)))
+      .count(),
+    0,
+    "stated as the ledger claim it is: zero arms once the reply is held"
+  );
+
+  // The reply is the one that came in, and it is live: ack it as the run loop's teardown does.
+  close_reply.send(Ok(())).expect("the close reply is live");
+  assert!(
+    matches!(response.await, Ok(Ok(()))),
+    "the close() caller is answered, never left pending behind a wedged re-arm"
+  );
+
+  // All three roots retired, so nothing is left recorded-live-but-disarmed (I3) for the teardown.
+  let view = h.owner.subsumer.view();
+  assert!(
+    !view.is_watched(&key("/a/b"))
+      && !view.is_watched(&key("/a/c"))
+      && !view.is_watched(&key("/a/d")),
+    "no subscription is left published-watched on a released handle"
+  );
+  assert!(
+    h.owner.needs_rescan.contains_key(&sb)
+      && h.owner.needs_rescan.contains_key(&sc)
+      && h.owner.needs_rescan.contains_key(&sd),
+    "each retirement still parked its durable dominating terminal Rescan"
+  );
+}
+
+/// FIRST CLOSE WINS, across a widen unwind. `Tributaries::close` AWAITS its send on the one-slot
+/// signal, so a second caller's reply lands the instant the first is consumed — mid-unwind. If the
+/// unwind then issues a re-arm, that re-arm's own close race can consume the SECOND reply and hand it
+/// back as the reconcile's verdict, where it is preferred over the error carrying the first: the
+/// first caller's `close()` is left waiting on a reply that was silently dropped, while a caller who
+/// arrived later is answered.
+///
+/// Staged with both callers real: `response` waits on the first, `late` on the second. The
+/// assertion is about WHICH reply comes back — acking the returned one must satisfy the first caller
+/// and only the first. The subsumed roots' arms are WEDGED, which is what makes the second reply
+/// reachable at all under a reverted ordering: a re-arm issued while holding the first reply parks,
+/// the queued sender lands its reply into the slot that re-arm just left empty, and the re-arm's own
+/// close race consumes it.
+///
+/// FAIL-ON-REVERT: let the unwind re-arm while holding the first reply (thread it in as a posture
+/// rather than treating it as terminal) and that re-arm parks on the wedge, takes the SECOND reply,
+/// and returns it — the caller prefers it over the error carrying the first, so `response` resolves
+/// `Err` (the first reply was dropped) and the `late` assertion inverts.
+#[tokio::test(start_paused = true)]
+async fn a_second_close_during_a_widen_unwind_never_displaces_the_first_reply() {
+  let mut h = Harness::new();
+
+  let sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b"); // handle 1
+  let sc = h.watch("/a/c", Interest::all()).await.expect("watch /a/c"); // handle 2
+
+  // A re-arm issued past the held reply would park here — the hung mount that gives the second close
+  // its window, and that nothing is left to interrupt.
+  h.owner.source.wedge_arm("/a/b");
+  h.owner.source.wedge_arm("/a/c");
+
+  // Caller ONE closes: its reply takes the signal's only slot.
+  let (first, response) = futures_channel::oneshot::channel();
+  h.closes.try_send(first).expect("the close signal accepts");
+  // Caller TWO closes while the first is still queued: `Tributaries::close` awaits the send, so this
+  // parks on the full slot and lands the moment the first reply is consumed.
+  let (second, late) = futures_channel::oneshot::channel();
+  let queueing = {
+    let closes = h.closes.clone();
+    tokio::spawn(async move { closes.send(second).await })
+  };
+
+  let stop = tokio::time::timeout(
+    Duration::from_secs(30),
+    h.owner.reconcile_watch(
+      &key("/a"),
+      &(),
+      WatchOptions::new().with_interest(Interest::all()),
+    ),
+  )
+  .await
+  .expect("the unwind returns rather than parking on a wedged re-arm")
+  .expect_err("the consumed close abandons the widen");
+  let super::ReconcileStop::CloseRequested(close_reply) = stop else {
+    panic!("a close reply rides back out of the reconcile: {stop:?}");
+  };
+  queueing
+    .await
+    .expect("the second closer task completes")
+    .expect("…and its reply lands on the slot the first one freed");
+
+  // The returned reply is the FIRST caller's: acking it answers that caller, and only that caller.
+  close_reply
+    .send(Ok(()))
+    .expect("the returned reply is live");
+  assert!(
+    matches!(response.await, Ok(Ok(()))),
+    "the FIRST close() to be consumed is the one satisfied — first close wins"
+  );
+  // The second reply was neither consumed nor dropped by the unwind: it is still on the signal, for
+  // the teardown the returned reply drives to find.
+  assert_eq!(
+    h.owner.closes.len(),
+    1,
+    "the later close is left queued, not consumed in place of the first"
+  );
+  // And the unwind still did its own job: both roots retired with their durable dominating terminal
+  // Rescans, so nothing is left recorded-live-but-disarmed (I3) for that teardown.
+  let view = h.owner.subsumer.view();
+  assert!(
+    !view.is_watched(&key("/a/b")) && !view.is_watched(&key("/a/c")),
+    "no subscription is left published-watched on a released handle"
+  );
+  assert!(
+    h.owner.needs_rescan.contains_key(&sb) && h.owner.needs_rescan.contains_key(&sc),
+    "each retirement still parked its durable dominating terminal Rescan"
+  );
+  drop(view);
+  // Dropping the owner is that teardown's last step. The queued reply's sender goes with the
+  // receiver, which is what `Tributaries::close` maps to `CloseError::Stopped` — the documented
+  // answer for "another racing close already won and tore the owner down".
+  drop(h);
+  assert!(
+    late.await.is_err(),
+    "the later caller learns the watcher stopped, rather than being answered ahead of the first"
+  );
+}
+
+/// The pace's half of the same ordering claim: every handle going away is
+/// discovered while root ONE paces, and the outer multi-root loop must not carry on to root two. It
+/// used to — the condition was returned as an ordinary per-root failure, so the loop retired that
+/// root and armed the next, and each later re-arm follows [`Owner::arm`]'s closed-channel path into
+/// an UN-RACED `Source::arm` that nothing is left to interrupt.
+///
+/// Driven by hand-polling so the close is neither timing- nor task-ordering-dependent: poll once to
+/// park inside the pace (the ledger's state is asserted there), close the signal, poll again. The
+/// later roots' arms are WEDGED, so a loop that carries on cannot complete — the second poll would
+/// return `Pending` rather than the verdict.
+///
+/// FAIL-ON-REVERT: return handles-gone as a per-root failure again (clear the budget and retire just
+/// this root) and the second poll parks on `/a/c`'s wedged arm — `Pending`, with the `Arm(/a/c)` that
+/// must not exist on the ledger.
+#[tokio::test]
+async fn handles_gone_at_a_pace_ends_the_restore_before_the_next_root_is_armed() {
+  use std::task::{Context, Poll, Waker};
+
+  let mut h = Harness::new();
+
+  let sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b"); // handle 1
+  let sc = h.watch("/a/c", Interest::all()).await.expect("watch /a/c"); // handle 2
+  let sd = h.watch("/a/d", Interest::all()).await.expect("watch /a/d"); // handle 3
+  h.owner.epochs.stamp(sb, Epoch::new(4));
+  h.owner.epochs.stamp(sc, Epoch::new(2));
+  h.owner.epochs.stamp(sd, Epoch::new(6));
+
+  // The wider arm and root ONE's re-arm are refused on the retryable kind, and never clear: root one
+  // reaches the pace, which is where the handles go away.
+  h.owner.source.refuse_capacity("/a", u32::MAX);
+  h.owner.source.refuse_capacity("/a/b", u32::MAX);
+  // The roots AFTER it must never be armed at all, so arming one hangs instead of merely counting.
+  h.owner.source.wedge_arm("/a/c");
+  h.owner.source.wedge_arm("/a/d");
+
+  let mut cx = Context::from_waker(Waker::noop());
+  let widen = key("/a");
+  let mut reconcile = Box::pin(h.owner.reconcile_watch(
+    &widen,
+    &(),
+    WatchOptions::new().with_interest(Interest::all()),
+  ));
+
+  // Pass #1: the widen disarms all three roots, the wider arm is refused, and root one's re-arm is
+  // refused too — so the restore parks in its pace, with the close signal still open and empty. It
+  // cannot have parked anywhere later: every arm past root one's is wedged, and this pass ends.
+  assert!(
+    reconcile.as_mut().poll(&mut cx).is_pending(),
+    "staging: the restore is parked in root one's retry pace"
+  );
+
+  // The last handle drops: the close signal closes in lockstep with the command mailbox the run loop
+  // takes its teardown signal from. The pace's close arm reads it on the next poll.
+  h.closes.close();
+
+  let stop = match reconcile.as_mut().poll(&mut cx) {
+    Poll::Ready(Err(stop)) => stop,
+    Poll::Ready(Ok(sub)) => panic!("the refused widen cannot commit: {sub:?}"),
+    Poll::Pending => panic!(
+      "the restore armed a later root past the terminal condition and parked on its wedged mount — \
+       nothing is left to interrupt it, and teardown never starts"
+    ),
+  };
+  drop(reconcile);
+  assert!(
+    matches!(&stop, super::ReconcileStop::HandlesGone),
+    "every handle gone is an ABANDON — no reply is invented for a caller that no longer exists — and \
+     a no-ack TEARDOWN, never the ordinary failed watch the run loop keeps running past ({stop:?})"
+  );
+  // The zero-ARM ledger, read once the future is gone: root one's re-arm is the LAST arm. The close
+  // landed between the two polls, so this also fixes when the later roots were not armed — never,
+  // before or after it. Scoped to what [`Call`] records; the total claim over every `Source` method is
+  // the seam cells' ([`SourceCall`]).
+  assert_eq!(
+    h.owner.source.calls(),
+    vec![
+      Call::Arm(PathBuf::from("/a/b")),
+      Call::Arm(PathBuf::from("/a/c")),
+      Call::Arm(PathBuf::from("/a/d")),
+      Call::Disarm(1),
+      Call::Disarm(2),
+      Call::Disarm(3),
+      Call::Arm(PathBuf::from("/a")),
+      Call::Arm(PathBuf::from("/a/b")),
+    ],
+    "zero arms once the handles are gone — the outer loop does not carry on to /a/c or /a/d"
+  );
+
+  // Terminal for the roots too: all three retired, so the teardown finds none recorded-live-but-
+  // disarmed (I3), and each subscriber is owed its durable dominating terminal Rescan.
+  let view = h.owner.subsumer.view();
+  assert!(
+    !view.is_watched(&key("/a/b"))
+      && !view.is_watched(&key("/a/c"))
+      && !view.is_watched(&key("/a/d")),
+    "no subscription is left published-watched on a released handle"
+  );
+  assert!(
+    h.owner.needs_rescan.contains_key(&sb)
+      && h.owner.needs_rescan.contains_key(&sc)
+      && h.owner.needs_rescan.contains_key(&sd),
+    "each retirement still parked its durable dominating terminal Rescan"
+  );
+}
+
+/// The other condition a pace can report, and the one the per-root probe cannot cover for it: a close
+/// REPLY consumed at root one's pace. From that instant the reconcile is holding a reply on a signal
+/// that is now empty and still open — so the probe reads `Empty` and waves the next root's re-arm
+/// through, and that re-arm has nothing left to preempt it and can consume a later caller's reply
+/// over the held one. Which makes the pace's own reading terminal in its own right: it ends the
+/// restore where it is taken.
+///
+/// Hand-polled for the same determinism as the handles-gone cell, and the roots after the first are
+/// WEDGED so a loop that carries on cannot complete.
+///
+/// FAIL-ON-REVERT: turn the pace's consumed close back into a per-root verdict the outer loop carries
+/// on from — the per-root probe does NOT save it, because a consumed reply leaves the signal empty
+/// rather than closed — and the second poll parks on `/a/c`'s wedged arm, with the `Arm(/a/c)` that
+/// must not exist on the ledger.
+#[tokio::test]
+async fn a_close_consumed_at_a_pace_ends_the_restore_before_the_next_root_is_armed() {
+  use std::task::{Context, Poll, Waker};
+
+  let mut h = Harness::new();
+
+  let sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b"); // handle 1
+  let sc = h.watch("/a/c", Interest::all()).await.expect("watch /a/c"); // handle 2
+  h.owner.epochs.stamp(sb, Epoch::new(4));
+  h.owner.epochs.stamp(sc, Epoch::new(2));
+
+  // The wider arm and root ONE's re-arm are refused on the retryable kind and never clear, so root
+  // one reaches the pace — where the close lands.
+  h.owner.source.refuse_capacity("/a", u32::MAX);
+  h.owner.source.refuse_capacity("/a/b", u32::MAX);
+  // Root two must never be armed, so arming it hangs rather than merely showing up on the ledger.
+  h.owner.source.wedge_arm("/a/c");
+
+  let mut cx = Context::from_waker(Waker::noop());
+  let widen = key("/a");
+  let mut reconcile = Box::pin(h.owner.reconcile_watch(
+    &widen,
+    &(),
+    WatchOptions::new().with_interest(Interest::all()),
+  ));
+  assert!(
+    reconcile.as_mut().poll(&mut cx).is_pending(),
+    "staging: the restore is parked in root one's retry pace"
+  );
+
+  // A close arrives mid-pace, exactly as `Tributaries::close` leaves one on the dedicated signal.
+  let (reply, response) = futures_channel::oneshot::channel();
+  h.closes.try_send(reply).expect("the close signal accepts");
+
+  let stop = match reconcile.as_mut().poll(&mut cx) {
+    Poll::Ready(Err(stop)) => stop,
+    Poll::Ready(Ok(sub)) => panic!("the refused widen cannot commit: {sub:?}"),
+    Poll::Pending => panic!(
+      "the restore armed root two while holding the consumed reply and parked on its wedged mount — \
+       the signal it would need to be rescued by is the one it just emptied"
+    ),
+  };
+  drop(reconcile);
+  let super::ReconcileStop::CloseRequested(close_reply) = stop else {
+    panic!("the reply consumed at the pace rides back out of the reconcile: {stop:?}");
+  };
+  assert_eq!(
+    h.owner.source.calls(),
+    vec![
+      Call::Arm(PathBuf::from("/a/b")),
+      Call::Arm(PathBuf::from("/a/c")),
+      Call::Disarm(1),
+      Call::Disarm(2),
+      Call::Arm(PathBuf::from("/a")),
+      Call::Arm(PathBuf::from("/a/b")),
+    ],
+    "zero arms once the pace consumed a reply — root two is retired, not re-armed"
+  );
+
+  // The consumed reply is answered rather than dropped: `close()` completes.
+  close_reply
+    .send(Ok(()))
+    .expect("the returned reply is live");
+  assert!(
+    matches!(response.await, Ok(Ok(()))),
+    "the close() caller is answered, never left pending behind a widen's unwind"
+  );
+  let view = h.owner.subsumer.view();
+  assert!(
+    !view.is_watched(&key("/a/b")) && !view.is_watched(&key("/a/c")),
+    "no subscription is left published-watched on a released handle"
+  );
+  assert!(
+    h.owner.needs_rescan.contains_key(&sb) && h.owner.needs_rescan.contains_key(&sc),
+    "each retirement still parked its durable dominating terminal Rescan"
+  );
+}
+
+/// The budget's expiry is a fallback to the OLD behaviour, never something softer: a capacity
+/// refusal that outlives `RESTORE_RETRY_BUDGET` retires the root with its durable dominating
+/// terminal `Rescan`, exactly as a fatal one does. The retry buys a bounded wait; it never
+/// converts an unclearing refusal into a root that reads watched forever and delivers nothing.
+///
+/// One subsumed root, so the whole shared budget is spent on it. The clock is paused, so the
+/// budget elapses as a fact of the cell rather than in real seconds.
+///
+/// FAIL-ON-REVERT: drop the deadline (retry while the refusal is `Capacity`, unconditionally) and
+/// this cell never terminates — the refusal never clears. Revert the retry entirely and the
+/// re-arm is attempted once, so the `>= 2` attempt assertion fails.
+#[tokio::test(start_paused = true)]
+async fn a_capacity_refusal_outliving_the_retry_budget_retires_the_root_as_it_always_did() {
+  let mut h = Harness::new();
+
+  let sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b"); // handle 1
+  h.owner.epochs.stamp(sb, Epoch::new(4));
+
+  // Neither the wider arm nor the re-arm will ever be admitted.
+  h.owner.source.refuse_capacity("/a", u32::MAX);
+  h.owner.source.refuse_capacity("/a/b", u32::MAX);
+
+  let started = tokio::time::Instant::now();
+  let result = h.watch("/a", Interest::all()).await;
+  let elapsed = started.elapsed();
+  assert!(result.is_err(), "the refused widen fails the watch");
+
+  // The budget was spent — and only the budget.
+  assert!(
+    elapsed >= super::RESTORE_RETRY_BUDGET,
+    "the retry ran until its deadline: {elapsed:?}"
+  );
+  let attempts = h
+    .owner
+    .source
+    .calls()
+    .iter()
+    .filter(|call| **call == Call::Arm(PathBuf::from("/a/b")))
+    .count()
+    - 1; // the initial watch's own arm
+  assert!(
+    attempts >= 2,
+    "the re-arm was retried, not concluded dead on its first refusal: {attempts}"
+  );
+  let ceiling = super::RESTORE_RETRY_BUDGET.div_duration_f64(super::RESTORE_RETRY_PACE) as usize;
+  assert!(
+    attempts <= ceiling + 2,
+    "…and the retry is bounded by the budget, not by the source's patience: {attempts}"
+  );
+
+  // Then it retired exactly as a fatal refusal always did.
+  assert!(
+    !h.owner.subsumer.view().is_watched(&key("/a/b")),
+    "an unclearing refusal still ends in retirement — never a root that reads watched forever"
+  );
+  assert_eq!(
+    h.owner.subsumer.roots().count(),
+    0,
+    "the root left the view"
+  );
+  assert!(
+    !h.owner.filters.contains_key(&sb),
+    "the retired root's subscriber state is freed (I4)"
+  );
+  h.owner.flush_pending_rescans();
+  let delivered = h.drain();
+  assert_eq!(
+    delivered.len(),
+    1,
+    "exactly one signal is owed: {delivered:?}"
+  );
+  assert!(delivered[0].is_rescan(), "…a Rescan");
+  assert_eq!(delivered[0].subscription(), sb);
+  assert_eq!(
+    delivered[0].epoch(),
+    Epoch::new(5),
+    "the terminal Rescan strictly dominates sb's high-water of 4"
+  );
+}
+
+/// WINDOW ONE of the restore's arm race: the last close sender disappears AFTER the per-root probe
+/// read the signal empty. The probe is a snapshot — checking it earlier or more often cannot change
+/// that — so what makes the ordering sound is that the ATTEMPT re-reads the signal in the same race
+/// as the arm ([`Owner::rearm_racing_close`]), with the close arm polled first: a closure landing in
+/// this window costs ZERO source calls.
+///
+/// Staged exactly as that sentence reads, against the attempt the restore's loop actually runs: the
+/// real [`Owner::probe_close_signal`] answers `None` on an open, empty signal, the signal then closes,
+/// and the real [`Owner::rearm_disarmed_root`] is asked for its first attempt. It is driven directly
+/// rather than through a widen because the window has no suspension point end-to-end — nothing awaits
+/// between the probe and the arm's own close poll, so no outer harness can place a closure there;
+/// only the attempt can be handed the state the closure leaves behind.
+///
+/// The negative is asserted by LIVENESS, not by counting: the re-arm is WEDGED, so an attempt that
+/// re-issues cannot come back at all, and the deadline below fires. (A closed signal is precisely the
+/// state in which nothing is left able to interrupt such an arm.)
+///
+/// FAIL-ON-REVERT: point the attempt back at the generic [`Owner::arm`] choke point and its
+/// closed-channel path re-issues `Source::arm` UN-RACED — that arm parks on the wedge forever, so the
+/// timeout fires and the ledger shows the `Arm` that must not have been issued.
+#[tokio::test(start_paused = true)]
+async fn a_signal_that_closes_after_the_probe_ends_the_attempt_before_the_source_is_touched() {
+  let mut h = Harness::new();
+
+  // The re-arm this attempt would issue never returns — the hung mount an un-raced re-issue hands
+  // itself, with the close signal already gone.
+  h.owner.source.wedge_arm("/a/b");
+
+  // The TOCTOU read, taken by the restore's own probe: the signal is open and empty, so the probe
+  // waves the re-arm through…
+  assert!(
+    h.owner.probe_close_signal().is_none(),
+    "staging: the probe reads the open, empty signal as non-terminal"
+  );
+  // …and only THEN does the last handle drop, closing the signal in lockstep with the command
+  // mailbox the run loop takes its teardown signal from. Every check the probe could have made is
+  // already behind us.
+  h.closes.close();
+
+  // A full budget, on the owner's own (paused) clock: the attempt is terminal before the deadline is
+  // ever consulted, so nothing here rests on how much of it is left.
+  let retry_until = tokio::time::Instant::now().into_std() + super::RESTORE_RETRY_BUDGET;
+  let step = tokio::time::timeout(
+    Duration::from_secs(30),
+    h.owner.rearm_disarmed_root(&key("/a/b"), retry_until),
+  )
+  .await
+  .expect(
+    "the attempt reports the closed signal instead of arming; an arm issued here would park on the \
+     wedged mount forever, with nothing left able to interrupt it",
+  );
+
+  assert!(
+    matches!(
+      step,
+      super::RearmStep::Terminal(super::RestoreTerminal::HandlesGone)
+    ),
+    "every handle gone is TERMINAL for the whole restore, read off the attempt's own race"
+  );
+  // The zero-ARM ledger: not one arm, disarm, replace or cover request reached the source. (Nothing
+  // else could have either — there is no barrier and no orphan here — but that is this cell's setup
+  // rather than something [`Call`] testifies to; see the seam cells for the total claim.)
+  assert!(
+    h.owner.source.calls().is_empty(),
+    "the closed signal is read BEFORE `Source::arm` is issued: {:?}",
+    h.owner.source.calls()
+  );
+}
+
+/// WINDOW TWO: the closure arrives after a retry's pace resolved on its TIMER rather than on its own
+/// close arm — so the reading that let the retry proceed is behind us, and the next attempt is the
+/// only thing left able to notice. Which it is, because [`Owner::rearm_disarmed_root`] has exactly one
+/// arm site: EVERY attempt is raced, the first and each post-pace retry alike.
+///
+/// Hand-polled so the pace's timer win and the closure are ordered facts, not timing luck: poll to
+/// park in root one's pace, let the pace elapse, poll again — which resolves the pace on the timer
+/// (the signal is still open and empty) and issues the retried attempt — then close the signal and
+/// poll once more.
+///
+/// The negative is asserted by LIVENESS: the retried arm and every later root's arm are WEDGED, so a
+/// re-issue cannot return a verdict at all and the final poll stays `Pending`. The wedge is scripted
+/// by call count because it has to appear PARTWAY through this one reconcile, which holds the owner
+/// borrowed for its whole life.
+///
+/// FAIL-ON-REVERT: race only the FIRST attempt and delegate the retries to the generic
+/// [`Owner::arm`] (or point the whole attempt back at it) and the post-pace attempt's closed-channel
+/// path re-issues `Source::arm` un-raced onto the wedge: the last poll parks, and the ledger carries
+/// the extra `Arm(/a/b)` that must not exist.
+#[tokio::test]
+async fn a_closure_after_the_pace_timer_wins_ends_the_retried_attempt_without_re_issuing_it() {
+  use std::task::{Context, Poll, Waker};
+
+  let mut h = Harness::new();
+
+  let sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b"); // handle 1
+  let sc = h.watch("/a/c", Interest::all()).await.expect("watch /a/c"); // handle 2
+  h.owner.epochs.stamp(sb, Epoch::new(4));
+  h.owner.epochs.stamp(sc, Epoch::new(2));
+
+  // The wider arm is refused on the retryable kind and never clears, so the widen unwinds into the
+  // restore. Root one's FIRST re-arm is refused the same way, which is what sends it to a pace.
+  h.owner.source.refuse_capacity("/a", u32::MAX);
+  h.owner.source.refuse_capacity("/a/b", 1);
+  // From root one's SECOND re-arm on, its mount hangs: the refused first attempt is served, and the
+  // POST-PACE retry — the attempt this cell is about — parks forever.
+  h.owner.source.wedge_arms_after("/a/b", 1);
+  // Root two must never be armed again either, so a loop that carries on cannot complete.
+  h.owner.source.wedge_arm("/a/c");
+
+  let mut cx = Context::from_waker(Waker::noop());
+  let widen = key("/a");
+  let mut reconcile = Box::pin(h.owner.reconcile_watch(
+    &widen,
+    &(),
+    WatchOptions::new().with_interest(Interest::all()),
+  ));
+
+  // Pass #1: both roots are released, the wider arm is refused, and root one's first re-arm is
+  // refused too — so the restore parks in its pace, with the signal still open and empty.
+  assert!(
+    reconcile.as_mut().poll(&mut cx).is_pending(),
+    "staging: the restore is parked in root one's retry pace"
+  );
+
+  // Let the pace elapse, so the next poll resolves it on the TIMER rather than on its close arm.
+  tokio::time::sleep(2 * super::RESTORE_RETRY_PACE).await;
+
+  // Pass #2: the pace's close arm reads the open, empty signal and the timer wins, so the retried
+  // attempt is issued — and parks on the mount that has just gone hung.
+  assert!(
+    reconcile.as_mut().poll(&mut cx).is_pending(),
+    "staging: the pace elapsed and the retried re-arm is in flight"
+  );
+
+  // NOW the last handle drops — after the retry timer won, with the retried arm already pending.
+  h.closes.close();
+
+  let stop = match reconcile.as_mut().poll(&mut cx) {
+    Poll::Ready(Err(stop)) => stop,
+    Poll::Ready(Ok(sub)) => panic!("the refused widen cannot commit: {sub:?}"),
+    Poll::Pending => panic!(
+      "the retried attempt was not raced: its closed signal re-issued an un-raced arm onto the \
+       wedged mount, and nothing is left able to interrupt it"
+    ),
+  };
+  drop(reconcile);
+  assert!(
+    matches!(&stop, super::ReconcileStop::HandlesGone),
+    "every handle gone is an ABANDON — no reply is invented for a caller that no longer exists — and \
+     a no-ack TEARDOWN, never the ordinary failed watch the run loop keeps running past ({stop:?})"
+  );
+  assert_eq!(
+    h.owner.source.calls(),
+    vec![
+      Call::Arm(PathBuf::from("/a/b")),
+      Call::Arm(PathBuf::from("/a/c")),
+      Call::Disarm(1),
+      Call::Disarm(2),
+      Call::Arm(PathBuf::from("/a")),
+      Call::Arm(PathBuf::from("/a/b")),
+      Call::Arm(PathBuf::from("/a/b")),
+      // The retried attempt is the LAST call: no un-raced re-issue of it, and no /a/c.
+    ],
+    "the retried attempt reports the closed signal instead of re-issuing, and the outer loop does \
+     not carry on to /a/c"
+  );
+
+  // Terminal for the roots too: both retired, so the teardown finds none recorded-live-but-disarmed
+  // (I3), and each subscriber is owed its durable dominating terminal Rescan.
+  let view = h.owner.subsumer.view();
+  assert!(
+    !view.is_watched(&key("/a/b")) && !view.is_watched(&key("/a/c")),
+    "no subscription is left published-watched on a released handle"
+  );
+  assert!(
+    h.owner.needs_rescan.contains_key(&sb) && h.owner.needs_rescan.contains_key(&sc),
+    "each retirement still parked its durable dominating terminal Rescan"
+  );
+}
+
+/// WINDOW THREE, and the core case: the closure arrives while the raced re-arm is already PENDING.
+/// This is the one the generic [`Owner::arm`] turns into an un-raced arm — its closed-channel path
+/// re-issues `Source::arm` and awaits it bare, which is right for an ordinary reconcile (it still owes
+/// its caller a verdict) and wrong for a restore, which owes the [`run`] loop a prompt return so the
+/// equally-closed command mailbox can drive teardown. Re-issued here, that arm has NOTHING left able
+/// to interrupt it: a source stalled on a dead mount pins the owner and its native resources for
+/// good, while the roots the widen already released stay merely recorded-and-disarmed.
+///
+/// So the restore races the arm itself and maps the gone signal straight to a terminal, dropping the
+/// pending arm. Hand-polled so the closure lands inside that pending arm as a fact of the cell: poll
+/// to park in root one's re-arm, close the signal, poll again.
+///
+/// The negative is asserted by LIVENESS, not by counting: the re-arm is WEDGED, so a re-issue cannot
+/// come back and the second poll stays `Pending` — an out-of-order check cannot merely add a call
+/// here, the reconcile cannot return.
+///
+/// FAIL-ON-REVERT: point the attempt back at the generic [`Owner::arm`] and the second poll parks on
+/// the re-issued `Arm(/a/b)` — with that second, un-raced arm on the ledger and the reconcile never
+/// returning to the loop.
+#[tokio::test]
+async fn a_closure_while_the_raced_re_arm_is_pending_ends_the_restore_rather_than_re_issuing_it() {
+  use std::task::{Context, Poll, Waker};
+
+  let mut h = Harness::new();
+
+  let sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b"); // handle 1
+  let sc = h.watch("/a/c", Interest::all()).await.expect("watch /a/c"); // handle 2
+  h.owner.epochs.stamp(sb, Epoch::new(4));
+  h.owner.epochs.stamp(sc, Epoch::new(2));
+
+  // The wider arm is refused on the retryable kind, so the widen unwinds into the restore…
+  h.owner.source.refuse_capacity("/a", u32::MAX);
+  // …where every re-arm hangs: root one's is what the closure lands inside, and root two's is what a
+  // loop carrying on past the terminal would park on. Set AFTER the watches above, which needed those
+  // same arms to succeed.
+  h.owner.source.wedge_arm("/a/b");
+  h.owner.source.wedge_arm("/a/c");
+
+  let mut cx = Context::from_waker(Waker::noop());
+  let widen = key("/a");
+  let mut reconcile = Box::pin(h.owner.reconcile_watch(
+    &widen,
+    &(),
+    WatchOptions::new().with_interest(Interest::all()),
+  ));
+
+  // Pass #1: both roots released, the wider arm refused, and root one's re-arm issued and parked. The
+  // close signal was open and empty at the race's first poll — the arm is legitimately in flight.
+  assert!(
+    reconcile.as_mut().poll(&mut cx).is_pending(),
+    "staging: root one's raced re-arm is pending on its wedged mount"
+  );
+
+  // The last handle drops WHILE that arm is pending: the close arm of the race that issued it is
+  // what reads the signal next.
+  h.closes.close();
+
+  let stop = match reconcile.as_mut().poll(&mut cx) {
+    Poll::Ready(Err(stop)) => stop,
+    Poll::Ready(Ok(sub)) => panic!("the refused widen cannot commit: {sub:?}"),
+    Poll::Pending => panic!(
+      "the pending re-arm's closed signal was answered by an UN-RACED re-issue: it parked on the \
+       wedged mount, the reconcile never returns to the loop, and teardown never starts"
+    ),
+  };
+  drop(reconcile);
+  assert!(
+    matches!(&stop, super::ReconcileStop::HandlesGone),
+    "every handle gone is an ABANDON — no reply is invented for a caller that no longer exists — and \
+     a no-ack TEARDOWN, never the ordinary failed watch the run loop keeps running past ({stop:?})"
+  );
+  // The ledger fixes both halves: root one's re-arm was issued exactly ONCE — the pending future is
+  // dropped, never re-issued — and root two's was never issued at all.
+  assert_eq!(
+    h.owner.source.calls(),
+    vec![
+      Call::Arm(PathBuf::from("/a/b")),
+      Call::Arm(PathBuf::from("/a/c")),
+      Call::Disarm(1),
+      Call::Disarm(2),
+      Call::Arm(PathBuf::from("/a")),
+      Call::Arm(PathBuf::from("/a/b")),
+    ],
+    "one re-arm, raced and abandoned — not a second, un-raced one, and nothing for /a/c"
+  );
+
+  // Terminal for the roots too: both retired, so the teardown finds none recorded-live-but-disarmed
+  // (I3), and each subscriber is owed its durable dominating terminal Rescan.
+  let view = h.owner.subsumer.view();
+  assert!(
+    !view.is_watched(&key("/a/b")) && !view.is_watched(&key("/a/c")),
+    "no subscription is left published-watched on a released handle"
+  );
+  assert!(
+    h.owner.needs_rescan.contains_key(&sb) && h.owner.needs_rescan.contains_key(&sc),
+    "each retirement still parked its durable dominating terminal Rescan"
+  );
+}
+
+/// The OUTCOME rather than the ordering, and the layer above all three windows above. Those make the
+/// cancellation correct; this is about what the cancellation is then REPORTED as. Reported as an
+/// ordinary failed watch, [`Owner::on_watch`] answers the caller and
+/// [`Owner::dispatch_command`] returns [`super::Flow::Continue`] — so the [`run`] loop keeps running
+/// with a cancelled [`Source::arm`] behind it, and its own dropped-handles arm cannot stop that: that
+/// arm fires only once the mailbox is closed AND DRAINED, so every command still buffered in it is
+/// dispatched first, each free to call the source again before the source is dropped — the one
+/// boundary at which the contract's cancellation clause reclaims what the abandoned arm may have
+/// started.
+///
+/// So the gone signal is a no-ack TEARDOWN ([`super::Teardown::HandlesGone`]), and this cell reads it
+/// exactly where the loop decides: the [`super::Flow`] `dispatch_command` returns. `Break` with NO
+/// `closing` — the signal that closed is the one every `close()` caller rides, so there is nothing to
+/// acknowledge and nothing may be invented — and no source-drain debt (nothing drained).
+///
+/// Hand-polled so the closure is an ordered fact rather than timing luck: poll to park in root one's
+/// retry pace, close the signal, poll again. Root two's re-arm is WEDGED, so the negative holds by
+/// LIVENESS as well as by the ledger — a restore that carried on could not return a `Flow` at all,
+/// and a mis-ordered check cannot merely add a call.
+///
+/// FAIL-ON-REVERT: map the terminal back to `WatchError::Closed` (`Failed`, an ordinary failed watch)
+/// and this returns `Flow::Continue` — the loop keeps going past the cancelled arm. Invent an
+/// acknowledgement for it (`closing: Some(_)`) and the same match fails: no reply exists to answer.
+#[tokio::test]
+async fn handles_gone_during_a_restore_breaks_the_owner_loop_with_no_acknowledgement() {
+  use std::task::{Context, Poll, Waker};
+
+  let mut h = Harness::new();
+
+  let sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b"); // handle 1
+  let sc = h.watch("/a/c", Interest::all()).await.expect("watch /a/c"); // handle 2
+  h.owner.epochs.stamp(sb, Epoch::new(4));
+  h.owner.epochs.stamp(sc, Epoch::new(2));
+
+  // The wider arm and root ONE's re-arm are refused on the retryable kind and never clear, so the
+  // restore reaches root one's pace — where the handles go away.
+  h.owner.source.refuse_capacity("/a", u32::MAX);
+  h.owner.source.refuse_capacity("/a/b", u32::MAX);
+  // Root two must never be armed, so a restore that carries on cannot come back at all.
+  h.owner.source.wedge_arm("/a/c");
+
+  // The widen, dispatched the way the run loop dispatches one: through `dispatch_command`, whose
+  // `Flow` IS the loop's decision to keep going or stop.
+  let (reply, response) = futures_channel::oneshot::channel();
+  let mut cx = Context::from_waker(Waker::noop());
+  let mut dispatch = Box::pin(h.owner.dispatch_command(Ok(super::Command::Watch {
+    key: key("/a"),
+    value: (),
+    options: WatchOptions::new().with_interest(Interest::all()),
+    reply,
+  })));
+
+  // Pass #1: the widen releases both roots, the wider arm is refused, and root one's re-arm is
+  // refused too — so the restore parks in its pace, with the close signal still open and empty.
+  assert!(
+    dispatch.as_mut().poll(&mut cx).is_pending(),
+    "staging: the restore is parked in root one's retry pace"
+  );
+
+  // The last handle drops: the close signal closes in lockstep with the command mailbox.
+  h.closes.close();
+
+  let flow = match dispatch.as_mut().poll(&mut cx) {
+    Poll::Ready(flow) => flow,
+    Poll::Pending => panic!(
+      "the restore armed root two past the terminal condition and parked on its wedged mount — \
+       nothing is left to interrupt it, and the loop never gets its verdict"
+    ),
+  };
+  drop(dispatch);
+  match flow {
+    super::Flow::Break {
+      closing: None,
+      drain_owed: false,
+    } => {}
+    super::Flow::Break {
+      closing: Some(_), ..
+    } => panic!(
+      "an acknowledgement was invented: the signal that closed is the one a `close()` caller would \
+       have ridden, so no reply can exist to answer"
+    ),
+    super::Flow::Break {
+      drain_owed: true, ..
+    } => panic!("a consumer-side teardown owes no source-drain pass"),
+    super::Flow::Continue => panic!(
+      "the loop was told to keep running past a cancelled arm: whatever is still buffered in the \
+       closed mailbox gets dispatched, and may call the source again before it is dropped"
+    ),
+  }
+
+  // The zero-ARM ledger, read once the future is gone: root one's re-arm is the LAST arm, so no arm ran
+  // between the cancelled one and this verdict. Scoped to what [`Call`] records; that no `Source` call
+  // of ANY kind runs between the cancelled arm and the teardown seam is the seam cells' claim
+  // ([`SourceCall`]), which the retirement's cookie reap would otherwise slip past this ledger.
+  assert_eq!(
+    h.owner.source.calls(),
+    vec![
+      Call::Arm(PathBuf::from("/a/b")),
+      Call::Arm(PathBuf::from("/a/c")),
+      Call::Disarm(1),
+      Call::Disarm(2),
+      Call::Arm(PathBuf::from("/a")),
+      Call::Arm(PathBuf::from("/a/b")),
+    ],
+    "zero source calls once the handles are gone"
+  );
+  // Nothing is invented for the `watch()` caller either: its reply is DROPPED, which is what
+  // `watch()` reads as `Closed` — and no such caller can even be left, since a pending `watch()`
+  // borrows the handle whose loss this outcome IS.
+  assert!(
+    response.await.is_err(),
+    "the abandoned watch's reply is dropped, never answered over a teardown"
+  );
+
+  // Terminal for the roots too: both retired, so the teardown finds none recorded-live-but-disarmed
+  // (I3), and each subscriber is owed its durable dominating terminal Rescan.
+  let view = h.owner.subsumer.view();
+  assert!(
+    !view.is_watched(&key("/a/b")) && !view.is_watched(&key("/a/c")),
+    "no subscription is left published-watched on a released handle"
+  );
+  assert!(
+    h.owner.needs_rescan.contains_key(&sb) && h.owner.needs_rescan.contains_key(&sc),
+    "each retirement still parked its durable dominating terminal Rescan"
+  );
+}
+
+/// The buffered command specifically, driven through the REAL [`run`] loop — the one place the
+/// difference between `Flow::Continue` and `Flow::Break` is observable as behaviour rather than as a
+/// value. A `Watch` admitted while handles still existed sits in the mailbox behind the widen;
+/// `async_channel` hands a closed-but-nonempty mailbox its buffered items before it ever reports the
+/// channel gone, so a loop that merely kept going would dispatch that `Watch` and arm the source with
+/// the restore's cancelled arm still unreclaimed — for a caller who is provably gone (a pending
+/// `watch()` borrows the handle it sent on).
+///
+/// The negative is asserted by LIVENESS: the buffered watch's own arm is WEDGED, so dispatching it
+/// cannot merely add a ledger entry — the loop can never return, and teardown never runs. This cell
+/// therefore fails by hanging on the poll, which no later refactor can explain away as a counting
+/// artifact.
+///
+/// Hand-polled so both facts are ordered: poll to park in the restore's pace with the second command
+/// already queued, then drop every handle (close signal closed, mailbox closed WITH the command still
+/// in it) and poll again.
+///
+/// FAIL-ON-REVERT: report the gone signal as an ordinary failed watch and the second poll parks
+/// forever on `Arm(/z)` — the command that must never reach the source.
+#[tokio::test]
+async fn a_command_buffered_when_the_handles_dropped_never_reaches_the_source() {
+  use std::task::{Context, Poll, Waker};
+
+  let mut h = Harness::new();
+
+  let sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b"); // handle 1
+  h.owner.epochs.stamp(sb, Epoch::new(4));
+
+  // The wider arm and the re-arm are refused on the retryable kind and never clear, so the widen
+  // unwinds into a restore that reaches its pace — where the handles go away.
+  h.owner.source.refuse_capacity("/a", u32::MAX);
+  h.owner.source.refuse_capacity("/a/b", u32::MAX);
+  // The BUFFERED command's own arm hangs, so a loop that dispatches it cannot come back.
+  h.owner.source.wedge_arm("/z");
+
+  let Harness {
+    owner,
+    events,
+    _commands: commands,
+    _sync_commands,
+    closes,
+  } = h;
+
+  // Two commands, the widen FIRST: the loop dispatches it and must never reach the second, which was
+  // admitted (and buffered) while handles still existed.
+  let (widen_reply, widen_response) = futures_channel::oneshot::channel();
+  commands
+    .try_send(super::Command::Watch {
+      key: key("/a"),
+      value: (),
+      options: WatchOptions::new().with_interest(Interest::all()),
+      reply: widen_reply,
+    })
+    .expect("enqueue the widen");
+  let (buffered_reply, buffered_response) = futures_channel::oneshot::channel();
+  commands
+    .try_send(super::Command::Watch {
+      key: key("/z"),
+      value: (),
+      options: WatchOptions::new().with_interest(Interest::all()),
+      reply: buffered_reply,
+    })
+    .expect("enqueue the command behind it");
+
+  let mut cx = Context::from_waker(Waker::noop());
+  let mut run = Box::pin(super::run(owner));
+
+  // Pass #1: the loop selects the widen — the command arm outranks the source arm, which matters
+  // here because [`FakeSource::next`] answers `None` at once and would otherwise break the loop to a
+  // source drain — and it releases `/a/b`, is refused the wider arm, and parks in the restore's pace,
+  // with the `/z` watch still in the mailbox.
+  assert!(
+    run.as_mut().poll(&mut cx).is_pending(),
+    "staging: the run loop is parked in the restore's retry pace"
+  );
+
+  // Every handle drops: the close signal closes, and the command mailbox closes WITH THE `/z` WATCH
+  // STILL IN IT — the state in which a continuing loop reaches that command rather than the
+  // dropped-handles `Err` this teardown otherwise shares.
+  closes.close();
+  drop(commands);
+
+  match run.as_mut().poll(&mut cx) {
+    Poll::Ready(()) => {}
+    Poll::Pending => panic!(
+      "the loop kept running past the cancelled re-arm and dispatched the buffered `/z` watch: its \
+       arm has nothing left able to interrupt it, so the owner is pinned and teardown never runs"
+    ),
+  }
+
+  // Never dispatched, so never answered: the caller — already gone, every handle is — reads the
+  // dropped reply as `Closed`, exactly as it reads the abandoned widen's.
+  assert!(
+    buffered_response.await.is_err(),
+    "the buffered watch is answered by nobody, because it was served by nobody"
+  );
+  assert!(
+    widen_response.await.is_err(),
+    "the abandoned widen's reply is dropped rather than answered over a teardown"
+  );
+
+  // The teardown the break reached still paid what the retirement owed: the subsumed root's durable
+  // dominating terminal `Rescan` is on the stream before the owner is gone.
+  let mut delivered = Vec::new();
+  while let Ok(event) = events.try_recv() {
+    delivered.push(event);
+  }
+  assert_eq!(
+    delivered.len(),
+    1,
+    "exactly one signal is owed: {delivered:?}"
+  );
+  assert!(delivered[0].is_rescan(), "…a Rescan");
+  assert_eq!(delivered[0].subscription(), sb);
+  assert_eq!(
+    delivered[0].epoch(),
+    Epoch::new(5),
+    "the terminal Rescan strictly dominates sb's high-water of 4"
+  );
+}
+
+/// The seam ordering itself, for the exact case the code's own documentation got wrong:
+/// **a retired root carrying a pending sync**. The failed-widen unwind was documented as
+/// owner-local — "no [`Source`] call is issued for any root between the reconcile's cancelled source
+/// future and the source's own teardown seam" — and the call graph says otherwise:
+///
+/// ```text
+/// begin_close_then_retire_disarmed_roots
+///   → retire_root_with_terminal_rescan → rescan_live_root
+///     → dominate_syncs_of_root → reap_cookie → Source::end_sync
+/// ```
+///
+/// So a terminal outcome retired a root whose barrier was still pending, that retirement reaped its
+/// cookie, and the reap reached the source with an abandoned [`Source::arm`] still unreclaimed — the
+/// one call whose cancellation nothing short of the source's own teardown can reclaim. Two more of
+/// the same shape follow it in [`run`]'s tail (`reap_all_pending_syncs`, and grant cleanup's
+/// [`disarm`](Source::disarm)/[`set_cover`](Source::set_cover) — the next cell).
+///
+/// The fix is not to make that chain source-free — it is the shared no-silent-loss primitive and it
+/// is not going to become owner-local — but to move the SEAM ahead of it. So the claim this cell
+/// pins is an ORDER, and it reads it off the TOTAL [`SourceCall`] ledger: every `Source` method the
+/// fake implements, the read probes included, in sequence, for the source's whole life. `BeginClose`
+/// sits between the cancelled re-arm and the cookie reap, and `JoinClose` — the bounded wait — still
+/// comes last.
+///
+/// Driven through the REAL [`run`] loop rather than `dispatch_command`, because the tail is half of
+/// the window and only the loop reaches it. Hand-polled so the closure is an ordered fact rather than
+/// timing luck: poll to park in root one's retry pace, drop every handle, poll again. Root two's
+/// re-arm is WEDGED, so a restore that carried on could not return at all.
+///
+/// FAIL-ON-REVERT: put the seam back at the end of the tail (`owner.source.begin_close()` after
+/// `swap_in_empty`, with the terminal unwind entering nothing) and the ledger reads
+/// `… Arm(/a/b), EndSync(…), BeginClose, JoinClose` — the reap ahead of the seam, which is the
+/// defect itself.
+#[tokio::test]
+async fn a_retired_root_with_a_pending_sync_reaps_its_cookie_only_past_the_seam() {
+  use crate::source::SyncOutcome;
+  use std::task::{Context, Poll, Waker};
+
+  let mut h = Harness::new();
+
+  let sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b"); // handle 1
+  let sc = h.watch("/a/c", Interest::all()).await.expect("watch /a/c"); // handle 2
+  h.owner.epochs.stamp(sb, Epoch::new(4));
+  h.owner.epochs.stamp(sc, Epoch::new(2));
+
+  // The barrier that makes the retirement reach the source: a cookie riding root ONE, whose caller is
+  // still waiting (the receiver is HELD, so the loop-top `prune_abandoned_syncs` leaves it alone —
+  // an abandoned barrier would reap early and the window would never be tested).
+  let root_b = h
+    .owner
+    .subsumer
+    .subscription_root(sb)
+    .expect("live root for /a/b");
+  let (sync_reply, sync_response) = futures_channel::oneshot::channel();
+  h.owner.pending_syncs.push(super::PendingSync {
+    cookie_key: key("/a/b/cookie-1"),
+    sub: sb,
+    root: root_b,
+    loss_serial_at_install: 0,
+    dominated_at_install: false,
+    reply: sync_reply,
+  });
+
+  // The wider arm and root ONE's re-arm are refused on the retryable kind and never clear, so the
+  // restore reaches root one's pace — where the handles go away.
+  h.owner.source.refuse_capacity("/a", u32::MAX);
+  h.owner.source.refuse_capacity("/a/b", u32::MAX);
+  // Root two must never be armed, so a restore that carries on cannot come back.
+  h.owner.source.wedge_arm("/a/c");
+  // Taken BEFORE the owner is moved into `run`: the seam is the last thing that happens, so the
+  // ledger has to outlive the source it records.
+  let seam = h.owner.source.seam();
+
+  let Harness {
+    owner,
+    events,
+    _commands: commands,
+    _sync_commands,
+    closes,
+  } = h;
+
+  let (widen_reply, widen_response) = futures_channel::oneshot::channel();
+  commands
+    .try_send(super::Command::Watch {
+      key: key("/a"),
+      value: (),
+      options: WatchOptions::new().with_interest(Interest::all()),
+      reply: widen_reply,
+    })
+    .expect("enqueue the widen");
+
+  let mut cx = Context::from_waker(Waker::noop());
+  let mut run = Box::pin(super::run(owner));
+
+  // Pass #1: the loop selects the widen (the command arm outranks the source arm, which matters here
+  // because [`FakeSource::next`] answers `None` at once and would otherwise break the loop to a source
+  // drain), releases both roots, is refused the wider arm, and parks in the restore's pace.
+  assert!(
+    run.as_mut().poll(&mut cx).is_pending(),
+    "staging: the run loop is parked in the restore's retry pace"
+  );
+
+  // Every handle drops: the close signal closes in lockstep with the command mailbox.
+  closes.close();
+  drop(commands);
+
+  match run.as_mut().poll(&mut cx) {
+    Poll::Ready(()) => {}
+    Poll::Pending => panic!(
+      "the restore armed root two past the terminal condition and parked on its wedged mount — \
+       nothing is left to interrupt it, and teardown never runs"
+    ),
+  }
+
+  // THE ORDER. Total, in sequence, for the whole life of the source:
+  //
+  //   the two establishing watches (canonicalize, arm, the choke point's liveness probe each),
+  //   the widen's canonicalize, its two releases, its refused wider arm, root one's refused re-arm,
+  //   → THE SEAM ←
+  //   the retired root's cookie reap, then the bounded quiescence wait.
+  //
+  // Root two contributes no reap (no barrier rode it) and no re-arm (the terminal preceded it).
+  assert_eq!(
+    seam.calls(),
+    vec![
+      SourceCall::CanonicalizeKey(key("/a/b")),
+      SourceCall::Arm(PathBuf::from("/a/b")),
+      SourceCall::RootKey(1),
+      SourceCall::CanonicalizeKey(key("/a/c")),
+      SourceCall::Arm(PathBuf::from("/a/c")),
+      SourceCall::RootKey(2),
+      SourceCall::CanonicalizeKey(key("/a")),
+      SourceCall::Disarm(1),
+      SourceCall::Disarm(2),
+      SourceCall::Arm(PathBuf::from("/a")),
+      SourceCall::Arm(PathBuf::from("/a/b")),
+      SourceCall::BeginClose,
+      SourceCall::EndSync(key("/a/b/cookie-1")),
+      SourceCall::JoinClose,
+    ],
+    "the retirement's cookie reap must land PAST the seam, not between the cancelled re-arm and it"
+  );
+  // The redundancy that survives a future cell asserting only a prefix.
+  assert_eq!(
+    seam.begin_closes(),
+    1,
+    "the seam is entered exactly once, however many callers could have entered it"
+  );
+
+  // Nothing about the unwind's own obligations is traded away for the ordering: the barrier resolves
+  // `Dominated` (its cookie can no longer prove anything, and the terminal `Rescan` dominates it), and
+  // the abandoned watch's reply is dropped rather than answered over a teardown.
+  assert!(
+    matches!(
+      sync_response.await.expect("the barrier is answered"),
+      Ok(SyncOutcome::Dominated)
+    ),
+    "a barrier on a retired root is met by re-enumeration"
+  );
+  assert!(
+    widen_response.await.is_err(),
+    "the abandoned widen's reply is dropped, never answered over a teardown"
+  );
+
+  // And each subscriber still got its durable dominating terminal `Rescan` before the stream ended.
+  let mut delivered = Vec::new();
+  while let Ok(event) = events.try_recv() {
+    delivered.push(event);
+  }
+  assert_eq!(delivered.len(), 2, "one per subsumed root: {delivered:?}");
+  assert!(
+    delivered.iter().all(super::Event::is_rescan),
+    "both are Rescans: {delivered:?}"
+  );
+}
+
+/// The seam ordering for the OTHER two reachabilities in the same window, both in [`run`]'s teardown
+/// tail rather than in the reconcile: the remaining cookies reaped at teardown
+/// (`reap_all_pending_syncs` → [`Source::end_sync`]) and QUEUED GRANT CLEANUP, whose orphan release
+/// reaches [`Source::disarm`] when it empties a root and [`Source::set_cover`] when it merely narrows
+/// one. Traced:
+///
+/// ```text
+/// drain_pending_cleanup → apply_cleanup → release_subscription → Source::disarm / Source::set_cover
+///                                                             → retire_syncs_of_subscription
+///                                                               → reap_cookie → Source::end_sync
+/// ```
+///
+/// Both ran before the old end-of-tail seam, so a terminal reconcile's cancelled [`Source::arm`] was
+/// followed by a release and a prune with nothing yet told to wind down. Moving the seam to the TOP of
+/// the tail is what puts them past it, and this cell reads that off the same total ledger.
+///
+/// Two orphans, because the release has two source-touching outcomes and one cell should pin both: the
+/// sole subscriber of `/x` (its departure EMPTIES the root → `Disarm`) and the root-key subscriber of
+/// `/y`, which keeps a narrower sibling (its departure leaves the root OVER-BROAD → `SetCover`).
+/// Neither root is part of the widen, so the widen's unwind cannot be what releases them.
+///
+/// FAIL-ON-REVERT: leave the seam at the end of the tail and the ledger reads
+/// `… Arm(/a/b), EndSync(…), Disarm(3), SetCover(4), BeginClose, JoinClose` — all three source calls
+/// ahead of the seam.
+#[tokio::test]
+async fn queued_orphan_cleanup_touches_the_source_only_past_the_seam() {
+  use std::task::{Context, Poll, Waker};
+
+  let mut h = Harness::new();
+
+  // The widen's two roots.
+  let sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b"); // handle 1
+  let sc = h.watch("/a/c", Interest::all()).await.expect("watch /a/c"); // handle 2
+  h.owner.epochs.stamp(sb, Epoch::new(4));
+  h.owner.epochs.stamp(sc, Epoch::new(2));
+  // An unrelated root with ONE subscriber: releasing it empties the root.
+  let sx = h.watch("/x", Interest::all()).await.expect("watch /x"); // handle 3
+  // An unrelated root whose ROOT-KEY subscriber departs while a narrower one stays: the root survives
+  // over-broad, so the release prunes coverage in place instead of releasing it.
+  let sy = h.watch("/y", Interest::all()).await.expect("watch /y"); // handle 4
+  h.watch("/y/n", Interest::all())
+    .await
+    .expect("watch /y/n under it");
+
+  // A barrier still riding `/x`'s root, whose caller is HELD so the loop-top prune leaves it alone:
+  // this is the cookie the teardown's own reap has to handle, and it must handle it past the seam.
+  let root_x = h
+    .owner
+    .subsumer
+    .subscription_root(sx)
+    .expect("live root for /x");
+  let (sync_reply, sync_response) = futures_channel::oneshot::channel();
+  h.owner.pending_syncs.push(super::PendingSync {
+    cookie_key: key("/x/cookie-7"),
+    sub: sx,
+    root: root_x,
+    loss_serial_at_install: 0,
+    dominated_at_install: false,
+    reply: sync_reply,
+  });
+
+  // A sender on the grant-resolution channel that OUTLIVES the destructuring, so both orphans can be
+  // queued MID-UNWIND — after the loop's last top-of-iteration `drain_pending_cleanup` and before the
+  // terminal. Queued any earlier they are drained by that loop-top pass, long before the widen is even
+  // selected, and the window this cell exists for is never entered.
+  let grants = h.owner.cleanup_tx.clone();
+
+  h.owner.source.refuse_capacity("/a", u32::MAX);
+  h.owner.source.refuse_capacity("/a/b", u32::MAX);
+  h.owner.source.wedge_arm("/a/c");
+  let seam = h.owner.source.seam();
+
+  let Harness {
+    owner,
+    events: _events,
+    _commands: commands,
+    _sync_commands,
+    closes,
+  } = h;
+
+  let (widen_reply, widen_response) = futures_channel::oneshot::channel();
+  commands
+    .try_send(super::Command::Watch {
+      key: key("/a"),
+      value: (),
+      options: WatchOptions::new().with_interest(Interest::all()),
+      reply: widen_reply,
+    })
+    .expect("enqueue the widen");
+
+  let mut cx = Context::from_waker(Waker::noop());
+  let mut run = Box::pin(super::run(owner));
+
+  assert!(
+    run.as_mut().poll(&mut cx).is_pending(),
+    "staging: the run loop is parked in the restore's retry pace"
+  );
+
+  // Both grants resolve as ORPHANS while the unwind is parked: the loop is inside the reconcile, so
+  // nothing drains them until the teardown tail — which is exactly where the release must land past the
+  // seam. (`async_channel` keeps messages queued before a `close` receivable, so the tail's atomic claim
+  // cut does not discard these.)
+  grants
+    .try_send(super::Cleanup::DropOrphan(sx))
+    .expect("queue the emptying orphan");
+  grants
+    .try_send(super::Cleanup::DropOrphan(sy))
+    .expect("queue the narrowing orphan");
+
+  closes.close();
+  drop(commands);
+
+  match run.as_mut().poll(&mut cx) {
+    Poll::Ready(()) => {}
+    Poll::Pending => panic!(
+      "the restore armed root two past the terminal condition and parked on its wedged mount"
+    ),
+  }
+
+  let calls = seam.calls();
+  let seam_at = calls
+    .iter()
+    .position(|call| *call == SourceCall::BeginClose)
+    .expect("the seam was entered");
+  // The whole point, stated as an exact sequence rather than a count: everything the teardown asks of
+  // the source comes AFTER the seam entry, in the tail's own order — the remaining cookie first
+  // (`reap_all_pending_syncs`), then the two orphan releases in the order they were queued, then the
+  // bounded wait.
+  assert_eq!(
+    &calls[seam_at..],
+    &[
+      SourceCall::BeginClose,
+      SourceCall::EndSync(key("/x/cookie-7")),
+      SourceCall::Disarm(3),
+      SourceCall::SetCover(4),
+      SourceCall::JoinClose,
+    ],
+    "every teardown request must land past the seam, in the tail's order"
+  );
+  // And the other half of the claim: nothing of that kind happened BEFORE it. The prefix is the
+  // establishing traffic and the widen's own unwind, and not one `EndSync`, `Disarm(3)` or `SetCover`
+  // appears in it.
+  assert_eq!(
+    &calls[..seam_at],
+    &[
+      SourceCall::CanonicalizeKey(key("/a/b")),
+      SourceCall::Arm(PathBuf::from("/a/b")),
+      SourceCall::RootKey(1),
+      SourceCall::CanonicalizeKey(key("/a/c")),
+      SourceCall::Arm(PathBuf::from("/a/c")),
+      SourceCall::RootKey(2),
+      SourceCall::CanonicalizeKey(key("/x")),
+      SourceCall::Arm(PathBuf::from("/x")),
+      SourceCall::RootKey(3),
+      SourceCall::CanonicalizeKey(key("/y")),
+      SourceCall::Arm(PathBuf::from("/y")),
+      SourceCall::RootKey(4),
+      SourceCall::CanonicalizeKey(key("/y/n")),
+      SourceCall::RootKey(4),
+      SourceCall::CanonicalizeKey(key("/a")),
+      SourceCall::Disarm(1),
+      SourceCall::Disarm(2),
+      SourceCall::Arm(PathBuf::from("/a")),
+      SourceCall::Arm(PathBuf::from("/a/b")),
+    ],
+    "nothing was asked of the source between the cancelled re-arm and the seam"
+  );
+  assert_eq!(
+    seam.begin_closes(),
+    1,
+    "the seam is entered exactly once, however many callers could have entered it"
+  );
+
+  // The orphan releases still did their owner-local work, and the held barrier still resolved: the
+  // reordering buys the invariant without dropping an obligation. `/x`'s barrier is answered
+  // `Closed` — its caller's reply is dropped by the teardown reap, which is what a dropped sender
+  // reads as.
+  assert!(
+    sync_response.await.is_err(),
+    "a barrier still pending at teardown reads as Closed"
+  );
+  assert!(
+    widen_response.await.is_err(),
+    "the abandoned widen's reply is dropped rather than answered over a teardown"
+  );
+}
+
+/// [`Source::begin_close`] is contracted as a once-per-source initiation, and moving it EARLIER
+/// created a second caller: the terminal reconcile enters it, and [`run`]'s tail enters it too. This
+/// cell is the double-entry check, over every teardown shape the loop has — the two that pass through a
+/// reconcile terminal (where BOTH callers exist) and the three that do not (where only the tail's entry
+/// can produce it at all).
+///
+/// Both halves matter and they fail differently. A missing latch double-enters the seam on the widen
+/// paths; a latch that swallows the tail's entry leaves an ORDINARY close never telling its source to
+/// wind down at all — the regression a cell that only looked at the widen would miss.
+///
+/// FAIL-ON-REVERT: drop the `source_closing` latch (call `self.source.begin_close()` directly) and the
+/// two widen shapes report 2. Delete the tail's `owner.begin_source_close()` and the three plain shapes
+/// report 0.
+#[tokio::test]
+async fn the_teardown_seam_is_entered_exactly_once_on_every_terminal_path() {
+  use std::task::{Context, Poll, Waker};
+
+  // SHAPE 1 — a mid-reconcile terminal with every handle gone: the unwind enters the seam, and the
+  // tail then runs over an owner that has already entered it.
+  {
+    let mut h = Harness::new();
+    let sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b");
+    h.owner.epochs.stamp(sb, Epoch::new(4));
+    h.owner.source.refuse_capacity("/a", u32::MAX);
+    h.owner.source.refuse_capacity("/a/b", u32::MAX);
+    let seam = h.owner.source.seam();
+    let Harness {
+      owner,
+      events: _events,
+      _commands: commands,
+      _sync_commands,
+      closes,
+    } = h;
+    let (reply, _response) = futures_channel::oneshot::channel();
+    commands
+      .try_send(super::Command::Watch {
+        key: key("/a"),
+        value: (),
+        options: WatchOptions::new().with_interest(Interest::all()),
+        reply,
+      })
+      .expect("enqueue the widen");
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut run = Box::pin(super::run(owner));
+    assert!(run.as_mut().poll(&mut cx).is_pending(), "staging: the pace");
+    closes.close();
+    drop(commands);
+    assert!(
+      matches!(run.as_mut().poll(&mut cx), Poll::Ready(())),
+      "the handles-gone terminal breaks the loop"
+    );
+    assert_eq!(
+      seam.begin_closes(),
+      1,
+      "handles gone mid-restore: the unwind's entry and the tail's must collapse to one"
+    );
+  }
+
+  // SHAPE 2 — a mid-reconcile terminal with a CONSUMED close reply: same two callers, plus an
+  // acknowledgement that must still carry the source's quiescence verdict.
+  {
+    let mut h = Harness::new();
+    let sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b");
+    h.owner.epochs.stamp(sb, Epoch::new(4));
+    h.owner.source.refuse_capacity("/a", u32::MAX);
+    h.owner.source.refuse_capacity("/a/b", u32::MAX);
+    let seam = h.owner.source.seam();
+    let Harness {
+      owner,
+      events: _events,
+      _commands: commands,
+      _sync_commands,
+      closes,
+    } = h;
+    let (reply, _response) = futures_channel::oneshot::channel();
+    commands
+      .try_send(super::Command::Watch {
+        key: key("/a"),
+        value: (),
+        options: WatchOptions::new().with_interest(Interest::all()),
+        reply,
+      })
+      .expect("enqueue the widen");
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut run = Box::pin(super::run(owner));
+    assert!(run.as_mut().poll(&mut cx).is_pending(), "staging: the pace");
+    let (close_reply, close_response) = futures_channel::oneshot::channel();
+    closes.try_send(close_reply).expect("request the close");
+    assert!(
+      matches!(run.as_mut().poll(&mut cx), Poll::Ready(())),
+      "the consumed reply breaks the loop"
+    );
+    assert_eq!(
+      seam.begin_closes(),
+      1,
+      "a close consumed mid-restore: the unwind's entry and the tail's must collapse to one"
+    );
+    assert!(
+      matches!(close_response.await, Ok(Ok(()))),
+      "the threaded reply still carries the source's quiescence verdict"
+    );
+  }
+
+  // SHAPE 3 — an ordinary close command, no widen anywhere: the tail is the ONLY caller, so this is
+  // where a latch that suppressed it would show up.
+  {
+    let mut h = Harness::new();
+    let _sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b");
+    let seam = h.owner.source.seam();
+    let Harness {
+      owner,
+      events: _events,
+      _commands: commands,
+      _sync_commands,
+      closes,
+    } = h;
+    let (close_reply, close_response) = futures_channel::oneshot::channel();
+    closes.try_send(close_reply).expect("request the close");
+    super::run(owner).await;
+    drop(commands);
+    assert_eq!(
+      seam.begin_closes(),
+      1,
+      "an ordinary close must still tell its source to wind down"
+    );
+    assert!(
+      matches!(close_response.await, Ok(Ok(()))),
+      "and still carry the verdict back"
+    );
+  }
+
+  // SHAPE 4 — every handle dropped with no close request and no widen: the mailbox's own `Err` arm.
+  {
+    let mut h = Harness::new();
+    let _sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b");
+    let seam = h.owner.source.seam();
+    let Harness {
+      owner,
+      events: _events,
+      _commands: commands,
+      _sync_commands,
+      closes,
+    } = h;
+    closes.close();
+    drop(commands);
+    super::run(owner).await;
+    assert_eq!(
+      seam.begin_closes(),
+      1,
+      "dropped handles must still tell the source to wind down"
+    );
+  }
+
+  // SHAPE 5 — a SOURCE DRAIN with a consumer still attached: the one teardown that runs the owed-Rescan
+  // drain first, so the seam is entered ahead of a pass that itself drains grant cleanup.
+  {
+    let mut h = Harness::new();
+    let _sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b");
+    let seam = h.owner.source.seam();
+    let Harness {
+      owner,
+      events,
+      _commands: commands,
+      _sync_commands,
+      closes,
+    } = h;
+    // The fake's `next` answers `None` as soon as its scripted stream is empty, which IS the drain.
+    super::run(owner).await;
+    assert_eq!(
+      seam.begin_closes(),
+      1,
+      "a source drain must still tell the source to wind down, exactly once"
+    );
+    // What this shape pins is the COUNT above plus the seam's two ends: nothing is owed here, so the
+    // drain issues no request of its own and there is no ordering left to observe — the drain path's
+    // ordering is the tail's first statement, and the previous cell is what reads it. The bounded wait
+    // still comes last, which is the half a reordering of the tail would break here too.
+    let calls = seam.calls();
+    assert_eq!(
+      calls.last(),
+      Some(&SourceCall::JoinClose),
+      "the bounded wait is still last: {calls:?}"
+    );
+    assert!(
+      calls
+        .iter()
+        .filter(|call| **call == SourceCall::BeginClose)
+        .count()
+        == 1,
+      "and the seam appears once in the sequence too: {calls:?}"
+    );
+    drop((commands, closes, events));
+  }
+}
+
+/// The INITIAL retarget: an in-place widen that reads EVERY HANDLE GONE off its
+/// retarget race is a TERMINAL outcome, not an ordinary failed watch. It breaks the [`run`] loop, and
+/// the teardown seam is then the next `Source` interaction there is.
+///
+/// It used to `return Err(WatchError::Closed.into())` — a [`ReconcileStop::Failed`], so `on_watch`
+/// answered the caller and `dispatch_command` returned [`Flow::Continue`] and the loop ran ON: pruning
+/// abandoned barriers (→ [`Source::end_sync`]) and dispatching whatever was still BUFFERED behind the
+/// widen in the closed mailbox (→ [`Source::arm`]), every one of them AHEAD of the seam and every one
+/// of them while the abandoned retarget may still commit. [`Source::replace`] is not cancel-abortive:
+/// dropping the future abandons only the notification, never the swap.
+///
+/// The handles are retired WHILE THE RETARGET IS IN FLIGHT — the fake closes the close signal from
+/// inside `replace` and then never answers — because that is the case with an unreclaimable effect in
+/// it: the race's close arm reads the signal gone on the next poll and drops a `replace` the owner had
+/// already polled. A signal closed BEFORE the race began reaches the same arm having never issued the
+/// retarget at all, and the arm cannot tell the two apart, so pinning the one with the live effect
+/// pins both.
+///
+/// The buffered second watch is the LIVENESS half, per the seam cells above: its `arm` is WEDGED, so a
+/// loop that kept going cannot merely add a ledger entry — it parks forever on a mount that never
+/// answers, with nothing left able to preempt it, and the teardown never runs at all.
+///
+/// FAIL-ON-REVERT: put `return Err(WatchError::Closed.into())` back in the retarget's `HandlesGone`
+/// arm and the second poll is `Pending` — the loop dispatched the wedged watch and the run future
+/// never completes.
+#[tokio::test]
+async fn an_in_place_retarget_losing_every_handle_breaks_the_loop_at_the_seam() {
+  use std::task::{Context, Poll, Waker};
+
+  let mut h = Harness::new();
+  h.owner.source.supports_replace = true;
+
+  let sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b"); // handle 1
+  h.owner.epochs.stamp(sb, Epoch::new(4));
+
+  // A barrier riding root one whose caller is still WAITING (the receiver is held, so the loop-top
+  // `prune_abandoned_syncs` leaves it alone). It is the teardown's own reap, and where it lands
+  // relative to the seam is half of what this cell reads.
+  let root_b = h
+    .owner
+    .subsumer
+    .subscription_root(sb)
+    .expect("live root for /a/b");
+  let (sync_reply, sync_response) = futures_channel::oneshot::channel();
+  h.owner.pending_syncs.push(super::PendingSync {
+    cookie_key: key("/a/b/cookie-1"),
+    sub: sb,
+    root: root_b,
+    loss_serial_at_install: 0,
+    dominated_at_install: false,
+    reply: sync_reply,
+  });
+
+  // The watch buffered BEHIND the widen: a loop that keeps going dispatches it, and its arm never
+  // answers. Nothing preempts it — the close signal is already gone — so a mis-ordering is a run
+  // future that cannot complete, not one extra ledger entry.
+  h.owner.source.wedge_arm("/w");
+  // Every handle retired while the widen's retarget is in flight.
+  h.owner
+    .source
+    .close_signal_during_replace(1, h.closes.clone());
+  // Taken BEFORE the owner is moved into `run`: the seam is the last thing that happens.
+  let seam = h.owner.source.seam();
+
+  let Harness {
+    owner,
+    events: _events,
+    _commands: commands,
+    _sync_commands,
+    closes,
+  } = h;
+
+  let (widen_reply, widen_response) = futures_channel::oneshot::channel();
+  commands
+    .try_send(super::Command::Watch {
+      key: key("/a"),
+      value: (),
+      options: WatchOptions::new().with_interest(Interest::all()),
+      reply: widen_reply,
+    })
+    .expect("enqueue the widen");
+  let (wedged_reply, wedged_response) = futures_channel::oneshot::channel();
+  commands
+    .try_send(super::Command::Watch {
+      key: key("/w"),
+      value: (),
+      options: WatchOptions::new().with_interest(Interest::all()),
+      reply: wedged_reply,
+    })
+    .expect("enqueue the watch buffered behind it");
+  // The public senders drop in lockstep with the close signal the fake is about to close; both
+  // commands are already queued, and `async_channel` keeps a queued message receivable.
+  drop(commands);
+
+  let mut cx = Context::from_waker(Waker::noop());
+  let mut run = Box::pin(super::run(owner));
+
+  // Pass #1: the loop selects the widen (the command arm outranks the source arm, which matters
+  // because [`FakeSource::next`] answers `None` at once and would otherwise break the loop to a source
+  // drain), plans the in-place retarget, and parks inside `replace` — which closed the close signal on
+  // its way in.
+  assert!(
+    run.as_mut().poll(&mut cx).is_pending(),
+    "staging: the run loop is parked in the in-place retarget"
+  );
+  assert!(
+    closes.is_closed(),
+    "staging: the retarget retired every handle while it was in flight"
+  );
+
+  match run.as_mut().poll(&mut cx) {
+    Poll::Ready(()) => {}
+    Poll::Pending => panic!(
+      "the handles-gone retarget failed the watch instead of breaking the loop, so the loop went on \
+       to dispatch the watch buffered behind it and parked on its wedged mount — nothing is left to \
+       interrupt it, and teardown never runs"
+    ),
+  }
+
+  // THE ORDER. Total, in sequence, for the whole life of the source:
+  //
+  //   the establishing watch (canonicalize, arm, the choke point's liveness probe),
+  //   the widen's canonicalize, the sole subsumed root's pre-retarget key probe, the abandoned
+  //   retarget,
+  //   → THE SEAM ←
+  //   the teardown's cookie reap, then the bounded quiescence wait.
+  //
+  // The wedged watch contributes NOTHING: the break came before it was ever dispatched.
+  assert_eq!(
+    seam.calls(),
+    vec![
+      SourceCall::CanonicalizeKey(key("/a/b")),
+      SourceCall::Arm(PathBuf::from("/a/b")),
+      SourceCall::RootKey(1),
+      SourceCall::CanonicalizeKey(key("/a")),
+      SourceCall::RootKey(1),
+      SourceCall::Replace(1),
+      SourceCall::BeginClose,
+      SourceCall::EndSync(key("/a/b/cookie-1")),
+      SourceCall::JoinClose,
+    ],
+    "the abandoned retarget must be followed by the seam, not by another Source call"
+  );
+  assert_eq!(
+    seam.begin_closes(),
+    1,
+    "the seam is entered exactly once, however many callers could have entered it"
+  );
+
+  // The abandoned widen's caller is answered by a DROPPED reply, not by an error over a teardown —
+  // and the watch behind it never reached the source at all.
+  assert!(
+    widen_response.await.is_err(),
+    "the abandoned widen's reply is dropped rather than answered over a teardown"
+  );
+  assert!(
+    wedged_response.await.is_err(),
+    "the watch buffered behind it was never dispatched"
+  );
+  assert!(
+    sync_response.await.is_err(),
+    "a barrier still pending at teardown reads as Closed"
+  );
+}
+
+/// The ROLLBACK retarget — the same terminal claim for the widen's SECOND `replace`, proven
+/// separately because it is a separate arm on a separate race, and neither arm inherits the other's
+/// treatment.
+///
+/// The first retarget COMMITS at a divergent `/z`, which contains none of the subsumed roots, so
+/// `fs_path_preserves_plan` rejects it and the owner rolls the retarget back to `/a/b`. It is that
+/// ROLLBACK which loses every handle mid-flight, and it leaves the preserved handle at the divergent
+/// WIDER key with the rollback abandoned — so a `Failed` verdict would let the loop go on planning
+/// against a coverage picture that is already wrong and may change again underneath it.
+///
+/// FAIL-ON-REVERT: put `return Err(WatchError::Closed.into())` back in the ROLLBACK's `HandlesGone`
+/// arm and the second poll is `Pending` — the loop dispatched the wedged watch buffered behind the
+/// widen and parked on a mount that never answers.
+#[tokio::test]
+async fn an_in_place_rollback_losing_every_handle_breaks_the_loop_at_the_seam() {
+  use std::task::{Context, Poll, Waker};
+
+  let mut h = Harness::new();
+  h.owner.source.supports_replace = true;
+
+  let sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b"); // handle 1
+  h.owner.epochs.stamp(sb, Epoch::new(4));
+
+  let root_b = h
+    .owner
+    .subsumer
+    .subscription_root(sb)
+    .expect("live root for /a/b");
+  let (sync_reply, sync_response) = futures_channel::oneshot::channel();
+  h.owner.pending_syncs.push(super::PendingSync {
+    cookie_key: key("/a/b/cookie-1"),
+    sub: sb,
+    root: root_b,
+    loss_serial_at_install: 0,
+    dominated_at_install: false,
+    reply: sync_reply,
+  });
+
+  // The widen of `/a` commits at `/z` — a key containing no subsumed root — so the owner rolls back.
+  h.owner.source.retarget("/a", "/z");
+  // …and it is the ROLLBACK (ordinal two) that loses every handle while in flight.
+  h.owner
+    .source
+    .close_signal_during_replace(2, h.closes.clone());
+  h.owner.source.wedge_arm("/w");
+  let seam = h.owner.source.seam();
+
+  let Harness {
+    owner,
+    events: _events,
+    _commands: commands,
+    _sync_commands,
+    closes,
+  } = h;
+
+  let (widen_reply, widen_response) = futures_channel::oneshot::channel();
+  commands
+    .try_send(super::Command::Watch {
+      key: key("/a"),
+      value: (),
+      options: WatchOptions::new().with_interest(Interest::all()),
+      reply: widen_reply,
+    })
+    .expect("enqueue the widen");
+  let (wedged_reply, wedged_response) = futures_channel::oneshot::channel();
+  commands
+    .try_send(super::Command::Watch {
+      key: key("/w"),
+      value: (),
+      options: WatchOptions::new().with_interest(Interest::all()),
+      reply: wedged_reply,
+    })
+    .expect("enqueue the watch buffered behind it");
+  drop(commands);
+
+  let mut cx = Context::from_waker(Waker::noop());
+  let mut run = Box::pin(super::run(owner));
+
+  assert!(
+    run.as_mut().poll(&mut cx).is_pending(),
+    "staging: the run loop is parked in the divergence rollback"
+  );
+  assert!(
+    closes.is_closed(),
+    "staging: the rollback retired every handle while it was in flight"
+  );
+
+  match run.as_mut().poll(&mut cx) {
+    Poll::Ready(()) => {}
+    Poll::Pending => panic!(
+      "the handles-gone ROLLBACK failed the watch instead of breaking the loop, so the loop went on \
+       to dispatch the watch buffered behind it and parked on its wedged mount"
+    ),
+  }
+
+  // Two retargets ahead of the seam — the divergent commit and the abandoned rollback — and not one
+  // Source call between the abandoned one and `BeginClose`.
+  assert_eq!(
+    seam.calls(),
+    vec![
+      SourceCall::CanonicalizeKey(key("/a/b")),
+      SourceCall::Arm(PathBuf::from("/a/b")),
+      SourceCall::RootKey(1),
+      SourceCall::CanonicalizeKey(key("/a")),
+      SourceCall::RootKey(1),
+      SourceCall::Replace(1),
+      SourceCall::Replace(1),
+      SourceCall::BeginClose,
+      SourceCall::EndSync(key("/a/b/cookie-1")),
+      SourceCall::JoinClose,
+    ],
+    "the abandoned rollback must be followed by the seam, not by another Source call"
+  );
+  assert_eq!(
+    seam.begin_closes(),
+    1,
+    "the seam is entered exactly once, however many callers could have entered it"
+  );
+
+  assert!(
+    widen_response.await.is_err(),
+    "the abandoned widen's reply is dropped rather than answered over a teardown"
+  );
+  assert!(
+    wedged_response.await.is_err(),
+    "the watch buffered behind it was never dispatched"
+  );
+  assert!(
+    sync_response.await.is_err(),
+    "a barrier still pending at teardown reads as Closed"
+  );
+}
+
+/// The DROPPED driver future: a caller that drops the [`run`] future never reaches
+/// its teardown tail, and the tail is where the seam is entered. Yet the owner's destructor still calls
+/// the source — [`Source::end_sync`], once per cookie still pending — so leaving the seam to the tail
+/// left this path issuing `Source` calls with ZERO `begin_close` behind them, against a contract that
+/// specifies exactly one. `Source::Drop` cannot cover it: the owner's fields drop only AFTER the
+/// destructor body, so it is strictly behind every callback in it.
+///
+/// The future is dropped while parked in a WEDGED [`Source::arm`], which is the state that makes the
+/// ordering matter rather than merely the count: the cancelled arm is the one call nothing short of the
+/// source's own teardown can reclaim, so a reap issued ahead of the seam here is exactly the pre-seam
+/// re-entry the moved seam exists to forbid.
+///
+/// The ledger ends at the reap: a synchronous destructor cannot await, so there is no `JoinClose` on
+/// this path at all — which [`Source::begin_close`] documents as the abnormal-teardown shape.
+///
+/// FAIL-ON-REVERT: delete the destructor's seam entry and the ledger reads `… Arm(/x), EndSync(…)` —
+/// a `Source` call past a cancelled arm with the source never told to wind down, and
+/// `begin_closes()` reads 0 against a once-per-source contract.
+#[tokio::test]
+async fn dropping_the_driver_future_enters_the_seam_before_its_cookie_reap() {
+  use std::task::{Context, Waker};
+
+  let mut h = Harness::new();
+  let sa = h.watch("/a", Interest::all()).await.expect("watch /a"); // handle 1
+
+  let root_a = h
+    .owner
+    .subsumer
+    .subscription_root(sa)
+    .expect("live root for /a");
+  let (sync_reply, sync_response) = futures_channel::oneshot::channel();
+  h.owner.pending_syncs.push(super::PendingSync {
+    cookie_key: key("/a/cookie-3"),
+    sub: sa,
+    root: root_a,
+    loss_serial_at_install: 0,
+    dominated_at_install: false,
+    reply: sync_reply,
+  });
+
+  // The mount the future is dropped on: this arm never answers, so the future is dropped with a
+  // `Source::arm` genuinely in flight.
+  h.owner.source.wedge_arm("/x");
+  let seam = h.owner.source.seam();
+  // Read AFTER the owner is gone: the destructor's own read-plane guarantee is asserted alongside the
+  // seam, because the ordering between them is the one this cell must not silently swap.
+  let view = h.owner.subsumer.view();
+
+  let Harness {
+    owner,
+    events: _events,
+    _commands: commands,
+    _sync_commands,
+    closes: _closes,
+  } = h;
+
+  let (reply, response) = futures_channel::oneshot::channel();
+  commands
+    .try_send(super::Command::Watch {
+      key: key("/x"),
+      value: (),
+      options: WatchOptions::new().with_interest(Interest::all()),
+      reply,
+    })
+    .expect("enqueue the watch that parks");
+
+  let mut cx = Context::from_waker(Waker::noop());
+  let mut run = Box::pin(super::run(owner));
+  assert!(
+    run.as_mut().poll(&mut cx).is_pending(),
+    "staging: the run loop is parked in the wedged arm"
+  );
+
+  // The caller drops the driver future — a cancelled task, not a teardown. The owner is dropped with
+  // it, and its destructor is the only thing that still runs.
+  drop(run);
+
+  assert_eq!(
+    seam.calls(),
+    vec![
+      SourceCall::CanonicalizeKey(key("/a")),
+      SourceCall::Arm(PathBuf::from("/a")),
+      SourceCall::RootKey(1),
+      SourceCall::CanonicalizeKey(key("/x")),
+      SourceCall::Arm(PathBuf::from("/x")),
+      SourceCall::BeginClose,
+      SourceCall::EndSync(key("/a/cookie-3")),
+    ],
+    "the destructor's cookie reap must land PAST the seam, and the seam is the only thing between it \
+     and the cancelled arm"
+  );
+  assert_eq!(
+    seam.begin_closes(),
+    1,
+    "a dropped driver future still tells its source to wind down — exactly once"
+  );
+
+  // The read plane is still emptied FIRST, which the ledger cannot say: the seam entry was inserted
+  // below that publish precisely so a panicking `begin_close` cannot leave stale coverage advertised.
+  assert!(
+    !view.is_watched(&key("/a")),
+    "the destructor emptied the read plane — no stale coverage for a dropped owner"
+  );
+  assert!(
+    response.await.is_err(),
+    "the parked watch's reply is dropped rather than answered"
+  );
+  assert!(
+    sync_response.await.is_err(),
+    "the reaped barrier's caller sees the dropped reply as Closed"
+  );
+}
+
+/// The PANIC UNWIND — the destructor's other caller-less termination, and the one
+/// where getting it wrong costs more than an ordering. `Owner::drop` runs here with a panic already in
+/// flight, so a second unwind out of it is not a contained failure but an immediate process ABORT: the
+/// seam entry is therefore contained on its own, exactly as each cookie reap is, and it sits BELOW the
+/// read-plane publish so one misbehaving `begin_close` cannot leave a retained [`WatchView`]
+/// advertising a dead owner's coverage.
+///
+/// The panic comes out of [`Source::arm`] — a public extension point the owner runs on its own thread
+/// with nothing to race against — and unwinds through the whole run future. The future is owned by the
+/// closure under [`std::panic::catch_unwind`], so the owner is dropped BY that unwind rather than
+/// after it.
+///
+/// FAIL-ON-REVERT: delete the destructor's seam entry and the ledger reads `… Arm(/x), EndSync(…)`
+/// with `begin_closes()` at 0 — a `Source` call on an unwinding owner's way out with the source never
+/// told to wind down.
+#[tokio::test]
+async fn a_panic_unwinding_through_the_driver_future_enters_the_seam_before_its_cookie_reap() {
+  use std::task::{Context, Waker};
+
+  let mut h = Harness::new();
+  let sa = h.watch("/a", Interest::all()).await.expect("watch /a"); // handle 1
+
+  let root_a = h
+    .owner
+    .subsumer
+    .subscription_root(sa)
+    .expect("live root for /a");
+  let (sync_reply, sync_response) = futures_channel::oneshot::channel();
+  h.owner.pending_syncs.push(super::PendingSync {
+    cookie_key: key("/a/cookie-4"),
+    sub: sa,
+    root: root_a,
+    loss_serial_at_install: 0,
+    dominated_at_install: false,
+    reply: sync_reply,
+  });
+
+  // The arm that PANICS rather than answering — the unwind this destructor's containment exists for.
+  h.owner.source.panic_arm("/x");
+  let seam = h.owner.source.seam();
+  let view = h.owner.subsumer.view();
+
+  let Harness {
+    owner,
+    events: _events,
+    _commands: commands,
+    _sync_commands,
+    closes: _closes,
+  } = h;
+
+  let (reply, response) = futures_channel::oneshot::channel();
+  commands
+    .try_send(super::Command::Watch {
+      key: key("/x"),
+      value: (),
+      options: WatchOptions::new().with_interest(Interest::all()),
+      reply,
+    })
+    .expect("enqueue the watch that panics");
+
+  // The run future lives INSIDE the caught frame, so the unwind out of its `poll` is what drops the
+  // owner — the destructor runs mid-panic, which is the case that must not double-unwind.
+  let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut run = Box::pin(super::run(owner));
+    let _ = run.as_mut().poll(&mut cx);
+  }));
+  assert!(
+    unwound.is_err(),
+    "staging: the source's panic unwound out of the run future"
+  );
+
+  assert_eq!(
+    seam.calls(),
+    vec![
+      SourceCall::CanonicalizeKey(key("/a")),
+      SourceCall::Arm(PathBuf::from("/a")),
+      SourceCall::RootKey(1),
+      SourceCall::CanonicalizeKey(key("/x")),
+      SourceCall::Arm(PathBuf::from("/x")),
+      SourceCall::BeginClose,
+      SourceCall::EndSync(key("/a/cookie-4")),
+    ],
+    "the unwinding owner's cookie reap must land PAST the seam"
+  );
+  assert_eq!(
+    seam.begin_closes(),
+    1,
+    "a panic unwinding through the owner still tells its source to wind down — exactly once"
+  );
+  // Unchanged by the insertion, and the reason it goes below the publish rather than above it.
+  assert!(
+    !view.is_watched(&key("/a")),
+    "the destructor still emptied the read plane on the panic path"
+  );
+  assert!(
+    response.await.is_err(),
+    "the panicked watch's reply is gone"
+  );
+  assert!(
+    sync_response.await.is_err(),
+    "the reaped barrier's caller sees the dropped reply as Closed"
   );
 }
 
@@ -4557,7 +7529,7 @@ async fn widen_drops_buffered_coalescer_delta_so_repoint_rescan_parks_at_own_epo
   let cfg = DebounceConfig::new()
     .with_quiet_window(Duration::from_secs(3600))
     .with_max_hold(Duration::from_secs(7200));
-  let mut h = Harness::build(Some(Coalescer::new(Some(cfg))), Some(2));
+  let mut h = Harness::build(Some(Coalescer::new(Some(cfg))), Some(2), None);
   let sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b"); // root 1
   for raw in 0..5 {
     h.owner.epochs.stamp(sb, Epoch::new(raw)); // high-water 4
@@ -4933,7 +7905,7 @@ async fn source_drain_orders_parked_rescan_before_its_buffered_tail() {
   let cfg = DebounceConfig::new()
     .with_quiet_window(Duration::from_secs(3600))
     .with_max_hold(Duration::from_secs(7200));
-  let mut h = Harness::build(Some(Coalescer::new(Some(cfg))), Some(1));
+  let mut h = Harness::build(Some(Coalescer::new(Some(cfg))), Some(1), None);
   let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
   for raw in 0..2 {
     h.owner.epochs.stamp(sub, Epoch::new(raw)); // high-water 1
@@ -5103,7 +8075,7 @@ async fn source_drain_close_interrupt_still_runs_a_final_owed_pass() {
   );
 
   // `run`'s tail: because the drain returned `Some(reply)`, run ONE final best-effort owed pass
-  // before publish_empty + ack. The slot is now free, so this delivers the owed Rescan.
+  // before the empty publish + ack. The slot is now free, so this delivers the owed Rescan.
   h.owner.drain_owed_once();
   // Ack exactly as `run` does; the close() caller then completes.
   close_reply.send(Ok(())).expect("ack the close");
@@ -5217,7 +8189,7 @@ async fn close_tail_drains_cleanup_not_public_backlog() {
   h.owner.drain_owed_once();
 
   // The final pass delivered the now-owed Rescan BEFORE the ack is sent (mirroring `run`'s tail order:
-  // drain_pending_cleanup → drain_owed_once → publish_empty → reply.send). Assert it is observable now.
+  // drain_pending_cleanup → drain_owed_once → swap_in_empty → reply.send). Assert it is observable now.
   let delivered = h.drain();
   assert!(
     delivered
@@ -5450,12 +8422,14 @@ impl OwnerU64 {
     let (cleanup_tx, cleanup_rx) = async_channel::unbounded();
     let owner = Owner {
       source: FakeSource::new(),
+      source_closing: false,
+      deferred: crate::subsume::Salvage::new(),
       subsumer: Subsumer::new(),
       epochs: EpochLedger::new(),
-      filters: HashMap::new(),
+      filters: Filters::new(),
       filter_payload_forgotten: false,
-      needs_rescan: BTreeMap::new(),
-      suppressed_rescan: BTreeMap::new(),
+      needs_rescan: ParkedRescans::new(),
+      suppressed_rescan: ParkedRescans::new(),
       unclaimed: std::collections::HashSet::new(),
       flush_cursor: None,
       #[cfg(test)]
@@ -5506,7 +8480,7 @@ async fn delivered_delta_carries_owning_subscription_value() {
   let mut rig = OwnerU64::new(8, None);
   let sub = rig
     .owner
-    .reconcile_watch(&key("/a"), 42, WatchOptions::new())
+    .reconcile_watch(&key("/a"), &42, WatchOptions::new())
     .await
     .expect("watch /a");
 
@@ -5549,12 +8523,12 @@ async fn baked_value_attributes_queued_events_after_teardown_empties_view() {
 
   let a = rig
     .owner
-    .reconcile_watch(&key("/a"), 7, WatchOptions::new())
+    .reconcile_watch(&key("/a"), &7, WatchOptions::new())
     .await
     .expect("watch /a"); // root handle 1
   let b = rig
     .owner
-    .reconcile_watch(&key("/b"), 9, WatchOptions::new())
+    .reconcile_watch(&key("/b"), &9, WatchOptions::new())
     .await
     .expect("watch /b"); // root handle 2
 
@@ -5592,7 +8566,7 @@ async fn baked_value_attributes_queued_events_after_teardown_empties_view() {
 
   // Publish the EMPTY read plane exactly as `run()` does at teardown: the view now reports
   // nothing watched, so `resolve` can no longer attribute the still-queued events.
-  rig.owner.subsumer.publish_empty();
+  drop(rig.owner.subsumer.swap_in_empty());
   assert!(
     view.resolve(&key("/b")).is_none(),
     "teardown emptied the view — resolve now attributes NOTHING for the queued tail delta"
@@ -5696,7 +8670,7 @@ async fn owner_drop_publishes_empty_read_plane_on_a_panicking_caller_callback() 
     .owner
     .reconcile_watch(
       &key("/a"),
-      (),
+      &(),
       WatchOptions::new().with_filter(Filter::new(|_| -> bool {
         panic!("caller filter predicate panics inside fan-out")
       })),
@@ -5776,6 +8750,4247 @@ async fn owner_teardown_reaps_every_cookie_although_a_payload_panics_as_it_is_di
     COOKIES,
     "a payload that panics as it is disposed of skipped the cookies queued behind it — each \
      one is a marker file left on the caller's filesystem"
+  );
+}
+
+/// The SAME reap on the other teardown path: [`run`]'s tail reaps every still-pending cookie under a
+/// containment of its own, so one panicking [`Source::end_sync`] can neither leave the cookies queued
+/// behind it on the caller's filesystem nor answer `close()` for the source.
+///
+/// The tail's reap is the destructor's reap reached from the other direction, and it is the more
+/// expensive one to lose. The destructor has nothing behind it but its own field drops; the tail
+/// still owes the bounded [`join_close`](Source::join_close) and the acknowledgement carrying its
+/// verdict, and the destructor that runs next can make NEITHER — it cannot await, and it is not
+/// given the reply. So an unwind out of the first reap leaves `run` itself and the caller's
+/// `close()` reads the dropped sender as [`Stopped`](crate::error::CloseError::Stopped) over a
+/// source teardown nobody waited for. [`Source`] is a public extension point exactly like the
+/// caller's `C`/`V`, so this is the downgrade the sibling teardown cells close, reached through the
+/// source rather than through a caller value.
+///
+/// Three cookies with the hostile one FIRST, because the claim is about the boundary's PLACEMENT:
+/// containment around the whole loop would catch the same panic and still skip the two behind it.
+///
+/// The payload is hostile too ([`PanicsOnDrop`]), and here that is owed for the same reason the reap
+/// is rather than for the destructor's. This tail never runs on an unwind — a panic inside the loop
+/// above skips it entirely — so a second unwind is no process abort; it is simply one more way to
+/// escape `run` ahead of the wait and the acknowledgement.
+///
+/// FAIL-ON-REVERT: drop the containment from [`reap_cookie`](Owner::reap_cookie) — the funnel
+/// [`reap_all_pending_syncs`](Owner::reap_all_pending_syncs) reaps through — and the first reap's
+/// unwind carries off the `mem::take`n vector: the two cookies behind it are reaped by neither the
+/// tail NOR the destructor, since the take already emptied `pending_syncs`, while the ledger ends
+/// without `JoinClose` and `close()` reports `Stopped`. Give that funnel a bare `catch_unwind` whose
+/// `Err` falls out of scope instead, and the payload's own destructor unwinds one line further out
+/// to exactly the same effect.
+#[tokio::test]
+async fn the_tails_cookie_reap_survives_a_panicking_end_sync_and_still_carries_the_verdict() {
+  use std::task::{Context, Poll, Waker};
+
+  let mut h = Harness::new();
+  let sa = h.watch("/a", Interest::all()).await.expect("watch /a"); // handle 1
+  let root_a = h
+    .owner
+    .subsumer
+    .subscription_root(sa)
+    .expect("live root for /a");
+
+  let mut sync_responses = Vec::new();
+  for leaf in ["/a/cookie-tail-boom", "/a/cookie-2", "/a/cookie-3"] {
+    let (sync_reply, sync_response) = futures_channel::oneshot::channel();
+    sync_responses.push(sync_response);
+    h.owner.pending_syncs.push(super::PendingSync {
+      cookie_key: key(leaf),
+      sub: sa,
+      root: root_a,
+      loss_serial_at_install: 0,
+      dominated_at_install: false,
+      reply: sync_reply,
+    });
+  }
+
+  // Read AFTER the owner has been moved into `run` and dropped: the reaps and the bounded wait are
+  // the last things that happen, so a ledger reachable through `h.owner` could not testify.
+  let seam = h.owner.source.seam();
+
+  let Harness {
+    owner,
+    events: _events,
+    _commands,
+    _sync_commands,
+    closes,
+  } = h;
+
+  // Injected exactly as `Tributaries::close` does, before the first poll, so the loop's dedicated
+  // close arm wins its first iteration and the tail is all this cell drives.
+  let (close_reply, close_response) = futures_channel::oneshot::channel();
+  closes.try_send(close_reply).expect("request the close");
+
+  let mut cx = Context::from_waker(Waker::noop());
+  let mut run = Box::pin(super::run(owner));
+  // Contained HERE too, so an escape is observed by this cell rather than by the harness: the
+  // assertions below are what must fail, and they can only run if the poll returns. Through
+  // [`contain`](tributary_proto::unwind::contain) rather than a bare `catch_unwind` so the hostile
+  // payload a REVERTED reap hands back is retired before the failing assertion below unwinds past
+  // it — a bare `catch_unwind` leaves it in scope, and the revert aborts the test binary on the
+  // payload's second unwind instead of reporting which claim broke.
+  let drove = tributary_proto::unwind::contain(|| run.as_mut().poll(&mut cx));
+
+  assert!(
+    matches!(drove, Ok(Poll::Ready(()))),
+    "a panicking `Source::end_sync` must not leave the tail — the reap is contained in the funnel \
+     the tail reaps through, not allowed out through the owner's spawner"
+  );
+  // THE VERDICT, because it is the whole claim: `Stopped` is what a dropped sender reads as, and a
+  // reap that unwound out of the tail dropped exactly that sender.
+  assert!(
+    matches!(close_response.await, Ok(Ok(()))),
+    "close() must still carry the SOURCE's quiescence verdict, not a Stopped invented by an \
+     `end_sync` that unwound out of the tail's reap"
+  );
+
+  let calls = seam.calls();
+  let split = calls
+    .iter()
+    .position(|call| *call == SourceCall::BeginClose)
+    .unwrap_or_else(|| panic!("the tail never entered the seam: {calls:?}"));
+  assert_eq!(
+    &calls[split..],
+    &[
+      SourceCall::BeginClose,
+      SourceCall::EndSync(key("/a/cookie-tail-boom")),
+      SourceCall::EndSync(key("/a/cookie-2")),
+      SourceCall::EndSync(key("/a/cookie-3")),
+      SourceCall::JoinClose,
+    ],
+    "every cookie queued behind the panicking reap is still reaped, and the bounded wait is still \
+     made ahead of the acknowledgement: {calls:?}"
+  );
+  assert_eq!(
+    seam.begin_closes(),
+    1,
+    "the seam is entered exactly once however the reaps behind it behave"
+  );
+
+  for sync_response in sync_responses {
+    assert!(
+      sync_response.await.is_err(),
+      "a barrier still pending at teardown reads as Closed"
+    );
+  }
+}
+
+/// The teardown seam's own initiation as the misbehaving extension point, entered from [`run`]'s
+/// TAIL: [`begin_source_close`](Owner::begin_source_close) contains the source call it makes, so a
+/// panicking [`Source::begin_close`] cannot carry off every reap, the bounded wait and the
+/// acknowledgement behind it. The mid-reconcile entry is the sibling cell; this one is the entry
+/// with the whole tail behind it.
+///
+/// This is the ONE `Source` call the tail makes before its reaps. `Owner::drop` enters the same
+/// funnel — for the abnormal terminations, where a second unwind is an immediate process abort —
+/// and the mitigation that gives the tail is real but partial: the
+/// `source_closing` latch is set BEFORE the source is called, so an escaping panic still leaves the
+/// destructor able to reap and empty the read plane, and its own contained entry is a no-op rather
+/// than a second `begin_close`. What the destructor cannot do is the rest: it cannot await
+/// [`join_close`](Source::join_close) and it is not given the close reply, so an uncontained
+/// initiation costs exactly the source's quiescence VERDICT and the caller's acknowledgement —
+/// `close()` reads the dropped sender as [`Stopped`](crate::error::CloseError::Stopped) over a
+/// teardown nobody waited for.
+///
+/// Two cookies are left pending so the reaps are observable as well as the verdict: they are what
+/// stands between the panicking initiation and the wait, and a boundary placed anywhere later than
+/// this call would lose them.
+///
+/// The payload is hostile ([`PanicsOnDrop`]), which is what distinguishes
+/// [`contain`](tributary_proto::unwind::contain) from a bare `catch_unwind` here exactly as it does
+/// at the sibling reap.
+///
+/// FAIL-ON-REVERT: drop the containment from inside
+/// [`begin_source_close`](Owner::begin_source_close) and the panic leaves `run`'s poll — the cell's
+/// own boundary reports `Err`, the ledger ends at the destructor's reaps with no `JoinClose`, and
+/// `close()` answers off a dropped sender. `begin_closes()` reads 1 either way, which is the point:
+/// the latch was never the part that was missing.
+#[tokio::test]
+async fn the_tails_seam_entry_survives_a_panicking_begin_close_and_still_reaps_and_answers() {
+  use std::task::{Context, Poll, Waker};
+
+  let mut h = Harness::new();
+  let sa = h.watch("/a", Interest::all()).await.expect("watch /a"); // handle 1
+  let root_a = h
+    .owner
+    .subsumer
+    .subscription_root(sa)
+    .expect("live root for /a");
+
+  let mut sync_responses = Vec::new();
+  for leaf in ["/a/cookie-2", "/a/cookie-3"] {
+    let (sync_reply, sync_response) = futures_channel::oneshot::channel();
+    sync_responses.push(sync_response);
+    h.owner.pending_syncs.push(super::PendingSync {
+      cookie_key: key(leaf),
+      sub: sa,
+      root: root_a,
+      loss_serial_at_install: 0,
+      dominated_at_install: false,
+      reply: sync_reply,
+    });
+  }
+
+  h.owner.source.panic_begin_close();
+
+  // Read AFTER the owner has been moved into `run` and dropped: the seam is the last thing that
+  // happens, so a ledger reachable through `h.owner` could not testify.
+  let seam = h.owner.source.seam();
+
+  let Harness {
+    owner,
+    events: _events,
+    _commands,
+    _sync_commands,
+    closes,
+  } = h;
+
+  // Injected exactly as `Tributaries::close` does, before the first poll, so the loop's dedicated
+  // close arm wins its first iteration and the tail is all this cell drives.
+  let (close_reply, close_response) = futures_channel::oneshot::channel();
+  closes.try_send(close_reply).expect("request the close");
+
+  let mut cx = Context::from_waker(Waker::noop());
+  let mut run = Box::pin(super::run(owner));
+  // Contained HERE too, so an escape is observed by this cell rather than by the harness — and
+  // through [`contain`](tributary_proto::unwind::contain) rather than a bare `catch_unwind` so the
+  // hostile payload a REVERTED tail hands back is retired before the failing assertion below unwinds
+  // past it. A bare `catch_unwind` would leave it in scope, and the revert would abort the test
+  // binary instead of reporting which claim broke.
+  let drove = tributary_proto::unwind::contain(|| run.as_mut().poll(&mut cx));
+
+  assert!(
+    matches!(drove, Ok(Poll::Ready(()))),
+    "a panicking `Source::begin_close` must not leave the tail — the seam entry is contained in the \
+     funnel the tail enters, not allowed out through the owner's spawner"
+  );
+  // THE VERDICT, because it is what the destructor behind an escaping panic could never supply.
+  assert!(
+    matches!(close_response.await, Ok(Ok(()))),
+    "close() must still carry the SOURCE's quiescence verdict, not a Stopped invented by a \
+     `begin_close` that unwound out of the tail's seam entry"
+  );
+
+  let calls = seam.calls();
+  let split = calls
+    .iter()
+    .position(|call| *call == SourceCall::BeginClose)
+    .unwrap_or_else(|| panic!("the tail never entered the seam: {calls:?}"));
+  assert_eq!(
+    &calls[split..],
+    &[
+      SourceCall::BeginClose,
+      SourceCall::EndSync(key("/a/cookie-2")),
+      SourceCall::EndSync(key("/a/cookie-3")),
+      SourceCall::JoinClose,
+    ],
+    "every cookie behind the panicking initiation is still reaped, and the bounded wait is still \
+     made ahead of the acknowledgement: {calls:?}"
+  );
+  assert_eq!(
+    seam.begin_closes(),
+    1,
+    "the latch is set BEFORE the source is called, so an initiation that unwound still counts as \
+     the one entry and the destructor's own contained entry behind it is a no-op"
+  );
+
+  for sync_response in sync_responses {
+    assert!(
+      sync_response.await.is_err(),
+      "a barrier still pending at teardown reads as Closed"
+    );
+  }
+}
+
+/// The SAME initiation misbehaving at the OTHER kind of entry: a **mid-reconcile terminal mint**,
+/// which enters the seam before it retires anything and is nowhere near [`run`]'s tail. A failed
+/// widen whose restore reads a close reply retires every root still awaiting restoration, and
+/// [`begin_close_then_retire_disarmed_roots`](Owner::begin_close_then_retire_disarmed_roots) enters
+/// the seam as its first statement to keep that retirement's own `Source` calls on the far side of
+/// the initiation.
+///
+/// A boundary written at the TAIL's call site covers none of this. The unwind here leaves the
+/// reconcile, `dispatch_command` and the [`run`] loop itself, so the tail is never reached at all:
+/// no cookie reap, no bounded [`join_close`](Source::join_close), and no acknowledgement — the
+/// caller's `close()` reads the dropped sender as [`Stopped`](crate::error::CloseError::Stopped)
+/// over a teardown nobody waited for. Nor can [`Owner::drop`] repair it: the latch this entry
+/// already set makes the destructor's own entry a no-op, and the destructor can make neither the
+/// wait nor the acknowledgement regardless. That is why the containment lives inside
+/// [`begin_source_close`](Owner::begin_source_close) rather than at the entries — the funnel
+/// performs the act, so an entry cannot forget the boundary.
+///
+/// A cookie rides the retired root, so the reaps are observable as well as the verdict: they are
+/// what stands between the panicking initiation and the wait on THIS path, exactly as the two
+/// pending cookies do on the tail's.
+///
+/// The close arrives as a REPLY on the dedicated signal rather than as a closed channel, because the
+/// acknowledgement is half the claim: a handles-gone terminal has nobody to answer, so it could
+/// witness the reaps and the wait but never the verdict reaching a caller.
+///
+/// FAIL-ON-REVERT: drop the containment from
+/// [`begin_source_close`](Owner::begin_source_close) and the panic leaves `run`'s poll — the cell's
+/// own boundary reports `Err`, the ledger ends at the destructor's reap with no `JoinClose`, and
+/// `close()` answers off a dropped sender. Put a boundary back at `run`'s tail INSTEAD and nothing
+/// changes: this entry is not the tail's.
+#[tokio::test]
+async fn a_mid_reconcile_seam_entry_survives_a_panicking_begin_close_and_still_reaps_and_answers() {
+  use std::task::{Context, Poll, Waker};
+
+  let mut h = Harness::new();
+
+  let sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b"); // handle 1
+  let sc = h.watch("/a/c", Interest::all()).await.expect("watch /a/c"); // handle 2
+  h.owner.epochs.stamp(sb, Epoch::new(4));
+  h.owner.epochs.stamp(sc, Epoch::new(2));
+
+  // The barrier that makes the retirement reach the source behind the panicking initiation. Its
+  // receiver is HELD, so the loop-top `prune_abandoned_syncs` leaves it alone.
+  let root_b = h
+    .owner
+    .subsumer
+    .subscription_root(sb)
+    .expect("live root for /a/b");
+  let (sync_reply, sync_response) = futures_channel::oneshot::channel();
+  h.owner.pending_syncs.push(super::PendingSync {
+    cookie_key: key("/a/b/cookie-1"),
+    sub: sb,
+    root: root_b,
+    loss_serial_at_install: 0,
+    dominated_at_install: false,
+    reply: sync_reply,
+  });
+
+  // The wider arm and root ONE's re-arm are refused on the retryable kind and never clear, so the
+  // restore parks in root one's pace — where the close reply lands.
+  h.owner.source.refuse_capacity("/a", u32::MAX);
+  h.owner.source.refuse_capacity("/a/b", u32::MAX);
+  // Root two must never be armed, so a restore that carried on past the terminal cannot come back.
+  h.owner.source.wedge_arm("/a/c");
+  h.owner.source.panic_begin_close();
+
+  // Taken BEFORE the owner is moved into `run`: the wait is the last thing that happens, so the
+  // ledger has to outlive the source it records.
+  let seam = h.owner.source.seam();
+
+  let Harness {
+    owner,
+    events: _events,
+    _commands: commands,
+    _sync_commands,
+    closes,
+  } = h;
+
+  let (widen_reply, widen_response) = futures_channel::oneshot::channel();
+  commands
+    .try_send(super::Command::Watch {
+      key: key("/a"),
+      value: (),
+      options: WatchOptions::new().with_interest(Interest::all()),
+      reply: widen_reply,
+    })
+    .expect("enqueue the widen");
+
+  let mut cx = Context::from_waker(Waker::noop());
+  let mut run = Box::pin(super::run(owner));
+
+  assert!(
+    run.as_mut().poll(&mut cx).is_pending(),
+    "staging: the run loop is parked in the restore's retry pace"
+  );
+
+  // Injected exactly as `Tributaries::close` does — a REPLY, so the teardown owes an
+  // acknowledgement. The pace's close arm is polled first, so this ends the restore on its next
+  // pass, with the reply consumed and in hand.
+  let (close_reply, close_response) = futures_channel::oneshot::channel();
+  closes.try_send(close_reply).expect("request the close");
+
+  // Contained HERE too, so an escape is observed by this cell rather than by the harness — and
+  // through [`contain`](tributary_proto::unwind::contain) rather than a bare `catch_unwind` so the
+  // hostile payload a REVERTED funnel hands back is retired before the failing assertion below
+  // unwinds past it.
+  let drove = tributary_proto::unwind::contain(|| run.as_mut().poll(&mut cx));
+
+  assert!(
+    matches!(drove, Ok(Poll::Ready(()))),
+    "a panicking `Source::begin_close` must not leave a MID-RECONCILE terminal — the seam entry is \
+     contained in the funnel every entry goes through, not only at the tail's"
+  );
+  // THE VERDICT, and on this path it is what an uncontained initiation costs outright: the tail
+  // that makes it is behind the unwind, not in front of it.
+  assert!(
+    matches!(close_response.await, Ok(Ok(()))),
+    "close() must still carry the SOURCE's quiescence verdict, not a Stopped invented by a \
+     `begin_close` that unwound out of the terminal reconcile"
+  );
+
+  // THE ORDER, total and in sequence for the whole life of the source: the initiation still lands
+  // ahead of the retirement's cookie reap although it unwound, and the bounded wait is still last.
+  assert_eq!(
+    seam.calls(),
+    vec![
+      SourceCall::CanonicalizeKey(key("/a/b")),
+      SourceCall::Arm(PathBuf::from("/a/b")),
+      SourceCall::RootKey(1),
+      SourceCall::CanonicalizeKey(key("/a/c")),
+      SourceCall::Arm(PathBuf::from("/a/c")),
+      SourceCall::RootKey(2),
+      SourceCall::CanonicalizeKey(key("/a")),
+      SourceCall::Disarm(1),
+      SourceCall::Disarm(2),
+      SourceCall::Arm(PathBuf::from("/a")),
+      SourceCall::Arm(PathBuf::from("/a/b")),
+      SourceCall::BeginClose,
+      SourceCall::EndSync(key("/a/b/cookie-1")),
+      SourceCall::JoinClose,
+    ],
+    "the retirement's reap and the bounded wait behind a panicking initiation must both still happen"
+  );
+  assert_eq!(
+    seam.begin_closes(),
+    1,
+    "the latch is set BEFORE the source is called, so an initiation that unwound still counts as \
+     the one entry and the tail's own entry behind it is a no-op"
+  );
+
+  assert!(
+    matches!(
+      sync_response.await,
+      Ok(Ok(crate::source::SyncOutcome::Dominated))
+    ),
+    "the retired root's barrier is still answered Dominated by the terminal Rescan that dominates it"
+  );
+  assert!(
+    widen_response.await.is_err(),
+    "the abandoned widen's reply is dropped rather than answered over a teardown"
+  );
+}
+
+/// [`reap_cookie`](Owner::reap_cookie) as the misbehaving extension point on a caller the tail never
+/// reaches: a failed widen's TERMINAL RETIREMENT, which arrives through
+/// [`dominate_syncs_of_root`](Owner::dominate_syncs_of_root) while the reconcile is already
+/// unwinding.
+///
+/// This is the reachability the boundary's altitude decides. Five prunes reap through that one
+/// funnel, and a boundary written at any one of them leaves the other four uncontained — this one
+/// included, although it is the [`Source`] call the moved seam exists to order and therefore the one
+/// path where an unwind costs the most: it escapes the reconcile, `dispatch_command` and the [`run`]
+/// loop, so the tail's remaining reaps, the bounded [`join_close`](Source::join_close) and the
+/// acknowledgement carrying its verdict are all skipped, and the last two are unreachable from
+/// [`Owner::drop`].
+///
+/// Two cookies on the retired root with the hostile one FIRST, because the claim is about the
+/// boundary's PLACEMENT as much as its existence: a boundary around the prune's loop would catch the
+/// identical panic and still leave the second marker file on the caller's filesystem.
+///
+/// The close arrives as a REPLY rather than as a closed signal, so the acknowledgement is
+/// observable: a handles-gone terminal has nobody to answer.
+///
+/// FAIL-ON-REVERT: drop the containment from [`reap_cookie`](Owner::reap_cookie) and the cell's own
+/// boundary reports `Err` — the second cookie is reaped by nothing, the ledger ends without
+/// `JoinClose`, and `close()` answers off a dropped sender. Keep that containment but bypass the
+/// funnel HERE with a bare `self.source.end_sync(…)` and the same thing happens, which is what
+/// attributes the claim to this caller rather than to the funnel serving all of them.
+#[tokio::test]
+async fn a_failed_widens_terminal_retirement_survives_a_panicking_cookie_reap_and_still_answers() {
+  use std::task::{Context, Poll, Waker};
+
+  let mut h = Harness::new();
+
+  let sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b"); // handle 1
+  let sc = h.watch("/a/c", Interest::all()).await.expect("watch /a/c"); // handle 2
+  h.owner.epochs.stamp(sb, Epoch::new(4));
+  h.owner.epochs.stamp(sc, Epoch::new(2));
+
+  // Both barriers ride the root the restore retires, the hostile cookie first. Their receivers are
+  // HELD, so the loop-top `prune_abandoned_syncs` leaves them alone.
+  let root_b = h
+    .owner
+    .subsumer
+    .subscription_root(sb)
+    .expect("live root for /a/b");
+  let mut sync_responses = Vec::new();
+  for leaf in ["/a/b/cookie-widen-boom", "/a/b/cookie-2"] {
+    let (sync_reply, sync_response) = futures_channel::oneshot::channel();
+    sync_responses.push(sync_response);
+    h.owner.pending_syncs.push(super::PendingSync {
+      cookie_key: key(leaf),
+      sub: sb,
+      root: root_b,
+      loss_serial_at_install: 0,
+      dominated_at_install: false,
+      reply: sync_reply,
+    });
+  }
+
+  h.owner.source.refuse_capacity("/a", u32::MAX);
+  h.owner.source.refuse_capacity("/a/b", u32::MAX);
+  h.owner.source.wedge_arm("/a/c");
+
+  let seam = h.owner.source.seam();
+
+  let Harness {
+    owner,
+    events: _events,
+    _commands: commands,
+    _sync_commands,
+    closes,
+  } = h;
+
+  let (widen_reply, widen_response) = futures_channel::oneshot::channel();
+  commands
+    .try_send(super::Command::Watch {
+      key: key("/a"),
+      value: (),
+      options: WatchOptions::new().with_interest(Interest::all()),
+      reply: widen_reply,
+    })
+    .expect("enqueue the widen");
+
+  let mut cx = Context::from_waker(Waker::noop());
+  let mut run = Box::pin(super::run(owner));
+
+  assert!(
+    run.as_mut().poll(&mut cx).is_pending(),
+    "staging: the run loop is parked in the restore's retry pace"
+  );
+
+  let (close_reply, close_response) = futures_channel::oneshot::channel();
+  closes.try_send(close_reply).expect("request the close");
+
+  // Contained HERE too, through [`contain`](tributary_proto::unwind::contain) so a REVERTED
+  // funnel's hostile payload is retired before the failing assertion below unwinds past it.
+  let drove = tributary_proto::unwind::contain(|| run.as_mut().poll(&mut cx));
+
+  assert!(
+    matches!(drove, Ok(Poll::Ready(()))),
+    "a panicking `Source::end_sync` must not leave a terminal retirement — the reap is contained in \
+     the funnel every prune reaps through, not only at the prunes the tail reaches"
+  );
+  assert!(
+    matches!(close_response.await, Ok(Ok(()))),
+    "close() must still carry the SOURCE's quiescence verdict, not a Stopped invented by an \
+     `end_sync` that unwound out of the terminal retirement"
+  );
+
+  // THE ORDER, total and in sequence: the seam, then BOTH of the retired root's cookies, then the
+  // bounded wait. Root two contributes no reap (no barrier rode it) and no re-arm (the terminal
+  // preceded it).
+  assert_eq!(
+    seam.calls(),
+    vec![
+      SourceCall::CanonicalizeKey(key("/a/b")),
+      SourceCall::Arm(PathBuf::from("/a/b")),
+      SourceCall::RootKey(1),
+      SourceCall::CanonicalizeKey(key("/a/c")),
+      SourceCall::Arm(PathBuf::from("/a/c")),
+      SourceCall::RootKey(2),
+      SourceCall::CanonicalizeKey(key("/a")),
+      SourceCall::Disarm(1),
+      SourceCall::Disarm(2),
+      SourceCall::Arm(PathBuf::from("/a")),
+      SourceCall::Arm(PathBuf::from("/a/b")),
+      SourceCall::BeginClose,
+      SourceCall::EndSync(key("/a/b/cookie-widen-boom")),
+      SourceCall::EndSync(key("/a/b/cookie-2")),
+      SourceCall::JoinClose,
+    ],
+    "the cookie queued behind the panicking reap is still reaped, and the bounded wait is still \
+     made ahead of the acknowledgement"
+  );
+  assert_eq!(
+    seam.begin_closes(),
+    1,
+    "the seam is entered exactly once however the reaps behind it behave"
+  );
+
+  for sync_response in sync_responses {
+    assert!(
+      matches!(
+        sync_response.await,
+        Ok(Ok(crate::source::SyncOutcome::Dominated))
+      ),
+      "every barrier of the retired root is still answered Dominated"
+    );
+  }
+  assert!(
+    widen_response.await.is_err(),
+    "the abandoned widen's reply is dropped rather than answered over a teardown"
+  );
+}
+
+/// [`Source::cancel_sync`] as the misbehaving extension point on [`on_sync`](Owner::on_sync)'s
+/// CLOSE-WIN arm — the by-name reclamation of the in-flight cookie write a close just abandoned,
+/// issued while the owner holds the CONSUMED [`CloseReply`].
+///
+/// Holding the reply is what makes this arm different from the sibling abandon: an unwind out of the
+/// reclamation drops that sender on its way out, so `close()` answers
+/// [`Stopped`](crate::error::CloseError::Stopped) before anything downstream can decide otherwise —
+/// and it escapes `run` ahead of every cookie reap, the bounded [`join_close`](Source::join_close)
+/// and the acknowledgement, none of which [`Owner::drop`] can supply. So the boundary lives in
+/// [`abandon_sync`](Owner::abandon_sync), the funnel both arms reclaim through, rather than at the
+/// terminal arm alone: the live arm wants the same bound for the ordinary reason (one misbehaving
+/// source must not take the whole owner and every unrelated subscription with it).
+///
+/// The arm is also a TERMINAL MINT, so it enters the seam before the reclamation — which is what
+/// makes [`source_closing`](Owner::source_closing) a truthful reading of "the owner is on its
+/// terminal path" at every mint rather than at all but this one. The ledger reads that back:
+/// `BeginClose` ahead of the `CancelSync`, and [`Source::begin_close`] documents `cancel_sync` as one
+/// of the four fire-and-forget requests that may still arrive after it.
+///
+/// A cookie is left pending so the tail's reap is observable behind the panicking reclamation.
+///
+/// FAIL-ON-REVERT: drop the containment from [`abandon_sync`](Owner::abandon_sync) and the cell's
+/// own boundary reports `Err` — the pending cookie is reaped by the destructor alone, the ledger
+/// ends without `JoinClose`, and `close()` answers off the reply this arm dropped mid-unwind. Move
+/// the seam entry back below the reclamation and the ledger's first two teardown entries swap,
+/// which is the ordering half.
+#[tokio::test]
+async fn on_syncs_close_win_survives_a_panicking_cancel_sync_and_still_reaps_and_answers() {
+  use core::sync::atomic::Ordering;
+  use std::task::{Context, Poll, Waker};
+
+  let mut h = Harness::new();
+  h.owner.source.supports_sync = true;
+  // The write parks on every pass, so only the close can end the race.
+  h.owner.source.sync_script = VecDeque::from([ScriptStep::Pending, ScriptStep::Pending]);
+  let sa = h.watch("/a", Interest::all()).await.expect("watch /a"); // handle 1
+
+  // The reap that must still happen behind the panicking reclamation. Its receiver is HELD, so the
+  // loop-top prune leaves it alone.
+  let root_a = h
+    .owner
+    .subsumer
+    .subscription_root(sa)
+    .expect("live root for /a");
+  let (parked_reply, parked_response) = futures_channel::oneshot::channel();
+  h.owner.pending_syncs.push(super::PendingSync {
+    cookie_key: key("/a/cookie-2"),
+    sub: sa,
+    root: root_a,
+    loss_serial_at_install: 0,
+    dominated_at_install: false,
+    reply: parked_reply,
+  });
+
+  h.owner.source.panic_cancel_sync();
+  let loss_gen = h.owner.loss_gen.load(Ordering::SeqCst);
+  let seam = h.owner.source.seam();
+
+  let Harness {
+    owner,
+    events: _events,
+    _commands,
+    _sync_commands: sync_commands,
+    closes,
+  } = h;
+
+  // The barrier whose write the close abandons. Its caller stays alive (the receiver is held), so
+  // the cancellation arm cannot win the race instead.
+  let (sync_reply, sync_response) = futures_channel::oneshot::channel();
+  sync_commands
+    .try_send(super::SyncRequest {
+      sub: sa,
+      loss_gen_at_call: loss_gen,
+      reply: sync_reply,
+    })
+    .expect("enqueue the sync request");
+
+  let mut cx = Context::from_waker(Waker::noop());
+  let mut run = Box::pin(super::run(owner));
+
+  assert!(
+    run.as_mut().poll(&mut cx).is_pending(),
+    "staging: the loop dispatched the sync and its write is in flight"
+  );
+
+  let (close_reply, close_response) = futures_channel::oneshot::channel();
+  closes.try_send(close_reply).expect("request the close");
+
+  // Contained HERE too, through [`contain`](tributary_proto::unwind::contain) so a REVERTED
+  // funnel's hostile payload is retired before the failing assertion below unwinds past it.
+  let drove = tributary_proto::unwind::contain(|| run.as_mut().poll(&mut cx));
+
+  assert!(
+    matches!(drove, Ok(Poll::Ready(()))),
+    "a panicking `Source::cancel_sync` must not leave the close-win arm — the reclamation is \
+     contained in the funnel both abandon arms go through"
+  );
+  // THE VERDICT, and here it is the reply this very arm was holding: an unwind out of the
+  // reclamation drops it, and `close()` reads that as `Stopped`.
+  assert!(
+    matches!(close_response.await, Ok(Ok(()))),
+    "close() must still carry the SOURCE's quiescence verdict, not a Stopped invented by a \
+     `cancel_sync` that unwound while holding the consumed reply"
+  );
+
+  // THE ORDER: the seam ahead of the reclamation (the terminal mint enters it), the reclamation
+  // although it unwound, then the tail's reap and the bounded wait behind it.
+  assert_eq!(
+    seam.calls(),
+    vec![
+      SourceCall::CanonicalizeKey(key("/a")),
+      SourceCall::Arm(PathBuf::from("/a")),
+      SourceCall::RootKey(1),
+      SourceCall::BeginSync(1),
+      SourceCall::BeginClose,
+      SourceCall::CancelSync(1),
+      SourceCall::EndSync(key("/a/cookie-2")),
+      SourceCall::JoinClose,
+    ],
+    "the cookie behind the panicking reclamation is still reaped, and the bounded wait is still \
+     made ahead of the acknowledgement"
+  );
+  assert_eq!(
+    seam.begin_closes(),
+    1,
+    "the terminal mint enters the seam and the tail's own entry behind it is a no-op"
+  );
+
+  assert!(
+    sync_response.await.is_err(),
+    "the abandoned barrier's reply is dropped, which its caller reads as Closed"
+  );
+  assert!(
+    parked_response.await.is_err(),
+    "a barrier still pending at teardown reads as Closed"
+  );
+}
+
+/// A CANCELLED [`Source`] future as the misbehaving extension point, on [`Owner::arm`]'s close-win
+/// arm.
+///
+/// A different piece of implementor code from every `Source`-call cell beside this one. What the
+/// close race destroys is a value of the implementor's own opaque type — an `async fn` future
+/// holding whatever its body parked with — and the [`Source`] contract requires its destructor to be
+/// panic-free no more than it requires a [`Filter`] predicate to be. `select_biased!` destroys the
+/// futures it owns BEFORE it runs the winning arm's handler, so an unwind out of one leaves `run`
+/// carrying off a [`CloseReply`] that was already in hand, ahead of the reap, the bounded
+/// [`join_close`](Source::join_close) and the acknowledgement — the last two unreachable from
+/// [`Owner::drop`]. So the future is held in a slot the race only borrows and destroyed through
+/// [`retire_raced_source_future`](super::retire_raced_source_future) once the winner is known.
+///
+/// Hand-polled so the close lands INSIDE the pending arm as a fact of the cell: poll to park in the
+/// arm, request the close, poll again.
+///
+/// A cookie is left pending on an unrelated root so the tail's reap is observable behind the
+/// cancellation.
+///
+/// FAIL-ON-REVERT: hand the funnel a `false` here — destroying the cancelled arm bare, which is what
+/// leaving it inside the `select` amounts to — and the cell's own boundary reports `Err`: the pending
+/// cookie is reaped by the destructor alone, the ledger ends without `JoinClose`, and `close()`
+/// answers off the reply this arm was holding.
+#[tokio::test]
+async fn arms_close_win_survives_a_cancelled_arm_whose_destructor_panics() {
+  use std::task::{Context, Poll, Waker};
+
+  let mut h = Harness::new();
+  let sx = h.watch("/x", Interest::all()).await.expect("watch /x"); // handle 1
+  let root_x = h
+    .owner
+    .subsumer
+    .subscription_root(sx)
+    .expect("live root for /x");
+
+  // The reap that must still happen behind the cancellation. Its receiver is HELD, so the loop-top
+  // prune leaves it alone.
+  let (parked_reply, parked_response) = futures_channel::oneshot::channel();
+  h.owner.pending_syncs.push(super::PendingSync {
+    cookie_key: key("/x/cookie-2"),
+    sub: sx,
+    root: root_x,
+    loss_serial_at_install: 0,
+    dominated_at_install: false,
+    reply: parked_reply,
+  });
+
+  // The disjoint watch whose arm parks forever and unwinds when the close race cancels it.
+  h.owner.source.boom_on_cancel_arm("/z");
+  let seam = h.owner.source.seam();
+
+  let Harness {
+    owner,
+    events: _events,
+    _commands: commands,
+    _sync_commands,
+    closes,
+  } = h;
+
+  let (watch_reply, watch_response) = futures_channel::oneshot::channel();
+  commands
+    .try_send(super::Command::Watch {
+      key: key("/z"),
+      value: (),
+      options: WatchOptions::new().with_interest(Interest::all()),
+      reply: watch_reply,
+    })
+    .expect("enqueue the watch whose arm hangs");
+
+  let mut cx = Context::from_waker(Waker::noop());
+  let mut run = Box::pin(super::run(owner));
+  assert!(
+    run.as_mut().poll(&mut cx).is_pending(),
+    "staging: the loop dispatched the watch and its arm is parked"
+  );
+
+  let (close_reply, close_response) = futures_channel::oneshot::channel();
+  closes.try_send(close_reply).expect("request the close");
+
+  // Contained HERE too, through [`contain`](tributary_proto::unwind::contain) so a REVERTED site's
+  // hostile payload is retired before the failing assertion below unwinds past it — a bare
+  // `catch_unwind` leaves it in scope and the revert aborts the binary instead of reporting which
+  // claim broke.
+  let drove = tributary_proto::unwind::contain(|| run.as_mut().poll(&mut cx));
+
+  assert!(
+    matches!(drove, Ok(Poll::Ready(()))),
+    "a cancelled `Source::arm` whose destructor unwinds must not leave the close-win arm"
+  );
+  // THE VERDICT: `Stopped` is what a dropped sender reads as, and an unwind out of the cancellation
+  // drops exactly the reply this arm had just consumed.
+  assert!(
+    matches!(close_response.await, Ok(Ok(()))),
+    "close() must still carry the SOURCE's quiescence verdict, not a Stopped invented by a cancelled \
+     arm that unwound while the owner held the consumed reply"
+  );
+
+  let calls = seam.calls();
+  let split = calls
+    .iter()
+    .position(|call| *call == SourceCall::BeginClose)
+    .unwrap_or_else(|| panic!("the seam was never entered: {calls:?}"));
+  assert_eq!(
+    &calls[split..],
+    &[
+      SourceCall::BeginClose,
+      SourceCall::EndSync(key("/x/cookie-2")),
+      SourceCall::JoinClose,
+    ],
+    "the cookie behind the cancellation is still reaped, and the bounded wait is still made ahead of \
+     the acknowledgement: {calls:?}"
+  );
+  assert_eq!(
+    seam.begin_closes(),
+    1,
+    "the seam is entered exactly once however the cancellation behaves"
+  );
+  assert!(
+    watch_response.await.is_err(),
+    "the abandoned watch's reply is dropped, which its caller reads as Closed"
+  );
+  assert!(
+    parked_response.await.is_err(),
+    "a barrier still pending at teardown reads as Closed"
+  );
+}
+
+/// The same cancelled-future extension point on [`Owner::grow`]'s close-win arm — the AWAITED
+/// coverage widening a covered-outside watch issues against an already-live root.
+///
+/// Its own site rather than `arm`'s: the seam entry here is guarded by a NARROWER predicate (only the
+/// consumed reply is terminal; the handles-gone arm is a `Failed` the loop goes on from), so a
+/// containment written to that predicate has to be proven against this arm specifically.
+///
+/// FAIL-ON-REVERT: hand the funnel a `false` here and the cell's own boundary reports `Err` — the
+/// pending cookie is reaped by the destructor alone, the ledger ends without `JoinClose`, and
+/// `close()` answers off the consumed reply.
+#[tokio::test]
+async fn grows_close_win_survives_a_cancelled_grow_whose_destructor_panics() {
+  use std::task::{Context, Poll, Waker};
+
+  let mut h = Harness::new();
+  let sx = h.watch("/x", Interest::all()).await.expect("watch /x"); // handle 1
+  let root_x = h
+    .owner
+    .subsumer
+    .subscription_root(sx)
+    .expect("live root for /x");
+  let (parked_reply, parked_response) = futures_channel::oneshot::channel();
+  h.owner.pending_syncs.push(super::PendingSync {
+    cookie_key: key("/x/cookie-2"),
+    sub: sx,
+    root: root_x,
+    loss_serial_at_install: 0,
+    dominated_at_install: false,
+    reply: parked_reply,
+  });
+
+  // A wide `/a` root whose RETAINED cover was pruned back to `{/a/b}` — the state in which a watch of
+  // `/a/c` is covered-outside and so must GROW rather than arm.
+  let _sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b");
+  let sa = h
+    .watch("/a", Interest::all())
+    .await
+    .expect("watch /a widens");
+  h.unwatch(sa).expect("unwatch the widening /a");
+
+  h.owner.source.boom_on_cancel_grow();
+  let seam = h.owner.source.seam();
+
+  let Harness {
+    owner,
+    events: _events,
+    _commands: commands,
+    _sync_commands,
+    closes,
+  } = h;
+
+  let (watch_reply, watch_response) = futures_channel::oneshot::channel();
+  commands
+    .try_send(super::Command::Watch {
+      key: key("/a/c"),
+      value: (),
+      options: WatchOptions::new().with_interest(Interest::all()),
+      reply: watch_reply,
+    })
+    .expect("enqueue the covered-outside watch");
+
+  let mut cx = Context::from_waker(Waker::noop());
+  let mut run = Box::pin(super::run(owner));
+  assert!(
+    run.as_mut().poll(&mut cx).is_pending(),
+    "staging: the loop dispatched the covered-outside watch and its grow is parked"
+  );
+
+  let (close_reply, close_response) = futures_channel::oneshot::channel();
+  closes.try_send(close_reply).expect("request the close");
+  let drove = tributary_proto::unwind::contain(|| run.as_mut().poll(&mut cx));
+
+  assert!(
+    matches!(drove, Ok(Poll::Ready(()))),
+    "a cancelled `Source::grow` whose destructor unwinds must not leave the close-win arm"
+  );
+  assert!(
+    matches!(close_response.await, Ok(Ok(()))),
+    "close() must still carry the SOURCE's quiescence verdict, not a Stopped invented by a cancelled \
+     grow that unwound while the owner held the consumed reply"
+  );
+
+  let calls = seam.calls();
+  let split = calls
+    .iter()
+    .position(|call| *call == SourceCall::BeginClose)
+    .unwrap_or_else(|| panic!("the seam was never entered: {calls:?}"));
+  assert_eq!(
+    &calls[split..],
+    &[
+      SourceCall::BeginClose,
+      SourceCall::EndSync(key("/x/cookie-2")),
+      SourceCall::JoinClose,
+    ],
+    "the cookie behind the cancellation is still reaped, and the bounded wait is still made ahead of \
+     the acknowledgement: {calls:?}"
+  );
+  assert_eq!(seam.begin_closes(), 1, "the seam is entered exactly once");
+  assert!(
+    watch_response.await.is_err(),
+    "the abandoned watch's reply is dropped, which its caller reads as Closed"
+  );
+  assert!(
+    parked_response.await.is_err(),
+    "a barrier still pending at teardown reads as Closed"
+  );
+}
+
+/// The same cancelled-future extension point on
+/// [`replace_racing_close`](Owner::replace_racing_close)'s close-win arm — the in-place retarget a
+/// widen issues when the source offers the gapless path.
+///
+/// Its own site because the abandoned RETARGET is the one cancellation the owner already reasons
+/// about as not cancel-abortive: the binding may still commit the swap this reconcile is walking
+/// away from, so the terminal reading has to reach the seam even when the implementor's own
+/// destructor is what runs on the way there.
+///
+/// FAIL-ON-REVERT: hand the funnel a `false` here and the cell's own boundary reports `Err` — the
+/// pending cookie is reaped by the destructor alone, the ledger ends without `JoinClose`, and
+/// `close()` answers off the consumed reply.
+#[tokio::test]
+async fn replaces_close_win_survives_a_cancelled_retarget_whose_destructor_panics() {
+  use std::task::{Context, Poll, Waker};
+
+  let mut h = Harness::new();
+  h.owner.source.supports_replace = true;
+  let sx = h.watch("/x", Interest::all()).await.expect("watch /x"); // handle 1
+  let root_x = h
+    .owner
+    .subsumer
+    .subscription_root(sx)
+    .expect("live root for /x");
+  let (parked_reply, parked_response) = futures_channel::oneshot::channel();
+  h.owner.pending_syncs.push(super::PendingSync {
+    cookie_key: key("/x/cookie-2"),
+    sub: sx,
+    root: root_x,
+    loss_serial_at_install: 0,
+    dominated_at_install: false,
+    reply: parked_reply,
+  });
+
+  let _sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b");
+  h.owner.source.boom_on_cancel_replace();
+  let seam = h.owner.source.seam();
+
+  let Harness {
+    owner,
+    events: _events,
+    _commands: commands,
+    _sync_commands,
+    closes,
+  } = h;
+
+  let (watch_reply, watch_response) = futures_channel::oneshot::channel();
+  commands
+    .try_send(super::Command::Watch {
+      key: key("/a"),
+      value: (),
+      options: WatchOptions::new().with_interest(Interest::all()),
+      reply: watch_reply,
+    })
+    .expect("enqueue the widen");
+
+  let mut cx = Context::from_waker(Waker::noop());
+  let mut run = Box::pin(super::run(owner));
+  assert!(
+    run.as_mut().poll(&mut cx).is_pending(),
+    "staging: the loop dispatched the widen and its in-place retarget is parked"
+  );
+
+  let (close_reply, close_response) = futures_channel::oneshot::channel();
+  closes.try_send(close_reply).expect("request the close");
+  let drove = tributary_proto::unwind::contain(|| run.as_mut().poll(&mut cx));
+
+  assert!(
+    matches!(drove, Ok(Poll::Ready(()))),
+    "a cancelled `Source::replace` whose destructor unwinds must not leave the close-win arm"
+  );
+  assert!(
+    matches!(close_response.await, Ok(Ok(()))),
+    "close() must still carry the SOURCE's quiescence verdict, not a Stopped invented by a cancelled \
+     retarget that unwound while the owner held the consumed reply"
+  );
+
+  let calls = seam.calls();
+  let split = calls
+    .iter()
+    .position(|call| *call == SourceCall::BeginClose)
+    .unwrap_or_else(|| panic!("the seam was never entered: {calls:?}"));
+  assert_eq!(
+    &calls[split..],
+    &[
+      SourceCall::BeginClose,
+      SourceCall::EndSync(key("/x/cookie-2")),
+      SourceCall::JoinClose,
+    ],
+    "the cookie behind the cancellation is still reaped, and the bounded wait is still made ahead of \
+     the acknowledgement: {calls:?}"
+  );
+  assert_eq!(seam.begin_closes(), 1, "the seam is entered exactly once");
+  assert!(
+    watch_response.await.is_err(),
+    "the abandoned widen's reply is dropped, which its caller reads as Closed"
+  );
+  assert!(
+    parked_response.await.is_err(),
+    "a barrier still pending at teardown reads as Closed"
+  );
+}
+
+/// The same cancelled-future extension point on
+/// [`rearm_racing_close`](Owner::rearm_racing_close)'s close arm — a failed widen's RESTORE re-arm,
+/// the one race this crate added rather than inherited.
+///
+/// Its own site because it is the only one where BOTH close readings are terminal, so the
+/// containment covers the whole arm rather than the consumed-reply half of it. It is also the site
+/// furthest from the tail: the restore is already unwinding a widen when the cancellation happens,
+/// and everything after it — the roots' retirement, their durable dominating `Rescan`s, the reap —
+/// stands behind the panic.
+///
+/// FAIL-ON-REVERT: hand the funnel a `false` here and the cell's own boundary reports `Err` — the
+/// roots are never retired, the pending cookie is reaped by the destructor alone, the ledger ends
+/// without `JoinClose`, and `close()` answers off the consumed reply.
+#[tokio::test]
+async fn a_restores_raced_rearm_survives_a_cancellation_whose_destructor_panics() {
+  use std::task::{Context, Poll, Waker};
+
+  let mut h = Harness::new();
+  let sx = h.watch("/x", Interest::all()).await.expect("watch /x"); // handle 1
+  let root_x = h
+    .owner
+    .subsumer
+    .subscription_root(sx)
+    .expect("live root for /x");
+  let (parked_reply, parked_response) = futures_channel::oneshot::channel();
+  h.owner.pending_syncs.push(super::PendingSync {
+    cookie_key: key("/x/cookie-2"),
+    sub: sx,
+    root: root_x,
+    loss_serial_at_install: 0,
+    dominated_at_install: false,
+    reply: parked_reply,
+  });
+
+  let sb = h.watch("/a/b", Interest::all()).await.expect("watch /a/b");
+  let sc = h.watch("/a/c", Interest::all()).await.expect("watch /a/c");
+
+  // The wider arm is refused on the retryable kind, so the widen unwinds into the restore…
+  h.owner.source.refuse_capacity("/a", u32::MAX);
+  // …where root one's re-arm parks forever and unwinds when the close race cancels it.
+  h.owner.source.boom_on_cancel_arm("/a/b");
+  let seam = h.owner.source.seam();
+
+  let Harness {
+    owner,
+    events: _events,
+    _commands: commands,
+    _sync_commands,
+    closes,
+  } = h;
+
+  let (watch_reply, watch_response) = futures_channel::oneshot::channel();
+  commands
+    .try_send(super::Command::Watch {
+      key: key("/a"),
+      value: (),
+      options: WatchOptions::new().with_interest(Interest::all()),
+      reply: watch_reply,
+    })
+    .expect("enqueue the widen");
+
+  let mut cx = Context::from_waker(Waker::noop());
+  let mut run = Box::pin(super::run(owner));
+  assert!(
+    run.as_mut().poll(&mut cx).is_pending(),
+    "staging: the refused widen is in its restore, parked in root one's raced re-arm"
+  );
+
+  let (close_reply, close_response) = futures_channel::oneshot::channel();
+  closes.try_send(close_reply).expect("request the close");
+  let drove = tributary_proto::unwind::contain(|| run.as_mut().poll(&mut cx));
+
+  assert!(
+    matches!(drove, Ok(Poll::Ready(()))),
+    "a cancelled restore re-arm whose destructor unwinds must not leave the race"
+  );
+  assert!(
+    matches!(close_response.await, Ok(Ok(()))),
+    "close() must still carry the SOURCE's quiescence verdict, not a Stopped invented by a cancelled \
+     re-arm that unwound while the restore held the consumed reply"
+  );
+
+  let calls = seam.calls();
+  let split = calls
+    .iter()
+    .position(|call| *call == SourceCall::BeginClose)
+    .unwrap_or_else(|| panic!("the seam was never entered: {calls:?}"));
+  assert_eq!(
+    calls.last(),
+    Some(&SourceCall::JoinClose),
+    "the bounded wait is still made ahead of the acknowledgement: {calls:?}"
+  );
+  assert!(
+    calls[split..].contains(&SourceCall::EndSync(key("/x/cookie-2"))),
+    "the cookie behind the cancellation is still reaped: {calls:?}"
+  );
+  assert_eq!(seam.begin_closes(), 1, "the seam is entered exactly once");
+  assert!(
+    watch_response.await.is_err(),
+    "the abandoned widen's reply is dropped, which its caller reads as Closed"
+  );
+  assert!(
+    parked_response.await.is_err(),
+    "a barrier still pending at teardown reads as Closed"
+  );
+  let _ = (sb, sc);
+}
+
+/// The same cancelled-future extension point on [`on_sync`](Owner::on_sync)'s close-win arm — the
+/// in-flight COOKIE WRITE a close abandons.
+///
+/// Its own site, and the one whose live sibling is deliberately left uncontained: this race also
+/// loses to the caller's own `sync()` timeout, and THAT reading is not terminal — the loop keeps
+/// serving every other subscription, nothing is owed an acknowledgement, and the cancellation sits
+/// beside an uncontained await on the very same future. Only the consumed reply has work behind it
+/// nothing downstream can redo.
+///
+/// The by-name reclamation the close arm issues is what proves the containment did not merely
+/// swallow the arm: `CancelSync` still reaches the source, behind the seam, with the token the
+/// abandoned write recorded.
+///
+/// FAIL-ON-REVERT: hand the funnel a `false` here and the cell's own boundary reports `Err` — the
+/// abandoned write's cookie is never reclaimed, the pending cookie is reaped by the destructor
+/// alone, the ledger ends without `JoinClose`, and `close()` answers off the consumed reply.
+#[tokio::test]
+async fn on_syncs_close_win_survives_a_cancelled_write_whose_destructor_panics() {
+  use core::sync::atomic::Ordering;
+  use std::task::{Context, Poll, Waker};
+
+  let mut h = Harness::new();
+  h.owner.source.supports_sync = true;
+  h.owner.source.boom_on_cancel_begin_sync();
+  let sa = h.watch("/a", Interest::all()).await.expect("watch /a"); // handle 1
+
+  let root_a = h
+    .owner
+    .subsumer
+    .subscription_root(sa)
+    .expect("live root for /a");
+  let (parked_reply, parked_response) = futures_channel::oneshot::channel();
+  h.owner.pending_syncs.push(super::PendingSync {
+    cookie_key: key("/a/cookie-2"),
+    sub: sa,
+    root: root_a,
+    loss_serial_at_install: 0,
+    dominated_at_install: false,
+    reply: parked_reply,
+  });
+
+  let loss_gen = h.owner.loss_gen.load(Ordering::SeqCst);
+  let seam = h.owner.source.seam();
+
+  let Harness {
+    owner,
+    events: _events,
+    _commands,
+    _sync_commands: sync_commands,
+    closes,
+  } = h;
+
+  // The barrier whose write the close abandons. Its caller stays alive (the receiver is held), so
+  // the cancellation arm cannot win the race instead.
+  let (sync_reply, sync_response) = futures_channel::oneshot::channel();
+  sync_commands
+    .try_send(super::SyncRequest {
+      sub: sa,
+      loss_gen_at_call: loss_gen,
+      reply: sync_reply,
+    })
+    .expect("enqueue the sync request");
+
+  let mut cx = Context::from_waker(Waker::noop());
+  let mut run = Box::pin(super::run(owner));
+  assert!(
+    run.as_mut().poll(&mut cx).is_pending(),
+    "staging: the loop dispatched the sync and its write is in flight"
+  );
+
+  let (close_reply, close_response) = futures_channel::oneshot::channel();
+  closes.try_send(close_reply).expect("request the close");
+  let drove = tributary_proto::unwind::contain(|| run.as_mut().poll(&mut cx));
+
+  assert!(
+    matches!(drove, Ok(Poll::Ready(()))),
+    "a cancelled `Source::begin_sync` whose destructor unwinds must not leave the close-win arm"
+  );
+  assert!(
+    matches!(close_response.await, Ok(Ok(()))),
+    "close() must still carry the SOURCE's quiescence verdict, not a Stopped invented by a cancelled \
+     write that unwound while the owner held the consumed reply"
+  );
+
+  assert_eq!(
+    seam.calls(),
+    vec![
+      SourceCall::CanonicalizeKey(key("/a")),
+      SourceCall::Arm(PathBuf::from("/a")),
+      SourceCall::RootKey(1),
+      SourceCall::BeginSync(1),
+      SourceCall::BeginClose,
+      SourceCall::CancelSync(1),
+      SourceCall::EndSync(key("/a/cookie-2")),
+      SourceCall::JoinClose,
+    ],
+    "the abandoned write is still reclaimed by name behind the seam, the cookie behind it is still \
+     reaped, and the bounded wait is still made ahead of the acknowledgement"
+  );
+  assert_eq!(seam.begin_closes(), 1, "the seam is entered exactly once");
+  assert!(
+    sync_response.await.is_err(),
+    "the abandoned barrier's reply is dropped, which its caller reads as Closed"
+  );
+  assert!(
+    parked_response.await.is_err(),
+    "a barrier still pending at teardown reads as Closed"
+  );
+}
+
+/// The tail's QUEUED GRANT CLEANUP as the third way a `Source` call reaches the terminal path: the
+/// close-time [`drain_pending_cleanup`](Owner::drain_pending_cleanup) applies each queued
+/// [`Cleanup`], and a [`Cleanup::DropOrphan`] whose release empties a root issues that root's
+/// fire-and-forget [`Source::disarm`]. Contained per call, so one panicking release cannot carry off
+/// the cleanups queued behind it, the bounded [`join_close`](Source::join_close), or the
+/// acknowledgement carrying its verdict.
+///
+/// Two orphans on two disjoint roots, the hostile one FIRST, because the claim is about the
+/// boundary's PLACEMENT: a boundary around the drain loop would catch the same panic and still
+/// abandon the second orphan's root — armed, in a source that has already been told to stop, with
+/// nothing left to release it.
+///
+/// The engine is consistent by the time this call is made — `plan_unwatch` has committed the removal
+/// and its salvage is placed — so resuming past the panic leaves nothing half-applied. The fake
+/// applies the release before it unwinds for the same reason: what is under test is how far the
+/// unwind travels, not a source left half-torn-down.
+///
+/// FAIL-ON-REVERT: call `self.source.disarm(fs_root)` bare again and the first orphan's unwind
+/// leaves `run` — the second root is never disarmed, the ledger ends without `JoinClose`, and
+/// `close()` answers off a dropped sender. Move the boundary out to wrap `apply_cleanup` inside the
+/// drain loop instead and the second orphan survives but the claim is weaker than the code; move it
+/// around the drain and the second orphan is lost again.
+#[tokio::test]
+async fn the_tails_grant_cleanup_survives_a_panicking_disarm_and_still_releases_the_rest() {
+  use std::task::{Context, Poll, Waker};
+
+  let mut h = Harness::new();
+  let sa = h.watch("/a", Interest::all()).await.expect("watch /a"); // handle 1
+  let sb = h.watch("/b", Interest::all()).await.expect("watch /b"); // handle 2
+  let root_a = h
+    .owner
+    .subsumer
+    .subscription_root(sa)
+    .expect("live root for /a");
+  let root_b = h
+    .owner
+    .subsumer
+    .subscription_root(sb)
+    .expect("live root for /b");
+  assert_ne!(root_a, root_b, "the two watches must sit on disjoint roots");
+
+  h.owner.source.panic_disarm(root_a);
+
+  // Queued exactly as a dropped `WatchGrant` queues them, and left for the TAIL to apply: the close
+  // below is injected before the first poll, and the loop's close check sits above its
+  // top-of-iteration cleanup drain, so the first thing to see these is `run`'s teardown.
+  h.owner
+    .cleanup_tx
+    .try_send(super::Cleanup::DropOrphan(sa))
+    .expect("queue the hostile orphan");
+  h.owner
+    .cleanup_tx
+    .try_send(super::Cleanup::DropOrphan(sb))
+    .expect("queue the orphan behind it");
+
+  let seam = h.owner.source.seam();
+
+  let Harness {
+    owner,
+    events: _events,
+    _commands,
+    _sync_commands,
+    closes,
+  } = h;
+
+  let (close_reply, close_response) = futures_channel::oneshot::channel();
+  closes.try_send(close_reply).expect("request the close");
+
+  let mut cx = Context::from_waker(Waker::noop());
+  let mut run = Box::pin(super::run(owner));
+  // Through [`contain`](tributary_proto::unwind::contain) for the reason the sibling seam cell gives:
+  // a reverted release hands back a HOSTILE payload, and retiring it here is what makes the revert
+  // report a failed assertion instead of aborting the binary.
+  let drove = tributary_proto::unwind::contain(|| run.as_mut().poll(&mut cx));
+
+  assert!(
+    matches!(drove, Ok(Poll::Ready(()))),
+    "a panicking `Source::disarm` must not leave the tail's grant-cleanup drain"
+  );
+  assert!(
+    matches!(close_response.await, Ok(Ok(()))),
+    "close() must still carry the SOURCE's quiescence verdict, not a Stopped invented by a `disarm` \
+     that unwound out of the tail's cleanup drain"
+  );
+
+  let calls = seam.calls();
+  let split = calls
+    .iter()
+    .position(|call| *call == SourceCall::BeginClose)
+    .unwrap_or_else(|| panic!("the tail never entered the seam: {calls:?}"));
+  assert_eq!(
+    &calls[split..],
+    &[
+      SourceCall::BeginClose,
+      SourceCall::Disarm(root_a),
+      SourceCall::Disarm(root_b),
+      SourceCall::JoinClose,
+    ],
+    "the orphan queued behind the panicking release is still released, and the bounded wait is \
+     still made ahead of the acknowledgement: {calls:?}"
+  );
+  assert_eq!(
+    seam.begin_closes(),
+    1,
+    "the seam is entered exactly once however the releases behind it behave"
+  );
+}
+
+/// The grant-cleanup COOKIE REAP contained per cookie, so one panicking [`Source::end_sync`] can
+/// neither strand the marker files queued behind it nor abandon the rest of the release that issued
+/// it — the emptied root's [`Source::disarm`] included.
+///
+/// Driven on the LIVE path deliberately, and that is a claim about reachability worth stating
+/// plainly: [`run`]'s tail cannot reach this reap with anything to do. The tail's
+/// [`reap_all_pending_syncs`](Owner::reap_all_pending_syncs) runs BEFORE its grant-cleanup drain and
+/// `mem::take`s the whole pending map, so by the time a queued [`Cleanup::DropOrphan`] reaches
+/// [`retire_syncs_of_subscription`](Owner::retire_syncs_of_subscription) there is no cookie left for
+/// it to find — and neither the source-drain drain nor the mid-reconcile terminal re-admits one. The
+/// boundary here is therefore owed to the paths that DO reach it with cookies pending: a caller
+/// `unwatch`, an orphaned `watch` grant, and the run loop's own top-of-iteration cleanup drain, where
+/// an escaping panic takes the whole owner down and every unrelated subscription with it — the same
+/// blast radius the filter gate and the owner's destructor are already contained against.
+///
+/// Two cookies with the hostile one FIRST, so the boundary's placement is what is under test:
+/// containment around the reap loop would catch the same panic and still leave the second marker
+/// file on the caller's filesystem, and containment around the whole release would additionally skip
+/// the `Disarm` the ledger ends with.
+///
+/// FAIL-ON-REVERT: drop the containment from [`reap_cookie`](Owner::reap_cookie), or bypass that
+/// funnel at THIS prune with a bare `self.source.end_sync(…)`, and the cell's own boundary reports
+/// `Err` — the second cookie is never reaped and the emptied root is never disarmed. The second form
+/// is what attributes the claim to this caller rather than to the funnel serving all of them.
+#[tokio::test]
+async fn a_grant_cleanups_cookie_reap_survives_a_panicking_end_sync_and_still_disarms() {
+  let mut h = Harness::new();
+  let sa = h.watch("/a", Interest::all()).await.expect("watch /a"); // handle 1
+  let root_a = h
+    .owner
+    .subsumer
+    .subscription_root(sa)
+    .expect("live root for /a");
+
+  let mut sync_responses = Vec::new();
+  for leaf in ["/a/cookie-cleanup-boom", "/a/cookie-2"] {
+    let (sync_reply, sync_response) = futures_channel::oneshot::channel();
+    sync_responses.push(sync_response);
+    h.owner.pending_syncs.push(super::PendingSync {
+      cookie_key: key(leaf),
+      sub: sa,
+      root: root_a,
+      loss_serial_at_install: 0,
+      dominated_at_install: false,
+      reply: sync_reply,
+    });
+  }
+
+  let seam = h.owner.source.seam();
+  let before = seam.calls().len();
+
+  // Exactly what the tail's drain and the loop's own do with a dropped grant's cleanup. Through
+  // [`contain`](tributary_proto::unwind::contain) so a reverted reap's HOSTILE payload is retired
+  // here rather than dropped by the failing assertion's own unwind, which would abort the binary.
+  let applied = tributary_proto::unwind::contain(|| {
+    h.owner.apply_cleanup(super::Cleanup::DropOrphan(sa));
+  });
+  assert!(
+    applied.is_ok(),
+    "a panicking `Source::end_sync` must not leave the release that issued it"
+  );
+
+  let calls = seam.calls();
+  assert_eq!(
+    &calls[before..],
+    &[
+      SourceCall::EndSync(key("/a/cookie-cleanup-boom")),
+      SourceCall::EndSync(key("/a/cookie-2")),
+      SourceCall::Disarm(root_a),
+    ],
+    "the cookie behind the panicking reap is still reaped, and the release still reaches the \
+     emptied root's disarm: {calls:?}"
+  );
+
+  for sync_response in sync_responses {
+    assert!(
+      matches!(
+        sync_response.await,
+        Ok(Err(crate::error::SyncError::Retired))
+      ),
+      "every barrier of the released subscription is still failed typed"
+    );
+  }
+
+  // The owner is still serving: the containment bounded the unwind, it did not end the watcher.
+  let sc = h.watch("/c", Interest::all()).await.expect("watch /c");
+  assert!(
+    h.owner.subsumer.subscription_root(sc).is_some(),
+    "the contained panic left the owner alive and still able to commit a watch"
+  );
+}
+
+/// Whether [`PlaneValue`]'s destructor unwinds, and how many times it has.
+///
+/// Process-wide, like [`BOOM_COOKIES_REAPED`] and for the same reason: the value these govern is
+/// released from inside the owner being DROPPED — the very destructor under test — so a ledger
+/// reachable through the owner could not testify about it. Only
+/// [`owner_teardown_enters_the_seam_although_releasing_the_displaced_plane_unwinds`] constructs a
+/// [`PlaneValue`] at all, so nothing else can move either counter.
+static PLANE_VALUE_DROP_UNWINDS: core::sync::atomic::AtomicBool =
+  core::sync::atomic::AtomicBool::new(false);
+static PLANE_VALUE_UNWOUND: core::sync::atomic::AtomicUsize =
+  core::sync::atomic::AtomicUsize::new(0);
+
+/// A caller value (`V`) whose destructor UNWINDS once [`PLANE_VALUE_DROP_UNWINDS`] is set.
+///
+/// The `V` half of the caller-panic class an owner teardown must survive: `C`/`V` are caller types
+/// stored in the published read-plane snapshot, and a caller `Drop` is as arbitrary as a caller
+/// `Filter` predicate — the contract cannot require panic-freedom of either.
+///
+/// ARMED rather than unconditional because the staging itself moves the value: dropping a
+/// subscription copies-on-write the radix node that holds its value and disposes of the copy, so a
+/// destructor that unwound on every drop would unwind in a frame the cell is only passing through.
+/// A ZST, so a panicking release retains no allocation of its own for a whole-process leak check to
+/// report — see [`ForgottenPayload`].
+#[derive(Clone)]
+struct PlaneValue;
+
+impl Drop for PlaneValue {
+  fn drop(&mut self) {
+    if PLANE_VALUE_DROP_UNWINDS.load(core::sync::atomic::Ordering::SeqCst) {
+      PLANE_VALUE_UNWOUND.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+      std::panic::panic_any(ForgottenPayload);
+    }
+  }
+}
+
+/// An [`Owner`] over a [`FakeSource`] whose CALLER VALUE the cell chooses — the rig for every
+/// teardown cell that needs the read plane to own a caller `V` with a destructor of its own
+/// ([`PlaneValue`], which unwinds; [`WitnessValue`], which reports). Mirrors [`OwnerU64`]; the value
+/// type is the only difference that matters.
+struct OwnerOverValue<V> {
+  owner: Owner<OsString, V, TokioRuntime, FakeSource>,
+  /// Kept alive so the owner's event sender never observes a closed channel.
+  _events: async_channel::Receiver<Event<OsString, V>>,
+  /// Kept alive so the owner's command receiver never observes a closed channel.
+  _commands: async_channel::Sender<super::Command<OsString, V>>,
+  /// Kept alive so the owner's sync-admission receiver never observes a closed channel.
+  _sync_commands: async_channel::Sender<super::SyncRequest>,
+  /// Kept alive so the owner's close receiver never observes a closed channel. The teardown cells
+  /// that drive [`run`](super::run) rather than the destructor send their close request on it.
+  _closes: async_channel::Sender<super::CloseReply>,
+}
+
+impl<V: Clone> OwnerOverValue<V> {
+  fn new() -> Self {
+    let (event_tx, event_rx) = async_channel::unbounded();
+    let (command_tx, command_rx) = async_channel::unbounded();
+    let (sync_command_tx, sync_command_rx) = async_channel::unbounded::<super::SyncRequest>();
+    let (close_tx, close_rx) = async_channel::bounded(1);
+    let (cleanup_tx, cleanup_rx) = async_channel::unbounded();
+    let owner = Owner {
+      source: FakeSource::new(),
+      source_closing: false,
+      deferred: crate::subsume::Salvage::new(),
+      subsumer: Subsumer::new(),
+      epochs: EpochLedger::new(),
+      filters: Filters::new(),
+      filter_payload_forgotten: false,
+      needs_rescan: ParkedRescans::new(),
+      suppressed_rescan: ParkedRescans::new(),
+      unclaimed: std::collections::HashSet::new(),
+      flush_cursor: None,
+      #[cfg(test)]
+      last_flush_visited: 0,
+      #[cfg(test)]
+      test_pre_cut_claims: Vec::new(),
+      debounce: None,
+      coalescer: None,
+      pending_syncs: Vec::new(),
+      sync_seq: 0,
+      sync_nonce_seed: std::collections::hash_map::RandomState::new(),
+      loss_serial: HashMap::new(),
+      loss_gen: std::sync::Arc::new(core::sync::atomic::AtomicU64::new(0)),
+      cleanup_tx,
+      cleanup_rx,
+      commands: command_rx,
+      sync_commands: sync_command_rx,
+      closes: close_rx,
+      events: event_tx,
+      #[cfg(debug_assertions)]
+      observed_handles: super::ObservedHandles::new(),
+      _rt: PhantomData::<TokioRuntime>,
+    };
+    Self {
+      owner,
+      _events: event_rx,
+      _commands: command_tx,
+      _sync_commands: sync_command_tx,
+      _closes: close_tx,
+    }
+  }
+}
+
+/// Emptying the read plane is TWO operations, and the owner's destructor may only run the
+/// infallible one ahead of the teardown seam. Installing the empty snapshot runs no caller code.
+/// RELEASING the snapshot it displaces runs caller destructors: that snapshot owns radix nodes
+/// holding `C` keys and `V` values, and it is their LAST owner whenever an authoritative mutation
+/// removed them and no publish followed — the state a caller callback that unwound out of a
+/// subsumer mutator between its commit and its `publish` leaves standing.
+///
+/// Fused as a store, that release sits AHEAD of the seam entry and the cookie reaps with nothing
+/// guarding it, so one caller `Drop` skips both: zero `begin_close` against a once-per-source
+/// contract, and every marker file left on the caller's filesystem. On the termination this
+/// destructor exists for — an owner already unwinding — it is worse than skipped work, because a
+/// second unwind out of a destructor running during an unwind ABORTS the process.
+///
+/// The release is therefore held back and contained, below every obligation the destructor has.
+/// This cell drives the SURVIVABILITY half of that: the displaced publication is the last owner of
+/// a `V` whose destructor unwinds, and the teardown must still enter the seam exactly once, still
+/// reap its cookie, and let nothing escape. Where the release sits among those is what
+/// [`owner_teardown_releases_the_displaced_plane_below_every_cookie_it_owes`] reads, because ONE
+/// contained unwind cannot distinguish it — the containment absorbs a single panic wherever it
+/// stands.
+///
+/// The state is ASSEMBLED, not provoked. Reaching it through a real mutator needs a caller `C`
+/// whose `Clone` unwinds (or a handle whose `Hash` does) landing between `cover_remove`'s commit and
+/// `plan_unwatch`'s publish — a call count internal to the mutator, and a cell keyed on it would
+/// pin that count rather than this destructor. The cell takes the publication out, drops the
+/// subscription, and puts the publication back, which is that state exactly.
+///
+/// The teardown runs under [`catch_unwind`](std::panic::catch_unwind) on a path that is NOT itself
+/// unwinding, deliberately: it makes "nothing escapes this destructor" an assertion rather than a
+/// process abort, and it keeps the reverted form a FAILING cell instead of a dead harness. The
+/// containment is what makes the unwinding termination safe, and escape-freedom is the property
+/// that decides it either way.
+///
+/// The drop-path ledger carries no `JoinClose`: a synchronous destructor cannot await the bounded
+/// wait, which is the abnormal-teardown shape [`Source::begin_close`] documents.
+///
+/// FAIL-ON-REVERT: release the displaced publication at the swap (the fused `store` this replaced)
+/// and the caller destructor unwinds out of the destructor's first statement — `teardown` is `Err`,
+/// the ledger has no `BeginClose` and no `EndSync` at all, and the cookie survives its owner.
+#[tokio::test]
+async fn owner_teardown_enters_the_seam_although_releasing_the_displaced_plane_unwinds() {
+  let mut rig = OwnerOverValue::<PlaneValue>::new();
+
+  // The subscription whose caller value the published snapshot ends up alone in owning.
+  let sub = rig
+    .owner
+    .reconcile_watch(&key("/a"), &PlaneValue, WatchOptions::new())
+    .await
+    .expect("watch /a"); // root handle 1
+  let root = rig
+    .owner
+    .subsumer
+    .subscription_root(sub)
+    .expect("live root for /a");
+
+  // A cookie still pending at teardown: the reap is the work standing BEHIND the release, and the
+  // ledger is how the cell reads whether it was attempted.
+  let (sync_reply, sync_response) = futures_channel::oneshot::channel();
+  rig.owner.pending_syncs.push(super::PendingSync {
+    cookie_key: key("/a/cookie-plane"),
+    sub,
+    root,
+    loss_serial_at_install: 0,
+    dominated_at_install: false,
+    reply: sync_reply,
+  });
+
+  // STAGING — the authoritative trees move PAST the published snapshot: take the publication out
+  // of the slot, drop the subscription (which removes its value from the authoritative coverage
+  // plane, and would have released it through the publish that follows), then put the publication
+  // back. The slot now holds a snapshot that is the last owner of a departed caller value.
+  let published = rig.owner.subsumer.swap_in_empty();
+  rig
+    .owner
+    .subsumer
+    .test_plan_unwatch(sub)
+    .expect("the live subscription departs the authoritative plane");
+  rig.owner.subsumer.test_reinstall_publication(published);
+
+  // Read AFTER the owner is gone: the destructor's own read-plane guarantee is asserted alongside
+  // the seam, because the release must not be allowed to cost it.
+  let seam = rig.owner.source.seam();
+  let view = rig.owner.subsumer.view();
+  assert!(
+    view.is_watched(&key("/a")),
+    "staging: the slot still advertises the departed subscription — the stale publication is the \
+     one thing left holding its value"
+  );
+
+  // Only now does the value's destructor unwind, so the staging above ran over silent drops.
+  let unwound_before = PLANE_VALUE_UNWOUND.load(core::sync::atomic::Ordering::SeqCst);
+  PLANE_VALUE_DROP_UNWINDS.store(true, core::sync::atomic::Ordering::SeqCst);
+  let teardown = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(rig)));
+  PLANE_VALUE_DROP_UNWINDS.store(false, core::sync::atomic::Ordering::SeqCst);
+
+  assert_eq!(
+    PLANE_VALUE_UNWOUND.load(core::sync::atomic::Ordering::SeqCst) - unwound_before,
+    1,
+    "staging: the teardown really did release the displaced publication as the last owner of the \
+     departed value, and that release really did unwind"
+  );
+  // THE LEDGER, split at the seam. Below it: the teardown's own calls, and only those — the reap an
+  // unwinding release must not have cost, and no `JoinClose`, which a synchronous destructor cannot
+  // await.
+  let calls = seam.calls();
+  let split = calls
+    .iter()
+    .position(|call| *call == SourceCall::BeginClose)
+    .unwrap_or_else(|| {
+      panic!(
+        "a caller destructor unwinding out of the read plane's release left the source never told \
+         to wind down: {calls:?}"
+      )
+    });
+  assert_eq!(
+    &calls[..split],
+    &[
+      SourceCall::CanonicalizeKey(key("/a")),
+      SourceCall::Arm(PathBuf::from("/a")),
+      SourceCall::RootKey(1),
+    ],
+    "the establishing watch is all that precedes the seam: {calls:?}"
+  );
+  assert_eq!(
+    &calls[split..],
+    &[
+      SourceCall::BeginClose,
+      SourceCall::EndSync(key("/a/cookie-plane")),
+    ],
+    "a caller destructor unwinding out of the read plane's release must leave the seam entered and \
+     the cookie reaped: {calls:?}"
+  );
+  assert_eq!(
+    seam.begin_closes(),
+    1,
+    "the seam is entered exactly once over the source's whole life"
+  );
+  assert!(
+    teardown.is_ok(),
+    "nothing may escape this destructor: it runs on the owner's panic path too, where a second \
+     unwind is an immediate process abort rather than a contained failure"
+  );
+
+  // Unchanged by the split: the SWAP is what empties the plane, and it ran before anything could
+  // unwind.
+  assert!(
+    !view.is_watched(&key("/a")),
+    "the destructor still emptied the read plane, although releasing what it displaced unwound"
+  );
+  assert!(
+    sync_response.await.is_err(),
+    "the reaped barrier's caller sees the dropped reply as Closed"
+  );
+}
+
+/// What a [`WitnessValue`] saw at the instant the teardown released it.
+#[derive(Debug)]
+struct ReleaseObservation {
+  /// Every [`Source`] call the teardown had made by then, in order.
+  calls: Vec<SourceCall>,
+  /// The close acknowledgement, if it had ALREADY been delivered by then. [`None`] means it had
+  /// not — or that the path has no reply to deliver at all, which is the synchronous destructor.
+  ack: Option<Result<(), crate::error::CloseError>>,
+}
+
+thread_local! {
+  /// The ledger a released [`WitnessValue`] reads, and the arming switch for the whole witness.
+  ///
+  /// Thread-local rather than owner-reachable because the release happens INSIDE the teardown under
+  /// test — the owner's own destructor, or [`run`](super::run)'s tail past its last await — so a
+  /// witness held by the owner could not testify about it. Thread-local rather than process-wide
+  /// (which is what [`PLANE_VALUE_UNWOUND`] must be, being read across a `catch_unwind`) because
+  /// libtest gives each cell its own thread and both teardowns run on the cell's own: no parallel
+  /// cell can perturb these, and none needs to.
+  static RELEASE_WITNESS: core::cell::RefCell<Option<SeamLedger>> =
+    const { core::cell::RefCell::new(None) };
+  /// The close acknowledgement's receiver, parked where the released value's destructor can ask it
+  /// whether the reply has landed YET. Left empty by the destructor path, which has no reply.
+  static ACK_PROBE: core::cell::RefCell<
+    Option<futures_channel::oneshot::Receiver<Result<(), crate::error::CloseError>>>,
+  > = const { core::cell::RefCell::new(None) };
+  /// What the FIRST released witness saw. The first release is the earliest instant a caller
+  /// destructor could unwind, so it is the strictest reading of what the teardown still owed.
+  static RELEASE_OBSERVATION: core::cell::RefCell<Option<ReleaseObservation>> =
+    const { core::cell::RefCell::new(None) };
+  /// How many witnesses the teardown released, so a cell can pin that ONE displaced snapshot really
+  /// does hold SEVERAL departed caller values — the premise the ordering rests on.
+  static RELEASED_WITNESSES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// A caller value (`V`) whose destructor REPORTS instead of unwinding: at the instant the teardown
+/// releases it, it reads the source's [`SeamLedger`] and probes the close acknowledgement, and
+/// files both in [`RELEASE_OBSERVATION`].
+///
+/// The ordering half of the class [`PlaneValue`] covers the survivability half of. Containment
+/// answers "does ONE unwinding caller destructor escape", and no more: `catch_unwind` regains
+/// control only once the unwind reaches it, while drop glue leaving a panicking `C`/`V` destructor
+/// carries on destroying the remaining radix nodes of the same publication — so a SECOND caller
+/// destructor that panics there is a panic during cleanup, which ABORTS the process. An aborted
+/// process asserts nothing, so the ordering is read where it IS decidable: from a value that
+/// testifies out of its own `Drop` about the work already behind it.
+///
+/// ARMED by [`RELEASE_WITNESS`] holding a ledger, exactly as [`PlaneValue`] is armed and for the
+/// same reason: the staging itself moves the value — registering and retiring a subscription
+/// copies-on-write the radix node that holds it and disposes of the copy — so an unarmed witness
+/// stays silent through frames the cell is only passing through.
+#[derive(Clone)]
+struct WitnessValue;
+
+impl Drop for WitnessValue {
+  fn drop(&mut self) {
+    let Some(calls) = RELEASE_WITNESS.with_borrow(|ledger| ledger.as_ref().map(SeamLedger::calls))
+    else {
+      return;
+    };
+    RELEASED_WITNESSES.set(RELEASED_WITNESSES.get() + 1);
+    let ack =
+      ACK_PROBE.with_borrow_mut(|probe| probe.as_mut().and_then(|rx| rx.try_recv().ok()?));
+    RELEASE_OBSERVATION.with_borrow_mut(|slot| {
+      if slot.is_none() {
+        *slot = Some(ReleaseObservation { calls, ack });
+      }
+    });
+  }
+}
+
+/// Stages the one state the read plane's release is ABOUT — a published snapshot that is the last
+/// owner of DEPARTED caller values — over two disjoint roots, and hands back the pending cookie's
+/// caller-side reply.
+///
+/// TWO, not one, because the ordering argument rests on there being more than one: a single
+/// interrupted mutator can leave several removed entries alive in the publication alone, so the
+/// release can run several caller destructors, and containment only ever catches the first.
+///
+/// The state is ASSEMBLED, not provoked, for the reason spelled out on
+/// [`owner_teardown_enters_the_seam_although_releasing_the_displaced_plane_unwinds`]: reaching it
+/// through a real mutator would key the cell on a call count internal to that mutator. Take the
+/// publication out of the slot, retire both subscriptions from the authoritative plane (whose own
+/// publish then lands on the emptied slot), and put the stale publication back.
+async fn stage_departed_plane_values(
+  rig: &mut OwnerOverValue<WitnessValue>,
+) -> futures_channel::oneshot::Receiver<Result<super::SyncOutcome, crate::error::SyncError>> {
+  let a = rig
+    .owner
+    .reconcile_watch(&key("/a"), &WitnessValue, WatchOptions::new())
+    .await
+    .expect("watch /a"); // root handle 1
+  let b = rig
+    .owner
+    .reconcile_watch(&key("/b"), &WitnessValue, WatchOptions::new())
+    .await
+    .expect("watch /b"); // root handle 2
+  let root = rig
+    .owner
+    .subsumer
+    .subscription_root(a)
+    .expect("live root for /a");
+
+  // A cookie still pending at teardown: its reap is the work standing behind the release on BOTH
+  // paths, and the seam ledger is how the witness reads whether it had already happened.
+  let (reply, response) = futures_channel::oneshot::channel();
+  rig.owner.pending_syncs.push(super::PendingSync {
+    cookie_key: key("/a/cookie-order"),
+    sub: a,
+    root,
+    loss_serial_at_install: 0,
+    dominated_at_install: false,
+    reply,
+  });
+
+  let published = rig.owner.subsumer.swap_in_empty();
+  rig
+    .owner
+    .subsumer
+    .test_plan_unwatch(a)
+    .expect("the live subscription on /a departs the authoritative plane");
+  rig
+    .owner
+    .subsumer
+    .test_plan_unwatch(b)
+    .expect("the live subscription on /b departs the authoritative plane");
+  rig.owner.subsumer.test_reinstall_publication(published);
+
+  let view = rig.owner.subsumer.view();
+  assert!(
+    view.is_watched(&key("/a")) && view.is_watched(&key("/b")),
+    "staging: the slot still advertises both departed subscriptions — the stale publication is the \
+     one thing left holding their values"
+  );
+  response
+}
+
+/// The teardown seam's ledger as the establishing two watches leave it, which every release
+/// observation below opens with.
+fn establishing_calls() -> Vec<SourceCall> {
+  vec![
+    SourceCall::CanonicalizeKey(key("/a")),
+    SourceCall::Arm(PathBuf::from("/a")),
+    SourceCall::RootKey(1),
+    SourceCall::CanonicalizeKey(key("/b")),
+    SourceCall::Arm(PathBuf::from("/b")),
+    SourceCall::RootKey(2),
+  ]
+}
+
+/// The owner's destructor must release the displaced read plane BELOW every obligation it has — the
+/// teardown seam AND every pending cookie's reap — not merely below the seam.
+///
+/// Containing that release makes ONE unwinding caller destructor survivable, and no more: a second
+/// one panicking as drop glue works through the same publication is a panic during cleanup, which
+/// aborts the process before the containment can regain control. ONE displaced snapshot is enough
+/// to reach that — the interrupted-mutator state the release exists for can strand several removed
+/// entries at once, which is why the staging retires two subscriptions rather than one.
+///
+/// So the release is ordered LAST instead, and an abort out of it then costs nothing that was owed:
+/// the seam is entered and every marker file reaped before the first caller destructor runs at all.
+/// What follows is only the owner's own field drops, and `subsumer`, `filters` and `source` all
+/// hold caller-defined state that can abort this destructor the same way regardless.
+///
+/// FAIL-ON-REVERT: put the release back above the reap loop and the witness reports a ledger with
+/// no `EndSync` in it; fuse it into the swap as a `store` would and the ledger has no `BeginClose`
+/// either.
+#[tokio::test]
+async fn owner_teardown_releases_the_displaced_plane_below_every_cookie_it_owes() {
+  let mut rig = OwnerOverValue::<WitnessValue>::new();
+  let sync_response = stage_departed_plane_values(&mut rig).await;
+  let view = rig.owner.subsumer.view();
+  let seam = rig.owner.source.seam();
+
+  // Only now does the witness report, so the staging above ran over silent drops.
+  RELEASE_WITNESS.with_borrow_mut(|slot| *slot = Some(seam.clone()));
+  drop(rig);
+  RELEASE_WITNESS.with_borrow_mut(|slot| *slot = None);
+
+  assert_eq!(
+    RELEASED_WITNESSES.get(),
+    2,
+    "staging: ONE displaced publication was the last owner of BOTH departed values — which is why \
+     containing the release cannot be the whole answer"
+  );
+  let observed = RELEASE_OBSERVATION
+    .take()
+    .expect("the destructor released the displaced publication");
+  let mut owed = establishing_calls();
+  owed.push(SourceCall::BeginClose);
+  owed.push(SourceCall::EndSync(key("/a/cookie-order")));
+  assert_eq!(
+    observed.calls, owed,
+    "the first caller destructor the release runs must find the seam entered and every cookie \
+     already reaped — everything this destructor owes: {observed:?}"
+  );
+  assert!(
+    observed.ack.is_none(),
+    "a synchronous destructor has no close acknowledgement to give: {observed:?}"
+  );
+  assert_eq!(
+    seam.begin_closes(),
+    1,
+    "the seam is entered exactly once over the source's whole life"
+  );
+
+  // Unchanged by the ordering: the SWAP is what empties the plane, and it is still this
+  // destructor's first statement.
+  assert!(
+    !view.is_watched(&key("/a")) && !view.is_watched(&key("/b")),
+    "the destructor still emptied the read plane before anything else it does"
+  );
+  assert!(
+    sync_response.await.is_err(),
+    "the reaped barrier's caller sees the dropped reply as Closed"
+  );
+}
+
+/// [`run`](super::run)'s normal tail must release the displaced read plane BELOW the bounded
+/// quiescence wait and BELOW the acknowledgement that carries its verdict.
+///
+/// Both are work nothing else can do: the destructor that runs next cannot await
+/// [`Source::join_close`], and it is not given the reply. Containment cannot protect them, for the
+/// reason the destructor cell above states — it catches the first panic, and a second caller
+/// destructor unwinding out of the same publication aborts the process. Ordering the release last
+/// is what makes that abort cost nothing: a `close()` answered by a dropped sender over a source
+/// teardown nobody waited for is no longer standing behind it.
+///
+/// The SWAP stays where it is, above the wait, and this cell pins that half too: the plane must be
+/// empty before `close()` resolves, or a caller whose `close()` returned can still hold a
+/// [`WatchView`](crate::WatchView) advertising coverage whose owner and source are gone.
+///
+/// FAIL-ON-REVERT: move the release back above `join_close().await` and the witness reports a
+/// ledger with no `JoinClose` in it; leave it between the wait and the reply and the witness finds
+/// no acknowledgement delivered.
+#[tokio::test]
+async fn the_run_tail_releases_the_displaced_plane_below_the_wait_and_the_acknowledgement() {
+  let mut rig = OwnerOverValue::<WitnessValue>::new();
+  let sync_response = stage_departed_plane_values(&mut rig).await;
+  let view = rig.owner.subsumer.view();
+  let seam = rig.owner.source.seam();
+
+  let OwnerOverValue {
+    owner,
+    _events,
+    _commands,
+    _sync_commands,
+    _closes: closes,
+  } = rig;
+  let (close_reply, close_response) = futures_channel::oneshot::channel();
+  closes.try_send(close_reply).expect("request the close");
+
+  RELEASE_WITNESS.with_borrow_mut(|slot| *slot = Some(seam.clone()));
+  ACK_PROBE.with_borrow_mut(|slot| *slot = Some(close_response));
+  super::run(owner).await;
+  RELEASE_WITNESS.with_borrow_mut(|slot| *slot = None);
+  let _ = ACK_PROBE.take();
+
+  assert_eq!(
+    RELEASED_WITNESSES.get(),
+    2,
+    "staging: ONE displaced publication was the last owner of BOTH departed values"
+  );
+  let observed = RELEASE_OBSERVATION
+    .take()
+    .expect("the tail released the displaced publication");
+  let mut owed = establishing_calls();
+  owed.push(SourceCall::BeginClose);
+  owed.push(SourceCall::EndSync(key("/a/cookie-order")));
+  owed.push(SourceCall::JoinClose);
+  assert_eq!(
+    observed.calls, owed,
+    "the first caller destructor the release runs must find the bounded wait already made: \
+     {observed:?}"
+  );
+  assert!(
+    matches!(observed.ack, Some(Ok(()))),
+    "and the close already acknowledged, carrying the source's quiescence verdict: {observed:?}"
+  );
+  assert_eq!(
+    seam.begin_closes(),
+    1,
+    "the seam is entered exactly once over the source's whole life"
+  );
+
+  // The half the ordering may NOT buy: the plane is emptied by the SWAP, which stays above the
+  // wait, so it is already empty at the instant `close()` resolves.
+  assert!(
+    !view.is_watched(&key("/a")) && !view.is_watched(&key("/b")),
+    "the tail still emptied the read plane before the close was answered"
+  );
+  assert!(
+    sync_response.await.is_err(),
+    "the reaped barrier's caller sees the dropped reply as Closed"
+  );
+}
+
+thread_local! {
+  /// Arms [`HostileValue`]'s destructor, and DISARMS ITSELF the moment one unwinds.
+  ///
+  /// Exactly one unwind, because one is the whole budget.
+  /// [`contain`](tributary_proto::unwind::contain) regains control only once the unwind reaches it,
+  /// while the drop glue leaving a panicking caller destructor carries on destroying the rest of the
+  /// bundle — so a SECOND panicking destructor there is a panic during cleanup, which aborts the
+  /// process outright. An aborted process asserts nothing and takes the whole harness with it, so
+  /// the survivability question a cell can actually decide is the one-unwind one. The ordering
+  /// question is decided without any panic at all, by [`WitnessValue`].
+  ///
+  /// Thread-local, unlike [`PLANE_VALUE_DROP_UNWINDS`], because SEVERAL cells arm this one and
+  /// libtest runs them in parallel: a process-wide switch would let one cell's arming spend the
+  /// other's single unwind, which is a flake rather than a defect. Each cell owns its thread, the
+  /// values are released by a `run` future this thread polls by hand, and `catch_unwind` never
+  /// leaves the thread it was entered on — so the switch is reachable everywhere the cell needs it.
+  static HOSTILE_VALUE_ARMED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+  /// How many [`HostileValue`] destructors have unwound on this cell's own thread.
+  static HOSTILE_VALUE_UNWOUND: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// A caller value (`V`) whose destructor unwinds — but only for the instances a cell MARKED, and
+/// only while [`HOSTILE_VALUE_ARMED`] stands.
+///
+/// Per-instance rather than per-type, unlike [`PlaneValue`], because this cell needs a populated
+/// read plane it is NOT testing: the establishing subscriptions' values ride the published snapshots
+/// the terminal unwind displaces, and a type that unwound for all of them would spend the single
+/// unwind budget above on a value the cell is only passing through.
+#[derive(Clone)]
+struct HostileValue {
+  unwinds: bool,
+}
+
+impl HostileValue {
+  /// The value a cell hands to the request whose abandonment it is testing.
+  fn hostile() -> Self {
+    Self { unwinds: true }
+  }
+
+  /// The value a cell hands to an establishing subscription it is only passing through.
+  fn inert() -> Self {
+    Self { unwinds: false }
+  }
+}
+
+impl Drop for HostileValue {
+  fn drop(&mut self) {
+    if self.unwinds && HOSTILE_VALUE_ARMED.replace(false) {
+      HOSTILE_VALUE_UNWOUND.set(HOSTILE_VALUE_UNWOUND.get() + 1);
+      std::panic::panic_any(ForgottenPayload);
+    }
+  }
+}
+
+/// A caller destructor unwinding out of a TERMINAL reconcile's own removals must not be able to
+/// answer `close()` for the source.
+///
+/// The terminal reconcile holds a CONSUMED [`CloseReply`] and hands it back for the run tail to
+/// answer with [`Source::join_close`]'s verdict. Everything it does on the way out — abandoning the
+/// not-yet-committed plan, retiring the roots the widen disarmed — removes caller `C`/`V` from the
+/// engine, and a mutator that DESTROYED those removals ran the caller's destructors right there, in
+/// front of the bounded wait and the acknowledgement. One unwinding `Drop` then took the reply with
+/// it: the caller's `close()` read a dropped sender as [`Stopped`](crate::error::CloseError::Stopped)
+/// over a source teardown nobody waited for, and the source's own quiescence evidence — the
+/// strongest lifecycle fact the lower layer produces — was never asked for.
+///
+/// Containment cannot be the answer at those sites for the reason the sibling cells state: it
+/// catches the first panic, and the tail is what owes the wait. So the mutators hand their removals
+/// back instead ([`Salvage`](crate::subsume::Salvage)) and the driver's ONE disposal route
+/// ([`Owner::retire_salvage`]) holds them, on the terminal path only, until the release the tail
+/// already makes last.
+///
+/// The shape is the widen whose arm and re-arm are both refused on capacity, so the reconcile is
+/// pacing inside its restore when the close lands — a genuinely terminal reconcile, not an assembled
+/// state — and the cookie riding a DISJOINT root is the reap the tail still owes when the release
+/// runs.
+///
+/// This cell strands no allocation: both hostile instances sit directly in the bundle's `Vec`s, so
+/// every frame between the unwinding destructor and the containment is drop glue, which drops its
+/// remaining fields and elements while unwinding. That is what separates it from
+/// [`owner_teardown_enters_the_seam_although_releasing_the_displaced_plane_unwinds`], whose value
+/// sits inside an `Arc<Published>`: `Arc`'s deallocation is a statement AFTER the value's
+/// `drop_in_place`, so an unwind out of that one skips it.
+///
+/// FAIL-ON-REVERT: make [`Owner::retire_salvage`] release unconditionally (delete the
+/// `source_closing` branch, which IS the deferral) and the plan abort destroys the caller value
+/// inside the reconcile. The unwind leaves `run` itself, so the tail never happens: `close()` reads
+/// the dropped sender as `Stopped`, the drive assertion sees the escape, and the ledger has neither
+/// the cookie reap nor `JoinClose` in it.
+#[tokio::test]
+async fn a_terminal_reconciles_caller_destructor_cannot_answer_close_for_the_source() {
+  use std::task::{Context, Poll, Waker};
+
+  let mut rig = OwnerOverValue::<HostileValue>::new();
+
+  // The root the widen subsumes, and a DISJOINT root to hang the still-pending cookie on — so the
+  // reap the release must stand behind is the TAIL's `reap_all_pending_syncs`, not the retirement's
+  // own domination of the widened root's barriers.
+  let subsumed = rig
+    .owner
+    .reconcile_watch(&key("/a/b"), &HostileValue::inert(), WatchOptions::new())
+    .await
+    .expect("watch /a/b"); // root handle 1
+  let bystander = rig
+    .owner
+    .reconcile_watch(&key("/x"), &HostileValue::inert(), WatchOptions::new())
+    .await
+    .expect("watch /x"); // root handle 2
+  rig.owner.epochs.stamp(subsumed, Epoch::new(4));
+  let bystander_root = rig
+    .owner
+    .subsumer
+    .subscription_root(bystander)
+    .expect("live root for /x");
+  let (sync_reply, sync_response) = futures_channel::oneshot::channel();
+  rig.owner.pending_syncs.push(super::PendingSync {
+    cookie_key: key("/x/cookie-terminal"),
+    sub: bystander,
+    root: bystander_root,
+    loss_serial_at_install: 0,
+    dominated_at_install: false,
+    reply: sync_reply,
+  });
+
+  // The widen's arm AND every re-arm of the root it disarmed are refused on CAPACITY, so the
+  // reconcile reaches its restore and paces there — the window a close can land in.
+  rig.owner.source.refuse_capacity("/a", u32::MAX);
+  rig.owner.source.refuse_capacity("/a/b", u32::MAX);
+  let seam = rig.owner.source.seam();
+
+  let OwnerOverValue {
+    owner,
+    _events,
+    _commands: commands,
+    _sync_commands,
+    _closes: closes,
+  } = rig;
+  let (watch_reply, _watch_response) = futures_channel::oneshot::channel();
+  commands
+    .try_send(super::Command::Watch {
+      key: key("/a"),
+      // THE value under test: the request's own, which the abandoned plan stashes a clone of and
+      // the abandoned request still owns.
+      value: HostileValue::hostile(),
+      options: WatchOptions::new().with_interest(Interest::all()),
+      reply: watch_reply,
+    })
+    .expect("enqueue the widen");
+
+  let mut cx = Context::from_waker(Waker::noop());
+  let mut run = Box::pin(super::run(owner));
+  assert!(run.as_mut().poll(&mut cx).is_pending(), "staging: the pace");
+  let (close_reply, close_response) = futures_channel::oneshot::channel();
+  closes.try_send(close_reply).expect("request the close");
+
+  // Only now does the marked value's destructor unwind, so the staging above ran over silent drops.
+  let unwound_before = HOSTILE_VALUE_UNWOUND.get();
+  HOSTILE_VALUE_ARMED.set(true);
+  let drove = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run.as_mut().poll(&mut cx)));
+  HOSTILE_VALUE_ARMED.set(false);
+
+  assert_eq!(
+    HOSTILE_VALUE_UNWOUND.get() - unwound_before,
+    1,
+    "staging: the terminal reconcile really did give up a caller value whose destructor unwinds"
+  );
+  // THE VERDICT, read first because it is the whole claim: `Stopped` is what a dropped sender reads
+  // as, and a mid-reconcile release that unwound dropped exactly that sender.
+  assert!(
+    matches!(close_response.await, Ok(Ok(()))),
+    "close() must still carry the SOURCE's quiescence verdict, not a Stopped invented by a caller \
+     destructor unwinding out of the reconcile that consumed the reply"
+  );
+  assert!(
+    matches!(drove, Ok(Poll::Ready(()))),
+    "the run loop must reach its own end: an unwinding caller destructor is contained where the \
+     tail places it, not allowed out through the owner's spawner"
+  );
+
+  // And the work that verdict is supposed to cover: the ledger from the seam onward is the
+  // teardown's own, with the tail's cookie reap and the bounded wait both already made.
+  let calls = seam.calls();
+  let split = calls
+    .iter()
+    .position(|call| *call == SourceCall::BeginClose)
+    .unwrap_or_else(|| panic!("the terminal reconcile never entered the seam: {calls:?}"));
+  assert_eq!(
+    &calls[split..],
+    &[
+      SourceCall::BeginClose,
+      SourceCall::EndSync(key("/x/cookie-terminal")),
+      SourceCall::JoinClose,
+    ],
+    "every cookie reaped and the bounded wait made, all ahead of the release that unwound: \
+     {calls:?}"
+  );
+  assert_eq!(
+    seam.begin_closes(),
+    1,
+    "the seam is entered exactly once over the source's whole life"
+  );
+  assert!(
+    sync_response.await.is_err(),
+    "the reaped barrier's caller sees the dropped reply as Closed"
+  );
+}
+
+/// The seam is entered wherever a reconcile MINTS a terminal outcome, not only where the widen's
+/// unwind retires roots — because the latch is what tells [`Owner::retire_salvage`] the owner is on
+/// its terminal path.
+///
+/// [`Owner::arm`]'s consumed-close arm is the one the widen's retirement does NOT stand in front of:
+/// a plain [`Disjoint`](crate::subsume::WatchOutcome::Disjoint) watch whose arm loses the race has
+/// no disarmed roots to retire, so nothing else on that path would have set the latch. Its plan
+/// abort then destroys the caller's not-yet-committed reservation while a CONSUMED [`CloseReply`]
+/// sits in the returned stop — one unwinding caller destructor and `close()` reads a dropped sender
+/// as [`Stopped`](crate::error::CloseError::Stopped), with the source never asked to quiesce.
+///
+/// Entering the seam at the mint costs the source nothing observable: no `Source` call stands
+/// between it and the tail's own (idempotent) entry, so the order the source sees is exactly the
+/// order it saw before. What it buys is that "terminal" is one bit rather than a property of each
+/// unwinding arm's control flow.
+///
+/// FAIL-ON-REVERT: delete the `begin_source_close()` from [`Owner::arm`]'s `Some(close_reply)` arm
+/// and the latch is unset when the plan is aborted: the reservation's caller destructor runs inside
+/// the reconcile, the unwind leaves `run`, and `close()` reports `Stopped`.
+#[tokio::test]
+async fn a_disjoint_arm_losing_the_close_race_enters_the_seam_before_it_abandons_the_plan() {
+  use std::task::{Context, Poll, Waker};
+
+  let mut rig = OwnerOverValue::<HostileValue>::new();
+
+  // A bystander root carrying the cookie, so the tail owes a reap the release must stand behind.
+  let bystander = rig
+    .owner
+    .reconcile_watch(&key("/x"), &HostileValue::inert(), WatchOptions::new())
+    .await
+    .expect("watch /x"); // root handle 1
+  let bystander_root = rig
+    .owner
+    .subsumer
+    .subscription_root(bystander)
+    .expect("live root for /x");
+  let (sync_reply, sync_response) = futures_channel::oneshot::channel();
+  rig.owner.pending_syncs.push(super::PendingSync {
+    cookie_key: key("/x/cookie-disjoint"),
+    sub: bystander,
+    root: bystander_root,
+    loss_serial_at_install: 0,
+    dominated_at_install: false,
+    reply: sync_reply,
+  });
+
+  // The newcomer is DISJOINT, so its reconcile arms once and retires nothing: the close race inside
+  // that arm is the only thing that can make it terminal.
+  rig.owner.source.wedge_arm("/d");
+  let seam = rig.owner.source.seam();
+
+  let OwnerOverValue {
+    owner,
+    _events,
+    _commands: commands,
+    _sync_commands,
+    _closes: closes,
+  } = rig;
+  let (watch_reply, _watch_response) = futures_channel::oneshot::channel();
+  commands
+    .try_send(super::Command::Watch {
+      key: key("/d"),
+      value: HostileValue::hostile(),
+      options: WatchOptions::new().with_interest(Interest::all()),
+      reply: watch_reply,
+    })
+    .expect("enqueue the disjoint watch");
+
+  let mut cx = Context::from_waker(Waker::noop());
+  let mut run = Box::pin(super::run(owner));
+  assert!(
+    run.as_mut().poll(&mut cx).is_pending(),
+    "staging: the run loop is parked inside the disjoint arm"
+  );
+  let (close_reply, close_response) = futures_channel::oneshot::channel();
+  closes.try_send(close_reply).expect("request the close");
+
+  let unwound_before = HOSTILE_VALUE_UNWOUND.get();
+  HOSTILE_VALUE_ARMED.set(true);
+  let drove = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run.as_mut().poll(&mut cx)));
+  HOSTILE_VALUE_ARMED.set(false);
+
+  assert_eq!(
+    HOSTILE_VALUE_UNWOUND.get() - unwound_before,
+    1,
+    "staging: the abandoned plan really did give up a caller value whose destructor unwinds"
+  );
+  assert!(
+    matches!(close_response.await, Ok(Ok(()))),
+    "close() must still carry the SOURCE's quiescence verdict"
+  );
+  assert!(
+    matches!(drove, Ok(Poll::Ready(()))),
+    "nothing may escape the run loop"
+  );
+
+  let calls = seam.calls();
+  let split = calls
+    .iter()
+    .position(|call| *call == SourceCall::BeginClose)
+    .unwrap_or_else(|| panic!("the arm that consumed the close never entered the seam: {calls:?}"));
+  assert_eq!(
+    &calls[split..],
+    &[
+      SourceCall::BeginClose,
+      SourceCall::EndSync(key("/x/cookie-disjoint")),
+      SourceCall::JoinClose,
+    ],
+    "the reap and the bounded wait both stand ahead of the release that unwound: {calls:?}"
+  );
+  assert_eq!(
+    seam.begin_closes(),
+    1,
+    "entering the seam at the mint must not make it a SECOND entry: the tail's is then the no-op"
+  );
+  assert!(
+    sync_response.await.is_err(),
+    "the reaped barrier's caller sees the dropped reply as Closed"
+  );
+}
+
+thread_local! {
+  /// Whether a MARKED [`HostileComponent`]'s destructor unwinds, on this cell's own thread.
+  ///
+  /// One-shot: the first marked destructor to run clears it, so a cell spends exactly one unwind and
+  /// the drop glue that carries on behind it cannot raise the SECOND panic that would abort the
+  /// process outright.
+  static HOSTILE_COMPONENT_ARMED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+  /// How many [`HostileComponent`] destructors have unwound on this cell's own thread.
+  static HOSTILE_COMPONENT_UNWOUND: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// A caller KEY COMPONENT (`C`) whose destructor unwinds — the `C` half of [`HostileValue`], and the
+/// half the [`Salvage`](crate::subsume::Salvage) funnel's two structural blind spots are about.
+///
+/// `unwinds` is deliberately OUTSIDE the equality: [`Ord`]/[`Eq`]/[`Hash`] read `name` alone, so a
+/// marked component and an inert one with the same name are THE SAME KEY to the radix, the side
+/// table and the coverage plane. That is what lets a cell register several subscriptions at one key
+/// and mark only the DUPLICATES — the registrations whose keys a grouping keyed by an owned `Vec<C>`
+/// discards — so a fired destructor names exactly one site instead of the first `C` the teardown
+/// happens to touch.
+#[derive(Clone, Debug)]
+struct HostileComponent {
+  name: &'static str,
+  unwinds: bool,
+}
+
+impl HostileComponent {
+  /// The components of `path` — every one of them marked iff `unwinds`.
+  fn key(path: &'static str, unwinds: bool) -> Vec<Self> {
+    path
+      .split('/')
+      .filter(|part| !part.is_empty())
+      .map(|name| Self { name, unwinds })
+      .collect()
+  }
+
+  /// A key's component names — what the ledger records, so no ledger entry owns a component whose
+  /// destructor could fire while the cell is reading it.
+  fn names(key: &[Self]) -> Vec<&'static str> {
+    key.iter().map(|component| component.name).collect()
+  }
+}
+
+impl PartialEq for HostileComponent {
+  fn eq(&self, other: &Self) -> bool {
+    self.name == other.name
+  }
+}
+
+impl Eq for HostileComponent {}
+
+impl PartialOrd for HostileComponent {
+  fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+    Some(self.cmp(other))
+  }
+}
+
+impl Ord for HostileComponent {
+  fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+    self.name.cmp(other.name)
+  }
+}
+
+impl core::hash::Hash for HostileComponent {
+  fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+    self.name.hash(state);
+  }
+}
+
+impl Drop for HostileComponent {
+  fn drop(&mut self) {
+    if self.unwinds && HOSTILE_COMPONENT_ARMED.replace(false) {
+      HOSTILE_COMPONENT_UNWOUND.set(HOSTILE_COMPONENT_UNWOUND.get() + 1);
+      std::panic::panic_any(ForgottenPayload);
+    }
+  }
+}
+
+/// The caller data a [`Filter`] predicate captures, whose destructor unwinds — the FILTER half of
+/// [`HostileComponent`], and the only way to reach a caller destructor that no key component can
+/// stand in for.
+///
+/// A `Filter` boxes caller code, and caller code owns whatever the caller likes: retiring a
+/// subscription therefore runs a caller destructor that is neither a `C` nor a `V`, at a site the
+/// key-shaped fixtures cannot mark. It shares [`HostileComponent`]'s one-shot arming so a cell
+/// spends exactly one unwind however the destructor is reached.
+struct HostileFilterState;
+
+impl Drop for HostileFilterState {
+  fn drop(&mut self) {
+    if HOSTILE_COMPONENT_ARMED.replace(false) {
+      HOSTILE_COMPONENT_UNWOUND.set(HOSTILE_COMPONENT_UNWOUND.get() + 1);
+      std::panic::panic_any(ForgottenPayload);
+    }
+  }
+}
+
+/// A [`Filter`] whose predicate captures a [`HostileFilterState`], so DROPPING the filter unwinds.
+/// The predicate itself is inert and admits everything — a cell that never routes an event never
+/// enters it, and the measurement is about the gate's disposal, not its verdict.
+fn hostile_filter() -> Filter<HostileComponent> {
+  let state = HostileFilterState;
+  Filter::new(move |_| {
+    let _ = &state;
+    true
+  })
+}
+
+/// One [`Source`] call [`HostileKeySource`] received. Records component NAMES rather than
+/// components, so the ledger a cell reads after the unwind owns no destructor of its own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum HostileCall {
+  Arm(Vec<&'static str>),
+  Disarm(u32),
+  EndSync(Vec<&'static str>),
+  BeginClose,
+  JoinClose,
+}
+
+/// A minimal [`Source`] over [`HostileComponent`] keys: enough to arm, disarm, wedge one arm on a
+/// hung mount, reap a cookie and answer the close — the surface the two hostile-`C` cells drive.
+///
+/// It never DROPS a stored key: a released handle moves to `released` and keeps its entry, so the
+/// only marked destructors that can run are the engine's own, which is the whole measurement.
+struct HostileKeySource {
+  next_handle: u32,
+  live: HashMap<u32, Vec<HostileComponent>>,
+  released: std::collections::HashSet<u32>,
+  /// Keys whose `arm` NEVER resolves — the hung mount the close race exists for.
+  wedged: Vec<Vec<HostileComponent>>,
+  calls: std::sync::Arc<std::sync::Mutex<Vec<HostileCall>>>,
+}
+
+impl HostileKeySource {
+  fn new() -> Self {
+    Self {
+      next_handle: 0,
+      live: HashMap::new(),
+      released: std::collections::HashSet::new(),
+      wedged: Vec::new(),
+      calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+    }
+  }
+
+  fn note(&self, call: HostileCall) {
+    self.calls.lock().expect("hostile ledger").push(call);
+  }
+
+  fn ledger(&self) -> std::sync::Arc<std::sync::Mutex<Vec<HostileCall>>> {
+    self.calls.clone()
+  }
+
+  fn wedge_arm(&mut self, path: &'static str) {
+    self.wedged.push(HostileComponent::key(path, false));
+  }
+}
+
+impl Source<HostileComponent> for HostileKeySource {
+  type Handle = u32;
+
+  fn canonicalize_key(
+    &self,
+    key: &[HostileComponent],
+  ) -> Result<Vec<HostileComponent>, WatchError> {
+    Ok(key.to_vec())
+  }
+
+  async fn arm(
+    &mut self,
+    key: &[HostileComponent],
+  ) -> Result<Armed<HostileComponent, u32>, WatchError> {
+    self.note(HostileCall::Arm(HostileComponent::names(key)));
+    if self.wedged.iter().any(|wedge| wedge.as_slice() == key) {
+      core::future::pending::<()>().await;
+    }
+    self.next_handle += 1;
+    let handle = self.next_handle;
+    self.live.insert(handle, key.to_vec());
+    Ok(Armed::new(handle, key.to_vec()))
+  }
+
+  fn disarm(&mut self, handle: u32) {
+    self.note(HostileCall::Disarm(handle));
+    self.released.insert(handle);
+  }
+
+  async fn next(&mut self) -> Option<SourceEvent<HostileComponent, u32>> {
+    core::future::pending().await
+  }
+
+  fn end_sync(&mut self, _handle: u32, cookie_key: &[HostileComponent]) {
+    self.note(HostileCall::EndSync(HostileComponent::names(cookie_key)));
+  }
+
+  fn begin_close(&mut self) {
+    self.note(HostileCall::BeginClose);
+  }
+
+  async fn join_close(&mut self) -> Result<(), crate::error::SourceCloseError> {
+    self.note(HostileCall::JoinClose);
+    Ok(())
+  }
+
+  fn root_key(&self, handle: u32) -> Option<Vec<HostileComponent>> {
+    if self.released.contains(&handle) {
+      return None;
+    }
+    self.live.get(&handle).cloned()
+  }
+}
+
+/// An [`Owner`] over [`HostileKeySource`], plus the channel ends a driven [`run`](super::run) needs
+/// kept open. The [`OwnerOverValue`] of the `C` half.
+struct OwnerOverHostileKeys {
+  owner: Owner<HostileComponent, (), TokioRuntime, HostileKeySource>,
+  _events: async_channel::Receiver<Event<HostileComponent, ()>>,
+  /// A clone of the owner's event SENDER, so a cell can fill a bounded stream — see
+  /// [`fill_stream`](Self::fill_stream).
+  events: async_channel::Sender<Event<HostileComponent, ()>>,
+  commands: async_channel::Sender<super::Command<HostileComponent, ()>>,
+  _sync_commands: async_channel::Sender<super::SyncRequest>,
+  closes: async_channel::Sender<super::CloseReply>,
+}
+
+impl OwnerOverHostileKeys {
+  fn new() -> Self {
+    Self::bounded(usize::MAX)
+  }
+
+  /// The rig over an event stream of `capacity` — `usize::MAX` for the unbounded default.
+  fn bounded(capacity: usize) -> Self {
+    let (event_tx, event_rx) = if capacity == usize::MAX {
+      async_channel::unbounded()
+    } else {
+      async_channel::bounded(capacity)
+    };
+    let (command_tx, command_rx) = async_channel::unbounded();
+    let (sync_command_tx, sync_command_rx) = async_channel::unbounded::<super::SyncRequest>();
+    let (close_tx, close_rx) = async_channel::bounded(1);
+    let (cleanup_tx, cleanup_rx) = async_channel::unbounded();
+    let owner = Owner {
+      source: HostileKeySource::new(),
+      source_closing: false,
+      deferred: crate::subsume::Salvage::new(),
+      subsumer: Subsumer::new(),
+      epochs: EpochLedger::new(),
+      filters: Filters::new(),
+      filter_payload_forgotten: false,
+      needs_rescan: ParkedRescans::new(),
+      suppressed_rescan: ParkedRescans::new(),
+      unclaimed: std::collections::HashSet::new(),
+      flush_cursor: None,
+      #[cfg(test)]
+      last_flush_visited: 0,
+      #[cfg(test)]
+      test_pre_cut_claims: Vec::new(),
+      debounce: None,
+      coalescer: None,
+      pending_syncs: Vec::new(),
+      sync_seq: 0,
+      sync_nonce_seed: std::collections::hash_map::RandomState::new(),
+      loss_serial: HashMap::new(),
+      loss_gen: std::sync::Arc::new(core::sync::atomic::AtomicU64::new(0)),
+      cleanup_tx,
+      cleanup_rx,
+      commands: command_rx,
+      sync_commands: sync_command_rx,
+      closes: close_rx,
+      events: event_tx.clone(),
+      #[cfg(debug_assertions)]
+      observed_handles: super::ObservedHandles::new(),
+      _rt: PhantomData::<TokioRuntime>,
+    };
+    Self {
+      owner,
+      _events: event_rx,
+      events: event_tx,
+      commands: command_tx,
+      _sync_commands: sync_command_tx,
+      closes: close_tx,
+    }
+  }
+
+  /// Fills the event stream with one placeholder, so a consumer that has stopped draining is
+  /// modeled: [`flush_pending_rescans`](Owner::flush_pending_rescans) skips a full channel outright,
+  /// which leaves parked debt parked instead of delivered.
+  fn fill_stream(&self, sub: Subscription) {
+    self
+      .events
+      .try_send(Event::rescan(
+        sub,
+        HostileComponent::key("/filler", false),
+        Epoch::new(0),
+      ))
+      .expect("fill the event stream");
+  }
+
+  /// Hangs a still-pending barrier off `sub`'s root, so the teardown tail owes a cookie reap the
+  /// deferred release must stand behind.
+  fn park_cookie(
+    &mut self,
+    sub: Subscription,
+    cookie: &'static str,
+  ) -> futures_channel::oneshot::Receiver<Result<super::SyncOutcome, crate::error::SyncError>> {
+    let root = self
+      .owner
+      .subsumer
+      .subscription_root(sub)
+      .expect("live root for the bystander");
+    let (reply, response) = futures_channel::oneshot::channel();
+    self.owner.pending_syncs.push(super::PendingSync {
+      cookie_key: HostileComponent::key(cookie, false),
+      sub,
+      root,
+      loss_serial_at_install: 0,
+      dominated_at_install: false,
+      reply,
+    });
+    response
+  }
+}
+
+/// The terminal `Disjoint` close race must place EVERY caller key it owns, not only the ones a
+/// mutator handed back.
+///
+/// `#[must_use]` on [`Salvage`](crate::subsume::Salvage) enumerates CALL SITES, so it reaches only
+/// what a mutator RETURNS. A terminal reconcile also owns caller keys no mutator ever saw: the plan
+/// it is abandoning carried a copy of the key, and the reconcile itself owns the canonicalized key
+/// the source built out of the caller's own components and it borrows for its whole body. Both were
+/// destroyed by the frame exit, in front of the tail's bounded [`join_close`](Source::join_close)
+/// and the acknowledgement carrying its verdict — the same unwind the funnel exists to prevent,
+/// arriving through a hole the funnel's own compiler check cannot see.
+///
+/// The plan's copy is gone outright (the outcome carries no key at all: every variant's root key was
+/// a duplicate of the subscription's own with no production reader), and the canonicalized key is
+/// placed through the one disposal route once the borrow ends.
+///
+/// FAIL-ON-REVERT, either half: put `root_key: key.to_vec()` back on
+/// [`Disjoint`](crate::subsume::WatchOutcome::Disjoint), or delete the `keep_key(canonical_key)`
+/// from [`Owner::reconcile_watch`], and the marked destructor fires inside the reconcile instead:
+/// the unwind leaves `run`, `close()` reads the dropped sender as
+/// [`Stopped`](crate::error::CloseError::Stopped), and the ledger has neither the cookie reap nor
+/// `JoinClose` behind the seam.
+#[tokio::test]
+async fn a_terminal_disjoint_close_race_places_every_caller_key_it_owns() {
+  use std::task::{Context, Poll, Waker};
+
+  let mut rig = OwnerOverHostileKeys::new();
+
+  // A bystander root carrying the cookie, so the tail owes a reap the release must stand behind.
+  let bystander = rig
+    .owner
+    .reconcile_watch(
+      &HostileComponent::key("/x", false),
+      &(),
+      WatchOptions::new(),
+    )
+    .await
+    .expect("watch /x");
+  let cookie = rig.park_cookie(bystander, "/x/cookie-disjoint");
+
+  // The newcomer is DISJOINT and its arm hangs, so the close race inside that arm is the only thing
+  // that can make this reconcile terminal — and a disjoint watch retires no root, so the ONLY caller
+  // keys in play are the request's own, its canonicalization, and the reservation's copy.
+  rig.owner.source.wedge_arm("/d");
+  let ledger = rig.owner.source.ledger();
+
+  let OwnerOverHostileKeys {
+    owner,
+    _events,
+    events: _events_tx,
+    commands,
+    _sync_commands,
+    closes,
+  } = rig;
+  let (watch_reply, _watch_response) = futures_channel::oneshot::channel();
+  commands
+    .try_send(super::Command::Watch {
+      // THE key under test: MARKED, so every copy of it the abandoned reconcile owns names this
+      // cell when its destructor unwinds.
+      key: HostileComponent::key("/d", true),
+      value: (),
+      options: WatchOptions::new().with_interest(Interest::all()),
+      reply: watch_reply,
+    })
+    .expect("enqueue the disjoint watch");
+
+  let mut cx = Context::from_waker(Waker::noop());
+  let mut run = Box::pin(super::run(owner));
+  assert!(
+    run.as_mut().poll(&mut cx).is_pending(),
+    "staging: the run loop is parked inside the disjoint arm"
+  );
+  let (close_reply, close_response) = futures_channel::oneshot::channel();
+  closes.try_send(close_reply).expect("request the close");
+
+  // Only now can a marked destructor unwind, so the staging above ran over silent drops.
+  let unwound_before = HOSTILE_COMPONENT_UNWOUND.get();
+  HOSTILE_COMPONENT_ARMED.set(true);
+  let drove = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run.as_mut().poll(&mut cx)));
+  HOSTILE_COMPONENT_ARMED.set(false);
+
+  assert_eq!(
+    HOSTILE_COMPONENT_UNWOUND.get() - unwound_before,
+    1,
+    "staging: the terminal reconcile really did give up a caller key whose destructor unwinds"
+  );
+  // THE VERDICT, read first because it is the whole claim. `now_or_never` rather than `await`
+  // because a REVERT leaves the panicking poll's generator poisoned and undropped, so it still owns
+  // the reply sender: awaiting one would hang the cell instead of reporting what broke, and a
+  // regression cell has to say. By the time `run` resolves the acknowledgement is already sent, so
+  // the one-poll read is exactly the passing case.
+  assert!(
+    matches!(
+      futures_util::FutureExt::now_or_never(close_response),
+      Some(Ok(Ok(())))
+    ),
+    "close() must still carry the SOURCE's quiescence verdict, not a Stopped invented by a caller \
+     key destructor unwinding out of the reconcile that consumed the reply"
+  );
+  assert!(
+    matches!(drove, Ok(Poll::Ready(()))),
+    "nothing may escape the run loop"
+  );
+
+  let calls = ledger.lock().expect("hostile ledger").clone();
+  let split = calls
+    .iter()
+    .position(|call| *call == HostileCall::BeginClose)
+    .unwrap_or_else(|| panic!("the arm that consumed the close never entered the seam: {calls:?}"));
+  assert_eq!(
+    &calls[split..],
+    &[
+      HostileCall::BeginClose,
+      HostileCall::EndSync(std::vec!["x", "cookie-disjoint"]),
+      HostileCall::JoinClose,
+    ],
+    "the reap and the bounded wait both stand ahead of the release that unwound: {calls:?}"
+  );
+  assert!(
+    matches!(futures_util::FutureExt::now_or_never(cookie), Some(Err(_))),
+    "the reaped barrier's caller sees the dropped reply as Closed"
+  );
+}
+
+/// A converted mutator's INTERIOR is the funnel's other blind spot: `#[must_use]` says what a call
+/// site may do with a return, and nothing at all about what the mutator destroys on its way to
+/// producing one.
+///
+/// Several subscriptions may share one key. The dead-root retirement groups the departing
+/// subscribers by cover key, and a grouping keyed by an OWNED `Vec<C>` keeps the first and destroys
+/// every later duplicate the moment its entry is found occupied — inside
+/// [`force_remove_root`](Subsumer::force_remove_root), which the terminal failed-widen unwind calls
+/// with [`source_closing`](Owner::source_closing) already latched. One duplicate's caller destructor
+/// then unwound in front of the remaining reaps, the bounded wait and the acknowledgement, with the
+/// whole bundle the mutator was still assembling lost with it.
+///
+/// So every removed record is retained BEFORE the grouping runs, and the grouping borrows those
+/// retained keys instead of owning one.
+///
+/// The marking is what makes the reading precise: [`HostileComponent`]'s equality ignores the mark,
+/// so the three subscriptions here are at one key while only the two DUPLICATES are marked. The
+/// first registration's key is the one the grouping keeps, so a fired destructor can only be a
+/// discarded duplicate — never the retirement's own root key, and never a component the teardown
+/// merely passed through.
+///
+/// FAIL-ON-REVERT: group by `entry(sub_record.key)` again (owning the key, retaining only the
+/// representative) and the duplicate's destructor fires inside the mutator: the unwind leaves `run`,
+/// `close()` reports `Stopped`, and the ledger has neither the cookie reap nor `JoinClose` in it.
+#[tokio::test]
+async fn a_terminal_retirement_places_the_duplicate_keys_it_removes() {
+  use std::task::{Context, Poll, Waker};
+
+  // A stream the cell FILLS below, so the retirement's owed terminal `Rescan`s stay parked instead
+  // of being delivered. That is not incidental staging: delivering one CLONES the parked key onto
+  // the event and then destroys the parked entry, so a marked component would unwind inside
+  // `flush_pending_rescans` — the same class as the defect under test, in the driver's parked-debt
+  // plane rather than in a converted mutator, and it would answer this cell's question with the
+  // wrong site. Full, the flush is skipped and the only marked destructors left are the mutator's.
+  let mut rig = OwnerOverHostileKeys::bounded(1);
+
+  // THREE subscriptions at ONE key. The first is inert — its key is the one a grouping keyed by an
+  // owned `Vec<C>` keeps — and the two that follow are the MARKED duplicates such a grouping
+  // discards. They are `Covered` by the first's root, so all three ride handle 1 with their own
+  // equal keys recorded side by side.
+  let first = rig
+    .owner
+    .reconcile_watch(
+      &HostileComponent::key("/a/b", false),
+      &(),
+      WatchOptions::new(),
+    )
+    .await
+    .expect("watch /a/b");
+  let second = rig
+    .owner
+    .reconcile_watch(
+      &HostileComponent::key("/a/b", true),
+      &(),
+      WatchOptions::new(),
+    )
+    .await
+    .expect("re-watch /a/b");
+  let third = rig
+    .owner
+    .reconcile_watch(
+      &HostileComponent::key("/a/b", true),
+      &(),
+      WatchOptions::new(),
+    )
+    .await
+    .expect("re-watch /a/b once more");
+  let subsumed = rig
+    .owner
+    .subsumer
+    .subscription_root(first)
+    .expect("live root for /a/b");
+  assert_eq!(
+    rig.owner.subsumer.subscribers(subsumed),
+    vec![first, second, third],
+    "staging: one root, three subscribers, and the marked duplicates behind the inert first"
+  );
+  rig.fill_stream(first);
+
+  // A bystander root carrying the cookie, so the tail owes a reap the release must stand behind —
+  // and a DISJOINT one, so the reap is the tail's own rather than the retirement's domination.
+  let bystander = rig
+    .owner
+    .reconcile_watch(
+      &HostileComponent::key("/x", false),
+      &(),
+      WatchOptions::new(),
+    )
+    .await
+    .expect("watch /x");
+  let cookie = rig.park_cookie(bystander, "/x/cookie-widen");
+
+  // The widen releases the subsumed root and then hangs on the wider arm: the close lands there, so
+  // the reconcile is terminal with a root already disarmed — the unwind that retires it.
+  rig.owner.source.wedge_arm("/a");
+  let ledger = rig.owner.source.ledger();
+
+  let OwnerOverHostileKeys {
+    owner,
+    _events,
+    events: _events_tx,
+    commands,
+    _sync_commands,
+    closes,
+  } = rig;
+  let (watch_reply, _watch_response) = futures_channel::oneshot::channel();
+  commands
+    .try_send(super::Command::Watch {
+      // Inert: the widening request's own key is not what this cell is measuring.
+      key: HostileComponent::key("/a", false),
+      value: (),
+      options: WatchOptions::new().with_interest(Interest::all()),
+      reply: watch_reply,
+    })
+    .expect("enqueue the widen");
+
+  let mut cx = Context::from_waker(Waker::noop());
+  let mut run = Box::pin(super::run(owner));
+  assert!(
+    run.as_mut().poll(&mut cx).is_pending(),
+    "staging: the run loop is parked inside the wider arm, the subsumed root already released"
+  );
+  let (close_reply, close_response) = futures_channel::oneshot::channel();
+  closes.try_send(close_reply).expect("request the close");
+
+  let unwound_before = HOSTILE_COMPONENT_UNWOUND.get();
+  HOSTILE_COMPONENT_ARMED.set(true);
+  let drove = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run.as_mut().poll(&mut cx)));
+  HOSTILE_COMPONENT_ARMED.set(false);
+
+  assert_eq!(
+    HOSTILE_COMPONENT_UNWOUND.get() - unwound_before,
+    1,
+    "staging: the terminal retirement really did give up a duplicate key whose destructor unwinds"
+  );
+  // `now_or_never` for the reason the sibling cell states: a revert must report, never hang.
+  assert!(
+    matches!(
+      futures_util::FutureExt::now_or_never(close_response),
+      Some(Ok(Ok(())))
+    ),
+    "close() must still carry the SOURCE's quiescence verdict, not a Stopped invented by a \
+     duplicate key destroyed inside the mutator"
+  );
+  assert!(
+    matches!(drove, Ok(Poll::Ready(()))),
+    "nothing may escape the run loop"
+  );
+
+  let calls = ledger.lock().expect("hostile ledger").clone();
+  let split = calls
+    .iter()
+    .position(|call| *call == HostileCall::BeginClose)
+    .unwrap_or_else(|| panic!("the terminal widen never entered the seam: {calls:?}"));
+  assert_eq!(
+    &calls[split..],
+    &[
+      HostileCall::BeginClose,
+      HostileCall::EndSync(std::vec!["x", "cookie-widen"]),
+      HostileCall::JoinClose,
+    ],
+    "every cookie reaped and the bounded wait made, all ahead of the release that unwound: \
+     {calls:?}"
+  );
+  assert!(
+    matches!(futures_util::FutureExt::now_or_never(cookie), Some(Err(_))),
+    "the reaped barrier's caller sees the dropped reply as Closed"
+  );
+}
+
+/// The teardown tail's own DELIVERY destroys caller state, and it stands ahead of the bounded wait.
+///
+/// [`Owner::flush_pending_rescans`] is not a [`Subsumer`] mutator, so `#[must_use]` on
+/// [`Salvage`](crate::subsume::Salvage) cannot see it at all: it clones the parked key onto the
+/// event it mints and then CLEARS the parked entry, whose key and baked value are the caller's own.
+/// The tail runs it (`drain_owed_once`) between the cookie reaps and
+/// [`join_close`](Source::join_close), so a caller component destructor unwinding there takes the
+/// source's verdict and the acknowledgement with it.
+///
+/// This is the site the sibling retirement cell had to stage AROUND — it fills the event stream so
+/// this flush is skipped — which is what makes it measured rather than inferred.
+///
+/// The staging is exact in three ways. The debt is planted at a key of its OWN, not at the
+/// subscription's, because a marked key that is also a radix key is destroyed earlier by the
+/// persistent tree's own node collapse (see [`Salvage`](crate::subsume::Salvage)'s stated
+/// mid-mutator limit) and would name that instead. The stream is FULL across the first poll, so the
+/// flush at the top of each loop iteration delivers nothing on a live pass. And it is drained
+/// before the terminal poll, so the tail's flush is the one pass with room to deliver.
+///
+/// FAIL-ON-REVERT: put `self.needs_rescan.remove(&sub);` back in place of the placement on either
+/// the `Ok` or the `Closed` arm, and the parked entry's destructor fires inside the flush: the
+/// unwind leaves `run`, `close()` reads the dropped sender as
+/// [`Stopped`](crate::error::CloseError::Stopped), and the ledger has the reap but no `JoinClose`.
+#[tokio::test]
+async fn a_terminal_tail_flush_places_the_parked_entry_it_delivers() {
+  use std::task::{Context, Poll, Waker};
+
+  let mut rig = OwnerOverHostileKeys::bounded(1);
+
+  // The debt's owner, at an INERT key — the radix stores this one, and this cell is not about it.
+  let owed = rig
+    .owner
+    .reconcile_watch(
+      &HostileComponent::key("/x", false),
+      &(),
+      WatchOptions::new(),
+    )
+    .await
+    .expect("watch /x");
+  // THE key under test: parked debt at a key of its own, MARKED, living nowhere but this entry.
+  rig
+    .owner
+    .needs_rescan
+    .merge_max::<u32>(
+      owed,
+      HostileComponent::key("/x/lost", true),
+      Epoch::new(1),
+      Some(()),
+    )
+    .release();
+  // A cookie on the same root, so the tail owes a reap the flush must stand behind.
+  let cookie = rig.park_cookie(owed, "/x/cookie-flush");
+  // FULL across the first poll: the top-of-iteration flush skips a full channel outright, so the
+  // planted debt survives every live pass.
+  rig.fill_stream(owed);
+
+  // The newcomer is DISJOINT and its arm hangs, so the close race inside that arm is the only thing
+  // that makes this reconcile terminal — and a disjoint watch retires no root, so no retirement
+  // competes with the flush for the one unwind this cell spends.
+  rig.owner.source.wedge_arm("/d");
+  let ledger = rig.owner.source.ledger();
+
+  let OwnerOverHostileKeys {
+    owner,
+    _events,
+    events: _events_tx,
+    commands,
+    _sync_commands,
+    closes,
+  } = rig;
+  let (watch_reply, _watch_response) = futures_channel::oneshot::channel();
+  commands
+    .try_send(super::Command::Watch {
+      key: HostileComponent::key("/d", false),
+      value: (),
+      options: WatchOptions::new().with_interest(Interest::all()),
+      reply: watch_reply,
+    })
+    .expect("enqueue the disjoint watch");
+
+  let mut cx = Context::from_waker(Waker::noop());
+  let mut run = Box::pin(super::run(owner));
+  assert!(
+    run.as_mut().poll(&mut cx).is_pending(),
+    "staging: the run loop is parked inside the disjoint arm"
+  );
+  assert!(
+    _events.try_recv().is_ok(),
+    "staging: drain the filler so the TAIL's flush is the first pass with room to deliver"
+  );
+  let (close_reply, close_response) = futures_channel::oneshot::channel();
+  closes.try_send(close_reply).expect("request the close");
+
+  let unwound_before = HOSTILE_COMPONENT_UNWOUND.get();
+  HOSTILE_COMPONENT_ARMED.set(true);
+  let drove = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run.as_mut().poll(&mut cx)));
+  HOSTILE_COMPONENT_ARMED.set(false);
+
+  assert_eq!(
+    HOSTILE_COMPONENT_UNWOUND.get() - unwound_before,
+    1,
+    "staging: the teardown really did give up a caller key whose destructor unwinds"
+  );
+  // `now_or_never` rather than `await`: a REVERT leaves the panicking poll's generator poisoned and
+  // undropped, so it still owns the reply sender and an await would hang instead of reporting.
+  assert!(
+    matches!(
+      futures_util::FutureExt::now_or_never(close_response),
+      Some(Ok(Ok(())))
+    ),
+    "close() must still carry the SOURCE's quiescence verdict, not a Stopped invented by the \
+     parked entry the tail's own flush cleared"
+  );
+  assert!(
+    matches!(drove, Ok(Poll::Ready(()))),
+    "nothing may escape the run loop"
+  );
+  assert!(
+    !_events.is_empty(),
+    "staging: the flush really delivered the owed Rescan — an undelivered one clears no entry and \
+     measures nothing"
+  );
+
+  let calls = ledger.lock().expect("hostile ledger").clone();
+  let split = calls
+    .iter()
+    .position(|call| *call == HostileCall::BeginClose)
+    .unwrap_or_else(|| panic!("the terminal disjoint arm never entered the seam: {calls:?}"));
+  assert_eq!(
+    &calls[split..],
+    &[
+      HostileCall::BeginClose,
+      HostileCall::EndSync(std::vec!["x", "cookie-flush"]),
+      HostileCall::JoinClose,
+    ],
+    "the reap and the bounded wait both stand ahead of the release that unwound: {calls:?}"
+  );
+  assert!(
+    matches!(futures_util::FutureExt::now_or_never(cookie), Some(Err(_))),
+    "the reaped barrier's caller sees the dropped reply as Closed"
+  );
+}
+
+/// A merge that WIDENS a parked key destroys the components it truncates off, and a merge that
+/// re-bakes a value destroys the one it displaces — both by plain in-place mutation, which no
+/// `#[must_use]` can see.
+///
+/// The terminal retirement parks a `Rescan` for every subscriber of the dying root. A subscriber
+/// that ALREADY carries parked debt takes the occupied arm, where the parked key is truncated down
+/// to the two keys' common prefix — and the truncated tail is caller components. The retirement
+/// runs from the failed widen's unwind with
+/// [`source_closing`](Owner::source_closing) already latched, so this is in front of the tail's
+/// reaps, its bounded wait and its acknowledgement.
+///
+/// The standing debt is parked here through the ordinary door (a merge onto an empty plane) at a
+/// key one component DEEPER than the subscription's own — the shape a source-emitted `Rescan`
+/// parked at its own located key produces — so the retirement's merge really has a tail to shed,
+/// and only that tail is marked.
+///
+/// FAIL-ON-REVERT: make `widen_to_cover` truncate again (`parked.truncate(common)`) instead of
+/// splitting the tail off into the bundle, and the truncated component's destructor fires inside
+/// the merge: the unwind leaves `run`, `close()` reports `Stopped`, and the ledger has no
+/// `JoinClose`.
+#[tokio::test]
+async fn a_terminal_merge_places_the_key_tail_it_widens_away() {
+  use std::task::{Context, Poll, Waker};
+
+  // A stream the cell FILLS below, so the tail's flush is skipped outright and the only merge in
+  // play is the retirement's own.
+  let mut rig = OwnerOverHostileKeys::bounded(1);
+
+  // Inert key: this cell measures the TRUNCATED TAIL, not the subscription's own components.
+  let doomed = rig
+    .owner
+    .reconcile_watch(
+      &HostileComponent::key("/a/b", false),
+      &(),
+      WatchOptions::new(),
+    )
+    .await
+    .expect("watch /a/b");
+
+  // Standing debt at `/a/b/deep`, one component below the subscription's key and MARKED — so the
+  // retirement's merge against `/a/b` sheds exactly `deep` and nothing else.
+  let mut deep = HostileComponent::key("/a/b", false);
+  deep.extend(HostileComponent::key("/deep", true));
+  rig
+    .owner
+    .needs_rescan
+    .merge_max::<u32>(doomed, deep, Epoch::new(1), Some(()))
+    .release();
+  rig.fill_stream(doomed);
+
+  let bystander = rig
+    .owner
+    .reconcile_watch(
+      &HostileComponent::key("/x", false),
+      &(),
+      WatchOptions::new(),
+    )
+    .await
+    .expect("watch /x");
+  let cookie = rig.park_cookie(bystander, "/x/cookie-merge");
+
+  rig.owner.source.wedge_arm("/a");
+  let ledger = rig.owner.source.ledger();
+
+  let OwnerOverHostileKeys {
+    owner,
+    _events,
+    events: _events_tx,
+    commands,
+    _sync_commands,
+    closes,
+  } = rig;
+  let (watch_reply, _watch_response) = futures_channel::oneshot::channel();
+  commands
+    .try_send(super::Command::Watch {
+      key: HostileComponent::key("/a", false),
+      value: (),
+      options: WatchOptions::new().with_interest(Interest::all()),
+      reply: watch_reply,
+    })
+    .expect("enqueue the widen");
+
+  let mut cx = Context::from_waker(Waker::noop());
+  let mut run = Box::pin(super::run(owner));
+  assert!(
+    run.as_mut().poll(&mut cx).is_pending(),
+    "staging: the run loop is parked inside the wider arm, the subsumed root already released"
+  );
+  let (close_reply, close_response) = futures_channel::oneshot::channel();
+  closes.try_send(close_reply).expect("request the close");
+
+  let unwound_before = HOSTILE_COMPONENT_UNWOUND.get();
+  HOSTILE_COMPONENT_ARMED.set(true);
+  let drove = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run.as_mut().poll(&mut cx)));
+  HOSTILE_COMPONENT_ARMED.set(false);
+
+  assert_eq!(
+    HOSTILE_COMPONENT_UNWOUND.get() - unwound_before,
+    1,
+    "staging: the widening merge really did shed a component whose destructor unwinds"
+  );
+  assert!(
+    matches!(
+      futures_util::FutureExt::now_or_never(close_response),
+      Some(Ok(Ok(())))
+    ),
+    "close() must still carry the SOURCE's quiescence verdict, not a Stopped invented by a key \
+     tail truncated away inside the merge"
+  );
+  assert!(
+    matches!(drove, Ok(Poll::Ready(()))),
+    "nothing may escape the run loop"
+  );
+
+  let calls = ledger.lock().expect("hostile ledger").clone();
+  let split = calls
+    .iter()
+    .position(|call| *call == HostileCall::BeginClose)
+    .unwrap_or_else(|| panic!("the terminal widen never entered the seam: {calls:?}"));
+  assert_eq!(
+    &calls[split..],
+    &[
+      HostileCall::BeginClose,
+      HostileCall::EndSync(std::vec!["x", "cookie-merge"]),
+      HostileCall::JoinClose,
+    ],
+    "the reap and the bounded wait both stand ahead of the release that unwound: {calls:?}"
+  );
+  assert!(
+    matches!(futures_util::FutureExt::now_or_never(cookie), Some(Err(_))),
+    "the reaped barrier's caller sees the dropped reply as Closed"
+  );
+}
+
+/// A subscription's ADMISSION GATE is caller code, and the tail's queued grant cleanup retires it.
+///
+/// [`Owner::retire_sub_state`] reclaims the per-subscription [`Filter`], and a `Filter` boxes a
+/// caller predicate that may own anything at all — so the reclaim runs a caller destructor that no
+/// key component stands in for. Both retire paths reach it on the terminal side of the seam; this
+/// cell takes the failed widen's, where the retirement runs with
+/// [`source_closing`](Owner::source_closing) latched and every reap, the bounded wait and the
+/// acknowledgement still owed.
+///
+/// The key is INERT throughout, so the only destructor that can unwind is the gate's.
+///
+/// FAIL-ON-REVERT: put `self.filters.remove(&sub);` back in place of the placement, and the
+/// predicate's captured state is destroyed inside the retirement: the unwind leaves `run`,
+/// `close()` reports `Stopped`, and the ledger has no `JoinClose`.
+#[tokio::test]
+async fn a_terminal_retirement_places_the_admission_gate_it_reclaims() {
+  use std::task::{Context, Poll, Waker};
+
+  let mut rig = OwnerOverHostileKeys::new();
+
+  // The gate under test rides the subscription the terminal widen retires. The driver takes sole
+  // ownership of the filter at commit, so retiring the entry is what drops the predicate.
+  rig
+    .owner
+    .reconcile_watch(
+      &HostileComponent::key("/a/b", false),
+      &(),
+      WatchOptions::new().with_filter(hostile_filter()),
+    )
+    .await
+    .expect("watch /a/b");
+
+  let bystander = rig
+    .owner
+    .reconcile_watch(
+      &HostileComponent::key("/x", false),
+      &(),
+      WatchOptions::new(),
+    )
+    .await
+    .expect("watch /x");
+  let cookie = rig.park_cookie(bystander, "/x/cookie-gate");
+
+  rig.owner.source.wedge_arm("/a");
+  let ledger = rig.owner.source.ledger();
+
+  let OwnerOverHostileKeys {
+    owner,
+    _events,
+    events: _events_tx,
+    commands,
+    _sync_commands,
+    closes,
+  } = rig;
+  let (watch_reply, _watch_response) = futures_channel::oneshot::channel();
+  commands
+    .try_send(super::Command::Watch {
+      key: HostileComponent::key("/a", false),
+      value: (),
+      options: WatchOptions::new().with_interest(Interest::all()),
+      reply: watch_reply,
+    })
+    .expect("enqueue the widen");
+
+  let mut cx = Context::from_waker(Waker::noop());
+  let mut run = Box::pin(super::run(owner));
+  assert!(
+    run.as_mut().poll(&mut cx).is_pending(),
+    "staging: the run loop is parked inside the wider arm, the subsumed root already released"
+  );
+  let (close_reply, close_response) = futures_channel::oneshot::channel();
+  closes.try_send(close_reply).expect("request the close");
+
+  let unwound_before = HOSTILE_COMPONENT_UNWOUND.get();
+  HOSTILE_COMPONENT_ARMED.set(true);
+  let drove = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run.as_mut().poll(&mut cx)));
+  HOSTILE_COMPONENT_ARMED.set(false);
+
+  assert_eq!(
+    HOSTILE_COMPONENT_UNWOUND.get() - unwound_before,
+    1,
+    "staging: the terminal retirement really did give up a gate whose predicate state unwinds"
+  );
+  assert!(
+    matches!(
+      futures_util::FutureExt::now_or_never(close_response),
+      Some(Ok(Ok(())))
+    ),
+    "close() must still carry the SOURCE's quiescence verdict, not a Stopped invented by a caller \
+     filter destroyed inside the retirement"
+  );
+  assert!(
+    matches!(drove, Ok(Poll::Ready(()))),
+    "nothing may escape the run loop"
+  );
+
+  let calls = ledger.lock().expect("hostile ledger").clone();
+  let split = calls
+    .iter()
+    .position(|call| *call == HostileCall::BeginClose)
+    .unwrap_or_else(|| panic!("the terminal widen never entered the seam: {calls:?}"));
+  assert_eq!(
+    &calls[split..],
+    &[
+      HostileCall::BeginClose,
+      HostileCall::EndSync(std::vec!["x", "cookie-gate"]),
+      HostileCall::JoinClose,
+    ],
+    "the reap and the bounded wait both stand ahead of the release that unwound: {calls:?}"
+  );
+  assert!(
+    matches!(futures_util::FutureExt::now_or_never(cookie), Some(Err(_))),
+    "the reaped barrier's caller sees the dropped reply as Closed"
+  );
+}
+
+/// The gate a terminal reconcile NEVER INSTALLED is caller code too, and the frame that owned it
+/// is the one being abandoned.
+///
+/// [`reconcile_canonical_watch`](Owner::reconcile_canonical_watch) is handed the caller's
+/// [`Filter`] and consumes it only where it COMMITS. Every other way out is a
+/// [`ReconcileStop`](super::ReconcileStop) that says nothing about the gate — so while the
+/// reconcile OWNED it, a terminal exit destroyed an uninstalled `Filter`, whose boxed predicate
+/// holds whatever the caller likes. That destructor ran as the inner future completed: before the
+/// outer frame resumed, before the bounded [`join_close`](Source::join_close), and before the
+/// acknowledgement carrying its verdict.
+///
+/// It is the canonicalized key's sibling and takes the key's shape: the gate lives in a slot the
+/// CALLER's frame owns, a commit takes it out, and the borrow ends when the reconcile returns.
+///
+/// The key is INERT throughout — this is the wedged-arm close race the key cell drives, with the
+/// marking moved onto the gate — so the only destructor that can unwind is the one belonging to a
+/// gate that was never installed.
+///
+/// FAIL-ON-REVERT: take `filter: Filter<C>` by value again and install it directly, and the
+/// predicate's captured state is destroyed inside the abandoned reconcile: the unwind leaves `run`,
+/// `close()` reports `Stopped`, and the ledger has no `JoinClose`.
+#[tokio::test]
+async fn a_terminal_reconcile_places_the_gate_it_never_installed() {
+  use std::task::{Context, Poll, Waker};
+
+  let mut rig = OwnerOverHostileKeys::new();
+
+  // A bystander root carrying the cookie, so the tail owes a reap the release must stand behind.
+  let bystander = rig
+    .owner
+    .reconcile_watch(
+      &HostileComponent::key("/x", false),
+      &(),
+      WatchOptions::new(),
+    )
+    .await
+    .expect("watch /x");
+  let cookie = rig.park_cookie(bystander, "/x/cookie-uninstalled");
+
+  // The newcomer is DISJOINT and its arm hangs, so the close race inside that arm is the only thing
+  // that can make this reconcile terminal — and it goes terminal BEFORE any commit, which is the
+  // one state in which the gate is still the reconcile's to lose.
+  rig.owner.source.wedge_arm("/d");
+  let ledger = rig.owner.source.ledger();
+
+  let OwnerOverHostileKeys {
+    owner,
+    _events,
+    events: _events_tx,
+    commands,
+    _sync_commands,
+    closes,
+  } = rig;
+  let (watch_reply, _watch_response) = futures_channel::oneshot::channel();
+  commands
+    .try_send(super::Command::Watch {
+      // INERT key, so no copy of it can stand in for the gate when a destructor fires.
+      key: HostileComponent::key("/d", false),
+      value: (),
+      options: WatchOptions::new()
+        .with_interest(Interest::all())
+        .with_filter(hostile_filter()),
+      reply: watch_reply,
+    })
+    .expect("enqueue the disjoint watch");
+
+  let mut cx = Context::from_waker(Waker::noop());
+  let mut run = Box::pin(super::run(owner));
+  assert!(
+    run.as_mut().poll(&mut cx).is_pending(),
+    "staging: the run loop is parked inside the disjoint arm, nothing committed"
+  );
+  let (close_reply, close_response) = futures_channel::oneshot::channel();
+  closes.try_send(close_reply).expect("request the close");
+
+  let unwound_before = HOSTILE_COMPONENT_UNWOUND.get();
+  HOSTILE_COMPONENT_ARMED.set(true);
+  let drove = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run.as_mut().poll(&mut cx)));
+  HOSTILE_COMPONENT_ARMED.set(false);
+
+  assert_eq!(
+    HOSTILE_COMPONENT_UNWOUND.get() - unwound_before,
+    1,
+    "staging: the abandoned reconcile really did give up a gate whose predicate state unwinds"
+  );
+  assert!(
+    matches!(
+      futures_util::FutureExt::now_or_never(close_response),
+      Some(Ok(Ok(())))
+    ),
+    "close() must still carry the SOURCE's quiescence verdict, not a Stopped invented by an \
+     uninstalled gate destroyed inside the reconcile that consumed the reply"
+  );
+  assert!(
+    matches!(drove, Ok(Poll::Ready(()))),
+    "nothing may escape the run loop"
+  );
+
+  let calls = ledger.lock().expect("hostile ledger").clone();
+  let split = calls
+    .iter()
+    .position(|call| *call == HostileCall::BeginClose)
+    .unwrap_or_else(|| panic!("the arm that consumed the close never entered the seam: {calls:?}"));
+  assert_eq!(
+    &calls[split..],
+    &[
+      HostileCall::BeginClose,
+      HostileCall::EndSync(std::vec!["x", "cookie-uninstalled"]),
+      HostileCall::JoinClose,
+    ],
+    "the reap and the bounded wait both stand ahead of the release that unwound: {calls:?}"
+  );
+  assert!(
+    matches!(futures_util::FutureExt::now_or_never(cookie), Some(Err(_))),
+    "the reaped barrier's caller sees the dropped reply as Closed"
+  );
+}
+
+/// The tail's queued GRANT CLEANUP purges parked debt, and that debt is the caller's.
+///
+/// A committed-but-unclaimed [`WatchGrant`] whose caller never polls the reply enqueues a
+/// [`Cleanup::DropOrphan`], which the teardown tail drains
+/// ([`drain_pending_cleanup`](Owner::drain_pending_cleanup)) into
+/// [`release_subscription`](Owner::release_subscription). That release purges the sub's parked
+/// overflow `Rescan` — an entry owning a caller key and the caller value baked onto it — between
+/// the tail's cookie reaps and its bounded [`join_close`](Source::join_close).
+///
+/// The orphan is enqueued only AFTER the loop has parked inside a wedged arm, because the loop
+/// drains this channel at the top of every iteration: queued earlier it would be released on a LIVE
+/// path, where the release is correct and measures nothing.
+///
+/// FAIL-ON-REVERT: put `self.needs_rescan.remove(&sub);` / `self.suppressed_rescan.remove(&sub);`
+/// back in place of the placements, and the parked entry's destructor fires inside the release:
+/// the unwind leaves `run`, `close()` reports `Stopped`, and the ledger has no `JoinClose`.
+#[tokio::test]
+async fn a_terminal_grant_cleanup_places_the_parked_debt_it_purges() {
+  use std::task::{Context, Poll, Waker};
+
+  // FILLED below, so the flush at the top of each loop iteration is skipped and the planted debt
+  // survives to the tail's cleanup drain instead of being delivered on a live pass.
+  let mut rig = OwnerOverHostileKeys::bounded(1);
+
+  // Inert key: the debt's own parked key is what this cell marks, not the subscription's.
+  let orphan = rig
+    .owner
+    .reconcile_watch(
+      &HostileComponent::key("/p", false),
+      &(),
+      WatchOptions::new(),
+    )
+    .await
+    .expect("watch /p");
+  rig
+    .owner
+    .needs_rescan
+    .merge_max::<u32>(
+      orphan,
+      HostileComponent::key("/p", true),
+      Epoch::new(1),
+      Some(()),
+    )
+    .release();
+  rig.fill_stream(orphan);
+
+  let bystander = rig
+    .owner
+    .reconcile_watch(
+      &HostileComponent::key("/x", false),
+      &(),
+      WatchOptions::new(),
+    )
+    .await
+    .expect("watch /x");
+  let cookie = rig.park_cookie(bystander, "/x/cookie-orphan");
+
+  // The newcomer is DISJOINT and its arm hangs, so the close race inside that arm is what makes the
+  // reconcile terminal — and a disjoint watch retires no root, so the ONLY thing that can purge the
+  // planted debt is the tail's own cleanup drain.
+  rig.owner.source.wedge_arm("/d");
+  let ledger = rig.owner.source.ledger();
+  let cleanup_tx = rig.owner.cleanup_tx.clone();
+
+  let OwnerOverHostileKeys {
+    owner,
+    _events,
+    events: _events_tx,
+    commands,
+    _sync_commands,
+    closes,
+  } = rig;
+  let (watch_reply, _watch_response) = futures_channel::oneshot::channel();
+  commands
+    .try_send(super::Command::Watch {
+      key: HostileComponent::key("/d", false),
+      value: (),
+      options: WatchOptions::new().with_interest(Interest::all()),
+      reply: watch_reply,
+    })
+    .expect("enqueue the disjoint watch");
+
+  let mut cx = Context::from_waker(Waker::noop());
+  let mut run = Box::pin(super::run(owner));
+  assert!(
+    run.as_mut().poll(&mut cx).is_pending(),
+    "staging: the run loop is parked inside the disjoint arm"
+  );
+  // The grant's caller dropped its wait: exactly one `Cleanup::DropOrphan` fires per grant, and the
+  // loop is parked, so the tail is the first thing that can drain it.
+  drop(super::WatchGrant::new(orphan, cleanup_tx));
+  let (close_reply, close_response) = futures_channel::oneshot::channel();
+  closes.try_send(close_reply).expect("request the close");
+
+  let unwound_before = HOSTILE_COMPONENT_UNWOUND.get();
+  HOSTILE_COMPONENT_ARMED.set(true);
+  let drove = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run.as_mut().poll(&mut cx)));
+  HOSTILE_COMPONENT_ARMED.set(false);
+
+  assert_eq!(
+    HOSTILE_COMPONENT_UNWOUND.get() - unwound_before,
+    1,
+    "staging: the tail's cleanup drain really did purge a parked key whose destructor unwinds"
+  );
+  assert!(
+    matches!(
+      futures_util::FutureExt::now_or_never(close_response),
+      Some(Ok(Ok(())))
+    ),
+    "close() must still carry the SOURCE's quiescence verdict, not a Stopped invented by parked \
+     debt purged inside the release"
+  );
+  assert!(
+    matches!(drove, Ok(Poll::Ready(()))),
+    "nothing may escape the run loop"
+  );
+
+  let calls = ledger.lock().expect("hostile ledger").clone();
+  let split = calls
+    .iter()
+    .position(|call| *call == HostileCall::BeginClose)
+    .unwrap_or_else(|| panic!("the terminal disjoint arm never entered the seam: {calls:?}"));
+  assert_eq!(
+    &calls[split..],
+    &[
+      HostileCall::BeginClose,
+      HostileCall::EndSync(std::vec!["x", "cookie-orphan"]),
+      // The release emptied the orphan's root, so its synchronous fire-and-forget disarm rides here
+      // too — on the far side of the seam, where a best-effort request belongs.
+      HostileCall::Disarm(1),
+      HostileCall::JoinClose,
+    ],
+    "the reap and the bounded wait both stand ahead of the release that unwound: {calls:?}"
+  );
+  assert!(
+    matches!(futures_util::FutureExt::now_or_never(cookie), Some(Err(_))),
+    "the reaped barrier's caller sees the dropped reply as Closed"
+  );
+}
+
+/// A settle window nothing in a cell can outlive, so an admitted delta is still BUFFERED when the
+/// teardown reaches it.
+fn parked_debounce() -> DebounceConfig {
+  DebounceConfig::new()
+    .with_quiet_window(Duration::from_secs(3600))
+    .with_max_hold(Duration::from_secs(3600))
+}
+
+/// The teardown flush EMPTIES two indexes, and their keys are the caller's — a `clear()` and a
+/// discarded destructuring binding, neither of which returns anything for `#[must_use]` to guard.
+///
+/// [`Coalescer::flush_all`] force-emits the coalesced tail so a source drain loses nothing, and
+/// the events themselves are DELIVERED. What used to die where it stood is the bookkeeping around
+/// them: the deadline index was `clear()`ed, and consuming the buffer discarded each map-owned key
+/// under a `_path` binding. Both are deep copies of the caller's own components, and the tail runs
+/// this ([`drain_owed_once`](Owner::drain_owed_once)) between the cookie reaps and the bounded
+/// [`join_close`](Source::join_close).
+///
+/// The delta belongs to the BYSTANDER, which nothing in this cell releases — so no purge can reach
+/// its entries first and the tail's flush is the only thing that empties them.
+///
+/// FAIL-ON-REVERT, either half: put `self.deadlines.clear()` back, or drop each buffer key under a
+/// `_path` binding again, and the marked component is destroyed inside the flush: the unwind leaves
+/// `run`, `close()` reports `Stopped`, and the ledger has no `JoinClose`.
+#[tokio::test]
+async fn a_terminal_coalescer_flush_places_the_index_keys_it_empties() {
+  use std::task::{Context, Poll, Waker};
+
+  let mut rig = OwnerOverHostileKeys::new();
+
+  let bystander = rig
+    .owner
+    .reconcile_watch(
+      &HostileComponent::key("/x", false),
+      &(),
+      WatchOptions::new(),
+    )
+    .await
+    .expect("watch /x");
+  let cookie = rig.park_cookie(bystander, "/x/cookie-flush");
+
+  rig.owner.coalescer = Some(Coalescer::new(Some(parked_debounce())));
+  // MARKED: the admitted event's key is deep-copied into the buffer's own key and into the deadline
+  // index's, and those two copies are what the flush gives up. The event carries a third and is
+  // delivered whole, so a fired destructor can only belong to an index copy or to the release.
+  rig.owner.push_all(std::vec![Event::synthetic(
+    bystander,
+    HostileComponent::key("/x/f", true),
+    Location::new(),
+    EventKind::Modified,
+    Epoch::new(1),
+  )]);
+  assert!(
+    rig
+      .owner
+      .coalescer
+      .as_ref()
+      .is_some_and(|coalescer| coalescer.next_deadline().is_some()),
+    "staging: the delta is still buffered, so the tail's flush is what empties both indexes"
+  );
+
+  rig.owner.source.wedge_arm("/d");
+  let ledger = rig.owner.source.ledger();
+
+  let OwnerOverHostileKeys {
+    owner,
+    _events,
+    events: _events_tx,
+    commands,
+    _sync_commands,
+    closes,
+  } = rig;
+  let (watch_reply, _watch_response) = futures_channel::oneshot::channel();
+  commands
+    .try_send(super::Command::Watch {
+      key: HostileComponent::key("/d", false),
+      value: (),
+      options: WatchOptions::new().with_interest(Interest::all()),
+      reply: watch_reply,
+    })
+    .expect("enqueue the disjoint watch");
+
+  let mut cx = Context::from_waker(Waker::noop());
+  let mut run = Box::pin(super::run(owner));
+  assert!(
+    run.as_mut().poll(&mut cx).is_pending(),
+    "staging: the run loop is parked inside the disjoint arm"
+  );
+  let (close_reply, close_response) = futures_channel::oneshot::channel();
+  closes.try_send(close_reply).expect("request the close");
+
+  let unwound_before = HOSTILE_COMPONENT_UNWOUND.get();
+  HOSTILE_COMPONENT_ARMED.set(true);
+  let drove = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run.as_mut().poll(&mut cx)));
+  HOSTILE_COMPONENT_ARMED.set(false);
+
+  assert_eq!(
+    HOSTILE_COMPONENT_UNWOUND.get() - unwound_before,
+    1,
+    "staging: the tail's flush really did give up an index key whose destructor unwinds"
+  );
+  assert!(
+    matches!(
+      futures_util::FutureExt::now_or_never(close_response),
+      Some(Ok(Ok(())))
+    ),
+    "close() must still carry the SOURCE's quiescence verdict, not a Stopped invented by an index \
+     key destroyed inside the teardown flush"
+  );
+  assert!(
+    matches!(drove, Ok(Poll::Ready(()))),
+    "nothing may escape the run loop"
+  );
+
+  let calls = ledger.lock().expect("hostile ledger").clone();
+  let split = calls
+    .iter()
+    .position(|call| *call == HostileCall::BeginClose)
+    .unwrap_or_else(|| panic!("the terminal disjoint arm never entered the seam: {calls:?}"));
+  assert_eq!(
+    &calls[split..],
+    &[
+      HostileCall::BeginClose,
+      HostileCall::EndSync(std::vec!["x", "cookie-flush"]),
+      HostileCall::JoinClose,
+    ],
+    "the reap and the bounded wait both stand ahead of the release that unwound: {calls:?}"
+  );
+  assert!(
+    matches!(futures_util::FutureExt::now_or_never(cookie), Some(Err(_))),
+    "the reaped barrier's caller sees the dropped reply as Closed"
+  );
+}
+
+/// `BTreeMap::remove` hands back the VALUE and destroys the KEY, and the key is the caller's.
+///
+/// This is the sub-class a search for unsalvaged removals misses, because such a search reads what a
+/// removal RETURNS. The coalescer's purge salvaged the scan's copy of the key, the deadline
+/// index's copy, and the buffered event — and let `self.buffer.remove(&key)` destroy the copy the
+/// MAP owned, inside the call, unmentioned. Neither `#[must_use]` nor a private-map wrapper can see
+/// it: the removal does return something and the site does use it. `remove_entry` is the whole fix,
+/// and finding the site is the whole work.
+///
+/// It is terminal-reachable through the tail's own cleanup drain: `drain_pending_cleanup` →
+/// [`release_subscription`](Owner::release_subscription) →
+/// [`Coalescer::forget_subscription`] → [`Coalescer::drop_subscription`], with
+/// [`source_closing`](Owner::source_closing) latched and the bounded
+/// [`join_close`](Source::join_close) and the acknowledgement both still owed.
+///
+/// FAIL-ON-REVERT: put `self.buffer.remove(&key)` back in place of `remove_entry`, and the
+/// map-owned key's destructor fires inside the purge — ahead of every other copy, which the loop
+/// salvages only afterwards: the unwind leaves `run`, `close()` reports `Stopped`, and the ledger
+/// has no `JoinClose`.
+#[tokio::test]
+async fn a_terminal_purge_places_the_map_owned_key_its_removal_destroyed() {
+  use std::task::{Context, Poll, Waker};
+
+  let mut rig = OwnerOverHostileKeys::new();
+
+  // Watched FIRST, so its root is handle 1 — the disarm the release requests below.
+  let orphan = rig
+    .owner
+    .reconcile_watch(
+      &HostileComponent::key("/p", false),
+      &(),
+      WatchOptions::new(),
+    )
+    .await
+    .expect("watch /p");
+  let bystander = rig
+    .owner
+    .reconcile_watch(
+      &HostileComponent::key("/x", false),
+      &(),
+      WatchOptions::new(),
+    )
+    .await
+    .expect("watch /x");
+  let cookie = rig.park_cookie(bystander, "/x/cookie-purge");
+
+  rig.owner.coalescer = Some(Coalescer::new(Some(parked_debounce())));
+  // MARKED, and buffered for the ORPHAN — the subscription the tail's cleanup drain releases, so
+  // the purge reaches this entry before the tail's own flush could.
+  rig.owner.push_all(std::vec![Event::synthetic(
+    orphan,
+    HostileComponent::key("/p/f", true),
+    Location::new(),
+    EventKind::Modified,
+    Epoch::new(1),
+  )]);
+  assert!(
+    rig
+      .owner
+      .coalescer
+      .as_ref()
+      .is_some_and(|coalescer| coalescer.next_deadline().is_some()),
+    "staging: the delta is buffered under a map-owned key the purge must hand back"
+  );
+
+  rig.owner.source.wedge_arm("/d");
+  let ledger = rig.owner.source.ledger();
+  let cleanup_tx = rig.owner.cleanup_tx.clone();
+
+  let OwnerOverHostileKeys {
+    owner,
+    _events,
+    events: _events_tx,
+    commands,
+    _sync_commands,
+    closes,
+  } = rig;
+  let (watch_reply, _watch_response) = futures_channel::oneshot::channel();
+  commands
+    .try_send(super::Command::Watch {
+      key: HostileComponent::key("/d", false),
+      value: (),
+      options: WatchOptions::new().with_interest(Interest::all()),
+      reply: watch_reply,
+    })
+    .expect("enqueue the disjoint watch");
+
+  let mut cx = Context::from_waker(Waker::noop());
+  let mut run = Box::pin(super::run(owner));
+  assert!(
+    run.as_mut().poll(&mut cx).is_pending(),
+    "staging: the run loop is parked inside the disjoint arm"
+  );
+  // The grant's caller dropped its wait: exactly one `Cleanup::DropOrphan` fires per grant, and the
+  // loop is parked, so the tail is the first thing that can drain it.
+  drop(super::WatchGrant::new(orphan, cleanup_tx));
+  let (close_reply, close_response) = futures_channel::oneshot::channel();
+  closes.try_send(close_reply).expect("request the close");
+
+  let unwound_before = HOSTILE_COMPONENT_UNWOUND.get();
+  HOSTILE_COMPONENT_ARMED.set(true);
+  let drove = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run.as_mut().poll(&mut cx)));
+  HOSTILE_COMPONENT_ARMED.set(false);
+
+  assert_eq!(
+    HOSTILE_COMPONENT_UNWOUND.get() - unwound_before,
+    1,
+    "staging: the tail's purge really did give up a buffered key whose destructor unwinds"
+  );
+  assert!(
+    matches!(
+      futures_util::FutureExt::now_or_never(close_response),
+      Some(Ok(Ok(())))
+    ),
+    "close() must still carry the SOURCE's quiescence verdict, not a Stopped invented by the \
+     map-owned key a removal destroyed"
+  );
+  assert!(
+    matches!(drove, Ok(Poll::Ready(()))),
+    "nothing may escape the run loop"
+  );
+
+  let calls = ledger.lock().expect("hostile ledger").clone();
+  let split = calls
+    .iter()
+    .position(|call| *call == HostileCall::BeginClose)
+    .unwrap_or_else(|| panic!("the terminal disjoint arm never entered the seam: {calls:?}"));
+  assert_eq!(
+    &calls[split..],
+    &[
+      HostileCall::BeginClose,
+      HostileCall::EndSync(std::vec!["x", "cookie-purge"]),
+      // The release emptied the orphan's root, so its synchronous fire-and-forget disarm rides here
+      // too — on the far side of the seam, where a best-effort request belongs.
+      HostileCall::Disarm(1),
+      HostileCall::JoinClose,
+    ],
+    "the reap and the bounded wait both stand ahead of the release that unwound: {calls:?}"
+  );
+  assert!(
+    matches!(futures_util::FutureExt::now_or_never(cookie), Some(Err(_))),
+    "the reaped barrier's caller sees the dropped reply as Closed"
+  );
+}
+
+/// The set-cover RE-RECORD supersedes a cover by plain field assignment, and the tail reaches it.
+///
+/// [`Subsumer::set_retained_cover`] replaces a root's recorded coverage. The record it replaces is
+/// an `Option<Vec<Vec<C>>>` of caller components, and a plain assignment destroys it where it
+/// stands — the shape no `#[must_use]` can see, because nothing is returned at all.
+///
+/// It is terminal-reachable through the tail's own cleanup drain: `drain_pending_cleanup` →
+/// `release_subscription` → `plan_unwatch` → `Dropped { shrink: Some(..) }` → this re-record, with
+/// [`source_closing`](Owner::source_closing) latched and the bounded
+/// [`join_close`](Source::join_close) and the acknowledgement both still owed.
+///
+/// Reaching it with a NON-EMPTY previous record takes two shrinks: the root-key subscriber departs
+/// first (recording `{/a/b, /a/c}` over a full-coverage `None`), and only the SECOND departure —
+/// the orphan the tail releases — replaces a record that actually owns caller components. The
+/// record is then re-recorded with `/a/c` MARKED, which decides nothing (the mark is outside the
+/// component's equality) and leaves the marked components living in the RECORD alone, so a fired
+/// destructor can only be the superseded record's.
+///
+/// FAIL-ON-REVERT: assign the field again (`record.retained_cover = cover;`) in place of the
+/// `mem::replace` whose result is placed, and the superseded cover's destructor fires inside the
+/// mutator: the unwind leaves `run`, `close()` reports `Stopped`, and the ledger has no
+/// `JoinClose`.
+#[tokio::test]
+async fn a_terminal_cover_re_record_places_the_cover_it_supersedes() {
+  use std::task::{Context, Poll, Waker};
+
+  let mut rig = OwnerOverHostileKeys::new();
+
+  // One root at /a with three subscribers: the root-key one, an inert survivor, and the MARKED
+  // departure whose components the second re-record supersedes.
+  let wide = rig
+    .owner
+    .reconcile_watch(
+      &HostileComponent::key("/a", false),
+      &(),
+      WatchOptions::new(),
+    )
+    .await
+    .expect("watch /a");
+  rig
+    .owner
+    .reconcile_watch(
+      &HostileComponent::key("/a/b", false),
+      &(),
+      WatchOptions::new(),
+    )
+    .await
+    .expect("watch /a/b");
+  let departing = rig
+    .owner
+    .reconcile_watch(
+      &HostileComponent::key("/a/c", false),
+      &(),
+      WatchOptions::new(),
+    )
+    .await
+    .expect("watch /a/c");
+  let root = rig
+    .owner
+    .subsumer
+    .subscription_root(wide)
+    .expect("live root for /a");
+
+  // First shrink, on a LIVE path: the root-key subscriber departs, leaving the root over-broad, so
+  // the cover is recorded for the first time — over a `None`, which supersedes nothing.
+  rig
+    .owner
+    .release_subscription(wide)
+    .expect("release the root-key subscriber");
+  assert_eq!(
+    rig.owner.subsumer.retained_cover_of(root),
+    Some(vec![
+      HostileComponent::key("/a/b", false),
+      HostileComponent::key("/a/c", false)
+    ]),
+    "staging: the record now OWNS caller components, so the next re-record has one to supersede"
+  );
+  // Re-record the SAME cover with the departing prefix MARKED. The mark is outside the component's
+  // equality, so this narrows nothing and changes no decision — it only puts the marked components
+  // where this cell needs them: in the RECORD, and nowhere else. A key that is also a radix key
+  // would be destroyed earlier by the tree's own node collapse (see
+  // [`Salvage`](crate::subsume::Salvage)'s stated mid-mutator limit) and would name that instead.
+  rig
+    .owner
+    .subsumer
+    .set_retained_cover(
+      root,
+      Some(vec![
+        HostileComponent::key("/a/b", false),
+        HostileComponent::key("/a/c", true),
+      ]),
+    )
+    .release();
+
+  let bystander = rig
+    .owner
+    .reconcile_watch(
+      &HostileComponent::key("/x", false),
+      &(),
+      WatchOptions::new(),
+    )
+    .await
+    .expect("watch /x");
+  let cookie = rig.park_cookie(bystander, "/x/cookie-cover");
+
+  rig.owner.source.wedge_arm("/d");
+  let ledger = rig.owner.source.ledger();
+  let cleanup_tx = rig.owner.cleanup_tx.clone();
+
+  let OwnerOverHostileKeys {
+    owner,
+    _events,
+    events: _events_tx,
+    commands,
+    _sync_commands,
+    closes,
+  } = rig;
+  let (watch_reply, _watch_response) = futures_channel::oneshot::channel();
+  commands
+    .try_send(super::Command::Watch {
+      key: HostileComponent::key("/d", false),
+      value: (),
+      options: WatchOptions::new().with_interest(Interest::all()),
+      reply: watch_reply,
+    })
+    .expect("enqueue the disjoint watch");
+
+  let mut cx = Context::from_waker(Waker::noop());
+  let mut run = Box::pin(super::run(owner));
+  assert!(
+    run.as_mut().poll(&mut cx).is_pending(),
+    "staging: the run loop is parked inside the disjoint arm"
+  );
+  drop(super::WatchGrant::new(departing, cleanup_tx));
+  let (close_reply, close_response) = futures_channel::oneshot::channel();
+  closes.try_send(close_reply).expect("request the close");
+
+  let unwound_before = HOSTILE_COMPONENT_UNWOUND.get();
+  HOSTILE_COMPONENT_ARMED.set(true);
+  let drove = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run.as_mut().poll(&mut cx)));
+  HOSTILE_COMPONENT_ARMED.set(false);
+
+  assert_eq!(
+    HOSTILE_COMPONENT_UNWOUND.get() - unwound_before,
+    1,
+    "staging: the tail's second shrink really did supersede a cover whose destructor unwinds"
+  );
+  assert!(
+    matches!(
+      futures_util::FutureExt::now_or_never(close_response),
+      Some(Ok(Ok(())))
+    ),
+    "close() must still carry the SOURCE's quiescence verdict, not a Stopped invented by a cover \
+     superseded inside the re-record"
+  );
+  assert!(
+    matches!(drove, Ok(Poll::Ready(()))),
+    "nothing may escape the run loop"
+  );
+
+  let calls = ledger.lock().expect("hostile ledger").clone();
+  let split = calls
+    .iter()
+    .position(|call| *call == HostileCall::BeginClose)
+    .unwrap_or_else(|| panic!("the terminal disjoint arm never entered the seam: {calls:?}"));
+  assert_eq!(
+    &calls[split..],
+    &[
+      HostileCall::BeginClose,
+      HostileCall::EndSync(std::vec!["x", "cookie-cover"]),
+      HostileCall::JoinClose,
+    ],
+    "the reap and the bounded wait both stand ahead of the release that unwound: {calls:?}"
+  );
+  assert!(
+    matches!(futures_util::FutureExt::now_or_never(cookie), Some(Err(_))),
+    "the reaped barrier's caller sees the dropped reply as Closed"
+  );
+}
+
+/// The deferral must be ENGAGED ONLY on the terminal path.
+///
+/// [`Owner::retire_salvage`] holds a mutator's caller-owned removals when
+/// [`source_closing`](Owner::source_closing) stands and releases them at the call site otherwise,
+/// and only the second half bounds the bundle: the latch is set once, by the decision to tear this
+/// owner down, so what accumulates is one teardown's worth of removals and the owner is gone
+/// immediately after. Engage it on a live path instead and every committed watch, every departure
+/// and every dead-root retirement retains its caller `C`/`V` for as long as the watcher runs — an
+/// unbounded leak in the shape of ordinary traffic, and one no other cell would notice, since
+/// nothing observable changes until memory runs out.
+///
+/// So both halves are read here, over the same mutator, with only the latch between them: the LIVE
+/// side proves the bundle stays empty through a commit, a departure and a retirement; the TERMINAL
+/// side proves that emptiness is the latch working rather than the bundle being unreachable.
+///
+/// FAIL-ON-REVERT: make [`Owner::retire_salvage`] defer unconditionally (drop the `source_closing`
+/// test) and the first live assertion fails. Make it release unconditionally and the terminal
+/// assertion fails.
+#[tokio::test]
+async fn the_deferral_is_engaged_on_the_terminal_path_alone() {
+  let mut h = Harness::new();
+
+  // LIVE — a commit.
+  let a = h.watch("/a", Interest::all()).await.expect("watch /a");
+  let b = h.watch("/b", Interest::all()).await.expect("watch /b");
+  assert!(
+    h.owner.deferred.is_empty(),
+    "a committed watch deferred something: its republish displaced a publication, and on a live \
+     path that publication is the caller's to have back at once"
+  );
+
+  // LIVE — a departure, which removes the subscription record, its cover value and (its root now
+  // being empty) the root record too.
+  h.unwatch(a).expect("unwatch /a");
+  assert!(
+    h.owner.deferred.is_empty(),
+    "a departure deferred something"
+  );
+
+  // LIVE — a dead-root retirement, the heaviest live mutator there is: it force-removes the root,
+  // every subscriber's record and every cover value in one pass.
+  let root_b = h
+    .owner
+    .subsumer
+    .subscription_root(b)
+    .expect("live root for /b");
+  h.owner.retire_root_with_terminal_rescan(root_b);
+  assert!(
+    h.owner.deferred.is_empty(),
+    "a dead-root retirement deferred something on a LIVE path — the bundle would then grow with \
+     ordinary traffic, forever"
+  );
+
+  // TERMINAL — the same mutator, with only the latch changed.
+  let c = h.watch("/c", Interest::all()).await.expect("watch /c");
+  let root_c = h
+    .owner
+    .subsumer
+    .subscription_root(c)
+    .expect("live root for /c");
+  h.owner.begin_source_close();
+  h.owner.retire_root_with_terminal_rescan(root_c);
+  assert!(
+    !h.owner.deferred.is_empty(),
+    "past the seam the same retirement must HOLD its removals — otherwise the live emptiness above \
+     says nothing about the deferral and everything about it being dead code"
+  );
+}
+
+/// Queues one public `Watch` on the command mailbox exactly as [`Tributaries::watch`] does, with
+/// its reply slot already abandoned — the caller in this shape only asks whether the send was
+/// ADMITTED. Returns the mailbox's own verdict.
+fn queue_public_watch(
+  commands: &async_channel::Sender<super::Command<OsString, ()>>,
+) -> Result<(), async_channel::TrySendError<super::Command<OsString, ()>>> {
+  let (reply, response) = futures_channel::oneshot::channel();
+  drop(response);
+  commands.try_send(super::Command::Watch {
+    key: key("/refused"),
+    value: (),
+    options: WatchOptions::new(),
+    reply,
+  })
+}
+
+/// A refused request is HELD, so the teardown that refuses one must bound how many it can be
+/// handed.
+///
+/// The source-drain retry keeps servicing the public mailbox for as long as the owed delivery
+/// takes, and [`handle_teardown_command`](Owner::handle_teardown_command) PLACES every refused
+/// request's key, value and admission gate rather than destroying them. Holding is right; holding
+/// an unbounded number of them is not. The mailbox bounds what sits there at one instant and
+/// nothing more: a live handle refills it as fast as the drain empties it, and behind a full event
+/// channel the drain runs until the consumer resumes — so acceptance turns a bounded backlog into
+/// unbounded retention, with the owner's memory as the only stop. Nothing has to unwind for that to
+/// bite; it is a defect about RETAINING, not about ordering a destruction that happens anyway.
+///
+/// So this reads a COUNT rather than an emptiness. The mailbox is filled to capacity before the
+/// drain starts, and a handle then pushes far more at it than the mailbox could ever hold — one
+/// push per drain poll, for the whole life of the drain. What the teardown retains must still be
+/// exactly one mailbox's worth.
+///
+/// FAIL-ON-REVERT: drop the `self.commands.close()` at the top of
+/// [`drain_owed_before_shutdown`](Owner::drain_owed_before_shutdown) and put its public-command
+/// `select!` arm back, and every post-cut push is admitted and retained: the count climbs with the
+/// flood instead of standing at the mailbox's capacity.
+#[tokio::test]
+async fn a_source_drain_teardown_bounds_what_its_refusals_retain() {
+  use std::task::{Context, Waker};
+
+  /// The mailbox's whole capacity — the bound the retention may not exceed.
+  const MAILBOX: usize = 4;
+  /// Post-teardown pushes, far past anything the mailbox could hold at once.
+  const FLOOD: usize = 200;
+
+  let mut h = Harness::bounded_mailbox(1, MAILBOX);
+  // A CLAIMED sub whose dominating Rescan is parked behind a FULL, held-open event channel: the
+  // drain can neither deliver it nor exit, which is exactly the long window a live handle refills.
+  let live = h.watch("/a", Interest::all()).await.expect("watch /a");
+  for raw in 0..2 {
+    h.owner.epochs.stamp(live, Epoch::new(raw));
+  }
+  h.owner.try_emit(modified_event(live, "/a/f0", 0));
+  h.owner.try_emit(modified_event(live, "/a/f1", 1));
+  assert!(
+    h.owner.needs_rescan.contains_key(&live),
+    "staging: the claimed sub's Rescan is parked behind a full channel, so the drain must retry"
+  );
+  let _held = h.events.clone(); // a receiver that never drains: full AND open for the whole cell
+
+  // The pre-cut backlog: one mailbox's worth, and provably no more.
+  for _ in 0..MAILBOX {
+    queue_public_watch(&h._commands).expect("prefill the mailbox to capacity");
+  }
+  assert!(
+    queue_public_watch(&h._commands).is_err(),
+    "staging: the mailbox is full, so what the drain can INHERIT is capped by its capacity"
+  );
+
+  // The tail enters the seam before it runs this drain, and that latch is what makes
+  // `retire_salvage` HOLD rather than release at the call site — so without it the refusals below
+  // are disposed of live and the count would read zero for the wrong reason.
+  h.owner.begin_source_close();
+
+  let commands = h._commands.clone();
+  let mut cx = Context::from_waker(Waker::noop());
+  let mut drain = Box::pin(h.owner.drain_owed_before_shutdown());
+  let mut admitted_after_the_cut = 0usize;
+  for _ in 0..FLOOD {
+    if queue_public_watch(&commands).is_ok() {
+      admitted_after_the_cut += 1;
+    }
+    assert!(
+      drain.as_mut().poll(&mut cx).is_pending(),
+      "the drain stays in its retry loop — the owed Rescan is undeliverable and the consumer lives"
+    );
+  }
+  drop(drain);
+
+  assert_eq!(
+    admitted_after_the_cut, 0,
+    "a push after the cut must fail in the CALLER's frame, where the request it hands back is the \
+     caller's own to destroy, instead of reaching the owner to be held"
+  );
+  assert_eq!(
+    h.owner.deferred.filters_len(),
+    MAILBOX,
+    "the teardown holds exactly the pre-cut backlog: {FLOOD} further pushes retained nothing"
   );
 }
 
@@ -6036,12 +13251,14 @@ async fn release_marks_handle_logically_dead_immediately_even_with_transport_pen
       pending_set: std::collections::HashSet::new(),
       keys: HashMap::new(),
     },
+    source_closing: false,
+    deferred: crate::subsume::Salvage::new(),
     subsumer: Subsumer::new(),
     epochs: EpochLedger::new(),
-    filters: HashMap::new(),
+    filters: Filters::new(),
     filter_payload_forgotten: false,
-    needs_rescan: BTreeMap::new(),
-    suppressed_rescan: BTreeMap::new(),
+    needs_rescan: ParkedRescans::new(),
+    suppressed_rescan: ParkedRescans::new(),
     unclaimed: std::collections::HashSet::new(),
     flush_cursor: None,
     #[cfg(test)]
@@ -6069,7 +13286,7 @@ async fn release_marks_handle_logically_dead_immediately_even_with_transport_pen
 
   // Watch /a → handle 1, its transport watch installed and live.
   let sub = owner
-    .reconcile_watch(&key("/a"), (), WatchOptions::new())
+    .reconcile_watch(&key("/a"), &(), WatchOptions::new())
     .await
     .expect("watch /a");
   assert_eq!(
@@ -6203,12 +13420,14 @@ async fn unclaimed_orphans_parked_rescan_is_suppressed_by_state_in_the_run_loop(
       held_reply: std::sync::Mutex::new(None),
       delivered_terminal: false,
     },
+    source_closing: false,
+    deferred: crate::subsume::Salvage::new(),
     subsumer: Subsumer::new(),
     epochs: EpochLedger::new(),
-    filters: HashMap::new(),
+    filters: Filters::new(),
     filter_payload_forgotten: false,
-    needs_rescan: BTreeMap::new(),
-    suppressed_rescan: BTreeMap::new(),
+    needs_rescan: ParkedRescans::new(),
+    suppressed_rescan: ParkedRescans::new(),
     unclaimed: std::collections::HashSet::new(),
     flush_cursor: None,
     #[cfg(test)]
@@ -6837,10 +14056,13 @@ async fn valve_pumped_rescan_still_degrades_the_retained_cover() {
 }
 
 /// Regression — the source-drain teardown makes OWED progress under a sustained command
-/// flood: its per-iteration command servicing is BOUNDED (COMMAND_FAIRNESS_BUDGET), so a
-/// continuously non-empty mailbox cannot starve `drain_owed_once` — an already-CLAIMED parked
-/// Rescan is delivered within a bounded window even though the flood keeps the drain from exiting
-/// (the exit's empty-mailbox linearization defers, delivery does not).
+/// flood: a handle pushing `Watch` at the owner for the whole teardown cannot starve
+/// `drain_owed_once`, and an already-CLAIMED parked Rescan is delivered within a bounded window.
+///
+/// The drain CUTS the public mailbox before its first pass, so the flood's sends fail in the
+/// flooding task's own frame and never reach the owner at all; what the drain inherits is the
+/// backlog queued at the cut, drained once. Servicing the mailbox is therefore bounded by
+/// construction rather than by a fairness budget, and the owed pass runs on every iteration.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn source_drain_delivers_claimed_debt_under_sustained_command_flood() {
   let mut h = Harness::new(); // unbounded event channel — has capacity
@@ -6851,9 +14073,9 @@ async fn source_drain_delivers_claimed_debt_under_sustained_command_flood() {
   h.owner.park_rescan(live);
 
   let flood = spawn_command_flood(h._commands.clone());
-  // Under the flood the drain never observes an empty mailbox, so it keeps servicing (and never
-  // exits within the window) — but the bounded pre-drain guarantees the owed pass runs every
-  // iteration, so the claimed Rescan is delivered long before the timeout lapses.
+  // The flood races the drain's cut: whatever it queued before it is serviced once, and every push
+  // after it fails outside the owner. Either way the owed pass runs on every iteration, so the
+  // claimed Rescan is delivered long before the timeout lapses.
   let _ = tokio::time::timeout(Duration::from_secs(2), h.owner.drain_owed_before_shutdown()).await;
   flood.abort();
   assert!(
@@ -6967,12 +14189,12 @@ async fn close_is_not_starved_by_a_prefilled_command_backlog_and_flood() {
 }
 
 /// Regression, SOURCE-DRAIN teardown under a flood — a close DURING the owed-Rescan
-/// drain is surfaced within a bounded window even while a sustained command flood keeps the mailbox
-/// continuously non-empty. [`drain_owed_before_shutdown`](super::Owner::drain_owed_before_shutdown)
-/// checks the dedicated close signal FIRST (a non-blocking `try_recv` before its bounded command
-/// pre-drain AND the first arm of its retry `select!`), so the close outranks the flood the bounded
-/// pre-drain services. A claimed sub's parked overflow Rescan behind a full, held-open channel keeps
-/// the drain spinning (so the close-check is genuinely exercised mid-drain).
+/// drain is surfaced within a bounded window even after a sustained command flood has piled a deep
+/// backlog into the mailbox. [`drain_owed_before_shutdown`](super::Owner::drain_owed_before_shutdown)
+/// checks the dedicated close signal FIRST — a non-blocking `try_recv` ahead of the pre-cut backlog
+/// drain, AND the first arm of its retry `select!` — so the close outranks every queued request. A
+/// claimed sub's parked overflow Rescan behind a full, held-open channel keeps the drain spinning
+/// (so the close-check is genuinely exercised mid-drain).
 ///
 /// Fail-on-old (Close on the FIFO mailbox): behind the flood the drain's command servicing would
 /// dequeue flood commands ahead of the `Close`, so the close waits out the never-emptying backlog and
@@ -6994,7 +14216,7 @@ async fn source_drain_close_is_surfaced_under_sustained_command_flood() {
   );
   let _held = h.events.clone(); // a receiver that never drains (keeps the channel full + open)
 
-  // A sustained command flood keeping the mailbox continuously non-empty during the drain.
+  // A sustained command flood, filling the mailbox ahead of the drain and pushing at it after.
   let flood = spawn_command_flood(h._commands.clone());
 
   // A close rides the dedicated signal.
@@ -10257,7 +17479,8 @@ mod reserved_namespace {
       .coalescer
       .as_mut()
       .expect("debounce is enabled")
-      .flush_all(&mut held);
+      .flush_all::<u32>(&mut held)
+      .release();
     assert!(
       held.is_empty(),
       "no reserved record was ever admitted to the coalescer: {held:?}"
@@ -10761,14 +17984,14 @@ mod ownership {
       // A healthy subscription and a poisoned one, both covered by one root.
       let healthy = h
         .owner
-        .reconcile_watch(&key("/a"), (), WatchOptions::new())
+        .reconcile_watch(&key("/a"), &(), WatchOptions::new())
         .await
         .expect("watch /a");
       let poisoned = h
         .owner
         .reconcile_watch(
           &key("/a/b"),
-          (),
+          &(),
           WatchOptions::new().with_filter(Filter::new(|_| -> bool {
             panic!("a tenant's filter predicate panics inside fan-out")
           })),
@@ -10811,7 +18034,7 @@ mod ownership {
 
       // And the owner is still serving: a further watch reconciles normally.
       h.owner
-        .reconcile_watch(&key("/c"), (), WatchOptions::new())
+        .reconcile_watch(&key("/c"), &(), WatchOptions::new())
         .await
         .expect("the owner still serves after containing the panic");
     });
@@ -10838,14 +18061,14 @@ mod ownership {
       let mut h = Harness::new();
       let healthy = h
         .owner
-        .reconcile_watch(&key("/a"), (), WatchOptions::new())
+        .reconcile_watch(&key("/a"), &(), WatchOptions::new())
         .await
         .expect("watch /a");
       let poisoned = h
         .owner
         .reconcile_watch(
           &key("/a/b"),
-          (),
+          &(),
           WatchOptions::new().with_filter(Filter::new(|_| -> bool {
             std::panic::panic_any(PanicsOnDrop)
           })),
@@ -10884,7 +18107,7 @@ mod ownership {
 
       // And the owner is still serving.
       h.owner
-        .reconcile_watch(&key("/c"), (), WatchOptions::new())
+        .reconcile_watch(&key("/c"), &(), WatchOptions::new())
         .await
         .expect("the owner still serves after containing the payload's unwind too");
     });
@@ -11325,7 +18548,7 @@ mod ownership {
     h.owner.source.supports_sync = true;
     let sub = h
       .owner
-      .reconcile_watch(&key("/a"), (), WatchOptions::new())
+      .reconcile_watch(&key("/a"), &(), WatchOptions::new())
       .await
       .expect("watch /a");
 

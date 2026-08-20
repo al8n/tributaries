@@ -20,7 +20,7 @@ fn install(s: &mut S, handle: u32, key: &[u8], value: u32) -> Subscription {
     | WatchOutcome::Widen { sub, .. }
     | WatchOutcome::Disjoint { sub, .. } => *sub,
   };
-  s.commit_watch(&outcome, handle, key);
+  s.commit_watch(&outcome, handle, key).release();
   sub
 }
 
@@ -110,7 +110,7 @@ fn view_reflects_unwatch() {
   let sub = install(&mut s, 1, b"a", 1);
   assert!(view.contains(b"a"));
 
-  s.plan_unwatch(sub);
+  s.test_plan_unwatch(sub);
   assert!(
     !view.contains(b"a"),
     "the released root is gone from the view"
@@ -155,7 +155,7 @@ fn covered_sub_resolves_to_its_own_value_not_the_departed_root() {
   );
 
   // Unwatch /a's own watch: the armed root /a lives on for /a/b, now broader than any live sub.
-  s.plan_unwatch(a);
+  s.test_plan_unwatch(a);
 
   assert_eq!(
     view.resolve(b"abx").map(Snapshot::into_inner),

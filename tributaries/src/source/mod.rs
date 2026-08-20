@@ -529,10 +529,14 @@ pub trait LocalSource<C> {
   /// place rather than dropping and re-inserting.
   ///
   /// **Atomic on failure**: every error MUST leave the old root's coverage exactly as it was,
-  /// because the umbrella falls back to the release-and-rearm path on ANY error — including
-  /// the default's [`FaultKind::Unsupported`](crate::FaultKind::Unsupported), which is simply
-  /// "this source cannot widen in place; do it the old way". A source that cannot promise
-  /// atomicity must not implement this method.
+  /// and BOTH of the umbrella's error paths rest on that. Most errors fall back to
+  /// release-and-rearm — including the default's
+  /// [`FaultKind::Unsupported`](crate::FaultKind::Unsupported), which is simply "this source
+  /// cannot widen in place; do it the old way". A retryable
+  /// [`FaultKind::Capacity`](crate::FaultKind::Capacity) refusal does NOT: it fails the widen
+  /// outright, because tearing that untouched coverage down only to re-arm it against the very
+  /// budget that just refused is how a transient refusal becomes a retired healthy root. A
+  /// source that cannot promise atomicity must not implement this method.
   fn replace(
     &mut self,
     handle: Self::Handle,
@@ -617,13 +621,36 @@ pub trait LocalSource<C> {
   }
 
   /// Begins this source's shutdown: SYNCHRONOUS, non-blocking, fire-and-forget, in the
-  /// [`disarm`](Self::disarm) mold. The owner calls it once, at teardown, before it awaits
-  /// [`join_close`](Self::join_close).
+  /// [`disarm`](Self::disarm) mold. The owner calls it **exactly once** per source, at the instant it
+  /// decides to stop, and — on every teardown it is able to await — awaits
+  /// [`join_close`](Self::join_close) after it.
+  ///
+  /// **On an ABNORMAL teardown there is no `join_close`.** When the caller drops the driver future, or
+  /// a panic unwinds through it, the owner's destructor is the only thing left to run: it is
+  /// synchronous, so it enters this initiation — still exactly once, the owner latching it against its
+  /// own normal-path entry — and then drops the source, with nothing awaited in between. A source must
+  /// therefore be able to reach quiescence from its own `Drop` after a `begin_close` whose verdict is
+  /// never collected; what it must not do is depend on `join_close` running in order to release a
+  /// native resource. The fire-and-forget requests named below may arrive in that window too, for the
+  /// same reason.
   ///
   /// Splitting initiation from the wait is what keeps close RESPONSIVE while still making it
   /// HONEST: the owner can start the source's teardown at the instant it decides to stop, without
   /// that decision itself being able to block. The default is a no-op — a source with nothing to
   /// wind down needs no initiation.
+  ///
+  /// **Fire-and-forget requests MAY still arrive after it**, and before `join_close`:
+  /// [`disarm`](Self::disarm), [`set_cover`](Self::set_cover), [`end_sync`](Self::end_sync) and
+  /// [`cancel_sync`](Self::cancel_sync). The owner reaps the cookies of every unresolved barrier and
+  /// releases every root a late grant-cleanup empties as it winds down, and it issues those requests
+  /// past this initiation deliberately: `begin_close` is the earliest honest point at which the owner
+  /// has decided to stop, so entering it FIRST is what bounds an abandoned [`arm`](Self::arm) — whose
+  /// cancellation is reclaimed by nothing short of this source's teardown — instead of letting owner
+  /// unwinding run on ahead of it. Each of those four already promises to be idempotent, tolerant of a
+  /// handle or cookie that is already gone, and best-effort on an abnormal teardown, so no source needs
+  /// new behaviour here; a source that has genuinely stopped accepting them may drop them, provided its
+  /// own teardown still reclaims what they named (which its `join_close` verdict must account for).
+  /// No AWAITED call follows this one except `join_close` itself.
   fn begin_close(&mut self) {}
 
   /// Awaits this source's QUIESCENCE and reports whether it was proven.
@@ -815,10 +842,14 @@ pub trait Source<C> {
   /// place rather than dropping and re-inserting.
   ///
   /// **Atomic on failure**: every error MUST leave the old root's coverage exactly as it was,
-  /// because the umbrella falls back to the release-and-rearm path on ANY error — including
-  /// the default's [`FaultKind::Unsupported`](crate::FaultKind::Unsupported), which is simply
-  /// "this source cannot widen in place; do it the old way". A source that cannot promise
-  /// atomicity must not implement this method.
+  /// and BOTH of the umbrella's error paths rest on that. Most errors fall back to
+  /// release-and-rearm — including the default's
+  /// [`FaultKind::Unsupported`](crate::FaultKind::Unsupported), which is simply "this source
+  /// cannot widen in place; do it the old way". A retryable
+  /// [`FaultKind::Capacity`](crate::FaultKind::Capacity) refusal does NOT: it fails the widen
+  /// outright, because tearing that untouched coverage down only to re-arm it against the very
+  /// budget that just refused is how a transient refusal becomes a retired healthy root. A
+  /// source that cannot promise atomicity must not implement this method.
   fn replace(
     &mut self,
     handle: Self::Handle,
@@ -906,13 +937,36 @@ pub trait Source<C> {
   /// or retired — a synchronous liveness probe. Contract-identical to
   /// [`LocalSource::root_key`].
   /// Begins this source's shutdown: SYNCHRONOUS, non-blocking, fire-and-forget, in the
-  /// [`disarm`](Self::disarm) mold. The owner calls it once, at teardown, before it awaits
-  /// [`join_close`](Self::join_close).
+  /// [`disarm`](Self::disarm) mold. The owner calls it **exactly once** per source, at the instant it
+  /// decides to stop, and — on every teardown it is able to await — awaits
+  /// [`join_close`](Self::join_close) after it.
+  ///
+  /// **On an ABNORMAL teardown there is no `join_close`.** When the caller drops the driver future, or
+  /// a panic unwinds through it, the owner's destructor is the only thing left to run: it is
+  /// synchronous, so it enters this initiation — still exactly once, the owner latching it against its
+  /// own normal-path entry — and then drops the source, with nothing awaited in between. A source must
+  /// therefore be able to reach quiescence from its own `Drop` after a `begin_close` whose verdict is
+  /// never collected; what it must not do is depend on `join_close` running in order to release a
+  /// native resource. The fire-and-forget requests named below may arrive in that window too, for the
+  /// same reason.
   ///
   /// Splitting initiation from the wait is what keeps close RESPONSIVE while still making it
   /// HONEST: the owner can start the source's teardown at the instant it decides to stop, without
   /// that decision itself being able to block. The default is a no-op — a source with nothing to
   /// wind down needs no initiation.
+  ///
+  /// **Fire-and-forget requests MAY still arrive after it**, and before `join_close`:
+  /// [`disarm`](Self::disarm), [`set_cover`](Self::set_cover), [`end_sync`](Self::end_sync) and
+  /// [`cancel_sync`](Self::cancel_sync). The owner reaps the cookies of every unresolved barrier and
+  /// releases every root a late grant-cleanup empties as it winds down, and it issues those requests
+  /// past this initiation deliberately: `begin_close` is the earliest honest point at which the owner
+  /// has decided to stop, so entering it FIRST is what bounds an abandoned [`arm`](Self::arm) — whose
+  /// cancellation is reclaimed by nothing short of this source's teardown — instead of letting owner
+  /// unwinding run on ahead of it. Each of those four already promises to be idempotent, tolerant of a
+  /// handle or cookie that is already gone, and best-effort on an abnormal teardown, so no source needs
+  /// new behaviour here; a source that has genuinely stopped accepting them may drop them, provided its
+  /// own teardown still reclaims what they named (which its `join_close` verdict must account for).
+  /// No AWAITED call follows this one except `join_close` itself.
   fn begin_close(&mut self) {}
 
   /// Awaits this source's QUIESCENCE and reports whether it was proven.
