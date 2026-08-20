@@ -1667,7 +1667,19 @@ mod lifecycle {
     // One reused ticket is the duplicate-target half of the vector: the old lane
     // queued each duplicate, because it deduplicated only after dequeue.
     let (_, dup) = watcher.mint_sync_ticket();
-    for i in 0..100_000u64 {
+    // A hundred thousand rounds is a VOLUME argument, and volume is the one thing
+    // an interpreter cannot carry: a round is four ingress calls with a format and
+    // an allocation in them, which interpreted costs milliseconds rather than
+    // nanoseconds — two fifths of the whole shard's wall time spent in this one
+    // cell, and the largest single wedge risk against the job's own
+    // `timeout-minutes`. Nothing is lost by shortening it there. What the
+    // assertions below read is STRUCTURAL and absolute — an empty ledger and a
+    // capacity-1 wake — so the old lane's shape fails them on the first round
+    // rather than the hundred-thousandth, and every path Miri is actually
+    // checking is still walked a thousand times over. The native lane keeps the
+    // volume that makes it a flood.
+    let rounds: u64 = if cfg!(miri) { 1_000 } else { 100_000 };
+    for i in 0..rounds {
       watcher.request_remove_cookie(PathBuf::from(format!("/r/.tributaries-sync-{i}")));
       // A freshly minted, never-admitted ticket resolves nothing — it addresses no
       // record this watcher ever admitted, so the flood retains nothing through it.
@@ -1684,8 +1696,9 @@ mod lifecycle {
     );
     assert!(
       watcher.cleanup.wake_len() <= 1,
-      "the wake is capacity-1 and carries no request, so 400k calls cannot grow it \
+      "the wake is capacity-1 and carries no request, so {} calls cannot grow it \
        past one token: {}",
+      rounds * 4,
       watcher.cleanup.wake_len()
     );
 

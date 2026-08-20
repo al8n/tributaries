@@ -451,10 +451,27 @@ mod smoke {
   use tributary_proto::WatchId;
 
   use crate::os::{
-    Quiesce, SourceConfig,
+    Backend, Quiesce, SourceConfig,
     linux::{AnchorRequest, ExpectedObject, RawLinuxEvent, Source, WatchOutcome},
     transport::SourceMessage,
   };
+
+  /// A config for `root` with inotify PINNED — never `Backend::Auto`.
+  ///
+  /// `Auto` runs the fanotify probe inside the spawn barrier, and under a
+  /// privileged runner (`ci/linux-verify.sh all`, `inotify-priv`, `fanotify`) the
+  /// probe SUCCEEDS: every cell below would then arm a FANOTIFY source through
+  /// the inotify module's own control port, whose fanotify side is `Inert` and
+  /// carries no arm traffic, so each `add_watch` comes back `Failed(Io)`. That is
+  /// the whole of why these six were red under `--privileged` and green under
+  /// default caps — the capability decided the primitive, and the primitive these
+  /// cells name was the one privilege took away. Same pin, same reason, as
+  /// `driver::tests`' real-source `attach`.
+  fn pinned(root: &std::path::Path) -> SourceConfig {
+    let mut config = SourceConfig::new(vec![root.to_path_buf()]);
+    config.backend = Backend::Inotify;
+    config
+  }
 
   /// The `(dev, ino)` of `path`, for building an `ExpectedObject` an arm confirms.
   fn ident(path: &std::path::Path) -> ExpectedObject {
@@ -501,7 +518,7 @@ mod smoke {
   #[test]
   fn spawn_seals_meta_and_arms_through_the_control_path() {
     let dir = scratch("spawn");
-    let (handle, rx, meta) = Source::spawn(SourceConfig::new(vec![dir.clone()])).expect("spawn");
+    let (handle, rx, meta) = Source::spawn(pinned(&dir)).expect("spawn");
     // The barrier sealed the canonical root before any watch existed; nothing
     // can have been delivered yet.
     assert_eq!(meta.root, fs::canonicalize(&dir).unwrap());
@@ -542,7 +559,7 @@ mod smoke {
   #[test]
   fn arming_the_same_inode_twice_aliases() {
     let dir = scratch("alias");
-    let (handle, _rx, meta) = Source::spawn(SourceConfig::new(vec![dir.clone()])).expect("spawn");
+    let (handle, _rx, meta) = Source::spawn(pinned(&dir)).expect("spawn");
 
     let first = handle.add_watch(AnchorRequest {
       watch: watch(1),
@@ -576,7 +593,7 @@ mod smoke {
   #[test]
   fn arm_with_matching_identity_installs() {
     let dir = scratch("verify-ok");
-    let (handle, _rx, meta) = Source::spawn(SourceConfig::new(vec![dir.clone()])).expect("spawn");
+    let (handle, _rx, meta) = Source::spawn(pinned(&dir)).expect("spawn");
     let reply = handle.add_watch(AnchorRequest {
       watch: watch(1),
       parent: None,
@@ -606,7 +623,7 @@ mod smoke {
   #[test]
   fn arm_with_mismatched_identity_is_gone() {
     let dir = scratch("verify-mismatch");
-    let (handle, _rx, meta) = Source::spawn(SourceConfig::new(vec![dir.clone()])).expect("spawn");
+    let (handle, _rx, meta) = Source::spawn(pinned(&dir)).expect("spawn");
     let mut wrong = ident(&meta.root);
     // A different inode: the name now points at another object than the enumerate
     // recorded.
@@ -639,7 +656,7 @@ mod smoke {
   #[test]
   fn missing_target_maps_to_not_found() {
     let dir = scratch("enoent");
-    let (handle, _rx, meta) = Source::spawn(SourceConfig::new(vec![dir.clone()])).expect("spawn");
+    let (handle, _rx, meta) = Source::spawn(pinned(&dir)).expect("spawn");
     let reply = handle.add_watch(AnchorRequest {
       watch: watch(1),
       parent: None,
@@ -663,7 +680,7 @@ mod smoke {
   #[test]
   fn remove_watch_drains_through_ignored() {
     let dir = scratch("drain");
-    let (handle, rx, meta) = Source::spawn(SourceConfig::new(vec![dir.clone()])).expect("spawn");
+    let (handle, rx, meta) = Source::spawn(pinned(&dir)).expect("spawn");
     let reply = handle.add_watch(AnchorRequest {
       watch: watch(1),
       parent: None,
