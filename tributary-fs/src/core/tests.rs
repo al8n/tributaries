@@ -866,7 +866,7 @@ fn consumer_lag_parks_one_dominating_rescan() {
   assert!(emitted[0].kind().is_rescan());
 
   // Accepted: the scope returns to normal flow.
-  core.on_delivery(scope, Delivery::Accepted, at(40));
+  core.on_delivery(scope, Delivery::Accepted(emitted[0].epoch()), at(40));
   core.on_batch_events(
     scope,
     vec![ev("/r/c", flags(&[FsEventFlags::ITEM_CREATED]), 3, 5)],
@@ -896,7 +896,7 @@ fn newer_rescan_replaces_the_parked_one() {
   // A fresh loss while the offer is in flight mints a newer dominating
   // Rescan; the old acceptance must not end the lag.
   core.on_root_overflow(scope, at(3));
-  core.on_delivery(scope, Delivery::Accepted, at(4));
+  core.on_delivery(scope, Delivery::Accepted(offered), at(4));
   let effects = drain(&mut core);
   let emitted = emits(&effects);
   assert_eq!(
@@ -907,7 +907,7 @@ fn newer_rescan_replaces_the_parked_one() {
   assert!(emitted[0].kind().is_rescan());
   assert!(emitted[0].epoch() > offered);
 
-  core.on_delivery(scope, Delivery::Accepted, at(5));
+  core.on_delivery(scope, Delivery::Accepted(emitted[0].epoch()), at(5));
   core.on_batch_events(
     scope,
     vec![ev("/r/d", flags(&[FsEventFlags::ITEM_CREATED]), 9, 9)],
@@ -995,7 +995,7 @@ fn accepting_a_stale_offer_re_offers_the_merged_parked_rescan() {
   core.on_batch_events(scope, vec![ev("/r/sub", FsEventFlags::new(0), 2, 0)], at(3));
   // The stale acceptance names a superseded epoch: the lag holds and the
   // merged instruction becomes offerable immediately.
-  core.on_delivery(scope, Delivery::Accepted, at(4));
+  core.on_delivery(scope, Delivery::Accepted(stale.epoch()), at(4));
   let effects = drain(&mut core);
   let merged = emits(&effects);
   assert_eq!(merged.len(), 1, "the merged Rescan re-offers: {effects:?}");
@@ -1008,7 +1008,7 @@ fn accepting_a_stale_offer_re_offers_the_merged_parked_rescan() {
   assert_eq!(merged[0].epoch().as_u64(), first.epoch().as_u64() + 2);
 
   // Accepting the CURRENT instruction ends the lag.
-  core.on_delivery(scope, Delivery::Accepted, at(5));
+  core.on_delivery(scope, Delivery::Accepted(merged[0].epoch()), at(5));
   core.on_batch_events(
     scope,
     vec![ev("/r/c", flags(&[FsEventFlags::ITEM_CREATED]), 3, 5)],
@@ -1108,7 +1108,7 @@ fn unwatch_of_a_narrowed_lagged_scope_promotes_root_coverage() {
     "the terminal promise covers the root: {terminal:?}"
   );
   assert_eq!(terminal.epoch().as_u64(), first.epoch().as_u64() + 2);
-  core.on_delivery(scope, Delivery::Accepted, at(4));
+  core.on_delivery(scope, Delivery::Accepted(terminal.epoch()), at(4));
   assert!(!core.dying_contains(scope), "the acceptance retires it");
 }
 
@@ -1123,8 +1123,9 @@ fn delivered_epochs_are_always_announced_by_a_delivered_rescan() {
   let mut delivered: Vec<Change> = Vec::new();
   let deliver_all = |core: &mut DriverCore, delivered: &mut Vec<Change>, t: u64| {
     for change in emits(&drain(core)) {
+      let epoch = change.epoch();
       delivered.push(change.clone());
-      core.on_delivery(scope, Delivery::Accepted, at(t));
+      core.on_delivery(scope, Delivery::Accepted(epoch), at(t));
     }
   };
 
@@ -1192,6 +1193,7 @@ fn identity_minting_respects_devices_and_mounts() {
     refresh_stale: false,
     refresh_world_stale: false,
     lag: LagState::Normal,
+    delivered_through: tributary_proto::Epoch::START,
     park: Park::default(),
     resume_poisoned: false,
     publicly_live: true,
@@ -1231,6 +1233,7 @@ fn blind_mount_table_refuses_event_side_trust() {
     refresh_stale: false,
     refresh_world_stale: false,
     lag: LagState::Normal,
+    delivered_through: tributary_proto::Epoch::START,
     park: Park::default(),
     resume_poisoned: false,
     publicly_live: true,
@@ -1389,7 +1392,7 @@ fn lag_entry_purges_the_scopes_queued_emits() {
   );
 
   // Accepting it ends the lag; later changes flow again.
-  core.on_delivery(scope, Delivery::Accepted, at(3));
+  core.on_delivery(scope, Delivery::Accepted(emitted[0].epoch()), at(3));
   core.on_batch_events(
     scope,
     vec![ev("/r/d", flags(&[FsEventFlags::ITEM_CREATED]), 4, 13)],
@@ -1468,7 +1471,7 @@ fn terminal_rescan_retries_until_accepted() {
   assert_eq!(emitted.len(), 1, "the terminal Rescan retries: {effects:?}");
   assert!(emitted[0].kind().is_rescan());
 
-  core.on_delivery(scope, Delivery::Accepted, at(60));
+  core.on_delivery(scope, Delivery::Accepted(emitted[0].epoch()), at(60));
   assert!(
     emits(&drain(&mut core)).is_empty(),
     "accepted: nothing owed"
@@ -1501,7 +1504,7 @@ fn root_death_rescan_survives_refusal_after_teardown() {
   assert_eq!(emitted.len(), 1, "{effects:?}");
   assert!(emitted[0].kind().is_rescan());
 
-  core.on_delivery(scope, Delivery::Accepted, at(60));
+  core.on_delivery(scope, Delivery::Accepted(emitted[0].epoch()), at(60));
   assert_eq!(core.poll_timeout(), None);
 }
 
@@ -2895,6 +2898,7 @@ mod lowering {
       refresh_stale: false,
       refresh_world_stale: false,
       lag: LagState::Normal,
+      delivered_through: tributary_proto::Epoch::START,
       park: Park::default(),
       resume_poisoned: false,
       publicly_live: true,
@@ -4879,7 +4883,7 @@ mod descending {
   /// unclassifiable entry: `keep` and `drop` are armed, the registration
   /// window's own loss memory is spent, and the stat that must decide
   /// `/r/mystery` is outstanding and stamped with that window
-  /// ([`Monitor::bootstrap_stat_outstanding`]).
+  /// ([`Monitor::stat_loss_outstanding`]).
   ///
   /// The stat is uncounted and no conjunct of the barrier, so the scope reads
   /// settled here with `/r/mystery` covered by nothing — which is the whole
@@ -4899,7 +4903,7 @@ mod descending {
     );
     clear_registration_loss(&mut core, scope);
     assert!(
-      core.monitor.bootstrap_stat_outstanding(scope),
+      core.monitor.stat_loss_outstanding(scope),
       "and the stamped stat outlives the window that queued it"
     );
     let state = core.scopes.get(&scope).unwrap();
@@ -4941,8 +4945,8 @@ mod descending {
   /// uncovered slot, and a fence opened inside it used to resolve `Applied`.
   ///
   /// Both halves of the honest verdict are pinned, because the verdict alone
-  /// under-states it: the fence reports `Degraded`, AND the settle floor keeps
-  /// its under-claim instead of promoting the broadened cover — which is what
+  /// under-states it: the fence reports `Degraded`, AND the settle floor is left
+  /// under-claimed instead of promoting the broadened cover — which is what
   /// makes the next `set_cover` recompute a real broadening delta rather than
   /// ride a claim nothing proved.
   ///
@@ -4950,8 +4954,13 @@ mod descending {
   /// narrow to `{/r/keep}` the floor and the applied claim differ, and a clean
   /// settle would promote the floor to `{/r/keep, /r/drop}`.
   ///
+  /// The cover the verdict owes is pinned with it, and BEFORE it: the settling
+  /// observation stands the scope-level `Rescan` and holds the tranche over for
+  /// it, so the instruction reaches the consumer ahead of the answer that
+  /// promises it.
+  ///
   /// Mutation that kills it: drop the settlement's
-  /// `bootstrap_stat_outstanding` consult in `poll_cover_settlements`. The
+  /// `stat_loss_outstanding` consult in `poll_cover_settlements`. The
   /// fence then certifies the window and promotes the floor over a slot the
   /// scope has never covered.
   #[test]
@@ -4975,12 +4984,29 @@ mod descending {
       "the regrow quiesced, so nothing counted withholds the verdict"
     );
     assert!(
-      core.monitor.bootstrap_stat_outstanding(scope),
+      core.monitor.stat_loss_outstanding(scope),
       "and the slot is still uncovered when the fence is asked"
     );
 
     core.mark_cut_inflight(scope, 1);
     core.prove_cut(scope, 1);
+    assert_eq!(
+      core.poll_cover_settlements(DRAINED),
+      Vec::new(),
+      "the observation stands the cover first and holds the tranche over for it"
+    );
+    let effects = drain(&mut core);
+    let emitted = emits(&effects);
+    assert_eq!(emitted.len(), 1, "{effects:?}");
+    assert!(
+      emitted[0].kind().is_rescan() && emitted[0].location() == &loc(&[]),
+      "the cover is the scope's, since the slot's kind is exactly what nobody \
+       knows: {emitted:?}"
+    );
+    // Dequeuing an effect is not delivering it — the driver's flush reports the
+    // send's outcome, and only an ACCEPTANCE puts the instruction on the stream.
+    core.on_delivery(scope, Delivery::Accepted(emitted[0].epoch()), at(1));
+
     assert_eq!(
       core.poll_cover_settlements(DRAINED),
       vec![(fence, CoverSettle::Degraded)],
@@ -4989,13 +5015,14 @@ mod descending {
     let state = core.scopes.get(&scope).unwrap();
     assert_eq!(
       state.settle_floor,
-      Some(vec![p("/r/keep")]),
-      "the floor keeps its under-claim rather than promoting the broadened cover"
+      Some(Vec::new()),
+      "the floor drops with that cover rather than promoting the broadened one, \
+       so the next `set_cover` recomputes a real delta"
     );
     assert_eq!(
       state.applied_cover,
-      Some(vec![p("/r/keep")]),
-      "and the optimistic claim rewinds to it"
+      Some(Vec::new()),
+      "and the optimistic claim goes with it, as it does under any other cover"
     );
   }
 
@@ -5009,7 +5036,7 @@ mod descending {
   /// indistinguishable from the fix working and strictly worse than the defect.
   ///
   /// Mutation that kills it: release the loss nowhere (drop the
-  /// `bootstrap_stat_dec` at `ingest_stat_result`'s request removal). The
+  /// `stat_loss_dec` at `ingest_stat_result`'s request removal). The
   /// answered scope then never certifies again.
   #[test]
   fn an_answered_bootstrap_stat_lets_the_next_fence_certify() {
@@ -5033,7 +5060,7 @@ mod descending {
       &BTreeMap::from([("/r", root_listing_with_classified())]),
     );
     assert!(
-      !core.monitor.bootstrap_stat_outstanding(scope),
+      !core.monitor.stat_loss_outstanding(scope),
       "the answer released the loss it was standing for"
     );
     clear_registration_loss(&mut core, scope);
@@ -5062,6 +5089,1005 @@ mod descending {
       state.settle_floor,
       Some(vec![p("/r/keep"), p("/r/drop")]),
       "and the clean verdict promotes the floor to the cover it proved"
+    );
+  }
+
+  /// The same window, and the registration has nothing to do with it: a LATER
+  /// grow lists an unclassifiable name at a slot nothing occupies, and a fence
+  /// opened between that queue and its answer may not certify it either.
+  ///
+  /// `/r/mystery` may be a directory, and until the probe says so the scope holds
+  /// no watch on it: an entry created beneath it is recorded by nobody. Every
+  /// cover the registration case could fall back on is absent here — the window
+  /// is long closed, so nothing stamps the request, and the grow is PURE, so the
+  /// read that found the slot stood no `Rescan` of its own. The standing coverage
+  /// deficit does not close it: that re-signals at a sync cookie's DISPATCH,
+  /// which this set-cover reply passes nowhere near.
+  ///
+  /// Both halves of the honest verdict are pinned, because the verdict alone
+  /// under-states it: the fence reports `Degraded`, AND the settle floor is left
+  /// under-claimed instead of promoting the broadened cover — which is what
+  /// makes the next `set_cover` recompute a real broadening delta rather than
+  /// ride a claim nothing proved.
+  ///
+  /// The cover the verdict owes is pinned with it, and BEFORE it: the settling
+  /// observation stands the scope-level `Rescan` and holds the tranche over for
+  /// it, so the instruction reaches the consumer ahead of the answer that
+  /// promises it.
+  ///
+  /// Mutation that kills it: narrow `queue_stat`'s loss predicate back to the
+  /// registration stamp (`let stands_loss = bootstrap;`). The fence then
+  /// certifies the window and promotes the floor over a slot the scope has never
+  /// covered.
+  #[test]
+  fn a_fence_over_an_unanswered_empty_slot_stat_settles_degraded_and_keeps_its_floor() {
+    let (mut core, scope, _root) = shrunk_to_keep();
+    assert!(
+      !core.monitor.stat_loss_outstanding(scope),
+      "staging: the shrunk scope owes no loss, and its registration window is spent"
+    );
+
+    // The broadening cover: a PURE grow, which stands no `Rescan` of its own —
+    // so the standing stat is the only thing that can degrade this window.
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep"), p("/r/drop")]),
+      CoverReconcile::Reconciling
+    );
+    let fence = core.open_cover_fence(scope);
+    run_cascade(
+      &mut core,
+      &BTreeMap::from([("/r", root_listing_with_unknown())]),
+    );
+    assert!(
+      core.monitor.rearm_settled(scope),
+      "the regrow quiesced, so nothing counted withholds the verdict"
+    );
+    assert!(
+      core.monitor.stat_loss_outstanding(scope),
+      "and the slot is still uncovered when the fence is asked"
+    );
+
+    core.mark_cut_inflight(scope, 1);
+    core.prove_cut(scope, 1);
+    assert_eq!(
+      core.poll_cover_settlements(DRAINED),
+      Vec::new(),
+      "the observation stands the cover first and holds the tranche over for it"
+    );
+    let effects = drain(&mut core);
+    let emitted = emits(&effects);
+    assert_eq!(emitted.len(), 1, "{effects:?}");
+    assert!(
+      emitted[0].kind().is_rescan() && emitted[0].location() == &loc(&[]),
+      "the cover is the scope's, since the slot's kind is exactly what nobody \
+       knows: {emitted:?}"
+    );
+    // Dequeuing an effect is not delivering it — the driver's flush reports the
+    // send's outcome, and only an ACCEPTANCE puts the instruction on the stream.
+    core.on_delivery(scope, Delivery::Accepted(emitted[0].epoch()), at(1));
+
+    assert_eq!(
+      core.poll_cover_settlements(DRAINED),
+      vec![(fence, CoverSettle::Degraded)],
+      "a settled scope with an unanswered empty-slot stat is not a covered one"
+    );
+    let state = core.scopes.get(&scope).unwrap();
+    assert_eq!(
+      state.settle_floor,
+      Some(Vec::new()),
+      "the floor drops with that cover rather than promoting the broadened one, \
+       so the next `set_cover` recomputes a real delta"
+    );
+    assert_eq!(
+      state.applied_cover,
+      Some(Vec::new()),
+      "and the optimistic claim goes with it, as it does under any other cover"
+    );
+  }
+
+  /// [`run_cascade`], additionally answering every `Effect::Emit` the drain
+  /// offers — accepting each where `accept`, refusing each otherwise — and
+  /// reporting the changes it offered, in offer order. The driver's flush
+  /// reports each send's outcome synchronously, so a cell that drops one models
+  /// a driver that cannot exist; an acceptance carries the offered change's own
+  /// generation, exactly as the driver's does.
+  fn run_cascade_delivering(
+    core: &mut DriverCore,
+    listings: &BTreeMap<&str, Vec<RawDirEntry>>,
+    accept: bool,
+    now: Instant,
+  ) -> Vec<Change> {
+    let mut offered = Vec::new();
+    let mut wd = 200;
+    for _ in 0..32 {
+      let effects = drain(core);
+      let mut progressed = false;
+      for effect in &effects {
+        match effect {
+          Effect::AddWatch { watch, .. } => {
+            wd += 1;
+            core.on_watch_installed(
+              *watch,
+              core.arm_attempt(*watch),
+              crate::os::linux::WatchOutcome::Installed(wd),
+            );
+            progressed = true;
+          }
+          Effect::Enumerate { req, path, .. } => {
+            let entries = listings
+              .get(path.to_str().expect("test paths are UTF-8"))
+              .cloned()
+              .unwrap_or_default();
+            core.on_enumerated(*req, listed(entries));
+            progressed = true;
+          }
+          Effect::Emit { scope, change, .. } => {
+            offered.push(change.clone());
+            let delivery = if accept {
+              Delivery::Accepted(change.epoch())
+            } else {
+              Delivery::Refused
+            };
+            core.on_delivery(*scope, delivery, now);
+            progressed = true;
+          }
+          _ => {}
+        }
+      }
+      if !progressed {
+        return offered;
+      }
+    }
+    panic!("the cascade did not quiesce within the iteration bound");
+  }
+
+  /// Staging shared by the two cells below: a tranche licensed over a standing
+  /// empty-slot stat, whose cover the consumer's channel REFUSED — and whose
+  /// replacement ordering proof is already in hand.
+  ///
+  /// The refusal is the driver's `Full` arm: it purges the queued cover, folds it
+  /// into the scope's never-narrowing parked `Rescan` (INV-PARK), and signals the
+  /// overflow — which re-opens the scope's coverage work and so retires the proof
+  /// the standing pass held. The offer that instruction then makes is refused
+  /// too (the channel has had no chance to drain), so the lane ends parked on its
+  /// delivery retry. Rebuilding past all of it is the sequence that matters:
+  /// overflow recovery, replacement proof, and the tranche licensed again with
+  /// the cover still undelivered.
+  fn stat_cover_refused(core: &mut DriverCore, scope: ScopeId) -> FenceId {
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep"), p("/r/drop")]),
+      CoverReconcile::Reconciling
+    );
+    let fence = core.open_cover_fence(scope);
+    let listings = BTreeMap::from([("/r", root_listing_with_unknown())]);
+    run_cascade(core, &listings);
+    assert!(core.monitor.stat_loss_outstanding(scope));
+    core.mark_cut_inflight(scope, 1);
+    core.prove_cut(scope, 1);
+    assert_eq!(
+      core.poll_cover_settlements(DRAINED),
+      Vec::new(),
+      "staging: the observation stands the cover and holds the tranche for it"
+    );
+    assert!(
+      core.take_cover_flush_due(),
+      "staging: and asks the driver for the flush that offers it"
+    );
+
+    let offered = run_cascade_delivering(core, &listings, false, at(1));
+    assert_eq!(offered.len(), 2, "{offered:?}");
+    assert!(
+      offered
+        .iter()
+        .all(|change| change.kind().is_rescan() && change.location() == &loc(&[])),
+      "staging: the refused cover, then the dominating instruction it folded \
+       into: {offered:?}"
+    );
+    assert!(
+      core.monitor.rearm_settled(scope),
+      "staging: the overflow's own recovery quiesced"
+    );
+    assert!(
+      core.monitor.stat_loss_outstanding(scope),
+      "staging: and the slot is dark throughout — nothing answered the stat"
+    );
+    core.mark_cut_inflight(scope, 2);
+    core.prove_cut(scope, 2);
+    fence
+  }
+
+  /// THE HOLD IS AGAINST DELIVERY, NOT AGAINST THE ENQUEUE. A cover the loop-top
+  /// `try_send` refused is parked, not delivered, and a tranche that resolves
+  /// over it answers `Degraded` — a verdict whose whole contract is that its
+  /// covering `Rescan` is already in band — to a consumer that has been
+  /// instructed by nothing.
+  ///
+  /// So the licensed tranche stays held across the refusal, across the overflow
+  /// recovery it triggers, and across the replacement ordering proof, and reports
+  /// its verdict only once an offer is ACCEPTED. The latch is preserved
+  /// throughout: no second cover is stood, which is what keeps a scope whose stat
+  /// never answers from re-instructing a consumer that has yet to be instructed
+  /// once.
+  ///
+  /// Mutation that kills it: infer the delivery from the effect queue instead of
+  /// recording it — make `stat_cover_landed` ask whether any emit at `owed` is
+  /// still queued. A refusal PURGES the queued cover into the scope's parked
+  /// instruction, so the queue reads empty of it while nobody has been given
+  /// anything, and the tranche resolves at the replacement proof on the very
+  /// assertion below that names it. (Spending the hold on the enqueue instead —
+  /// reporting `StatCover::Discharged` where `stand_stat_cover` reports
+  /// `Awaiting` — kills it one step earlier, at the staging hold.) Either way
+  /// this is an ORDERING failure: the verdict arrives, ahead of the instruction
+  /// it promises.
+  #[test]
+  fn a_stat_cover_refused_by_a_full_consumer_holds_its_tranche_until_delivery() {
+    let (mut core, scope, _root) = shrunk_to_keep();
+    let fence = stat_cover_refused(&mut core, scope);
+    assert_eq!(
+      core.poll_cover_settlements(DRAINED),
+      Vec::new(),
+      "the tranche is licensed again and STILL held: the cover is parked, not delivered"
+    );
+    assert!(
+      !core.take_cover_flush_due(),
+      "and waiting costs no second re-top — it rides the lane's own delivery retry"
+    );
+
+    // The retry offers the parked instruction again, and this time the consumer
+    // takes it.
+    core.on_timeout(at(100));
+    let retried = drain(&mut core);
+    let offered = emits(&retried);
+    assert_eq!(offered.len(), 1, "{retried:?}");
+    assert!(offered[0].kind().is_rescan(), "{offered:?}");
+    core.on_delivery(scope, Delivery::Accepted(offered[0].epoch()), at(101));
+
+    assert_eq!(
+      core.poll_cover_settlements(DRAINED),
+      vec![(fence, CoverSettle::Degraded)],
+      "the verdict answers only behind the cover that is now on the consumer's stream"
+    );
+  }
+
+  /// …and the hold is TERMINAL where no offer can ever land. A consumer that
+  /// dropped its stream reports no delivery outcome at all — the driver's
+  /// `Closed` arm feeds no `Delivery`, so a lagged lane's in-flight mark is never
+  /// released and its parked change is never re-offered — and a hold waiting on
+  /// that is the wedge this whole signal exists to avoid. It degrades the verdict
+  /// instead, which is what the signal was made a loss rather than a barrier
+  /// conjunct to do.
+  ///
+  /// Mutation that kills it: drop the `consumer_gone` short-circuit from
+  /// `stat_cover_landed`. The lane stays lagged with nobody left to accept, the
+  /// tranche is never reported, and the caller's reply is stranded forever. This
+  /// is a LIVENESS failure: no verdict arrives at all.
+  #[test]
+  fn a_stat_cover_whose_consumer_is_gone_resolves_terminally() {
+    let (mut core, scope, _root) = shrunk_to_keep();
+    let fence = stat_cover_refused(&mut core, scope);
+    assert_eq!(
+      core.poll_cover_settlements(DRAINED),
+      Vec::new(),
+      "staging: held, exactly as in the cell above"
+    );
+
+    core.on_consumer_gone();
+    assert_eq!(
+      core.poll_cover_settlements(DRAINED),
+      vec![(fence, CoverSettle::Degraded)],
+      "a cover nobody can ever be given degrades the verdict rather than wedging the scope"
+    );
+  }
+
+  /// …and the hold ends on CONSUMER PROGRESS, which is not the same fact as the
+  /// scope's queue being empty of the cover's generation. An epoch names a
+  /// reconciliation generation, not one instruction: every ordinary change routed
+  /// after the covering `Rescan` carries that same generation, and the driver
+  /// drains a source snapshot immediately BEFORE it polls settlements and leaves
+  /// those effects queued. So a scope that is merely busy has an emit at the
+  /// cover's epoch resident at every observation, while the cover itself was
+  /// taken by the consumer one flush earlier.
+  ///
+  /// Here the consumer accepts everything and one ordinary same-epoch change
+  /// arrives before each observation. The tranche resolves on the acceptance, and
+  /// with it the settlement report a fence's parked cookie dispatches out of —
+  /// the two arms of one hold, as under backpressure above.
+  ///
+  /// Mutation that kills it: infer the delivery from the effect queue instead of
+  /// recording it — make `stat_cover_landed` ask whether any emit at `owed` is
+  /// still queued. The unrelated `Created` below answers yes, and it answers yes
+  /// again on every later pass a producing lane reaches, so the acknowledgement
+  /// and its cookie are parked for as long as the scope stays busy. This is a
+  /// LIVENESS failure — no verdict arrives at all — where the two cells above pin
+  /// an ordering one and its terminal.
+  #[test]
+  fn a_stat_cover_discharges_under_ordinary_traffic_at_its_own_generation() {
+    let (mut core, scope, root) = shrunk_to_keep();
+    let listings = BTreeMap::from([("/r", root_listing_with_unknown())]);
+
+    // The broadening cover: a PURE grow, standing no `Rescan` of its own, so the
+    // standing stat is the only thing that can degrade this window.
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep"), p("/r/drop")]),
+      CoverReconcile::Reconciling
+    );
+    let fence = core.open_cover_fence(scope);
+    run_cascade(&mut core, &listings);
+    assert!(core.monitor.rearm_settled(scope));
+    assert!(core.monitor.stat_loss_outstanding(scope));
+    core.mark_cut_inflight(scope, 1);
+    core.prove_cut(scope, 1);
+
+    // One ordinary change on the lane, left QUEUED — what the loop-top drain
+    // leaves behind when it ingests a snapshot just before this observation.
+    let mut churned = 0u64;
+    let mut churn = |core: &mut DriverCore| {
+      churned += 1;
+      core.on_inotify_events(
+        scope,
+        vec![inotify(
+          &[root],
+          IN_CREATE,
+          0,
+          Some(format!("f{churned}").as_bytes()),
+        )],
+        at(100 + churned),
+      );
+    };
+    let queued_epochs = |core: &DriverCore| -> Vec<tributary_proto::Epoch> {
+      core
+        .effects
+        .iter()
+        .filter_map(|effect| match effect {
+          Effect::Emit { change, .. } => Some(change.epoch()),
+          _ => None,
+        })
+        .collect()
+    };
+
+    churn(&mut core);
+    assert_eq!(
+      core.poll_cover_settlements(DRAINED),
+      Vec::new(),
+      "staging: the observation stands the cover and holds the tranche for it"
+    );
+    assert!(
+      core.take_cover_flush_due(),
+      "staging: and asks for the flush"
+    );
+
+    // The re-top's flush, with a consumer that takes everything it is offered.
+    let flushed = drain(&mut core);
+    let offered = emits(&flushed);
+    let cover = offered
+      .iter()
+      .find(|change| change.kind().is_rescan() && change.location() == &loc(&[]))
+      .map(|change| change.epoch())
+      .expect("staging: the flush offers the cover");
+    for change in &offered {
+      core.on_delivery(scope, Delivery::Accepted(change.epoch()), at(200));
+    }
+
+    // …and the lane keeps producing. Nothing has bumped the generation since the
+    // cover was minted, so this ordinary change carries the cover's OWN epoch and
+    // is resident when the observation below runs.
+    churn(&mut core);
+    assert_eq!(
+      queued_epochs(&core),
+      vec![cover],
+      "staging: unrelated traffic at the cover's own generation is queued at the \
+       observation"
+    );
+
+    assert_eq!(
+      core.poll_cover_settlements(DRAINED),
+      vec![(fence, CoverSettle::Degraded)],
+      "the verdict answers behind the cover the consumer ACCEPTED, whatever else \
+       the lane has since produced"
+    );
+  }
+
+  /// …and the loss is exactly as short-lived as the request on this trigger too.
+  /// Once the probe is answered the slot is covered, the signal clears, and the
+  /// next window certifies normally — `Applied`, with the floor promoted to the
+  /// cover it just proved.
+  ///
+  /// The counterpart the cell above needs to mean anything: a signal that never
+  /// cleared — or one every unclassifiable entry raised — would degrade every
+  /// fence the scope ever opens, which is indistinguishable from the fix working
+  /// and strictly worse than the defect.
+  ///
+  /// Mutation that kills it: release the loss nowhere (drop the `stat_loss_dec`
+  /// at `ingest_stat_result`'s request removal). The answered scope then never
+  /// certifies again.
+  #[test]
+  fn an_answered_empty_slot_stat_lets_the_next_fence_certify() {
+    let (mut core, scope, _root) = shrunk_to_keep();
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep"), p("/r/drop")]),
+      CoverReconcile::Reconciling
+    );
+    let probes = run_cascade_probing(
+      &mut core,
+      &BTreeMap::from([("/r", root_listing_with_unknown())]),
+    );
+    let (probe, path) = probes
+      .into_iter()
+      .find(|(_, path)| path.as_path() == Path::new("/r/mystery"))
+      .expect("the unclassifiable slot is probed for its kind");
+    assert_eq!(path, p("/r/mystery"));
+    assert!(core.monitor.stat_loss_outstanding(scope));
+
+    // The answer: `mystery` is a directory after all. Its install heals the
+    // booked hole, which stands the covering `Rescan` — spent below, so the
+    // fence beneath is not riding it.
+    core.on_probe_result(
+      probe,
+      ProbeOutcome::Present {
+        kind: FileKind::Dir,
+        file_id: NonZeroU64::new(13),
+        dev: 1,
+      },
+      at(1),
+    );
+    run_cascade(
+      &mut core,
+      &BTreeMap::from([("/r", root_listing_with_classified())]),
+    );
+    assert!(
+      !core.monitor.stat_loss_outstanding(scope),
+      "the answer released the loss it was standing for"
+    );
+    // The heal's own covering `Rescan` is a loss like any other, and it is spent
+    // here, so the fence below is measuring the stat and nothing else.
+    clear_registration_loss(&mut core, scope);
+    assert_eq!(
+      core.scopes.get(&scope).unwrap().settle_floor,
+      Some(Vec::new()),
+      "the heal's Rescan degraded the narrowed claim, as every Rescan does — \
+       so the floor below has somewhere to be promoted FROM"
+    );
+
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep"), p("/r/drop")]),
+      CoverReconcile::Reconciling
+    );
+    let fence = core.open_cover_fence(scope);
+    run_cascade(
+      &mut core,
+      &BTreeMap::from([("/r", root_listing_with_classified())]),
+    );
+    assert!(core.monitor.rearm_settled(scope));
+
+    core.mark_cut_inflight(scope, 1);
+    core.prove_cut(scope, 1);
+    assert_eq!(
+      core.poll_cover_settlements(DRAINED),
+      vec![(fence, CoverSettle::Applied)],
+      "the answered scope certifies its window like any other"
+    );
+    let state = core.scopes.get(&scope).unwrap();
+    assert_eq!(
+      state.settle_floor,
+      Some(vec![p("/r/keep"), p("/r/drop")]),
+      "and the clean verdict promotes the floor to the cover it proved"
+    );
+  }
+
+  /// The fine entries a Monitor deficit book holds before it collapses to the
+  /// whole-scope marker, plus one. Restated here because the constant itself is
+  /// private to the Monitor; the staging below asserts the collapse rather than
+  /// trusting the number.
+  const PAST_DEFICIT_CAP: usize = 17;
+
+  /// [`root_listing`] plus enough unclassifiable names to COLLAPSE the scope's
+  /// deficit book. Past the cap the book keeps no fine entry at all, so nothing
+  /// any of these slots' answers settles has a hole to heal — and the heal is
+  /// what stands the covering `Rescan` for every ordinary empty-slot answer.
+  fn root_listing_past_the_deficit_cap() -> Vec<RawDirEntry> {
+    let mut entries = root_listing();
+    for i in 0..PAST_DEFICIT_CAP {
+      entries.push(entry(
+        &std::format!("u{i:02}"),
+        FileKind::Unknown,
+        1,
+        20 + i as u64,
+      ));
+    }
+    entries
+  }
+
+  /// A fence held open ACROSS the answers, over a book that collapsed: the
+  /// observation that finally reads the scope finds neither the standing loss nor
+  /// a heal, and it must still not certify the window.
+  ///
+  /// This is the whole shape the settlement loss exists for, run past its
+  /// release. The grow is pure, so the read that listed `/r/uNN` stood no
+  /// `Rescan`. Every slot is empty, so each request stands the loss. Every answer
+  /// resolves to a DIRECTORY, so each install is a cold `install_child` whose
+  /// only cover is `remove_slot_deficit` — and the collapsed book left it nothing
+  /// to remove. And the window is never observed while the loss stands: a re-arm
+  /// read left outstanding keeps the fence pending across every answer, exactly
+  /// as any other unfinished coverage work would.
+  ///
+  /// So the release is the last thing standing between this fence and `Applied`
+  /// over intervals during which seventeen directories were watched by nobody.
+  /// The verdict must be `Degraded`, and the settle floor must keep its
+  /// under-claim so the next `set_cover` recomputes a real broadening delta.
+  ///
+  /// Mutation that kills it: drop the transfer in `ingest_stat_result` (return
+  /// `false` from the resolving arm). The fence then reports `Applied` and
+  /// promotes the floor over ground it never covered.
+  #[test]
+  fn a_fence_held_past_a_collapsed_book_answer_settles_degraded_and_keeps_its_floor() {
+    let (mut core, scope, _root) = shrunk_to_keep();
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep"), p("/r/drop")]),
+      CoverReconcile::Reconciling
+    );
+    let fence = core.open_cover_fence(scope);
+    assert!(
+      !core.monitor.rearm_settled(scope),
+      "staging: the grow's counted work holds the fence open from the start"
+    );
+    assert_eq!(core.poll_cover_settlements(DRAINED), Vec::new());
+
+    // Drive the grow, holding `/r/keep`'s re-arm READ back: that is the counted
+    // work that keeps the fence pending across every answer below, so no
+    // observation can spend the loss before the transfer has to stand.
+    let listings = BTreeMap::from([("/r", root_listing_past_the_deficit_cap())]);
+    let mut probes = Vec::new();
+    let mut held_read = None;
+    let mut wd = 200;
+    for _ in 0..64 {
+      let effects = drain(&mut core);
+      let mut progressed = false;
+      for effect in &effects {
+        match effect {
+          Effect::AddWatch { watch, .. } => {
+            wd += 1;
+            core.on_watch_installed(
+              *watch,
+              core.arm_attempt(*watch),
+              crate::os::linux::WatchOutcome::Installed(wd),
+            );
+            progressed = true;
+          }
+          Effect::Enumerate { req, path, .. } => {
+            if held_read.is_none() && path.as_path() == Path::new("/r/keep") {
+              held_read = Some(*req);
+              continue;
+            }
+            let entries = listings
+              .get(path.to_str().expect("test paths are UTF-8"))
+              .cloned()
+              .unwrap_or_default();
+            core.on_enumerated(*req, listed(entries));
+            progressed = true;
+          }
+          Effect::Probe { probe, path } => probes.push((*probe, path.clone())),
+          _ => {}
+        }
+      }
+      if !progressed {
+        break;
+      }
+    }
+    let held_read = held_read.expect("the survivor `/r/keep` is re-armed and re-read");
+    assert_eq!(
+      probes.len(),
+      PAST_DEFICIT_CAP,
+      "every unclassifiable slot is probed for its kind"
+    );
+    assert!(
+      core.monitor.stat_loss_outstanding(scope),
+      "staging: and each of them stands the scope's settlement loss"
+    );
+    assert!(
+      !core.monitor.rearm_settled(scope),
+      "staging: the held read keeps the fence pending across the answers"
+    );
+
+    // Every slot turns out to be a directory. Each install heals nothing — the
+    // collapsed book holds no entry — so the loss each release ends is the whole
+    // of what covered its interval.
+    for (probe, path) in probes {
+      let ino = path
+        .to_str()
+        .and_then(|path| path.rsplit('u').next())
+        .and_then(|digits| digits.parse::<u64>().ok())
+        .expect("every probe names one of the unclassifiable slots");
+      core.on_probe_result(
+        probe,
+        ProbeOutcome::Present {
+          kind: FileKind::Dir,
+          file_id: NonZeroU64::new(20 + ino),
+          dev: 1,
+        },
+        at(5),
+      );
+    }
+    assert!(
+      !core.monitor.stat_loss_outstanding(scope),
+      "the answers released every loss they stood"
+    );
+
+    // Only now does the scope quiesce, and only now is it observed.
+    core.on_enumerated(held_read, listed(Vec::new()));
+    run_cascade(&mut core, &listings);
+    assert!(core.monitor.rearm_settled(scope));
+    core.mark_cut_inflight(scope, 1);
+    core.prove_cut(scope, 1);
+    assert_eq!(
+      core.poll_cover_settlements(DRAINED),
+      vec![(fence, CoverSettle::Degraded)],
+      "a window whose only cover was the released loss is not a certified one"
+    );
+    let state = core.scopes.get(&scope).unwrap();
+    assert_eq!(
+      state.settle_floor,
+      Some(Vec::new()),
+      "and the floor keeps its under-claim rather than promoting the broadened cover"
+    );
+  }
+
+  /// The same fence, held past a racing OCCUPATION of every dark slot: the
+  /// answers land on slots a create has already filled, and the window may not
+  /// certify over the interval BEFORE those fills either.
+  ///
+  /// Every cover is stripped exactly as above — pure grow, collapsed book, no
+  /// heal for any answer to defer to — and one more thing is true here: each
+  /// slot holds a live watch by the time its answer arrives. That watch covers
+  /// the slot from its own arm forward and says nothing at all about the
+  /// interval between the listing that could not name the entry and the create
+  /// that filled it, which is exactly the interval the settlement loss was
+  /// standing for. The occupation could not hand that interval to a cover
+  /// either: `remove_slot_deficit` is its only one, and the collapse left it
+  /// nothing to remove.
+  ///
+  /// So an answer that read the filled slot as proof of an unbroken cover would
+  /// release the loss into silence and hand this fence `Applied` over seventeen
+  /// intervals during which seventeen directories were watched by nobody.
+  ///
+  /// Mutation that kills it: decide the transfer from the live slot again
+  /// (`incumbent.is_none()` in place of `dark_interval` in
+  /// `ingest_stat_result`). Every answer then finds its slot occupied, stands
+  /// nothing, and the fence certifies the window.
+  #[test]
+  fn a_fence_held_past_a_racing_occupation_settles_degraded_and_keeps_its_floor() {
+    let (mut core, scope, root_watch) = shrunk_to_keep();
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep"), p("/r/drop")]),
+      CoverReconcile::Reconciling
+    );
+    let fence = core.open_cover_fence(scope);
+    assert!(
+      !core.monitor.rearm_settled(scope),
+      "staging: the grow's counted work holds the fence open from the start"
+    );
+    assert_eq!(core.poll_cover_settlements(DRAINED), Vec::new());
+
+    // Drive the grow, holding `/r/keep`'s re-arm READ back: that is the counted
+    // work that keeps the fence pending across every answer below.
+    let listings = BTreeMap::from([("/r", root_listing_past_the_deficit_cap())]);
+    let mut probes = Vec::new();
+    let mut held_read = None;
+    let mut wd = 300;
+    for _ in 0..64 {
+      let effects = drain(&mut core);
+      let mut progressed = false;
+      for effect in &effects {
+        match effect {
+          Effect::AddWatch { watch, .. } => {
+            wd += 1;
+            core.on_watch_installed(
+              *watch,
+              core.arm_attempt(*watch),
+              crate::os::linux::WatchOutcome::Installed(wd),
+            );
+            progressed = true;
+          }
+          Effect::Enumerate { req, path, .. } => {
+            if held_read.is_none() && path.as_path() == Path::new("/r/keep") {
+              held_read = Some(*req);
+              continue;
+            }
+            let entries = listings
+              .get(path.to_str().expect("test paths are UTF-8"))
+              .cloned()
+              .unwrap_or_default();
+            core.on_enumerated(*req, listed(entries));
+            progressed = true;
+          }
+          Effect::Probe { probe, path } => probes.push((*probe, path.clone())),
+          _ => {}
+        }
+      }
+      if !progressed {
+        break;
+      }
+    }
+    let held_read = held_read.expect("the survivor `/r/keep` is re-armed and re-read");
+    assert_eq!(
+      probes.len(),
+      PAST_DEFICIT_CAP,
+      "every unclassifiable slot is probed for its kind"
+    );
+    assert!(
+      core.monitor.stat_loss_outstanding(scope),
+      "staging: and each of them stands the scope's settlement loss"
+    );
+
+    // THE RACE. A create fills every dark slot while its probe is still
+    // outstanding, so each answer will meet a slot that reads occupied.
+    let names: Vec<String> = (0..PAST_DEFICIT_CAP)
+      .map(|i| std::format!("u{i:02}"))
+      .collect();
+    let creates: Vec<RawLinuxEvent> = names
+      .iter()
+      .map(|name| {
+        inotify(
+          &[root_watch],
+          IN_CREATE | IN_ISDIR,
+          0,
+          Some(name.as_bytes()),
+        )
+      })
+      .collect();
+    core.on_inotify_events(scope, creates, at(3));
+    let mut occupied = 0usize;
+    for _ in 0..64 {
+      let effects = drain(&mut core);
+      let mut progressed = false;
+      for effect in &effects {
+        match effect {
+          Effect::AddWatch { watch, path, .. } => {
+            // Matched as a PATH and not as a string: an arm's path is `join`ed
+            // onto its parent, so the separator between them is the platform's.
+            occupied += usize::from(
+              names
+                .iter()
+                .any(|name| path.as_path() == Path::new("/r").join(name)),
+            );
+            wd += 1;
+            core.on_watch_installed(
+              *watch,
+              core.arm_attempt(*watch),
+              crate::os::linux::WatchOutcome::Installed(wd),
+            );
+            progressed = true;
+          }
+          Effect::Enumerate { req, path, .. } => {
+            assert_ne!(
+              path.as_path(),
+              Path::new("/r/keep"),
+              "the held read is not re-issued while it is outstanding"
+            );
+            let entries = listings
+              .get(path.to_str().expect("test paths are UTF-8"))
+              .cloned()
+              .unwrap_or_default();
+            core.on_enumerated(*req, listed(entries));
+            progressed = true;
+          }
+          _ => {}
+        }
+      }
+      if !progressed {
+        break;
+      }
+    }
+    assert_eq!(
+      occupied, PAST_DEFICIT_CAP,
+      "staging: every dark slot is filled and armed before its answer returns"
+    );
+    assert!(
+      core.monitor.stat_loss_outstanding(scope),
+      "staging: and not one of those fills discharged a loss — the collapsed book \
+       left each occupation's heal nothing to remove"
+    );
+    assert!(
+      !core.monitor.rearm_settled(scope),
+      "staging: the held read still keeps the fence pending across the answers"
+    );
+
+    // Every answer confirms the directory the create already installed. Nothing
+    // is retired, nothing is healed: the released loss is the whole of what
+    // covered each interval.
+    for (probe, path) in probes {
+      let ino = path
+        .to_str()
+        .and_then(|path| path.rsplit('u').next())
+        .and_then(|digits| digits.parse::<u64>().ok())
+        .expect("every probe names one of the unclassifiable slots");
+      core.on_probe_result(
+        probe,
+        ProbeOutcome::Present {
+          kind: FileKind::Dir,
+          file_id: NonZeroU64::new(20 + ino),
+          dev: 1,
+        },
+        at(5),
+      );
+    }
+    assert!(
+      !core.monitor.stat_loss_outstanding(scope),
+      "the answers released every loss they stood"
+    );
+
+    // Only now does the scope quiesce, and only now is it observed.
+    core.on_enumerated(held_read, listed(Vec::new()));
+    run_cascade(&mut core, &listings);
+    assert!(core.monitor.rearm_settled(scope));
+    core.mark_cut_inflight(scope, 1);
+    core.prove_cut(scope, 1);
+    assert_eq!(
+      core.poll_cover_settlements(DRAINED),
+      vec![(fence, CoverSettle::Degraded)],
+      "a filled slot is not proof the slot was never dark"
+    );
+    let state = core.scopes.get(&scope).unwrap();
+    assert_eq!(
+      state.settle_floor,
+      Some(Vec::new()),
+      "and the floor keeps its under-claim rather than promoting the broadened cover"
+    );
+  }
+
+  /// The same fence, and this time the book is NOT collapsed: it holds the dark
+  /// slot's fine entry from the moment the grow could not name the kind until
+  /// well past the answer, and nothing ever turns that entry into a cover.
+  ///
+  /// A paired RENAME occupies `/r/mystery` while the probe is outstanding. That
+  /// occupation is an O(1) re-key of an existing subtree — it consults no deficit
+  /// and heals no hole — so the entry stands, and when the answer arrives naming
+  /// the very directory the rename carried in, the settlement REUSES it: nothing
+  /// is installed, nothing is removed, nothing is retired, and the entry is left
+  /// for a sync cookie's DISPATCH to re-signal, which this set-cover reply passes
+  /// nowhere near.
+  ///
+  /// So a recorded hole is not a cover, and an answer that read the book as a
+  /// promise of one would release the loss into silence and hand this fence
+  /// `Applied` over the interval before the rename — during which `/r/mystery`
+  /// may have been a directory watched by nobody.
+  ///
+  /// Mutation that kills it: decide the transfer from the book again (`!booked`,
+  /// read before the reconcile, in place of `!healed` in `ingest_stat_result`).
+  /// The standing entry then suppresses the cover the release owed and the fence
+  /// certifies the window.
+  #[test]
+  fn a_fence_held_past_a_move_in_over_a_booked_hole_settles_degraded_and_keeps_its_floor() {
+    let (mut core, scope, root_watch) = shrunk_to_keep();
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/keep"), p("/r/drop")]),
+      CoverReconcile::Reconciling
+    );
+    let fence = core.open_cover_fence(scope);
+    assert!(
+      !core.monitor.rearm_settled(scope),
+      "staging: the grow's counted work holds the fence open from the start"
+    );
+    assert_eq!(core.poll_cover_settlements(DRAINED), Vec::new());
+
+    // Drive the grow, holding `/r/keep`'s re-arm READ back: that is the counted
+    // work that keeps the fence pending across the answer below, so no
+    // observation can spend the loss before the transfer has to stand.
+    let listings = BTreeMap::from([("/r", root_listing_with_unknown())]);
+    let mut probes = Vec::new();
+    let mut held_read = None;
+    let mut wd = 400;
+    for _ in 0..64 {
+      let effects = drain(&mut core);
+      let mut progressed = false;
+      for effect in &effects {
+        match effect {
+          Effect::AddWatch { watch, .. } => {
+            wd += 1;
+            core.on_watch_installed(
+              *watch,
+              core.arm_attempt(*watch),
+              crate::os::linux::WatchOutcome::Installed(wd),
+            );
+            progressed = true;
+          }
+          Effect::Enumerate { req, path, .. } => {
+            if held_read.is_none() && path.as_path() == Path::new("/r/keep") {
+              held_read = Some(*req);
+              continue;
+            }
+            let entries = listings
+              .get(path.to_str().expect("test paths are UTF-8"))
+              .cloned()
+              .unwrap_or_default();
+            core.on_enumerated(*req, listed(entries));
+            progressed = true;
+          }
+          Effect::Probe { probe, path } => probes.push((*probe, path.clone())),
+          _ => {}
+        }
+      }
+      if !progressed {
+        break;
+      }
+    }
+    let held_read = held_read.expect("the survivor `/r/keep` is re-armed and re-read");
+    let (probe, path) = probes
+      .into_iter()
+      .find(|(_, path)| path.as_path() == Path::new("/r/mystery"))
+      .expect("the unclassifiable slot is probed for its kind");
+    assert_eq!(path, p("/r/mystery"));
+    assert!(
+      core.monitor.stat_loss_outstanding(scope),
+      "staging: and the empty slot stands the scope's settlement loss"
+    );
+    assert!(
+      core.monitor.has_coverage_deficit(scope),
+      "staging: the darkness is booked, and one entry does not collapse a book"
+    );
+
+    // THE OCCUPATION. `/r/drop` is renamed onto the dark slot inside one batch,
+    // so the pairing carries the subtree over with no round trip between the
+    // halves to dirty the hold — an O(1) re-key, consulting no book.
+    core.on_inotify_events(
+      scope,
+      vec![
+        inotify(&[root_watch], IN_MOVED_FROM | IN_ISDIR, 9, Some(b"drop")),
+        inotify(&[root_watch], IN_MOVED_TO | IN_ISDIR, 9, Some(b"mystery")),
+      ],
+      at(3),
+    );
+    assert!(
+      core.monitor.has_coverage_deficit(scope),
+      "staging: the re-key healed nothing — the slot's entry is still standing"
+    );
+    assert!(
+      core.monitor.stat_loss_outstanding(scope),
+      "staging: so the released loss is still the whole of what covers the interval"
+    );
+    assert!(
+      !core.monitor.rearm_settled(scope),
+      "staging: the held read still keeps the fence pending across the answer"
+    );
+
+    // The answer names the directory the rename carried in — same device, same
+    // inode — so the settlement keeps it and installs nothing.
+    core.on_probe_result(
+      probe,
+      ProbeOutcome::Present {
+        kind: FileKind::Dir,
+        file_id: NonZeroU64::new(12),
+        dev: 1,
+      },
+      at(5),
+    );
+    assert!(
+      !core.monitor.stat_loss_outstanding(scope),
+      "the answer released the loss it was standing for"
+    );
+
+    // Only now does the scope quiesce, and only now is it observed.
+    let settled = BTreeMap::from([(
+      "/r",
+      vec![
+        entry("keep", FileKind::Dir, 1, 11),
+        entry("mystery", FileKind::Dir, 1, 12),
+      ],
+    )]);
+    core.on_enumerated(held_read, listed(Vec::new()));
+    run_cascade(&mut core, &settled);
+    assert!(core.monitor.rearm_settled(scope));
+    core.mark_cut_inflight(scope, 1);
+    core.prove_cut(scope, 1);
+    assert_eq!(
+      core.poll_cover_settlements(DRAINED),
+      vec![(fence, CoverSettle::Degraded)],
+      "a booked hole nothing healed is not a covered one"
+    );
+    let state = core.scopes.get(&scope).unwrap();
+    assert_eq!(
+      state.settle_floor,
+      Some(Vec::new()),
+      "and the floor keeps its under-claim rather than promoting the broadened cover"
     );
   }
 

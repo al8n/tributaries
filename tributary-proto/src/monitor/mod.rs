@@ -758,9 +758,11 @@ enum StatDescent {
 /// a name under a watched parent whose listed kind was
 /// [`FileKind::Unknown`](crate::FileKind::Unknown).
 ///
-/// The request carries the slot and nothing else. The descent a deferring read
-/// owes lives in [`owed_descents`](Monitor::owed_descents) keyed by the
-/// incumbent watch (see [`StatDescent`]) — a request that carried it would tie
+/// The request carries the slot, and the queue-time READINGS that decide how a
+/// late answer must be routed and what its release owes. It carries no
+/// OBLIGATION. The descent a deferring read owes lives in
+/// [`owed_descents`](Monitor::owed_descents) keyed by the incumbent watch (see
+/// [`StatDescent`]) — a request that carried it would tie
 /// the obligation to this coordinate, and the object that owes it can leave the
 /// coordinate before the answer lands. The COVER a retirement owes is likewise
 /// not carried here — it is decided from what the answer actually did to the
@@ -790,13 +792,156 @@ struct StatSlot {
   /// request, and is inert until an answer arrives, so nothing counted is added
   /// here.
   ///
-  /// The stamp has a second half, and it is NOT inert: while the request stands,
-  /// so does the scope's settlement loss
-  /// ([`Monitor::bootstrap_stats`]). The install-routing above answers "what
-  /// does a late answer do"; the loss answers "what may a barrier claim in the
-  /// meantime", and without it a fence opened between the queue and the answer
-  /// certifies a window whose possible directory has no watch at all.
+  /// The stamp governs the install ROUTING — and, through it, one thing more,
+  /// because that routing STANDS a cover: the detour's bridge half plus its
+  /// counted re-arm are the window's closing `Rescan`, so a release that would
+  /// otherwise hand this slot's darkness to a `Rescan` of its own withholds it
+  /// ([`Monitor::ingest_stat_result`]). What a barrier may claim while the
+  /// request stands is `stands_loss` below, which a registration-window request
+  /// always carries but is not alone in carrying.
   bootstrap: bool,
+  /// Whether this request stands its scope's SETTLEMENT LOSS
+  /// ([`Monitor::stat_losses`]) for as long as it is owed — the answer to "what
+  /// may a barrier claim in the meantime", where `bootstrap` answers "what does
+  /// a late answer install".
+  ///
+  /// Two queue-time conditions raise it, and their union is deliberate:
+  ///
+  /// - the scope's REGISTRATION window stood (`bootstrap`), whose crawl arms
+  ///   ground it announces nothing for; and
+  /// - the slot held NO watch when the request was queued, in ANY window. The
+  ///   listing that asked for the kind reconciled nothing for such a slot — it
+  ///   books darkness ([`Monitor::record_slot_deficit`]) and waits — so the slot
+  ///   may be a directory the scope has no watch on at all, and the read that
+  ///   found it need not have stood any `Rescan` of its own (a pure grow, or a
+  ///   record-driven cold read, stands none).
+  ///
+  /// Without it a fence opened between the queue and the answer certifies a
+  /// window whose possible directory is watched by nothing, and writes beneath
+  /// it are recorded by nothing. The standing coverage deficit does not close
+  /// that: it re-signals at a sync cookie's DISPATCH, and an ordinary set-cover
+  /// reply passes nowhere near it.
+  ///
+  /// It only ever RISES. The dedup in [`Monitor::queue_stat`] coalesces every
+  /// later read of the same name onto one request, so the loss the answer
+  /// discharges must be the strongest any of those reads carried — a slot whose
+  /// incumbent died under an already-outstanding stat is re-listed into an EMPTY
+  /// slot, and that read's darkness would otherwise be booked with nothing
+  /// standing for it. It never falls: a later occupation heals the hole through
+  /// [`Monitor::remove_slot_deficit`], which stands its own covering `Rescan`,
+  /// and dropping the loss there would trade a discharge edge that cannot be
+  /// forgotten for one that can.
+  ///
+  /// It is RELEASED at exactly two sites, because the row itself leaves
+  /// [`Monitor::pending_stat`] at exactly two: the answer's arrival
+  /// ([`Monitor::ingest_stat_result`]) and the parent's death
+  /// ([`NodeMarker::StatSlots`]). A result for a request neither of them left
+  /// behind releases nothing, having found no row to take.
+  ///
+  /// **Every release owes a REPLACEMENT**, and the rule is one rule at both:
+  /// where the interval the request spanned went dark with nothing stood for it
+  /// since ([`Monitor::stat_slot_dark`]), the loss is handed on rather than
+  /// released into silence. The answer hands it to a covering `Rescan` at the
+  /// slot wherever its own settlement healed no fine entry — the book holds
+  /// none for it (one collapsed past [`DEFICIT_CAP`] records none, and a
+  /// dispatch re-signal spends the ones it does record), or the reconcile
+  /// reused an occupant another path had already put in the slot. The parent's
+  /// death reports the darkness as an erased cover and lets the walk's
+  /// [`DeficitDischarge`] place it, since a teardown that stands nothing is the
+  /// right answer for a scope that is going away and the wrong one for a slot
+  /// emptied by a record.
+  stands_loss: bool,
+  /// Whether an interval this request stands for went DARK — a read found the
+  /// slot holding NO watch — with no cover stood for it since.
+  ///
+  /// The companion of `stands_loss` above, and separate from it because the two
+  /// answer different questions. The loss answers "may a barrier claim this
+  /// window", which a REGISTRATION-stamped request raises over ground the scope
+  /// already watches; this answers "was there an unwatched interval for the
+  /// release to hand off", which only an EMPTY slot creates. It implies
+  /// `stands_loss` — every read that raises this raises that, and the test
+  /// invariant checker pins the implication.
+  ///
+  /// It is CARRIED rather than re-derived at the answer, because the slot's
+  /// occupancy then is not the same question. A directory can be installed
+  /// under the outstanding request — a `Created`, a move-in, a later enumerate —
+  /// and an answer reading the filled slot would take "something is there now"
+  /// for "nothing was ever missing". What actually covers the interval before
+  /// such a fill is the fill's own heal
+  /// ([`Monitor::remove_slot_deficit`], which stands the covering `Rescan` when
+  /// it removes a real entry); a fill that removes none covers nothing — the
+  /// book held no entry for it to remove (one collapsed past [`DEFICIT_CAP`]
+  /// holds none, and a dispatch re-signal spends the ones it signals), or the
+  /// path that filled the slot consults no book at all
+  /// ([`Monitor::reparent`]) — and this is what says so at the answer.
+  ///
+  /// Raised from the one emptiness reading that decides it
+  /// ([`Monitor::queue_stat`]), on a created request and on one the dedup
+  /// coalesced onto alike. Cleared only by a cover actually stood: a real
+  /// removal in `remove_slot_deficit`, the single act that turns a slot's
+  /// booked darkness into the window's closing `Rescan`. An occupation that
+  /// stands no cover clears nothing and the answer still owes the transfer,
+  /// which is the direction an occupation path nobody has written yet fails in.
+  dark_uncovered: bool,
+  /// Whether a cover has been stood for the vacancy the slot holds RIGHT NOW —
+  /// the answer to "is this emptiness already accounted for", which the
+  /// emptiness itself cannot give.
+  ///
+  /// A slot reading empty at the answer is reason to cover only while nothing
+  /// has covered that emptiness yet. A `File`/`Gone` reconcile arriving from
+  /// outside this request removes the slot's fine entry and stands the covering
+  /// `Rescan` for exactly this vacancy — and leaves the slot EMPTY, since that
+  /// is what those occupants mean. Read as "empty, therefore uncovered", the
+  /// answer would then stand a SECOND cover over an interval already handed to
+  /// the first: an epoch bump, a degraded cover state, and a consumer
+  /// enumeration nothing asked for.
+  ///
+  /// Raised by an act that stands that cover and by nothing weaker. There are
+  /// exactly two, because the settlement that EMPTIES a slot can emit from either
+  /// of two places and a caller cannot tell from outside which of them did:
+  ///
+  /// - a real removal in [`Monitor::remove_slot_deficit`], at the one caller
+  ///   whose settlement leaves the slot empty ([`Monitor::reconcile_slot`]'s
+  ///   `File`/`Gone` arm). The other caller ([`Monitor::install_child`]) removes
+  ///   the same entry to OCCUPY the slot, which ends a vacancy rather than
+  ///   covering one, and raises nothing here; and
+  /// - the teardown of the departing occupant itself
+  ///   ([`Monitor::drop_departed_occupant`]), whose walk stands the scope's
+  ///   covering `Rescan` when it erases a deficit anchored inside the dying
+  ///   subtree. That cover is root-located, so it reaches this slot, and the walk
+  ///   that stands it is the walk that empties the slot, so it cannot predate the
+  ///   vacancy.
+  ///
+  /// Neither subsumes the other: they consume different books, and an occupation
+  /// racing the request has already spent the slot's own fine entry, leaving the
+  /// teardown as the whole of what the emptying stands.
+  ///
+  /// Deliberately NOT raised by every `Rescan` that happens to reach the slot. A
+  /// root-located cover from anywhere in the scope — an overflow, a sibling's
+  /// counted recovery, another subtree's bridge window, and the counted cover a
+  /// teardown of this very subtree may owe for an object that survives elsewhere
+  /// ([`Monitor::stand_counted_cover`]) — reaches this slot too, and that
+  /// population is open-ended: there is no site set to record at, and most of it
+  /// knows nothing about this slot. What makes the two above recordable is that
+  /// each is part of the settlement of THIS slot, so each knows the vacancy it
+  /// speaks for. Under-raising costs a redundant cover, which is legal;
+  /// over-raising costs a missed one, which is not.
+  ///
+  /// Cleared by the act that opens a NEW vacancy — a removal from
+  /// [`Monitor::child_index`] that really took an entry out
+  /// ([`Monitor::vacate_child_slot`]) — because a cover stood for the previous
+  /// vacancy says nothing about this one. That funnel is the only occupied-to-
+  /// empty transition there is, which is what lets this be read as a fact about
+  /// the CURRENT vacancy whenever the answer finds the slot empty. A refill needs
+  /// no clear of its own: an occupied slot is not read here at all, and the drop
+  /// that empties it again passes the same funnel.
+  ///
+  /// It is a SUPPRESSOR, never an obligation — it can only withhold a cover the
+  /// live emptiness would otherwise stand, never stand one. So it carries no
+  /// implication to `stands_loss` (a request standing no loss emits nothing
+  /// either way) and no mirrored counter to pin; a missing clear costs a MISSED
+  /// cover, which the cells hold rather than an invariant.
+  vacancy_covered: bool,
 }
 
 /// Key for a half-resolved rename. A [`MoveCookie`] is unique only within one
@@ -1098,17 +1243,24 @@ pub struct Monitor {
   /// now the node's [`NodeState`].
   pending_enumerate: BTreeMap<ReqId, WatchId>,
   /// Maps an outstanding [`Action::Stat`](crate::Action::Stat) to the slot
-  /// whose kind it must settle. An entry exists only while the answer is owed,
-  /// and an UNWATCHED such slot carries a recorded coverage deficit for exactly
-  /// as long — so a driver that never answers leaves standing darkness the
-  /// dispatch re-signal keeps covering, never silence. Deliberately NOT a
-  /// conjunct of [`coverage_settled`](Self::coverage_settled): an unanswered
-  /// stat must degrade to a re-signalled `Rescan`, not wedge every barrier of
-  /// the scope.
+  /// whose kind it must settle. An entry exists only while the answer is owed.
+  /// Deliberately NOT a conjunct of
+  /// [`coverage_settled`](Self::coverage_settled): an unanswered stat must
+  /// degrade to a re-signalled `Rescan`, not wedge every barrier of the scope.
   ///
-  /// A REGISTRATION-window request additionally stands its scope's settlement
-  /// loss for as long as it is owed
-  /// ([`bootstrap_stats`](Self::bootstrap_stats)) — the honest half of the
+  /// An UNWATCHED such slot BOOKS a coverage deficit at the read that asked for
+  /// the kind — but the two lifetimes are NOT one, and nothing may read a
+  /// standing request as proof that an entry still stands for its slot: a
+  /// dispatch re-signal clears the entries it signals
+  /// ([`resignal_deficits`](Self::resignal_deficits)) while the row stays owed,
+  /// and a book collapsed past [`DEFICIT_CAP`] records none to begin with. What
+  /// answers for the darkness across the whole of the request's life is the
+  /// settlement loss below and the replacement its release owes
+  /// ([`StatSlot::stands_loss`]).
+  ///
+  /// A request for a slot no watch covers — and every request a REGISTRATION
+  /// window queued — additionally stands its scope's settlement loss for as long
+  /// as it is owed ([`stat_losses`](Self::stat_losses)): the honest half of the
   /// exemption above, since the deficit re-signal that covers this darkness
   /// reaches a sync cookie's dispatch and not an ordinary set-cover reply.
   pending_stat: BTreeMap<ReqId, StatSlot>,
@@ -1117,18 +1269,16 @@ pub struct Monitor {
   /// O(log n) decision rather than a scan of every outstanding request. Mirrors
   /// that map's slots exactly (asserted by the test invariant checker).
   stat_slots: BTreeMap<(WatchId, Segment), ReqId>,
-  /// Per-scope count of outstanding stats stamped with the registration window
-  /// ([`StatSlot::bootstrap`]) — the O(1) backing for
-  /// [`bootstrap_stat_outstanding`](Self::bootstrap_stat_outstanding), and the
-  /// scope's SETTLEMENT-LOSS half of that stamp.
+  /// Per-scope count of outstanding stats that stand the scope's SETTLEMENT
+  /// LOSS ([`StatSlot::stands_loss`]) — the O(1) backing for
+  /// [`stat_loss_outstanding`](Self::stat_loss_outstanding).
   ///
-  /// The stamp alone governs only what the ANSWER's install does. Between the
-  /// queue and the answer the scope has already left its counted re-arm state —
-  /// queueing sets neither bridge bit and nothing counted — so a barrier built
-  /// on [`coverage_settled`](Self::coverage_settled) can pass while the stamped
-  /// slot still holds no child watch, and a set-cover fence would certify a
-  /// window whose possible directory is uncovered. This counter is what the
-  /// consumer reads to refuse that certification.
+  /// Between the queue and the answer the scope has already left its counted
+  /// re-arm state — queueing sets neither bridge bit and nothing counted — so a
+  /// barrier built on [`coverage_settled`](Self::coverage_settled) can pass
+  /// while the slot still holds no child watch, and a set-cover fence would
+  /// certify a window whose possible directory is uncovered. This counter is
+  /// what the consumer reads to refuse that certification.
   ///
   /// It is deliberately NOT a conjunct of `coverage_settled`. A blocking
   /// conjunct would let a driver that never answers wedge every barrier of the
@@ -1137,17 +1287,19 @@ pub struct Monitor {
   /// floor under-claimed, which instructs the consumer to re-enumerate exactly
   /// as the coverage contract already asks.
   ///
-  /// Maintained at the three edges every stamped request passes: the stamped
-  /// [`queue_stat`](Self::queue_stat), the answer's removal in
+  /// Maintained at the edges every such request passes, and there are only
+  /// three because [`pending_stat`](Self::pending_stat) has only three: the
+  /// [`queue_stat`](Self::queue_stat) that creates the row (or raises the loss
+  /// of the row it coalesced onto), the answer's removal in
   /// [`ingest_stat_result`](Self::ingest_stat_result) (whatever the answer says,
   /// including a failure, an unresolvable kind, and one whose parent died under
   /// it), and the parent's own death ([`NodeMarker::StatSlots`]). An entry
   /// leaves the map at zero, so a scope holds no residue — and the whole map
-  /// mirrors `pending_stat`'s stamped rows exactly (asserted by the test
+  /// mirrors `pending_stat`'s loss-standing rows exactly (asserted by the test
   /// invariant checker).
   ///
   /// [`defer_stat_descent`]: Self::defer_stat_descent
-  bootstrap_stats: BTreeMap<ScopeId, usize>,
+  stat_losses: BTreeMap<ScopeId, usize>,
   /// The downward descent each watch is OWED by a read that deferred to its
   /// slot's stat ([`StatDescent`]), keyed by the watch itself.
   ///
@@ -1407,7 +1559,7 @@ impl Monitor {
       pending_enumerate: BTreeMap::new(),
       pending_stat: BTreeMap::new(),
       stat_slots: BTreeMap::new(),
-      bootstrap_stats: BTreeMap::new(),
+      stat_losses: BTreeMap::new(),
       owed_descents: BTreeMap::new(),
       pending_moves: BTreeMap::new(),
       held_sources: BTreeSet::new(),
@@ -2294,7 +2446,7 @@ impl Monitor {
     // is refused is the unprovable WINDOW, not a hole here.
     let mut tail = reserved;
     for seg in connectors {
-      self.install_child(tail, scope, seg.clone(), true, None);
+      let _ = self.install_child(tail, scope, seg.clone(), true, None);
       // Infallible by construction: the parent was minted THIS call with an
       // empty slot, so `install_child` cannot have skipped. Every refusal this
       // method can report (`None`) happens strictly BEFORE the first mutation;
@@ -2407,9 +2559,10 @@ impl Monitor {
       && self.moves_settled(scope)
   }
 
-  /// Whether `scope` still owes an answer to a stat its REGISTRATION window
-  /// queued — a listing entry of unknown kind whose slot may be a directory the
-  /// scope has no watch on yet.
+  /// Whether `scope` still owes an answer to a stat that stands its settlement
+  /// loss — a listing entry of unknown kind whose slot may be a directory the
+  /// scope has no watch on yet, or any entry its REGISTRATION window asked
+  /// about.
   ///
   /// This is a LOSS signal for a settlement, and deliberately not a sixth
   /// conjunct of [`coverage_settled`](Self::coverage_settled). The two differ in
@@ -2422,24 +2575,77 @@ impl Monitor {
   ///   an unanswered stat has none.
   /// - As a **loss signal**, a fence settling while the stat stands reports a
   ///   degraded window and keeps its under-claimed settle floor, which instructs
-  ///   the consumer to re-enumerate — the same instruction the slot's standing
-  ///   coverage deficit already owes it, and the one the coverage contract
-  ///   already asks for. The barrier still resolves, on time.
+  ///   the consumer to re-enumerate — the instruction the coverage contract
+  ///   already asks for. That instruction is this signal's OWN, never a second
+  ///   copy of one a standing coverage deficit is holding for the same slot:
+  ///   the slot need carry no such entry at all (a registration-stamped request
+  ///   raises this over ground the scope already watches), and
+  ///   [`resignal_coverage_deficits`](Self::resignal_coverage_deficits) clears
+  ///   the entries it signals while the request stays owed. The barrier still
+  ///   resolves, on time.
   ///
-  /// Between the queue and the answer the scope is genuinely uncovered there and
-  /// genuinely settled: the crawl that listed the slot reconciled nothing for it
-  /// (it books darkness and asks for a kind), and the scope leaves its counted
-  /// re-arm state without waiting. A consumer that certifies coverage over that
-  /// window would claim a cover the slot's possible directory is outside of, and
-  /// writes beneath it would be recorded by nothing.
+  /// Between the queue and the answer the scope can be genuinely uncovered there
+  /// and genuinely settled: where the slot held no watch, the read that listed
+  /// it reconciled nothing for it (it books darkness and asks for a kind), and
+  /// the scope leaves its counted re-arm state without waiting. A consumer that
+  /// certifies coverage over that window would claim a cover the slot's possible
+  /// directory is outside of, and writes beneath it would be recorded by
+  /// nothing. Nor does the read that found the slot necessarily stand a `Rescan`
+  /// of its own — a pure grow and a record-driven cold read both stand none — so
+  /// this is the window's only loss.
+  ///
+  /// A REGISTRATION-window request raises the signal over a slot the scope may
+  /// already watch, and for the window's own reason rather than the one above:
+  /// that window's crawl arms ground it announces nothing for, so a fence
+  /// certifying inside it claims a cover no delivered record backs.
   ///
   /// False for a scope with no such stat outstanding, for a kernel-recursive one
-  /// (which queues no bootstrap read at all), and for an unknown or torn-down
-  /// one. Reading it allocates nothing.
+  /// (which descends into nothing and so stats no slot at all), and for an
+  /// unknown or torn-down one. Reading it allocates nothing.
   #[cfg_attr(not(tarpaulin), inline)]
   #[must_use]
-  pub fn bootstrap_stat_outstanding(&self, scope: ScopeId) -> bool {
-    self.bootstrap_stats.contains_key(&scope)
+  pub fn stat_loss_outstanding(&self, scope: ScopeId) -> bool {
+    self.stat_losses.contains_key(&scope)
+  }
+
+  /// Stands the covering [`Rescan`](ChangeKind::Rescan) a settlement about to
+  /// report [`stat_loss_outstanding`](Self::stat_loss_outstanding) owes its
+  /// consumer, and reports whether one was stood.
+  ///
+  /// The cover is the SCOPE's, not the slot's, and the loss's own shape is why.
+  /// The request is still owed, so nobody knows whether the slot is a directory
+  /// — which is exactly why the darkness could not be covered where it sits —
+  /// and a REGISTRATION-window request stands the loss over a crawl that armed
+  /// ground it announced nothing for anywhere under the root, which no one
+  /// slot's `Rescan` names at all. A root-covering `Rescan` is the instruction
+  /// the degraded verdict already carries — re-enumerate the scope — and the
+  /// same one a collapsed deficit book stands
+  /// ([`resignal_coverage_deficits`](Self::resignal_coverage_deficits)).
+  ///
+  /// Deliberately NO heal kick, which is the one place this parts company with
+  /// that re-signal. A kick acquires counted coverage work: it re-opens the
+  /// scope's barrier and retires the ordering proof the settling fence is
+  /// holding, so a scope whose stat never comes back would stand a cover,
+  /// re-open, settle, stand another, and never answer its caller at all. Nothing
+  /// here is owed to the SITE — the slot's own answer, or its parent's death,
+  /// ends the loss, and this call waits for neither.
+  ///
+  /// Nor does it CLEAR anything. The loss is level-persistent and stands until
+  /// it is discharged, so every verdict minted over it stands its own cover
+  /// rather than inheriting an earlier verdict's; a repeat while the previous
+  /// `Rescan` is still queued coalesces into it — that one is undelivered, so it
+  /// covers this verdict too — and still reports `true`.
+  ///
+  /// `false` for a scope standing no such loss, for a kernel-recursive one
+  /// (which stats no slot and so never stands one), and for an unknown or
+  /// torn-down scope, whose consumer this can no longer instruct.
+  pub fn cover_stat_loss(&mut self, scope: ScopeId) -> bool {
+    if !self.stat_loss_outstanding(scope) || !self.roots.contains_key(&scope) {
+      return false;
+    }
+    self.emit_rescan(scope, Location::new());
+    self.settle_bridges();
+    true
   }
 
   /// `scope`'s coverage-work epoch: a monotone count of how many times the
@@ -2490,8 +2696,12 @@ impl Monitor {
   /// (the scope root when the book collapsed), kicks one bounded re-arm at
   /// each site's healing anchor, and optimistically clears the re-signaled
   /// entries — a still-broken site re-records itself through its own failure
-  /// edge, with a fresh edge `Rescan`, before the kicked (counted) work can
-  /// settle. A site currently inside a held (mid-move) subtree keeps its
+  /// edge before the kicked (counted) work can settle. Most such edges stand a
+  /// fresh `Rescan` as they re-record; the unclassifiable EMPTY slot stands
+  /// none, its window being covered by the settlement loss its outstanding stat
+  /// carries instead
+  /// ([`stat_loss_outstanding`](Self::stat_loss_outstanding)). A site currently
+  /// inside a held (mid-move) subtree keeps its
   /// entry and dirties the hold instead, like every other held-subtree
   /// activity: a `Rescan` there would name the stale pre-move path.
   ///
@@ -3154,6 +3364,15 @@ impl Monitor {
   /// A [`NotFound`](crate::IoClass::NotFound) failure is the benign race — the
   /// entry was gone before the stat ran — and settles the slot as empty.
   ///
+  /// Settling a slot that spent any of the request's lifetime UNWATCHED ends
+  /// that interval, and the settlement loss the request stood
+  /// ([`stat_loss_outstanding`](Self::stat_loss_outstanding)) is released with
+  /// the answer whatever it says — so where the settlement finds no recorded
+  /// deficit to discharge (a book collapsed to its whole-scope marker records
+  /// none, and [`resignal_coverage_deficits`](Self::resignal_coverage_deficits)
+  /// spends the entries it signals), that loss is handed to a covering
+  /// [`Rescan`](ChangeKind::Rescan) rather than released into silence.
+  ///
   /// Whatever the answer, it also settles the INCUMBENT watch the read that
   /// deferred to this stat left standing: a kept incumbent receives the descent
   /// that read owed it, and a retired one earns a covering
@@ -3174,23 +3393,33 @@ impl Monitor {
     let Some(slot) = self.pending_stat.remove(&req) else {
       return;
     };
+    // Whether this request spans an interval the slot spent DARK — the question
+    // the released loss owes its replacement for
+    // ([`stat_slot_dark`](Self::stat_slot_dark)). Read off the row while it is
+    // still whole, and through the SAME predicate the parent's death asks of a
+    // row it reclaims unanswered: nothing between here and its use below moves a
+    // watch into or out of the slot, and two releases that disagreed about which
+    // windows were dark would be one release handing the darkness to nobody.
+    let dark_interval = self.stat_slot_dark(&slot);
     let StatSlot {
       parent,
       name,
       scope,
       placement,
       bootstrap,
+      stands_loss,
+      ..
     } = slot;
     self.stat_slots.remove(&(parent, name.clone()));
-    // The stamp's settlement-loss half is discharged by the ANSWER ARRIVING, not
-    // by what the answer says, so it is released here — ahead of every early
-    // return and every branch below. A failure, a kind that is `Unknown` again,
-    // an answer the placement staled, and one whose parent died under it all
-    // reach a terminal that re-books the darkness in the DEFICIT book (which the
+    // The settlement loss is discharged by the ANSWER ARRIVING, not by what the
+    // answer says, so it is released here — ahead of every early return and
+    // every branch below. A failure, a kind that is `Unknown` again, an answer
+    // the placement staled, and one whose parent died under it all reach a
+    // terminal that re-books the darkness in the DEFICIT book (which the
     // dispatch re-signal covers) or dies with the node; none of them leaves a
     // stat outstanding, so none of them may leave the loss standing either.
-    if bootstrap {
-      self.bootstrap_stat_dec(scope, 1);
+    if stands_loss {
+      self.stat_loss_dec(scope, 1);
     }
     // The slot's parent can have died while the stat ran; there is then no slot
     // left to settle, and its deficit died with the node.
@@ -3227,9 +3456,23 @@ impl Monitor {
     // answer could not settle at all — its owner had already left the slot —
     // and that is exactly the case the reparent (or the drop) must honor.
     let descent = incumbent.and_then(|kept| self.owed_descents.remove(&kept));
-    match res {
+    // Whether this answer left the interval the slot spent dark covered by
+    // NOTHING. Asked of every arm, and asked as a VALUE the match produces, so
+    // an arm added below does not compile until it has said which side of the
+    // question it is on — the release above is unconditional precisely so no
+    // answer shape can skip it, and its replacement is owed the same treatment.
+    let owes_cover = match res {
       StatResult::Ok(entry) if !stale && !entry.kind().is_unknown() => {
-        self.reconcile_slot(
+        // Whether the settlement HEALED the slot's booked darkness — the one act
+        // that turns a fine deficit entry into the covering `Rescan`. Taken as
+        // the reconcile's own answer rather than read off the book beforehand:
+        // what a pre-read could say is which entry stood, and the question is
+        // which one this call REMOVED. The two part company wherever the
+        // reconcile reuses what it finds — an identity match, or an identity
+        // nobody could read, over a slot some other occupation path filled while
+        // the request was outstanding — and there the entry stands, healed by
+        // nobody, with the loss that covered its interval already released.
+        let healed = self.reconcile_slot(
           parent,
           scope,
           &name,
@@ -3259,19 +3502,55 @@ impl Monitor {
         // empty-slot unknown is `Rescan`-covered without this — but a book
         // collapsed past `DEFICIT_CAP` records nothing to remove, and there this
         // is the window's only loss half.
-        if bootstrap
-          && incumbent.is_none()
-          && let Some(fresh) = self.child_watch(parent, &name)
-        {
+        //
+        // The install this answer performed into an EMPTY slot, if it performed
+        // one, is read once: the detour's suppression routing needs the handle,
+        // and the transfer below needs to know the detour stood the cover so it
+        // does not stand a second one.
+        let installed = incumbent
+          .is_none()
+          .then(|| self.child_watch(parent, &name))
+          .flatten();
+        if bootstrap && let Some(fresh) = installed {
           self.bridge_saw_rescan(scope);
           let _ = self.inherit_rearm(fresh);
         }
+        // THE TRANSFER. This answer ENDED the slot's darkness — a directory is
+        // armed and descended into, anything else drops whatever stale watch
+        // stood there — and the release above ended the loss that was covering
+        // the interval it spanned. Ordinarily the heal carries the handover:
+        // `remove_slot_deficit` turns the slot's fine entry into both bridge
+        // bits and the window closes with its `Rescan`. Where the settlement
+        // turned no entry — the book had none, or the reconcile reused an
+        // occupant it found rather than installing over one — that handover is
+        // to NOTHING, and the interval, during which the slot may have been an
+        // unwatched directory with writes beneath it recorded by no watch and
+        // announced by no listing, would pass from a degraded fence to a
+        // certified one at this line.
+        //
+        // Suppressed only by a cover this call OBSERVED being stood (`healed`,
+        // and the detour's own half below). A standing deficit entry is not one:
+        // the entry says the darkness was recorded, never that anything has
+        // since covered it, and the re-signal that will eventually turn it fires
+        // at a sync cookie's DISPATCH — nowhere near the ordinary set-cover
+        // reply this release is racing.
+        //
+        // Only where the slot spent an interval DARK (`dark_interval`): a slot
+        // a live watch covered for the whole of this request was never dark, so
+        // there is nothing to hand off, and standing a cover anyway would
+        // degrade every registration that meets a `DT_UNKNOWN` name over ground
+        // it already watches. That question is deliberately NOT answered by the
+        // slot's occupancy at this line — see `dark_interval` above.
+        stands_loss && dark_interval && !healed && !(bootstrap && installed.is_some())
       }
       // The object vanished before the stat: the slot is empty, which the
       // ordinary `Gone` reconcile settles (dropping any stale watch and
-      // discharging the deficit).
+      // discharging the deficit) — and, where that settlement discharged
+      // nothing, the same transfer the resolving arm above owes, decided off
+      // the same observed outcome.
       StatResult::Failed(class) if !stale && class.is_not_found() => {
-        self.reconcile_slot(parent, scope, &name, SlotOccupant::Gone, false, None);
+        let healed = self.reconcile_slot(parent, scope, &name, SlotOccupant::Gone, false, None);
+        stands_loss && dark_interval && !healed
       }
       // Unresolvable: the kind is still unknown, the stat itself failed, or the
       // answer describes a path the placement moved out from under it (`stale`).
@@ -3289,17 +3568,28 @@ impl Monitor {
         if self.child_watch(parent, &name).is_none() {
           self.record_slot_deficit(scope, parent, name.clone());
         }
-        // The darkness is re-booked either way; what differs is WHERE the
-        // covering re-read may be addressed. Under a hold this slot's
-        // reconstruction is the pre-move path, so a `Rescan` here would send the
-        // consumer to the slot the subtree has LEFT while the real destination
-        // kept no re-arm obligation at all — uncovered until a later deficit
-        // re-signal. The fence above dirtied the hold instead, which obliges the
-        // pairing to `Rescan` and re-arm the destination.
-        if lowering.locatable() {
-          self.emit_rescan(scope, self.child_location(parent, &name));
-        }
+        true
       }
+    };
+    // The ONE cover site, past every arm: the degrade's standing `Rescan` and
+    // the transfer a settling answer owes are a single emission, so neither can
+    // be reached without the other having been decided and neither can fire
+    // twice over one answer.
+    //
+    // Located, and so subject to the same address test every other located
+    // recovery is. Under a hold this slot's reconstruction is the pre-move path,
+    // so a `Rescan` here would send the consumer to the slot the subtree has
+    // LEFT while the real destination kept no re-arm obligation at all —
+    // uncovered until a later deficit re-signal. The fence above dirtied the
+    // hold instead, which obliges the pairing to `Rescan` and re-arm the
+    // destination; and the hold holds [`coverage_settled`](Self::coverage_settled)
+    // itself down for as long as it stands — through the held source
+    // ([`holds_settled`](Self::holds_settled)) and through the parked rename half
+    // that detached it ([`moves_settled`](Self::moves_settled)) — so no fence can
+    // certify the window this emission would have covered before that pairing
+    // runs.
+    if owes_cover && lowering.locatable() {
+      self.emit_rescan(scope, self.child_location(parent, &name));
     }
     self.settle_stat_slot(
       scope,
@@ -3394,19 +3684,29 @@ impl Monitor {
   /// re-listed as unknown on every retry of an unreadable directory must not
   /// stack a request per read.
   ///
-  /// The request is born owing nothing; a read that DEFERS a descent to it
+  /// The request is born owing no DESCENT; a read that DEFERS one to it
   /// books that separately against the slot's incumbent
   /// ([`defer_stat_descent`](Self::defer_stat_descent)), which is also what lets
   /// a later read's stronger obligation reach a stat this dedup already
-  /// coalesced onto.
+  /// coalesced onto. What it may be born STANDING is the settlement loss below,
+  /// which degrades the scope's fences from the queue until the answer.
+  ///
+  /// This is also where the request's SETTLEMENT LOSS is stood
+  /// ([`StatSlot::stands_loss`]), rather than at the reconcile that asked for the
+  /// stat: the row is created here and nowhere else, so a caller cannot queue a
+  /// stat over a slot it covers with nothing and forget to say so. The DARKNESS
+  /// that loss stands over ([`StatSlot::dark_uncovered`]) comes off the same
+  /// emptiness reading, so the two cannot disagree about what this read saw. The
+  /// dedup below escapes neither — a coalesced read raises both against the
+  /// request it lands on instead of returning silently.
   ///
   /// Never at a parent that is gone, for the same reason
   /// [`install_child`](Self::install_child) installs nothing there: the row's own
   /// reclamation is the parent's death ([`reclaim_node_marker`](Self::reclaim_node_marker)),
-  /// which has already happened, so nothing would ever take it back — and inside
-  /// the registration window it carries the settlement-loss stamp that degrades
-  /// every later fence until it is discharged. A tripwire on the containment
-  /// invariant, like `install_child`'s: loud in tests, wedge-proof in release.
+  /// which has already happened, so nothing would ever take it back — and its
+  /// settlement loss would degrade every later fence of the scope forever. A
+  /// tripwire on the containment invariant, like `install_child`'s: loud in
+  /// tests, wedge-proof in release.
   fn queue_stat(&mut self, parent: WatchId, scope: ScopeId, name: Segment) {
     debug_assert!(
       self.nodes.contains_key(&parent),
@@ -3415,17 +3715,27 @@ impl Monitor {
     if !self.nodes.contains_key(&parent) {
       return;
     }
-    if self.stat_slots.contains_key(&(parent, name.clone())) {
+    // An UNOCCUPIED slot is one the asking read covered with nothing: it
+    // reconciled no watch there and booked the darkness, so until the answer
+    // lands the slot may be a directory this scope does not watch. Read before
+    // the dedup, because the emptiness is a fact about THIS read and the request
+    // it lands on may be an older read's.
+    let uncovered = self.child_watch(parent, &name).is_none();
+    if let Some(&outstanding) = self.stat_slots.get(&(parent, name.clone())) {
+      if uncovered {
+        self.raise_stat_darkness(outstanding);
+      }
       return;
     }
     let req = self.next_req_id();
     let bootstrap = self.in_bootstrap_window(scope);
-    if bootstrap {
-      // The stamp's SETTLEMENT-LOSS half, standing from here until the answer
-      // (or the parent's death) discharges it — see [`bootstrap_stats`].
+    let stands_loss = bootstrap || uncovered;
+    if stands_loss {
+      // Standing from here until the answer (or the parent's death) discharges
+      // it — see [`stat_losses`].
       //
-      // [`bootstrap_stats`]: Self::bootstrap_stats
-      self.bootstrap_stat_inc(scope);
+      // [`stat_losses`]: Self::stat_losses
+      self.stat_loss_inc(scope);
     }
     self.stat_slots.insert((parent, name.clone()), req);
     self.pending_stat.insert(
@@ -3436,10 +3746,21 @@ impl Monitor {
         scope,
         placement: self.placement_now(),
         // Stamped at QUEUE time, deliberately — see [`StatSlot::bootstrap`].
-        // The dedup above needs no upgrade rule: inside the registration window
-        // the only outstanding stat for a slot is one an earlier in-window read
-        // queued, which already carries the stamp.
+        // The dedup above needs no upgrade rule for THIS half: inside the
+        // registration window the only outstanding stat for a slot is one an
+        // earlier in-window read queued, which already carries the stamp.
         bootstrap,
+        stands_loss,
+        // The emptiness this read saw, which the loss above does not record on
+        // its own: a registration-stamped request raises the loss over a slot it
+        // watched all along, and only THIS says whether any of it was dark.
+        dark_uncovered: uncovered,
+        // Born false whatever the slot holds, and for the same reason either
+        // way: an EMPTY slot is one this read just booked darkness for and
+        // nothing has covered since, and an OCCUPIED one holds no vacancy for
+        // anything to have covered. Only a removal that stands the slot's cover
+        // raises it — see [`StatSlot::vacancy_covered`].
+        vacancy_covered: false,
       },
     );
     self.actions.push_back(Action::stat(
@@ -3472,12 +3793,13 @@ impl Monitor {
   /// degrade to a re-signalled `Rescan`, never wedge the scope's every barrier.
   /// Nothing rests on the answer ALONE — the incumbent keeps its watch and its
   /// coverage meanwhile, and the crawl that deferred stood its own `Rescan` — so
-  /// an answer that never comes costs a degraded cover rather than a wedge. For
-  /// a REGISTRATION-window request the degrade is made explicit rather than left
+  /// an answer that never comes costs a degraded cover rather than a wedge.
+  /// Where the deferring read left the slot covered by NOTHING — and for every
+  /// REGISTRATION-window request — the degrade is made explicit rather than left
   /// to the deficit re-signal, which reaches a sync cookie's dispatch and not an
   /// ordinary set-cover reply: the standing request marks the scope's
-  /// settlement lossy ([`bootstrap_stats`](Self::bootstrap_stats)) for exactly
-  /// as long as it is owed.
+  /// settlement lossy ([`stat_losses`](Self::stat_losses)) for exactly as long
+  /// as it is owed.
   fn defer_stat_descent(&mut self, parent: WatchId, name: &Segment, descent: StatDescent) {
     if !self.stat_slots.contains_key(&(parent, name.clone())) {
       return;
@@ -3658,7 +3980,7 @@ impl Monitor {
           // A cold enumerate is discovery, not a replace, so an already-watched slot
           // is reused (`replaced = false`).
           let occupant = Self::entry_occupant(entry.kind());
-          self.reconcile_slot(dir, scope, entry.name(), occupant, false, entry.node());
+          let _ = self.reconcile_slot(dir, scope, entry.name(), occupant, false, entry.node());
         }
       }
     }
@@ -3733,7 +4055,7 @@ impl Monitor {
       // fresh installs alike.
       let fresh =
         matches!(occupant, SlotOccupant::Dir) && self.child_watch(dir, entry.name()).is_none();
-      self.reconcile_slot(dir, scope, entry.name(), occupant, false, entry.node());
+      let _ = self.reconcile_slot(dir, scope, entry.name(), occupant, false, entry.node());
       if fresh {
         self.mark_bootstrap_loss(scope);
       }
@@ -4118,7 +4440,7 @@ impl Monitor {
         continue;
       }
       if self.child_watch(dir, entry.name()).is_none() {
-        self.install_child(dir, scope, entry.name().clone(), true, entry.node());
+        let _ = self.install_child(dir, scope, entry.name().clone(), true, entry.node());
         if let Some(fresh) = self.child_watch(dir, entry.name()) {
           let _ = self.inherit_rearm(fresh);
         }
@@ -4138,7 +4460,7 @@ impl Monitor {
     // stat confirms is a retained node whose binding this read cannot vouch for.
     for entry in res.entries() {
       if entry.kind().is_unknown() {
-        self.reconcile_slot(
+        let _ = self.reconcile_slot(
           dir,
           scope,
           entry.name(),
@@ -4676,7 +4998,7 @@ impl Monitor {
       return;
     }
     if self.child_watch(parent, &name).is_none() {
-      self.install_child(parent, scope, name.clone(), is_dir, identity);
+      let _ = self.install_child(parent, scope, name.clone(), is_dir, identity);
       if let Some(fresh) = self.child_watch(parent, &name) {
         let _ = self.inherit_rearm(fresh);
       }
@@ -5256,7 +5578,7 @@ impl Monitor {
     if let Some(name) = rec.name() {
       // A create is discovery, not a replace: an occupied slot is a duplicate
       // (an enumerate racing the live `Created`), so reuse it (`replaced = false`).
-      self.reconcile_slot(
+      let _ = self.reconcile_slot(
         rec.watch(),
         scope,
         name,
@@ -5274,7 +5596,7 @@ impl Monitor {
     if let Some(name) = rec.name() {
       // The slot's object is gone: drop any watch that covered it, so a later
       // create at the same name is not mistaken for a duplicate of the old object.
-      self.reconcile_slot(
+      let _ = self.reconcile_slot(
         rec.watch(),
         scope,
         name,
@@ -5377,7 +5699,10 @@ impl Monitor {
           if matches!(unpairable, (Some(_), Some(_))) {
             self.stand_counted_cover(scope);
           }
-          self.drop_subtree(src, DeficitDischarge::CoveringRescan);
+          // The object left the slot — that is what this record reports and what
+          // the `Removed` below degrades it to — so the vacancy the teardown
+          // opens is handed to whatever cover the teardown itself stood.
+          self.drop_departed_occupant(src);
         }
         let from = self.record_location(rec);
         self.resolve_lost_source(scope, from, is_dir, rec.evidence());
@@ -5571,7 +5896,7 @@ impl Monitor {
                 self.emit_rescan(scope, to);
                 // Reconcile with the class the pair PROVES — a record with an omitted
                 // flag must not demote the moved directory to an unwatched file slot.
-                self.reconcile_slot(
+                let _ = self.reconcile_slot(
                   rec.watch(),
                   scope,
                   name,
@@ -5616,7 +5941,7 @@ impl Monitor {
               self.reanchor_pending_sources(scope, from, &to);
             }
             self.rescan_dirty_pair(scope, &pending, &to);
-            self.reconcile_slot(
+            let _ = self.reconcile_slot(
               rec.watch(),
               scope,
               name,
@@ -5683,7 +6008,7 @@ impl Monitor {
               // `Rescan`, owed for the same reason past the window as within it.
               self.emit_rescan(scope, to.clone());
             }
-            self.reconcile_slot(
+            let _ = self.reconcile_slot(
               rec.watch(),
               scope,
               name,
@@ -5724,7 +6049,7 @@ impl Monitor {
           self.emit(scope, to, ChangeKind::Created, rec.evidence());
         }
         if let Some(name) = rec.name() {
-          self.reconcile_slot(
+          let _ = self.reconcile_slot(
             rec.watch(),
             scope,
             name,
@@ -5852,7 +6177,7 @@ impl Monitor {
     if let Some(node) = self.nodes.get(&child)
       && let (Some(parent), Some(name)) = (node.parent, node.name.clone())
     {
-      self.child_index.remove(&(parent, name));
+      self.vacate_child_slot(parent, name);
     }
     self.moved_placement(child);
     if matches!(
@@ -6058,9 +6383,24 @@ impl Monitor {
   /// [`Action::Stat`](crate::Action::Stat) is asked for the kind, and — where
   /// nothing already covers the slot — it is booked as a standing deficit, so the
   /// darkness re-signals at every dispatch instead of passing for a proven
-  /// non-directory. Any incumbent watch stays live meanwhile: it may be covering
+  /// non-directory, AND the request stands the scope's settlement loss
+  /// ([`StatSlot::stands_loss`]) so no fence certifies the window in between.
+  /// Any incumbent watch stays live meanwhile: it may be covering
   /// the very directory the listing failed to name. A no-op when the core does not
   /// descend (kernel-recursive: no per-directory watches to manage).
+  ///
+  /// Reports whether this reconcile HEALED the slot's booked darkness — whether
+  /// [`remove_slot_deficit`](Self::remove_slot_deficit) removed a real fine entry
+  /// for `(parent, name)`, the single act that stands the BOOKED darkness's
+  /// covering `Rescan`. Two occupants can stand it (a `Dir` that installs, a
+  /// `File`/`Gone` that empties), and a caller cannot tell which from the
+  /// occupant it passed in: a `Dir` reconcile that REUSES the incumbent — an
+  /// identity match, or an identity nobody could read — installs nothing and
+  /// heals nothing, and a book collapsed past [`DEFICIT_CAP`] holds no entry for
+  /// any of them to remove.
+  /// Most callers own no such obligation and ignore the answer; the one that does
+  /// is [`ingest_stat_result`](Self::ingest_stat_result), whose released
+  /// settlement loss owes this slot a cover wherever this reconcile stood none.
   ///
   /// [`install_child`]: Self::install_child
   fn reconcile_slot(
@@ -6071,9 +6411,9 @@ impl Monitor {
     occupant: SlotOccupant,
     replaced: bool,
     identity: Option<Identity>,
-  ) {
+  ) -> bool {
     if !self.scope_descends(scope) {
-      return;
+      return false;
     }
     match occupant {
       SlotOccupant::Dir => {
@@ -6092,10 +6432,11 @@ impl Monitor {
           inherit = self.has_rearm_obligation(stale);
           self.drop_subtree(stale, DeficitDischarge::CoveringRescan);
         }
-        self.install_child(parent, scope, name.clone(), true, identity);
+        let healed = self.install_child(parent, scope, name.clone(), true, identity);
         if inherit && let Some(fresh) = self.child_watch(parent, name) {
           let _ = self.inherit_rearm(fresh);
         }
+        healed
       }
       SlotOccupant::Unknown => {
         // Neither branch above may run on ignorance: watching would arm on every
@@ -6108,14 +6449,21 @@ impl Monitor {
         // it would signal darkness that does not exist — and the heal interlock could
         // not clear it, since re-occupying an occupied slot is a no-op. Either way the
         // stat is asked: it decides whether to install, to keep, or to drop.
+        //
+        // The hole booked here is the one deficit site with no `Rescan` behind
+        // it — this read need never have stood one — so its window's cover is
+        // the settlement loss `queue_stat` stands over the same emptiness. That
+        // half deliberately lives in the funnel: it is owed by any queue at an
+        // uncovered slot, including one this call only coalesces onto.
         if self.child_watch(parent, name).is_none() {
           self.record_slot_deficit(scope, parent, name.clone());
         }
         self.queue_stat(parent, scope, name.clone());
+        false
       }
       SlotOccupant::File | SlotOccupant::Gone => {
         if let Some(stale) = self.child_watch(parent, name) {
-          self.drop_subtree(stale, DeficitDischarge::CoveringRescan);
+          self.drop_departed_occupant(stale);
         }
         // The slot's object is gone (or a never-watched file). A recorded
         // arm-refused hole there is NOT converged by the emptying: the
@@ -6125,7 +6473,25 @@ impl Monitor {
         // the hole's darkness hid. `remove_slot_deficit` stands the covering
         // `Rescan` (both bridge bits → the settle's closing `Rescan`, which
         // bypasses interest and filter) when it removes a real entry.
-        let _ = self.remove_slot_deficit(scope, parent, name);
+        let covered = self.remove_slot_deficit(scope, parent, name);
+        // This is the one settlement whose cover is stood over a slot that stays
+        // EMPTY — `File` and `Gone` both mean no watch may stand here — so it is
+        // the one that can leave an outstanding stat looking at an emptiness
+        // somebody else has already accounted for. Say so, off the removal's own
+        // answer rather than off the occupant passed in: a collapsed book holds
+        // no entry for any occupant to turn, and stands nothing.
+        // `install_child`'s removal is the same act to the opposite end — it
+        // OCCUPIES the slot — so it says nothing here.
+        //
+        // The removal is HALF of what this settlement can stand. The teardown
+        // above is the other half, and it raises the same flag off its own answer
+        // rather than through this one: a slot whose fine entry an occupation
+        // already spent leaves the removal nothing to turn while the teardown may
+        // still have erased plenty (see [`StatSlot::vacancy_covered`]).
+        if covered {
+          self.cover_stat_vacancy(parent, name);
+        }
+        covered
       }
     }
   }
@@ -6332,8 +6698,13 @@ impl Monitor {
     // The parent-side `Removed` this pairs with is interest- and filter-subject
     // (a `Modified`-only subscription never sees it), so a deficit dying with
     // the deleted subtree carries a covering `Rescan` rather than clearing
-    // silently.
-    self.drop_subtree(rec.watch(), DeficitDischarge::CoveringRescan);
+    // silently — and the vacancy it leaves is handed to that same `Rescan`, so a
+    // stat still outstanding for the slot does not stand a second one. The
+    // record is the object's OWN deletion, which is the proof this route needs;
+    // the parent-side `Removed` reaches the same emptiness through
+    // [`reconcile_slot`](Self::reconcile_slot) and finds the watch already gone,
+    // so whichever of the two the driver delivers first owns the cover.
+    self.drop_departed_occupant(rec.watch());
   }
 
   fn on_ignored(&mut self, scope: ScopeId, rec: &OsRecord) {
@@ -6601,6 +6972,16 @@ impl Monitor {
     self.nodes.insert(id, node);
   }
 
+  /// Mints and arms the watch for `(parent, name)`, reporting whether doing so
+  /// HEALED the slot's booked darkness — whether `remove_slot_deficit` removed a
+  /// real fine entry here, which is the single act that stands the slot's
+  /// covering `Rescan`.
+  ///
+  /// The answer is the OUTCOME, not a prediction of it, which is what a caller
+  /// deciding whether it still owes that slot a cover needs: an install this call
+  /// did not perform (the slot was already occupied) and one that found no entry
+  /// to remove (a book collapsed past [`DEFICIT_CAP`]) both stand nothing, and
+  /// only running the install says which happened.
   fn install_child(
     &mut self,
     parent: WatchId,
@@ -6608,7 +6989,7 @@ impl Monitor {
     name: Segment,
     is_dir: bool,
     identity: Option<Identity>,
-  ) {
+  ) -> bool {
     // No child under a parent that is not there — a TRIPWIRE, not the mechanism.
     // Every install runs inside some directory's reconcile, and what keeps that
     // directory alive is the containment invariant (see
@@ -6627,27 +7008,36 @@ impl Monitor {
       "a child is only ever installed under a live parent"
     );
     if !self.nodes.contains_key(&parent) {
-      return;
+      return false;
     }
     // Descent is idempotent: a cold enumerate racing a live `Created` (or
     // duplicate create records) must not mint a second watch for one path, or
     // every record under it would be delivered twice. Reuse any pending-or-live
     // child watch already covering `(parent, name)`.
     if self.child_index.contains_key(&(parent, name.clone())) {
-      return;
+      return false;
     }
     // The slot-heal clear edge (the P2↔P1 interlock): occupying a recorded
     // arm-refused hole heals it, and the hole's dark interval is covered only
     // by the window's closing `Rescan` — so `remove_slot_deficit` stands both
     // bridge bits itself when it removes a real entry, order-robustly (an
     // organic pure grow reaching the hole has no `Rescan` of its own). This is
-    // the ONE funnel every slot occupation passes through: `reconcile_slot`'s
-    // `Dir` arm, `rearm_enumerate`'s direct installs, and the incomplete-read
-    // reconciles all route here. (A record-driven cold re-install lands here
-    // too and stands the bits; its `Removed`+`Created` records already
-    // converged an all-interest consumer, so the resulting closing `Rescan` is
-    // redundant-but-legal for it and honest for a filtered one.)
-    let _ = self.remove_slot_deficit(scope, parent, &name);
+    // the ONE funnel every fresh INSTALL passes through: `reconcile_slot`'s
+    // `Dir` arm, `rearm_enumerate`'s direct installs, the incomplete-read
+    // reconciles, `cover_and_rebuild_slot` and the widen's chain build all route
+    // here. (A record-driven cold re-install lands here too and stands the bits;
+    // its `Removed`+`Created` records already converged an all-interest consumer,
+    // so the resulting closing `Rescan` is redundant-but-legal for it and honest
+    // for a filtered one.)
+    //
+    // It is NOT every OCCUPATION, and nothing may read it as one: a paired
+    // `MovedTo` re-keys a held subtree straight onto its destination slot
+    // ([`reparent`](Self::reparent)), consulting no deficit and healing no hole.
+    // So a filled slot is never evidence that some site stood that slot's cover.
+    // What an outstanding stat's darkness rests on is carried on the request
+    // instead ([`StatSlot::dark_uncovered`]), and only a real heal here
+    // discharges it.
+    let healed = self.remove_slot_deficit(scope, parent, &name);
     let id = WatchId::new(self.watch_ids.mint());
     let attempt = self.next_arm_attempt();
     let placement = self.placement_now();
@@ -6678,6 +7068,52 @@ impl Monitor {
     // narrowed to the requested interest at emission, not here.
     let mask = Self::coverage_mask(self.scope_interest(scope));
     self.queue_watch(id, crate::action::WatchTarget::child(parent, name), mask);
+    healed
+  }
+
+  /// Drops the subtree occupying a slot the driving record proves the object has
+  /// LEFT — a parent-side removal, the object's own delete, an unpairable
+  /// move-out — and hands the vacancy the drop opens to the walk's own covering
+  /// `Rescan` wherever the walk stood one
+  /// ([`cover_stat_vacancy`](Self::cover_stat_vacancy)).
+  ///
+  /// The second act that can stand a cover for a slot's current vacancy, beside the
+  /// fine-entry removal in [`remove_slot_deficit`](Self::remove_slot_deficit),
+  /// and the one no caller could report for itself: what the walk erased — and so
+  /// whether the discharge emitted anything — is known only inside it. The two
+  /// part company at exactly one place, which is why both are needed: an
+  /// occupation racing the request spends the slot's fine entry, so the removal
+  /// turns nothing, while the occupant's own subtree may have booked plenty for
+  /// the walk to erase.
+  ///
+  /// Three things make the cover this hands over a cover for THIS vacancy:
+  ///
+  /// - it is located at the scope ROOT ([`drop_subtree`](Self::drop_subtree)), so
+  ///   it reaches every slot of the scope, this one included;
+  /// - the drop that stands it is the same walk that EMPTIES the slot, so the
+  ///   cover cannot predate the vacancy it is credited to; and
+  /// - the record that drove the drop proves the object is gone from the slot, so
+  ///   the vacancy carries no darkness continuing PAST the cover — which is what
+  ///   separates this from the drops that merely disarm a binding
+  ///   (an arm refusal, a retired adoption). Those leave an object that may still
+  ///   be there, unwatched: their darkness outlives whatever they emitted, and
+  ///   they book it ([`record_slot_deficit`](Self::record_slot_deficit)) or
+  ///   rebuild the slot instead of coming here.
+  ///
+  /// The slot is captured BEFORE the walk erases the links that name it, and only
+  /// where the index still points at this very node: a node already detached from
+  /// its slot (a held move source, whose name a replacement may since have taken)
+  /// empties nothing here and so speaks for no vacancy.
+  fn drop_departed_occupant(&mut self, occupant: WatchId) {
+    let vacated = self
+      .nodes
+      .get(&occupant)
+      .and_then(|node| node.parent.zip(node.name.clone()))
+      .filter(|(parent, name)| self.child_index.get(&(*parent, name.clone())) == Some(&occupant));
+    let stood = self.drop_subtree(occupant, DeficitDischarge::CoveringRescan);
+    if stood && let Some((parent, name)) = vacated {
+      self.cover_stat_vacancy(parent, &name);
+    }
   }
 
   /// Drops the watch subtree rooted at `root`, queuing an
@@ -6708,7 +7144,24 @@ impl Monitor {
   /// containment invariant rather than an assumption, and it is what makes this
   /// ONE walk: this destroys `subtree(root)` and nothing else, which is what every
   /// caller's continuation is written on.
-  fn drop_subtree(&mut self, root: WatchId, discharge: DeficitDischarge) {
+  ///
+  /// Reports whether the DISCHARGE stood the scope's covering `Rescan` — the
+  /// OUTCOME of the match below, never the reason passed in: a walk that erased
+  /// nothing stands nothing (A2), a re-anchor BOOKS the loss rather than covering
+  /// it, and a teardown or an unsubscribed prune covers nothing by construction.
+  /// Where one IS stood it is the window's closing `Rescan`, located at the scope
+  /// ROOT and so reaching every slot of the scope — which is what lets
+  /// [`drop_departed_occupant`](Self::drop_departed_occupant) hand the vacancy
+  /// this walk opens to it. Most callers own no such obligation and ignore the
+  /// answer.
+  ///
+  /// The counted debt's [`stand_counted_cover`] is a root `Rescan` too and is
+  /// deliberately NOT reported: it answers for an object that survives somewhere
+  /// unnameable rather than for anything this walk did to a slot, and a walk can
+  /// owe it having emptied nothing at all.
+  ///
+  /// [`stand_counted_cover`]: Self::stand_counted_cover
+  fn drop_subtree(&mut self, root: WatchId, discharge: DeficitDischarge) -> bool {
     // The dropped subtree's scope, and — for a re-anchor — the dropped
     // child's surviving-parent slot: both captured BEFORE the walk erases
     // them. Every node in a subtree shares the root's scope (scopes are
@@ -6764,7 +7217,7 @@ impl Monitor {
         if let (Some(parent), Some(name)) = (node.parent, node.name.clone())
           && self.child_index.get(&(parent, name.clone())) == Some(&id)
         {
-          self.child_index.remove(&(parent, name));
+          self.vacate_child_slot(parent, name);
         }
       }
       // Reclaim every per-node marker through the one funnel, and fold each
@@ -6787,6 +7240,12 @@ impl Monitor {
     // Discharge the erased darkness per the named reason. A drop that erased
     // nothing owes nothing, so a clean prune/regrow of deficit-free coverage
     // stays silent (A2).
+    //
+    // What the discharge actually STOOD is folded up as it goes, so the answer
+    // is the outcome rather than a re-reading of the reason: only two of the
+    // four discharges can emit anything at all, and either of them can be the
+    // silent one.
+    let mut stood = false;
     if erased.discharge {
       match discharge {
         // A structural record a filtered subscription would not see cannot
@@ -6797,6 +7256,13 @@ impl Monitor {
           if let Some(scope) = root_scope {
             self.bridge_saw_rescan(scope);
             self.bridge_fresh_rearm(scope);
+            // Both bits on a descending scope ARE the closing `Rescan`:
+            // [`settle_bridges`](Self::settle_bridges) emits it at the window's
+            // first settle edge, and until that edge `rearm_settled` — and so
+            // `coverage_settled` — reads false, so no fence can pass the window
+            // the emission covers. A kernel-recursive scope takes neither bit
+            // and stands nothing here.
+            stood = self.scope_descends(scope);
           }
         }
         // Re-anchor the loss at the surviving parent slot; the crawl's own
@@ -6826,8 +7292,17 @@ impl Monitor {
       )
       && let Some(scope) = root_scope
     {
+      // Deliberately NOT folded into `stood`. This cover is stood on a claim
+      // about an OBJECT — it provably survives at a location this call cannot
+      // name — and a walk can owe it having vacated no slot at all (a held source
+      // detached long ago, a descent owed to a watch that had already left).
+      // Reading a root `Rescan` stood for somebody's whereabouts as the
+      // settlement of THIS slot's emptiness is the inference the answer is not
+      // entitled to make; the discharge above is, because erased deficits and the
+      // slot's own fine entry are the same darkness in the same book.
       self.stand_counted_cover(scope);
     }
+    stood
   }
 
   /// Reclaims one [`NodeMarker`] for the dying node `id`, reporting what
@@ -6858,27 +7333,67 @@ impl Monitor {
       }
       // A dropped directory's outstanding slot stats can never be settled
       // against it — the slots died with it — so their requests are reclaimed
-      // exactly as an outstanding enumerate is. Nothing is owed here either:
-      // the darkness such a slot stands for is booked as a DEFICIT, which the
-      // `Deficits` marker erases and discharges per the caller's reason.
+      // exactly as an outstanding enumerate is. What the reclamation OWES is
+      // where the two part company: this one RELEASES the scope's settlement
+      // loss, and a release owes a replacement.
       NodeMarker::StatSlots => {
-        // The registration-window stamp's settlement-loss half dies with the
-        // request it was standing for: the slot is gone, so no answer can ever
-        // arrive to release it, and leaving it standing would degrade every
-        // later fence of the scope forever. Counted from the reclaimed rows
-        // rather than assumed, since only some of them carry the stamp; each
-        // one's scope is its parent's (the invariant checker pins it).
-        let mut stamped = 0usize;
+        // The darkness the released rows were standing for, folded up BEFORE
+        // they go — the release-side twin of the transfer the answer owes.
+        //
+        // The loss is the whole of what a fence had to go on while the slot may
+        // have been an unwatched directory, so ending it hands that interval to
+        // whatever is stood in its place. The `Deficits` marker below is not
+        // reliably that: this parent may have booked no fine entry for the slot
+        // (a book collapsed past [`DEFICIT_CAP`] records none), and a dispatch
+        // re-signal may already have spent the entry it did book — either way
+        // that marker erases nothing and the walk would stand nothing at all.
+        //
+        // Asked through the same predicate the answer asks
+        // ([`stat_slot_dark`](Self::stat_slot_dark)), and asked HERE because
+        // this is where the row can still be read. The slot's occupancy is still
+        // the pre-walk truth at this line: this node's children are on the
+        // walk's stack and vacate their slots only as they are popped, which is
+        // after every marker of THIS node is reclaimed.
+        //
+        // Gated on the row STANDING the loss, exactly as the answer's transfer
+        // is: a request that degraded no fence ends no obligation, and an
+        // incumbent that left the slot under it is the departing drop's business
+        // rather than this row's.
+        let dark = self
+          .pending_stat
+          .values()
+          .filter(|slot| slot.parent == id && slot.stands_loss)
+          .any(|slot| self.stat_slot_dark(slot));
+        // A settlement loss dies with the request it was standing for: the slot
+        // is gone, so no answer can ever arrive to release it, and leaving it
+        // standing would degrade every later fence of the scope forever. Counted
+        // from the reclaimed rows rather than assumed, since only some of them
+        // stand one; each one's scope is its parent's (the invariant checker
+        // pins it).
+        let mut standing = 0usize;
         self.pending_stat.retain(|_, slot| {
           if slot.parent != id {
             return true;
           }
-          stamped += usize::from(slot.bootstrap);
+          standing += usize::from(slot.stands_loss);
           false
         });
-        self.bootstrap_stat_dec(node.scope, stamped);
+        self.stat_loss_dec(node.scope, standing);
         self.stat_slots.retain(|(parent, _), _| *parent != id);
-        ErasedCover::Nothing
+        // Reported as an ERASURE, never placed here: the walk's own
+        // [`DeficitDischarge`] decides what an erased cover is worth, and it is
+        // the only side that knows. A record- or move-driven drop turns this
+        // into the window's closing `Rescan`; a crawl rebuild re-anchors it as a
+        // slot hole at the surviving parent, at the same coarser coordinate the
+        // erased deficits themselves land on; a terminal teardown and a
+        // proven-unsubscribed prune stand nothing, and standing something there
+        // would be meaningless — the scope is going away, or the coverage is
+        // outside every committed subscription, so no barrier is left to hand it
+        // to.
+        match dark {
+          true => ErasedCover::Discharge,
+          false => ErasedCover::Nothing,
+        }
       }
       // A dropped watch is no longer a held move source. The hold itself owes
       // nothing: what a hold can accrue is the suppressed-activity debt below,
@@ -7124,29 +7639,158 @@ impl Monitor {
     }
   }
 
-  /// Counts one stamped registration-window stat of `scope` queued.
+  /// Counts one loss-standing stat of `scope` queued.
   ///
   /// Deliberately NOT [`acquired_coverage_work`](Self::acquired_coverage_work):
   /// the stat is uncounted, so it acquires no coverage work, and bumping the
   /// epoch here would retire every ordering proof a settled window is holding
   /// for a request that adds nothing for a proof to order.
-  fn bootstrap_stat_inc(&mut self, scope: ScopeId) {
-    *self.bootstrap_stats.entry(scope).or_insert(0) += 1;
+  fn stat_loss_inc(&mut self, scope: ScopeId) {
+    *self.stat_losses.entry(scope).or_insert(0) += 1;
   }
 
-  /// Releases `by` of `scope`'s stamped registration-window stats, dropping the
-  /// entry at zero so a scope with none holds no residue. A zero release is a
-  /// no-op, which is what lets the teardown edge call it unconditionally with
-  /// whatever it reclaimed.
-  fn bootstrap_stat_dec(&mut self, scope: ScopeId, by: usize) {
+  /// Releases `by` of `scope`'s loss-standing stats, dropping the entry at zero
+  /// so a scope with none holds no residue. A zero release is a no-op, which is
+  /// what lets the teardown edge call it unconditionally with whatever it
+  /// reclaimed.
+  fn stat_loss_dec(&mut self, scope: ScopeId, by: usize) {
     if by == 0 {
       return;
     }
-    if let Some(count) = self.bootstrap_stats.get_mut(&scope) {
+    if let Some(count) = self.stat_losses.get_mut(&scope) {
       *count -= by;
       if *count == 0 {
-        self.bootstrap_stats.remove(&scope);
+        self.stat_losses.remove(&scope);
       }
+    }
+  }
+
+  /// Whether `slot`'s request spans an interval the slot spent DARK — holding no
+  /// watch, so a directory standing there was covered by nothing.
+  ///
+  /// THE question a released settlement loss owes its replacement for, and it
+  /// lives in ONE place because both releases must answer it the same way: the
+  /// answer's arrival ([`ingest_stat_result`](Self::ingest_stat_result)) and the
+  /// parent's death ([`NodeMarker::StatSlots`]) end the same obligation over the
+  /// same interval, and a window one of them called dark while the other called
+  /// it covered is a release that hands the darkness to nobody.
+  ///
+  /// It takes two terms because no single reading carries it.
+  ///
+  /// The LIVE term says the slot holds no watch at this instant, which is reason
+  /// enough to cover. What it does NOT say is that a slot reading OCCUPIED was
+  /// never dark: a `Created`, a move-in, or a later enumerate can have filled
+  /// the slot under the outstanding request, and the fill covers the interval
+  /// before it only where it HEALED a booked hole — a book collapsed past
+  /// [`DEFICIT_CAP`] leaves it nothing to heal and it stands nothing at all.
+  /// Read as proof of an unbroken cover, the fill would erase exactly the
+  /// history the loss was standing for.
+  ///
+  /// So that history is CARRIED on the request instead
+  /// ([`StatSlot::dark_uncovered`]): raised by the read that found the slot
+  /// empty, cleared only by a cover actually stood. The live term stays for the
+  /// darkness no read ever observed — an incumbent dropped under the request
+  /// with nothing re-listing the name — where the carried fact has nothing to
+  /// say and the slot is plainly dark now.
+  ///
+  /// …and that live term is asked of the CURRENT VACANCY, not of emptiness as
+  /// such ([`StatSlot::vacancy_covered`]). An emptiness a `File`/`Gone`
+  /// reconcile has already handed to a covering `Rescan` stays empty afterwards
+  /// — that is what those occupants mean — so "empty here" would resurrect a
+  /// cover that already stood and charge the scope a second epoch and a second
+  /// enumeration for it. What is asked instead is whether THIS vacancy is still
+  /// uncovered: raised by the drop that opens one, cleared by the removal that
+  /// covers one, and neither by the slot merely reading empty.
+  ///
+  /// Darkness ALONE, deliberately: whether the request also STANDS the scope's
+  /// settlement loss ([`StatSlot::stands_loss`]) is the caller's separate
+  /// conjunct at both releases. A request standing none degraded no fence, so it
+  /// ended no obligation and owes no replacement — the departure it may have
+  /// witnessed belongs to whatever performed it.
+  fn stat_slot_dark(&self, slot: &StatSlot) -> bool {
+    slot.dark_uncovered
+      || (self.child_watch(slot.parent, &slot.name).is_none() && !slot.vacancy_covered)
+  }
+
+  /// Raises everything an EMPTY-slot read owes against an ALREADY-OUTSTANDING
+  /// request — the dedup half of [`queue_stat`](Self::queue_stat)'s emptiness
+  /// rule, and BOTH of the halves that rule stands.
+  ///
+  /// A stat is coalesced across every read that re-encounters the name, so what
+  /// the answer discharges must be the strongest any of them carried. A slot
+  /// occupied when the first read asked can be emptied under the standing
+  /// request (its incumbent removed, or replaced by a non-directory), and the
+  /// next read to list the name unclassifiable then books darkness over a slot
+  /// this scope covers with nothing. Returning silently there would leave that
+  /// read's hole with no loss standing at all.
+  ///
+  /// The DARKNESS ([`StatSlot::dark_uncovered`]) is raised AHEAD of the loss's
+  /// own idempotence, because the two are not raised by the same populations: a
+  /// registration-stamped request already stands the loss over a slot it watched
+  /// all along, and short-circuiting on that would let the emptiness this read is
+  /// reporting reach the answer as though the slot had never been dark. The loss
+  /// half stays idempotent below, so the common case — a re-list of a slot whose
+  /// request already stands both — adds nothing and the counter keeps mirroring
+  /// the map.
+  fn raise_stat_darkness(&mut self, req: ReqId) {
+    let Some(slot) = self.pending_stat.get_mut(&req) else {
+      return;
+    };
+    slot.dark_uncovered = true;
+    if slot.stands_loss {
+      return;
+    }
+    slot.stands_loss = true;
+    let scope = slot.scope;
+    self.stat_loss_inc(scope);
+  }
+
+  /// Tells any stat outstanding for `(parent, name)` that the vacancy the slot
+  /// holds has just been handed a cover
+  /// ([`StatSlot::vacancy_covered`]) — so its answer, which will find the slot
+  /// still empty, does not stand a second one over the same interval.
+  ///
+  /// Called from the settlement whose cover is stood over a slot that stays
+  /// empty, by each of the two acts within it that can stand one — the departing
+  /// occupant's teardown ([`drop_departed_occupant`](Self::drop_departed_occupant))
+  /// and the fine entry's removal
+  /// ([`remove_slot_deficit`](Self::remove_slot_deficit)) — and bound in both
+  /// cases to that act's OWN answer: a walk that erased nothing and a collapsed
+  /// book that held nothing each stand nothing, and a stat still looking at an
+  /// uncovered emptiness must not be told otherwise. Raising is idempotent, so a
+  /// settlement in which both acts fire says the same thing twice.
+  fn cover_stat_vacancy(&mut self, parent: WatchId, name: &Segment) {
+    if let Some(&req) = self.stat_slots.get(&(parent, name.clone()))
+      && let Some(slot) = self.pending_stat.get_mut(&req)
+    {
+      slot.vacancy_covered = true;
+    }
+  }
+
+  /// Empties the slot `(parent, name)` in [`child_index`](Self::child_index),
+  /// and tells any stat outstanding for it that the vacancy it is now looking at
+  /// is a NEW one ([`StatSlot::vacancy_covered`]): whatever covered the last one
+  /// covered an interval that ended when something occupied this slot.
+  ///
+  /// The ONE funnel every occupied-to-empty transition passes through — the
+  /// detach of a move source ([`detach_child`](Self::detach_child)) and the drop
+  /// walk's slot clear ([`drop_subtree`](Self::drop_subtree)) are the only two
+  /// removals there are — which is what makes the flag readable as a fact about
+  /// the CURRENT vacancy. A removal added outside it would leave a stale cover
+  /// standing over a fresh darkness, which costs a MISSED cover; there is no
+  /// counter to catch that, so the funnel is the guarantee.
+  ///
+  /// Clears on the removal's own answer: a call that took nothing out opened no
+  /// vacancy — the slot already held none, or held a replacement this removal is
+  /// not entitled to orphan — and discharges nothing.
+  fn vacate_child_slot(&mut self, parent: WatchId, name: Segment) {
+    if self.child_index.remove(&(parent, name.clone())).is_none() {
+      return;
+    }
+    if let Some(&req) = self.stat_slots.get(&(parent, name))
+      && let Some(slot) = self.pending_stat.get_mut(&req)
+    {
+      slot.vacancy_covered = false;
     }
   }
 
@@ -7354,12 +7998,34 @@ impl Monitor {
   }
 
   /// Records a slot hole `(parent, name)` in `scope`'s deficit book (see
-  /// [`DeficitBook::slots`]): an arm-refused install, or an organically
-  /// erased deficit re-anchored by
-  /// [`drop_subtree_for_crawl_rebuild`](Self::drop_subtree_for_crawl_rebuild).
-  /// The hole's edge `Rescan` already stands (emitted at the arm failure,
-  /// or when the re-anchored deficit was originally recorded); this carries
-  /// the level-persistent fact past it.
+  /// [`DeficitBook::slots`]). A `Rescan` covers only changes up to itself while
+  /// the slot stays dark on disk, so this carries the level-persistent fact past
+  /// whatever the edge stood.
+  ///
+  /// The entry is a standing COORDINATE, never a claim that a `Rescan` already
+  /// stands for it — its four callers do not agree about that, and one of them
+  /// stands none:
+  ///
+  /// - an **arm-refused install** ([`ingest_watch_result`]) emits the hole's
+  ///   `Rescan` immediately before booking;
+  /// - an **unresolvable stat answer** ([`ingest_stat_result`]) emits it
+  ///   immediately after — or, under a hold whose slot reconstructs to the
+  ///   vacated pre-move path, leaves it to the pairing its fence dirtied;
+  /// - a **re-anchored deficit**
+  ///   ([`drop_subtree_for_crawl_rebuild`](Self::drop_subtree_for_crawl_rebuild))
+  ///   carries the `Rescan` that stood when the erased entry was originally
+  ///   recorded;
+  /// - an **empty-slot `Unknown` reconcile** ([`reconcile_slot`]) stands NO
+  ///   `Rescan` — the read that reached it may have stood none of its own (a
+  ///   pure grow, or a record-driven cold read). Its window is covered instead
+  ///   by the settlement loss [`queue_stat`](Self::queue_stat) stands for the
+  ///   request that decides the slot ([`stat_losses`](Self::stat_losses)), for
+  ///   exactly as long as the answer is owed — and the answer that ends it hands
+  ///   that loss to a covering `Rescan` of its own wherever the settlement finds
+  ///   no entry to heal (see [`ingest_stat_result`]). Which is NOT only where
+  ///   this call recorded none: the entry it does record is spent by any
+  ///   dispatch re-signal ([`resignal_deficits`](Self::resignal_deficits)) that
+  ///   reaches the slot first, and the loss outlives it.
   ///
   /// Never beneath a parent that is gone. A hole is a COORDINATE, and the
   /// re-signal reconstructs it from the parent's own location: with the parent
@@ -7372,6 +8038,10 @@ impl Monitor {
   /// [`install_child`](Self::install_child)'s: every caller books against a
   /// coordinate it holds live, and the one act that could have invalidated one
   /// mid-continuation is refused at its source.
+  ///
+  /// [`ingest_watch_result`]: Self::ingest_watch_result
+  /// [`ingest_stat_result`]: Self::ingest_stat_result
+  /// [`reconcile_slot`]: Self::reconcile_slot
   fn record_slot_deficit(&mut self, scope: ScopeId, parent: WatchId, name: Segment) {
     if !self.scope_descends(scope) {
       return;
@@ -7427,6 +8097,30 @@ impl Monitor {
     }
   }
 
+  /// Whether `scope`'s book carries a FINE entry for the slot `(parent, name)` —
+  /// the darkness whose removal stands the covering `Rescan`
+  /// ([`remove_slot_deficit`](Self::remove_slot_deficit)).
+  ///
+  /// A COLLAPSED book answers `false`: the collapse records the scope's darkness
+  /// at ROOT granularity and keeps no entry for any settlement to heal, so this
+  /// is a strictly narrower question than
+  /// [`has_coverage_deficit`](Self::has_coverage_deficit).
+  ///
+  /// An OBSERVATION, deliberately available to white-box cells and to nothing
+  /// else. A standing entry says the darkness was recorded, never that anything
+  /// has covered it, so no site may decide what it owes the slot by reading one:
+  /// what discharges an obligation is a cover observed being STOOD
+  /// (`remove_slot_deficit`'s own answer, which the settlement paths return),
+  /// and the two part company at every occupation that heals nothing.
+  #[cfg(test)]
+  fn slot_deficit_booked(&self, scope: ScopeId, parent: WatchId, name: &Segment) -> bool {
+    self
+      .deficits
+      .get(&scope)
+      .and_then(|book| book.slots.get(&parent))
+      .is_some_and(|names| names.contains(name))
+  }
+
   /// Removes a recorded slot hole, reporting whether one was recorded. When it
   /// removes a REAL entry it stands the covering `Rescan` (both bridge bits →
   /// the window's closing `Rescan`): the hole's darkness ends here — an
@@ -7437,6 +8131,24 @@ impl Monitor {
   /// sees), so ONLY a covering `Rescan` (which bypasses interest AND filter)
   /// can honestly discharge it. A no-op removal (no such entry) sets nothing,
   /// so a clean occupation of a deficit-free slot stays silent (A2).
+  ///
+  /// A real removal is also the DISCHARGE for any outstanding stat's claim on
+  /// the same slot ([`StatSlot::dark_uncovered`]): the cover stood here is the
+  /// one that claim was waiting for, so the answer must not stand a second.
+  /// Bound to the same `removed` flag as the bridge bits, which is what keeps
+  /// the two from drifting — an occupation that healed NOTHING (a book collapsed
+  /// past [`DEFICIT_CAP`] holds no entry to heal) stands no cover here and
+  /// discharges no claim, leaving the answer owing the transfer.
+  ///
+  /// The claim's other half — whether the cover this stood was stood over a slot
+  /// left EMPTY ([`StatSlot::vacancy_covered`]) — is decided by the CALLER, which
+  /// is the only side that knows: the same removal empties the slot from
+  /// [`reconcile_slot`](Self::reconcile_slot)'s `File`/`Gone` arm and occupies it
+  /// from [`install_child`](Self::install_child). And this is not the only act
+  /// that can raise that half — the emptying's own teardown
+  /// ([`drop_departed_occupant`](Self::drop_departed_occupant)) stands a cover
+  /// this book knows nothing about, which is why the half is a suppressor with no
+  /// mirrored obligation rather than a mirror of `removed`.
   fn remove_slot_deficit(&mut self, scope: ScopeId, parent: WatchId, name: &Segment) -> bool {
     let Some(book) = self.deficits.get_mut(&scope) else {
       return false;
@@ -7452,6 +8164,13 @@ impl Monitor {
     if removed {
       self.bridge_saw_rescan(scope);
       self.bridge_fresh_rearm(scope);
+      // The same act, told to the request that is waiting to hear it: this slot's
+      // darkness has been handed to a cover, so the answer owes no second one.
+      if let Some(&req) = self.stat_slots.get(&(parent, name.clone()))
+        && let Some(slot) = self.pending_stat.get_mut(&req)
+      {
+        slot.dark_uncovered = false;
+      }
     }
     removed
   }
@@ -7906,19 +8625,38 @@ impl Monitor {
         "an outstanding stat belongs to its parent's scope"
       );
     }
-    // The registration-window loss counter mirrors the STAMPED outstanding stats
+    // The settlement-loss counter mirrors the loss-standing outstanding stats
     // exactly. A counter that over-read would degrade every later fence of the
     // scope for the rest of its life; one that under-read would certify the very
     // window this signal exists to refuse — so it is pinned to the map rather
     // than trusted to its three edges.
-    let mut stamped: BTreeMap<ScopeId, usize> = BTreeMap::new();
-    for slot in self.pending_stat.values().filter(|slot| slot.bootstrap) {
-      *stamped.entry(slot.scope).or_insert(0) += 1;
+    let mut standing: BTreeMap<ScopeId, usize> = BTreeMap::new();
+    for slot in self.pending_stat.values().filter(|slot| slot.stands_loss) {
+      *standing.entry(slot.scope).or_insert(0) += 1;
     }
     assert_eq!(
-      stamped, self.bootstrap_stats,
-      "the registration-window stat counter mirrors the stamped requests exactly"
+      standing, self.stat_losses,
+      "the stat settlement-loss counter mirrors the loss-standing requests exactly"
     );
+    // …and the REGISTRATION half of the predicate is never lost inside the
+    // union: a stamped request stands the loss whatever its slot held. Pinned
+    // separately because the mirror above is satisfied by ANY consistent pair of
+    // maps, including one where the stamp had quietly stopped raising it.
+    for slot in self.pending_stat.values() {
+      assert!(
+        !slot.bootstrap || slot.stands_loss,
+        "a registration-stamped stat always stands its scope's settlement loss"
+      );
+      // …and so does a request carrying an uncovered dark interval, which is the
+      // union's other member: the transfer that hands that interval a cover is
+      // the RELEASED LOSS's replacement, so a request owing one without standing
+      // a loss would be emitting a cover for a window no fence was ever degraded
+      // over.
+      assert!(
+        !slot.dark_uncovered || slot.stands_loss,
+        "a stat carrying uncovered darkness always stands its scope's settlement loss"
+      );
+    }
     // Every booked descent names a LIVE watch — the drop walk is the funnel
     // that discharges one whose owner dies, so a key with no node would be an
     // obligation nothing can ever perform and nothing ever covered.

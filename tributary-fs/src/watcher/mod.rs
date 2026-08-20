@@ -283,7 +283,8 @@ pub enum CoverOutcome {
   Applied,
   /// The reconcile settled, but coverage loss was signaled since the root's
   /// last settled window (a failed re-arm, an unreadable re-arm read, an
-  /// overflow, or the root tearing down mid-fence) — the loss memory is
+  /// overflow, an unclassifiable directory entry the root does not yet cover,
+  /// or the root tearing down mid-fence) — the loss memory is
   /// per-root, so a loss landing just BEFORE the reconcile degrades it too:
   /// coverage may be partial, and the covering
   /// [`Rescan`](crate::EventKind::Rescan) — already delivered in-band —
@@ -1660,7 +1661,8 @@ impl<R> Watcher<R> {
   ///   writing immediately on the resolved ack races nothing.
   /// - [`Degraded`](CoverOutcome::Degraded): the reconcile settled, but coverage loss was
   ///   signaled since the root's last settled window (a failed re-arm, an unreadable re-arm
-  ///   read, an overflow, a teardown racing the fence): coverage may be partial, and the
+  ///   read, an overflow, an unclassifiable directory entry the root does not yet cover, a
+  ///   teardown racing the fence): coverage may be partial, and the
   ///   covering [`Rescan`](crate::EventKind::Rescan) — already delivered in-band — dominates
   ///   the gap. The loss memory is per-root, not per-fence: a loss that landed BEFORE this
   ///   reconcile (with no reconcile in flight) both degrades this acknowledgement and drops
