@@ -325,6 +325,29 @@ pub enum WatchError {
   /// nothing — are still admitted. A caller that needs filtering again builds a new watcher.
   #[error("the watcher's filter plane is retired; this watch could only be created unfiltered")]
   FilterRetired,
+  /// The watcher's **source plane is retired**: it will never ask its [`Source`](crate::Source)
+  /// to reclaim anything again, so it refuses to acquire anything new from it — this watch
+  /// would arm a source watch nothing is ever going to release.
+  ///
+  /// A `Source` call this watcher made unwound, and the payload that panic carried could not be
+  /// disposed of either — its own destructor panicked, so the only containment left was to leak
+  /// it. Leaking is bounded because the plane latches here: the watcher stops issuing the
+  /// fire-and-forget reclamations ([`disarm`](crate::Source::disarm),
+  /// [`set_cover`](crate::Source::set_cover), [`end_sync`](crate::Source::end_sync),
+  /// [`cancel_sync`](crate::Source::cancel_sync)) that were the repeatable way to reach that
+  /// leak. Refusing new ACQUISITION is the other half of the same bound, and it is not
+  /// optional: a plane that reclaims nothing and still armed a fresh root on every watch would
+  /// have traded a bounded heap leak for an unbounded one in kernel watch budget, which a
+  /// caller drives at will.
+  ///
+  /// **NOT retryable on this watcher** — the condition never clears — and nothing already
+  /// established is lost to it: every live subscription stays live, covered and delivering, and
+  /// [`unwatch`](crate::Tributaries::unwatch) still retires one. Only GROWTH is refused. Unlike
+  /// [`FilterRetired`](Self::FilterRetired) this reaches every watch, filtered or not, because
+  /// what it protects is the resource the watch would ACQUIRE rather than the predicate it
+  /// would run. A caller that needs another subscription builds a new watcher.
+  #[error("the watcher's source plane is retired; no new watch can be established on it")]
+  SourceRetired,
 }
 
 impl WatchError {
@@ -398,6 +421,13 @@ impl WatchError {
     matches!(self, Self::FilterRetired)
   }
 
+  /// Whether this is [`SourceRetired`](Self::SourceRetired) — the watcher will never ask its
+  /// source to reclaim anything again, so it refuses to acquire anything new from it.
+  #[inline]
+  pub const fn is_source_retired(&self) -> bool {
+    matches!(self, Self::SourceRetired)
+  }
+
   /// The classified fault this error carries, for the two fault-carrying variants
   /// ([`Canonicalize`](Self::Canonicalize) and [`Source`](Self::Source)).
   #[inline]
@@ -409,7 +439,8 @@ impl WatchError {
       | Self::RescanBacklog
       | Self::Closed
       | Self::CoverageIncomplete
-      | Self::FilterRetired => None,
+      | Self::FilterRetired
+      | Self::SourceRetired => None,
     }
   }
 
@@ -514,6 +545,24 @@ pub enum SyncError {
            many barriers are outstanding)"
   )]
   Busy,
+  /// The watcher's **source plane is retired**, so no new barrier can be started on it: the
+  /// cookie this sync would write is one the watcher will never ask the source to reap.
+  ///
+  /// The same latch [`WatchError::SourceRetired`] reports, reached through the other thing a
+  /// caller can ask a watcher to acquire. A `Source` call unwound with a payload whose own
+  /// destructor unwound too, so the payload had to be leaked; the watcher answers that by
+  /// issuing no further [`end_sync`](crate::Source::end_sync) or
+  /// [`cancel_sync`](crate::Source::cancel_sync), and a barrier admitted past that point would
+  /// be a marker file written under the caller's tree with nothing left that ever unlinks it —
+  /// one more per sync, for as long as the caller keeps asking.
+  ///
+  /// **NOT retryable**, and distinct from the two refusals that are: [`Busy`](Self::Busy)
+  /// clears as soon as the outstanding barriers resolve, and [`Retired`](Self::Retired) is
+  /// about one SUBSCRIPTION going away under one pending barrier. This one is the whole
+  /// watcher, permanently. Refused BEFORE any cookie is written, so a refusal leaves no marker
+  /// behind, and barriers already in flight resolve on their own terms.
+  #[error("the watcher's source plane is retired; no new sync barrier can be established on it")]
+  SourceRetired,
   /// The watcher is closed.
   #[error("the watcher is closed")]
   Closed,
@@ -560,6 +609,14 @@ impl SyncError {
   #[inline]
   pub const fn is_busy(&self) -> bool {
     matches!(self, Self::Busy)
+  }
+
+  /// Whether this is [`SourceRetired`](Self::SourceRetired) — the permanent refusal to start a
+  /// barrier the watcher will never ask the source to reap, distinct from the retryable
+  /// [`Busy`](Self::Busy).
+  #[inline]
+  pub const fn is_source_retired(&self) -> bool {
+    matches!(self, Self::SourceRetired)
   }
 
   /// Whether this is [`Closed`](Self::Closed).

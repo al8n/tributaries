@@ -7127,6 +7127,34 @@ impl Monitor {
   /// fire ONLY when the walk erased a real entry, so a deficit-free drop
   /// stays silent (the A2 overreach guard).
   ///
+  /// # What the deficit-free-drop guard does NOT cover, and why that is the ruling
+  ///
+  /// One sequence slips between the guard and every act that would otherwise
+  /// stand for it. A slot's incumbent is dropped here having erased no
+  /// deficit, so this stays silent; the scope's [`DeficitBook`] is COLLAPSED
+  /// past [`DEFICIT_CAP`], so nothing fine is booked in its place; no read
+  /// lists the name while the slot is empty, so nothing observes the
+  /// emptiness; and the slot is then re-occupied cold — by
+  /// [`install_child`](Self::install_child), which finds no deficit to remove,
+  /// or by [`reparent`](Self::reparent), which consults none. The interval the
+  /// slot stood dark is therefore stood for by nothing slot-shaped.
+  ///
+  /// **Under a collapsed book that interval is covered by the scope-level
+  /// marker and the dispatch re-signal alone**, and that is where the
+  /// collapsed-book regime's cover for it ends. The trade is the collapse's
+  /// whole purpose: past the cap the scope keeps ONE whole-scope marker plus
+  /// one root re-arm kick instead of one `Rescan` per hole
+  /// ([`resignal_coverage_deficits`](Self::resignal_coverage_deficits)), and
+  /// raising darkness here to close the gap would override this guard for
+  /// EVERY deficit-free drop — not only the ones that go on to be silently
+  /// re-occupied — which is precisely the per-hole bookkeeping the collapse
+  /// exists to stop paying.
+  ///
+  /// So this is a documented boundary rather than an unfound hole: a reader
+  /// arriving at the guard meets what it undertakes and what it does not.
+  /// Nothing here is load-bearing for an UNcollapsed book, where the slot's
+  /// own fine entry is what the drop erases or leaves standing.
+  ///
   /// Some markers are discharged separately and on their own condition: they
   /// are not deficit anchors, so a subtree that booked no deficit still owes
   /// them, and their objects provably survive (see
