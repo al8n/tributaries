@@ -73,6 +73,19 @@ fn covers(event: &Event, path: &Path) -> bool {
   event.is_rescan() && path.starts_with(event.path())
 }
 
+/// An event NAMES a path when it reports that object itself and is not a `Rescan` — a real
+/// delivery under a live watch.
+///
+/// The strictness is the point, and it is what every post-grow probe below asserts on. A grow
+/// that re-covers ground which was DARK now stands a covering `Rescan` at the scope ROOT, and
+/// such a `Rescan` satisfies [`covers`] for EVERY path under the root — including a probe
+/// written after the grow. A probe assertion phrased in terms of [`covers`] would therefore be
+/// answered by the grow's own cover and would prove nothing about the watch that was supposed
+/// to deliver it, which is exactly the claim those probes exist to make.
+fn names(event: &Event, path: &Path) -> bool {
+  !event.is_rescan() && event.path() == path
+}
+
 /// The `(device, inode)` identities of `paths` (each must exist), with the device in the
 /// KERNEL encoding fdinfo prints: `sdev:` carries the superblock's `s_dev` — `MKDEV`, i.e.
 /// `major << 20 | minor` — while `stat`'s `st_dev` is glibc-encoded, so the two only happen
@@ -335,7 +348,10 @@ async fn set_cover_prunes_outside_subtree_then_grows_it_back() {
   let drop_regrown = root.join("drop/deep/regrown.txt");
   std::fs::write(&drop_regrown, b"w").unwrap();
   assert!(
-    wait_for(&mut w, |e| covers(e, &drop_regrown))
+    // By NAME: this grow re-covers dark ground that HOLDS content (`before.txt`, `after.txt`),
+    // so it now stands a covering `Rescan` of its own — which must not be able to answer a
+    // claim about the re-armed watch (see [`names`]).
+    wait_for(&mut w, |e| names(e, &drop_regrown))
       .await
       .is_some(),
     "the re-armed /drop/deep subtree delivers again after the set-cover grew it back"
@@ -425,7 +441,9 @@ async fn set_cover_grows_a_retained_ancestor_re_arming_pruned_descendants() {
   let other_regrown = root.join("a/b/other/regrown.txt");
   std::fs::write(&other_regrown, b"w").unwrap();
   assert!(
-    wait_for(&mut w, |e| covers(e, &other_regrown))
+    // By NAME: a/b/other held `before.txt` and `after.txt` while it was dark, so this grow
+    // stands a covering `Rescan` of its own — see [`names`].
+    wait_for(&mut w, |e| names(e, &other_regrown))
       .await
       .is_some(),
     "growing back to the retained ANCESTOR a/b re-arms the previously-pruned a/b/other"
@@ -436,12 +454,37 @@ async fn set_cover_grows_a_retained_ancestor_re_arming_pruned_descendants() {
 /// The effect-completion fence's ACCEPTANCE TEST (design §6 risk register): the resolved
 /// ack IS "the retained cover is live". Shrink to `{keep}` and prove the coverage gap the
 /// old queue-time ack would hide (a deep write under the pruned /drop yields nothing);
-/// then grow back with `set_cover({keep, drop})` and — immediately on the resolved
-/// `Applied`, with deliberately NO convergence wait, drain, or sleep — write under the
-/// re-grown subtree and assert delivery. Under a queue-time ack that write races the
-/// re-arm cascade and is lost with no `Rescan` owed for the gap; under the settle-time
-/// fence every re-armed watch (the grandchild `drop/deep` included — re-arms emit no
-/// `Created`, so nothing else covers it) is live before the ack resolves.
+/// then grow back with `set_cover({keep, drop})` and — immediately on the resolved ack,
+/// with deliberately NO convergence wait, drain, or sleep — write under the re-grown
+/// subtree and assert that write is delivered BY NAME. Under a queue-time ack that write
+/// races the re-arm cascade and is lost; under the settle-time fence every re-armed watch
+/// (the grandchild `drop/deep` included — re-arms emit no `Created`, so nothing else covers
+/// it) is live before the ack resolves. That immediacy is this cell's whole claim.
+///
+/// # The grow-back is not clean, and this cell is what proves it isn't
+///
+/// The verdict is `Degraded`, and that is the CORRECT answer rather than a blemish the
+/// immediacy claim has to tolerate. `gap.txt` is written under /drop/deep while that ground
+/// is dark, and the quiet window above proves the consumer was never told: the prune took the
+/// watches that would have recorded it, and the grow's crawl is suppressed, so it announces
+/// nothing for what it finds. Whatever the re-covered ground already held — `gap.txt`, and
+/// `before.txt` from before the prune, which is dark for the same reason — is absorbed in
+/// silence. This cell used to write that content deliberately, prove nothing was delivered,
+/// and then assert the grow-back reported clean, which is issue #82 asserted as correct.
+///
+/// So the grow OWES a cover for exactly the interval this cell proved was dark, and it pays
+/// it: the freshly-installed /drop reads back non-empty, which supplies the bridge window's
+/// loss half, and that window's closing `Rescan` at the scope root routes through the cover
+/// fence's loss memory and settles the fence `Degraded`. `Degraded` here reads "re-read this
+/// ground" — the only honest answer to a consumer that was never told what landed while the
+/// ground was dark. An empty pruned subtree would still settle `Applied`; the content is what
+/// makes this one owe.
+///
+/// The cover is therefore asserted as DELIVERED, not merely as a verdict: a `Rescan` at /drop
+/// or an ancestor must reach the consumer's stream. And the probe is asserted by NAME
+/// ([`names`]), because that same covering `Rescan` satisfies [`covers`] for every path under
+/// the root — a `covers`-shaped probe would be answered by the cover itself and would leave
+/// the immediacy claim proving nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn set_cover_ack_resolves_at_watch_live() {
   let root = scratch_root("fence-ack");
@@ -469,7 +512,9 @@ async fn set_cover_ack_resolves_at_watch_live() {
 
   // Shrink to {keep} and PROVE THE GAP: the pruned subtree's descriptors are reclaimed,
   // and a deep write under it yields NOTHING within a bounded quiet window — exactly the
-  // hole the grow's ack must not resolve before closing.
+  // hole the grow's ack must not resolve before closing, and exactly the content the
+  // grow-back below owes a cover for. `gap.txt` outlives this window: it stays under the
+  // ground being re-covered, unnamed by any record and unreported by any listing.
   w.set_cover(h, vec![root.join("keep")])
     .await
     .expect("set_cover shrink");
@@ -497,7 +542,8 @@ async fn set_cover_ack_resolves_at_watch_live() {
   .unwrap_or(false);
   assert!(
     !leaked,
-    "the gap is real: the pruned /drop delivers nothing"
+    "the gap is real: the pruned /drop delivers nothing, so gap.txt is content the consumer \
+     was never told about"
   );
 
   // GROW BACK — and write the INSTANT the ack resolves. No drain, no converge, no sleep
@@ -507,15 +553,40 @@ async fn set_cover_ack_resolves_at_watch_live() {
     .await
     .expect("set_cover grow");
   assert!(
-    outcome.is_applied(),
-    "a clean grow settles Applied, got {outcome:?}"
+    outcome.is_degraded(),
+    "the grow re-covers ground that was dark and holds content nothing ever reported \
+     (`before.txt`, and the `gap.txt` written while /drop was pruned), so its window owes a \
+     cover and the fence settles Degraded, got {outcome:?}"
   );
   let probe = root.join("drop/deep/immediate.txt");
   std::fs::write(&probe, b"z").unwrap();
+
+  // Both facts in ONE collection pass, in the order the driver produces them (the cover is
+  // offered ahead of the verdict it justifies; the probe's own event follows the write): the
+  // promised cover really is ON THE WIRE, and the immediate write is delivered BY NAME. Two
+  // sequential waits would let the first consume the other's event — the same race the
+  // prune/grow cell documents — and a `covers`-shaped probe would let the cover answer for
+  // the write.
+  let dark = root.join("drop");
+  let (mut covered, mut immediate) = (false, false);
+  let both = tokio::time::timeout(DEADLINE, async {
+    while let Some(event) = w.next().await {
+      covered |= event.is_rescan() && dark.starts_with(event.path());
+      immediate |= names(&event, &probe);
+      if covered && immediate {
+        return true;
+      }
+    }
+    false
+  })
+  .await
+  .unwrap_or(false);
   assert!(
-    wait_for(&mut w, |e| covers(e, &probe)).await.is_some(),
-    "a write issued immediately on the resolved ack is delivered — the ack resolves at \
-     watch-live, not at effect-queue time"
+    both,
+    "the Degraded verdict's cover reaches the consumer — a Rescan at /drop or an ancestor, \
+     obliging re-enumeration of the ground that was dark — AND the write issued immediately \
+     on the resolved ack is delivered by name: the ack resolves at watch-live, not at \
+     effect-queue time (cover: {covered}, immediate: {immediate})"
   );
   close_and_drain(w, &all).await;
 }
@@ -590,7 +661,9 @@ async fn set_cover_root_key_cancel_re_arms_every_pruned_region() {
   let drop_regrown = root.join("drop/deep/regrown.txt");
   std::fs::write(&drop_regrown, b"w").unwrap();
   assert!(
-    wait_for(&mut w, |e| covers(e, &drop_regrown))
+    // By NAME: the cancel re-covers dark ground that HOLDS content, so it stands a covering
+    // `Rescan` of its own — see [`names`].
+    wait_for(&mut w, |e| names(e, &drop_regrown))
       .await
       .is_some(),
     "a root-key cancel after an applied shrink re-arms every previously-pruned region"
