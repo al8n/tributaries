@@ -2968,9 +2968,10 @@ fn retire_parked_cookies<F: FsOps>(
 /// legitimately find no sender (a caller dropped at close).
 ///
 /// Reports whether a settlement stood a covering `Rescan` and held its tranche
-/// over for it ([`DriverCore::take_cover_flush_due`]): the caller must flush its
-/// effects and resolve again rather than park, so that cover reaches the
-/// consumer before the verdict it covers answers anybody.
+/// over for the flush that offers it ([`DriverCore::take_cover_flush_due`]): the
+/// caller must flush its effects and resolve again rather than park, so that
+/// cover is OFFERED before the verdict naming it answers anybody. Whether the
+/// offer lands is the consumer's business and never gates the answer.
 #[allow(clippy::too_many_arguments)]
 fn resolve_cover_settlements<R, F>(
   core: &mut DriverCore,
@@ -6107,18 +6108,21 @@ pub(crate) async fn run<R, F>(
 
     // A settlement stood the covering `Rescan` a standing classification stat
     // owes and held its tranche for it: RE-TOP, so the loop-top flush OFFERS
-    // that `Rescan` to the consumer's stream before any pass answers the caller
-    // with the degraded verdict it covers. Nothing external would bring the loop
-    // back for it — the tranche is licensed and its barrier is settled, so no
-    // arm, no read and no reply is outstanding on its behalf.
+    // that `Rescan` to the consumer's stream before the next pass answers the
+    // caller with the degraded verdict naming it — the same ordering every other
+    // `Degraded` producer gets from having queued its cover a pass earlier.
+    // Nothing external would bring the loop back for it — the tranche is
+    // licensed and its barrier is settled, so no arm, no read and no reply is
+    // outstanding on its behalf.
     //
     // The bounded-service invariant below is discharged by the per-tranche latch
     // this flag reports: only the pass that STANDS a cover raises it, so the
     // re-top run is ONE pass — commands (`Close` above all), op completions,
     // grant unwinds and the deadline each wait at most that. A cover the flush
-    // then finds the channel too full to take does NOT raise it again: that
-    // tranche waits on the scope's delivery retry, which the deadline below
-    // already carries, and defers through the passes in between.
+    // then finds the channel too full to take does NOT raise it again, and is
+    // NOT waited for: it is parked and re-offered on the scope's delivery retry,
+    // behind a verdict the very next pass answers. Nothing here — and nothing
+    // the next pass reads — depends on the consumer draining its channel.
     if cover_flush_due {
       continue;
     }
@@ -10676,25 +10680,15 @@ fn execute_effects<R, F>(
         scope,
         root,
         change,
-      } => {
-        // Read BEFORE the send, which moves the change into the channel on
-        // success: an acceptance reports the generation it accepted, and that is
-        // the only thing that raises the scope's delivery watermark.
-        let epoch = change.epoch();
-        match events.try_send((scope, root, change)) {
-          Ok(()) => core.on_delivery(scope, Delivery::Accepted(epoch), now()),
-          Err(async_channel::TrySendError::Full(_)) => {
-            core.on_delivery(scope, Delivery::Refused, now());
-          }
-          // The consumer dropped its stream; shutdown arrives via the command
-          // channel closing, so undeliverable changes are simply gone. RECORDED,
-          // though, because this arm reports no `Delivery` at all: a lagged lane's
-          // in-flight mark is never released and its parked change never re-offered,
-          // so an ordering hold waiting on delivery must learn here that no offer
-          // can ever land and discharge terminally instead.
-          Err(async_channel::TrySendError::Closed(_)) => core.on_consumer_gone(),
+      } => match events.try_send((scope, root, change)) {
+        Ok(()) => core.on_delivery(scope, Delivery::Accepted, now()),
+        Err(async_channel::TrySendError::Full(_)) => {
+          core.on_delivery(scope, Delivery::Refused, now());
         }
-      }
+        // The consumer dropped its stream; shutdown arrives via the command
+        // channel closing, so undeliverable changes are simply gone.
+        Err(async_channel::TrySendError::Closed(_)) => {}
+      },
     }
   }
 
