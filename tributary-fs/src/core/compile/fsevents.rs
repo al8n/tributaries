@@ -9,7 +9,7 @@ use std::{
   vec::Vec,
 };
 
-use tributary_proto::{OsRecord, RecordKind, Scope};
+use tributary_proto::{Evidence, OsRecord, RecordKind, Scope};
 
 use super::super::{
   DriverCore, Effect, Item, ItemPlan, Lowered, PendingBatch, Planned, ProbePurpose, ScopeId,
@@ -181,7 +181,12 @@ impl DriverCore {
           target,
           path: ev.path.clone(),
           allow_cookie,
-          content_changed: modified || attrib,
+          // Two distinct proven facts, kept distinct: OR-ing them into one
+          // bool made a metadata-only word mint a `Modified` record, which an
+          // attrib-only subscription does not admit.
+          content: Evidence::new()
+            .maybe_modified(modified)
+            .maybe_attrib(attrib),
         },
       );
       return ItemPlan::Await {
