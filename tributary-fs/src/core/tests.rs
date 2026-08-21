@@ -866,7 +866,7 @@ fn consumer_lag_parks_one_dominating_rescan() {
   assert!(emitted[0].kind().is_rescan());
 
   // Accepted: the scope returns to normal flow.
-  core.on_delivery(scope, Delivery::Accepted(emitted[0].epoch()), at(40));
+  core.on_delivery(scope, Delivery::Accepted, at(40));
   core.on_batch_events(
     scope,
     vec![ev("/r/c", flags(&[FsEventFlags::ITEM_CREATED]), 3, 5)],
@@ -896,7 +896,7 @@ fn newer_rescan_replaces_the_parked_one() {
   // A fresh loss while the offer is in flight mints a newer dominating
   // Rescan; the old acceptance must not end the lag.
   core.on_root_overflow(scope, at(3));
-  core.on_delivery(scope, Delivery::Accepted(offered), at(4));
+  core.on_delivery(scope, Delivery::Accepted, at(4));
   let effects = drain(&mut core);
   let emitted = emits(&effects);
   assert_eq!(
@@ -907,7 +907,7 @@ fn newer_rescan_replaces_the_parked_one() {
   assert!(emitted[0].kind().is_rescan());
   assert!(emitted[0].epoch() > offered);
 
-  core.on_delivery(scope, Delivery::Accepted(emitted[0].epoch()), at(5));
+  core.on_delivery(scope, Delivery::Accepted, at(5));
   core.on_batch_events(
     scope,
     vec![ev("/r/d", flags(&[FsEventFlags::ITEM_CREATED]), 9, 9)],
@@ -995,7 +995,7 @@ fn accepting_a_stale_offer_re_offers_the_merged_parked_rescan() {
   core.on_batch_events(scope, vec![ev("/r/sub", FsEventFlags::new(0), 2, 0)], at(3));
   // The stale acceptance names a superseded epoch: the lag holds and the
   // merged instruction becomes offerable immediately.
-  core.on_delivery(scope, Delivery::Accepted(stale.epoch()), at(4));
+  core.on_delivery(scope, Delivery::Accepted, at(4));
   let effects = drain(&mut core);
   let merged = emits(&effects);
   assert_eq!(merged.len(), 1, "the merged Rescan re-offers: {effects:?}");
@@ -1008,7 +1008,7 @@ fn accepting_a_stale_offer_re_offers_the_merged_parked_rescan() {
   assert_eq!(merged[0].epoch().as_u64(), first.epoch().as_u64() + 2);
 
   // Accepting the CURRENT instruction ends the lag.
-  core.on_delivery(scope, Delivery::Accepted(merged[0].epoch()), at(5));
+  core.on_delivery(scope, Delivery::Accepted, at(5));
   core.on_batch_events(
     scope,
     vec![ev("/r/c", flags(&[FsEventFlags::ITEM_CREATED]), 3, 5)],
@@ -1108,7 +1108,7 @@ fn unwatch_of_a_narrowed_lagged_scope_promotes_root_coverage() {
     "the terminal promise covers the root: {terminal:?}"
   );
   assert_eq!(terminal.epoch().as_u64(), first.epoch().as_u64() + 2);
-  core.on_delivery(scope, Delivery::Accepted(terminal.epoch()), at(4));
+  core.on_delivery(scope, Delivery::Accepted, at(4));
   assert!(!core.dying_contains(scope), "the acceptance retires it");
 }
 
@@ -1123,9 +1123,8 @@ fn delivered_epochs_are_always_announced_by_a_delivered_rescan() {
   let mut delivered: Vec<Change> = Vec::new();
   let deliver_all = |core: &mut DriverCore, delivered: &mut Vec<Change>, t: u64| {
     for change in emits(&drain(core)) {
-      let epoch = change.epoch();
       delivered.push(change.clone());
-      core.on_delivery(scope, Delivery::Accepted(epoch), at(t));
+      core.on_delivery(scope, Delivery::Accepted, at(t));
     }
   };
 
@@ -1193,7 +1192,6 @@ fn identity_minting_respects_devices_and_mounts() {
     refresh_stale: false,
     refresh_world_stale: false,
     lag: LagState::Normal,
-    delivered_through: tributary_proto::Epoch::START,
     park: Park::default(),
     resume_poisoned: false,
     publicly_live: true,
@@ -1233,7 +1231,6 @@ fn blind_mount_table_refuses_event_side_trust() {
     refresh_stale: false,
     refresh_world_stale: false,
     lag: LagState::Normal,
-    delivered_through: tributary_proto::Epoch::START,
     park: Park::default(),
     resume_poisoned: false,
     publicly_live: true,
@@ -1392,7 +1389,7 @@ fn lag_entry_purges_the_scopes_queued_emits() {
   );
 
   // Accepting it ends the lag; later changes flow again.
-  core.on_delivery(scope, Delivery::Accepted(emitted[0].epoch()), at(3));
+  core.on_delivery(scope, Delivery::Accepted, at(3));
   core.on_batch_events(
     scope,
     vec![ev("/r/d", flags(&[FsEventFlags::ITEM_CREATED]), 4, 13)],
@@ -1471,7 +1468,7 @@ fn terminal_rescan_retries_until_accepted() {
   assert_eq!(emitted.len(), 1, "the terminal Rescan retries: {effects:?}");
   assert!(emitted[0].kind().is_rescan());
 
-  core.on_delivery(scope, Delivery::Accepted(emitted[0].epoch()), at(60));
+  core.on_delivery(scope, Delivery::Accepted, at(60));
   assert!(
     emits(&drain(&mut core)).is_empty(),
     "accepted: nothing owed"
@@ -1504,7 +1501,7 @@ fn root_death_rescan_survives_refusal_after_teardown() {
   assert_eq!(emitted.len(), 1, "{effects:?}");
   assert!(emitted[0].kind().is_rescan());
 
-  core.on_delivery(scope, Delivery::Accepted(emitted[0].epoch()), at(60));
+  core.on_delivery(scope, Delivery::Accepted, at(60));
   assert_eq!(core.poll_timeout(), None);
 }
 
@@ -2898,7 +2895,6 @@ mod lowering {
       refresh_stale: false,
       refresh_world_stale: false,
       lag: LagState::Normal,
-      delivered_through: tributary_proto::Epoch::START,
       park: Park::default(),
       resume_poisoned: false,
       publicly_live: true,
@@ -5005,7 +5001,7 @@ mod descending {
     );
     // Dequeuing an effect is not delivering it — the driver's flush reports the
     // send's outcome, and only an ACCEPTANCE puts the instruction on the stream.
-    core.on_delivery(scope, Delivery::Accepted(emitted[0].epoch()), at(1));
+    core.on_delivery(scope, Delivery::Accepted, at(1));
 
     assert_eq!(
       core.poll_cover_settlements(DRAINED),
@@ -5164,7 +5160,7 @@ mod descending {
     );
     // Dequeuing an effect is not delivering it — the driver's flush reports the
     // send's outcome, and only an ACCEPTANCE puts the instruction on the stream.
-    core.on_delivery(scope, Delivery::Accepted(emitted[0].epoch()), at(1));
+    core.on_delivery(scope, Delivery::Accepted, at(1));
 
     assert_eq!(
       core.poll_cover_settlements(DRAINED),
@@ -5189,8 +5185,7 @@ mod descending {
   /// offers — accepting each where `accept`, refusing each otherwise — and
   /// reporting the changes it offered, in offer order. The driver's flush
   /// reports each send's outcome synchronously, so a cell that drops one models
-  /// a driver that cannot exist; an acceptance carries the offered change's own
-  /// generation, exactly as the driver's does.
+  /// a driver that cannot exist.
   fn run_cascade_delivering(
     core: &mut DriverCore,
     listings: &BTreeMap<&str, Vec<RawDirEntry>>,
@@ -5224,7 +5219,7 @@ mod descending {
           Effect::Emit { scope, change, .. } => {
             offered.push(change.clone());
             let delivery = if accept {
-              Delivery::Accepted(change.epoch())
+              Delivery::Accepted
             } else {
               Delivery::Refused
             };
@@ -5241,9 +5236,9 @@ mod descending {
     panic!("the cascade did not quiesce within the iteration bound");
   }
 
-  /// Staging shared by the two cells below: a tranche licensed over a standing
-  /// empty-slot stat, whose cover the consumer's channel REFUSED — and whose
-  /// replacement ordering proof is already in hand.
+  /// Staging for the cell below: a tranche licensed over a standing empty-slot
+  /// stat, whose cover the consumer's channel REFUSED — and whose replacement
+  /// ordering proof is already in hand.
   ///
   /// The refusal is the driver's `Full` arm: it purges the queued cover, folds it
   /// into the scope's never-narrowing parked `Rescan` (INV-PARK), and signals the
@@ -5252,7 +5247,7 @@ mod descending {
   /// too (the channel has had no chance to drain), so the lane ends parked on its
   /// delivery retry. Rebuilding past all of it is the sequence that matters:
   /// overflow recovery, replacement proof, and the tranche licensed again with
-  /// the cover still undelivered.
+  /// the cover offered, refused, and still undelivered.
   fn stat_cover_refused(core: &mut DriverCore, scope: ScopeId) -> FenceId {
     assert_eq!(
       core.on_set_cover(scope, &[p("/r/keep"), p("/r/drop")]),
@@ -5267,11 +5262,12 @@ mod descending {
     assert_eq!(
       core.poll_cover_settlements(DRAINED),
       Vec::new(),
-      "staging: the observation stands the cover and holds the tranche for it"
+      "staging: the observation stands the cover and holds the tranche for the \
+       one flush that offers it"
     );
     assert!(
       core.take_cover_flush_due(),
-      "staging: and asks the driver for the flush that offers it"
+      "staging: and asks the driver for that flush"
     );
 
     let offered = run_cascade_delivering(core, &listings, false, at(1));
@@ -5296,112 +5292,82 @@ mod descending {
     fence
   }
 
-  /// THE HOLD IS AGAINST DELIVERY, NOT AGAINST THE ENQUEUE. A cover the loop-top
-  /// `try_send` refused is parked, not delivered, and a tranche that resolves
-  /// over it answers `Degraded` — a verdict whose whole contract is that its
-  /// covering `Rescan` is already in band — to a consumer that has been
-  /// instructed by nothing.
+  /// THE ANSWER IS NOT GATED ON CONSUMER PROGRESS. `Degraded` reports a covering
+  /// `Rescan` EMITTED, never one delivered, so the offer's outcome may not decide
+  /// when the verdict is minted: a caller awaiting `set_cover` while its own
+  /// channel sits full and unread would otherwise be waiting on itself.
   ///
-  /// So the licensed tranche stays held across the refusal, across the overflow
-  /// recovery it triggers, and across the replacement ordering proof, and reports
-  /// its verdict only once an offer is ACCEPTED. The latch is preserved
-  /// throughout: no second cover is stood, which is what keeps a scope whose stat
-  /// never answers from re-instructing a consumer that has yet to be instructed
-  /// once.
+  /// Here the loop-top `try_send` refuses the cover, the refusal purges it into
+  /// the scope's parked dominating instruction, that instruction's own offer is
+  /// refused too, and the lane ends parked on its delivery retry with the
+  /// consumer still holding nothing. The very next observation answers anyway.
+  /// The latch is preserved across all of it — no second cover is stood, which is
+  /// what keeps a scope whose stat never answers from re-instructing a consumer
+  /// on every pass — and no second re-top is asked for, because the ordering the
+  /// flag buys was spent on the flush that made the refused offer.
   ///
-  /// Mutation that kills it: infer the delivery from the effect queue instead of
-  /// recording it — make `stat_cover_landed` ask whether any emit at `owed` is
-  /// still queued. A refusal PURGES the queued cover into the scope's parked
-  /// instruction, so the queue reads empty of it while nobody has been given
-  /// anything, and the tranche resolves at the replacement proof on the very
-  /// assertion below that names it. (Spending the hold on the enqueue instead —
-  /// reporting `StatCover::Discharged` where `stand_stat_cover` reports
-  /// `Awaiting` — kills it one step earlier, at the staging hold.) Either way
-  /// this is an ORDERING failure: the verdict arrives, ahead of the instruction
-  /// it promises.
+  /// Mutation that kills it: gate the resolution on the delivery — hold while the
+  /// scope's cover is undelivered, by watermark, by lane state, or by looking for
+  /// the emit in the queue. The observation below then reports nothing, the
+  /// caller's reply is parked behind a channel only the caller can drain, and
+  /// this cell fails on the assertion that names it. This is a LIVENESS failure:
+  /// no verdict arrives while the consumer does not read.
   #[test]
-  fn a_stat_cover_refused_by_a_full_consumer_holds_its_tranche_until_delivery() {
+  fn a_stat_cover_refused_by_a_full_consumer_still_answers_its_tranche() {
     let (mut core, scope, _root) = shrunk_to_keep();
     let fence = stat_cover_refused(&mut core, scope);
+    assert!(
+      matches!(
+        core.scopes.get(&scope).map(|state| &state.lag),
+        Some(LagState::Lagged { .. })
+      ),
+      "staging: the lane is parked on its retry — the consumer has taken nothing"
+    );
+
     assert_eq!(
       core.poll_cover_settlements(DRAINED),
-      Vec::new(),
-      "the tranche is licensed again and STILL held: the cover is parked, not delivered"
+      vec![(fence, CoverSettle::Degraded)],
+      "the tranche is licensed again and answers: the cover was emitted, and \
+       delivering it is not what the verdict claims"
     );
     assert!(
       !core.take_cover_flush_due(),
-      "and waiting costs no second re-top — it rides the lane's own delivery retry"
+      "and asks for no second flush — the one it already took is the whole ordering"
     );
 
-    // The retry offers the parked instruction again, and this time the consumer
-    // takes it.
+    // The instruction is not lost by being answered ahead of: it stays parked and
+    // the lane's own retry re-offers it, behind the verdict.
     core.on_timeout(at(100));
-    let retried = drain(&mut core);
-    let offered = emits(&retried);
-    assert_eq!(offered.len(), 1, "{retried:?}");
-    assert!(offered[0].kind().is_rescan(), "{offered:?}");
-    core.on_delivery(scope, Delivery::Accepted(offered[0].epoch()), at(101));
-
-    assert_eq!(
-      core.poll_cover_settlements(DRAINED),
-      vec![(fence, CoverSettle::Degraded)],
-      "the verdict answers only behind the cover that is now on the consumer's stream"
+    let effects = drain(&mut core);
+    let retried = emits(&effects);
+    assert_eq!(retried.len(), 1, "{effects:?}");
+    assert!(
+      retried[0].kind().is_rescan() && retried[0].location() == &loc(&[]),
+      "the covering `Rescan` is re-offered after the answer: {retried:?}"
     );
   }
 
-  /// …and the hold is TERMINAL where no offer can ever land. A consumer that
-  /// dropped its stream reports no delivery outcome at all — the driver's
-  /// `Closed` arm feeds no `Delivery`, so a lagged lane's in-flight mark is never
-  /// released and its parked change is never re-offered — and a hold waiting on
-  /// that is the wedge this whole signal exists to avoid. It degrades the verdict
-  /// instead, which is what the signal was made a loss rather than a barrier
-  /// conjunct to do.
+  /// …and it answers after exactly ONE flush, however busy the lane. The hold is
+  /// spent by the re-top, not by the queue draining: an epoch names a
+  /// reconciliation generation and not one instruction, so every ordinary change
+  /// routed after the covering `Rescan` carries that same generation, and the
+  /// driver ingests a source snapshot immediately BEFORE it polls settlements and
+  /// leaves those effects queued. A scope that is merely busy therefore has an
+  /// emit at the cover's own epoch resident at every observation it ever reaches.
   ///
-  /// Mutation that kills it: drop the `consumer_gone` short-circuit from
-  /// `stat_cover_landed`. The lane stays lagged with nobody left to accept, the
-  /// tranche is never reported, and the caller's reply is stranded forever. This
-  /// is a LIVENESS failure: no verdict arrives at all.
+  /// Here the consumer accepts everything it is offered and one ordinary
+  /// same-epoch change arrives after the flush. The tranche resolves regardless,
+  /// and with it the settlement report a fence's parked cookie dispatches out of.
+  ///
+  /// Mutation that kills it: spend the hold on the queue instead of on the flush
+  /// — hold while any emit at the cover's generation is still queued for the
+  /// scope, the natural way to write "make sure the cover got out". The unrelated
+  /// `Created` below answers yes, and answers yes again on every later pass a
+  /// producing lane reaches, so the acknowledgement and its cookie are parked for
+  /// as long as the scope stays busy. This is a LIVENESS failure — no verdict
+  /// arrives at all — on a healthy lane whose consumer is keeping up.
   #[test]
-  fn a_stat_cover_whose_consumer_is_gone_resolves_terminally() {
-    let (mut core, scope, _root) = shrunk_to_keep();
-    let fence = stat_cover_refused(&mut core, scope);
-    assert_eq!(
-      core.poll_cover_settlements(DRAINED),
-      Vec::new(),
-      "staging: held, exactly as in the cell above"
-    );
-
-    core.on_consumer_gone();
-    assert_eq!(
-      core.poll_cover_settlements(DRAINED),
-      vec![(fence, CoverSettle::Degraded)],
-      "a cover nobody can ever be given degrades the verdict rather than wedging the scope"
-    );
-  }
-
-  /// …and the hold ends on CONSUMER PROGRESS, which is not the same fact as the
-  /// scope's queue being empty of the cover's generation. An epoch names a
-  /// reconciliation generation, not one instruction: every ordinary change routed
-  /// after the covering `Rescan` carries that same generation, and the driver
-  /// drains a source snapshot immediately BEFORE it polls settlements and leaves
-  /// those effects queued. So a scope that is merely busy has an emit at the
-  /// cover's epoch resident at every observation, while the cover itself was
-  /// taken by the consumer one flush earlier.
-  ///
-  /// Here the consumer accepts everything and one ordinary same-epoch change
-  /// arrives before each observation. The tranche resolves on the acceptance, and
-  /// with it the settlement report a fence's parked cookie dispatches out of —
-  /// the two arms of one hold, as under backpressure above.
-  ///
-  /// Mutation that kills it: infer the delivery from the effect queue instead of
-  /// recording it — make `stat_cover_landed` ask whether any emit at `owed` is
-  /// still queued. The unrelated `Created` below answers yes, and it answers yes
-  /// again on every later pass a producing lane reaches, so the acknowledgement
-  /// and its cookie are parked for as long as the scope stays busy. This is a
-  /// LIVENESS failure — no verdict arrives at all — where the two cells above pin
-  /// an ordering one and its terminal.
-  #[test]
-  fn a_stat_cover_discharges_under_ordinary_traffic_at_its_own_generation() {
+  fn a_stat_cover_answers_behind_one_flush_however_busy_the_lane() {
     let (mut core, scope, root) = shrunk_to_keep();
     let listings = BTreeMap::from([("/r", root_listing_with_unknown())]);
 
@@ -5449,7 +5415,7 @@ mod descending {
     assert_eq!(
       core.poll_cover_settlements(DRAINED),
       Vec::new(),
-      "staging: the observation stands the cover and holds the tranche for it"
+      "staging: the observation stands the cover and holds the tranche for the flush"
     );
     assert!(
       core.take_cover_flush_due(),
@@ -5464,8 +5430,8 @@ mod descending {
       .find(|change| change.kind().is_rescan() && change.location() == &loc(&[]))
       .map(|change| change.epoch())
       .expect("staging: the flush offers the cover");
-    for change in &offered {
-      core.on_delivery(scope, Delivery::Accepted(change.epoch()), at(200));
+    for _ in &offered {
+      core.on_delivery(scope, Delivery::Accepted, at(200));
     }
 
     // …and the lane keeps producing. Nothing has bumped the generation since the
@@ -5482,8 +5448,8 @@ mod descending {
     assert_eq!(
       core.poll_cover_settlements(DRAINED),
       vec![(fence, CoverSettle::Degraded)],
-      "the verdict answers behind the cover the consumer ACCEPTED, whatever else \
-       the lane has since produced"
+      "the verdict answers behind the one flush that offered the cover, whatever \
+       else the lane has since queued"
     );
   }
 

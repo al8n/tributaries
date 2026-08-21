@@ -286,11 +286,26 @@ pub enum CoverOutcome {
   /// overflow, an unclassifiable directory entry the root does not yet cover,
   /// or the root tearing down mid-fence) — the loss memory is
   /// per-root, so a loss landing just BEFORE the reconcile degrades it too:
-  /// coverage may be partial, and the covering
-  /// [`Rescan`](crate::EventKind::Rescan) — already delivered in-band —
-  /// dominates the gap. Any loss also drops the root's recorded coverage
-  /// claim, so re-issuing the same cover re-attempts the FULL grow (re-proving
-  /// the requested coverage), and a clean re-issue resolves `Applied`.
+  /// coverage may be partial, and a covering
+  /// [`Rescan`](crate::EventKind::Rescan) dominating the gap has been
+  /// **emitted** on the root's stream. Any loss also drops the root's recorded
+  /// coverage claim, so re-issuing the same cover re-attempts the FULL grow
+  /// (re-proving the requested coverage), and a clean re-issue resolves
+  /// `Applied`.
+  ///
+  /// **Emitted is not delivered — RE-ENUMERATE, do not wait for the `Rescan`.**
+  /// This outcome reports what the watcher did about the gap, never what the
+  /// consumer has read. An event channel with no room refuses the offer, which
+  /// is parked and retried BEHIND this answer. A reconcile answered on the
+  /// watcher's CLOSING pass is weaker still: the driver is being dropped, so a
+  /// queued cover may never reach the stream — and a loss that only the closing
+  /// settlement itself could have covered gets no `Rescan` at all, because that
+  /// pass has no flush to stand one into.
+  ///
+  /// The acknowledgement is therefore deliberately independent of consumer
+  /// progress: a caller awaiting it while its own stream sits unread is
+  /// answered rather than deadlocked against itself. Re-enumerating on
+  /// `Degraded` is what makes every one of these cases safe.
   Degraded,
   /// The root is backed by a kernel-recursive backend (fanotify / FSEvents),
   /// whose single whole-subtree stream never narrowed: there is nothing to
@@ -1151,8 +1166,8 @@ impl<R> Watcher<R> {
   ///   shortcut is.
   ///
   ///   That re-proof names an OBJECT at a slot, which makes the same-mount-frame
-  ///   condition above more than an endpoint test: the continuous shape ASSUMES
-  ///   the mount stack at the adopted slot does not change and change BACK
+  ///   condition above more than an endpoint test: the continuous shape REQUIRES
+  ///   that the mount stack at the adopted slot does not change and change BACK
   ///   between the commit and that first read. The frame is compared when the
   ///   replace is admitted, and the first read fences every directory it lists
   ///   against the root's mount — but both are SAMPLES, and nothing between them
@@ -1165,10 +1180,25 @@ impl<R> Watcher<R> {
   ///   resolves across a mount boundary to an object the re-proof cannot match,
   ///   the adopted edge fails, and its coverage is re-established loudly under a
   ///   covering `Rescan`. An overlay raised and dropped entirely INSIDE the
-  ///   window is NOT detected — the slot reads exactly as the widen left it and
-  ///   the re-proof matches, so the widen certifies continuous. Changes to the
+  ///   window is not — the slot reads exactly as the widen left it and the
+  ///   re-proof matches, so the widen certifies continuous. Changes to the
   ///   underlying object are then delivered at a path that, for part of the
   ///   window, named a different tree, and that part gets no covering `Rescan`.
+  ///
+  ///   **Mount stability at the adopted slot is a PRECONDITION of this
+  ///   guarantee, not a gap in it.** A transient mount-stack change across the
+  ///   commit window is outside what `replace_root` promises: continuity here is
+  ///   a claim about the adopted OBJECT — the inode the old root named, whose
+  ///   stream is kept — and never a claim that the path resolved to that object
+  ///   for every instant of the window. Witnessing the window would take an
+  ///   ordered mount-topology signal, which the descending backend does not have
+  ///   (`FAN_MNT_ATTACH`/`FAN_MNT_DETACH` are fanotify's, and the splice is
+  ///   inotify-only); the only alternative is to refuse the continuous shape
+  ///   whenever the interval cannot be proven mount-stable, which in practice is
+  ///   always, and would delete the zero-gap widen outright. Callers that must
+  ///   exclude a mount-privileged actor in the watching namespace should not
+  ///   rely on continuity across a widen — every OTHER replace shape is
+  ///   make-before-break and covers its whole window with a `Rescan`.
   ///
   /// - **Every other replace** (kernel-recursive backends, widening by more
   ///   than one segment, and disjoint or narrowing targets on the descending
@@ -1662,9 +1692,16 @@ impl<R> Watcher<R> {
   /// - [`Degraded`](CoverOutcome::Degraded): the reconcile settled, but coverage loss was
   ///   signaled since the root's last settled window (a failed re-arm, an unreadable re-arm
   ///   read, an overflow, an unclassifiable directory entry the root does not yet cover, a
-  ///   teardown racing the fence): coverage may be partial, and the
-  ///   covering [`Rescan`](crate::EventKind::Rescan) — already delivered in-band — dominates
-  ///   the gap. The loss memory is per-root, not per-fence: a loss that landed BEFORE this
+  ///   teardown racing the fence): coverage may be partial, and a covering
+  ///   [`Rescan`](crate::EventKind::Rescan) dominating the gap has been **emitted**.
+  ///   **Emitted, not delivered: re-enumerate the retained cover on this outcome instead of
+  ///   waiting for the `Rescan` to arrive.** A full event channel refuses the offer and it is
+  ///   parked and retried behind this answer; and a reconcile answered on the CLOSING pass may
+  ///   see its queued cover die with the driver, or — for a loss only that settlement could
+  ///   have covered — never stand one, there being no flush left to stand it into. This
+  ///   acknowledgement never waits on consumer progress, so awaiting it while your own stream
+  ///   sits unread cannot deadlock you against yourself.
+  ///   The loss memory is per-root, not per-fence: a loss that landed BEFORE this
   ///   reconcile (with no reconcile in flight) both degrades this acknowledgement and drops
   ///   the root's recorded coverage claim, so re-issuing the same cover re-attempts the FULL
   ///   grow — re-proving the requested coverage rather than trusting the pre-loss record —

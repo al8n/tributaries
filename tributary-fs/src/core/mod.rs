@@ -273,15 +273,8 @@ pub(crate) enum Effect {
 /// The outcome of one attempted [`Effect::Emit`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Delivery {
-  /// The consumer channel accepted the change, carrying the generation it was
-  /// stamped with. That generation — and nothing else — raises the scope's
-  /// delivery watermark ([`ScopeState::delivered_through`]).
-  ///
-  /// Carried IN the variant so an acceptance cannot be reported without naming
-  /// what was accepted: the watermark's whole value is that it records a
-  /// delivered FACT, and a caller able to signal a bare "accepted" could raise
-  /// it from an enqueue.
-  Accepted(tributary_proto::Epoch),
+  /// The consumer channel accepted the change.
+  Accepted,
   /// The consumer channel was full; the change was not delivered.
   Refused,
 }
@@ -376,20 +369,30 @@ pub(crate) enum CoverSettle {
   /// The reconcile settled, but the window was lossy — a covering `Rescan`
   /// passed, a grow kickoff coalesced into an in-flight cold read, or an
   /// unanswered classification stat stands the scope's settlement loss.
-  /// Coverage may be partial; the `Rescan` dominates the gap.
+  /// Coverage may be partial; a covering `Rescan` dominating the gap has been
+  /// EMITTED.
   ///
-  /// All three carry a cover INTO the verdict, which is what lets that last
-  /// sentence be read as a promise rather than a hope. The first IS the
+  /// Emitted, and no more than that: this verdict is not a delivery receipt, and
+  /// the caller RE-ENUMERATES the retained cover rather than waiting for the
+  /// instruction to arrive. A full consumer channel refuses the offer and parks
+  /// it (INV-PARK) to be retried behind this answer. A verdict minted on the
+  /// CLOSING pass is weaker again — the core is dropped with its effects still
+  /// queued, and the one loss source whose cover only a settlement can stand
+  /// gets none there at all — which is exactly why the caller re-enumerates
+  /// instead. Making the answer wait for the delivery would put a caller's own
+  /// reply behind that caller draining its event stream.
+  ///
+  /// All three sources carry a cover into the verdict. The first IS the
   /// `Rescan`. The second holds the barrier down
   /// ([`Monitor::coverage_settled`](tributary_proto::Monitor::coverage_settled))
   /// until the coalesced read completes, and that completion escalates into one.
   /// The third is the only loss that stands none of its own — the read that
   /// queued the stat reconciled nothing for the slot, and a pure grow stands no
-  /// `Rescan` at all — so the settle observation stands a scope-level one and
-  /// holds the tranche until the delivery lane has ACCEPTED it, which is what
-  /// puts the instruction on the consumer's stream ahead of the verdict that
-  /// promises it (see
-  /// [`poll_cover_settlements`](DriverCore::poll_cover_settlements)).
+  /// `Rescan` at all — so a LIVE settle observation stands a scope-level one and
+  /// holds the tranche for the single flush that offers it, which is the same
+  /// best-effort ordering the other two already have (see
+  /// [`poll_cover_settlements`](DriverCore::poll_cover_settlements)). The close
+  /// pass stands none: no flush follows it.
   Degraded,
   /// The scope died under this fence: the teardown fold resolved it and there
   /// is no stream left to report anything on.
@@ -479,17 +482,21 @@ impl SettlePass<'_> {
     matches!(self, Self::Live { .. })
   }
 
-  /// Whether this pass may hold a licensed tranche until the cover a standing
-  /// stat loss owes has been DELIVERED, so it is on the consumer's stream before
-  /// the verdict it covers answers a caller.
+  /// Whether this pass may stand the cover a standing stat loss owes and hold a
+  /// licensed tranche for the ONE flush that offers it, so the instruction is
+  /// offered before the verdict it covers answers a caller.
   ///
-  /// Only the live loop may: the driver re-tops on such a hold rather than
-  /// parking, so the cover is offered at once, and the scope's own delivery
-  /// retry re-offers it for as long as the consumer's channel refuses. The close
-  /// drain is the last pass there will ever be — a held fence would strand its
-  /// caller's reply forever — so it reports the lossy verdict where it stands,
-  /// carrying the same best-effort remainder every effect queued at close
-  /// carries.
+  /// Only the live loop may, and the hold it takes is bounded by the DRIVER: the
+  /// driver re-tops on it ([`take_cover_flush_due`](DriverCore::take_cover_flush_due)),
+  /// the loop-top flush offers the cover, and the very next observation resolves —
+  /// whether that offer was accepted or refused. Nothing here waits on consumer
+  /// progress, which a `Degraded` verdict does not promise.
+  ///
+  /// The close drain neither stands a cover nor holds. It is the last pass there
+  /// will ever be, so a held fence would strand its caller's reply forever, and
+  /// there is no flush left to carry an instruction anywhere — the drained items'
+  /// effects die with the core. It reports the lossy verdict where it stands, and
+  /// the caller re-enumerates on it exactly as the contract says.
   const fn orders_stat_cover(self) -> bool {
     matches!(self, Self::Live { .. })
   }
@@ -504,38 +511,38 @@ impl SettlePass<'_> {
   }
 }
 
-/// Where the covering `Rescan` a standing stat loss owes one tranche stands.
+/// Whether the covering `Rescan` a standing stat loss owes one tranche has been
+/// stood yet.
 ///
-/// Queuing that `Rescan` is not delivering it: the loop-top `try_send` REFUSES
-/// it whenever the consumer's channel is full, which parks it as the scope's
-/// dominating instruction (INV-PARK) instead of putting it on the stream. So the
-/// hold is spent on the delivery OUTCOME — [`Delivery::Accepted`] for the
-/// instruction that carries the cover — and never on the act of enqueuing, which
-/// a bare stood/not-stood flag is all that can record.
+/// A [`Degraded`](CoverSettle::Degraded) verdict reports that such a `Rescan` was
+/// EMITTED, never that the consumer has taken it: the loop-top `try_send` refuses
+/// it whenever the channel is full, which parks it as the scope's dominating
+/// instruction (INV-PARK), and the caller re-enumerates rather than waiting for
+/// it. So the latch records the one fact the verdict rests on — the cover was
+/// stood — and nothing about the delivery it does not promise.
 ///
-/// The outcome is read off the scope's delivery watermark
-/// ([`ScopeState::delivered_through`]) rather than looked for in the queue: the
-/// instruction the wait is on may not survive to be found — a refusal purges it
-/// and folds it into a fresh dominating `Rescan` — and the generation it was
-/// stamped with is shared by every ordinary change routed after it, so its
-/// presence in the queue is not its own.
+/// What it still buys is ORDERING, best-effort and bounded by the driver alone:
+/// the tranche is held for exactly the ONE re-top whose flush offers the cover
+/// ([`take_cover_flush_due`](DriverCore::take_cover_flush_due)), so a consumer
+/// with room is instructed before the verdict — exactly as it is for every other
+/// `Degraded` producer, whose covers are queued by an earlier pass and flushed at
+/// this pass's loop top. A consumer without room is not waited for: the cover is
+/// parked (or folded into the instruction already parked) and rides the lane's
+/// own delivery retry, behind the verdict.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum StatCover {
   /// No cover has been stood for this tranche.
   #[default]
   Unstood,
-  /// Stood and NOT yet on the consumer's stream: the generation the scope's
-  /// delivery watermark must reach for the hold to discharge — the covering
-  /// instruction's own, and so also that of anything minted to absorb it.
+  /// Stood: the tranche is held for the single flush that follows and resolves
+  /// at the next observation, whatever that flush did with it — accepted,
+  /// refused and parked, or (where the lane was ALREADY lagging) folded into the
+  /// scope's parked dominating `Rescan` and never separately offered at all.
   ///
-  /// Preserved across a REFUSAL — which folds the cover into the scope's
-  /// never-narrowing parked `Rescan`, so re-standing would instruct a consumer
-  /// that has yet to be instructed once — and across a PROOF INVALIDATION, which
-  /// defers the tranche with its entry, and so this state, intact.
-  Awaiting(tributary_proto::Epoch),
-  /// The tranche owes nothing further: the cover reached the consumer, or there
-  /// is no consumer left for it to reach.
-  Discharged,
+  /// Preserved across a PROOF INVALIDATION, which defers the tranche with its
+  /// entry — and so this state — intact, so a deferred tranche re-instructs
+  /// nobody.
+  Stood,
 }
 
 /// One scope's pending set-cover fence bookkeeping.
@@ -568,8 +575,8 @@ enum StatCover {
 ///
 /// It is also the one source that arrives with NO cover of its own — the two
 /// events above are (or produce) the `Rescan` that marks them — so the
-/// observation that reads it stands one, and holds the tranche until the
-/// consumer has it ([`stat_cover`](CoverFence::stat_cover)).
+/// observation that reads it stands one, and holds the tranche for the single
+/// flush that offers it ([`stat_cover`](CoverFence::stat_cover)).
 ///
 /// Either event marks every currently-pending fence lossy AND is remembered
 /// here until the scope next settles, so a fence opened AFTER the event but
@@ -612,19 +619,18 @@ struct CoverFence {
   /// The scope's loss memory since the last settle observation (see the
   /// lossy-window rule above).
   lossy: bool,
-  /// Where the covering `Rescan` a standing stat loss owes stands for the
-  /// tranche this entry is about to resolve
+  /// Whether the covering `Rescan` a standing stat loss owes has been stood for
+  /// the tranche this entry is about to resolve
   /// ([`Monitor::cover_stat_loss`](tributary_proto::Monitor::cover_stat_loss)).
   ///
-  /// The latch is what makes the hold that orders that `Rescan` ahead of the
-  /// verdict stand exactly ONE cover per tranche: it leaves
-  /// [`Unstood`](StatCover::Unstood) when the cover is stood, is reset when the
-  /// tranche is drained, and goes with the entry when the last pending fence
-  /// does. Without it a scope whose stat never answers would stand a fresh cover
-  /// on every pass and never report the degraded verdict the standing loss
-  /// exists to produce; with it a later tranche — resolving under its own
-  /// successor proof, over a stretch of the window the earlier cover does not
-  /// reach — still stands one of its own.
+  /// The latch is what makes the one-flush ordering stand exactly ONE cover per
+  /// tranche: it leaves [`Unstood`](StatCover::Unstood) when the cover is stood,
+  /// is reset when the tranche is drained, and goes with the entry when the last
+  /// pending fence does. Without it a scope whose stat never answers would stand
+  /// a fresh cover on every pass and never report the degraded verdict the
+  /// standing loss exists to produce; with it a later tranche — resolving under
+  /// its own successor proof, over a stretch of the window the earlier cover does
+  /// not reach — still stands one of its own.
   stat_cover: StatCover,
   /// Open ordinals minted for this entry so far. Per entry, which is the only
   /// scale the tranche rule compares at: a proof's mark lives on this same
@@ -1378,30 +1384,6 @@ struct ScopeState {
   /// loss, but a cross-world verdict must not survive a replace.
   refresh_world_stale: bool,
   lag: LagState,
-  /// The greatest generation this scope's consumer has ACCEPTED — the delivery
-  /// lane's monotone watermark. Raised by [`Delivery::Accepted`] and by nothing
-  /// else: never by queuing an emit, never by offering one.
-  ///
-  /// It exists because the queue cannot answer "has this instruction been
-  /// delivered". An [`Epoch`](tributary_proto::Epoch) names a reconciliation
-  /// GENERATION, not one instruction, so every ordinary change routed after a
-  /// `Rescan` carries that same generation, and "no emit at this generation is
-  /// queued" reads false on any lane that is merely busy — forever, on one that
-  /// stays busy. A watermark cannot be hidden that way: it only rises, so it has
-  /// no earlier reading to be mistaken for, and traffic behind an instruction can
-  /// only push it further past whatever is being waited for, never back below it.
-  ///
-  /// Ordering it against a QUEUED instruction is exact because a `Rescan` bumps
-  /// the generation before it is minted (see [`Epoch`](tributary_proto::Epoch)):
-  /// everything already queued ahead of one carries a strictly smaller
-  /// generation, and the effect queue is FIFO. So the watermark first reaches a
-  /// queued `Rescan`'s generation by that `Rescan` being accepted — anything else
-  /// stamped at or above it was minted later and is offered behind it.
-  ///
-  /// Starts at [`Epoch::START`](tributary_proto::Epoch::START), which no `Rescan`
-  /// can carry — the bump precedes the mint — so a scope whose consumer has taken
-  /// nothing reads below every cover it could owe.
-  delivered_through: tributary_proto::Epoch,
   park: Park,
   /// The journal id counter wrapped; any minted resume token is invalid.
   resume_poisoned: bool,
@@ -1686,10 +1668,6 @@ pub(crate) struct DriverCore {
   /// that no external input will bring it back for. Read and cleared by
   /// [`take_cover_flush_due`](Self::take_cover_flush_due).
   cover_flush_due: bool,
-  /// Whether the consumer dropped its event stream, so no queued or parked
-  /// change can ever be delivered again — see
-  /// [`on_consumer_gone`](Self::on_consumer_gone).
-  consumer_gone: bool,
   scope_seq: u64,
   probe_seq: u64,
   fence_seq: u64,
@@ -1749,7 +1727,6 @@ impl DriverCore {
       adoption_seals: BTreeMap::new(),
       settled_covers: Vec::new(),
       cover_flush_due: false,
-      consumer_gone: false,
       scope_seq: 0,
       probe_seq: 0,
       fence_seq: 0,
@@ -1942,7 +1919,6 @@ impl DriverCore {
         refresh_stale: false,
         refresh_world_stale: false,
         lag: LagState::Normal,
-        delivered_through: tributary_proto::Epoch::START,
         park: Park::default(),
         resume_poisoned: false,
         publicly_live: false,
@@ -2763,51 +2739,30 @@ impl DriverCore {
         .pending
         .partition_point(|pending| pending.opened <= through);
       // THE COVER THE STANDING STAT LOSS OWES. The mark above degrades this
-      // tranche's verdict; a degraded verdict promises the consumer a covering
-      // `Rescan` in band, and this condition is the one loss source that stands
-      // none of its own — the read that queued the stat reconciled nothing for
-      // the slot, and a pure grow or a record-driven cold read stands no
-      // `Rescan` at all. So it is stood HERE, scope-level, where the verdict is
-      // minted: the darkness cannot be covered at the slot (that is what the
-      // outstanding request means), and the root-covering `Rescan` is the
-      // re-enumerate instruction the degraded verdict already carries.
+      // tranche's verdict; a degraded verdict reports a covering `Rescan`
+      // EMITTED for the gap, and this condition is the one loss source that
+      // stands none of its own — the read that queued the stat reconciled
+      // nothing for the slot, and a pure grow or a record-driven cold read
+      // stands no `Rescan` at all. So it is stood HERE, scope-level, where the
+      // verdict is minted: the darkness cannot be covered at the slot (that is
+      // what the outstanding request means), and the root-covering `Rescan` is
+      // the re-enumerate instruction the degraded verdict names.
       //
-      // The tranche is then HELD — entry intact, exactly like the deferrals
-      // above — until that `Rescan` is ON the consumer's stream, so it is there
-      // before any pass answers the caller with the verdict it covers. What ends
-      // the hold is the delivery OUTCOME, never the act of queuing: the loop-top
-      // `try_send` REFUSES a queued change whenever the consumer's channel is
-      // full, parking it instead of delivering it, and a hold spent on the
-      // enqueue answers over an instruction nobody has been given.
+      // The tranche is then held for exactly ONE pass — entry intact, exactly
+      // like the deferrals above — so the driver's re-top
+      // ([`take_cover_flush_due`](Self::take_cover_flush_due)) flushes the
+      // instruction to the consumer's channel before the next observation
+      // answers the caller. That is the same ordering every OTHER `Degraded`
+      // producer gets for free: its cover is queued by an earlier pass and
+      // offered by this pass's loop-top flush.
       //
-      // That outcome is a RECORDED fact — the scope's delivery watermark
-      // ([`ScopeState::delivered_through`]), raised by acceptances alone — and
-      // not a state the lane is read for. Every inference off the lane fails in
-      // one direction or the other: the enqueue overstates delivery, and the
-      // absence of a queued emit at the cover's generation understates it,
-      // because ordinary traffic routed after the cover carries that same
-      // generation and would keep a busy-but-healthy lane held forever.
-      //
-      // What bounds the hold — since waiting on a delivery that never arrives is
-      // the wedge this signal exists to avoid:
-      //
-      // - a CLOSED consumer channel discharges it. No offer can ever land, the
-      //   driver records the closure at the offer that learns it
-      //   ([`on_consumer_gone`](Self::on_consumer_gone)), and that offer is
-      //   always made — the queued cover at the re-top's flush, a parked one on
-      //   the delivery retry below.
-      // - a FULL one is retried on the scope's own delivery deadline
-      //   (`DELIVERY_RETRY`, which [`poll_timeout`](Self::poll_timeout) carries),
-      //   so the loop is brought back for it and the hold ends at the first
-      //   offer the consumer accepts. Only the pass that STANDS the cover asks
-      //   the driver to re-top ([`take_cover_flush_due`](Self::take_cover_flush_due));
-      //   the waiting passes DEFER like every other deferral here, so no re-top
-      //   run grows and the driver's bounded-service invariant is untouched.
-      // - the close drain never holds at all
-      //   ([`orders_stat_cover`](SettlePass::orders_stat_cover)), and a caller
-      //   that cancels has its fence abandoned at the driver's choke point — so
-      //   the remaining wait is on the consumer reading ONE event, and a
-      //   consumer that never reads can still close or cancel out of it.
+      // The hold ends there and is never extended by the offer's OUTCOME. A
+      // refused cover is parked as the scope's dominating instruction and rides
+      // the lane's own delivery retry, BEHIND the verdict — because `Degraded`
+      // promises emission, not delivery, and a hold that waited for an
+      // acceptance would make a caller's own `set_cover` reply depend on that
+      // caller reading its event stream. Nothing here reads the lane, the
+      // channel, or the consumer.
       //
       // Only where a verdict is actually minted (`split > 0`): an observation
       // that resolves no fence — a bare loss-memory entry, or a tranche no proof
@@ -2819,33 +2774,23 @@ impl DriverCore {
       let (stat_cover, held) = if pass.orders_stat_cover() {
         match stood {
           // Nothing stood yet, and this pass mints a verdict over the standing
-          // loss: stand the cover and hold the tranche for it.
+          // loss: stand the cover and hold the tranche for the flush that offers
+          // it.
           StatCover::Unstood if stat_loss && split > 0 => match self.stand_stat_cover(scope) {
-            StatCover::Awaiting(owed) => (StatCover::Awaiting(owed), true),
-            // Nothing was stood, so nothing is owed and nothing is waited for: a
+            StatCover::Stood => (StatCover::Stood, true),
+            // Nothing was stood, so nothing is owed and nothing is ordered: a
             // kernel-recursive scope stats no slot, and a torn-down one has no
             // consumer left to instruct.
-            discharged => (discharged, false),
+            StatCover::Unstood => (StatCover::Unstood, false),
           },
           // No verdict over a standing loss here: nobody is instructed, so nobody
           // is owed a cover.
           StatCover::Unstood => (StatCover::Unstood, false),
-          // Stood, and the consumer has it.
-          StatCover::Awaiting(owed) if self.stat_cover_landed(scope, owed) => {
-            (StatCover::Discharged, false)
-          }
-          // Stood and still undelivered — after a refusal folded it into the
-          // scope's parked instruction, or after a proof invalidation deferred
-          // this tranche past it. The latch is PRESERVED through both.
-          //
-          // Held only while there is still a verdict to hold BACK (`split > 0`),
-          // by the same rule that stands the cover: an observation resolving no
-          // fence answers nobody, so holding it would strand the entry itself —
-          // a tranche whose fences were all abandoned would never reach the
-          // resolution that removes it.
-          StatCover::Awaiting(owed) => (StatCover::Awaiting(owed), split > 0),
-          // Delivered for this tranche already; a later lag cannot un-deliver it.
-          StatCover::Discharged => (StatCover::Discharged, false),
+          // Stood on an earlier pass, so its flush has already run — or a proof
+          // invalidation deferred this tranche past it, which is a longer wait
+          // still. Either way the instruction is out and the verdict may follow;
+          // the latch is preserved so no second cover is stood.
+          StatCover::Stood => (StatCover::Stood, false),
         }
       } else {
         (stood, false)
@@ -2903,98 +2848,41 @@ impl DriverCore {
   }
 
   /// Whether the last [`poll_cover_settlements`](Self::poll_cover_settlements)
-  /// stood a covering `Rescan` and held its tranche for it, clearing the flag as
-  /// it reports.
+  /// stood a covering `Rescan` and held its tranche for the flush that offers
+  /// it, clearing the flag as it reports.
   ///
   /// The driver re-tops on `true`: the loop-top effect flush OFFERS that
-  /// `Rescan` to the consumer's stream, and the pass that answers the caller
-  /// with the degraded verdict it covers runs only once an offer is accepted. It
+  /// `Rescan` to the consumer's stream, and the next pass — the one that answers
+  /// the caller with the degraded verdict naming it — runs behind that offer. It
   /// is the ONE settlement outcome no external input would bring the loop back
   /// for.
   ///
-  /// Raised by the pass that STANDS a cover and by no other — one re-top per held
-  /// tranche, so the re-top run stays a single pass and the driver's
-  /// bounded-service invariant is untouched. A hold that outlives that first
-  /// offer (a full channel refused it) reports nothing here: it waits on the
-  /// scope's own delivery retry, which [`poll_timeout`](Self::poll_timeout)
-  /// already carries into the driver's select, and defers in the meantime.
+  /// Raised by the pass that STANDS a cover and by no other — one re-top per
+  /// held tranche, so the re-top run stays a single pass and the driver's
+  /// bounded-service invariant is untouched. What the flush then makes of the
+  /// cover changes nothing here: a refused one is parked, and a lane already
+  /// lagging absorbed it into its parked instruction before the flush ran. Both
+  /// ride the scope's delivery retry, behind a verdict that has already
+  /// answered.
   pub(crate) fn take_cover_flush_due(&mut self) -> bool {
     std::mem::take(&mut self.cover_flush_due)
   }
 
   /// Stands the covering `Rescan` a standing stat loss owes the tranche about to
-  /// resolve, and reports what that tranche must now wait for.
+  /// resolve, and reports whether one was stood.
   ///
-  /// [`StatCover::Awaiting`] carries the epoch of the instruction that
-  /// discharges the hold: the `Rescan` just queued, or — where the lane was
-  /// already lagging — the scope's parked dominating one it was folded into,
-  /// whose epoch INV-PARK advanced to this mint's and whose coverage cannot have
-  /// narrowed. [`StatCover::Discharged`] where nothing was stood or nothing was
-  /// routed: a kernel-recursive scope stats no slot, and a torn-down one has no
-  /// consumer left to instruct.
+  /// [`StatCover::Stood`] asks the driver for the single re-top whose flush
+  /// offers it. [`StatCover::Unstood`] where nothing was stood: a
+  /// kernel-recursive scope stats no slot, and a torn-down one has no consumer
+  /// left to instruct — so nothing is ordered and the tranche resolves where it
+  /// stands.
   fn stand_stat_cover(&mut self, scope: ScopeId) -> StatCover {
     if !self.monitor.cover_stat_loss(scope) {
-      return StatCover::Discharged;
+      return StatCover::Unstood;
     }
     self.drain_monitor();
-    let Some(owed) = self.stat_cover_owed(scope) else {
-      return StatCover::Discharged;
-    };
     self.cover_flush_due = true;
-    StatCover::Awaiting(owed)
-  }
-
-  /// The epoch of the instruction now carrying `scope`'s just-stood cover: the
-  /// parked dominating `Rescan` where the lane is lagging, else the last `Rescan`
-  /// queued for the scope.
-  fn stat_cover_owed(&self, scope: ScopeId) -> Option<tributary_proto::Epoch> {
-    match &self.scopes.get(&scope)?.lag {
-      LagState::Normal => self.effects.iter().rev().find_map(|effect| match effect {
-        Effect::Emit {
-          scope: emitted,
-          change,
-          ..
-        } if *emitted == scope && change.kind().is_rescan() => Some(change.epoch()),
-        _ => None,
-      }),
-      LagState::Lagged { parked, .. } => parked.as_ref().map(Change::epoch),
-    }
-  }
-
-  /// Whether the cover stood at `owed` has reached the consumer's stream.
-  ///
-  /// The scope's delivery watermark answers it directly
-  /// ([`ScopeState::delivered_through`]): the consumer has taken some change at
-  /// `owed` or beyond. Nothing about the QUEUE is consulted, and that is the
-  /// point — an epoch names a reconciliation generation and not one instruction,
-  /// so an ordinary change routed after the cover carries the very same one. Any
-  /// test that reads "is something at this generation still pending" therefore
-  /// answers "yes" for unrelated traffic, and a lane that keeps producing would
-  /// hold its tranche for as long as it stayed busy, however promptly the
-  /// consumer took the cover itself.
-  ///
-  /// The watermark is exact in the other direction too, so this is not a
-  /// weakening. A `Rescan`'s generation is bumped before it is minted, the effect
-  /// queue is FIFO, and a lagged lane's fold advances the parked change's epoch to
-  /// the newest mint's — so everything ordered ahead of the covering instruction
-  /// carries a strictly smaller generation, and the watermark can first reach
-  /// `owed` only by the cover, or by the never-narrowing instruction that absorbed
-  /// it, being ACCEPTED. That is why a refusal — which purges the queued cover and
-  /// folds it into an epoch-bumped dominating `Rescan`, leaving no trace of the
-  /// original to look for — costs the wait nothing: the replacement carries a
-  /// generation at or above `owed`, and delivering it is delivering the cover.
-  ///
-  /// TERMINAL, never held, wherever no offer can ever land: the consumer's
-  /// channel is closed, or the scope is gone — in which case the resolution
-  /// folds its fences to [`Dead`](CoverSettle::Dead) anyway.
-  fn stat_cover_landed(&self, scope: ScopeId, owed: tributary_proto::Epoch) -> bool {
-    if self.consumer_gone {
-      return true;
-    }
-    let Some(state) = self.scopes.get(&scope) else {
-      return true;
-    };
-    state.delivered_through >= owed
+    StatCover::Stood
   }
 
   /// The cookie dispatch's deficit seam: re-signals `scope`'s standing
@@ -3996,7 +3884,7 @@ impl DriverCore {
         && matches!(entry.attempt, Attempt::InFlight(_))
       {
         match delivery {
-          Delivery::Accepted(_) => {
+          Delivery::Accepted => {
             self.dying.remove(&scope);
           }
           Delivery::Refused => {
@@ -4008,17 +3896,8 @@ impl DriverCore {
       }
       return;
     };
-    // THE WATERMARK RISES HERE AND NOWHERE ELSE — at the acceptance, from the
-    // accepted change's own generation. `max` rather than assignment so the field
-    // is monotone by construction rather than by the caller's ordering: a lagged
-    // lane can legitimately have a since-replaced offer accepted after a newer
-    // instruction was parked, and a watermark that could fall would be an earlier
-    // reading for a later one to be mistaken for.
-    if let Delivery::Accepted(epoch) = delivery {
-      state.delivered_through = state.delivered_through.max(epoch);
-    }
     match (delivery, &mut state.lag) {
-      (Delivery::Accepted(_), LagState::Lagged { parked, attempt }) => {
+      (Delivery::Accepted, LagState::Lagged { parked, attempt }) => {
         let delivered_current = match (parked.as_ref(), &attempt) {
           (Some(change), Attempt::InFlight(epoch)) => change.epoch() == *epoch,
           _ => false,
@@ -4031,7 +3910,7 @@ impl DriverCore {
           *attempt = Attempt::Idle;
         }
       }
-      (Delivery::Accepted(_), LagState::Normal) => {}
+      (Delivery::Accepted, LagState::Normal) => {}
       (Delivery::Refused, LagState::Normal) => {
         state.lag = LagState::Lagged {
           parked: None,
@@ -4052,18 +3931,6 @@ impl DriverCore {
         };
       }
     }
-  }
-
-  /// Records that the consumer dropped its event stream: nothing queued or
-  /// parked can ever be delivered again.
-  ///
-  /// Fed by the driver at the offer that learns it, and never cleared — a closed
-  /// channel does not reopen. It exists so an ordering hold discharges
-  /// TERMINALLY instead of waiting on a delivery that can no longer happen: a
-  /// dropped stream reports no [`Delivery`] outcome at all, so a lagged lane's
-  /// in-flight mark is never released and its parked change is never re-offered.
-  pub(crate) fn on_consumer_gone(&mut self) {
-    self.consumer_gone = true;
   }
 
   /// Advances time: resolves rename halves whose pairing window elapsed,
