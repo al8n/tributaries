@@ -219,9 +219,23 @@ const DEFICIT_CAP: usize = 16;
 /// closing `Rescan` a sync barrier's fence must observe. Either bit alone must
 /// NOT fire: `saw_rescan` alone is a lossy window that armed nothing fresh
 /// (every watch stayed armed, post-`Rescan` changes were recorded live), and
-/// `fresh_rearm` alone is a pure set-cover regrow of pruned coverage (the
-/// region was outside every committed claim; firing would degrade every
-/// prune/regrow cycle).
+/// `fresh_rearm` alone is a set-cover regrow whose newly-armed ground read
+/// back EMPTY — there was nothing under it for the suppression to absorb, so
+/// firing would degrade every prune/regrow cycle for no instruction at all.
+///
+/// That second clause is a fact about the READ, and it is not a licence for
+/// the GROW. A regrow re-covers ground that was DARK — pruned earlier, or
+/// never covered at all — and a suppressed crawl announces nothing for it, so
+/// whatever that ground already held is absorbed in silence: no record names
+/// it (no watch was armed to record one) and no listing reports it (the crawl
+/// emits no `Created`). Where the freshly-armed node's own re-arm read comes
+/// back WITH content, the window's loss half is that regrow's own to supply,
+/// and it is supplied at the read rather than at the install because the
+/// install cannot yet know. See
+/// [`mark_fresh_install`](Monitor::mark_fresh_install) for where the
+/// obligation is stated and
+/// [`settle_dark_install`](Monitor::settle_dark_install) for where its verdict
+/// is taken.
 ///
 /// `bootstrap` is the REGISTRATION window's own mark, and it is not a half of
 /// that conjunction. It is seeded at
@@ -529,6 +543,9 @@ enum_with_all! {
     Adoption,
     /// The coverage deficits anchored at this node (see [`DeficitBook`]).
     Deficits,
+    /// The unanswered content question a suppressed crawl's FRESH install left
+    /// on this node ([`dark_installs`](Monitor::dark_installs)).
+    DarkInstall,
   }
 }
 
@@ -1366,6 +1383,27 @@ pub struct Monitor {
   /// ([`ingest_watch_result`](Self::ingest_watch_result)) instead of leaving one
   /// for the pairing to re-prove.
   dirtied_holds: BTreeSet<WatchId>,
+  /// Nodes a suppressed crawl installed over ground that carried NO watch —
+  /// dark ground — and whose own re-arm read has not yet said what that ground
+  /// already held.
+  ///
+  /// The marker is a deferral, and the deferral is forced. Whether newly-armed
+  /// ground holds content the suppression is about to absorb in silence is not
+  /// knowable at the install, and is knowable at exactly one later moment: that
+  /// node's own listing. So the install states the QUESTION here and the read
+  /// answers it — the one thing in this file's marker family that records an
+  /// unanswered question rather than coverage already taken on.
+  ///
+  /// Set at the named install sites through
+  /// [`mark_fresh_install`](Self::mark_fresh_install); consumed at the node's
+  /// first evidence-clean completed read
+  /// ([`settle_dark_install`](Self::settle_dark_install)) WHICHEVER way the
+  /// verdict goes, and at the exhaustion of its bounded retries
+  /// ([`handle_incomplete_enumerate`](Self::handle_incomplete_enumerate)); it
+  /// rides a mid-re-arm replacement across [`reconcile_slot`](Self::reconcile_slot)
+  /// with the obligation it belongs to, and is reclaimed with the node by the
+  /// drop walk ([`NodeMarker::DarkInstall`]).
+  dark_installs: BTreeSet<WatchId>,
   /// Per-scope bridge-window flags (see [`BridgeFlags`]), flushed into a
   /// closing `Rescan` at the scope's settle edge by
   /// [`settle_bridges`](Self::settle_bridges).
@@ -1564,6 +1602,7 @@ impl Monitor {
       pending_moves: BTreeMap::new(),
       held_sources: BTreeSet::new(),
       dirtied_holds: BTreeSet::new(),
+      dark_installs: BTreeSet::new(),
       bridge: BTreeMap::new(),
       deficits: BTreeMap::new(),
       held_by_scope: BTreeMap::new(),
@@ -3984,6 +4023,31 @@ impl Monitor {
         }
       }
     }
+
+    // The deferred verdict a FRESH suppressed install left on `dir`: if this
+    // node was armed over dark ground and its own listing has content, the
+    // window's loss half is `dir`'s to supply (`settle_dark_install`).
+    //
+    // THE ROUTING IS THE CONSERVATISM, and it is asserted rather than assumed.
+    // The early return above sends every read that is incomplete, dirtied, or
+    // not evidence about this node to `handle_incomplete_enumerate`, so only an
+    // evidence-clean COMPLETE listing reaches this line — which is what makes
+    // an empty `entries` mean "this ground is empty" rather than "this read
+    // could not say". Nothing here re-derives that; a routing change that let a
+    // truncated listing through would silently turn ignorance into a verdict of
+    // no-content, so it trips here instead.
+    //
+    // Taken AFTER the dispatch, deliberately. The crawl's own cover gate reads
+    // `bridge_is_lossy` to decide whether it may stay silent, and firing ahead
+    // of it would let this verdict answer for a RETIREMENT the crawl made —
+    // a different obligation, with a different vehicle. Ordering is otherwise
+    // immaterial: the fire is a per-scope bit, and the window is flushed by the
+    // public entry point once all of this result's cascading is done.
+    debug_assert!(
+      !res.forces_rescan() && !dirty && lowering.is_evidence(),
+      "a dark-install verdict is only ever taken on an evidence-clean complete listing"
+    );
+    self.settle_dark_install(dir, scope, res.entries());
   }
 
   /// The part of a listing that can only ADD coverage at `dir`: a name `dir` does
@@ -4047,8 +4111,8 @@ impl Monitor {
     for entry in entries {
       let occupant = Self::entry_occupant(entry.kind());
       // The occupation check, taken BEFORE the reconcile that performs the
-      // install — the fresh/survivor distinction the registration window's loss
-      // half keys on. Named install site #2; the HELD route is the reason it is
+      // install — the fresh/survivor distinction both of the window's loss
+      // halves key on. Named install site #2; the HELD route is the reason it is
       // here at all (a held read suppresses its own `Rescan` below, so an
       // in-window additive install there has no other cover), and it must be the
       // reconcile pass and never the cascade below, which re-arms survivors and
@@ -4057,7 +4121,11 @@ impl Monitor {
         matches!(occupant, SlotOccupant::Dir) && self.child_watch(dir, entry.name()).is_none();
       let _ = self.reconcile_slot(dir, scope, entry.name(), occupant, false, entry.node());
       if fresh {
-        self.mark_bootstrap_loss(scope);
+        // Read back AFTER the reconcile, which is what performed the install:
+        // the deferred half is recorded against the minted node, so the answer
+        // rides the node rather than this listing.
+        let installed = self.child_watch(dir, entry.name());
+        self.mark_fresh_install(scope, installed);
       }
     }
     // Cascade the re-arm into EVERY child of `dir` — those in a name-slot AND any
@@ -4099,6 +4167,22 @@ impl Monitor {
       self.queue_enumerate(dir, EnumKind::Rearm { reprove }, attempts + 1);
       return;
     }
+    // Retries exhausted, so `dir`'s own complete listing is never going to
+    // arrive and its dark-install verdict can never be taken
+    // ([`settle_dark_install`](Self::settle_dark_install)). The marker is
+    // consumed here rather than left standing, for the same reason the verdict
+    // consumes it on the empty case: a marker that outlived its interval would
+    // be answered by some LATER re-arm of this node with that read's content,
+    // standing a loss half for a window this install had nothing to do with. It
+    // deliberately SURVIVES the bounded retries in between — each attempt is a
+    // fresh chance at the verdict, and the one that completes clean takes it.
+    //
+    // The interval itself is covered twice over without it: this path stood its
+    // own per-attempt `Rescan` above, and the interior deficit booked below
+    // keeps the unreconciled interior re-signalling past that `Rescan`. The HELD
+    // flavor suppresses both (`deliver`), and there the interval belongs to the
+    // hold's pairing, whose destination re-arm is counted.
+    self.dark_installs.remove(&dir);
     // Retries exhausted with an adoption edge still unverified, and no read
     // left that could ever prove it. The marker cannot simply be kept — past
     // the bounded retries it would hold `coverage_settled` down with nothing
@@ -4427,8 +4511,16 @@ impl Monitor {
     //
     // ONE opening `Rescan` per crawl, at the crawled directory, NOT one per child and
     // not one per flavor: an identity-less backend can confirm NO child, so a per-child
-    // emit would storm one `Rescan` per entry of every re-armed listing. A crawl that
-    // retires nothing owes nothing, so an ordinary prune-free grow stays silent.
+    // emit would storm one `Rescan` per entry of every re-armed listing.
+    //
+    // `retired` is the whole of what this gate answers for, and it is a claim about
+    // DESTRUCTION alone: a crawl that retires nothing destroyed no coverage, so it owes
+    // nothing HERE and an ordinary prune-free grow leaves this gate silent. It says
+    // nothing at all about ground the crawl ARMED for the first time, whose contents no
+    // listing of this window ever reported. That is a separate obligation with a
+    // separate vehicle — stated at the install below (`mark_fresh_install`), settled by
+    // the freshly-armed node's OWN read (`settle_dark_install`), and paid on the
+    // window's CLOSING `Rescan` rather than on this opening one.
     if retired && !(rebuilt_every_retirement && self.bridge_is_lossy(scope)) {
       self.emit_rescan(scope, self.location_of(dir));
     }
@@ -4441,14 +4533,15 @@ impl Monitor {
       }
       if self.child_watch(dir, entry.name()).is_none() {
         let _ = self.install_child(dir, scope, entry.name().clone(), true, entry.node());
-        if let Some(fresh) = self.child_watch(dir, entry.name()) {
+        let fresh = self.child_watch(dir, entry.name());
+        if let Some(fresh) = fresh {
           let _ = self.inherit_rearm(fresh);
         }
         // The occupation check above IS the fresh/survivor distinction, so the
-        // registration window's loss half is stated right here — a survivor
-        // re-armed by the branch above never reaches it. Named install site #1;
-        // see `mark_bootstrap_loss`.
-        self.mark_bootstrap_loss(scope);
+        // window's loss halves are stated right here — a survivor re-armed by
+        // the branch above never reaches it, having been covered already. Named
+        // install site #1; see `mark_fresh_install`.
+        self.mark_fresh_install(scope, fresh);
       }
     }
     // Book every unclassifiable name as darkness and ask for its kind — and hand that
@@ -6427,14 +6520,29 @@ impl Monitor {
         // Replacing a mid-re-arm watch must not lose its re-arm obligation: capture it
         // before the drop and pass it to the fresh watch, so a subtree being re-armed
         // during an overflow stays covered when a move-in replaces its slot.
+        //
+        // The obligation does not travel alone. A replacement of a mid-re-arm incumbent
+        // IS a fresh watch over ground no watch covers — the incumbent is torn down
+        // first — and it is read-SUPPRESSED, because the inherited obligation is what
+        // flavors its post-arm read. That is the whole of what a named install site
+        // means, reached at neither of them, so the unanswered content question the
+        // incumbent was carrying (`dark_installs`) rides across with the obligation it
+        // belongs to; dropping it here would let the replacement's pre-arm content be
+        // absorbed with no fire in an otherwise-clean window. Captured before the drop,
+        // whose walk reclaims the marker from the incumbent.
         let mut inherit = false;
+        let mut dark = false;
         if replace && let Some(stale) = existing {
           inherit = self.has_rearm_obligation(stale);
+          dark = inherit && self.dark_installs.contains(&stale);
           self.drop_subtree(stale, DeficitDischarge::CoveringRescan);
         }
         let healed = self.install_child(parent, scope, name.clone(), true, identity);
         if inherit && let Some(fresh) = self.child_watch(parent, name) {
           let _ = self.inherit_rearm(fresh);
+          if dark {
+            self.dark_installs.insert(fresh);
+          }
         }
         healed
       }
@@ -7493,6 +7601,34 @@ impl Monitor {
         true => ErasedCover::Discharge,
         false => ErasedCover::Nothing,
       },
+      // A fresh install destroyed before its verdict. NOTHING is owed, and the
+      // argument runs through the DESTROYERS rather than through the marker:
+      // this is the one entry in the enum that records an unanswered QUESTION
+      // rather than coverage already taken on, so there is no interval of the
+      // monitor's own for its erasure to strand. Every path that can reach a
+      // node still holding it carries its own cover:
+      //
+      // - a crawl retirement sets `retired`, so the crawl either stands its
+      //   opening `Rescan` or defers to a window already marked lossy whose
+      //   closing `Rescan` postdates the retirement;
+      // - a mid-re-arm REPLACEMENT does not destroy the question at all — it
+      //   transfers with the obligation (see `reconcile_slot`);
+      // - a record-driven vanish (`Removed`, a `File` over the slot, an
+      //   unpairable move-out) converges an all-interest consumer on the record
+      //   itself, and its walk carries `CoveringRescan` for anything it erased;
+      // - a refused arm stands a `Rescan` at the slot and books the hole before
+      //   dropping the node;
+      // - a terminal teardown has no barrier left to lie to.
+      //
+      // Answering `Discharge` or `Counted` instead would not be conservative,
+      // it would be wrong in the loud direction: every record-driven drop of a
+      // pending fresh node would stand a spurious cover for ground whose
+      // content was never established, which is the regrow degradation the
+      // content gate exists to prevent.
+      NodeMarker::DarkInstall => {
+        self.dark_installs.remove(&id);
+        ErasedCover::Nothing
+      }
     }
   }
 
@@ -7930,6 +8066,21 @@ impl Monitor {
   /// The registration window's LOSS half: a FRESH directory install by a
   /// suppressed crawl, while the bootstrap mark stands, marks the window lossy.
   ///
+  /// This is ONE of the two halves a fresh install can owe, and the other is
+  /// not stated here: see [`mark_fresh_install`](Self::mark_fresh_install), the
+  /// funnel the named sites actually call, which states both. What is
+  /// bootstrap-only is the CONTENT-BLINDNESS below — inside the registration
+  /// window the loss half stands on the install alone, with no regard for what
+  /// the ground turns out to hold. Outside it the same install owes a cover
+  /// only where the ground it armed really held something, and that half is
+  /// deferred to the node's own read
+  /// ([`settle_dark_install`](Self::settle_dark_install)).
+  ///
+  /// Content-gating THIS half would break a shipped contract rather than
+  /// tighten one: a root whose only subdirectory is EMPTY still delivers its
+  /// one `Rescan` at coverage settle, and a content gate here is exactly what
+  /// would silence it.
+  ///
   /// A suppressed crawl announces no `Created`, so ground it arms for the first
   /// time may hold an entry created between the grant and that directory's own
   /// arm — recorded by no kernel watch (the arm-before-readdir invariant is
@@ -7940,8 +8091,8 @@ impl Monitor {
   /// A SURVIVOR re-arm deliberately never calls this: a survivor was already
   /// covered, so only newly-armed ground can hold an unreported pre-arm
   /// creation. The distinction is exactly [`install_child`]'s occupation check,
-  /// which is why this is called at the named install sites and never inside the
-  /// generic funnels ([`insert_node`](Self::insert_node),
+  /// which is why the funnel carrying this is called at the named install sites
+  /// and never inside the generic funnels ([`insert_node`](Self::insert_node),
   /// [`set_state`](Self::set_state), [`inherit_rearm`](Self::inherit_rearm)):
   /// those cannot tell a suppressed-crawl install from a record-driven cold one,
   /// and a funnel-level rule would fire on a kernel `Created` racing the
@@ -7960,6 +8111,90 @@ impl Monitor {
   /// [`install_child`]: Self::install_child
   fn mark_bootstrap_loss(&mut self, scope: ScopeId) {
     if self.in_bootstrap_window(scope) {
+      self.bridge_saw_rescan(scope);
+    }
+  }
+
+  /// The named install sites' ONE statement of what a suppressed crawl's FRESH
+  /// install owes the bridge window — both halves, at one call, so a fourth
+  /// site cannot state one of them and forget the other.
+  ///
+  /// `fresh` is the watch the install minted, or `None` where the call has no
+  /// install to speak for. The two halves answer the same question — did this
+  /// crawl arm ground whose contents nothing ever reported? — on different
+  /// evidence, which is why neither subsumes the other:
+  ///
+  /// - **In the registration window** the answer is YES on the install alone
+  ///   ([`mark_bootstrap_loss`](Self::mark_bootstrap_loss)): the whole
+  ///   inventory is suppressed there, and the window's shipped contract makes
+  ///   even an empty subdirectory a covered case.
+  /// - **Outside it** the answer is yes only where the ground actually held
+  ///   something, and nothing at this line knows that yet — so the question is
+  ///   recorded against the node ([`dark_installs`](Self::dark_installs)) and
+  ///   settled by that node's own read.
+  ///
+  /// Idempotent where the two overlap. Under bootstrap the window is already
+  /// lossy by the time the deferred verdict lands, and `saw_rescan` is monotone
+  /// within a window, so the later fire sets a bit that already stands. That is
+  /// why the marker is recorded unconditionally rather than gated on being
+  /// outside the window: the gate would buy nothing and would be one more thing
+  /// for a fourth site to get wrong.
+  fn mark_fresh_install(&mut self, scope: ScopeId, fresh: Option<WatchId>) {
+    self.mark_bootstrap_loss(scope);
+    if let Some(fresh) = fresh {
+      self.dark_installs.insert(fresh);
+    }
+  }
+
+  /// Takes the deferred verdict a FRESH suppressed install left on `dir` (see
+  /// [`dark_installs`](Self::dark_installs)): the marker is CONSUMED, and iff
+  /// the node's own listing named at least one entry the window's loss half is
+  /// supplied.
+  ///
+  /// The rule: a suppressed crawl that installs a fresh watch supplies
+  /// `saw_rescan` iff that freshly-installed node's own re-arm read lists at
+  /// least one entry. Everything such a read names is content the consumer was
+  /// never told about — the crawl emits no `Created`, and no watch stood under
+  /// that ground to record anything — so a non-empty listing IS the absorbed
+  /// loss, and the window's closing `Rescan` is the one instruction that covers
+  /// it. Any ENTRY counts, not only a directory: a file written under the dark
+  /// ground before the arm was swallowed by the same silence.
+  ///
+  /// Consumed whichever way the verdict goes, and that is not tidiness. A
+  /// fresh-but-EMPTY node that kept its marker would answer some later,
+  /// unrelated re-arm of itself — an overflow recovery, a deficit heal kick —
+  /// with THAT read's content, standing a loss half for a window in which the
+  /// node armed no new ground at all. That is the prune/regrow degradation the
+  /// content gate exists to avoid, re-created one node at a time. The marker
+  /// asks about ONE interval, the install to the first read, and the first read
+  /// is the whole of its answer.
+  ///
+  /// The verdict is conservative because of where it is CALLED FROM, not
+  /// because of anything it checks. [`ingest_enumerate`](Self::ingest_enumerate)
+  /// routes an incomplete, dirtied or non-evidence read to
+  /// [`handle_incomplete_enumerate`](Self::handle_incomplete_enumerate) and
+  /// returns before reaching here, so `entries` is always an evidence-clean
+  /// COMPLETE listing: a read that cannot vouch for emptiness never gets to
+  /// call emptiness a verdict. That other path stands its own per-attempt
+  /// `Rescan` — which sets `saw_rescan` ahead of the coalesce check, so the
+  /// interval is covered while the retries run — and clears the marker itself
+  /// once they are exhausted. The conservatism is therefore INHERITED FROM
+  /// ROUTING, which is why the call site asserts it rather than trusting it: a
+  /// refactor that re-routed incomplete reads through this line would fail
+  /// loudly instead of quietly reading a truncated listing as "no content".
+  ///
+  /// One bit per SCOPE, so several fresh nodes firing in one window cost one
+  /// closing `Rescan` between them rather than one each. The window is always
+  /// still open when a fire lands: the marked node holds `rearm_pending`
+  /// continuously from its install to this read, and
+  /// [`settle_bridges`](Self::settle_bridges) skips an unsettled scope — so the
+  /// `fresh_rearm` half the install set is still standing here, and the
+  /// conjunction fires.
+  fn settle_dark_install(&mut self, dir: WatchId, scope: ScopeId, entries: &[DirEntry]) {
+    if !self.dark_installs.remove(&dir) {
+      return;
+    }
+    if !entries.is_empty() {
       self.bridge_saw_rescan(scope);
     }
   }
@@ -8431,6 +8666,19 @@ impl Monitor {
       assert!(
         self.held_sources.contains(dirtied),
         "a dirtied hold is a held source"
+      );
+    }
+    // A dark-install marker names a live node — the reverse check every marker
+    // side table carries, so a node that left the map without passing the drop
+    // walk cannot strand a verdict nothing will ever take. A STANDING marker on
+    // a live node is legal at any observation point, including a settled one:
+    // the question it holds is answered by that node's own read, which is a
+    // whole round trip away, and the counted re-arm the node is in is what
+    // holds the window open until it lands.
+    for fresh in &self.dark_installs {
+      assert!(
+        self.nodes.contains_key(fresh),
+        "a dark-install marker names a live node"
       );
     }
     // The incremental per-scope re-arm-pending counter equals a from-scratch

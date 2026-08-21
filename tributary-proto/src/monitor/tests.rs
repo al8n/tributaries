@@ -11516,11 +11516,19 @@ fn live_child_dir_ident(m: &mut Monitor, parent: WatchId, name: &str, id: Identi
 }
 
 /// The cover's overreach guard — the gate that keeps the fix bounded. The
-/// obligation is RETIREMENT, not churn: a crawl whose every incumbent is
-/// identity-confirmed retires no watch at all, so no `WatchId` is invalidated
-/// and no queued record is orphaned. A fresh name appearing beside the
-/// survivors is an ordinary set-cover grow. Neither may put a `Rescan` on the
-/// wire, or every prune-free grow would degrade.
+/// crawl's OPENING cover answers for RETIREMENT, not churn: a crawl whose
+/// every incumbent is identity-confirmed retires no watch at all, so no
+/// `WatchId` is invalidated and no queued record is orphaned, and the gate
+/// stays silent.
+///
+/// The fresh name `q` beside the survivors is a second obligation with a
+/// second vehicle, and here it is silent for its OWN reason rather than for
+/// the crawl's: a suppressed install over ground that reads back EMPTY
+/// absorbed nothing, so it supplies no loss half and the window closes on
+/// `fresh_rearm` alone. Ground that read back WITH content would stand the
+/// closing `Rescan` — see
+/// `a_regrow_over_dark_ground_with_content_stands_the_cover` — so what this
+/// cell pins is the emptiness of `q`, never a general licence for grows.
 #[test]
 fn a_crawl_that_retires_nothing_emits_nothing() {
   let mut m = per_dir();
@@ -11567,6 +11575,359 @@ fn a_crawl_that_retires_nothing_emits_nothing() {
     !m.has_coverage_deficit(scope(1)),
     "and books no phantom hole"
   );
+  m.assert_invariants();
+}
+
+/// The dark-ground cover (fail-on-old). A PURE set-cover grow re-covers ground
+/// the monitor had pruned away, and the crawl that re-arms it is suppressed: it
+/// installs watches and announces nothing. Anything that ground gained while it
+/// was dark is therefore absorbed in silence — no watch was armed to record it,
+/// and the re-arm read emits no `Created` — while the crawl RETIRES nothing, so
+/// the crawl's own cover gate stays silent too.
+///
+/// On old the window closed on `fresh_rearm` alone and the whole interval was
+/// lost: nothing supplied the loss half outside the registration window, so a
+/// sync barrier settled clean over `fresh`. The fix supplies it from the one
+/// place that can know — the freshly-armed node's own listing, which comes back
+/// with content.
+#[test]
+fn a_regrow_over_dark_ground_with_content_stands_the_cover() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+  let pruned = live_child_dir(&mut m, root, "drop");
+  assert!(
+    m.coverage_settled(scope(1)),
+    "the sequence starts from quiescence"
+  );
+
+  // The prune: `/r/drop` leaves coverage entirely. An unsubscribed prune stands
+  // nothing by contract, so the window this opens is CLEAN.
+  assert!(m.drop_watch_subtree(pruned));
+  let _ = drain_actions(&mut m);
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "an unsubscribed prune covers nothing"
+  );
+  assert!(m.coverage_settled(scope(1)));
+
+  // ... `mkdir /r/drop/fresh` lands HERE, with nothing watching it ...
+
+  // The re-cover. No overflow, no loss, no incomplete read: nothing has stood a
+  // `Rescan` for this scope, so the only cover this window can close with is one
+  // the regrow itself supplies.
+  assert!(m.rearm_watch_subtree(root).is_started());
+  let rearm = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_enumerate()
+        .filter(|e| e.dir() == root)
+        .map(|e| e.req())
+    })
+    .expect("the grow re-arm-enumerates the root");
+  m.on_enumerate(
+    rearm,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("drop"), FileKind::Dir)]),
+  );
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "the crawl retires nothing, so it opens nothing"
+  );
+  let regrown = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("the pruned directory re-installs");
+  m.ack_watch(regrown, Ok(WatchAck::Installed));
+  let read = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_enumerate()
+        .filter(|e| e.dir() == regrown)
+        .map(|e| e.req())
+    })
+    .expect("the re-installed directory re-arm-enumerates");
+
+  // The dark window's content, absorbed in silence: `fresh` is listed, and the
+  // suppressed read announces no `Created` for it.
+  m.on_enumerate(
+    read,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("fresh"), FileKind::Dir)]),
+  );
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "and the rebuild still announces nothing mid-window"
+  );
+  let fresh = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("the dark ground's directory arms");
+  m.ack_watch(fresh, Ok(WatchAck::Installed));
+  let fresh_read = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_enumerate()
+        .filter(|e| e.dir() == fresh)
+        .map(|e| e.req())
+    })
+    .expect("it re-arm-enumerates in turn");
+  m.on_enumerate(fresh_read, EnumerateResult::Ok(vec![]));
+
+  // The settle edge: `fresh_rearm` from the regrown install, `saw_rescan` from
+  // that node's own non-empty read.
+  assert!(m.rearm_settled(scope(1)));
+  assert!(m.coverage_settled(scope(1)));
+  let closing = drain_events(&mut m);
+  assert_eq!(
+    closing.len(),
+    1,
+    "one closing Rescan covers the dark interval: {closing:?}"
+  );
+  assert!(closing[0].kind().is_rescan());
+  assert_eq!(closing[0].location(), &Location::new());
+  m.assert_invariants();
+}
+
+/// The dark-ground cover's overreach guard, and the reason it is content-gated
+/// rather than keyed on the install. The same prune-then-regrow sequence over
+/// ground that comes back EMPTY absorbed nothing: there was no unreported
+/// content under it, so the closing `Rescan` would instruct the consumer to
+/// re-read nothing. Firing on the bare fresh install instead would put one on
+/// the wire for every prune/regrow cycle the monitor performs.
+#[test]
+fn a_regrow_over_empty_dark_ground_stays_silent() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+  let pruned = live_child_dir(&mut m, root, "drop");
+
+  assert!(m.drop_watch_subtree(pruned));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+  assert!(m.coverage_settled(scope(1)));
+
+  assert!(m.rearm_watch_subtree(root).is_started());
+  let rearm = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_enumerate()
+        .filter(|e| e.dir() == root)
+        .map(|e| e.req())
+    })
+    .expect("the grow re-arm-enumerates the root");
+  m.on_enumerate(
+    rearm,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("drop"), FileKind::Dir)]),
+  );
+  let regrown = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("the pruned directory re-installs");
+  m.ack_watch(regrown, Ok(WatchAck::Installed));
+  let read = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_enumerate()
+        .filter(|e| e.dir() == regrown)
+        .map(|e| e.req())
+    })
+    .expect("the re-installed directory re-arm-enumerates");
+
+  // Nothing was there while the ground was dark.
+  m.on_enumerate(read, EnumerateResult::Ok(vec![]));
+
+  assert!(m.rearm_settled(scope(1)));
+  assert!(m.coverage_settled(scope(1)));
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "empty dark ground absorbed nothing, so it owes nothing"
+  );
+  assert!(
+    !m.has_coverage_deficit(scope(1)),
+    "and books no phantom hole"
+  );
+  m.assert_invariants();
+}
+
+/// The marker's lifecycle guard: the question a fresh install leaves is spent
+/// at that node's FIRST evidence-clean read, whichever way the verdict goes.
+///
+/// A node whose first read comes back empty owes nothing — and must not keep
+/// the question standing, because the very same node is re-read later on
+/// ordinary occasions (an overflow recovery, a deficit heal kick, another
+/// grow). A marker cleared only on the firing branch would be answered by THAT
+/// read's content and stand a loss half for a window in which the node armed no
+/// new ground at all, re-creating the prune/regrow degradation one node at a
+/// time. Window two below is clean by construction: `n` appeared while `a` was
+/// watched, so its creation was recorded live.
+#[test]
+fn a_fresh_install_that_read_empty_owes_a_later_rearm_nothing() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+  let pruned = live_child_dir(&mut m, root, "a");
+  assert!(m.drop_watch_subtree(pruned));
+  let _ = drain_actions(&mut m);
+  let _ = drain_events(&mut m);
+
+  // Window one: the regrow arms `a` over ground that reads back EMPTY, so the
+  // question the install left is answered "no content" — and spent.
+  assert!(m.rearm_watch_subtree(root).is_started());
+  let rearm = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_enumerate()
+        .filter(|e| e.dir() == root)
+        .map(|e| e.req())
+    })
+    .expect("the grow re-arm-enumerates the root");
+  m.on_enumerate(
+    rearm,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("a"), FileKind::Dir)]),
+  );
+  let regrown = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("the pruned directory re-installs");
+  m.ack_watch(regrown, Ok(WatchAck::Installed));
+  let first = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_enumerate()
+        .filter(|e| e.dir() == regrown)
+        .map(|e| e.req())
+    })
+    .expect("the re-installed directory re-arm-enumerates");
+  m.on_enumerate(first, EnumerateResult::Ok(vec![]));
+  assert!(m.rearm_settled(scope(1)));
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "window one: empty ground owes nothing"
+  );
+  let _ = drain_actions(&mut m);
+
+  // Window two: an ordinary later re-arm of that SAME node, whose read now
+  // finds a directory that appeared while `a` was covered.
+  assert!(m.rearm_watch_subtree(regrown).is_started());
+  let second = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_enumerate()
+        .filter(|e| e.dir() == regrown)
+        .map(|e| e.req())
+    })
+    .expect("the later trigger re-arm-enumerates the same node");
+  m.on_enumerate(
+    second,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("n"), FileKind::Dir)]),
+  );
+  let n = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("the new name installs");
+  m.ack_watch(n, Ok(WatchAck::Installed));
+  let n_read = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == n).map(|e| e.req()))
+    .expect("and re-arm-enumerates in turn");
+  m.on_enumerate(n_read, EnumerateResult::Ok(vec![]));
+
+  assert!(m.rearm_settled(scope(1)));
+  assert!(m.coverage_settled(scope(1)));
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "window one's spent question answers nothing in window two"
+  );
+  m.assert_invariants();
+}
+
+/// The replace-inherit seam. A mid-re-arm incumbent replaced at its slot is
+/// torn down and re-installed, and the replacement is a FRESH watch over ground
+/// no watch covers, read-SUPPRESSED through the re-arm obligation it inherits —
+/// everything a named install site means, reached at neither of them. The
+/// unanswered content question rides across with the obligation, so the
+/// replacement's own listing still stands the cover its content is owed.
+///
+/// A `Modified`-only subscription is what makes the loss visible: the driving
+/// `Created` is interest-subject and delivers nothing at all here, so the
+/// closing `Rescan` is the whole of this consumer's instruction.
+#[test]
+fn a_replaced_fresh_install_carries_its_cover_to_the_replacement() {
+  let mut m = per_dir();
+  let root = live_root_idle_with(&mut m, scope(1), Interest::new().with_modified());
+
+  // A pure grow arms `d` over dark ground; its arm is still outstanding, so the
+  // node is mid-re-arm with its content question unanswered.
+  assert!(m.rearm_watch_subtree(root).is_started());
+  let rearm = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_enumerate()
+        .filter(|e| e.dir() == root)
+        .map(|e| e.req())
+    })
+    .expect("the grow re-arm-enumerates the root");
+  m.on_enumerate(
+    rearm,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("d"), FileKind::Dir).with_node(ident(1)),
+    ]),
+  );
+  let stale = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("the dark ground arms");
+  assert!(drain_events(&mut m).is_empty());
+
+  // The replacement: a `Created` naming a DIFFERENT object at the same name,
+  // landing before that arm is acknowledged.
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::Created)
+      .with_name(seg("d"))
+      .with_is_dir(true)
+      .with_node(ident(2)),
+    at(2),
+  );
+  assert!(!m.is_watched(stale), "the replaced incumbent is retired");
+  let replacement = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("the replacement arms in its place");
+  assert!(
+    drain_events(&mut m).is_empty(),
+    "a Modified-only subscriber is told nothing by the Created"
+  );
+
+  m.ack_watch(replacement, Ok(WatchAck::Installed));
+  let read = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| {
+      a.as_enumerate()
+        .filter(|e| e.dir() == replacement)
+        .map(|e| e.req())
+    })
+    .expect("the replacement re-arm-enumerates");
+  m.on_enumerate(
+    read,
+    EnumerateResult::Ok(vec![DirEntry::new(seg("x"), FileKind::Dir)]),
+  );
+  let x = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_watch().map(|w| w.id()))
+    .expect("its content arms in turn");
+  m.ack_watch(x, Ok(WatchAck::Installed));
+  let x_read = drain_actions(&mut m)
+    .iter()
+    .find_map(|a| a.as_enumerate().filter(|e| e.dir() == x).map(|e| e.req()))
+    .expect("and re-arm-enumerates");
+  m.on_enumerate(x_read, EnumerateResult::Ok(vec![]));
+
+  assert!(m.rearm_settled(scope(1)));
+  assert!(m.coverage_settled(scope(1)));
+  let closing = drain_events(&mut m);
+  assert_eq!(
+    closing.len(),
+    1,
+    "the transferred question still stands its cover: {closing:?}"
+  );
+  assert!(closing[0].kind().is_rescan());
+  assert_eq!(closing[0].location(), &Location::new());
   m.assert_invariants();
 }
 
