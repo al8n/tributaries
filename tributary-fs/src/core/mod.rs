@@ -1237,9 +1237,11 @@ enum ProbePurpose {
     /// member of an ambiguous same-fileID group, whose shared id must not
     /// pair anything.
     allow_cookie: bool,
-    /// The word also carried content/attrib bits; a surviving object then
-    /// owes a grounded `Modified` alongside the move half.
-    content_changed: bool,
+    /// The content and metadata facts the word carried alongside the rename.
+    /// A surviving object owes them as ONE grounded record beside the move
+    /// half, carrying every fact so either subscription admits it; an empty
+    /// set owes nothing.
+    content: Evidence,
   },
   /// A `RootChanged` needed the root's existence to pick the death signal.
   RootAlive { item: usize },
@@ -4906,7 +4908,7 @@ impl DriverCore {
         target,
         path,
         allow_cookie,
-        content_changed,
+        content,
       } => {
         match outcome {
           // Gone: the source half of a move out of (or within) the tree. A
@@ -4962,18 +4964,22 @@ impl DriverCore {
               rec = rec.with_cookie(cookie);
             }
             let mut planned = vec![Planned::Rec(rec)];
-            if content_changed {
-              // The word coalesced a content/attrib change with the rename;
-              // the survivor owes that truth alongside the move (existence
-              // subsumes any coalesced create/remove bits, but a content
-              // change is invisible to existence).
-              let rec = record_with(
-                state,
-                RecordKind::Modified,
-                target.clone(),
-                Some(kind.is_dir()),
-                node,
-              );
+            // The word coalesced content/metadata changes with the rename: a
+            // change existence cannot judge, so it rides the probe and is owed
+            // alongside the move. ONE record carries the WHOLE set, so a
+            // metadata-only subscription admits a chmod-with-rename that a
+            // `Modified` verb alone would have hidden from it. The set holds
+            // those two facts and no others: existence subsumes any coalesced
+            // create/remove bits at this probed site, and the `moved` fact
+            // already rides the `MovedTo` above.
+            //
+            // `None` is the empty set — most pure renames — and pushes
+            // NOTHING, exactly as the bool guard this replaced did. It must
+            // NOT fall back to the sibling arms' covering rescan, which would
+            // staple one onto every rename.
+            if let Some(rec) =
+              record_proved(state, content, target.clone(), Some(kind.is_dir()), node)
+            {
               planned.push(Planned::Rec(rec));
             }
             if kind.is_dir() || stale {

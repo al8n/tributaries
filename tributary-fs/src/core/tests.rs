@@ -94,9 +94,15 @@ fn alive_refresh(mounts: Vec<PathBuf>, authoritative: bool) -> MountRefresh {
 /// A core with one live scope rooted at `/r` on device 1, its birth refresh
 /// fed (an authoritative empty table): event-side trust is open.
 fn live_core() -> (DriverCore, ScopeId) {
+  live_core_with(Interest::all())
+}
+
+/// The same, under a narrowed subscription — the shape an admission claim
+/// needs, since `Interest::all()` admits on any fact at all.
+fn live_core_with(interest: Interest) -> (DriverCore, ScopeId) {
   let mut core = DriverCore::new(WINDOW, LIVENESS);
   let scope = core
-    .on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::FsEvents)
+    .on_watch(PathBuf::from("/r"), interest, BackendKind::FsEvents)
     .expect("a fresh scope registers");
   let effects = drain(&mut core);
   assert!(
@@ -1700,6 +1706,103 @@ fn impure_rename_words_never_take_the_pairing_fast_path() {
     emitted.iter().any(|c| c.kind().moved_from().is_some()),
     "the rename itself still pairs through the cookie window: {emitted:?}"
   );
+}
+
+/// One FSEvents rename word for a surviving `/r/new` that no source half
+/// accompanies — a move INTO the tree — carrying `extra` alongside the rename,
+/// under a scope subscribed to exactly `interest`.
+///
+/// A LONE half is what makes an admission claim decidable here: an
+/// evidence-granted PAIR always wears a covering rescan (see
+/// `same_batch_rename_pair_grounds_by_probes_into_single_moved`), and that
+/// rescan would stand behind any record the consumer was not admitted to,
+/// hiding the very silence these cells are about. Nothing waits on a timer
+/// either — the one probe is answered inside the fixture — so a claim about
+/// what this word delivers is decided by the drained effects.
+fn moved_in_word(interest: Interest, extra: &[FsEventFlags]) -> Vec<Effect> {
+  let (mut core, scope) = live_core_with(interest);
+  let mut word = vec![FsEventFlags::ITEM_RENAMED, FsEventFlags::ITEM_IS_FILE];
+  word.extend_from_slice(extra);
+  core.on_batch_events(scope, vec![ev("/r/new", flags(&word), 1, 42)], at(1));
+  let reqs = probes(&drain(&mut core));
+  assert_eq!(reqs.len(), 1, "the half probes for existence: {reqs:?}");
+  core.on_probe_result(
+    reqs[0].0,
+    ProbeOutcome::Present {
+      kind: FileKind::File,
+      file_id: NonZeroU64::new(42),
+      dev: 1,
+    },
+    at(2),
+  );
+  drain(&mut core)
+}
+
+#[test]
+fn a_rename_word_carrying_only_metadata_reaches_metadata_and_not_content() {
+  // The measured `mv a b; chmod 700 b` destination word: ITEM_IS_FILE |
+  // ITEM_CHANGE_OWNER | ITEM_RENAMED, carrying NO ITEM_MODIFIED. OR-ing the
+  // two facts into one bool minted a `Modified` record, whose evidence is
+  // `{modified}` alone: the metadata change then reached nobody who asked for
+  // exactly it, and — the effect list being empty, not merely short — no
+  // rescan stood behind the silence.
+  let effects = moved_in_word(
+    Interest::new().with_attrib(),
+    &[FsEventFlags::ITEM_CHANGE_OWNER],
+  );
+  let emitted = emits(&effects);
+  assert_eq!(
+    emitted.len(),
+    1,
+    "the metadata change reaches the subscription that asked for it: {effects:?}"
+  );
+  assert!(emitted[0].kind().is_modified(), "{emitted:?}");
+  assert_eq!(emitted[0].location(), &loc(&["new"]));
+
+  let effects = moved_in_word(
+    Interest::new().with_modified(),
+    &[FsEventFlags::ITEM_CHANGE_OWNER],
+  );
+  assert!(
+    emits(&effects).is_empty(),
+    "a chmod is not an edit: a content-only subscription is never told one happened: {effects:?}"
+  );
+}
+
+#[test]
+fn a_rename_word_proving_both_facts_is_admitted_by_either_subscription() {
+  // One word proving a content AND a metadata change, alongside the coalesced
+  // CREATED bit real words carry. ONE record answers it, taking its verb from
+  // the fact set (`Modified` outranks `Attrib`) while carrying both facts, so
+  // neither narrowed subscription is left out.
+  let extra = &[
+    FsEventFlags::ITEM_MODIFIED,
+    FsEventFlags::ITEM_XATTR_MOD,
+    FsEventFlags::ITEM_CREATED,
+  ];
+  for interest in [
+    Interest::new().with_attrib(),
+    Interest::new().with_modified(),
+  ] {
+    let effects = moved_in_word(interest, extra);
+    let emitted = emits(&effects);
+    assert_eq!(emitted.len(), 1, "one record, one change: {effects:?}");
+    // Existence already grounded this half: a folded-in `created` fact would
+    // win `Evidence::primary` and rename the record `Created`.
+    assert!(emitted[0].kind().is_modified(), "{emitted:?}");
+    assert_eq!(emitted[0].location(), &loc(&["new"]));
+  }
+
+  // The `moved` fact rides the move half alone; folding it in here too would
+  // hand a move-only subscription a second change for the same word.
+  let effects = moved_in_word(Interest::new().with_moved(), extra);
+  let emitted = emits(&effects);
+  assert_eq!(
+    emitted.len(),
+    1,
+    "the move half, and nothing else: {effects:?}"
+  );
+  assert!(emitted[0].kind().is_created(), "{emitted:?}");
 }
 
 #[test]
