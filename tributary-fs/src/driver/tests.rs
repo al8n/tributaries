@@ -11396,7 +11396,11 @@ mod sync_cookie {
   /// is the largest uid a minter can hold, and a real `nfsnobody` on some systems.
   #[test]
   fn the_cookie_directory_classifier_admits_only_names_this_crate_mints() {
-    // What this crate actually names the directory, on this platform.
+    // What this crate actually names its ONE stable directory, where it keeps
+    // one. Windows keeps none — it mints per obligation, which
+    // `every_minted_cookie_directory_name_is_claimed_by_the_classifier` covers
+    // on every host.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     assert!(crate::is_sync_cookie_dir_name(&cookie_dir_name()));
     // The bare stem (no uid to qualify it) and any uid's directory: two users may
     // legitimately watch one tree, and neither one's is a user change on the other's
@@ -11438,6 +11442,218 @@ mod sync_cookie {
         "{user_leaf} is not a name this crate mints — classifying it would erase a user file"
       );
     }
+  }
+
+  /// The Windows mint and the classifier are one round trip: every token
+  /// [`mint_cookie_dir_token`] can produce names a directory the exported
+  /// classifier claims, so the directory's own create — and every cookie inside
+  /// it — is suppressed rather than published as a user change.
+  ///
+  /// Host-portable on purpose. The rule is a decision about a `u32` and a
+  /// `&str`, and a rule that could only be exercised where a Windows kernel runs
+  /// is a rule whose inversion this suite would never see.
+  ///
+  /// FAIL-ON-REVERT (drop `admissible_token` from the mint): the `u32::MAX` row
+  /// below names `.tributaries-sync-cookies-4294967295`, which the classifier
+  /// calls a USER directory — so on the draw that lands there the cookie
+  /// directory and its whole contents reach consumer streams, silently and with
+  /// no `Rescan`.
+  #[test]
+  fn every_minted_cookie_directory_name_is_claimed_by_the_classifier() {
+    use crate::os::windows::security::admissible_token;
+
+    // The composition the mint actually performs, at both edges of the space and
+    // at the one value the classifier refuses.
+    for raw in [0, 1, 2, 4_294_967_294, u32::MAX] {
+      let name = cookie_dir_name_for(admissible_token(raw));
+      assert!(
+        crate::is_sync_cookie_dir_name(&name),
+        "{name} is a name the Windows mint can render, so the classifier must claim it"
+      );
+    }
+    // Staging for the row above: the raw value really is one the classifier
+    // refuses, so the remap is doing the work rather than the assertion passing
+    // vacuously.
+    assert!(!crate::is_sync_cookie_dir_name(&cookie_dir_name_for(
+      u32::MAX
+    )));
+
+    // And the real minter, run for real: every draw is claimed, and the draws
+    // are not a constant — a mint that answered one value would still be SAFE
+    // (the create is what refuses an occupied name) but would give up the
+    // defence in depth of a directory an attacker must also predict.
+    let draws: BTreeSet<u32> = (0..64).map(|_| mint_cookie_dir_token()).collect();
+    for token in &draws {
+      let name = cookie_dir_name_for(*token);
+      assert!(
+        crate::is_sync_cookie_dir_name(&name),
+        "{name} came out of the production mint, so the classifier must claim it"
+      );
+    }
+    assert!(
+      draws.len() * 2 > 64,
+      "64 draws collapsed to {} distinct values — the mint is answering a constant",
+      draws.len()
+    );
+  }
+
+  /// The mint loop's decision table, as a table.
+  ///
+  /// Three facts live here and are checked without a filesystem: `AlreadyExists`
+  /// is the ONE kind that mints another candidate (the anti-adoption rule — this
+  /// crate declines to look at a name it did not bind), every other kind aborts
+  /// on the spot because it describes the PARENT rather than the candidate, and
+  /// the retry is BOUNDED so a peer racing to occupy each candidate cannot spin
+  /// a blocking-pool thread forever.
+  ///
+  /// FAIL-ON-REVERT in three directions: an arm that treats `AlreadyExists` as
+  /// success (which is exactly what the deleted `create_directory_with_sddl`
+  /// did) breaks the first row; an arm that retries every error loops on a
+  /// missing parent until exhaustion and reports the wrong failure; an unbounded
+  /// loop never reaches `Exhausted`.
+  #[test]
+  fn the_mint_loop_retries_only_an_occupied_name_and_only_so_often() {
+    use std::io::ErrorKind;
+
+    assert_eq!(mint_step(None, 1), MintStep::Bound);
+    assert_eq!(
+      mint_step(None, COOKIE_DIR_MINT_ATTEMPTS + 1),
+      MintStep::Bound,
+      "a create that succeeded is bound whatever the attempt count says"
+    );
+
+    assert_eq!(
+      mint_step(Some(ErrorKind::AlreadyExists), 1),
+      MintStep::Retry
+    );
+    assert_eq!(
+      mint_step(Some(ErrorKind::AlreadyExists), COOKIE_DIR_MINT_ATTEMPTS - 1),
+      MintStep::Retry,
+      "the last attempt before the bound still retries"
+    );
+    assert_eq!(
+      mint_step(Some(ErrorKind::AlreadyExists), COOKIE_DIR_MINT_ATTEMPTS),
+      MintStep::Exhausted,
+      "and the bound is reached rather than exceeded"
+    );
+
+    for kind in [
+      ErrorKind::PermissionDenied,
+      ErrorKind::NotFound,
+      ErrorKind::StorageFull,
+      ErrorKind::ReadOnlyFilesystem,
+      ErrorKind::Other,
+    ] {
+      assert_eq!(
+        mint_step(Some(kind), 1),
+        MintStep::Failed,
+        "{kind:?} describes the parent, not the candidate — another name fails identically"
+      );
+    }
+  }
+
+  /// The anti-adoption rule itself: the mint loop never hands back a name that
+  /// was already bound, and never touches what was standing there.
+  ///
+  /// Host-portable because `create_dir`'s `AlreadyExists` is portable — this is
+  /// the same `bind_fresh_cookie_dir` the Windows arm runs, driven with an
+  /// injected candidate sequence and an injected binding call against real
+  /// occupied names. Production injects the anchored `NtCreateFile` create
+  /// instead; what the loop does with an `AlreadyExists` is the same either way,
+  /// and that is what this pins.
+  ///
+  /// FAIL-ON-REVERT: restore the deleted behaviour — an occupied name accepted
+  /// as success and then verified — and the first assertion fails outright,
+  /// because the path returned IS the occupied one and this crate would proceed
+  /// to write cookies into a directory a stranger prepared.
+  #[test]
+  fn an_occupied_candidate_is_discarded_rather_than_entered() {
+    let parent = std::env::temp_dir().join(format!(
+      "tributary-fs-mint-{}-{}",
+      std::process::id(),
+      line!()
+    ));
+    std::fs::create_dir_all(&parent).expect("create the scratch parent");
+
+    // Two occupied candidates of different SHAPES: a directory with contents
+    // (the crash-residue case, and the one an adoption verdict would have had to
+    // adjudicate) and a plain file (which `create_dir` also refuses).
+    let occupied_dir = parent.join(cookie_dir_name_for(7));
+    std::fs::create_dir(&occupied_dir).expect("occupy the first candidate");
+    std::fs::write(occupied_dir.join("stranger"), b"not this crate's").expect("plant contents");
+    let occupied_file = parent.join(cookie_dir_name_for(42));
+    std::fs::write(&occupied_file, b"a file, not a directory").expect("occupy the second");
+
+    let mut sequence = [7_u32, 42, 99].into_iter();
+    let mut calls = 0;
+    let (bound, ()) = bind_fresh_cookie_dir(
+      &parent,
+      &mut || {
+        calls += 1;
+        sequence
+          .next()
+          .expect("the loop asks for no more than three")
+      },
+      &mut |leaf| std::fs::create_dir(parent.join(leaf)),
+    )
+    .expect("the third candidate is free");
+
+    assert_eq!(
+      bound.file_name().and_then(|leaf| leaf.to_str()),
+      Some(cookie_dir_name_for(99).as_str()),
+      "the loop returned an occupied name — an occupied name is somebody else's directory"
+    );
+    assert_eq!(calls, 3, "one draw per attempt, and no attempt is skipped");
+    assert!(
+      bound.is_dir() && std::fs::read_dir(&bound).into_iter().flatten().count() == 0,
+      "what it returned is a directory this call created, so it is empty"
+    );
+    // Neither occupant was entered, emptied, replaced or removed.
+    assert_eq!(
+      std::fs::read(occupied_dir.join("stranger")).ok(),
+      Some(b"not this crate's".to_vec()),
+      "the occupied directory's contents are untouched"
+    );
+    assert_eq!(
+      std::fs::read(&occupied_file).ok(),
+      Some(b"a file, not a directory".to_vec()),
+      "and so is the occupied file"
+    );
+
+    // A candidate sequence that never leaves the occupied name exhausts the
+    // bound and reports it typed, rather than spinning forever.
+    let mut attempts = 0;
+    let exhausted = bind_fresh_cookie_dir(
+      &parent,
+      &mut || {
+        attempts += 1;
+        7
+      },
+      &mut |leaf| std::fs::create_dir(parent.join(leaf)),
+    )
+    .expect_err("every candidate is occupied");
+    assert_eq!(exhausted.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(
+      attempts, COOKIE_DIR_MINT_ATTEMPTS,
+      "the loop gives up at its bound, having minted exactly that many candidates"
+    );
+
+    // And a failure that is not about the candidate aborts on the first draw.
+    let mut single = 0;
+    let absent = parent.join("no-such-parent");
+    let missing = bind_fresh_cookie_dir(
+      &absent,
+      &mut || {
+        single += 1;
+        1
+      },
+      &mut |leaf| std::fs::create_dir(absent.join(leaf)),
+    )
+    .expect_err("the parent does not exist");
+    assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+    assert_eq!(single, 1, "another name would fail identically");
+
+    std::fs::remove_dir_all(&parent).expect("drop the scratch parent");
   }
 
   /// Admits a sync under a fresh, unique ticket — the common form for a cell that
@@ -14784,7 +15000,7 @@ mod sync_cookie {
     let guard_pred = dispatched_guard(&mut reg, &mut core, scope_pred, name);
     fs.put(&path, FileKind::File, 1);
     let id_pred = guard_pred
-      .claim(&fs.cookie_at(&path))
+      .claim(&fs.cookie_residue_at(&path))
       .expect("the predecessor claims P");
 
     // Reap it, but HOLD the pool job at the preemption window: the unlink syscall
@@ -14804,7 +15020,7 @@ mod sync_cookie {
     let guard_succ = dispatched_guard(&mut reg, &mut core, scope_succ, name);
     fs.put(&path, FileKind::File, 2);
     let id_succ = guard_succ
-      .claim(&fs.cookie_at(&path))
+      .claim(&fs.cookie_residue_at(&path))
       .expect("the successor reclaims P");
     assert_ne!(
       id_pred, id_succ,
@@ -14891,7 +15107,7 @@ mod sync_cookie {
     let guard_b = dispatched_guard(&mut reg, &mut core, scope_b, name);
     fs.put(&path, FileKind::File, 2);
     let id_b = guard_b
-      .claim(&fs.cookie_at(&path))
+      .claim(&fs.cookie_residue_at(&path))
       .expect("B claims the live file");
     {
       let inner = lock_ledger(&reg.ledger);
@@ -14913,7 +15129,7 @@ mod sync_cookie {
 
     // A's delayed claim finally fires.
     let id_a = guard_a
-      .claim(&fs.cookie_at(&path))
+      .claim(&fs.cookie_residue_at(&path))
       .expect("A's late claim is admitted");
     assert_ne!(id_a, id_b, "A and B are distinct incarnations");
     {
@@ -14971,7 +15187,9 @@ mod sync_cookie {
     // the file is gone) but its confirm has not yet landed.
     let guard_n = dispatched_guard(&mut reg, &mut core, scope_n, name);
     fs.put(&path, FileKind::File, 1);
-    let id_n = guard_n.claim(&fs.cookie_at(&path)).expect("N claims P");
+    let id_n = guard_n
+      .claim(&fs.cookie_residue_at(&path))
+      .expect("N claims P");
     {
       let mut inner = lock_ledger(&reg.ledger);
       inner
@@ -14985,7 +15203,9 @@ mod sync_cookie {
     // Incarnation M reclaims the same path and owns the live file.
     let guard_m = dispatched_guard(&mut reg, &mut core, scope_m, name);
     fs.put(&path, FileKind::File, 2);
-    let id_m = guard_m.claim(&fs.cookie_at(&path)).expect("M reclaims P");
+    let id_m = guard_m
+      .claim(&fs.cookie_residue_at(&path))
+      .expect("M reclaims P");
 
     // N's stale confirm lands: retire N. Keyed by id, it removes only N.
     lock_ledger(&reg.ledger).retire(id_n, Reaped::ConfirmedGone);
@@ -15036,11 +15256,13 @@ mod sync_cookie {
 
     // A real claim inserts record M (Owned) at P.
     let guard = dispatched_guard(&mut reg, &mut core, scope, name);
-    let m = guard.claim(&fs.cookie_at(&path)).expect("the claim lands");
+    let m = guard
+      .claim(&fs.cookie_residue_at(&path))
+      .expect("the claim lands");
     let stale = CookieId(m.0 + 999);
 
     // Case A: record M present, self-reap with a STALE id — no unlink, untouched.
-    self_reap(&fs, &guard, fs.cookie_at(&path), Some(stale));
+    self_reap(&fs, &guard, fs.cookie_residue_at(&path), Some(stale));
     assert_eq!(
       fs.cookie_remove_dispatches(),
       0,
@@ -15051,7 +15273,7 @@ mod sync_cookie {
         .obligations
         .get(&m)
         .is_some_and(|ob| matches!(ob.phase, Phase::Owned)
-          && ob.file.as_ref().map(CookieFile::path) == Some(&*path)),
+          && ob.residue.as_ref().map(CookieResidue::path) == Some(&*path)),
       "the live record M is untouched"
     );
 
@@ -15063,7 +15285,7 @@ mod sync_cookie {
       inner.by_path.clear();
       inner.by_name.clear();
     }
-    self_reap(&fs, &guard, fs.cookie_at(&path), Some(stale));
+    self_reap(&fs, &guard, fs.cookie_residue_at(&path), Some(stale));
     assert_eq!(
       fs.cookie_remove_dispatches(),
       0,
@@ -15101,7 +15323,7 @@ mod sync_cookie {
           name: name.to_owned(),
           ticket: m.0,
           id: m,
-          file: Some(fs.cookie_at(&path)),
+          residue: Some(fs.cookie_residue_at(&path)),
           reap_requested: false,
           last_failure_seq: 5,
           phase: Phase::RemoveFailed {
@@ -15173,7 +15395,7 @@ mod sync_cookie {
           name: "n".to_owned(),
           ticket: m.0,
           id: m,
-          file: Some(fs.cookie_at(&path)),
+          residue: Some(fs.cookie_residue_at(&path)),
           reap_requested: false,
           last_failure_seq: 1,
           phase: Phase::RemoveFailed {
@@ -15245,7 +15467,7 @@ mod sync_cookie {
           name: "n2".to_owned(),
           ticket: f.0,
           id: f,
-          file: Some(fs.cookie_at(&fresh)),
+          residue: Some(fs.cookie_residue_at(&fresh)),
           reap_requested: false,
           last_failure_seq: 0,
           phase: Phase::Owned,
@@ -15275,6 +15497,350 @@ mod sync_cookie {
         inner.obligations.get(&f).map(|ob| &ob.phase),
         Some(Phase::Removing { attempts: 0 })
       ));
+    }
+  }
+
+  /// The DIRECTORY-ONLY obligation: what a record becomes when its cookie has
+  /// settled and the directory minted to hold it has not.
+  ///
+  /// These cells mint a REAL [`CookieDir`] — the type has no other constructor,
+  /// and none is wanted — and drive it against the fake, because what they pin is
+  /// the ledger's state machine and not any platform's syscalls. The disposal
+  /// verdict comes from the fake for the same reason the removal verdict always
+  /// has: this crate's development host keeps ONE shared cookie directory whose
+  /// real disposal cannot fail (`CookieDir::dispose` there is a no-op success), so
+  /// a directory that SURVIVES its obligation has no other source here.
+  #[cfg(all(
+    not(miri),
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+  ))]
+  mod directory_only {
+    use super::*;
+
+    /// A real, unique parent for one cell, with a real cookie directory minted
+    /// inside it — the anchored shape a real write produces.
+    fn minted(tag: &str) -> (PathBuf, Arc<CookieDir>) {
+      use std::sync::atomic::{AtomicU32, Ordering};
+      static COUNTER: AtomicU32 = AtomicU32::new(0);
+      let parent = std::env::temp_dir().join(format!(
+        "tributary-fs-dironly-{}-{}-{}",
+        tag,
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed),
+      ));
+      std::fs::create_dir_all(&parent).expect("create the scratch parent");
+      let dir = Arc::new(CookieDir::open_or_create(&parent).expect("a cookie directory is minted"));
+      (parent, dir)
+    }
+
+    /// One landed cookie ANCHORED to that directory, in the shape only a real
+    /// write mints: a create's own descriptor, and the identity read off it.
+    ///
+    /// The file is real so the pin holds something; the fake's node map is what
+    /// the removal's identity proof actually reads, so the landing is staged
+    /// there under `ino` and the two agree by construction.
+    fn anchored_cookie(fs: &FakeFs, dir: &Arc<CookieDir>, name: &str, ino: u64) -> CookieFile {
+      let created = dir
+        .create(name)
+        .expect("a cookie is created in the minted directory");
+      let landing = dir.path().join(name);
+      fs.put(&landing, FileKind::File, ino);
+      let identity = fs
+        .cookie_at(&landing)
+        .identity()
+        .expect("the staged node answers an identity");
+      CookieFile::anchored(
+        Arc::clone(dir),
+        name,
+        CookieProof::Object(identity),
+        created,
+      )
+    }
+
+    fn phase_of(reg: &CookieRegistry<FakeFs>, id: CookieId) -> Option<Phase> {
+      lock_ledger(&reg.ledger)
+        .obligations
+        .get(&id)
+        .map(|ob| match ob.phase {
+          Phase::Parked { fence } => Phase::Parked { fence },
+          Phase::InPool => Phase::InPool,
+          Phase::Owned => Phase::Owned,
+          Phase::Removing { attempts } => Phase::Removing { attempts },
+          Phase::RemoveFailed { attempts, retry_at } => Phase::RemoveFailed { attempts, retry_at },
+        })
+    }
+
+    /// A retry after the pin is SPENT never touches a name again.
+    ///
+    /// The reap settles the cookie, releases the create's retained handle, and
+    /// then fails to dispose of the directory. From that instant the identity the
+    /// record captured names nothing: the kernel is free to reissue the file id
+    /// the pin was holding out of the allocator's reach, so a successor bound at
+    /// the cookie's name can be handed the very same id and compare EQUAL. This
+    /// cell stages exactly that — the name re-taken by a stranger carrying the
+    /// REISSUED identity — and requires the retry to leave it alone.
+    ///
+    /// It cannot merely decline to delete it. The retry must not consult the name
+    /// at all, and it structurally cannot: the record's residue is
+    /// `CookieResidue::Dir`, which holds no `CookieFile`, so there is no argument
+    /// with which `FsOps::remove_cookie` could be called. `cookie_remove_dispatches`
+    /// is the observable for that — it counts every removal that reached the
+    /// blocking pool, before any proof is consulted.
+    ///
+    /// FAIL-ON-REVERT: leave the residue shaped as a `File` across the failed
+    /// disposal (which is what a record carrying `Option<CookieFile>` has no
+    /// choice but to do) and the retry re-enters the identity arm, matches the
+    /// reissued id, and deletes the stranger's file — the last three assertions
+    /// fail together.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retry_after_the_pin_is_spent_never_consults_the_cookies_name() {
+      let (parent, dir) = minted("spent-pin");
+      let fs = FakeFs::new(1);
+      let mut reg = registry(fs.clone());
+      let mut core = fence_source();
+      let scope = ScopeId::new(NonZeroU64::new(21).unwrap());
+      let name = ".tributaries-sync-spent-pin";
+      let landing = dir.path().join(name);
+      let (op_tx, _op_rx) = async_channel::unbounded::<OpResult<FakeHandle>>();
+
+      let guard = dispatched_guard(&mut reg, &mut core, scope, name);
+      let residue = CookieResidue::File(anchored_cookie(&fs, &dir, name, 4242));
+      let id = guard.claim(&residue).expect("the claim lands");
+
+      // Something is inside the directory, so its disposition will refuse — the
+      // same-uid peer case, and the one that makes the directory outlive the
+      // cookie it held.
+      fs.fail_cookie_disposal_of(dir.path());
+
+      reg.request_removal::<TokioRuntime>(&op_tx, RemovalRequest::Targeted(id));
+      settle(|| matches!(phase_of(&reg, id), Some(Phase::RemoveFailed { .. }))).await;
+
+      assert_eq!(
+        (
+          fs.cookie_remove_dispatches(),
+          fs.cookie_dispose_dispatches()
+        ),
+        (1, 1),
+        "staging: the file half settled and the directory half did not"
+      );
+      {
+        let inner = lock_ledger(&reg.ledger);
+        let ob = inner.obligations.get(&id).expect("the record is retained");
+        assert!(
+          matches!(
+            ob.phase,
+            Phase::RemoveFailed {
+              attempts: 1,
+              retry_at: None
+            }
+          ),
+          "a surviving directory keeps the obligation counted and parked for retry"
+        );
+        assert_eq!(
+          ob.residue.as_ref().and_then(CookieResidue::owed_dir),
+          Some(dir.path()),
+          "what it owes is the DIRECTORY — the whole of what is left"
+        );
+        assert!(
+          ob.residue.as_ref().and_then(CookieResidue::file).is_none(),
+          "and it owes no file half, so it carries no identity and no pin: there \
+           is nothing left for a comparison to be made with"
+        );
+      }
+
+      // The identity slot the spent pin released, reissued to a stranger who has
+      // taken the cookie's name. This is the object the stale comparison would
+      // match.
+      fs.put(&landing, FileKind::File, 4242);
+
+      reg.request_removal::<TokioRuntime>(&op_tx, RemovalRequest::RetryDue(id));
+      settle(|| fs.cookie_dispose_dispatches() == 2).await;
+      settle(|| matches!(phase_of(&reg, id), Some(Phase::RemoveFailed { .. }))).await;
+
+      assert_eq!(
+        fs.cookie_remove_dispatches(),
+        1,
+        "the retry performed NO file removal: a record whose pin is spent has no \
+         name it may still speak for"
+      );
+      assert!(
+        fs.files_under(dir.path()).contains(&landing),
+        "the stranger holding the reissued identity is untouched"
+      );
+      assert!(
+        matches!(
+          phase_of(&reg, id),
+          Some(Phase::RemoveFailed { attempts: 2, .. })
+        ),
+        "and the retry rode the SAME attempt budget the file half was retried on"
+      );
+
+      // Whatever was holding the directory goes away; the next retry converges.
+      fs.clear_cookie_disposal_failure_of(dir.path());
+      reg.request_removal::<TokioRuntime>(&op_tx, RemovalRequest::RetryDue(id));
+      settle(|| reg.len() == 0).await;
+      assert_eq!(
+        reg.len(),
+        0,
+        "the obligation retires once the directory is gone"
+      );
+      assert_eq!(
+        fs.cookie_remove_dispatches(),
+        1,
+        "…having never repeated the file removal"
+      );
+
+      let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// A write that FAILED after minting its directory is counted, retried, and
+    /// retired on evidence — never `NeverCreated`.
+    ///
+    /// `CookieWriteError::clean` means "nothing of this write is on disk". Once a
+    /// directory has been minted that is false wherever the directory is the
+    /// obligation's own, and reporting it anyway retires the record
+    /// `NeverCreated`, frees the cap slot that was supposed to bound exactly this,
+    /// and leaves the directory to `CookieDir::drop` — whose failure is discarded
+    /// by design. A peer that races the cookie's name into the fresh directory
+    /// without replacing the directory produces that failure on every attempt, so
+    /// every repeat would leave another permanent, uncounted directory.
+    ///
+    /// The verdict itself is platform-specific and this cell asserts THIS host's:
+    /// a platform that mints per obligation owes the directory, and one that
+    /// shares a single directory owes nothing, so `clean` is the literal truth
+    /// there. What the rest of the cell drives is the LEDGER half, which is the
+    /// same everywhere — so the residue is built here, exactly as
+    /// `post_mint_failure` builds it where one is owed.
+    ///
+    /// FAIL-ON-REVERT: retire the obligation `NeverCreated` on this failure (which
+    /// is what a `clean` verdict makes the write path do) and the live count, the
+    /// census, and the phase all fail at once — with the directory still on disk.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_post_mint_write_failure_is_counted_and_retried_not_never_created() {
+      let (parent, dir) = minted("post-mint");
+      let fs = FakeFs::new(1);
+      let mut reg = registry(fs.clone());
+      let mut core = fence_source();
+      let scope = ScopeId::new(NonZeroU64::new(22).unwrap());
+      let name = ".tributaries-sync-post-mint";
+      let landing = dir.path().join(name);
+      let (op_tx, _op_rx) = async_channel::unbounded::<OpResult<FakeHandle>>();
+
+      // The write path's own verdict for a failure that lands after the mint.
+      let failure = post_mint_failure(
+        &dir,
+        name,
+        std::io::Error::new(
+          std::io::ErrorKind::AlreadyExists,
+          "a peer took the cookie's name",
+        ),
+      );
+      assert_eq!(
+        failure.residue.is_some(),
+        dir.owed(landing.clone()).is_some(),
+        "a post-mint failure reports a residue exactly where the directory is this \
+         obligation's to destroy, and reports `clean` only where nothing of the \
+         write is left for anyone to reap"
+      );
+      if cfg!(all(target_os = "windows", not(miri))) {
+        assert_eq!(
+          failure.residue.as_deref().and_then(CookieResidue::owed_dir),
+          Some(dir.path()),
+          "the platform that mints per obligation hands the DIRECTORY back"
+        );
+        assert!(
+          failure
+            .residue
+            .as_deref()
+            .and_then(CookieResidue::file)
+            .is_none(),
+          "…and only the directory: no file was ever created for this failure"
+        );
+      } else {
+        assert!(
+          failure.residue.is_none(),
+          "the platform that SHARES one cookie directory owes nothing for it — \
+           counting it would admit a debt no obligation may ever discharge"
+        );
+      }
+
+      // The ledger half, which is one shape on every platform: the residue such a
+      // failure hands back where a directory IS owed.
+      let residue = CookieResidue::Dir(CookieDirDebt {
+        path: landing.clone(),
+        dir: Arc::clone(&dir),
+      });
+      fs.fail_cookie_disposal_of(dir.path());
+
+      let guard = dispatched_guard(&mut reg, &mut core, scope, name);
+      let claimed = guard.claim(&residue);
+      assert!(
+        claimed.is_some(),
+        "the residue is admitted like any owned cookie"
+      );
+      self_reap(&fs, &guard, residue, claimed);
+
+      let id = claimed.expect("the claim landed");
+      assert_eq!(
+        reg.len(),
+        1,
+        "the obligation did NOT retire: its directory is on disk"
+      );
+      assert!(
+        matches!(
+          phase_of(&reg, id),
+          Some(Phase::RemoveFailed {
+            attempts: 1,
+            retry_at: None
+          })
+        ),
+        "it reaches RemoveFailed — counted by both caps, parked for the driver to \
+         schedule, swept by close"
+      );
+      assert_eq!(
+        fs.cookie_remove_dispatches(),
+        0,
+        "and it never asked for a file removal: there is no file, and no identity \
+         with which to ask for one"
+      );
+      let (census, live) = reg.census();
+      assert_eq!(
+        (census.births, census.never_created, live),
+        (1, 0, 1),
+        "nothing here is `NeverCreated`: something WAS created"
+      );
+      assert_eq!(
+        lock_ledger(&reg.ledger).by_path.get(&landing),
+        Some(&id),
+        "the landing is published, so a path-addressed removal still resolves it"
+      );
+
+      // The directory becomes disposable; the retry converges on evidence.
+      fs.clear_cookie_disposal_failure_of(dir.path());
+      reg.request_removal::<TokioRuntime>(&op_tx, RemovalRequest::RetryDue(id));
+      settle(|| reg.len() == 0).await;
+      let (census, live) = reg.census();
+      assert_eq!(
+        (
+          census.births,
+          census.confirmed_gone,
+          census.never_created,
+          live
+        ),
+        (1, 1, 0, 0),
+        "it retires ConfirmedGone — on the disposal's own verdict"
+      );
+      assert!(
+        lock_ledger(&reg.ledger).by_path.is_empty(),
+        "and its landing leaves the index with it"
+      );
+      assert_eq!(
+        fs.cookie_remove_dispatches(),
+        0,
+        "still no file removal, ever"
+      );
+
+      let _ = std::fs::remove_dir_all(&parent);
     }
   }
 
@@ -15321,7 +15887,10 @@ mod sync_cookie {
           name: name.to_owned(),
           ticket: id.0,
           id,
-          file: Some(CookieFile::new(path.to_path_buf(), RootIdentity::new(1, 0))),
+          residue: Some(CookieResidue::File(CookieFile::new(
+            path.to_path_buf(),
+            RootIdentity::new(1, 0),
+          ))),
           reap_requested: false,
           last_failure_seq: 0,
           phase: Phase::Owned,
@@ -15806,7 +16375,9 @@ mod sync_cookie {
 
     // The CLAIM opens the gate — before this write's completion message is sent, which is the
     // whole of the widening.
-    let id = guard.claim(&fs.cookie_at(&path)).expect("the claim lands");
+    let id = guard
+      .claim(&fs.cookie_residue_at(&path))
+      .expect("the claim lands");
     assert!(
       !reg.has_pending_write(scope),
       "the gate opens at the claim, not at the completion tail"
@@ -16023,7 +16594,7 @@ mod sync_cookie {
     let path = PathBuf::from("/r/.tributaries-sync-abnormal-1");
     fs.put(&path, FileKind::File, 1);
     claimed
-      .claim(&fs.cookie_at(&path))
+      .claim(&fs.cookie_residue_at(&path))
       .expect("the claim lands");
     let _in_pool = dispatched_guard(&mut reg, &mut core, scope, ".tributaries-sync-abnormal-2");
     assert_eq!(reg.unremoved(), 2, "both obligations are counted");
@@ -16170,7 +16741,7 @@ mod sync_cookie {
       let path = PathBuf::from("/r").join(name);
       fs.put(&path, FileKind::File, 1);
       assert!(
-        guard.claim(&fs.cookie_at(&path)).is_none(),
+        guard.claim(&fs.cookie_residue_at(&path)).is_none(),
         "the claim refuses on the mark"
       );
       (guard, path)
@@ -16184,7 +16755,9 @@ mod sync_cookie {
       let id = guard.id;
       let path = PathBuf::from("/r").join(name);
       fs.put(&path, FileKind::File, 1);
-      guard.claim(&fs.cookie_at(&path)).expect("the claim lands");
+      guard
+        .claim(&fs.cookie_residue_at(&path))
+        .expect("the claim lands");
       cleanup.request_remove(&path);
       reg.sweep_reap_marks::<TokioRuntime>(&op_tx);
       assert_eq!(
@@ -16257,7 +16830,7 @@ mod sync_cookie {
     // The in-pool write's refused claim still reaps the file it created: exactly one of the three
     // outcomes fired per record, and nothing leaked.
     let (guard, path) = in_pool;
-    self_reap(&fs, &guard, fs.cookie_at(&path), None);
+    self_reap(&fs, &guard, fs.cookie_residue_at(&path), None);
     settle(|| fs.files_under("/r").len() <= 1).await;
   }
 
@@ -16286,7 +16859,9 @@ mod sync_cookie {
       let guard = dispatched_guard(&mut reg, &mut core, scope, name);
       let path = PathBuf::from("/r").join(name);
       fs.put(&path, FileKind::File, 1);
-      guard.claim(&fs.cookie_at(&path)).expect("the claim lands");
+      guard
+        .claim(&fs.cookie_residue_at(&path))
+        .expect("the claim lands");
       path
     };
     let first = owned(".tributaries-sync-wake-1");
@@ -16447,7 +17022,9 @@ mod sync_cookie {
     );
     let path = PathBuf::from("/r/.tributaries-sync-dead-1");
     fs.put(&path, FileKind::File, 1);
-    guard.claim(&fs.cookie_at(&path)).expect("the claim lands");
+    guard
+      .claim(&fs.cookie_residue_at(&path))
+      .expect("the claim lands");
     assert_eq!(reg.unremoved(), 1, "the obligation is counted");
 
     // The driver dies abnormally: its registry and its half of the wake drop together, exactly as
@@ -16979,9 +17556,117 @@ mod sync_cookie {
          nothing counts and nothing ever reaps"
       );
       assert_eq!(
-        residue.and_then(|file| file.identity()),
+        residue
+          .as_deref()
+          .and_then(CookieResidue::file)
+          .and_then(CookieFile::identity),
         None,
         "and it is handed back proven by its anchor alone — there is no identity to compare"
+      );
+      assert!(
+        residue.as_deref().and_then(CookieResidue::file).is_some(),
+        "the FILE is what survived, so the residue is the file half — the directory \
+         rides inside it and is disposed of when this record's removal settles"
+      );
+    }
+
+    /// The counted reap SPENDS the create's retained handle, and it has to: the
+    /// directory disposal that follows it cannot run while that handle is open.
+    ///
+    /// This is the ordering the whole two-step retirement rests on. Windows mints a
+    /// directory PER OBLIGATION and destroys it at the end of `reap_residue`, and a
+    /// disposal attempted over a live pin meets a NON-EMPTY directory under EITHER
+    /// disposition class: the cookie is deleted THROUGH the pin, so POSIX semantics
+    /// take its name away only once the pin closes, and the classic
+    /// `FILE_DISPOSITION_INFO` fallback keeps the entry until the object's LAST
+    /// handle closes — which the pin also is. A rare residue turned into a
+    /// guaranteed one, on every volume rather than only the ones that fall back. No
+    /// kernel here does any of that, so what this cell witnesses is the
+    /// PRECONDITION, in the platform-neutral code that establishes it: by the time
+    /// `reap_residue` reaches the disposal, the pin is gone.
+    ///
+    /// The same line is why releasing it is sound. The pin holds the cookie's
+    /// identity slot out of the allocator's reach so a removal can tell the cookie
+    /// apart from a successor at its name, and it is reached only once the removal
+    /// has SETTLED that question.
+    ///
+    /// FAIL-ON-REVERT (dispose before clearing the pin, or never clear it): the
+    /// last assertion fails here, and every Windows sync on a fallback volume
+    /// leaves a directory whose removal retries forever.
+    #[test]
+    fn a_confirmed_reap_spends_the_creates_retained_handle() {
+      let root = scratch("reap-pin");
+      let fs = RealFs::new();
+      let cookie = fs
+        .write_cookie(&root, &root, ".tributaries-sync-reap-pin")
+        .expect("a cookie is created in a writable scratch root");
+      assert!(
+        cookie.pinned_handle().is_some(),
+        "staging: the create's descriptor is retained while the cookie stands"
+      );
+
+      let mut residue = CookieResidue::File(cookie);
+      let verdict = reap_residue(&fs, &mut residue);
+      let held = residue.file().and_then(CookieFile::pinned_handle).is_some();
+      let present = residue.path().exists();
+      std::fs::remove_dir_all(&root).expect("drop the scratch tree");
+
+      verdict.expect("a cookie standing at its own name reaps");
+      assert!(!present, "the cookie left the tree");
+      assert!(
+        !held,
+        "the reap would reach its directory disposal still holding the cookie's own \
+         handle: on a volume that falls back to the classic disposition that \
+         directory is not empty, and its removal fails every time"
+      );
+    }
+
+    /// And a reap that FAILED keeps that handle, because the retry still needs it.
+    ///
+    /// Release it on a removal that never settled and the object it was pinning can
+    /// be freed, its identity handed to a successor at the same name, and the
+    /// retry's comparison then reads that successor back as a MATCH. So the release
+    /// is conditioned on the removal having settled, never on it having been
+    /// attempted — and the record takes the pin back from the failing job for
+    /// exactly this reason (`spawn_unlink`).
+    ///
+    /// The obstruction is the same unopenable socket the cell above it uses: it
+    /// leaves the removal unable to say what stands at the name, which is a
+    /// returned failure rather than a verdict.
+    ///
+    /// FAIL-ON-REVERT (clear the pin unconditionally, or before the verdict): the
+    /// assertion below fails, and a retry against a reissued identity unlinks a
+    /// stranger's file.
+    #[test]
+    fn a_failed_reap_keeps_the_creates_retained_handle() {
+      let root = scratch("reap-pin-kept");
+      let dir = root.join("d");
+      std::fs::create_dir(&dir).expect("the cookie's own directory");
+      let fs = RealFs::new();
+      let cookie = fs
+        .write_cookie(&root, &dir, ".tributaries-sync-reap-pin-kept")
+        .expect("a cookie is created in a writable scratch root");
+
+      std::fs::remove_file(cookie.path()).expect("the cookie's name is freed");
+      let bound = std::env::temp_dir().join(format!("tp{}.s", std::process::id()));
+      let _ = std::fs::remove_file(&bound);
+      let socket = std::os::unix::net::UnixListener::bind(&bound).expect("a socket binds");
+      std::fs::rename(&bound, cookie.path()).expect("the socket takes the cookie's name");
+
+      let mut residue = CookieResidue::File(cookie);
+      let verdict = reap_residue(&fs, &mut residue);
+      let held = residue.file().and_then(CookieFile::pinned_handle).is_some();
+      drop(socket);
+      std::fs::remove_dir_all(&root).expect("drop the scratch tree");
+
+      assert!(
+        verdict.is_err(),
+        "staging: an unprovable removal is a failure to retry, not a settled verdict"
+      );
+      assert!(
+        held,
+        "a reap that settled nothing released the cookie's identity slot: the retry \
+         can no longer tell the cookie apart from a successor at its name"
       );
     }
 
@@ -17162,6 +17847,598 @@ mod sync_cookie {
           "a cookie directory owned by somebody else is refused, not adopted"
         );
       }
+    }
+  }
+
+  /// The Windows cookie directory is NEVER ADOPTED: it is minted, created, used
+  /// and destroyed by one obligation, and nothing already standing on disk is
+  /// ever entered or removed.
+  ///
+  /// Real directories, real handles, the real `FsOps`. The properties are about
+  /// what a kernel does with a name it already holds and with a delete
+  /// disposition on an open handle, and no fake tree can witness either.
+  #[cfg(all(target_os = "windows", not(miri)))]
+  mod windows_non_adoption {
+    use super::*;
+
+    /// A unique real directory for one cell.
+    ///
+    /// Deliberately NOT canonicalized, unlike the Unix `scratch`: production
+    /// canonicalizes both sides of its own beneath-check, so nothing here needs
+    /// the verbatim `\\?\` form — and the junction cell drives `mklink`, a `cmd`
+    /// builtin under no obligation to understand one.
+    fn scratch(tag: &str) -> PathBuf {
+      use std::sync::atomic::{AtomicU32, Ordering};
+      static COUNTER: AtomicU32 = AtomicU32::new(0);
+      let dir = std::env::temp_dir().join(format!(
+        "tributary-fs-cookie-{}-{}-{}",
+        tag,
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed),
+      ));
+      std::fs::create_dir_all(&dir).expect("create scratch dir");
+      dir
+    }
+
+    /// The directory a completed write put its cookie in.
+    fn cookie_dir_of(cookie: &CookieFile) -> PathBuf {
+      cookie
+        .path()
+        .parent()
+        .expect("the cookie has a containing directory")
+        .to_path_buf()
+    }
+
+    /// Every leaf under `root` the exported classifier claims — what a sync must
+    /// leave none of once its obligation has retired.
+    fn reserved_leaves(root: &Path) -> Vec<String> {
+      std::fs::read_dir(root)
+        .expect("the scratch root is readable")
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|leaf| crate::is_sync_cookie_dir_name(leaf))
+        .collect()
+    }
+
+    /// A whole write/remove round trip leaves NOTHING behind — not the cookie,
+    /// and not the directory that held it. The disposal proof.
+    ///
+    /// FAIL-ON-REVERT (drop `CookieDir`'s `Drop`, or open the directory without
+    /// `DELETE`): every sync on this platform accumulates one permanent empty
+    /// directory in the watched tree, forever, since nothing else ever removes
+    /// one. That is also what makes the retry bound affordable — a name that is
+    /// reclaimed cannot pile up.
+    ///
+    /// It equally pins the field order in `CookieFile`: put `dir` before `pin`
+    /// and the directory's disposition is attempted while the cookie's own
+    /// handle still holds its entry, which leaves the directory standing. That
+    /// holds on EVERY volume rather than only the ones that fall back to the
+    /// classic disposition — the removal now deletes through the pin itself, so
+    /// under POSIX semantics too the cookie's name leaves this directory exactly
+    /// when the pin closes.
+    #[test]
+    fn a_completed_write_leaves_no_cookie_directory_behind() {
+      let root = scratch("dispose");
+      let fs = RealFs::new();
+      let cookie = fs
+        .write_cookie(&root, &root, ".tributaries-sync-dispose")
+        .expect("a cookie is created in a writable scratch root");
+      let cookie_dir = cookie_dir_of(&cookie);
+      assert!(
+        cookie_dir.is_dir(),
+        "staging: the write created a directory to put the cookie in"
+      );
+      assert_eq!(
+        reserved_leaves(&root).len(),
+        1,
+        "staging: exactly one cookie directory stands while the obligation lives"
+      );
+
+      let removal = fs
+        .remove_cookie(&cookie)
+        .expect("the cookie's removal settles");
+      // The obligation retires HERE — the record's last clone goes, the cookie's
+      // own handle closes, and the directory's disposition follows it.
+      drop(cookie);
+
+      let leftovers = reserved_leaves(&root);
+      let stood = cookie_dir.exists();
+      std::fs::remove_dir_all(&root).expect("drop the scratch tree");
+
+      assert_eq!(removal, CookieRemoval::Unlinked);
+      assert!(
+        !stood,
+        "the directory the obligation created outlived the obligation"
+      );
+      assert!(
+        leftovers.is_empty(),
+        "a retired sync left cookie directories behind: {leftovers:?}"
+      );
+    }
+
+    /// A cookie RENAMED inside its own directory is still destroyed, and the
+    /// directory still goes with it.
+    ///
+    /// Rust opens the cookie granting `FILE_SHARE_DELETE`, so a peer under the same
+    /// user can rename this obligation's cookie WITHIN the directory the obligation
+    /// minted while the create's handle stays open. Nothing defends the NAME, and
+    /// nothing needs to: the removal deletes through the handle, so the object it
+    /// destroys is the object it created, wherever that object's name has gone.
+    ///
+    /// FAIL-ON-REVERT (resolve `dir.path().join(name)` again, as the `Object` arm
+    /// did): the removal finds the original name absent, answers `AlreadyGone` — a
+    /// SUCCESS — and `reap_residue` believes it, spends the pin and converts the
+    /// record to directory-only debt on the strength of it. The renamed cookie is
+    /// still on disk, so the disposal that follows meets a non-empty directory and
+    /// fails; the reap below returns `Err`, and every retry can then only repeat
+    /// that same failing disposal with no handle, name or proof left to reach the
+    /// file with. The file and the directory persist and the record consumes
+    /// backlog and global capacity forever.
+    #[test]
+    fn a_renamed_cookie_is_still_destroyed_through_the_creates_handle() {
+      let root = scratch("renamed");
+      let fs = RealFs::new();
+      let cookie = fs
+        .write_cookie(&root, &root, ".tributaries-sync-renamed")
+        .expect("a cookie is created in a writable scratch root");
+      let cookie_dir = cookie_dir_of(&cookie);
+      // The peer's rename: a different name, the SAME directory this obligation
+      // minted, and this process's own handle open across it.
+      let moved = cookie_dir.join("renamed-by-a-peer");
+      std::fs::rename(cookie.path(), &moved)
+        .expect("a peer renames the cookie inside the directory the obligation minted");
+
+      let mut residue = CookieResidue::File(cookie);
+      let reaped = reap_residue(&fs, &mut residue);
+      let settled_the_file_half = residue.file().is_none();
+      // The directory's handle is released only here. A POSIX-semantics disposition
+      // takes the name away at once, but the classic fallback keeps it until the
+      // last handle closes, so reading the tree before this would be reading a
+      // difference between volumes rather than the property.
+      drop(residue);
+
+      let survivor = moved.exists();
+      let leftovers = reserved_leaves(&root);
+      let stood = cookie_dir.exists();
+      let _ = std::fs::remove_dir_all(&root);
+
+      reaped.expect(
+        "the reap must settle: the cookie is destroyed through the handle its own \
+         create returned, which a rename cannot redirect",
+      );
+      assert!(
+        !survivor,
+        "the renamed cookie survived: the removal followed the NAME, so the object \
+         this obligation created was never destroyed"
+      );
+      assert!(
+        settled_the_file_half,
+        "staging: a settled file half leaves the directory-only debt behind"
+      );
+      assert!(
+        !stood,
+        "the directory outlived the obligation that minted it"
+      );
+      assert!(
+        leftovers.is_empty(),
+        "a converged reap left cookie directories behind: {leftovers:?}"
+      );
+    }
+
+    /// A residue whose PIN is gone deletes NOTHING by name, on either proof — this
+    /// platform opens no name for deletion at all.
+    ///
+    /// Two rows of one contract. With a stranger standing at the cookie's name the
+    /// removal REFUSES: an identity whose pin has been spent is not evidence — the
+    /// pin is what held the object's file id out of the allocator's reach, so once
+    /// it is gone that id may already name a successor — and deleting on it is the
+    /// unlink this design forbids. With the name EMPTY it answers the idempotent
+    /// success, which is the retry case this platform actually produces: a residue
+    /// destroyed through its retained handle, the handle then spent so the
+    /// directory can be disposed of, and a failed disposal coming back here with
+    /// the cookie already gone.
+    ///
+    /// FAIL-ON-REVERT (open the name for DELETE once an identity matches, as the
+    /// `Object` arm did): a record with no pin left reaches a name it can prove
+    /// nothing about, and the first assertion finds the stranger's file destroyed.
+    #[test]
+    fn a_pinless_residue_deletes_nothing_by_name() {
+      const STRANGER: &[u8] = b"a file the watcher never created";
+
+      let root = scratch("pinless");
+      let dir = CookieDir::open_or_create(&root).expect("a cookie directory is minted");
+      let name = ".tributaries-sync-pinless";
+      let created = dir.create(name).expect("a cookie is created in it");
+      let identity = identity_of_handle(&created)
+        .expect("staging: the create's own handle answers")
+        .expect("staging: this filesystem reads an identity off a handle");
+      // The pin is SPENT and the name reclaimed by a stranger — the state a failed
+      // disposal used to be able to leave a record in.
+      drop(created);
+      std::fs::remove_file(dir.path().join(name)).expect("the cookie's name is freed");
+      std::fs::write(dir.path().join(name), STRANGER).expect("a stranger takes the freed name");
+
+      let refused = remove_anchored(&dir, name, CookieProof::Object(identity), None);
+      let survivor = std::fs::read(dir.path().join(name)).ok();
+
+      // And the row that must still make PROGRESS: nothing at the name at all.
+      std::fs::remove_file(dir.path().join(name)).expect("the stranger's file goes away");
+      let empty = remove_anchored(&dir, name, CookieProof::Object(identity), None);
+
+      drop(dir);
+      let _ = std::fs::remove_dir_all(&root);
+
+      assert_eq!(
+        survivor.as_deref(),
+        Some(STRANGER),
+        "the stranger's file was destroyed by a record whose only evidence is an \
+         identity its spent pin had stopped vouching for"
+      );
+      assert!(
+        refused.is_err(),
+        "an occupied name is a REFUSAL, not a verdict: settling one would retire a \
+         record whose own file may still be on disk"
+      );
+      assert!(
+        matches!(empty, Ok(CookieRemoval::AlreadyGone)),
+        "an empty name must be the idempotent success, or the directory this \
+         obligation minted is never disposed of: {empty:?}"
+      );
+    }
+
+    /// A directory disposition that FAILS keeps the whole reap failing, so the
+    /// obligation stays counted — and a later retry converges once the obstruction
+    /// clears.
+    ///
+    /// Mandatory `DELETE` on the create grants the RIGHT to request the deletion;
+    /// it does not make the deletion infallible. A read-only volume, a filter
+    /// driver, or — the sharp case staged here — a same-uid peer that plants a file
+    /// inside this obligation's directory all leave a disposition that refuses.
+    /// Because a directory is minted PER OBLIGATION, a failure that was discarded
+    /// would leave one fresh permanent residue per sync, with no ledger record, no
+    /// cap, no retry and no diagnostic against it.
+    ///
+    /// Returning the failure enrolls the directory in the accounting the cookie
+    /// FILE already has: the caller keeps the record, parks it `RemoveFailed`,
+    /// counts it against both backlog caps and re-arms it on the same attempt
+    /// budget (`spawn_unlink`, `self_reap`). This cell proves the physical half of
+    /// that contract — the failure is reported and the directory is still standing.
+    ///
+    /// The retry row is its own property, and against a real kernel it is the
+    /// sharper one. By then the cookie file is already unlinked and the pin that
+    /// held its file id out of the allocator's reach has been SPENT, so the
+    /// identity the write captured names nothing this obligation still owns. The
+    /// residue the failed reap hands back is therefore directory-only, and the
+    /// retry disposes without ever consulting the cookie's name — there is no
+    /// `CookieFile` left in it to consult one with.
+    ///
+    /// FAIL-ON-REVERT (discard the disposal's error, which is all `CookieDir`'s
+    /// `Drop` can do): the first reap reports success, the obligation retires, and
+    /// the directory below stands forever with nothing counting it. FAIL-ON-REVERT
+    /// (keep the residue shaped as a file across the failed disposal): the middle
+    /// assertion finds an identity the obligation has no right to act on any more.
+    #[test]
+    fn a_refused_directory_disposal_keeps_the_reap_failing_until_it_clears() {
+      let root = scratch("dispose-refused");
+      let fs = RealFs::new();
+      let cookie = fs
+        .write_cookie(&root, &root, ".tributaries-sync-dispose-refused")
+        .expect("a cookie is created in a writable scratch root");
+      let cookie_dir = cookie_dir_of(&cookie);
+      // A peer under the same user plants a file inside the directory this
+      // obligation minted. Nothing about the cookie changes — the directory simply
+      // stops being empty, and an occupied directory is one the disposition
+      // refuses.
+      let planted = cookie_dir.join("planted-by-a-peer");
+      std::fs::write(&planted, b"not this crate's").expect("the peer's file lands");
+
+      let mut residue = CookieResidue::File(cookie);
+      let refused = reap_residue(&fs, &mut residue);
+      let stood = cookie_dir.is_dir();
+      let owes_only_the_directory =
+        residue.file().is_none() && residue.owed_dir() == Some(&*cookie_dir);
+
+      // Clear the obstruction and retry, which is what the ledger's re-arm does to
+      // a record parked `RemoveFailed`. The retry's own `Ok` is what proves the
+      // disposal succeeded; the tree is read afterwards only to confirm the end
+      // state.
+      std::fs::remove_file(&planted).expect("the peer's file goes away");
+      let cleared = reap_residue(&fs, &mut residue);
+      // The directory handle is released only here. A POSIX-semantics disposition
+      // takes the name away at once, but the classic fallback keeps it until the
+      // last handle closes, so reading the tree before this would be reading a
+      // difference between volumes rather than the property.
+      drop(residue);
+      let leftovers = reserved_leaves(&root);
+      let still_stood = cookie_dir.exists();
+      std::fs::remove_dir_all(&root).expect("drop the scratch tree");
+
+      assert!(
+        refused.is_err(),
+        "a directory that could not be disposed of must be REPORTED: an unreported \
+         one is a residue with no record, no cap and no retry"
+      );
+      assert!(
+        stood,
+        "staging: the refused disposal left the directory exactly where it was"
+      );
+      assert!(
+        owes_only_the_directory,
+        "the failed reap handed back an obligation that still claims a cookie: its \
+         pin is spent, so the identity it carries can be reissued to a successor \
+         at that very name"
+      );
+      cleared.expect("the retry settles once the obstruction is gone");
+      assert!(
+        !still_stood,
+        "the directory outlived the obligation that minted it"
+      );
+      assert!(
+        leftovers.is_empty(),
+        "a converged reap left cookie directories behind: {leftovers:?}"
+      );
+    }
+
+    /// A name that is already bound is never entered — the anti-adoption rule
+    /// against a real kernel, including the case-variant occupant only a
+    /// case-insensitive filesystem produces.
+    ///
+    /// The candidate sequence is injected so the collision is certain rather
+    /// than waited for: production draws from 2^32 and would never collide on
+    /// demand.
+    ///
+    /// FAIL-ON-REVERT (accept `ERROR_ALREADY_EXISTS` as success, which is
+    /// exactly what the deleted `create_directory_with_sddl` did): the value
+    /// returned names the STRANGER's directory, this crate writes its cookies
+    /// into it, and the case-variant row shows the same defect reached through a
+    /// name that does not even match byte for byte.
+    #[test]
+    fn an_occupied_candidate_name_is_never_entered() {
+      let root = scratch("occupied");
+      let occupied = root.join(cookie_dir_name_for(7));
+      std::fs::create_dir(&occupied).expect("occupy the first candidate");
+      std::fs::write(occupied.join("stranger"), b"not this crate's").expect("plant contents");
+      // The SECOND candidate is occupied by a differently-cased spelling of its
+      // name. Windows resolves names case-insensitively, so the create still
+      // refuses it — and an implementation that compared names itself, byte for
+      // byte, would call this candidate free and enter a directory it did not
+      // make.
+      let variant = root.join(cookie_dir_name_for(42).to_uppercase());
+      std::fs::create_dir(&variant).expect("occupy the second candidate, cased differently");
+
+      let mut sequence = [7_u32, 42, 99].into_iter();
+      let dir = CookieDir::minted(&root, &mut || {
+        sequence
+          .next()
+          .expect("the loop asks for no more than three")
+      })
+      .expect("the third candidate is free");
+      let landed = dir.path().to_path_buf();
+      // Retiring it here also exercises the disposal on a directory the mint
+      // reached only after two refusals.
+      drop(dir);
+
+      let occupant = std::fs::read(occupied.join("stranger")).ok();
+      let variant_stood = variant.is_dir();
+      let landed_stood = landed.exists();
+      std::fs::remove_dir_all(&root).expect("drop the scratch tree");
+
+      assert_eq!(
+        landed.file_name().and_then(|leaf| leaf.to_str()),
+        Some(cookie_dir_name_for(99).as_str()),
+        "the mint entered a name it did not create"
+      );
+      assert_eq!(
+        occupant.as_deref(),
+        Some(&b"not this crate's"[..]),
+        "the occupied directory was entered, emptied or replaced"
+      );
+      assert!(
+        variant_stood,
+        "the case-variant occupant was removed — nothing this crate did not create may be"
+      );
+      assert!(
+        !landed_stood,
+        "and what the mint did create was disposed of"
+      );
+    }
+
+    /// Junk wearing reserved names neither blocks a sync nor is destroyed by
+    /// one, in both directions that matter.
+    ///
+    /// A junction planted at the very name the mint asks for next is REFUSED by
+    /// the create — a junction is a bound name like any other — so the loop moves
+    /// on, nothing is created through it, and it is still standing afterwards. A
+    /// junction at the legacy bare stem and a squatter at a qualified reserved
+    /// name likewise stand while a full write/remove round trip runs beside them.
+    ///
+    /// This is the availability half of the architecture, and a FAIL-ON-OLD cell
+    /// in the strongest sense: on the stable-name arm a junction at the one
+    /// well-known name was a PERMANENT unhealable sync failure, because nothing
+    /// in this crate ever removed a cookie directory. It pins the other direction
+    /// too — a mint that "cleaned up" a name it wanted would destroy a stranger's
+    /// object, which is what this whole design forbids.
+    #[test]
+    fn reserved_name_junk_neither_blocks_a_sync_nor_is_deleted_by_it() {
+      let root = scratch("junk");
+      let elsewhere = scratch("junk-target");
+      std::fs::write(elsewhere.join("outside"), b"beyond the watched root")
+        .expect("the junction's target holds a file");
+
+      /// Plants a junction at `at`, pointing at `target`. A junction needs no
+      /// privilege, so a failure is this cell's own precondition and not a
+      /// verdict.
+      fn junction(at: &Path, target: &Path) {
+        let linked = std::process::Command::new("cmd")
+          .args(["/c", "mklink", "/J"])
+          .arg(at)
+          .arg(target)
+          .output()
+          .expect("cmd runs");
+        assert!(
+          linked.status.success(),
+          "a junction needs no privilege, so a failure here is the cell's own precondition \
+           and not a verdict: {}",
+          String::from_utf8_lossy(&linked.stderr)
+        );
+      }
+
+      // A junction standing at the FIRST candidate the mint will ask for, and a
+      // second at the legacy bare stem nothing may ever enter again.
+      let aimed_at = root.join(cookie_dir_name_for(7));
+      junction(&aimed_at, &elsewhere);
+      let legacy = root.join(COOKIE_DIR_PREFIX);
+      junction(&legacy, &elsewhere);
+      let squatter = root.join(cookie_dir_name_for(0));
+      std::fs::create_dir(&squatter).expect("plant a squatter at a qualified reserved name");
+      std::fs::write(squatter.join("stranger"), b"not this crate's").expect("with contents");
+
+      // The mint is aimed straight at the junction, so the collision is certain
+      // rather than waited for.
+      let mut sequence = [7_u32, 51].into_iter();
+      let aimed = CookieDir::minted(&root, &mut || {
+        sequence.next().expect("the loop asks for no more than two")
+      })
+      .expect("a junction at a candidate name costs one retry, not a failed sync");
+      let aimed_leaf = aimed
+        .path()
+        .file_name()
+        .and_then(|leaf| leaf.to_str())
+        .map(str::to_owned);
+      drop(aimed);
+
+      // And the production path, with the same junk standing.
+      let fs = RealFs::new();
+      let written = fs.write_cookie(&root, &root, ".tributaries-sync-junk");
+      let landed = written.as_ref().ok().map(cookie_dir_of);
+      let removal = written.as_ref().ok().map(|cookie| fs.remove_cookie(cookie));
+      let refusal = written
+        .as_ref()
+        .err()
+        .map(|failure| failure.source.to_string());
+      drop(written);
+
+      let escaped = std::fs::read_dir(&elsewhere)
+        .expect("the junction's target is readable")
+        .count();
+      let squatted = std::fs::read(squatter.join("stranger")).ok();
+      let junctions_stood =
+        std::fs::symlink_metadata(&aimed_at).is_ok() && std::fs::symlink_metadata(&legacy).is_ok();
+      let landed_stood = landed.as_ref().is_some_and(|dir| dir.exists());
+      let landed_leaf = landed
+        .as_ref()
+        .and_then(|dir| dir.file_name())
+        .and_then(|leaf| leaf.to_str())
+        .map(str::to_owned);
+
+      // The junctions are unlinked FIRST: removing one through a recursive walk
+      // would be the one operation that must never descend it.
+      let _ = std::fs::remove_dir(&aimed_at);
+      let _ = std::fs::remove_dir(&legacy);
+      let _ = std::fs::remove_dir_all(&root);
+      let _ = std::fs::remove_dir_all(&elsewhere);
+
+      assert_eq!(
+        aimed_leaf.as_deref(),
+        Some(cookie_dir_name_for(51).as_str()),
+        "the mint entered the junction rather than minting past it"
+      );
+      assert_eq!(
+        refusal, None,
+        "junk at a reserved name blocked the sync: {refusal:?}"
+      );
+      assert!(
+        matches!(removal, Some(Ok(CookieRemoval::Unlinked))),
+        "and the cookie the sync wrote is removed normally: {removal:?}"
+      );
+      assert!(
+        landed_leaf
+          .as_deref()
+          .is_some_and(|leaf| leaf != COOKIE_DIR_PREFIX && leaf != cookie_dir_name_for(0)),
+        "the sync landed in junk somebody else planted: {landed_leaf:?}"
+      );
+      assert_eq!(
+        escaped, 1,
+        "something was created through a junction — a cookie beyond the watched root \
+         mints an event no stream ever reports"
+      );
+      assert_eq!(
+        squatted.as_deref(),
+        Some(&b"not this crate's"[..]),
+        "the squatter's directory was entered or emptied"
+      );
+      assert!(
+        junctions_stood,
+        "the sync deleted a junction it did not create"
+      );
+      assert!(
+        !landed_stood,
+        "and the directory it did create was disposed of"
+      );
+    }
+
+    /// A crash leaves a cookie directory still holding its cookie. A later run
+    /// neither enters it nor removes it, and syncs normally beside it.
+    ///
+    /// Both halves matter and pull opposite ways. Entering it is the adoption
+    /// this architecture deletes — the residue is indistinguishable, from the
+    /// outside, from a directory a stranger planted. Removing it is the
+    /// destruction the design forbids, since a directory this process did not
+    /// create is one it cannot prove anything about; the disposal is addressed
+    /// to a RETAINED handle precisely so it can never reach one.
+    #[test]
+    fn a_crash_residue_is_left_untouched_while_a_new_sync_succeeds_beside_it() {
+      let root = scratch("residue");
+      let stale = root.join(cookie_dir_name_for(123_456));
+      std::fs::create_dir(&stale).expect("plant a previous run's cookie directory");
+      std::fs::write(
+        stale.join(".tributaries-sync-crashed"),
+        b"a cookie nobody removed",
+      )
+      .expect("with the cookie the crash stranded in it");
+
+      let fs = RealFs::new();
+      let cookie = fs
+        .write_cookie(&root, &root, ".tributaries-sync-residue")
+        .expect("a stale cookie directory beside it blocks nothing");
+      let landed = cookie_dir_of(&cookie);
+      let removal = fs.remove_cookie(&cookie);
+      drop(cookie);
+
+      let stranded = std::fs::read(stale.join(".tributaries-sync-crashed")).ok();
+      let residue_stood = stale.is_dir();
+      let landed_stood = landed.exists();
+      // Compared by LEAF, not by path: the write canonicalizes its side, so two
+      // spellings of the same directory would differ anyway.
+      let landed_leaf = landed
+        .file_name()
+        .and_then(|leaf| leaf.to_str())
+        .map(str::to_owned);
+      let _ = std::fs::remove_dir_all(&root);
+
+      assert!(
+        matches!(removal, Ok(CookieRemoval::Unlinked)),
+        "the new sync's own cookie is removed normally: {removal:?}"
+      );
+      assert_ne!(
+        landed_leaf.as_deref(),
+        Some(cookie_dir_name_for(123_456).as_str()),
+        "the new sync entered the residue instead of minting its own directory"
+      );
+      assert!(
+        residue_stood,
+        "the residue directory was destroyed — a directory this run did not create is one \
+         it can prove nothing about"
+      );
+      assert_eq!(
+        stranded.as_deref(),
+        Some(&b"a cookie nobody removed"[..]),
+        "the residue was entered or emptied"
+      );
+      assert!(
+        !landed_stood,
+        "and the directory it did create was disposed of"
+      );
     }
   }
 }

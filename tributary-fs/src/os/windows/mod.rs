@@ -15,6 +15,11 @@ pub(crate) mod dirscan;
 #[cfg(all(target_os = "windows", not(miri)))]
 pub(crate) mod ffi;
 pub(crate) mod rdcw;
+// The cookie directory's mint is the production consumer; on every other host
+// only the unit cells reach these rules, which is exactly why they are compiled
+// everywhere.
+#[cfg_attr(not(all(target_os = "windows", not(miri))), allow(dead_code))]
+pub(crate) mod security;
 #[cfg(all(target_os = "windows", not(miri)))]
 pub(crate) mod source;
 #[cfg(all(target_os = "windows", not(miri)))]
