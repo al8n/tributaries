@@ -562,12 +562,25 @@ pub trait LocalSource<C> {
   /// backend cannot report an in-band marker cannot offer the barrier and keeps the default
   /// ([`SyncError::Unsupported`]) — an honest refusal, never a pretend barrier.
   ///
-  /// `token` identifies the sync (instance + pid + seq); the binding renders it into whatever
-  /// a marker is called in its namespace, and must ensure [`is_sync_artifact`](Self::is_sync_artifact)
-  /// answers `true` for the key it returns. A source that must park the write behind its own
-  /// coverage-settle machinery does so INSIDE this await (the fs binding parks on the
-  /// per-directory re-arm fence), which is exactly why the initiation is awaited and bounded
-  /// like [`grow`](Self::grow).
+  /// `token` identifies the sync — [`instance`](SyncToken::instance), [`pid`](SyncToken::pid),
+  /// [`seq`](SyncToken::seq) and an unpredictable [`nonce`](SyncToken::nonce) — and the binding
+  /// renders it into whatever a marker is called in its namespace. TWO obligations bind that
+  /// rendering: the marker's identity MUST incorporate [`nonce`](SyncToken::nonce) (or a
+  /// representation of it that is no easier to predict), and
+  /// [`is_sync_artifact`](Self::is_sync_artifact) MUST answer `true` for the key it returns.
+  ///
+  /// The nonce is load-bearing, not decoration. The owner resolves a barrier by MATCHING the
+  /// marker's key and nothing else, so a marker identity a co-user under the watched tree can
+  /// predict lets that co-user create-and-remove the NEXT one ahead of time and leave a stale
+  /// matching event behind — one that resolves the barrier before the caller's own pre-call
+  /// changes have drained, which is the one thing the barrier promises. `(instance, pid, seq)` is
+  /// fully computable from any marker already observed, so a binding that renders those three and
+  /// drops the nonce satisfies every other clause here and still breaks the barrier, silently.
+  /// (The fs binding renders all four: `.tributaries-sync-<instance>-<pid>-<seq>-<nonce>`.)
+  ///
+  /// A source that must park the write behind its own coverage-settle machinery does so INSIDE
+  /// this await (the fs binding parks on the per-directory re-arm fence), which is exactly why the
+  /// initiation is awaited and bounded like [`grow`](Self::grow).
   fn begin_sync(
     &mut self,
     handle: Self::Handle,
@@ -875,12 +888,25 @@ pub trait Source<C> {
   /// backend cannot report an in-band marker cannot offer the barrier and keeps the default
   /// ([`SyncError::Unsupported`]) — an honest refusal, never a pretend barrier.
   ///
-  /// `token` identifies the sync (instance + pid + seq); the binding renders it into whatever
-  /// a marker is called in its namespace, and must ensure [`is_sync_artifact`](Self::is_sync_artifact)
-  /// answers `true` for the key it returns. A source that must park the write behind its own
-  /// coverage-settle machinery does so INSIDE this await (the fs binding parks on the
-  /// per-directory re-arm fence), which is exactly why the initiation is awaited and bounded
-  /// like [`grow`](Self::grow).
+  /// `token` identifies the sync — [`instance`](SyncToken::instance), [`pid`](SyncToken::pid),
+  /// [`seq`](SyncToken::seq) and an unpredictable [`nonce`](SyncToken::nonce) — and the binding
+  /// renders it into whatever a marker is called in its namespace. TWO obligations bind that
+  /// rendering: the marker's identity MUST incorporate [`nonce`](SyncToken::nonce) (or a
+  /// representation of it that is no easier to predict), and
+  /// [`is_sync_artifact`](Self::is_sync_artifact) MUST answer `true` for the key it returns.
+  ///
+  /// The nonce is load-bearing, not decoration. The owner resolves a barrier by MATCHING the
+  /// marker's key and nothing else, so a marker identity a co-user under the watched tree can
+  /// predict lets that co-user create-and-remove the NEXT one ahead of time and leave a stale
+  /// matching event behind — one that resolves the barrier before the caller's own pre-call
+  /// changes have drained, which is the one thing the barrier promises. `(instance, pid, seq)` is
+  /// fully computable from any marker already observed, so a binding that renders those three and
+  /// drops the nonce satisfies every other clause here and still breaks the barrier, silently.
+  /// (The fs binding renders all four: `.tributaries-sync-<instance>-<pid>-<seq>-<nonce>`.)
+  ///
+  /// A source that must park the write behind its own coverage-settle machinery does so INSIDE
+  /// this await (the fs binding parks on the per-directory re-arm fence), which is exactly why the
+  /// initiation is awaited and bounded like [`grow`](Self::grow).
   fn begin_sync(
     &mut self,
     handle: Self::Handle,
@@ -1082,13 +1108,18 @@ impl<C, T: Source<C>> LocalSource<C> for T {
 
 /// The identity of one sync barrier, minted by the owner: unique across
 /// concurrent syncs (`seq`), across watcher instances in one process
-/// (`instance`), and across processes (`pid`).
+/// (`instance`), across processes (`pid`) — and, the one thing those three
+/// cannot supply, UNPREDICTABLE to anything else watching the tree (`nonce`).
 ///
 /// The umbrella is generic over the key component `C` and cannot know what a
 /// path looks like, so it hands this token to the binding and the BINDING
 /// renders the cookie's name from it (the fs binding:
-/// `.tributaries-sync-<instance>-<pid>-<seq>`). That keeps the reserved
+/// `.tributaries-sync-<instance>-<pid>-<seq>-<nonce>`). That keeps the reserved
 /// namespace — and its suppression rule — at the layer that owns path shapes.
+///
+/// A rendering that leaves [`nonce`](Self::nonce) out is not a shorter name but
+/// a broken barrier: [`Source::begin_sync`] states the obligation it fails, and
+/// what a co-user does with a marker identity it can predict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SyncToken {
   instance: u64,
@@ -1106,10 +1137,12 @@ impl SyncToken {
   /// is a deterministic function of `(instance, pid, seq)`, so another writer
   /// under the same tree could predict the next name, create-then-delete it,
   /// and leave a stale event that a later sync would match — falsely
-  /// completing the barrier ahead of a real pre-call change. An owner-secret
-  /// nonce makes the name unpredictable, so the only event ever carrying a
-  /// sync's key is that sync's own cookie create — which per-source FIFO
-  /// places after every change that happened before it.
+  /// completing the barrier ahead of a real pre-call change. A nonce taken
+  /// from a cryptographic stream cipher the driver seeded from the OS makes
+  /// the name unpredictable — the published words of a keystream do not reveal
+  /// the seed behind them — so the only event ever carrying a sync's key is
+  /// that sync's own cookie create, which per-source FIFO places after every
+  /// change that happened before it.
   pub const fn new(instance: u64, pid: u32, seq: u64, nonce: u64) -> Self {
     Self {
       instance,
@@ -1137,6 +1170,11 @@ impl SyncToken {
 
   /// The unguessable per-sync nonce — the component an external writer cannot
   /// predict, so it cannot pre-create a colliding marker.
+  ///
+  /// Every binding's rendered marker identity MUST incorporate it; the other
+  /// three fields are computable from any marker already observed, so they
+  /// carry none of the barrier's integrity on their own. See
+  /// [`Source::begin_sync`].
   pub const fn nonce(&self) -> u64 {
     self.nonce
   }

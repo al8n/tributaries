@@ -1537,7 +1537,7 @@ async fn the_reserved_namespace_classifies_every_cookie_and_only_cookies() {
   // The whole minted range round-trips: the extremes of every field are still
   // recognized by the classifier that has to suppress them. The low end is each
   // field's true minimum — 1 for the bounded decimals, 0 for the nonce, whose
-  // minter is a hasher and can genuinely render it.
+  // minter is a stream generator and can genuinely render it.
   for token in [
     SyncToken::new(1, 1, 1, 0),
     SyncToken::new(u64::MAX, u32::MAX, u64::MAX, u64::MAX),
@@ -1694,8 +1694,8 @@ fn a_seq_field_of_zero_is_a_user_file_not_a_cookie() {
 /// pre-increment that runs before the mint, so 1 — never 0 — is the first value any cookie
 /// name has carried, in this shape and in the three-field one; the `pid` is this very
 /// process's, so the pid floor is proven against a live pid rather than a constant; and the
-/// `nonce` is 0, a hasher's genuine minimum, which is exactly why that field carries no value
-/// bound at all.
+/// `nonce` is 0, a generator word's genuine minimum, which is exactly why that field carries no
+/// value bound at all.
 ///
 /// `driver::tests::the_first_sync_an_owner_admits_mints_seq_one` is this cell's other half:
 /// it drives a real `on_sync` and pins the seq the minter hands over, so a release that

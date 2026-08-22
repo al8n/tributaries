@@ -35,9 +35,25 @@ futures-util = { version = "0.3", default-features = false, features = [
   "async-await-macro",
 ] }
 iradix = "0.3"
+# The barrier's integrity rests on a cookie name a co-user cannot predict (see
+# `SyncToken`). ChaCha20 is a cryptographic stream cipher, so a driver that seeds one
+# from the OS at construction mints every later nonce as arithmetic, and publishing those
+# words in cookie file names still reveals nothing about the seed behind them. Pure
+# computation with no OS dependency, so — unlike `getrandom` below — it needs no target
+# gate and builds for `wasm32-unknown-unknown` unchanged.
+rand_chacha = "0.9"
 thiserror = "2"
 tributary-fs = { version = "0.1", path = "../tributary-fs", optional = true }
 tributary-proto = { version = "0.1", path = "../tributary-proto" }
+
+# The ONE place an OS entropy source is consulted: the 32-byte seed for the cookie-nonce
+# generator above, taken once when a driver is assembled and never again. Gated off
+# `wasm32-unknown-unknown`, which has no entropy source of its own — the backend there is
+# the embedder's choice, and forcing one on a library's dependents is not this crate's
+# call. Absent it a driver holds no generator and refuses every barrier outright, rather
+# than running on a name something else can compute.
+[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
+getrandom = "0.3"
 
 [dev-dependencies]
 # Mirror a real consumer's manifest: the indexer-shaped integration suite

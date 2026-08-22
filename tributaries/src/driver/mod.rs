@@ -40,6 +40,10 @@ use std::{
 
 use agnostic_lite::RuntimeLite;
 use futures_util::FutureExt;
+use rand_chacha::{
+  ChaCha20Rng,
+  rand_core::{RngCore, SeedableRng},
+};
 use tributary_proto::{Epoch, unwind::dispose_panic_payload};
 
 #[cfg(feature = "fs")]
@@ -418,6 +422,10 @@ where
   /// events pass through untouched. `options` carries purely umbrella knobs (channel
   /// capacities, debounce); the pre-built source owns its own transport configuration.
   ///
+  /// This runs [`parts`](Self::parts)' construction, so its fourth caveat binds here
+  /// too: the cookie-nonce generator's single seed is drawn from the OS right here, and
+  /// that read can wait on a system whose entropy pool is not yet initialised.
+  ///
   /// This is the generic construction path; the pure-fs `new` (under the
   /// default `fs` feature) builds a `FsSource` and delegates here. For caller-owned
   /// spawning — structured
@@ -439,7 +447,7 @@ where
   /// [`with_source`](Self::with_source)'s one-liner, on a `LocalSet`, under structured
   /// concurrency, or on any executor compatible with `R`'s timers.
   ///
-  /// Three caveats bind the caller:
+  /// Four caveats bind the caller:
   ///
   /// - **Liveness is yours.** The watcher makes progress only while the driver future
   ///   is being polled. A future that is held but never polled leaves every submitted
@@ -459,6 +467,16 @@ where
   ///   floor, so it must be polled on an executor those timers work under — a
   ///   tokio-flavored `R` panics off a tokio reactor, while async-io-backed runtimes
   ///   run anywhere.
+  /// - **Construction draws OS entropy, ONCE, and can wait to.** Assembling the watcher
+  ///   reads 32 bytes from the platform's entropy interface to seed the cookie-nonce
+  ///   generator the OWNER mints each barrier's name from, and on a freshly booted
+  ///   system that read can block until the OS pool is initialised. It is paid here, on
+  ///   the constructing thread, precisely so neither the barrier's own path nor the
+  ///   owner loop ever pays it: construction advertises no deadline and pays it once —
+  ///   the same trade the standard library makes when it seeds a `RandomState`.
+  ///   Where no seed can be taken at all (`wasm32-unknown-unknown` has no entropy
+  ///   source) construction still succeeds and it is every [`sync`](Self::sync)
+  ///   that answers [`Entropy`](crate::error::SyncError::Entropy).
   ///
   /// The returned future is `Send` (pinned by the crate's compile-time owner proofs),
   /// so it is spawnable on both work-stealing and local executors. For a source that
@@ -487,9 +505,9 @@ where
   /// SOURCE (and with it the driver future that owns it) is pinned. Hand the handle to
   /// any thread; keep the future home.
   ///
-  /// [`parts`](Self::parts)' three caveats bind here identically — liveness is yours,
-  /// dropping the future is hard teardown, and the polling executor must support `R`'s
-  /// timers — plus the locality one:
+  /// [`parts`](Self::parts)' four caveats bind here identically — liveness is yours,
+  /// dropping the future is hard teardown, the polling executor must support `R`'s
+  /// timers, and construction takes its one seed of OS entropy — plus the locality one:
   ///
   /// - **Poll it where the source lives.** Drive the returned future on the owning
   ///   thread: directly (`block_on`, or as one arm of that thread's own select loop) or
@@ -580,9 +598,13 @@ where
       coalescer: debounce.map(|config| Coalescer::new(Some(config))),
       pending_syncs: Vec::new(),
       sync_seq: 0,
-      sync_nonce_seed: std::collections::hash_map::RandomState::new(),
       loss_serial: HashMap::new(),
       loss_gen: Arc::clone(&loss_gen),
+      // The ONE OS entropy draw in this driver's life happens right here — synchronously, on the
+      // CONSTRUCTING thread, while the owner is still a value and its future does not yet exist,
+      // so the acquisition is on no loop's path. Every later cookie nonce is a word off the stream
+      // it seeds, minted by the owner itself with arithmetic and never a syscall.
+      nonces: sync_nonce_generator(),
       cleanup_tx,
       cleanup_rx,
       commands: command_rx,
@@ -871,6 +893,21 @@ where
   /// wait. The owner reaps the abandoned cookie, whose events are suppressed
   /// by the reserved namespace regardless.
   ///
+  /// # The cookie nonce costs this call nothing
+  ///
+  /// The unpredictable field of the cookie's name is one word out of a ChaCha20
+  /// generator this driver seeded ONCE, from the OS, when it was assembled —
+  /// and this call never touches it. The driver's owner task holds that
+  /// generator OUTRIGHT, and mints the word at the moment it mints the token: a
+  /// single serialized task with exclusive access, so there is no lock, no
+  /// `Arc`, and no state shared with this plane at all. Minting is arithmetic
+  /// on that owned stream — no syscall, no blocking, no offload onto a foreign
+  /// spawner — so the nonce puts nothing on the barrier's path for the deadline
+  /// below to cover, and nothing about this method's behaviour depends on `R`
+  /// having a usable blocking pool. The single OS draw is paid at CONSTRUCTION
+  /// instead, which advertises no deadline and pays it once, the same trade the
+  /// standard library makes when it seeds a `RandomState`.
+  ///
   /// # Errors
   ///
   /// [`SyncError::UnknownSubscription`] when `sub` is not live;
@@ -881,8 +918,16 @@ where
   /// cookie directory is outside the sub's coverage;
   /// [`Retired`](SyncError::Retired) when the CALLER unwatched the sub while
   /// the sync was pending (a root DEATH instead resolves
-  /// [`Dominated`](SyncOutcome::Dominated)); [`Timeout`](SyncError::Timeout);
-  /// [`Closed`](SyncError::Closed).
+  /// [`Dominated`](SyncOutcome::Dominated)); [`Entropy`](SyncError::Entropy)
+  /// when this watcher holds no cookie-nonce generator — the barrier is refused
+  /// rather than run on a name a co-user could compute. That is settled once,
+  /// at construction, by whether the generator's seed could be read from the
+  /// OS: a watcher that has one never reaches this error, and on a watcher that
+  /// does not, no call can ever get past it to a [`SyncOutcome`] (a barrier
+  /// needs a token, and a token needs a nonce), so retrying will not change it.
+  /// On `wasm32-unknown-unknown`, which has no entropy source at all, no seed
+  /// is ever taken and every barrier ends here;
+  /// [`Timeout`](SyncError::Timeout); [`Closed`](SyncError::Closed).
   pub async fn sync(
     &self,
     sub: Subscription,
@@ -904,12 +949,12 @@ where
     // whose kernel event predates this call can no longer publish-and-clear itself into invisibility
     // before the barrier is installed and be reported as a false `Delivered`.
     let loss_gen_at_call = self.loss_gen.load(Ordering::SeqCst);
-    let req = SyncRequest {
-      sub,
-      loss_gen_at_call,
-      reply,
-    };
     match R::timeout(timeout, async move {
+      let req = SyncRequest {
+        sub,
+        loss_gen_at_call,
+        reply,
+      };
       if tx.send(req).await.is_err() {
         return Err(SyncError::Closed);
       }
@@ -939,6 +984,9 @@ impl<R: RuntimeLite> Tributaries<OsString, (), R, RootHandle> {
   /// coalescer (design §6) with a [`DebounceConfig`](crate::DebounceConfig) on
   /// `options` ([`TributariesOptions::debounce`]); absent it, events pass through
   /// untouched.
+  ///
+  /// It delegates to [`with_source`](Self::with_source), so that constructor's note about
+  /// the one OS entropy draw taken at assembly binds here too.
   ///
   /// # Errors
   ///
@@ -1208,10 +1256,6 @@ where
   pending_syncs: Vec<PendingSync<C, S::Handle>>,
   /// The per-owner monotonic cookie sequence — the `seq` of every `SyncToken`.
   sync_seq: u64,
-  /// The owner's secret hasher seed: OS-random at construction, unknown to any
-  /// other process, so a per-sync nonce derived from it (hashing `sync_seq`)
-  /// is unpredictable externally — the cookie name cannot be pre-created.
-  sync_nonce_seed: std::collections::hash_map::RandomState,
   /// Per-subscription monotonic **loss serial**, bumped every time the sub
   /// sheds a delta to (or overflows) a parked `Rescan`, and NEVER decremented
   /// on publish. A pending sync snapshots it at install; if it has advanced by
@@ -1240,6 +1284,74 @@ where
   /// a few owner-loop iterations. The precise per-subscription `loss_serial` still governs the long
   /// install-to-resolve window, where precision is worth having. Correctness beats precision here.
   loss_gen: Arc<AtomicU64>,
+  /// The driver's **cookie-nonce generator**: a ChaCha20 stream seeded ONCE, from the OS, when
+  /// the driver was assembled — or nothing at all, when that seed could not be taken.
+  ///
+  /// # What the cookie name needs, and where it comes from
+  ///
+  /// The barrier's whole integrity argument is that a co-user under the watched tree cannot
+  /// predict the NEXT cookie name:
+  /// [`resolve_matching_pending_sync`](Self::resolve_matching_pending_sync) compares the key and
+  /// nothing else, so anyone who can pre-create and remove the coming name leaves a stale event
+  /// that resolves the barrier over changes the caller has not been shown.
+  ///
+  /// That name's last field is a word off this generator. ChaCha20 is a cryptographic stream
+  /// cipher, so its output is computationally unpredictable to anyone who does not hold the seed
+  /// — and the seed is 32 bytes read once from the platform's own entropy interface, kept in this
+  /// process's memory, and never rendered into anything this driver writes.
+  ///
+  /// The nonce being PUBLISHED is exactly why the primitive has to be a cryptographic one.
+  /// [`cookie_name`](crate::source::fs::cookie_name) renders `instance-pid-seq-nonce`, so every
+  /// cookie file appearing under the watched tree hands an observer that word beside the counter
+  /// it was minted at. Keystream words do not let anyone recover the key that produced them, so
+  /// the NEXT name stays unpredictable however many previous ones were read.
+  ///
+  /// This replaced `SipHash-1-3(RandomState, sync_seq)`, and that is precisely where the
+  /// difference bites. The counter is perfectly predictable, so each published name was a known
+  /// (input, output) pair for the key in use — against a primitive whose own documentation
+  /// disclaims being a pseudo-random function and reserves the right to change the algorithm
+  /// underneath. `RandomState` is a HashDoS defence; the barrier's integrity was never something
+  /// it could carry.
+  ///
+  /// # Why it lives on the OWNER, owned outright
+  ///
+  /// ONE stream per driver is what makes the single seed meaningful, and the owner is the one
+  /// place a single stream needs no sharing to be single: it is a single serialized task, and
+  /// [`on_sync`](Self::on_sync) already takes `&mut self`, so the draw at the token mint has
+  /// exclusive access by construction. No `Arc`, no lock, and no field the handle plane can reach
+  /// — a generator on the handle needed all of them, because [`Tributaries`] clones are
+  /// `Send + Sync` and could mint concurrently. Deleting the shared state is what makes the "no
+  /// syscall, no blocking" claim unconditional rather than a claim about how short a critical
+  /// section is.
+  ///
+  /// `None` — on `wasm32-unknown-unknown`, which has no entropy source at all, or on a genuine
+  /// failure of one that exists — refuses every barrier with [`SyncError::Entropy`], and there is
+  /// deliberately no branch that mints a computable nonce instead: a barrier resting on a name a
+  /// co-user can predict is the silent degradation this construction exists to end.
+  ///
+  /// # What is NOT claimed
+  ///
+  /// - **Not perfect secrecy.** This is computational unpredictability against an observer who
+  ///   does not hold the seed, and nothing stronger.
+  /// - **No reseeding, and so no forward secrecy.** One seed serves a driver for its whole life.
+  ///   Anyone who can read that seed out of this process can compute every nonce the driver has
+  ///   minted and every one it ever will.
+  /// - **Nothing a type enforces.** A regression replacing the draw with a counter would compile
+  ///   and would break the barrier silently. This is a claim about which primitive is used, and
+  ///   about there being NO branch anywhere that substitutes a computable value for it — neither
+  ///   of which a signature checks, which is why it is written down instead.
+  ///
+  /// # Why the seed is taken at construction
+  ///
+  /// `getrandom` documents that its backends may WAIT: on a freshly booted system the OS pool can
+  /// be uninitialised, and the interface blocks until it is not. Construction is the one place
+  /// that can afford to say so — it advertises no deadline, it happens once per driver, and it
+  /// runs on the CONSTRUCTING thread while this owner is still a value, so the acquisition never
+  /// touches the loop that later mints from it. What the owner does per barrier is one
+  /// [`next_u64`](RngCore::next_u64) on an already-seeded stream: arithmetic, with no syscall, no
+  /// blocking, no offload onto a foreign spawner and no interaction with the caller's timeout
+  /// whatsoever. It is the same trade the standard library makes when it seeds a `RandomState`.
+  nonces: Option<ChaCha20Rng>,
   commands: async_channel::Receiver<Command<C, V>>,
   /// The receive end of sync's **dedicated** admission mailbox (the concrete [`SyncRequest`]), so a
   /// sync no longer rides the key/value-bearing [`Command`] mailbox — which is what lets
@@ -3161,6 +3273,46 @@ where
   let mut released = core::mem::take(&mut owner.deferred);
   released.keep_publication(displaced);
   let _ = tributary_proto::unwind::contain(move || drop(released));
+}
+
+/// Seeds a driver's cookie-nonce generator — the ONE entropy draw in that
+/// driver's life, taken while it is assembled and never repeated.
+///
+/// `None` when no seed could be taken, which the driver carries as "no
+/// generator" for the rest of its life. The stream this hands back lives on the
+/// [`Owner`], which is also where what the whole construction does and does not
+/// claim is written down: see [`nonces`](Owner::nonces).
+fn sync_nonce_generator() -> Option<ChaCha20Rng> {
+  sync_nonce_seed().map(ChaCha20Rng::from_seed)
+}
+
+/// The 32 bytes [`sync_nonce_generator`] builds a driver's stream from, read
+/// straight out of the platform's entropy interface.
+///
+/// `None` on failure, which the driver carries as "no generator" for the rest
+/// of its life: every barrier then ends in [`SyncError::Entropy`]. There is no
+/// fallback, because a seed something else could compute would make every nonce
+/// derived from it computable too.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+fn sync_nonce_seed() -> Option<[u8; 32]> {
+  let mut seed = [0u8; 32];
+  getrandom::fill(&mut seed).ok()?;
+  Some(seed)
+}
+
+/// `wasm32-unknown-unknown` has no entropy source of its own — the backend is
+/// the embedder's choice, and a library cannot make it for them.
+///
+/// So no seed is ever taken there, the driver holds no generator, and every
+/// barrier is refused with [`SyncError::Entropy`] rather than run on a name
+/// something else can compute. That refusal costs the sync path nothing at
+/// runtime: it is a `None` the driver has carried since it was built, not work
+/// done per call — no target consults an entropy source per sync. What a driver
+/// that HAS a generator does per barrier is arithmetic on the stream this seed
+/// would have keyed.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+fn sync_nonce_seed() -> Option<[u8; 32]> {
+  None
 }
 
 /// How long the owner waits before re-attempting delivery of a parked per-subscription
@@ -6543,6 +6695,14 @@ where
   /// `loss_gen_at_call` is the shared [`loss_gen`](Self::loss_gen) the CALLER snapshotted before it
   /// enqueued the request; comparing it against the live generation is what makes the barrier's loss
   /// window open at the call rather than here.
+  ///
+  /// The cookie name's unpredictable field is drawn HERE, at the token mint, off this owner's own
+  /// [`nonces`](Self::nonces) — one word of a ChaCha20 stream seeded at construction, taken under
+  /// the `&mut self` this method already holds, so the single per-driver stream needs neither a
+  /// lock nor an `Arc` to be single. A driver that holds no generator at all is refused with
+  /// [`SyncError::Entropy`] at that same position, so the checks a caller can act on
+  /// ([`Busy`](SyncError::Busy), [`UnknownSubscription`](SyncError::UnknownSubscription)) still
+  /// answer first.
   async fn on_sync(
     &mut self,
     sub: Subscription,
@@ -6601,15 +6761,19 @@ where
       return SyncAdmit::Done;
     };
     self.sync_seq += 1;
-    // An unguessable nonce keyed by the owner's OS-random secret: another
-    // writer under the tree cannot predict it, so it cannot pre-create a
-    // colliding marker whose stale event would falsely complete this sync.
-    let nonce = {
-      use std::hash::{BuildHasher, Hasher};
-      let mut hasher = self.sync_nonce_seed.build_hasher();
-      hasher.write_u64(self.sync_seq);
-      hasher.finish()
+    // No generator means this driver never got a seed, so there is no unpredictable name to mint —
+    // refuse rather than fall back to one `(instance, pid, seq)` alone determines. Nothing reached
+    // the source yet, so the refusal leaves no marker behind.
+    //
+    // The draw is one ChaCha20 word off a stream this owner holds OUTRIGHT, under the `&mut self`
+    // it is already inside: arithmetic on owned state, so it takes no lock, shares nothing with the
+    // handle plane, and can neither block nor reach the OS. The single entropy read that keyed the
+    // stream was paid once, at construction, on the constructing thread.
+    let Some(generator) = self.nonces.as_mut() else {
+      let _ = reply.send(Err(SyncError::Entropy));
+      return SyncAdmit::Done;
     };
+    let nonce = generator.next_u64();
     let token = SyncToken::new(
       sub.instance().get(),
       std::process::id(),

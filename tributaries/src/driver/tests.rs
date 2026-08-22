@@ -9,6 +9,10 @@ use std::{
 };
 
 use agnostic_lite::tokio::TokioRuntime;
+use rand_chacha::{
+  ChaCha20Rng,
+  rand_core::{RngCore, SeedableRng},
+};
 use tributary_proto::{ChangeId, Epoch, Location};
 
 use super::{Filters, Owner, ParkedRescans, epoch::EpochLedger};
@@ -45,6 +49,19 @@ fn components(path: &Path) -> Vec<OsString> {
 /// dotted leaves in it are `.cookie`, under ordinary parents), so admitting the ground
 /// reclassifies nothing the cells sharing [`FakeSource`] already rest on.
 const COOKIE_DIR: &str = ".tributaries-sync-cookies-501";
+
+/// The cookie-nonce generator every harness owner here is built with, standing in for the
+/// OS-seeded stream [`assemble`](super::Tributaries::assemble) hands a real one.
+///
+/// A fixed seed, deliberately: the fakes here key their cookies on the sequence
+/// (`/a/cookie-1`) and never render a name, so no cell's outcome depends on the words it
+/// produces — only on the owner holding a generator at all, which is what carries a barrier
+/// past the [`Entropy`](crate::error::SyncError::Entropy) refusal. The cell that has anything
+/// to say about the values themselves is
+/// [`the_sync_nonce_draw_is_not_constant_stuck_or_cyclic`], which builds the real one.
+fn sync_nonces() -> Option<ChaCha20Rng> {
+  Some(ChaCha20Rng::from_seed([0x5e; 32]))
+}
 
 /// One recorded call against the fake source, in the order it happened.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1605,9 +1622,9 @@ impl Harness {
       coalescer,
       pending_syncs: Vec::new(),
       sync_seq: 0,
-      sync_nonce_seed: std::collections::hash_map::RandomState::new(),
       loss_serial: HashMap::new(),
       loss_gen: std::sync::Arc::new(core::sync::atomic::AtomicU64::new(0)),
+      nonces: sync_nonces(),
       cleanup_tx,
       cleanup_rx,
       commands: command_rx,
@@ -8831,9 +8848,9 @@ impl OwnerU64 {
       coalescer,
       pending_syncs: Vec::new(),
       sync_seq: 0,
-      sync_nonce_seed: std::collections::hash_map::RandomState::new(),
       loss_serial: HashMap::new(),
       loss_gen: std::sync::Arc::new(core::sync::atomic::AtomicU64::new(0)),
+      nonces: sync_nonces(),
       cleanup_tx,
       cleanup_rx,
       commands: command_rx,
@@ -13094,9 +13111,9 @@ impl<V: Clone> OwnerOverValue<V> {
       coalescer: None,
       pending_syncs: Vec::new(),
       sync_seq: 0,
-      sync_nonce_seed: std::collections::hash_map::RandomState::new(),
       loss_serial: HashMap::new(),
       loss_gen: std::sync::Arc::new(core::sync::atomic::AtomicU64::new(0)),
+      nonces: sync_nonces(),
       cleanup_tx,
       cleanup_rx,
       commands: command_rx,
@@ -14691,9 +14708,9 @@ impl OwnerOverHostileKeys {
       coalescer: None,
       pending_syncs: Vec::new(),
       sync_seq: 0,
-      sync_nonce_seed: std::collections::hash_map::RandomState::new(),
       loss_serial: HashMap::new(),
       loss_gen: std::sync::Arc::new(core::sync::atomic::AtomicU64::new(0)),
+      nonces: sync_nonces(),
       cleanup_tx,
       cleanup_rx,
       commands: command_rx,
@@ -16603,9 +16620,9 @@ async fn release_marks_handle_logically_dead_immediately_even_with_transport_pen
     coalescer: None,
     pending_syncs: Vec::new(),
     sync_seq: 0,
-    sync_nonce_seed: std::collections::hash_map::RandomState::new(),
     loss_serial: HashMap::new(),
     loss_gen: std::sync::Arc::new(core::sync::atomic::AtomicU64::new(0)),
+    nonces: sync_nonces(),
     cleanup_tx,
     cleanup_rx,
     commands: command_rx,
@@ -16773,9 +16790,9 @@ async fn unclaimed_orphans_parked_rescan_is_suppressed_by_state_in_the_run_loop(
     coalescer: None,
     pending_syncs: Vec::new(),
     sync_seq: 0,
-    sync_nonce_seed: std::collections::hash_map::RandomState::new(),
     loss_serial: HashMap::new(),
     loss_gen: std::sync::Arc::new(core::sync::atomic::AtomicU64::new(0)),
+    nonces: sync_nonces(),
     cleanup_tx,
     cleanup_rx,
     commands: command_rx,
@@ -21996,4 +22013,46 @@ mod ownership {
       other => panic!("close reported {other:?} over a source that proved nothing"),
     }
   }
+}
+
+/// The sync nonce draw is not constant, stuck, or a small cycle.
+///
+/// # What this proves, and what it does NOT
+///
+/// It is a smoke test on the whole minting path a driver actually uses — the
+/// seed taken from the OS, and the stream it drives. A degenerate outcome (a
+/// constant, a stuck value, a short cycle) collapses it immediately.
+///
+/// It does **not** prove unpredictability, and an earlier version of this note
+/// claimed something stronger that is simply false. It said the guarantee was
+/// "compiler-enforced", on the reasoning that the draw takes no argument and so
+/// cannot be a function of the sequence counter. **A no-argument function can
+/// read a static counter, a thread-local, a clock or a process id**, and a
+/// regression returning `fetch_add(1)` would compile, pass this cell with 4096
+/// distinct values, and leave every future cookie name perfectly predictable.
+/// The counter-example was in this very crate: an earlier
+/// `wasm32-unknown-unknown` arm hashed the process id under a fresh
+/// `RandomState` — no parameter, and derived entirely from implicit state.
+///
+/// What actually carries the property is the PRIMITIVE and its seed: a ChaCha20
+/// keystream whose 32-byte key came from the OS and is never published, and the
+/// absence of any fallback that would substitute a computable value for it.
+/// That is a claim about a dependency and a missing branch, not something a
+/// signature can enforce and not something this cell can check.
+#[test]
+fn the_sync_nonce_draw_is_not_constant_stuck_or_cyclic() {
+  const DRAWS: usize = 4096;
+  // One generator, drawn from repeatedly — exactly the shape an owner holds: seeded once at
+  // construction, then minting one word per sync at the token.
+  let mut nonces = crate::driver::sync_nonce_generator().expect("this host has an entropy source");
+  let mut seen = std::collections::BTreeSet::new();
+  for _ in 0..DRAWS {
+    seen.insert(nonces.next_u64());
+  }
+  assert_eq!(
+    seen.len(),
+    DRAWS,
+    "every draw is distinct: a repeat inside {DRAWS} draws of a 64-bit space is a \
+     degenerate entropy path, not luck"
+  );
 }
