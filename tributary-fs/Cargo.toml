@@ -96,11 +96,16 @@ windows-sys = { version = "0.61", features = [
   "Win32_Storage_FileSystem",
   "Win32_System_IO",
   "Win32_System_Ioctl",
-  # No call is made through the WDK surface: it is imported for the notify
-  # filter bits Win32 does not re-export (extended attributes, the named-
-  # stream trio), purely so the ABI pin in `os::windows::ffi` can compare the
-  # backend's own literals against the vendored ABI rather than trusting them.
+  # Wdk_Storage_FileSystem: `NtCreateFile` and its FILE_CREATE /
+  # FILE_DIRECTORY_FILE / FILE_SYNCHRONOUS_IO_NONALERT constants — the atomic
+  # create-and-open the cookie directory is minted by (CreateDirectoryW returns
+  # no handle). It also carries the notify filter bits Win32 does not re-export
+  # (extended attributes, the named-stream trio), which the ABI pin in
+  # `os::windows::ffi` compares the backend's own literals against.
   "Wdk_Storage_FileSystem",
+  # Wdk_Foundation: `OBJECT_ATTRIBUTES`, which is how that create is anchored to
+  # a parent HANDLE and a leaf name instead of to a path.
+  "Wdk_Foundation",
 ] }
 
 [lints]

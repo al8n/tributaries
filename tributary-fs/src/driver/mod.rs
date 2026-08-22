@@ -351,10 +351,10 @@ impl LedgerInner {
     self.census.count(reaped);
     #[cfg(not(all(test, feature = "tokio")))]
     let _ = reaped;
-    if let Some(file) = ob.file.as_ref()
-      && self.by_path.get(file.path()) == Some(&id)
+    if let Some(residue) = ob.residue.as_ref()
+      && self.by_path.get(residue.path()) == Some(&id)
     {
-      self.by_path.remove(file.path());
+      self.by_path.remove(residue.path());
     }
     if self.by_name.get(&ob.name) == Some(&id) {
       self.by_name.remove(&ob.name);
@@ -412,10 +412,17 @@ impl LedgerInner {
 const COOKIE_DIR_PREFIX: &str = ".tributaries-sync-cookies";
 
 /// Whether `name` is the leaf of a cookie directory **this crate creates** —
-/// `.tributaries-sync-cookies`, optionally suffixed with the creating user's effective
-/// uid.
+/// `.tributaries-sync-cookies`, optionally suffixed with the creating user's
+/// qualifier.
 ///
-/// The uid suffix is matched for ANY uid, not just the caller's: two users may
+/// The qualifier is the creating user's effective uid on Unix and a per-obligation
+/// random token on Windows (see this module's `cookie_dir_name_for`). Both are
+/// rendered into the SAME canonical-decimal space deliberately: a suffix outside it
+/// would fail this classifier and put every Windows cookie directory — and
+/// everything a consumer reports inside it — on user streams, which is the leak this
+/// classifier exists to close.
+///
+/// The suffix is matched for ANY qualifier, not just the caller's: two users may
 /// legitimately watch one tree, and neither one's cookie directory is a user change on
 /// the other's stream. It is matched only in the shape this crate can actually render —
 /// canonical decimal, inside the uid space — so a user directory that merely begins with
@@ -428,20 +435,30 @@ const COOKIE_DIR_PREFIX: &str = ".tributaries-sync-cookies";
 #[must_use]
 pub fn is_sync_cookie_dir_name(name: &str) -> bool {
   match name.strip_prefix(COOKIE_DIR_PREFIX) {
-    // The bare stem: the name on a platform with no uid to qualify it.
+    // The bare stem: the name on a platform with no qualifier to render, and the
+    // name Windows used before it had one. Windows directories now live at a
+    // qualified name, so the ones a previous release left behind are never entered
+    // — this arm is what keeps them SUPPRESSED rather than republished as a user
+    // directory whose whole subtree suddenly appears on the stream.
     Some("") => true,
-    // `-<euid>`, exactly as `format!` renders a `uid_t`.
+    // `-<qualifier>`, exactly as `format!` renders a `u32`.
     Some(suffix) => suffix.strip_prefix('-').is_some_and(is_minted_uid),
     None => false,
   }
 }
 
-/// Whether `field` is exactly what `format!("{euid}")` renders for some `libc::uid_t` a
-/// [`cookie_dir_name`] minter could hold: decimal digits, no sign, no redundant leading zero
-/// (`0` itself is the one-digit case), and inside the 32-bit uid space every platform that
-/// opens a cookie directory uses — less its one unownable value, `(uid_t)-1`.
+/// Whether `field` is exactly what `format!("{qualifier}")` renders for some qualifier a
+/// [`cookie_dir_name_for`] minter could hold: decimal digits, no sign, no redundant leading
+/// zero (`0` itself is the one-digit case), and inside the 32-bit uid space every platform
+/// that opens a cookie directory uses — less its one unownable value, `(uid_t)-1`.
 ///
-/// A suffix outside that is one [`cookie_dir_name`] could never have produced, so the
+/// The Windows minter DRAWS into this same space rather than widening the alphabet, and
+/// it is this bound that makes the one value below unreachable there too: the mint
+/// remaps a draw landing on `u32::MAX` (see `os::windows::security::admissible_token`),
+/// because a name this classifier refuses is a directory whose entire contents reach a
+/// consumer as user changes.
+///
+/// A suffix outside that is one [`cookie_dir_name_for`] could never have produced, so the
 /// directory wearing it was created by somebody else. Admitting it would classify a user
 /// directory — and, for a consumer that suppresses what lands inside the cookie
 /// directory, everything reported within it — as this driver's artifact, and silently.
@@ -458,8 +475,9 @@ fn is_minted_uid(field: &str) -> bool {
     //
     // `u32::MAX` is refused because it is `(uid_t)-1` — POSIX's invalid-uid sentinel, the
     // value `chown`/`chgrp` read as "leave this id alone" and the one `setreuid` takes as
-    // "no change". No account is allocated it and no `geteuid()` returns it, so
-    // `cookie_dir_name` can never render this suffix. Do NOT simplify this back to a bare
+    // "no change". No account is allocated it and no `geteuid()` returns it, and the
+    // Windows mint remaps a draw that lands there, so no minter on any platform
+    // can render this suffix. Do NOT simplify this back to a bare
     // `parse::<u32>()`: a consumer suppresses every change reported inside a directory this
     // admits, so admitting `.tributaries-sync-cookies-4294967295` erases a user directory's
     // whole contents from every stream, with no `Rescan` and no diagnostic.
@@ -477,12 +495,56 @@ fn is_minted_uid(field: &str) -> bool {
 /// unlink a name and rebind it — and where, in consequence, no removal addressed
 /// by pathname could ever be safe.
 ///
-/// This type takes that permission away. The directory is created by this driver,
-/// `0o700`, owned by the effective user: binding a name in it requires write
-/// permission on it, which the mode grants to nobody else. A cookie's name can
-/// therefore not be rebound between the removal's proof and its unlink, and both
-/// operations go through this descriptor rather than through the name — so not
-/// even an intermediate component of the path participates.
+/// This type answers that, and DIFFERENTLY on the two kinds of platform — because
+/// the two kernels' watch models differ, not because one arm is a weaker copy of
+/// the other.
+///
+/// On Unix it takes the permission away. The directory is one stable, long-lived
+/// `.tributaries-sync-cookies-<euid>` created `0o700` and owned by the effective
+/// user, so binding a name inside it requires write permission the mode grants to
+/// nobody else. A cookie's name therefore cannot be rebound between the removal's
+/// proof and its unlink, and both operations go through this DESCRIPTOR rather than
+/// through the name — so not even an intermediate component of the path
+/// participates.
+///
+/// On Windows the permission is NOT taken away, and this contract says so rather
+/// than implying otherwise: the directory is created passing no security
+/// descriptor, so it inherits the parent's access-control list, which is whatever
+/// the watched tree grants. What forbids a wrong removal there is not the
+/// directory at all — it is that the removal resolves no name to begin with: the
+/// disposition is set on the handle the cookie's own create returned, so it
+/// follows that object wherever the name goes and can reach no other (see
+/// [`remove_anchored`]).
+///
+/// What the directory gives on Windows is a different thing: it is never shared
+/// with a previous run and never adopted from disk. Each obligation mints its own
+/// randomly named directory, holds the handle THE CREATE ITSELF RETURNED for the
+/// obligation's life, and destroys the directory when the obligation retires. The
+/// invariant is not "the directory is trustworthy" but "there is no directory to
+/// trust": no cookie directory is ever entered through a name this call did not
+/// just create.
+///
+/// That non-adoption is also what makes an interrupted run's residue PERMANENT, and
+/// the limitation is stated where the destructor is defined rather than left to be
+/// inferred from here: see [`Drop`](CookieDir::drop).
+///
+/// # Why the two arms differ — the kernels, not the taste
+///
+/// The Windows backends are KERNEL-RECURSIVE (`ReadDirectoryChangesW` with
+/// `bWatchSubtree`, and the USN journal is volume-wide), so a directory created a
+/// microsecond ago is covered the instant it exists and the cookie inside it mints
+/// an event that reaches the stream. Linux's default descending profile arms a
+/// watch per directory, so a freshly created directory races its own arming and the
+/// cookie's event can simply be lost — which is exactly why the Unix arm keeps ONE
+/// stable, already-covered directory and must verify what it finds there.
+///
+/// The Unix checks are load-bearing there and would defend nothing here. `unlinkat`
+/// separates the removal's proof from its unlink, so ownership and mode are what
+/// exclude a rebinding peer in that window. Windows has no such window to exclude
+/// anyone from: the disposition is set on the handle the cookie's own create
+/// returned (see [`remove_anchored`]), so no name is resolved and there is nothing
+/// for a peer to rebind between a proof and a removal. Porting the Unix checks
+/// across would mirror the SHAPE of a defence without the thing defended.
 ///
 /// # Where it lives, and why not directly under the root
 ///
@@ -493,18 +555,130 @@ fn is_minted_uid(field: &str) -> bool {
 /// so nesting adds no coverage requirement the caller did not already have; a
 /// directory at the root would add one the caller cannot satisfy.
 ///
-/// # What a pre-existing directory must prove
+/// # Unix: what a pre-existing directory must prove
 ///
-/// A directory already standing at the name is VERIFIED, never adopted on faith:
-/// it must be a real directory (not a symlink — the open refuses to follow one),
-/// owned by this effective user, and carry no group or other permission bits. A
-/// directory failing any of those is refused and the sync reports a typed write
+/// A directory already standing at the name is VERIFIED, never adopted on faith,
+/// and every check reads the OPENED DESCRIPTOR rather than a second lookup of the
+/// name. It must be a real directory (not a symlink — the open refuses to follow
+/// one), owned by this effective user, and carry no group or other permission bits.
+/// A directory failing any of those is refused and the sync reports a typed write
 /// failure. Adopting one instead would hand the whole argument above to whoever
 /// created it.
 ///
-/// The name carries the effective uid so two users watching one shared tree get
+/// The name carries the effective uid, so two users watching one shared tree get
 /// one directory EACH rather than one refusing the other forever; the ownership
 /// check then only ever fires on a directory somebody planted.
+///
+/// # Windows: nothing is proven, because nothing is adopted
+///
+/// There is no pre-existing directory to interrogate. The name is minted fresh per
+/// obligation — the reserved stem qualified by a random 32-bit token, drawn into
+/// exactly the space [`is_sync_cookie_dir_name`] recognizes — and bound by an
+/// `NtCreateFile` whose `FILE_CREATE` disposition fails if the name exists at all.
+/// A name that is ALREADY BOUND is not adopted, not verified and not examined: the
+/// candidate is discarded, another is minted, and the loop gives up after a bounded
+/// number of attempts with a typed write failure. That refusal to enter an existing
+/// name is the whole enforcement point, and it is the exact inversion of the arm
+/// this replaced, which turned `ERROR_ALREADY_EXISTS` into success and then tried
+/// to adjudicate whatever it had found.
+///
+/// NO check survives, and no check is needed, because the create and the open are
+/// ONE CALL. `NtCreateFile` returns the handle to the object it just created, so
+/// the directory this value holds cannot be a replacement swapped in behind a name
+/// — there is no second lookup of that name to swap under. `FILE_DIRECTORY_FILE`
+/// makes what it creates a directory, and a name that already holds anything at all
+/// (a junction, a file, somebody else's directory) is a collision rather than
+/// something to adjudicate. The reparse-point verdict this arm used to take
+/// afterwards existed only to catch that swap, and it went out with the swap.
+///
+/// The create is also ANCHORED. `parent` is opened once and every candidate is
+/// created as a bare LEAF beneath that handle, so no candidate name is resolved as
+/// a path and nothing below the parent can be redirected. The parent's own open is
+/// still by path, which is the pre-existing `canonicalize` residual the write
+/// documents at its call site — unchanged here, and not widened.
+///
+/// The directory's DESTRUCTION is the obligation's under COUNTED RETIREMENT: it
+/// belongs to the obligation's REMOVAL rather than to the drop of this value, and
+/// [`reap_residue`] RETAINS the obligation — counted, and retried on its attempt
+/// budget — until that disposal REQUEST succeeds, as the paragraphs below spell out.
+/// That is the guarantee, and it holds.
+///
+/// What retirement waits for is the REQUEST, and that is not the instant the link
+/// leaves the parent. [`dispose`] only SETS a delete disposition, through a handle it
+/// BORROWS from this value; the removal follows when handles close, and by then the
+/// record is already gone — [`CookieRegistry::spawn_unlink`] retires it and only
+/// afterwards drops the residue still holding an `Arc` to this value. Under the
+/// POSIX-semantics disposition the link goes when the handle the disposition was set
+/// through — this value's own — is closed; under the classic `FILE_DISPOSITION_INFO`
+/// fallback the removal waits for the object's LAST handle, whoever holds it. So the
+/// directory can outlive its ledger obligation by that much. What retirement buys is
+/// that the kernel has ACCEPTED the request, which is the only part a retry could
+/// ever have changed.
+///
+/// REGISTRY TEARDOWN is the other mechanism, and it promises nothing of the kind.
+/// [`CookieRegistry`]'s own `Drop` retires every remaining record FIRST and only
+/// then attempts a DETACHED best-effort disposal, which a cancelled runtime may
+/// never run and whose failure is discarded — as is [`Drop`](CookieDir::drop)'s
+/// beneath it; a record already `Removing` is retired and skipped there outright.
+/// So a failed orderly close, a panic or a cancellation can leave this process
+/// ALIVE, the obligation RETIRED, and the directory still on disk — most concretely
+/// when the same-uid peer described below has planted a file inside it, which is a
+/// disposition that FAILS. Destructors having run is not the same as the directory
+/// having gone away.
+///
+/// The create asks for `DELETE`, so the retained handle always has it, and
+/// [`dispose`] sets the delete disposition THROUGH that handle — no pathname
+/// resolved, nothing else consulted. Asking for `DELETE` at CREATE time is what
+/// keeps the RIGHT to dispose unconditional: a volume or ACL that would refuse it
+/// fails the create, which is a typed write failure the sync reports, rather than
+/// yielding a working directory this process could never clean up.
+///
+/// `DELETE` is that right and NOTHING more. It is not `FILE_DELETE_ON_CLOSE` and it
+/// is no promise from the kernel, so a process that never gets to spend the right
+/// leaves the directory standing; [`Drop`](CookieDir::drop) states which exits those
+/// are and what the residue costs.
+///
+/// Holding the right is not the same as the disposition succeeding. A read-only
+/// volume, a filter driver, or — the sharp case — a same-uid peer that plants a
+/// file inside this directory each leave a disposition that FAILS, and a directory
+/// is minted per obligation, so a failure that went unreported would leave one
+/// fresh permanent residue per sync. It is therefore not swallowed: [`reap_residue`]
+/// runs the disposal as the second half of the cookie's own removal and RETURNS
+/// its failure, which keeps the obligation in the ledger as `RemoveFailed` —
+/// counted against the backlog caps, retried on the same attempt budget, and
+/// reported by close — exactly as a failed cookie unlink already is. `Drop` remains
+/// underneath that as a best-effort backstop for the paths no counted removal
+/// reaches.
+///
+/// The same holds for a WRITE that fails after minting one, which is the other way
+/// a directory outlives the step that made it: no cookie of that obligation ever
+/// stands, so no cookie removal will ever carry the directory to a disposal. The
+/// write hands it back as a directory-only residue instead ([`post_mint_failure`]),
+/// which enters the ledger under the same caps and the same budget. Nothing this
+/// call creates reaches a terminal on `Drop`'s best effort alone except the paths
+/// [`Drop`](CookieDir::drop) documents itself as covering — and those are ordinary
+/// teardown and unwinding, the whole of what a destructor reaches. An exit that
+/// never unwinds runs no destructor at all, so what is outstanding at that instant
+/// reaches no terminal by any route; that limitation is stated in full where `Drop`
+/// is defined.
+///
+/// [`dispose`]: CookieDir::dispose
+///
+/// This is what makes the shared contract sentence — a directory standing at the
+/// name is never adopted on faith — literally true here rather than argued for:
+/// nothing is adopted at all. On the OCCUPIED-NAME axis it is also better for
+/// availability than the stable-name arm it replaces: there, a NON-directory planted
+/// at the one well-known name was a permanent unhealable sync failure, since nothing
+/// ever removed a cookie directory — and a DIRECTORY planted there was no failure at
+/// all, it was the adoption this replaces. Here an occupied name costs an ATTEMPT
+/// rather than a verdict: the candidate is discarded and another minted, and because
+/// every draw is independent the SAME occupied name can be drawn again and burn
+/// further attempts — up to all of them, which ends the mint with a typed write
+/// failure this sync reports and the next one re-draws from scratch, not the
+/// permanent unhealable state the old arm had.
+/// It is not better on every axis, and the trade is the paragraph above: the create
+/// now DEMANDS `DELETE`, so a volume or ACL that grants the create and refuses that
+/// right now fails a sync the old arm would have completed.
 ///
 /// # What this does not give, and the trust boundary that follows
 ///
@@ -530,6 +704,146 @@ pub(crate) struct CookieDir {
   /// Every `openat`/`unlinkat` runs against this, never against `path`.
   #[cfg(any(target_os = "linux", target_os = "macos"))]
   fd: std::os::fd::OwnedFd,
+  /// The handle the directory's own CREATE returned, held open for as long as
+  /// any cookie created through it is outstanding — the Unix descriptor's
+  /// lifetime, on a platform with no `openat` to spend it on.
+  ///
+  /// It is the create's handle rather than a later open of the same name, and
+  /// that is the whole guarantee: the object it refers to is one this call made,
+  /// with no interval in between for a peer to unlink the name and stand its own
+  /// directory there.
+  ///
+  /// No cookie operation resolves through it. The cookie's CREATE resolves `path`
+  /// instead (see [`CookieDir::create`]), which is exactly the residual
+  /// [`FsOps::write_cookie`]'s bound names instead of denying; every DESTROY of a
+  /// cookie resolves no name at all — a write destroying the cookie it just made,
+  /// and every later removal of that cookie whatever its [`CookieProof`] (see
+  /// [`remove_anchored`]) — and each addresses the COOKIE's own retained handle
+  /// rather than this one. What it is for is
+  /// the DISPOSAL in [`dispose`](CookieDir::dispose), and in the
+  /// [`Drop`](CookieDir::drop) backstop beneath it — the delete disposition is set
+  /// through this handle, so the destruction addresses the object this call
+  /// created and resolves no pathname at all. It therefore always carries
+  /// `DELETE`: the create asks for that right, so a volume or ACL that would
+  /// refuse it fails the create instead of yielding a directory nothing can ever
+  /// clean up.
+  ///
+  /// The create asks for full sharing, so the handle pins nothing: a peer may
+  /// still delete or rename the tree around it, exactly as the cookie file's own
+  /// retained handle already allows.
+  #[cfg(all(target_os = "windows", not(miri)))]
+  handle: std::os::windows::io::OwnedHandle,
+}
+
+/// The BEST-EFFORT BACKSTOP under the counted disposal, run by the last holder of
+/// a directory whose obligation never got one — on the exits that RUN A DESTRUCTOR
+/// at all, which is ordinary teardown and unwinding and nothing else.
+///
+/// The counted path is [`reap_residue`]: it runs the disposal (through
+/// [`FsOps::dispose_cookie_dir`], which is this platform's
+/// [`dispose`](CookieDir::dispose)) as the second half of the retirement and
+/// RETURNS the failure, so an obligation whose directory survives stays in the
+/// ledger — as a DIRECTORY-ONLY residue ([`CookieResidue::Dir`]) — counted and
+/// retried until the disposal confirms. A write that failed after minting a
+/// directory hands one back the same way ([`post_mint_failure`]), so it too has a
+/// counted removal rather than this.
+///
+/// What is left for this to cover is everything that never reaches such a removal
+/// but still DROPS this value — the abnormal-exit sweep, whose files may still share
+/// the cookie's pin with a racing self-reap and whose whole contract is best-effort;
+/// a residue whose record the abnormal-exit take had already retired, so there was
+/// nothing left to hand it to — plus the ordinary REDUNDANT case, where the counted
+/// disposal already succeeded and this second disposition has nothing left to
+/// destroy. Every one of those is a normal return, a panic or a cancellation, all of
+/// which unwind; none of them is a process leaving without unwinding, which this
+/// does not reach and the section below says so.
+///
+/// Its own failure is therefore still discarded, and that is a BOUNDED reading
+/// rather than a harmless one: a disposal an obligation depends on has already been
+/// reported through [`reap_residue`], so what fails here has no live record to fail
+/// against. What it does NOT mean is that nothing is left behind.
+/// [`CookieRegistry`]'s abnormal-exit take retires every record BEFORE the detached
+/// disposal it then attempts, that job may never run on a cancelled runtime, and a
+/// `Removing` record is retired and skipped there outright — so this process can go
+/// on running with the obligation retired and the directory still standing. That is
+/// the same untracked residue the section below prices, reached WITH destructors
+/// having run rather than without them.
+///
+/// [`CookieFile`] declares its `pin` BEFORE its `dir` for THIS path's sake: fields
+/// drop in declaration order, and a cookie's own handle must close before the
+/// directory holding it is asked to go away, or the disposition would meet a
+/// non-empty directory under the classic `FILE_DISPOSITION_INFO` fallback. The
+/// counted path does not rely on that order — it closes the pin explicitly — but
+/// this one has nothing else.
+///
+/// # What this does NOT cover, and what that costs
+///
+/// A destructor is not a process-exit hook, and this one is claimed as nothing more
+/// than a destructor. `std::process::exit`, `abort`, a panic under
+/// `panic = "abort"`, an unhandled structured exception and an external
+/// `TerminateProcess` all end the process WITHOUT unwinding, so Rust runs no
+/// destructor: this `drop` never executes and [`dispose`](CookieDir::dispose) is
+/// never called on any directory outstanding at that instant.
+///
+/// The retained handle does not close that gap, and the reason is worth stating
+/// because the create's `DELETE` looks as though it should. `DELETE` is the RIGHT to
+/// destroy the object; it is not `FILE_DELETE_ON_CLOSE` and it carries no promise
+/// from the kernel. When the process is torn down the kernel merely CLOSES the
+/// handle — the directory, and any cookie file still inside it, stays on disk.
+///
+/// The cost, stated plainly rather than argued away, and it prices ANY residue this
+/// process leaves standing — whether an exit ran no destructor at all, or a
+/// best-effort disposal ran and FAILED. One directory is minted PER OBLIGATION, so a
+/// single interrupted run can strand up to `cookie_global_cap` of them, each
+/// possibly still holding its cookie. That cap is PER WATCHER, not per process: it
+/// bounds ONE ledger, and [`cookie_ingress`] mints a fresh ledger for every
+/// `Watcher::spawn_with`, so the directories the LIVE LEDGERS still track come to at
+/// most the SUM of their caps. That sum is not the whole of what stands: a residue
+/// whose record was already RETIRED is outside every ledger — the teardown above
+/// retires first and disposes detached, so a disposal that never ran or FAILED
+/// leaves a directory nothing counts — and a process that has torn watchers down can
+/// therefore be standing more than its live caps allow. Because this platform never
+/// adopts a directory standing at a name (see [`CookieDir`]), no later run will ever
+/// enter or reclaim one, and nothing in this crate ever removes it. The ledger those
+/// caps are counted in is IN MEMORY, so it bounds nothing that outlives the process
+/// that owned it: repeated crash/restart cycles accumulate reserved directories
+/// without any bound THE LEDGER imposes. What bounds them at all is the finite name
+/// space below, and that only within one parent directory.
+///
+/// Nothing is corrupted, and no residue STILL BOUND AT ITS MINTED RESERVED LEAF
+/// reaches a consumer as a user change: [`is_sync_cookie_dir_name`] keeps that name,
+/// and the cookie directly inside it, suppressed. That suppression and the name-space
+/// accounting below both read the LEAF, and nothing holds a leftover at the leaf it
+/// was minted with: the handle this type retains shares DELETE, and a residue an
+/// interrupted run left has no handle at all, so a peer with write access to the
+/// parent can RENAME one onto an ordinary leaf. That frees the name it left for a
+/// later draw, and the destination — with whatever is inside it — no longer matches
+/// the classifier, so it classifies as a USER directory. Whether a LATER sync can
+/// still bind a name is a question about that name space rather than a guarantee,
+/// and the mechanism is exactly this. A mint draws its candidates from what
+/// [`mint_cookie_dir_token`] can produce — a `u32` remapped through
+/// [`admissible_token`](crate::os::windows::security::admissible_token), so 2^32 - 1
+/// distinct names — and creates each as a LEAF in the parent that sync targets;
+/// [`bind_fresh_cookie_dir`] gives up with a typed write failure after
+/// `COOKIE_DIR_MINT_ATTEMPTS` (8) consecutive `AlreadyExists` results. Each residue
+/// standing in that parent AT ITS MINTED NAME occupies one of those names, so it
+/// takes one name out of the draw, and a sync fails only when EVERY attempt lands
+/// on a name already taken. Accumulated residue therefore raises the chance that a mint
+/// exhausts its attempts, and a saturated parent would force it; residue under any
+/// OTHER parent is not in that draw at all.
+///
+/// Crash-safe reclamation is tracked as
+/// <https://github.com/al8n/tributaries/issues/117>, which records why the two
+/// obvious remedies are design questions rather than patches: `FILE_DELETE_ON_CLOSE`
+/// destroys the directory on last-handle-close only if it is EMPTY, which is exactly
+/// what a crash cannot promise, and scavenging at startup means deciding a found
+/// directory is ours — an ADOPTION VERDICT, the one thing this architecture exists
+/// to never render.
+#[cfg(all(target_os = "windows", not(miri)))]
+impl Drop for CookieDir {
+  fn drop(&mut self) {
+    let _ = self.dispose();
+  }
 }
 
 impl CookieDir {
@@ -653,6 +967,31 @@ impl CookieDir {
     self.unlink(name)
   }
 
+  /// NOTHING is owed for this directory, ever. This platform keeps ONE cookie
+  /// directory per watched directory, found by name and shared by every
+  /// obligation that ever writes into it, so no obligation owns it and none may
+  /// destroy it — removing it would be wrong, not merely unnecessary, because a
+  /// concurrent sync may be writing into it.
+  ///
+  /// Which is why a write that fails after minting one still reports
+  /// [`CookieWriteError::clean`] here: nothing of that write is on disk that this
+  /// obligation could ever be asked to destroy, so admitting a record for it would
+  /// count a debt that does not exist and retire it claiming a removal that never
+  /// happened.
+  fn owed(self: &Arc<Self>, landing: PathBuf) -> Option<CookieDirDebt> {
+    let _ = landing;
+    None
+  }
+
+  /// Nothing PER-OBLIGATION to dispose of, so the disposal succeeds having done
+  /// nothing — which is the truth here rather than a stub. [`reap_residue`] runs
+  /// the same two-step retirement on every platform and this is this platform's
+  /// answer to its second step, which is why a directory-only residue is never
+  /// observable here: it is discharged in the step that records it.
+  fn dispose(&self) -> Result<(), std::io::Error> {
+    Ok(())
+  }
+
   fn open_at(
     &self,
     name: &str,
@@ -677,81 +1016,172 @@ impl CookieDir {
 
 #[cfg(all(target_os = "windows", not(miri)))]
 impl CookieDir {
-  /// Creates (or re-opens) the cookie directory inside `parent`.
+  /// CREATES the cookie directory inside `parent`. Never re-opens one, never
+  /// adopts one, and never looks at what may already be standing at a candidate
+  /// name (see [`CookieDir`] for why this platform can afford that and Unix
+  /// cannot).
   ///
-  /// Windows has no `openat`, and nothing here establishes the exclusive-write
-  /// argument the Unix implementation rests on: on this platform the directory is
-  /// a grouping and a reserved-namespace convenience, NOT the source of removal
-  /// safety. Safety here comes from the disposition being set on an already-open
-  /// handle whose identity is RE-verified first — see [`remove_anchored`].
+  /// The name is minted at random per obligation and bound by the create itself,
+  /// which is also the call that yields the handle — so the directory this value
+  /// holds is the one that create made, not whatever a second lookup of the name
+  /// would have found. The counted disposal in [`reap_residue`] is the other half
+  /// of that, with [`Drop`](CookieDir::drop) beneath it: under COUNTED RETIREMENT the
+  /// obligation is retained — counted, retried on its budget — until the disposal
+  /// REQUEST succeeds. That is not the same instant as the physical unlink, and the
+  /// gap is the shape of the guarantee rather than slack in it:
+  /// [`dispose`](Self::dispose) sets the disposition through a BORROWED handle, so
+  /// the link leaves the parent only when handles close, which is after the record
+  /// has been retired. Under POSIX semantics that is immediate once this value's own
+  /// handle goes; under the classic `FILE_DISPOSITION_INFO` fallback it can wait for
+  /// every remaining handle. The directory can therefore outlive its obligation by
+  /// that interval — see [`CookieDir`], which states the same split.
+  ///
+  /// [`CookieRegistry`]'s TEARDOWN does not hold even that line — it retires the
+  /// record first and disposes best-effort after, possibly never — and `Drop` reaches
+  /// ordinary teardown and unwinding and nothing else. So an abnormal teardown can
+  /// strand a directory this still-running process no longer tracks, and an exit that
+  /// never unwinds strands whatever was outstanding; see [`CookieDir`] for the two
+  /// mechanisms and [`Drop`](CookieDir::drop) for what the residue costs and where it
+  /// is tracked.
   fn open_or_create(parent: &Path) -> Result<Self, std::io::Error> {
-    let path = parent.join(cookie_dir_name());
-    match std::fs::create_dir(&path) {
-      Ok(()) => {}
-      Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
-      Err(err) => return Err(err),
-    }
-    // A reparse point standing at the name would redirect every cookie out of the
-    // watched root, where its event could never reach the stream.
-    let meta = std::fs::symlink_metadata(&path)?;
-    if !meta.is_dir() {
-      return Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        "the cookie directory's name is held by something that is not a directory",
-      ));
-    }
-    Ok(Self { path })
+    Self::minted(parent, &mut mint_cookie_dir_token)
+  }
+
+  /// The body of [`open_or_create`](Self::open_or_create), with the candidate
+  /// sequence handed in so a cell can aim it at a name it has already occupied.
+  /// Production always passes [`mint_cookie_dir_token`].
+  ///
+  /// Two properties are load-bearing and both come from the shape of this
+  /// function rather than from a check inside it.
+  ///
+  /// The create is ANCHORED: `parent` is opened once, and every candidate is
+  /// created as a bare leaf beneath that handle (`ffi::create_directory_at`),
+  /// which returns the handle it made. No candidate name is ever resolved as a
+  /// path and none is ever looked up twice, so there is no create-then-open
+  /// window for a peer to unlink what this call made and stand its own directory
+  /// in its place — the atomicity that replaced the reparse verdict this arm used
+  /// to take afterwards.
+  ///
+  /// And nothing fallible happens after a create succeeds. The handle goes
+  /// straight into the guard whose [`Drop`](CookieDir::drop) disposes of it, so
+  /// there is no path on which this returns `Err` having left a directory on
+  /// disk — which is exactly the claim `CookieWriteError::clean` makes about the
+  /// call site's failures, made true by construction rather than asserted.
+  fn minted(parent: &Path, mint: &mut dyn FnMut() -> u32) -> Result<Self, std::io::Error> {
+    use std::os::windows::io::AsHandle;
+
+    use crate::os::windows::ffi;
+
+    let anchor = ffi::open_cookie_parent(parent)?;
+    let (path, handle) = bind_fresh_cookie_dir(parent, mint, &mut |leaf| {
+      ffi::create_directory_at(anchor.as_handle(), leaf)
+    })?;
+    Ok(Self { path, handle })
   }
 
   /// Creates `name` inside this directory. `create_new` refuses an existing name,
   /// and the reparse-point flag refuses to follow a link planted at it.
+  ///
+  /// # The access mask, derived from what the handle DOES
+  ///
+  /// `DELETE | SYNCHRONIZE`, derived the same way `ffi::create_directory_at`
+  /// derives the directory's: name the operations this handle performs, ask for
+  /// what each one REQUIRES, and stop. A right that merely sounds like it
+  /// belongs on a file being written is a latent `ACCESS_DENIED` on any ACL that
+  /// withholds it, and this handle would rather fail nowhere than fail there.
+  ///
+  /// A cookie is an EMPTY file whose existence is the whole message, so three
+  /// operations are all this descriptor ever sees: this create; the one
+  /// `FileIdInfo` read that promotes its identity ([`identity_of_handle`], from
+  /// [`FsOps::write_cookie`]); and the delete disposition that destroys it
+  /// ([`remove_anchored`], [`destroy_created`](Self::destroy_created)). Nothing
+  /// writes bytes to it, reads bytes from it, sets a timestamp or attribute on
+  /// it, or reads its security descriptor.
+  ///
+  /// * `DELETE` is what the disposition requires — `SetFileInformationByHandle`
+  ///   states it for `FILE_DISPOSITION_INFO` and `NtSetInformationFile` for both
+  ///   underlying classes. It travels with the descriptor so the create's own
+  ///   handle can destroy what it made without resolving a name, which is this
+  ///   platform's only object-exact removal.
+  /// * `SYNCHRONIZE` is the synchronous handle's own requirement: `OpenOptions`
+  ///   passes no `FILE_FLAG_OVERLAPPED`, so the open is synchronous, and
+  ///   `NtCreateFile` states that a `FILE_SYNCHRONOUS_IO_NONALERT` create must
+  ///   set SYNCHRONIZE in `DesiredAccess`. `FILE_GENERIC_WRITE` was carrying it
+  ///   incidentally; it is named here so removing the write bits cannot drop it
+  ///   by accident.
+  ///
+  /// What went is the rest of `FILE_GENERIC_WRITE`: `FILE_WRITE_DATA` and
+  /// `FILE_APPEND_DATA` (nothing is ever written — the file's whole content is
+  /// its absence), `FILE_WRITE_ATTRIBUTES` and `FILE_WRITE_EA` (nothing is set
+  /// on it), and `READ_CONTROL` (nothing reads its ACL). Note that
+  /// `dwDesiredAccess` and the CREATE disposition are independent: `CREATE_NEW`
+  /// carries no access requirement of its own — only `TRUNCATE_EXISTING` does —
+  /// so dropping the write bits cannot fail the create. `write(true)` stays set
+  /// only because Rust's `OpenOptions` refuses a create disposition without it;
+  /// `access_mode` replaces the rights it would otherwise imply, so the
+  /// effective mask is exactly the two bits above.
+  ///
+  /// `FILE_READ_ATTRIBUTES` is deliberately NOT here, and its absence is the
+  /// status quo rather than a reduction: `FILE_GENERIC_WRITE` never contained
+  /// it, so the identity read has always run without it. Microsoft's
+  /// requirement for `FileIdInformation` is unstated — `NtQueryInformationFile`
+  /// names a `DesiredAccess` requirement for every class that has one
+  /// (`FileBasicInformation` and friends need `FILE_READ_ATTRIBUTES`) and names
+  /// none for this one, and `GetFileInformationByHandleEx` documents no access
+  /// requirement at all, unlike its setting counterpart. If a Windows run ever
+  /// reports `ACCESS_DENIED` from that read, `FILE_READ_ATTRIBUTES` is the bit
+  /// to add — and it would be a requirement this mask never met, not one it
+  /// dropped.
   fn create(&self, name: &str) -> Result<std::fs::File, std::io::Error> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
-      DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_WRITE,
+      DELETE, FILE_FLAG_OPEN_REPARSE_POINT, SYNCHRONIZE,
     };
 
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
-    // DELETE travels with the descriptor so the create's own handle can destroy
-    // what it made without resolving a name — the residue path's only object-exact
-    // removal on this platform. `access_mode` replaces the read/write bits, so
-    // `write` stays set for `create_new`'s sake (a create disposition without it is
-    // rejected) while the effective rights are exactly these two.
-    options.access_mode(FILE_GENERIC_WRITE | DELETE);
+    options.access_mode(DELETE | SYNCHRONIZE);
     options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     options.open(self.path.join(name))
   }
 
-  /// Opens whatever stands at `name` with the LOWEST rights that still answer an
-  /// identity. Asking for DELETE here instead would let a sharing violation hide a
-  /// displacement behind a retry that can never converge; the DELETE-capable handle
-  /// is taken separately, and re-verified, only once the object has been proven.
+  /// Opens whatever stands at `name` just far enough to learn that SOMETHING does.
+  ///
+  /// Its one caller is the PINLESS refusal in [`remove_anchored`], which asks only
+  /// whether the name is empty and destroys nothing whatever it finds — so DELETE
+  /// is deliberately not among the rights asked for. No handle this returns is
+  /// ever deleted through, and this platform opens no name for deletion at all.
   ///
   /// `FILE_FLAG_BACKUP_SEMANTICS` is required for a handle on a DIRECTORY, and a
   /// directory is one of the things that can be standing at the name.
+  ///
+  /// # The access mask, derived from what the handle DOES
+  ///
+  /// ZERO, because the handle does NOTHING. It is dropped on the line it is
+  /// bound; the whole answer this open produces is whether it succeeded, and the
+  /// caller reads only that — `NotFound` is the idempotent success, and every
+  /// other outcome, an open that SUCCEEDS included, fails the removal closed.
+  /// Microsoft names this exact use: `dwDesiredAccess` "can be zero, allowing
+  /// the application to query file attributes without accessing the file …
+  /// useful to test for the existence of a file without opening it for read
+  /// and/or write access".
+  ///
+  /// `FILE_READ_ATTRIBUTES` stood here, and no attribute is ever read through
+  /// this handle. Dropping it cannot change a verdict — an existing name whose
+  /// ACL denies attribute reads used to answer `AccessDenied` and now opens, and
+  /// both land in the same fail-closed arm — while asking for it could turn a
+  /// name this process may perfectly well see into a removal that never
+  /// converges. That is the rule [`create`](Self::create) and
+  /// `ffi::open_cookie_parent` are written to as well: the bits come from the
+  /// operations, and an unused right is refused rather than kept.
   fn open_for_classification(&self, name: &str) -> Result<std::fs::File, std::io::Error> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
-      FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+      FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     };
 
     let mut options = std::fs::OpenOptions::new();
-    options.access_mode(FILE_READ_ATTRIBUTES);
-    options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
-    options.open(self.path.join(name))
-  }
-
-  /// Opens `name` with DELETE rights, for the caller that has already classified
-  /// the object and will RE-verify this handle's identity before destroying it.
-  fn open_for_delete(&self, name: &str) -> Result<std::fs::File, std::io::Error> {
-    use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-      DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
-    };
-
-    let mut options = std::fs::OpenOptions::new();
-    options.access_mode(FILE_READ_ATTRIBUTES | DELETE);
+    options.access_mode(0);
     options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
     options.open(self.path.join(name))
   }
@@ -769,6 +1199,53 @@ impl CookieDir {
     use std::os::windows::io::AsHandle;
 
     crate::os::windows::ffi::delete_by_handle(created.as_handle())
+  }
+
+  /// The DIRECTORY-ONLY debt a write that failed after minting this directory
+  /// must hand back. Always `Some` here: every obligation mints its own directory
+  /// (see [`CookieDir`]) and must destroy it, so the directory is a debt the
+  /// LEDGER carries — counted by both caps, retried on the same attempt budget,
+  /// reported by close — rather than one left to [`Drop`](Self::drop)'s best
+  /// effort, whose failure is discarded.
+  ///
+  /// See the Unix arm of this method for the other answer and why it differs;
+  /// this is the only question in the directory accounting whose answer is
+  /// platform-specific at all, and [`post_mint_failure`] is its only caller.
+  fn owed(self: &Arc<Self>, landing: PathBuf) -> Option<CookieDirDebt> {
+    Some(CookieDirDebt {
+      path: landing,
+      dir: Arc::clone(self),
+    })
+  }
+
+  /// Destroys the directory this obligation minted, through the handle its own
+  /// CREATE returned — no pathname is resolved, so nothing this process did not
+  /// create can be reached from here.
+  ///
+  /// The CALLER must have closed the cookie's own retained handle first, and
+  /// [`reap_residue`] — the one caller that matters — does exactly that. Under POSIX
+  /// semantics the cookie's name leaves this directory when the handle its removal
+  /// deleted THROUGH is closed, and that handle is the PIN whatever the record's
+  /// [`CookieProof`] says: every cookie removal on this platform deletes through the
+  /// create's own retained handle ([`remove_anchored`]), which `reap_residue`
+  /// releases on the line before. The classic `FILE_DISPOSITION_INFO` fallback
+  /// instead leaves the entry standing until the object's LAST handle closes, and a
+  /// directory holding a delete-pending entry is still NON-EMPTY. The pin is such a
+  /// handle too, so under EITHER class a disposal attempted over a live pin meets a
+  /// non-empty directory and fails.
+  ///
+  /// A directory somebody already removed is SUCCESS: the object this obligation
+  /// minted is gone from the only place it could ever be addressed, which is the
+  /// same idempotence [`CookieRemoval::AlreadyGone`] states for a cookie. Every
+  /// other failure is returned, so the obligation that owns this directory stays
+  /// counted and retries rather than leaving a residue nothing tracks.
+  fn dispose(&self) -> Result<(), std::io::Error> {
+    use std::os::windows::io::AsHandle;
+
+    match crate::os::windows::ffi::delete_by_handle(self.handle.as_handle()) {
+      Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+      other => other,
+    }
   }
 }
 
@@ -812,33 +1289,213 @@ impl CookieDir {
       "this platform has no way to bind a cookie's removal to the object created",
     ))
   }
+
+  /// Nothing is owed, because nothing is ever minted:
+  /// [`open_or_create`](Self::open_or_create) never yields a directory here, so no
+  /// write can fail after minting one and no obligation can be left holding one.
+  /// The same `None` the Unix arm answers, for a different reason.
+  fn owed(self: &Arc<Self>, landing: PathBuf) -> Option<CookieDirDebt> {
+    let _ = landing;
+    None
+  }
+
+  /// Unreachable by construction — [`open_or_create`](Self::open_or_create) never
+  /// yields a directory here — and success is still the honest answer: no
+  /// directory was minted for an obligation, so none can be left behind. Refusing
+  /// instead would report a residue that does not exist. The removal itself has
+  /// already failed closed by the time this could be reached.
+  fn dispose(&self) -> Result<(), std::io::Error> {
+    Ok(())
+  }
 }
 
-/// The cookie directory's name: the reserved stem, plus the effective uid where
-/// there is one (see [`CookieDir`] for why it is part of the name).
+/// The cookie directory's name for the user qualifier `user`: the reserved stem,
+/// a hyphen, and the qualifier in canonical decimal.
 ///
-/// Called only by the two [`CookieDir::open_or_create`] bodies that can actually
-/// open a directory; the no-anchor platform refuses before it needs a name, so
-/// this is inert there rather than unused.
-#[cfg_attr(
-  not(any(
-    target_os = "linux",
-    target_os = "macos",
-    all(target_os = "windows", not(miri))
-  )),
-  allow(dead_code)
-)]
+/// The ONE minter, on every platform. Each platform's qualifier is rendered into
+/// the same space — the effective uid on Unix, a per-obligation random token on
+/// Windows — so [`is_sync_cookie_dir_name`] never has to widen its alphabet to
+/// keep recognizing what this crate creates.
+///
+/// On Unix it is a PERSISTENT on-disk surface: the directory is stable across
+/// runs and found by name, so a change here abandons every directory a previous
+/// release minted. On Windows nothing is ever found by name, so nothing there
+/// depends on this rendering staying put — only the classifier does.
+fn cookie_dir_name_for(user: u32) -> String {
+  format!("{COOKIE_DIR_PREFIX}-{user}")
+}
+
+/// The cookie directory's name on the platforms that keep ONE, stable across
+/// runs: the reserved stem qualified by the effective uid (see [`CookieDir`] for
+/// why the qualifier is part of the name).
+///
+/// There is deliberately no Windows arm. That platform names a fresh directory
+/// per obligation and never looks one up, so a function answering "the name on
+/// this platform" would be answering a question it no longer has — and the one
+/// honest answer it could give, the bare stem, is precisely the legacy name the
+/// classifier keeps SUPPRESSED and nothing may ever enter again.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn cookie_dir_name() -> String {
-  #[cfg(any(target_os = "linux", target_os = "macos"))]
-  {
-    // SAFETY: `geteuid` reads no memory, takes no arguments, and cannot fail.
-    let euid = unsafe { libc::geteuid() };
-    format!("{COOKIE_DIR_PREFIX}-{euid}")
+  // SAFETY: `geteuid` reads no memory, takes no arguments, and cannot fail.
+  let euid = unsafe { libc::geteuid() };
+  cookie_dir_name_for(euid)
+}
+
+/// How many candidate names one [`CookieDir::open_or_create`] will mint before
+/// it gives up.
+///
+/// The loop only ever repeats on a name that is ALREADY BOUND, and a candidate is a
+/// fresh draw from the 2^32 - 1 names
+/// [`admissible_token`](crate::os::windows::security::admissible_token) leaves
+/// distinct — so a repeat is expected to be RARE, never impossible. This crate's own
+/// names are in that draw: the live directory of every other obligation under the
+/// same parent, and every residue from an earlier run STILL BOUND AT ITS MINTED
+/// RESERVED LEAF, is a name a draw can land on again, which is why an `AlreadyExists`
+/// is handled at all and why [`CookieDir`]'s `Drop` prices accumulated residue as
+/// pressure on this draw. A residue a peer has RENAMED off that leaf is still under
+/// the parent and still on disk, but its name is no longer one
+/// [`cookie_dir_name_for`] can produce, so it has left the draw entirely — the
+/// condition `Drop` states where it prices this name space, and the reason the
+/// pressure is counted at the MINTED name rather than per surviving directory.
+///
+/// Every attempt draws INDEPENDENTLY: [`bind_fresh_cookie_dir`] keeps no record of
+/// what it has already tried, so one occupied leaf can come up again on a later
+/// attempt and consume more than one of them. What is DETERMINISTIC is the bound:
+/// eight consecutive collisions — chance, a redraw of the SAME occupied token, or a
+/// peer racing to occupy whatever this process asks for next — end the loop with a
+/// typed write failure the obligation can retire on, rather than spinning forever
+/// inside a blocking-pool thread.
+#[cfg_attr(not(all(target_os = "windows", not(miri))), allow(dead_code))]
+const COOKIE_DIR_MINT_ATTEMPTS: usize = 8;
+
+/// What one create attempt in the mint loop means.
+///
+/// Split out as a value so the rule — WHICH errors mint another candidate, which
+/// abort, and where the bound falls — is decidable without a filesystem and is
+/// therefore pinned by cells on every host, not only where a Windows kernel runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(all(target_os = "windows", not(miri))), allow(dead_code))]
+enum MintStep {
+  /// The create bound the name: this call owns the directory standing there.
+  Bound,
+  /// The name was already bound. Discard the candidate — never inspect it, never
+  /// adopt it — and mint another.
+  Retry,
+  /// The name was already bound and no attempts remain.
+  Exhausted,
+  /// The create failed for a reason another name would not fix.
+  Failed,
+}
+
+/// The mint loop's whole decision table, over the error kind a create attempt
+/// reported (`None` for success) and the 1-based attempt number.
+///
+/// `AlreadyExists` is the ONE kind that retries, and it is the anti-adoption rule
+/// itself: this crate refuses to enter a name it did not just bind, so an
+/// occupied candidate is discarded rather than examined. Everything else — a
+/// missing parent, a denied create, a full disk — describes the PARENT rather
+/// than the candidate, so another name would fail identically and reporting the
+/// first failure is both faster and more honest.
+#[cfg_attr(not(all(target_os = "windows", not(miri))), allow(dead_code))]
+fn mint_step(failure: Option<std::io::ErrorKind>, attempt: usize) -> MintStep {
+  match failure {
+    None => MintStep::Bound,
+    Some(std::io::ErrorKind::AlreadyExists) if attempt < COOKIE_DIR_MINT_ATTEMPTS => {
+      MintStep::Retry
+    }
+    Some(std::io::ErrorKind::AlreadyExists) => MintStep::Exhausted,
+    Some(_) => MintStep::Failed,
   }
-  #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-  {
-    COOKIE_DIR_PREFIX.to_owned()
+}
+
+/// Binds a freshly minted cookie-directory name under `parent` by calling `bind`
+/// on candidate LEAF names, and answers the path THIS CALL created together with
+/// whatever that successful create produced.
+///
+/// The guarantee is the create, not the name: `bind` must fail with
+/// `AlreadyExists` on a name that is already bound, so the only path this can
+/// return is one that did not exist an instant before. No candidate is ever
+/// stat'ed, opened, or judged — an occupied name is simply not this call's, and
+/// the next candidate is minted (see [`mint_step`]).
+///
+/// The binding call is injected for one reason: the loop's rule is portable and
+/// the Windows create is not. Production hands in `ffi::create_directory_at`,
+/// which creates the leaf beneath a retained parent handle and answers the
+/// handle it made; the cells hand in `create_dir`, whose `AlreadyExists` means
+/// the same thing on every host. So the anti-adoption rule is proven wherever
+/// this crate's suite runs rather than only where the arm that uses it executes,
+/// and the value that comes back — a handle in production, nothing in a cell —
+/// stays the injected call's business.
+#[cfg_attr(not(all(target_os = "windows", not(miri))), allow(dead_code))]
+fn bind_fresh_cookie_dir<T>(
+  parent: &Path,
+  mint: &mut dyn FnMut() -> u32,
+  bind: &mut dyn FnMut(&str) -> Result<T, std::io::Error>,
+) -> Result<(PathBuf, T), std::io::Error> {
+  let mut attempt = 0;
+  loop {
+    attempt += 1;
+    let leaf = cookie_dir_name_for(mint());
+    let outcome = bind(&leaf);
+    match mint_step(outcome.as_ref().err().map(std::io::Error::kind), attempt) {
+      MintStep::Bound => {
+        let bound = outcome.expect("mint_step reports Bound only for a create that succeeded");
+        return Ok((parent.join(leaf), bound));
+      }
+      MintStep::Retry => {}
+      MintStep::Exhausted => {
+        return Err(std::io::Error::new(
+          std::io::ErrorKind::AlreadyExists,
+          "every minted cookie directory name was already bound",
+        ));
+      }
+      MintStep::Failed => {
+        return Err(
+          outcome
+            .err()
+            .expect("mint_step reports Failed only for a create that failed"),
+        );
+      }
+    }
   }
+}
+
+/// One candidate qualifier for a cookie directory's name.
+///
+/// The token's job is to make a COLLISION rare, not to make a name secret: what
+/// forbids entering somebody else's directory is the create in
+/// [`bind_fresh_cookie_dir`], which refuses a bound name however that name was
+/// chosen — and which, on Windows, is the same call that returns the handle, so
+/// a name the create did not bind cannot be entered even for the instant a
+/// second lookup would take. Being hard to guess is defence in depth on top of
+/// that — an attacker who predicts a cookie's own name must also predict the
+/// directory it lands in — so a `RandomState` key is used rather than a
+/// dependency, and this comment says
+/// plainly what it is: std's hash-flooding defence, keyed from OS entropy, and
+/// NOT a cryptographic pseudo-random function. Every draw mixes a FRESH state's
+/// key with the process id and the current instant, so no two draws in a thread
+/// differ by a constant — but the strength claimed for the result is "collides
+/// rarely and is awkward to predict", never "is unguessable".
+///
+/// The result is remapped off the one value the classifier refuses, so every name
+/// this can produce is a name a consumer suppresses (see
+/// [`admissible_token`](crate::os::windows::security::admissible_token)).
+#[cfg_attr(not(all(target_os = "windows", not(miri))), allow(dead_code))]
+fn mint_cookie_dir_token() -> u32 {
+  use std::hash::{BuildHasher, Hasher};
+
+  let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+  hasher.write_u32(std::process::id());
+  hasher.write_u128(
+    std::time::SystemTime::now()
+      .duration_since(std::time::UNIX_EPOCH)
+      .map_or(0, |since| since.as_nanos()),
+  );
+  let drawn = hasher.finish();
+  // Folded rather than truncated: the two halves of a `u64` hash are equally
+  // good here and mixing them costs nothing.
+  let folded = ((drawn ^ (drawn >> 32)) & u64::from(u32::MAX)) as u32;
+  crate::os::windows::security::admissible_token(folded)
 }
 
 /// A cookie name as a C string, for the `*at` calls. An interior NUL is refused
@@ -861,30 +1518,24 @@ fn cookie_c_name(name: &str) -> Result<std::ffi::CString, std::io::Error> {
 /// the object it finds there.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum CookieProof {
-  /// The create read this identity off its OWN descriptor. Every removal
-  /// re-reads the identity of whatever stands at the name and refuses unless it
-  /// matches, so a name that has come to hold a different object is settled as
-  /// displaced instead of unlinked.
+  /// The create read this identity off its OWN descriptor.
   ///
-  /// On Unix the comparison and the unlink are separate calls, so this DETECTS a
-  /// displacement rather than excluding one; the removal's contract says which
-  /// actors that covers and which it names trusted (see [`remove_anchored`]).
-  /// On Windows the disposition is set on a handle that has itself been proven,
-  /// so there the removal genuinely destroys the object it compared.
+  /// It is what a UNIX removal compares. Neither Unix can condition an unlink on
+  /// an object, so the removal re-reads the identity of whatever stands at the
+  /// name and refuses unless it matches — which DETECTS a displacement rather than
+  /// excluding one, the comparison and the unlink being separate calls. The
+  /// removal's contract says which actors that covers and which it names trusted
+  /// (see [`remove_anchored`]).
   ///
-  /// The identity is READ only by a removal that has an anchor to remove through;
-  /// where none exists the removal refuses before comparing anything, so the field
-  /// is inert there and the lint is turned off exactly there.
+  /// Windows never reads it. There the cookie is destroyed through the create's
+  /// own retained handle, which follows the OBJECT and so is strictly stronger
+  /// than any comparison made across two lookups of a name — and it is what an
+  /// [`Anchor`](Self::Anchor) residue was already destroyed through, so the two
+  /// proofs differ in nothing that platform acts on. The identity is carried for
+  /// the ledger's sake alone there, which is why the field is inert on every
+  /// platform but the two Unixes and the lint is turned off exactly there.
   Object(
-    #[cfg_attr(
-      not(any(
-        target_os = "linux",
-        target_os = "macos",
-        all(target_os = "windows", not(miri))
-      )),
-      allow(dead_code)
-    )]
-    RootIdentity,
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))] RootIdentity,
   ),
   /// The create could NOT read an identity, and the immediate destroy that
   /// follows such a create also failed — so a file is on disk that nothing can
@@ -897,10 +1548,12 @@ pub(crate) enum CookieProof {
   /// it `remove_file(path)` minus only the path resolution.
   ///
   /// What each platform does instead: Windows destroys the object through the
-  /// create's own retained handle, with no name resolved (genuinely object-exact).
-  /// Unix promotes the record to an `Object` proof by reading the identity off
-  /// that same retained handle — a lookup of nothing, so it names this write's own
-  /// object — and refuses the removal outright when it cannot.
+  /// create's own retained handle, with no name resolved (genuinely object-exact)
+  /// — which is what it does for an [`Object`](Self::Object) record too, so this
+  /// proof asks nothing special of it. Unix promotes the record to an `Object`
+  /// proof by reading the identity off that same retained handle — a lookup of
+  /// nothing, so it names this write's own object — and refuses the removal
+  /// outright when it cannot.
   Anchor,
 }
 
@@ -954,10 +1607,14 @@ pub(crate) enum CookieProof {
 /// The pin is an `Arc`, not an owned `File`: this value is cloned onto every
 /// removal job, and a `File` clone would `dup` a second descriptor per clone —
 /// multiplying the very cost the obligation cap is meant to bound. Every clone
-/// shares the one descriptor, which closes when the last of them dies. Since the
-/// ledger record holds one clone and each in-flight removal holds its own, the
-/// pin necessarily outlives the removal syscall that reads against it, which is
-/// what makes the comparison sound at removal time and not merely at create.
+/// shares the one descriptor, which closes when the last of them dies. A dispatched
+/// removal MOVES the pin out of the record into the job it hands the residue to
+/// ([`CookieRegistry::removal_decision_locked`]), so while the removal runs exactly
+/// one holder exists and it is the JOB — which is both what lets [`reap_residue`]
+/// close the pin before disposing of the directory and why the pin necessarily
+/// outlives the removal syscall that reads against it, making the comparison sound at
+/// removal time and not merely at create. A job that fails hands the pin back with
+/// its residue.
 ///
 /// `dir` and `pin` are `None` only for a cookie minted BELOW the real write — the
 /// fake [`FsOps`] and hand-built ledger records — where no descriptor exists to
@@ -966,6 +1623,24 @@ pub(crate) enum CookieProof {
 #[derive(Clone, Debug)]
 pub(crate) struct CookieFile {
   path: PathBuf,
+  /// Never read on Unix, and that is the point: its whole contribution there is its
+  /// `Drop`, which is the instant the kernel becomes free to hand this object's
+  /// identity to someone else. On Windows it is the removal ITSELF — every cookie
+  /// destroy on that platform is a disposition set on this handle, whatever the
+  /// record's [`CookieProof`] says, because a handle follows its object and a name
+  /// does not.
+  ///
+  /// Declared BEFORE `dir`, and the order is load-bearing on Windows: fields drop
+  /// in declaration order, `CookieDir`'s own `Drop` destroys the directory it
+  /// created, and on the volumes that take the classic `FILE_DISPOSITION_INFO`
+  /// fallback — where a deleted entry survives until the object's LAST handle
+  /// closes — a directory still holding this open cookie is a directory the
+  /// disposition refuses to remove. That order carries the best-effort BACKSTOP
+  /// only. The counted disposal does not depend on it: [`reap_residue`] closes this
+  /// handle EXPLICITLY, between the cookie's removal and the directory's
+  /// disposition, which is why the removal paths arrange for the `CookieFile` they
+  /// hand it to own the last reference (see `CookieRegistry::removal_decision_locked`).
+  pin: Option<Arc<std::fs::File>>,
   /// The directory descriptor every operation on this cookie is anchored to,
   /// shared by every clone so one open directory serves the whole obligation.
   dir: Option<Arc<CookieDir>>,
@@ -973,11 +1648,6 @@ pub(crate) struct CookieFile {
   /// and always a single normal component.
   name: String,
   proof: CookieProof,
-  /// Never read, and that is the point: its whole contribution is its `Drop`,
-  /// which is the instant the kernel becomes free to hand this object's identity
-  /// to someone else. On Windows it is read once more — it is the only object-exact
-  /// destroy that platform's [`CookieProof::Anchor`] residue has.
-  pin: Option<Arc<std::fs::File>>,
 }
 
 impl CookieFile {
@@ -1044,16 +1714,119 @@ impl CookieFile {
   }
 }
 
+/// What ONE cookie obligation still owes the filesystem — the ledger's whole
+/// representation of physical debt, and the only thing a reap is ever handed.
+///
+/// # Why a cookie's debt needs two shapes
+///
+/// Where a directory was minted for the obligation, the obligation owes TWO
+/// objects: the cookie file, and the directory holding it. They are destroyed in
+/// that order, by two separate syscalls, and either can fail on its own — so
+/// there is a real, reachable state in which the FILE half has settled and the
+/// DIRECTORY half has not. A ledger that can only say "this record owes a
+/// [`CookieFile`]" has no way to write that state down, and the record is left
+/// claiming a file half it has already discharged.
+///
+/// That is not a cosmetic inaccuracy. A settled file half has SPENT the pin (see
+/// [`reap_residue`] for why it must), and the moment the pin is released the
+/// kernel may hand the file id it was holding out of the allocator's reach to
+/// somebody else. The identity the record still carries then names nothing: a
+/// successor bound at the cookie's name can be issued the very same id and
+/// compare EQUAL to a cookie that is already gone. A record that kept its
+/// [`CookieFile`] across a failed disposal would therefore arm its next retry
+/// with an identity that had stopped being evidence — and delete whatever
+/// matched it.
+///
+/// # What the second shape forbids
+///
+/// [`Dir`](Self::Dir) is that state, and it forbids the comparison by carrying
+/// nothing to compare with. [`FsOps::remove_cookie`] takes a [`CookieFile`], and
+/// [`remove_anchored`]'s identity arm reads a [`CookieProof`] out of one. A
+/// directory-only obligation holds neither, so the call cannot be written — not
+/// "is refused by a check inside it", but has no argument to be made with.
+#[derive(Clone, Debug)]
+pub(crate) enum CookieResidue {
+  /// BOTH halves are owed: the cookie file — its anchor, its name inside that
+  /// anchor, what authorizes its removal and the create's retained descriptor —
+  /// and, riding inside it, the directory it was created in.
+  File(CookieFile),
+  /// DIRECTORY-ONLY: the file half has settled (unlinked, already gone, or
+  /// displaced by a foreign object) and only the directory this obligation
+  /// minted is still owed.
+  ///
+  /// It carries no proof and no pin because it has nothing left to prove, and
+  /// the one operation it can still take part in is
+  /// [`FsOps::dispose_cookie_dir`].
+  Dir(CookieDirDebt),
+}
+
+/// The directory half of one obligation's debt: the landing the record was
+/// claimed under, and the directory still to destroy.
+#[derive(Clone, Debug)]
+pub(crate) struct CookieDirDebt {
+  /// The record's landing path, carried UNCHANGED across the file half's
+  /// settlement. `by_path` is keyed by it from the claim
+  /// ([`CookieGuard::claim`]) to the retire ([`LedgerInner::retire`]), so a
+  /// residue that renamed itself part-way through its life would strand that
+  /// index entry on a key nothing would ever look up again.
+  path: PathBuf,
+  /// The directory to destroy, shared with the record the job was dispatched
+  /// from. Unlike the cookie's pin, this needs no unique holder: the disposition
+  /// is set on the handle the directory's own create returned, which every clone
+  /// shares.
+  dir: Arc<CookieDir>,
+}
+
+impl CookieResidue {
+  /// Where this obligation's cookie landed — the `by_path` key, and what a
+  /// path-addressed removal resolves through. Stable across the file half's
+  /// settlement, so the index entry a claim inserted is the one a retire drops.
+  fn path(&self) -> &Path {
+    match self {
+      Self::File(file) => file.path(),
+      Self::Dir(owed) => &owed.path,
+    }
+  }
+
+  /// The file half, for the cells that watch a reap SETTLE it — the create's
+  /// retained handle, and the proof that goes with it. `None` once the residue
+  /// is directory-only, which is the state those cells are watching for.
+  #[cfg(all(test, feature = "tokio"))]
+  pub(crate) const fn file(&self) -> Option<&CookieFile> {
+    match self {
+      Self::File(file) => Some(file),
+      Self::Dir(_) => None,
+    }
+  }
+
+  /// The directory still owed, for the cells that must name it — to arm its
+  /// disposal failure, or to prove a record has become directory-only.
+  #[cfg(all(test, feature = "tokio"))]
+  pub(crate) fn owed_dir(&self) -> Option<&Path> {
+    match self {
+      Self::File(_) => None,
+      Self::Dir(owed) => Some(owed.dir.path()),
+    }
+  }
+}
+
 /// What one cookie removal PROVED about the name it was handed. Every variant is
-/// a success — the obligation retires on all three — but they are not the same
-/// fact, and collapsing them would hide the only one that means a foreign object
-/// is sitting where this driver's cookie used to be.
+/// a success — under all three the cookie FILE is gone from the only place this
+/// driver could address it — but they are not the same fact, and collapsing them
+/// would hide the only one that means a foreign object is sitting where this
+/// driver's cookie used to be.
+///
+/// A verdict here settles the file, not the whole obligation: where a directory
+/// was minted to hold the cookie, [`reap_residue`] must also dispose of it, and the
+/// record retires only once both have settled.
 ///
 /// A platform with no anchor primitive constructs none of them: its removal
 /// refuses rather than settling a verdict it has no primitive to reach (see
 /// [`CookieDir`]). The variants are inert there, not unused, and the driver still
 /// matches on all three — so the lint is turned off exactly on that platform and
-/// keeps its bite everywhere a variant could genuinely fall out of use.
+/// keeps its bite everywhere a variant could genuinely fall out of use. Windows
+/// reaches only two of the three, for the reason [`Displaced`](Self::Displaced)
+/// gives.
 #[cfg_attr(
   not(any(
     target_os = "linux",
@@ -1072,11 +1845,23 @@ pub(crate) enum CookieRemoval {
   /// The name denotes a DIFFERENT object. This sync's cookie is gone from it and
   /// a stranger holds it now, so nothing is unlinked — deleting it would destroy
   /// data this driver never created and cannot restore.
+  ///
+  /// UNIX-ONLY, and by construction rather than by accident. It is the verdict a
+  /// removal reaches by comparing an identity against whatever a second lookup of
+  /// the name found, and Windows does no such lookup: it deletes through the
+  /// create's own retained handle and refuses outright when it has none (see
+  /// [`remove_anchored`]), so it can neither reach a stranger nor learn that one
+  /// exists. A stranger at a Windows cookie's name is met by the DIRECTORY's
+  /// disposal instead, which refuses a non-empty directory and keeps the
+  /// obligation counted and retried — never by this verdict, which would retire
+  /// it. The lint is turned off there for that reason and keeps its bite on the
+  /// two platforms that do construct it.
+  #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
   Displaced,
 }
 
 /// Why a cookie write produced no usable cookie, and — the part that decides the
-/// obligation's fate — whether it left a FILE behind.
+/// obligation's fate — what it left ON DISK.
 ///
 /// A write that fails before anything lands is a clean pre-physical failure, and
 /// its obligation retires having created nothing. A write that creates a file it
@@ -1087,19 +1872,31 @@ pub(crate) enum CookieRemoval {
 /// obligation cap that is supposed to bound them. The residue is therefore
 /// returned, and the caller admits it as an ordinary owned cookie whose removal
 /// is retried — counted the whole time.
+///
+/// The same doctrine covers the DIRECTORY, and it has to: on a platform that
+/// mints one per obligation, every failure after the mint leaves a directory on
+/// disk, and `clean` would say otherwise. Such a failure comes back carrying a
+/// [`CookieResidue::Dir`] instead (see [`post_mint_failure`]), so the obligation
+/// enters the same ledger, under the same caps, with the same retry budget —
+/// rather than retiring `NeverCreated` and leaving the directory to
+/// [`CookieDir`]'s `Drop`, whose failure is discarded by design.
 #[derive(Debug)]
 pub(crate) struct CookieWriteError {
   /// The failure the sync reports, verbatim.
   pub(crate) source: std::io::Error,
-  /// A file this write created, could not identify, and could not destroy. It is
-  /// still on disk, and whoever receives it OWNS it. Boxed so the failure path
-  /// costs a pointer rather than a whole cookie record on every `Result` the
-  /// write returns.
-  pub(crate) residue: Option<Box<CookieFile>>,
+  /// What this write left behind and could not destroy — a file it could not
+  /// identify, or the directory it had already minted. It is still on disk, and
+  /// whoever receives it OWNS it. Boxed so the failure path costs a pointer
+  /// rather than a whole cookie record on every `Result` the write returns.
+  pub(crate) residue: Option<Box<CookieResidue>>,
 }
 
 impl CookieWriteError {
   /// The pre-physical failure: nothing of this write is on disk.
+  ///
+  /// The claim is literal, and only the sites that can still make it truthfully
+  /// may use it — every failure that lands after a directory has been minted
+  /// goes through [`post_mint_failure`] instead.
   pub(crate) const fn clean(source: std::io::Error) -> Self {
     Self {
       source,
@@ -1143,14 +1940,21 @@ struct Obligation {
   /// Immutable incarnation identity — also this record's ledger key. Never
   /// changes for the life of the record; a same-path successor gets a fresh one.
   id: CookieId,
-  /// The cookie the write landed — its path AND the identity of the object that
-  /// create made — learned only once the write reports it. `None` while the sync
-  /// is parked on its fence or its write is still in the pool; `Some(F)` from the
-  /// claim (or the refused claim's self-reap) onward — the sweeps and the
-  /// abnormal-path backstop unlink through it, and `by_path` maps its path back
-  /// to this id. A fileless record is exactly one for which no file can exist
-  /// yet, so every sweep leaves it to its own write (or, parked, to its
-  /// pre-physical terminal) rather than unlinking.
+  /// What this obligation still owes the filesystem — learned only once the
+  /// write reports it. `None` while the sync is parked on its fence or its write
+  /// is still in the pool; `Some` from the claim (or the refused claim's
+  /// self-reap) onward — the sweeps and the abnormal-path backstop reap through
+  /// it, and `by_path` maps its landing back to this id. A record with no residue
+  /// is exactly one for which nothing physical can exist yet, so every sweep
+  /// leaves it to its own write (or, parked, to its pre-physical terminal)
+  /// rather than unlinking.
+  ///
+  /// It is a [`CookieResidue`] rather than a [`CookieFile`] because the two
+  /// halves of the debt settle SEPARATELY: a record whose cookie is confirmed
+  /// gone but whose minted directory survived owes the directory alone, and that
+  /// state has to be writable here or the record keeps claiming a file half it
+  /// has already discharged — with an identity whose pin is spent. See
+  /// [`CookieResidue`] for what that would cost.
   ///
   /// The identity rides the record rather than being re-derived at removal time
   /// because a removal can run arbitrarily long after the write — a retry
@@ -1162,13 +1966,27 @@ struct Obligation {
   /// [`CookieFile`]): the record is the thing whose lifetime the pin must match,
   /// because the identity has to stay unreissuable for exactly as long as some
   /// removal may still compare against it. It is released when [`retire`] drops
-  /// this record — and, for a removal in flight at that instant, when that job's
-  /// own clone dies just after. One descriptor per landed cookie, so the live
-  /// descriptor count is the count of records with a landing, which
-  /// `cookie_global_cap` bounds along with the rest of the ledger.
+  /// this record, when the file half settles (the residue becomes
+  /// [`Dir`](CookieResidue::Dir), which has no pin because it has no identity to
+  /// keep alive), and — for a removal in flight at that instant — when that job's
+  /// own clone dies just after. One descriptor per landed cookie, and every landed
+  /// cookie belongs to a record — one that has published its landing, or one still
+  /// `InPool` whose own write holds the descriptor until it does — so the descriptors
+  /// held for TRACKED, not-yet-retired work are at most the ledger's size.
+  ///
+  /// That is NOT a bound on every live descriptor, and teardown is where the two come
+  /// apart. Dispatching a removal MOVES the pin out of the record and into its job
+  /// ([`CookieRegistry::removal_decision_locked`]), and [`CookieRegistry`]'s own
+  /// `Drop` retires a `Removing` record while deliberately leaving that job alone. So
+  /// the ledger can be EMPTY while a job blocked on a hung mount still holds its
+  /// cookie pin — and, on Windows, the [`CookieDir`] handle with it — for as long as
+  /// it stays blocked, counted by nothing. What `cookie_global_cap` bounds is
+  /// ADMISSION: at most that many records exist at once, so at most that many such
+  /// jobs can be in flight when a teardown retires them all. It bounds no
+  /// descriptor's LIFETIME.
   ///
   /// [`retire`]: LedgerInner::retire
-  file: Option<CookieFile>,
+  residue: Option<CookieResidue>,
   /// This obligation must not survive: set by a cancel that names it, whatever
   /// its phase. It rides the record rather than a free-standing tombstone set,
   /// so it cannot be set for an obligation that does not exist, cannot be left
@@ -1493,7 +2311,9 @@ struct CookieGuard {
 }
 
 impl CookieGuard {
-  /// Hands a just-created cookie to the registry, which then owns it. `None`
+  /// Hands what a just-finished write left on disk to the registry, which then
+  /// owns it — the cookie itself, or (where the write failed after minting its
+  /// directory) the directory alone. `None`
   /// means the handover was REFUSED — a cancel named this obligation, the
   /// registry is gone, the scope is retiring, or the scope's root generation has
   /// moved past the one this write was dispatched under — so a sweep has already
@@ -1520,7 +2340,7 @@ impl CookieGuard {
   /// An ABSENT record means the abnormal-path [`Drop`] already took the ledger;
   /// its flag is raised before that take, so this refuses on either observation
   /// and the write reaps its own file.
-  fn claim(&self, file: &CookieFile) -> Option<CookieId> {
+  fn claim(&self, residue: &CookieResidue) -> Option<CookieId> {
     let mut inner = lock_ledger(&self.ledger);
     let ob = inner.obligations.get_mut(&self.id)?;
     if ob.reap_requested
@@ -1548,9 +2368,9 @@ impl CookieGuard {
     // if it does occur: the displaced id's record is left untouched (we cannot know
     // which file-at-P history is live), and it reaches its terminal through the
     // id-addressed sweeps, which unlink P on its behalf and earn its confirm.
-    ob.file = Some(file.clone());
+    ob.residue = Some(residue.clone());
     ob.phase = Phase::Owned;
-    inner.by_path.insert(file.path().to_path_buf(), self.id);
+    inner.by_path.insert(residue.path().to_path_buf(), self.id);
     Some(self.id)
   }
 }
@@ -1560,18 +2380,27 @@ impl CookieGuard {
 /// cannot strand a file, and neither can a scope that dies under an in-flight
 /// write.
 ///
-/// Every physical unlink that ends a cookie's life is a TRACKED, counted job:
-/// its ledger record is dropped only once the unlink CONFIRMS (success, or a
-/// file already gone), so a transient failure retains the record for a later
-/// sweep rather than silently orphaning the file. The reaps that end a cookie
-/// — a completed-cookie reap and a scope's stream teardown
-/// ([`retire_scope`](Self::retire_scope)), and the orderly close's
+/// Every physical unlink DISPATCHED ON THE TRACKED PATH is a counted job: its
+/// ledger record is dropped only once the unlink CONFIRMS (success, or a file
+/// already gone), so a transient failure retains the record for a later sweep
+/// rather than silently orphaning the file. That is this type's point, and it holds
+/// for every removal a LIVE registry decides.
+///
+/// The reaps that end a cookie — a completed-cookie reap and a scope's stream
+/// teardown ([`retire_scope`](Self::retire_scope)), and the orderly close's
 /// [`sweep_owned`](Self::sweep_owned) — each raise their flag before taking the
 /// paths, so a write still in the blocking pool can never slip a file past the
-/// sweep that was supposed to reap it. This type's [`Drop`] is the
+/// sweep that was supposed to reap it.
+///
+/// TEARDOWN is the one exception to that guarantee. This type's [`Drop`] is the
 /// ABNORMAL-path backstop only (a panic or a task cancellation, where no close
 /// grace exists): it dispatches its remaining unlinks DETACHED so it can never
-/// block the very unwind it runs under.
+/// block the very unwind it runs under — and it retires every remaining record
+/// UNCONFIRMED, as the abnormal residual each is, a record already `Removing` being
+/// retired with its in-flight job left to finish or not on its own. On that path
+/// alone a record leaves the ledger with no unlink having confirmed, and
+/// `Obligation::residue` states what such a job still holds open once the record
+/// counting it is gone.
 struct CookieRegistry<F: FsOps> {
   ops: F,
   /// Raised before the registry stops accepting handovers — at the orderly
@@ -1700,7 +2529,7 @@ impl<F: FsOps> CookieRegistry<F> {
         name: name.clone(),
         ticket,
         id,
-        file: None,
+        residue: None,
         reap_requested: false,
         last_failure_seq: 0,
         phase: Phase::Parked { fence },
@@ -1916,14 +2745,15 @@ impl<F: FsOps> CookieRegistry<F> {
     rearmed
   }
 
-  /// Spawns the ONE blocking unlink of `file` for incarnation `id` (the record
+  /// Spawns the ONE blocking reap of `file` for incarnation `id` (the record
   /// was already transitioned to `Removing` under the ledger lock by the
   /// decision that called this, which read `id` from the record inside that
   /// same section). The job writes the PHYSICAL VERDICT itself, under the ledger
-  /// mutex, before reporting anything: a confirmed removal (unlinked, already
-  /// gone, or the name displaced by a foreign object) retires incarnation `id` —
-  /// a racing successor keeps its own key and is left intact — and a transient
-  /// failure parks the record as `RemoveFailed` so the file is never orphaned.
+  /// mutex, before reporting anything: a confirmed reap (the cookie unlinked,
+  /// already gone, or displaced by a foreign object, AND the directory it was
+  /// created in disposed of) retires incarnation `id` — a racing successor keeps
+  /// its own key and is left intact — and a failure of EITHER half parks the
+  /// record as `RemoveFailed` so nothing physical is ever orphaned.
   /// The `CookieRemoveDone` that follows carries the id and drives SCHEDULING
   /// only: the driver owns the clock, so it alone stamps the retry deadline.
   /// Truth therefore rides the job that learned it, and a lost completion costs
@@ -1931,17 +2761,27 @@ impl<F: FsOps> CookieRegistry<F> {
   ///
   /// The job carries the write's own identity for the cookie — and, through its
   /// clone of the record's [`CookieFile`], the create's descriptor, so that
-  /// identity is still the cookie's alone while this syscall runs. A successor
-  /// that reclaimed the name is therefore REFUSED rather than unlinked
+  /// identity is still the cookie's alone while this syscall runs. On Unix a
+  /// successor that reclaimed the name is therefore REFUSED rather than unlinked
   /// ([`CookieRemoval::Displaced`]): the successor's file survives, its own
   /// record still owns it, and this incarnation retires having proved its file is
-  /// no longer at the name. What remains unclosed is a Linux/macOS-only window
-  /// stated at `remove_verified`; Windows closes it by removing through the
-  /// verified handle.
+  /// no longer at the name. What remains unclosed there is the window between that
+  /// proof and the unlink, stated in full at [`remove_anchored`]. Windows has
+  /// neither the window nor the comparison: it deletes through the create's own
+  /// handle, so a name a successor reclaimed is never resolved at all.
+  ///
+  /// The record's clone of that descriptor was MOVED here rather than shared
+  /// ([`removal_decision_locked`](Self::removal_decision_locked)), so this job
+  /// holds the last reference and [`reap_residue`] can close it before disposing
+  /// of the directory. A job that fails hands its WHOLE residue straight back,
+  /// under the same lock that parks the record — so what the record says between
+  /// attempts is exactly what the attempt learned: the pin returns with a file
+  /// half that did not settle, and a file half that DID settle returns as a
+  /// directory-only debt carrying neither pin nor identity.
   fn spawn_unlink<R>(
     &self,
     op_tx: &async_channel::Sender<OpResult<F::Handle>>,
-    file: CookieFile,
+    residue: CookieResidue,
     id: CookieId,
   ) where
     R: RuntimeLite,
@@ -1950,7 +2790,8 @@ impl<F: FsOps> CookieRegistry<F> {
     let ledger = Arc::clone(&self.ledger);
     let tx = op_tx.clone();
     R::spawn_blocking_detach(move || {
-      let confirmed = ops.remove_cookie(&file).is_ok();
+      let mut residue = residue;
+      let confirmed = reap_residue(&ops, &mut residue).is_ok();
       {
         let mut inner = lock_ledger(&ledger);
         if confirmed {
@@ -1959,8 +2800,20 @@ impl<F: FsOps> CookieRegistry<F> {
           // this lock.
           inner.retire(id, Reaped::ConfirmedGone);
         } else {
+          // The residue the JOB holds is the truth: it is the record's own clone,
+          // advanced by whatever this attempt settled. Handing it back WHOLE is
+          // what keeps the record and the physical world in step — the create's
+          // retained handle returns with a file half that did not settle (a retry
+          // that found no pin could no longer hold the cookie's identity slot out
+          // of the allocator's reach, which is the whole reason the comparison at
+          // the next attempt means anything), and a file half that did settle
+          // returns as the directory-only debt it has become, with no identity
+          // left to compare and nothing left that could ask it to.
+          if let Some(ob) = inner.obligations.get_mut(&id) {
+            ob.residue = Some(residue);
+          }
           // The syscall has already returned, so leaving `Removing` here cannot
-          // overlap a second unlink for this record: the file is retained as
+          // overlap a second unlink for this record: what survived is retained as
           // failed, PARKED until the driver schedules its retry.
           inner.record_remove_failed(id);
         }
@@ -1987,19 +2840,20 @@ impl<F: FsOps> CookieRegistry<F> {
   fn removal_decision_locked(
     inner: &mut LedgerInner,
     req: &RemovalRequest,
-  ) -> Option<(CookieFile, CookieId)> {
+  ) -> Option<(CookieResidue, CookieId)> {
     // A record that is missing — already retired — is idempotently nothing.
     let id = match req {
       RemovalRequest::Targeted(id) | RemovalRequest::RetryDue(id) => *id,
     };
     let ob = inner.obligations.get_mut(&id)?;
-    // A record with no landing has no file to unlink: its sync is still parked (no
-    // write has been dispatched, so nothing physical can exist), or its write is
-    // in the pool and only that write can learn where its cookie landed. This one
-    // line is what makes every sweep, retry and public removal structurally
-    // incapable of unlinking for a pre-physical record: a parked record is left to
-    // its pre-physical terminal, and an in-pool one reaps itself against the flags.
-    let file = ob.file.clone()?;
+    // A record with no residue has nothing physical to reap: its sync is still
+    // parked (no write has been dispatched, so nothing physical can exist), or its
+    // write is in the pool and only that write can learn where its cookie landed.
+    // This one line is what makes every sweep, retry and public removal
+    // structurally incapable of unlinking for a pre-physical record: a parked
+    // record is left to its pre-physical terminal, and an in-pool one reaps itself
+    // against the flags.
+    let mut residue = ob.residue.clone()?;
     let attempts = match (&ob.phase, req) {
       // Owned: a marked record or a targeted sweep dispatches a fresh removal;
       // a retry for a not-yet-failed record is a no-op.
@@ -2030,7 +2884,26 @@ impl<F: FsOps> CookieRegistry<F> {
     // inside the phase, so the transition retires it with no second structure to
     // keep in step and no chance of a schedule outliving its arming.
     ob.phase = Phase::Removing { attempts };
-    Some((file, id))
+    // The create's retained handle MOVES to the job, and that move is what lets
+    // the job close it: the pin is an `Arc`, and [`reap_residue`] can only dispose
+    // of the directory this obligation minted once the cookie's own handle is
+    // gone. Single-flight is what makes the move safe — this transition is the
+    // only way a job is ever dispatched for this record, so exactly one holder
+    // exists at a time — and a job that FAILS hands its residue back before
+    // parking the record (see [`spawn_unlink`](Self::spawn_unlink)). Nothing reads
+    // a `Removing` record's pin in the meantime: every sweep coalesces on that
+    // phase, and the abnormal-exit take skips it.
+    //
+    // A DIRECTORY-ONLY residue has no pin to move, because it has no identity to
+    // keep alive: the file half it belonged to settled on an earlier attempt.
+    // Both sides must be `File` for a pin to exist at all, which is why the move
+    // is written as one pattern over the two rather than as a check on either.
+    if let Some(CookieResidue::File(record)) = ob.residue.as_mut()
+      && let CookieResidue::File(job) = &mut residue
+    {
+      job.pin = record.pin.take();
+    }
+    Some((residue, id))
   }
 
   /// The ONE unlink dispatch point routed to by `retire_scope`, `sweep_owned`,
@@ -2048,8 +2921,8 @@ impl<F: FsOps> CookieRegistry<F> {
       let mut inner = lock_ledger(&self.ledger);
       Self::removal_decision_locked(&mut inner, &req)
     };
-    if let Some((file, id)) = decision {
-      self.spawn_unlink::<R>(op_tx, file, id);
+    if let Some((residue, id)) = decision {
+      self.spawn_unlink::<R>(op_tx, residue, id);
     }
   }
 
@@ -2085,7 +2958,7 @@ impl<F: FsOps> CookieRegistry<F> {
   where
     R: RuntimeLite,
   {
-    let dispatch: Vec<(CookieFile, CookieId)> = {
+    let dispatch: Vec<(CookieResidue, CookieId)> = {
       let mut inner = lock_ledger(&self.ledger);
       let marked: Vec<CookieId> = inner
         .obligations
@@ -2104,8 +2977,8 @@ impl<F: FsOps> CookieRegistry<F> {
         })
         .collect()
     };
-    for (file, id) in dispatch {
-      self.spawn_unlink::<R>(op_tx, file, id);
+    for (residue, id) in dispatch {
+      self.spawn_unlink::<R>(op_tx, residue, id);
     }
   }
 
@@ -2385,14 +3258,14 @@ impl<F: FsOps> Drop for CookieRegistry<F> {
     // and awaits the hung unlink — disproportionate machinery for an inert file
     // left by a pathological mount during shutdown. On a healthy fs the drain
     // confirms every unlink within the grace and this branch reaps nothing.
-    let reap: Vec<CookieFile> = {
+    let reap: Vec<CookieResidue> = {
       let mut inner = lock_ledger(&self.ledger);
       let ids: Vec<CookieId> = inner.obligations.keys().copied().collect();
       ids
         .into_iter()
         .filter_map(|id| inner.retire(id, Reaped::AbnormalResidual))
         .filter(|ob| !matches!(ob.phase, Phase::Removing { .. }))
-        .filter_map(|ob| ob.file)
+        .filter_map(|ob| ob.residue)
         .collect()
     };
     if reap.is_empty() {
@@ -2404,8 +3277,14 @@ impl<F: FsOps> Drop for CookieRegistry<F> {
       // write captured, so even this last sweep unlinks only what it can prove
       // is its own — the abnormal path is exactly where a stale path is most
       // likely to have been reclaimed by someone else.
-      for file in reap {
-        let _ = ops.remove_cookie(&file);
+      //
+      // This is also the ONE reap that cannot promise it holds the last reference
+      // to a cookie's retained handle: a self-reap racing the take above may still
+      // share it. A directory disposal that fails for that reason has no live
+      // record left to be counted against — the take retired them all — and falls
+      // to `CookieDir`'s own `Drop`, which is exactly what that backstop is for.
+      for mut residue in reap {
+        let _ = reap_residue(&ops, &mut residue);
       }
     }));
   }
@@ -3109,27 +3988,29 @@ where
             // subscription's cookie lands in the parent) together with the
             // identity of the object the create returned, so every later removal
             // can prove the name is still that object before unlinking it.
-            match guard.claim(&file) {
+            let landing = file.path().to_path_buf();
+            let residue = CookieResidue::File(file);
+            match guard.claim(&residue) {
               None => {
                 // A refused claim means a cancel named this obligation, the
                 // registry is gone, the scope is retiring, or the generation
                 // moved: its cookie must not survive, so the write self-reaps
                 // (never discarding ownership before the unlink confirms).
-                self_reap(&ops, &guard, file, None);
+                self_reap(&ops, &guard, residue, None);
                 let _ = reply.send(Err(crate::error::SyncRootError::Retired));
               }
               Some(id) => {
                 // The caller names cookies by path, so only the path crosses the
                 // reply; the identity stays with the record, which is the only
                 // thing that ever unlinks.
-                if reply.send(Ok(file.path().to_path_buf())).is_err() {
+                if reply.send(Ok(landing)).is_err() {
                   // A caller that abandoned the sync (timed out, dropped the
                   // future) has dropped this reply receiver and will never ask
                   // for this cookie's removal. The write completing late must
                   // not outlive the barrier that asked for it: reap the file,
                   // but keep ownership (of incarnation `id`) until the unlink
                   // confirms.
-                  self_reap(&ops, &guard, file, Some(id));
+                  self_reap(&ops, &guard, residue, Some(id));
                 }
               }
             }
@@ -3154,15 +4035,16 @@ where
             source,
             residue: Some(residue),
           }) => {
-            // The write FAILED but left a file behind (it could not identify what
-            // it made, and could not destroy it either). Retiring `NeverCreated`
-            // here would be a lie with teeth: the file would stop counting against
-            // the obligation cap that bounds exactly this, and nothing would ever
-            // reap it. So the residue is admitted like any other owned cookie and
-            // then immediately self-reaped — the caller is being told the write
-            // failed and will never ask for this path, so nobody else ever will.
-            // A retry that fails again leaves the record `RemoveFailed`: counted,
-            // owned, and swept at the scope's teardown.
+            // The write FAILED and left something behind: a file it could not
+            // identify and could not destroy, or the directory it had already
+            // minted. Retiring `NeverCreated` here would be a lie with teeth: what
+            // survives would stop counting against the obligation cap that bounds
+            // exactly this, and nothing would ever reap it. So the residue is
+            // admitted like any other owned cookie and then immediately
+            // self-reaped — the caller is being told the write failed and will
+            // never ask for this path, so nobody else ever will. A retry that
+            // fails again leaves the record `RemoveFailed`: counted, owned, and
+            // swept at the scope's teardown.
             let residue = *residue;
             let claimed = guard.claim(&residue);
             self_reap(&ops, &guard, residue, claimed);
@@ -3183,12 +4065,149 @@ where
   core.take_cover_flush_due()
 }
 
-/// The write job's self-reap: unlink a cookie its own write must not leave
-/// behind, NEVER discarding ownership before the unlink CONFIRMS, and NEVER
-/// acting on a record that is not the one this write was born for. Every verdict
-/// is written to that record here, in the job, under the ledger lock; the
-/// `CookieWriteDone` that follows carries only the id, and the driver — the sole
-/// owner of the clock — schedules the retry of a record left `RemoveFailed`.
+/// The whole PHYSICAL retirement of one cookie obligation: the cookie file, and
+/// then the directory that was minted to hold it.
+///
+/// The two are ONE fallible operation because they are one obligation. Windows
+/// mints a fresh directory per obligation (see [`CookieDir`]), so a disposal whose
+/// failure was discarded would leave one permanent, uncounted directory per sync —
+/// the same untracked-residue shape the write path already refuses to produce for
+/// a file it could not destroy ([`CookieWriteError`]). Returning the failure
+/// instead keeps the record in the ledger: counted by both backlog caps, parked
+/// `RemoveFailed`, retried on the same attempt budget, re-armed by the same
+/// sweeps, and reported by close. No new state, no new counter, no new cap — the
+/// directory simply rides the accounting the cookie file already has.
+///
+/// Only Windows has anything per-obligation to dispose of, and that is confined to
+/// the DISPOSAL: the residue advances the same way everywhere, and a platform with
+/// nothing to destroy simply answers success. Whether a directory is a debt at all
+/// is asked in exactly one other place — [`CookieDir::owed`], for a write that
+/// failed after minting one.
+///
+/// # The residue ADVANCES, and that is what closes the retry
+///
+/// The two halves settle separately, so the value handed in is advanced in place
+/// as each settles: a [`File`](CookieResidue::File) residue whose cookie has been
+/// removed becomes a [`Dir`](CookieResidue::Dir) one BEFORE the disposal is
+/// attempted, and the caller hands whatever it holds back to the record if this
+/// returns `Err` ([`CookieRegistry::spawn_unlink`], [`self_reap`]).
+///
+/// That ordering is load-bearing rather than tidy. A disposal that fails leaves an
+/// obligation whose cookie is confirmed gone and whose pin has been SPENT — and a
+/// spent pin frees the file id the kernel was holding out of the allocator's
+/// reach, so the identity the file half recorded stops naming anything and a
+/// successor bound at the cookie's name can be issued the very same id. Were the
+/// residue to come back still shaped as a `File`, the next retry would compare
+/// that dead identity against whatever now stands at the name and delete a match.
+/// It comes back as a directory debt instead, which carries no identity and no
+/// pin, and whose only remaining operation is the disposal — see
+/// [`CookieResidue`].
+///
+/// What licenses discarding the file half is a separate question from what makes
+/// discarding it safe, and both have to hold at once. The transition runs only on
+/// a VERDICT, and every verdict is proof that this obligation's own file is gone:
+/// Unix's are the anchored unlink's own, and Windows deletes through the create's
+/// retained handle, so its [`AlreadyGone`](CookieRemoval::AlreadyGone) reports the
+/// OBJECT gone rather than a name that stopped denoting it (see
+/// [`remove_anchored`], and the pinless refusal there, which discards no ownership
+/// because it holds none). A verdict that could be reached by a cookie merely
+/// RENAMED inside its directory would strand the obligation here forever: the
+/// surviving entry refuses the disposal below, and the residue this line installs
+/// has nothing left with which to remove it.
+///
+/// # The order between the halves, which is the rest of this function's correctness
+///
+/// The create's retained handle is CLOSED BETWEEN the two halves, and it has to
+/// be. The Windows disposition asks for POSIX semantics first, under which a name
+/// leaves its directory when the handle it was deleted THROUGH is closed — and that
+/// handle is the PIN, for every [`CookieProof`] alike, since that is what every
+/// cookie removal on this platform deletes through ([`remove_anchored`]). The line
+/// below releases it, which is what takes the cookie's name out of the directory.
+/// The disposition also FALLS BACK to the classic `FILE_DISPOSITION_INFO` on a
+/// volume or build that does not know the Ex class, and under that class the
+/// deleted entry survives until the object's LAST handle closes. The pin is such a
+/// handle too. Under EITHER class, disposing of the directory while it is open
+/// meets a non-empty directory and fails EVERY time — turning a rare residue into a
+/// guaranteed one.
+///
+/// Closing it here is sound because it is spent by here. The pin exists to hold
+/// the cookie's identity slot out of the allocator's reach so a removal can tell
+/// the cookie apart from a successor at its name ([`CookieFile`]), and this line is
+/// reached only once the removal has SETTLED that question — unlinked, already
+/// gone, or displaced. A removal that failed returns above it with the pin intact,
+/// and its record takes the pin back for the retry.
+///
+/// The pin is an `Arc`, so clearing it here closes the handle only if this
+/// `CookieFile` holds the last reference. The removal paths arrange exactly that:
+/// a record hands its pin to the one job that owns its fate
+/// ([`CookieRegistry::removal_decision_locked`], [`self_reap`]) and takes it back
+/// if that job fails. The single exception is the abnormal-exit sweep, which may
+/// still share a pin with a racing self-reap; its disposal may fail for that
+/// reason, it has no live record left to report to, and `CookieDir`'s `Drop` is
+/// the backstop that catches it.
+///
+/// # The retry
+///
+/// A retry of a residue that never got past its file half repeats the whole
+/// sequence, and a second attempt at an ALREADY-UNLINKED cookie is
+/// [`AlreadyGone`](CookieRemoval::AlreadyGone) — a success — so it still reaches
+/// the disposal rather than reporting the file's absence and stopping. A retry of
+/// a residue that DID get past it disposes and does nothing else: there is no
+/// cookie left to remove, and no evidence left with which to remove one.
+///
+/// The verdict itself is not returned. Every caller acts on the `Result` alone —
+/// `Ok` retires the record, `Err` parks it — and `Displaced` is a success like the
+/// other two, so a returned verdict would be a value no caller could use.
+fn reap_residue<F: FsOps>(ops: &F, residue: &mut CookieResidue) -> Result<(), std::io::Error> {
+  let file = match residue {
+    // A DIRECTORY-ONLY obligation. Its file half settled on an earlier attempt and
+    // its pin went with it, so there is no cookie to remove and — the point of the
+    // shape — no identity to remove one on the strength of.
+    CookieResidue::Dir(owed) => return ops.dispose_cookie_dir(&owed.dir),
+    CookieResidue::File(file) => file,
+  };
+  let landing = file.path().to_path_buf();
+  ops.remove_cookie(file)?;
+  file.pin = None;
+  // A record with no anchor at all — one minted below the real write — never had a
+  // directory half, so the file half was the whole debt and this retirement is
+  // complete.
+  let Some(dir) = file.dir.clone() else {
+    return Ok(());
+  };
+  // The file half has SETTLED, so the residue stops being one. Two constraints meet
+  // on this line and both are load-bearing.
+  //
+  // It is reached only past the `?` above, so only on a VERDICT — and every verdict
+  // is proof that THIS obligation's file is gone, not merely that its name is empty
+  // (see the section above, and `remove_anchored`). So the transition can never
+  // trade a live file half away for a directory-only debt nothing can discharge.
+  //
+  // And the transition is otherwise UNCONDITIONAL and happens BEFORE the disposal is
+  // attempted, which is what makes the failure path safe: from here the obligation
+  // carries no identity and no pin, so nothing that survives this call can compare a
+  // spent identity against a name. The two hold together rather than against each
+  // other because what licenses the transition is the removal's own anchor — a
+  // descriptor-anchored unlink, or a handle-bound disposition — and never the
+  // identity this line is about to drop.
+  *residue = CookieResidue::Dir(CookieDirDebt {
+    path: landing,
+    dir: Arc::clone(&dir),
+  });
+  // Only the DISPOSAL differs by platform. The platform that mints a directory per
+  // obligation destroys it here and reports a failure the record then owes; the
+  // platform that shares one answers that it owes nothing, discharging the debt in
+  // the same step that recorded it, so no record there ever observes the state.
+  ops.dispose_cookie_dir(&dir)
+}
+
+/// The write job's self-reap: reap what its own write must not leave behind — the
+/// cookie it created, or the directory it minted and then failed after — NEVER
+/// discarding ownership before the removal CONFIRMS, and NEVER acting on a record
+/// that is not the one this write was born for. Every verdict is written to that
+/// record here, in the job, under the ledger lock; the `CookieWriteDone` that
+/// follows carries only the id, and the driver — the sole owner of the clock —
+/// schedules the retry of a record left `RemoveFailed`.
 ///
 /// `claimed = None` — the claim was REFUSED. The record is still `InPool`: it is
 /// RE-ASSERTED here (its landing published, so every sweep can find the file and
@@ -3207,9 +4226,14 @@ where
 /// overlap and we can never act on a SUCCESSOR that reclaimed the path.
 ///
 /// An ABSENT record (only the abnormal-path `Drop`'s take) leaves the refusal
-/// case a bare best-effort unlink of the file this write itself created, and the
+/// case a bare best-effort reap of what this write itself created, and the
 /// reply-fail case yielding: the record's fate is no longer ours to write.
-fn self_reap<F: FsOps>(ops: &F, guard: &CookieGuard, file: CookieFile, claimed: Option<CookieId>) {
+fn self_reap<F: FsOps>(
+  ops: &F,
+  guard: &CookieGuard,
+  mut residue: CookieResidue,
+  claimed: Option<CookieId>,
+) {
   // The incarnation whose fate this reap writes. Both cases name this write's own
   // record — a claim returns the guard's id — but the reply-fail case addresses
   // the id the claim ACTUALLY returned, so a stale claimant can never transition
@@ -3227,14 +4251,28 @@ fn self_reap<F: FsOps>(ops: &F, guard: &CookieGuard, file: CookieFile, claimed: 
       // file and prove it is ours. `by_path` follows the same newest-claim-wins
       // rule a claim does.
       Some(ob) if matches!(ob.phase, Phase::InPool) => {
-        ob.file = Some(file.clone());
+        // The record publishes the LANDING, not the create's retained handle: this
+        // reap is the holder that will close it, which is what lets the disposal
+        // below meet an empty directory (see [`reap_residue`]). A reap that fails
+        // hands the whole residue back at the bottom of this function.
+        let mut published = residue.clone();
+        if let CookieResidue::File(published) = &mut published {
+          published.pin = None;
+        }
+        ob.residue = Some(published);
         ob.phase = Phase::Removing { attempts: 0 };
-        inner.by_path.insert(file.path().to_path_buf(), id);
+        inner.by_path.insert(residue.path().to_path_buf(), id);
         true
       }
       // Reply-fail case: take the removal, or yield to whoever beat us.
       Some(ob) if matches!(ob.phase, Phase::Owned) => {
         ob.phase = Phase::Removing { attempts: 0 };
+        // The claim left the record a second reference to the create's retained
+        // handle; this reap is the holder that closes it, so the record releases
+        // its own — the same hand-off `removal_decision_locked` makes.
+        if let Some(CookieResidue::File(record)) = ob.residue.as_mut() {
+          record.pin = None;
+        }
         true
       }
       // Removing/RemoveFailed: a cancel-dispatched unlink already owns this
@@ -3254,16 +4292,25 @@ fn self_reap<F: FsOps>(ops: &F, guard: &CookieGuard, file: CookieFile, claimed: 
     }
   };
   if !tracked {
-    // A refused claim still unlinks the file it created — best-effort, and no
-    // record's fate rides on it (the take already retired the record).
-    let _ = ops.remove_cookie(&file);
+    // A refused claim still reaps what it created — the file AND the directory
+    // minted to hold it — best-effort, and no record's fate rides on it (the take
+    // already retired the record).
+    let _ = reap_residue(ops, &mut residue);
     return;
   }
-  if ops.remove_cookie(&file).is_ok() {
+  if reap_residue(ops, &mut residue).is_ok() {
     lock_ledger(&guard.ledger).retire(id, Reaped::ConfirmedGone);
   } else {
-    // Retain as failed: the file is still on disk and this record still owns it.
-    lock_ledger(&guard.ledger).record_remove_failed(id);
+    // Retain as failed: the file is still on disk, or the directory that held it
+    // is, and this record still owns whichever survived. The residue goes back
+    // WHOLE, for the reason `spawn_unlink` states — with the create's retained
+    // handle if the file half is still owed, and as a directory-only debt if the
+    // attempt settled that half and could not settle the directory.
+    let mut inner = lock_ledger(&guard.ledger);
+    if let Some(ob) = inner.obligations.get_mut(&id) {
+      ob.residue = Some(residue);
+    }
+    inner.record_remove_failed(id);
   }
 }
 
@@ -3579,6 +4626,13 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
   /// ALSO fails, the file it left is handed back as
   /// [`CookieWriteError::residue`] — never dropped on the floor, because a file
   /// nobody records is a file nothing ever reaps and nothing ever counts.
+  ///
+  /// The same rule binds every OTHER failure that lands after something physical
+  /// exists, the private directory included: once an implementation has minted a
+  /// directory of its own, `CookieWriteError::clean` is no longer a true
+  /// statement about that write and the directory must come back as a residue
+  /// (see [`post_mint_failure`]). A `clean` failure is a promise that this write
+  /// left the filesystem exactly as it found it.
   fn write_cookie(
     &self,
     root: &Path,
@@ -3600,13 +4654,18 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
   /// outside the tree entirely.
   ///
   /// Anchored is not the same as object-exact, and only Windows is both: its
-  /// disposition is set on a handle whose identity was verified first, so the
-  /// object destroyed IS the object proven. Unix has no unlink conditioned on file
-  /// identity, so its proof and its removal are two calls and the guarantee is
-  /// narrower — the entry removed is an entry of the private, uid-owned `0o700`
-  /// directory, and a process of THIS USER is trusted not to rebind names inside
-  /// it. [`remove_anchored`] states that boundary in full; no caller of this trait
-  /// may claim more than it does.
+  /// disposition is set on the handle the cookie's own CREATE returned, so the
+  /// object destroyed is the object created and no name is resolved to reach it —
+  /// which needs no proof, there being nothing left for a proof to rule out. Unix
+  /// has no unlink conditioned on file identity, so its proof and its removal are
+  /// two calls and the guarantee is narrower — the entry removed is an entry of
+  /// the private, uid-owned `0o700` directory, and a process of THIS USER is
+  /// trusted not to rebind names inside it. [`remove_anchored`] states that
+  /// boundary in full; no caller of this trait may claim more than it does.
+  ///
+  /// Which of the three verdicts an implementation can REACH follows from that:
+  /// Windows never answers [`Displaced`](CookieRemoval::Displaced), because a
+  /// removal that resolves no name cannot observe a stranger holding one.
   ///
   /// What no implementation may do under any contract is remove a name it holds no
   /// evidence about: an [`Anchor`](CookieProof::Anchor) record is either promoted
@@ -3621,7 +4680,38 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
   /// displaced, and reporting it as a settled verdict would retire a record whose
   /// file may still be on disk. The removal's own event is suppressed by the
   /// reserved namespace, never by any pending-cookie bookkeeping.
+  ///
+  /// This is the FILE half of an obligation's physical retirement, and on the
+  /// platform that mints a directory per obligation it is not the whole of it. No
+  /// removal path calls this directly: they all go through [`reap_residue`], which
+  /// runs this and then disposes of the directory the cookie was created in, as one
+  /// fallible, counted, retried operation.
+  ///
+  /// It takes a [`CookieFile`] and that is load-bearing rather than incidental: an
+  /// obligation whose file half has already settled holds a
+  /// [`CookieResidue::Dir`], which is not one, so this call cannot be made for it
+  /// at all. See [`CookieResidue`] for why a record in that state must never reach
+  /// an identity comparison.
   fn remove_cookie(&self, cookie: &CookieFile) -> Result<CookieRemoval, std::io::Error>;
+
+  /// Destroys the directory an obligation MINTED for its cookie (blocking) — the
+  /// DIRECTORY half of that same physical retirement, run once the cookie's own
+  /// removal has settled and the create's retained handle has been closed.
+  ///
+  /// Split from [`remove_cookie`] rather than folded into it because the two
+  /// halves settle SEPARATELY and each failure means something different: a file
+  /// half that failed leaves an obligation that still owes both, and a directory
+  /// half that failed leaves one that owes only the directory — a different debt,
+  /// carrying no identity, retried by a different call. [`reap_residue`] is what
+  /// sequences them, and it is the only caller.
+  ///
+  /// Idempotent in the same sense the file half is: a directory somebody has
+  /// already removed is SUCCESS, since the object this obligation minted is gone
+  /// from the only place it could ever be addressed. Every other failure is
+  /// RETURNED, so the obligation stays in the ledger — counted by both caps,
+  /// parked `RemoveFailed`, retried on the same budget — rather than leaving a
+  /// residue nothing tracks.
+  fn dispose_cookie_dir(&self, dir: &CookieDir) -> Result<(), std::io::Error>;
 
   /// Re-reads the live mount table strictly under `root` AND re-stats the root
   /// itself (blocking): the mount prefixes, whether the read was authoritative,
@@ -4593,22 +5683,63 @@ impl FsOps for RealFs {
         "the cookie directory resolves outside the watched root",
       )));
     }
-    // This is the last path this write resolves. The private directory is opened
-    // once, and every operation on the cookie — this create, and every removal the
-    // obligation ever attempts — goes through its descriptor, which is what makes
-    // the cookie's name unbindable by anyone else (see [`CookieDir`]).
+    // This is the last path this write resolves on the platforms that keep ONE
+    // shared directory: it is opened once, and every operation on the cookie — this
+    // create, and every removal the obligation ever attempts — goes through its
+    // descriptor, which is what makes the cookie's name unbindable by anyone else
+    // (see [`CookieDir`]). Windows confines neither, as the paragraphs below state.
     //
     // A residual the canonicalize above does not close: a symlink swapped INTO an
-    // intermediate directory between `canonicalize` and this open is still
+    // intermediate directory between `canonicalize` and the open below is still
     // followed, because a path-based open is not beneath-anchored. Bounded to what
     // it can actually cause — the cookie could be placed under a directory other
     // than the one the caller named, whose events the root's stream may never
-    // report, so the sync's barrier does not resolve. It cannot cause a deletion:
-    // whatever directory is opened is verified to be this user's before anything is
-    // created in it, and every removal is confined to that same descriptor.
+    // report, so the sync's barrier does not resolve.
+    //
+    // It cannot cause a deletion, for a DIFFERENT reason on each platform, and
+    // neither reason is the other's. On Unix every removal is confined to the
+    // descriptor this open returned, so it addresses an entry of the directory
+    // that was verified and of no other. On Windows NOTHING this obligation deletes
+    // resolves a name at all: every one of its destroys is object-exact by
+    // construction rather than proven after the fact, setting a disposition on a
+    // handle this process itself created, so there is no name left for anything to
+    // redirect. This write's immediate cleanup of the cookie it just made, and every
+    // later removal of that cookie whatever its proof, go through the handle the
+    // COOKIE's create returned; the disposal a directory-only residue retries goes
+    // through the handle the DIRECTORY's create returned (see the `handle` field on
+    // [`CookieDir`], which draws the same split).
+    //
+    // What still resolves `path` there is the cookie's own CREATE, and the pinless
+    // refusal's probe — which opens the name only to ask whether anything stands at
+    // it and destroys nothing whatever it finds.
+    //
+    // The Windows arm below claims nothing about a directory it found, because it
+    // never finds one: it CREATES the directory it uses, under a name minted for
+    // this obligation, in the call that also returns the handle it keeps. So the
+    // freshness is the create's, not a verdict's, and the directory it enters
+    // cannot be one somebody else prepared — not even one interposed in the
+    // instant between binding the name and opening it, because there is no such
+    // instant. What it still does not confine is the COOKIE's create inside that
+    // directory, which is the one operation there that resolves `path` and can
+    // destroy nothing; a peer able to write the parent can interpose on it, and that
+    // is a filed defect rather than a claim made here.
     let cookies =
       Arc::new(CookieDir::open_or_create(&canonical_dir).map_err(CookieWriteError::clean)?);
-    let created = cookies.create(name).map_err(CookieWriteError::clean)?;
+    // From HERE this write has a physical fact to answer for wherever the
+    // directory is minted per obligation: `clean` would claim the filesystem is
+    // exactly as this write found it, and it is not. Every failure below therefore
+    // routes through `post_mint_failure`, which hands the directory back as a
+    // counted, retried debt instead of leaving it to `CookieDir`'s `Drop`.
+    //
+    // The sharp case is not the create failing on its own: a peer that races the
+    // caller-selected cookie name into this freshly minted directory WITHOUT
+    // replacing the directory makes `create_new` fail, makes the disposal refuse a
+    // non-empty directory, and — under `clean` — frees the cap slot, so every
+    // repeat leaves another permanent reserved directory with nothing bounding
+    // them.
+    let created = cookies
+      .create(name)
+      .map_err(|err| post_mint_failure(&cookies, name, err))?;
     // The identity comes off the descriptor the create just returned — one
     // `fstat` of the object we made, in obedience to the one-sample rule (see the
     // module doc). Re-opening the name to read it would defeat the purpose: it
@@ -4655,6 +5786,10 @@ impl FsOps for RealFs {
       ));
     };
     remove_anchored(dir, &cookie.name, cookie.proof, cookie.pin.as_deref())
+  }
+
+  fn dispose_cookie_dir(&self, dir: &CookieDir) -> Result<(), std::io::Error> {
+    dir.dispose()
   }
 
   fn refresh_mounts(&self, root: &Path) -> MountRefresh {
@@ -5141,18 +6276,60 @@ fn destroy_unidentified(
   // for as long as the residue below (if any) lives.
   let destroyed = dir.destroy_created(name, &handle);
   match destroyed {
-    Ok(()) => CookieWriteError::clean(err),
-    // Already gone: nothing survives this write either way.
-    Err(gone) if gone.kind() == std::io::ErrorKind::NotFound => CookieWriteError::clean(err),
+    // No FILE survives this write — but the DIRECTORY it was created in may, and
+    // where that directory is this obligation's own it is still a debt. Handing it
+    // to `post_mint_failure` is what keeps `clean` meaning what it says.
+    Ok(()) => post_mint_failure(&dir, name, err),
+    // Already gone: no file survives this write either way, and the directory is
+    // judged exactly as above.
+    Err(gone) if gone.kind() == std::io::ErrorKind::NotFound => post_mint_failure(&dir, name, err),
+    // The FILE survived. It is the residue, and the directory rides inside it —
+    // `reap_residue` disposes of that once this record's removal settles the file,
+    // so there is no second debt to hand back here.
     Err(_) => CookieWriteError {
       source: err,
-      residue: Some(Box::new(CookieFile::anchored(
+      residue: Some(Box::new(CookieResidue::File(CookieFile::anchored(
         dir,
         name,
         CookieProof::Anchor,
         handle,
-      ))),
+      )))),
     },
+  }
+}
+
+/// The verdict for a failure that lands AFTER this write minted its directory,
+/// and the ONE site allowed to decide between the two.
+///
+/// [`CookieWriteError::clean`] states that nothing of this write is on disk, and
+/// once a directory has been minted that is FALSE wherever the directory is the
+/// obligation's own. Reporting `clean` there retires the record `NeverCreated`,
+/// frees the cap slot that was supposed to bound exactly this, and leaves the
+/// directory to [`CookieDir`]'s `Drop` — whose failure is discarded by design,
+/// because a `Drop` has no live record to report to. A same-uid peer that plants
+/// a file inside the directory, a read-only volume, a filter driver: each makes
+/// that disposal fail, and each repeat then leaves another permanent, uncounted
+/// directory. That is the untracked-residue shape [`CookieWriteError`] exists to
+/// refuse for a file, and a directory is no different.
+///
+/// So the directory comes back as a DIRECTORY-ONLY residue instead
+/// ([`CookieResidue::Dir`]). Its obligation is admitted like any other owned
+/// cookie, counted by both backlog caps, reaped through the same phase machine,
+/// retried on the same attempt budget, and reported by close — no new state and
+/// no parallel accounting. The landing it is claimed under is the path the cookie
+/// would have occupied, which is where a claim publishes it and where a retire
+/// drops it again.
+///
+/// Where NO directory is owed — the shared Unix directory that no obligation may
+/// destroy, a target that mints none at all — `clean` is the literal truth and is
+/// what this returns. [`CookieDir::owed`] is where each platform answers that.
+fn post_mint_failure(dir: &Arc<CookieDir>, name: &str, source: std::io::Error) -> CookieWriteError {
+  match dir.owed(dir.path().join(name)) {
+    Some(owed) => CookieWriteError {
+      source,
+      residue: Some(Box::new(CookieResidue::Dir(owed))),
+    },
+    None => CookieWriteError::clean(source),
   }
 }
 
@@ -5277,70 +6454,90 @@ fn remove_anchored(
 /// Unixes lack: a disposition set on an already-open handle destroys the object
 /// that handle refers to, with no name resolved at all.
 ///
-/// Two opens, because one cannot do both jobs. The first asks for the LOWEST
-/// rights that answer an identity, so an object this process may not delete still
-/// reaches the comparison and settles as displaced instead of failing forever.
-/// The second asks for DELETE — and its identity is RE-READ before the
-/// disposition, because it is a second lookup of the name and a second lookup can
-/// land on a different object. Only a handle that has itself been proven is ever
-/// deleted through.
+/// So this removal resolves none. Whatever the record's [`CookieProof`] says, a
+/// residue that still holds the create's retained handle is destroyed THROUGH that
+/// handle — which is what an [`Anchor`](CookieProof::Anchor) residue was always
+/// destroyed through, made the general case rather than the exception. `proof` is
+/// therefore not consulted here at all, and is kept in the signature because the
+/// two Unixes need it.
 ///
-/// An [`Anchor`](CookieProof::Anchor) residue has no identity to prove and takes
-/// neither open: it is destroyed through the create's OWN retained handle, which
-/// is object-exact by construction. Without that handle there is nothing safe left
-/// to do, and the failure is returned so the record survives.
+/// # Why the handle beats the identity it replaces
+///
+/// An [`Object`](CookieProof::Object) proof used to open `name` twice — once for
+/// the lowest rights that answer an identity, once for DELETE — and re-read the
+/// identity across the two, because a second lookup of a name can land on a
+/// different object. That is a displacement DETECTOR bolted onto a name, and the
+/// pin is the thing itself: a handle follows its OBJECT, and a name does not.
+///
+/// The gap that leaves is not theoretical. Rust opens the cookie granting
+/// `FILE_SHARE_DELETE`, so a peer with rename rights can move this obligation's
+/// cookie WITHIN the directory the obligation minted while our handle stays open.
+/// A name-resolving removal then finds the original name absent and answers
+/// [`AlreadyGone`](CookieRemoval::AlreadyGone) — a success — for a file that is
+/// still on disk. [`reap_residue`] believes it, spends the pin, and converts the
+/// record to directory-only debt; the disposal necessarily fails while the renamed
+/// entry stands, and every retry can then only repeat that failing disposal, with
+/// the cookie's handle, name and proof all discarded. The file and the directory
+/// persist and the record consumes backlog and global capacity forever. Deleting
+/// through the create's own handle cannot be misled that way: the object destroyed
+/// is the object created, wherever its name has since gone.
+///
+/// # What the verdicts mean once the name is out of it
+///
+/// `NotFound` from a handle-bound delete is the OBJECT reported gone, not a name
+/// that stopped denoting it, so `AlreadyGone` is once again the idempotence it
+/// claims to be — which is what licenses [`reap_residue`]'s transition to a
+/// directory-only debt.
+///
+/// [`Displaced`](CookieRemoval::Displaced) is not reachable from here at all, and
+/// the variant says so rather than leaving a dead arm implying otherwise. A delete
+/// that resolves no name can neither reach a stranger nor learn that one exists;
+/// whatever stands at the cookie's name is simply not this removal's business. It
+/// is the DIRECTORY's disposal that meets such a stranger, refuses the non-empty
+/// directory, and keeps the obligation counted and retried — which is the correct
+/// outcome and the one a `Displaced` verdict would destroy by retiring the record.
+///
+/// # With no handle, nothing is deleted
+///
+/// A residue whose pin is gone has nothing object-exact left to delete through,
+/// and this platform has no unlink conditioned on an identity — so it deletes
+/// NOTHING, whichever proof it carries. An identity without its pin is not
+/// evidence either: the pin is what held the object's file id out of the
+/// allocator's reach, so once it is spent the id may already name a successor.
+///
+/// The one question such a record can still answer is whether anything stands at
+/// the name. An EMPTY name is the ordinary idempotent success — and it is the
+/// retry case this platform actually produces: a residue is destroyed THROUGH its
+/// retained handle, `reap_residue` then spends that handle so the directory can be
+/// disposed of, and a disposal that failed comes back here with the cookie already
+/// gone. Reporting a failure for it would strand the directory forever while
+/// claiming the removal had made no progress at all. Anything else FAILS CLOSED,
+/// because unlinking a name this record can say nothing about is the deletion the
+/// whole design refuses to perform.
 #[cfg(all(target_os = "windows", not(miri)))]
 fn remove_anchored(
   dir: &CookieDir,
   name: &str,
-  proof: CookieProof,
+  _proof: CookieProof,
   pin: Option<&std::fs::File>,
 ) -> Result<CookieRemoval, std::io::Error> {
   use std::os::windows::io::AsHandle;
 
-  let CookieProof::Object(identity) = proof else {
-    let Some(created) = pin else {
-      return Err(std::io::Error::other(
-        "an unidentified cookie with no retained handle cannot be removed",
-      ));
-    };
-    return match crate::os::windows::ffi::delete_by_handle(created.as_handle()) {
-      Ok(()) => Ok(CookieRemoval::Unlinked),
+  let Some(created) = pin else {
+    // The pinless refusal. It opens the name to CLASSIFY it and never to delete
+    // through it — `open_for_classification` does not even ask for the right.
+    return match dir.open_for_classification(name) {
       Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(CookieRemoval::AlreadyGone),
-      Err(err) => Err(err),
+      _ => Err(std::io::Error::other(
+        "a cookie with no retained handle cannot be removed",
+      )),
     };
   };
-  let standing = match dir.open_for_classification(name) {
-    Ok(file) => file,
-    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-      return Ok(CookieRemoval::AlreadyGone);
-    }
-    Err(err) => return Err(err),
-  };
-  if identity_of_handle(&standing)? != Some(identity) {
-    return Ok(CookieRemoval::Displaced);
-  }
-  drop(standing);
-  let deletable = match dir.open_for_delete(name) {
-    Ok(file) => file,
-    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-      return Ok(CookieRemoval::AlreadyGone);
-    }
-    // A sharing violation on the DELETE open is transient by the caller's
-    // contract: the record survives for a later sweep.
-    Err(err) => return Err(err),
-  };
-  // The re-proof. Everything below this line destroys the object `deletable`
-  // refers to, so it is this handle's identity — not the first one's — that has to
-  // match.
-  if identity_of_handle(&deletable)? != Some(identity) {
-    return Ok(CookieRemoval::Displaced);
-  }
-  match crate::os::windows::ffi::delete_by_handle(deletable.as_handle()) {
+  match crate::os::windows::ffi::delete_by_handle(created.as_handle()) {
     Ok(()) => Ok(CookieRemoval::Unlinked),
-    // The object went away under us between the proof and the disposition: still
-    // the idempotent success, since this driver's file is gone from the only place
-    // it could ever address it.
+    // The object itself is gone — this handle's, not merely the name's, since no
+    // name took part. The idempotent success, and here it is worth exactly what it
+    // says.
     Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(CookieRemoval::AlreadyGone),
     // Anything else (a sharing violation, a read-only volume) is transient by the
     // caller's contract: the record survives for a later sweep.
@@ -5482,11 +6679,13 @@ enum OpResult<H> {
   CookieWriteDone {
     id: CookieId,
   },
-  /// A dispatched physical cookie UNLINK finished for incarnation `id`, which the
-  /// job has already resolved on the record: `confirmed` = Ok / already gone (the
-  /// record and its indexes are retired); `!confirmed` = transient failure (the
-  /// record is parked `RemoveFailed`). As above, the driver only schedules — and a
-  /// report whose incarnation has since been retired or re-armed touches nothing.
+  /// A dispatched physical cookie REAP finished for incarnation `id` — the cookie
+  /// and, where one was minted for the obligation, the directory that held it (see
+  /// [`reap_residue`]) — which the job has already resolved on the record:
+  /// `confirmed` = both settled (the record and its indexes are retired);
+  /// `!confirmed` = a transient failure of EITHER (the record is parked
+  /// `RemoveFailed`). As above, the driver only schedules — and a report whose
+  /// incarnation has since been retired or re-armed touches nothing.
   CookieRemoveDone {
     id: CookieId,
     confirmed: bool,
