@@ -519,6 +519,36 @@ pub enum SyncError {
   /// resolves [`Dominated`](crate::SyncOutcome::Dominated)).
   #[error("the subscription was unwatched while the sync was pending")]
   Retired,
+  /// This watcher holds no cookie-nonce generator, so no unpredictable cookie
+  /// name can be minted for it.
+  ///
+  /// The barrier's integrity rests on a co-user being unable to predict the
+  /// next cookie name, so a sync that cannot mint a fresh nonce is refused
+  /// rather than run on a derivable one — see the nonce's own note.
+  ///
+  /// **This is decided once, when the watcher is BUILT, and never revisited.**
+  /// Every nonce is a word off a ChaCha20 stream seeded with 32 bytes taken
+  /// from the OS at construction; this error means those bytes could not be
+  /// taken, so the watcher was left with no generator at all. Nothing is
+  /// consulted per call, and nothing changes between calls.
+  ///
+  /// Retryability is therefore a property of the watcher, not of the moment:
+  ///
+  /// - **Retrying the sync never helps.** The seed is not re-drawn, so a
+  ///   watcher that answers this once answers it for every barrier it will ever
+  ///   be asked for.
+  /// - **Where the target HAS an entropy source**, building a fresh watcher
+  ///   draws again and may well succeed — though a platform entropy interface
+  ///   that fails at all means the process is in far worse trouble than a
+  ///   missed barrier.
+  /// - **On `wasm32-unknown-unknown` there is no entropy source at all** — the
+  ///   backend is the embedder's choice, which a library cannot make for them —
+  ///   so no seed is ever taken, EVERY sync on that target ends here, and a
+  ///   fresh watcher fares no better.
+  ///
+  /// Treat it as fatal to the barrier rather than as backpressure.
+  #[error("no OS entropy was available, so no unpredictable cookie name could be minted")]
+  Entropy,
   /// The deadline elapsed before the cookie was observed.
   #[error("the sync barrier timed out")]
   Timeout,

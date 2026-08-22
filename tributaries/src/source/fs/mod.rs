@@ -973,7 +973,15 @@ const COOKIE_NONCE_DIGITS: usize = 16;
 /// Renders a cookie's file name from the owner's token. Unique across
 /// concurrent syncs (seq), watcher instances in one process (instance), and
 /// processes (pid) — so a crashed prior process's leftovers collide with
-/// nothing.
+/// nothing — and UNPREDICTABLE to any other writer under the tree (nonce),
+/// which is what keeps the barrier from being resolvable by a marker someone
+/// else pre-created.
+///
+/// **All four fields are rendered**, and the last is the load-bearing one:
+/// `(instance, pid, seq)` is computable from any cookie already lying under the
+/// tree, so a name built from those three alone would announce the NEXT one.
+/// This is the fs binding's discharge of [`Source::begin_sync`]'s
+/// incorporate-the-nonce obligation.
 ///
 /// This is the only minter of the name [`is_cookie_name`] recognizes; the two must
 /// be changed together, and the round-trip cell pins that they are.
@@ -1046,9 +1054,9 @@ fn is_cookie_name(leaf: &str) -> bool {
   //   [`SyncTicket`](tributary_fs::SyncTicket) — an in-memory cancel address — and
   //   never reaches a file name.)
   //
-  // The `nonce` deliberately gets NO value bound: it is a hash output, so every
-  // `u64` including 0 is mintable, and its sixteen-lowercase-hex shape is the whole
-  // of what can be checked.
+  // The `nonce` deliberately gets NO value bound: it is a word off the driver's
+  // cookie-nonce generator, so every `u64` including 0 is mintable, and its
+  // sixteen-lowercase-hex shape is the whole of what can be checked.
   if !(is_minted_decimal(instance, 1, u64::MAX)
     && is_minted_decimal(pid, 1, u64::from(u32::MAX))
     && is_minted_decimal(seq, 1, u64::MAX))
