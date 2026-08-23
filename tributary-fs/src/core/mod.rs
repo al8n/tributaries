@@ -22,6 +22,117 @@
 //! removals late) — and any loss signal revokes its authority until a fresh
 //! read of the live table is installed.
 //!
+//! # THE CADENCE RULE
+//!
+//! **A safety predicate may not be derived from a value re-read at a cadence. It
+//! must rest on retained evidence of an observation, or on a transition the host
+//! itself observed.**
+//!
+//! This is not a style preference; it is the single shape behind every defect
+//! adversarial review has found in the mount subsystem, and it is cheap to audit
+//! against. A value re-read at a cadence answers *what is true now*. Almost every
+//! predicate here needs *what happened since*, and the two differ exactly when
+//! something happened and came back — which is the case that matters and the case a
+//! re-read cannot see. The failure is always the same one: a MATCH is taken as
+//! CONFIRMATION, so the predicate is loudest precisely when it is wrong.
+//!
+//! Five shapes it covers, one per site the rule was extracted from:
+//!
+//! - **A derivation cannot see evidence that was DISCARDED.**
+//!   [`generation_stale`](ScopeState::generation_stale) asks whether the coverage
+//!   set's exempt partition was verified in a world this scope has left — and it can
+//!   only read the records the set HOLDS. A rejected whole-root generation is
+//!   precisely the message that would have put the FIRST exempt record there, so
+//!   after the rejection the set is empty of exactly the evidence the derivation
+//!   looks for. The answer is not a fourth clearing site but retained evidence
+//!   ([`generation_rejected`](ScopeState::generation_rejected)), set by an
+//!   observation and discharged by ONE event — a generation actually landing.
+//! - **A value the kernel RECYCLES is not a world counter.** Mount ids are
+//!   allocated lowest-free, so a root that went A → B → A is back on the id a
+//!   refresh still holds and the comparison passes. The frame moves on an
+//!   INCARNATION token instead ([`RootIncarnation`](crate::os::RootIncarnation)) —
+//!   a non-recycled id where the kernel has one, else a count of mount-namespace
+//!   transitions read through a HELD fd. Both are transitions the host observed;
+//!   neither is a value this core re-read.
+//! - **A counter another concern can occupy is not a verdict.** A boundary
+//!   report's transport credit once came out of `os_batch_capacity`, so one event
+//!   batch's slot decided whether a walk's evidence could be delivered; then the
+//!   deferrable producer's reports shared the counter the undeferrable one's
+//!   terminal was read out of. Both are the same mistake as the public
+//!   `max_map_directories` once paying for walk declines.
+//! - **A PREDICTION about another party's world is a re-read wearing a record's
+//!   clothes.** A refused whole-root recovery used to leave its round trip
+//!   ([`pending_recovery`](ScopeState::pending_recovery)) standing, suppressing the
+//!   retry on the argument that a fresh request would be answered by a walk reading
+//!   the same root and refused identically. The core holds no reading of the
+//!   source's world at all — only one reply, evidence of where one walk stood at
+//!   one moment — so the suppression was a re-read of this core's OWN unchanged
+//!   frame taken as confirmation, and a transient same-object self-bind (the walk
+//!   fences against a mount that departs before the refresh, leaving the root on
+//!   the object it started on, so neither the legacy id nor the never-recycled
+//!   incarnation token moves) made it permanent. The answer is not a third state
+//!   machine: the record is DISCHARGED by the reply that dominates it, and the
+//!   retry is SPENT once, with the refusal that comes back from the request spent
+//!   on it as the observation the prediction wanted ([`RefusedWalk`]).
+//! - **A backlog is not a death.** A producer that could not claim a boundary-report
+//!   slot answered the terminal, on the reading that a full counter proves the
+//!   driver has stopped consuming. It proves only that eight reports await
+//!   ingestion at this instant, and permits return on another thread — so a driver
+//!   merely descheduled killed a healthy source. Separating the deferrable and
+//!   undeferrable counters (the shape above) stopped one producer occupying the
+//!   other's headroom; it did not turn an instantaneous count into evidence of a
+//!   transition. The answer is to reserve the credit BEFORE the events leave the
+//!   kernel — where a producer that "cannot defer" still has somewhere to put them
+//!   — and to reserve the terminal for a liveness proof (a closed receiver, a
+//!   failed read, an ABI verdict, an explicit shutdown).
+//!
+//! ## THE BOUND/VERDICT RULE
+//!
+//! The third and fifth shapes above are the same shape, and it is sharper than the
+//! cadence rule and decidable by inspection alone, so it is stated on its own:
+//!
+//! > **A piece of state may express a BOUND or a VERDICT, never both — and every
+//! > TERMINAL must name the observation that proves it.**
+//!
+//! A bound answers *how much*, and it is a residency, a quota, a cap. A verdict
+//! answers *what is true*, and the ones that matter here grant trust, retire a
+//! record, or end a source. Reading a full bound as a verdict is how a healthy
+//! source was killed twice: the boundary-report counters say eight reports await
+//! ingestion at this instant and nothing about the driver, so their exhaustion
+//! answers a WAIT, and the terminal is reserved for a liveness proof (a closed
+//! receiver, a failed read, an ABI verdict, an explicit shutdown).
+//!
+//! **The one exception, and the test for it:** a shared counter feeding a
+//! CONSERVATIVE verdict is sound, because a foreign occupant can only push the
+//! answer toward the safe side. A foreign occupant of the Windows drain's
+//! `DRAIN_PACKET_BUDGET` — the recorded exception — can only push a teardown toward
+//! `Unproven`, and a reserved unit on `teardown_pressure` can only push a `watch`
+//! toward a capacity refusal; neither grants trust and neither is terminal. Sharing
+//! is a defect exactly when the verdict it feeds is terminal or trust-granting.
+//!
+//! **A verdict names its observation, and the observation must still be OPEN.** The
+//! trap the rule's own sites fell into is naming a fact about a step that has
+//! already completed. [`on_root_recovered`](DriverCore::on_root_recovered)'s
+//! mismatch arm reads *a reply was refused* — a fact about the read that already
+//! happened — and used it to arm the next one; what says a read is still owed is
+//! [`owes_whole_root`](ScopeState::owes_whole_root), and while a round trip stands
+//! in the world this scope holds, a read can only move the frame out from under it
+//! and refuse it too. Retained evidence keyed to a disagreement
+//! ([`RefusedWalk`]) bounds the retry only on the leg that HAS a key; the arming
+//! must name the need.
+//!
+//! **And the site is not one site.** Three arms schedule a whole-root recovery —
+//! an autonomous generation rejected ([`on_walk_boundaries`](DriverCore::on_walk_boundaries)),
+//! a requested reply refused ([`on_root_recovered`](DriverCore::on_root_recovered)),
+//! a located admission reply from a world this scope has left
+//! ([`on_admitted`](DriverCore::on_admitted)) — and each spelled its own conjuncts,
+//! so five consecutive review rounds each found a different one incomplete: one
+//! armed unconditionally, one overwrote a round trip already out, one derived the
+//! need from a set it had just emptied. Naming the need is not enough if three
+//! copies name it differently, so the decision is
+//! [`recover_if_unserved`](DriverCore::recover_if_unserved) and the arms differ
+//! only in the CARRIER they route to ([`RecoveryRoute`]).
+//!
 //! # Mount-refresh publication
 //!
 //! [`on_mounts_refreshed`](DriverCore::on_mounts_refreshed) publishes on a strict
@@ -29,9 +140,12 @@
 //! root is terminal regardless of snapshot staleness, so its death evidence is never
 //! discarded by a stale flag. Everything the snapshot then carries — the mount TABLE
 //! and the root's descent FRAME (`root_mnt_id`) — publishes ONLY when the snapshot is
-//! not stale: a stale completion (a loss or tick overlapped its read, so the snapshot
-//! may predate the lost window, and the table + frame come from that one read)
-//! publishes neither and re-arms one fresh read. So `state.root_mnt_id` is only ever
+//! not stale: a stale completion (an INVALIDATING arming — a loss, or a world swap —
+//! overlapped its read, so the snapshot may predate the lost window, and the table +
+//! frame come from that one read) publishes neither and re-arms one fresh read. The
+//! periodic tick is NOT such an arming: it coalesces onto an in-flight read and lets
+//! it publish, because a cadence witnesses no transition (see [`RefreshCause`]).
+//! So `state.root_mnt_id` is only ever
 //! the last AUTHORITATIVE frame, never a stale/pre-window one, and the frame
 //! [`crosses_mount_boundary`] consumes for enumerate descent is always authoritative.
 //! A non-stale frame CHANGE (a same-object re-mount moved the root to a different
@@ -50,28 +164,260 @@
 //! while probe-read device evidence (`dev == root_dev`) still decides independently
 //! throughout.
 //!
+//! That install REPLACES the table component rather than unioning onto it, and the
+//! separation that makes replacement sound is the point: the rows a snapshot lists
+//! ([`ScopeState::mount_table`]) are replaceable because reads are serialized and a
+//! row absent from an authoritative one is a mount the host says is gone, while every
+//! prefix learned from something OTHER than a snapshot — an in-band mount word, a
+//! probe's foreign device — lives in [`ScopeState::learned_mounts`], which no read may
+//! shrink. The union that stood in their place retained one path per HISTORICAL
+//! mountpoint for the life of the scope. And the whole check is gated per backend
+//! ([`consumes_absence_trust`]): one predicate decides both whether the table is built
+//! and whether it may be read, so a backend that consumes no absence trust maintains
+//! nothing and is granted nothing.
+//!
 //! # Root-death signals per backend
 //!
 //! Every backend's root death — unmount, delete, or replace — must reach a
 //! trigger that runs [`on_mounts_refreshed`](DriverCore::on_mounts_refreshed)'s
 //! death mapping or the Monitor's self-event path; the trigger differs by
-//! backend, and one backend's unmount is signal-silent, which the periodic tick
+//! backend, and two backends' unmount is signal-silent, which the periodic tick
 //! ([`root_liveness_interval`](DriverCore::new)) exists to cover:
 //!
 //! | backend | root unmount trigger | in-tree delete/replace trigger |
 //! |---|---|---|
-//! | inotify (descending) | `IN_UNMOUNT` + `IN_IGNORED` event | `IN_DELETE_SELF` / `IN_MOVE_SELF` event |
+//! | inotify (descending) | `IN_UNMOUNT` + `IN_IGNORED` event — **but a LAZY unmount emits neither** (#74) → the **periodic tick** re-stats the root | `IN_DELETE_SELF` / `IN_MOVE_SELF` event |
 //! | FSEvents (macOS) | `RootChanged` flag → root-alive probe | `RootChanged` flag → root-alive probe |
-//! | fanotify (`FAN_MARK_FILESYSTEM`) | **SILENT** — no event, no hangup (the mark holds the sb alive; L4.1) → the **periodic liveness tick** re-stats the root | `FAN_DELETE_SELF` / `FAN_MOVE_SELF` event |
+//! | fanotify (`FAN_MARK_FILESYSTEM`) | **SILENT** — no event, no hangup (the mark holds the sb alive; L4.1) → the **periodic tick** re-stats the root | `FAN_DELETE_SELF` / `FAN_MOVE_SELF` event |
 //! | RDCW (Windows) | any terminal read completion → fatal source error → self-event | same signal; RDCW draws no in-band distinction from unmount |
 //! | USN journal (Windows) | a failed journal read → fatal source error → self-event | the root's own FRN named in a delete/rename record → `RootDeath` |
 //!
-//! Only fanotify's unmount emits nothing in-band, so only fanotify arms the
-//! tick (gated by [`liveness_ticked`](DriverCore::liveness_ticked)). Its in-tree
-//! self-events, and every other backend's death signal, already lower a
-//! terminal `Removed`/`Rescan` through the existing paths; the tick's role is
-//! solely to make the quiet unmount observable within a bounded latency — a
-//! loss-triggered refresh already catches it immediately when one occurs.
+//! So the Linux pair arms the tick and nothing else does (gated by
+//! [`liveness_ticked`](DriverCore::liveness_ticked)); every listed in-band
+//! signal already lowers a terminal `Removed`/`Rescan` through the existing
+//! paths, and the tick's role is solely to make the quiet cases observable
+//! within a bounded latency — a loss-triggered refresh already catches them
+//! immediately when a loss occurs.
+//!
+//! # Mount transitions below the root
+//!
+//! The same silence has a second half that is about COVERAGE rather than death:
+//! a mount that departs BELOW the root leaves everything under it uncovered, and
+//! a lazy unmount announces that to nobody either. Only FSEvents lowers such a
+//! departure in band (an `UNMOUNT` flag word, which `compile::fsevents`'
+//! `plan_mount` turns into a located cover AND a table removal); no other
+//! backend does, and the table install below is a UNION, so a departed prefix is
+//! never removed by a refresh.
+//!
+//! **The mount table is the OBSERVER for that whole class, not a belt beside
+//! one.** A mount created after the watcher settles is seen by nothing else: no
+//! enumerate runs (there is no event), the fanotify walk is spawn-only, and no
+//! arm fires. So [`on_mounts_refreshed`](DriverCore::on_mounts_refreshed) diffs
+//! each authoritative read against
+//! [`mounts_baseline`](ScopeState::mounts_baseline) — the coverage set — and
+//! feeds one LOCATED COVER per transition, in BOTH directions:
+//!
+//! - **departure**, a recorded mount-backed row gone from the read: cover, then
+//!   drop it;
+//! - **arrival**, a row absent from the set: cover — an appearing mount shadows
+//!   ground the consumer may already have enumerated, which is why
+//!   `compile::fsevents` covers the arrivals macOS signals — then record it;
+//! - **replacement**, a location whose `(mnt_id, dev)` changed: cover, and
+//!   re-record with the NEW identity. This is the same-path remount, and it is
+//!   why the set carries identity at all; `/proc/self/mountinfo` supplies both
+//!   fields on every row it already parses.
+//!
+//! Nothing derived here touches the trust components at all, and that separation
+//! is what the two sets exist for: coverage asks what MOVED since the last read,
+//! trust asks what is foreign NOW, and their safety directions are opposite. The
+//! trust table's own replacement discipline is stated above.
+//!
+//! Which records may be CONDEMNED is a separate question from which enter, and
+//! the answer is the provenance partition on [`MountRecord`] — without it, a
+//! btrfs subvolume (device belt, root's own mount id, no table row ever) reads
+//! as departed on every single tick.
+//!
+//! **Exempt from the DROP is not exempt from the COVER, and on an id-less host
+//! the scope FAILS CLOSED.** The exempt partition holds two populations, and
+//! reading them as one leaves #74 open on every kernel below 5.8. A record PROVEN
+//! to carry the root's own mount id is a subvolume and is silent forever. A
+//! record with an id unknown on either side is AMBIGUOUS — and on 4.11–5.7, where
+//! `statx(STATX_MNT_ID)` does not exist, that is the shape EVERY seam record
+//! takes, genuine vfsmounts included. One that lazy-unmounts before the next
+//! refresh leaves that refresh no row to upgrade it with, so nothing condemns it
+//! and the revealed subtree would stay dark.
+//!
+//! The answer is ONE scope-wide rule, not per-record bookkeeping:
+//!
+//! > **While a scope holds ANY ambiguous record, every AUTHORITATIVE refresh
+//! > covers the WHOLE ROOT** ([`ScopeState::fails_closed`]).
+//!
+//! Three earlier designs tried to bound this per record — a spent-once `bool`, a
+//! generation stamp with a cadence, a saturation latch — and each produced a
+//! fresh defect, because on a host that answers no mount ids the storm sequence
+//! and the silent-loss sequence are the SAME sequence of observations: absent
+//! from every frame, re-declined by every crawl. No predicate over a per-record
+//! observation can separate them. The scope-wide rule does not try: it pays for
+//! every ambiguity at once, at the coarsest granularity there is.
+//!
+//! **The cost is real and accepted.** On a 4.11–5.7 kernel whose root holds btrfs
+//! subvolumes, the record for each subvolume is ambiguous forever — no row will
+//! ever confirm it and no id will ever prove it — so the scope covers its whole
+//! root on every authoritative refresh, for the scope's life. That is
+//! correctness bought at a permanent per-refresh root cover, and it is the
+//! deliberate trade; see
+//! [`root_liveness_interval`](crate::WatcherOptions::root_liveness_interval).
+//!
+//! **Who actually pays is narrow.** On Linux ≥ 5.8 the ambiguous partition is
+//! provably EMPTY: `root_mnt_id` is read at spawn or the source does not start,
+//! and every seam that records a boundary reads the id from the fd it already
+//! pinned (a `statx` that FAILS never mints a record at all). So a record is
+//! either row-confirmed, or id-bearing and therefore condemnable or proven — and
+//! `fails_closed` answers `false` for the life of the scope. The fanotify backend
+//! requires `FAN_REPORT_TARGET_FID` (5.17), so it can never run on a host that
+//! pays this at all.
+//!
+//! A refusal at [`MAX_DEVICE_ONLY_BOUNDARIES`] needs no announcement of its own
+//! for the same reason: the bound only refuses when the partition is FULL of
+//! ambiguous records, which is exactly the state that already covers the whole
+//! root every refresh.
+//!
+//! A world swap (spawn, replace, widen) SEEDS the set from its own barrier
+//! read rather than emptying it. The barrier read opens no authority, but the cold
+//! crawl that follows the swap declines coverage beneath every mount it finds, and
+//! the two are unordered detached jobs — so a prefix that departs in that window
+//! leaves an unenumerated subtree that an empty set could never make
+//! derivable, at that refresh or any later one.
+//!
+//! ## Beside the detector: LATENCY seams, and PREVENTION
+//!
+//! Two roles sit beside the refresh, and neither is a second detector:
+//!
+//! - **latency seams** — the enumerate decline (`on_enumerated`), the os-layer
+//!   WALKS ([`on_walk_boundaries`](DriverCore::on_walk_boundaries)) and a
+//!   boundary-bearing probe answer ([`record_probe_boundary`]) record what they
+//!   observe into the same set ([`record_boundary`]). For a vfsmount that is
+//!   latency ONLY: the refresh sees everything they see, so a seam merely closes
+//!   the window between an observation and the next tick. For a DEVICE-ONLY
+//!   boundary they are the sole observers there will ever be, and what they
+//!   record there is never condemned.
+//! - **prevention** — an arm that would land ACROSS the scope frame is REFUSED
+//!   by the executor rather than installed ([`ScopeFrame`] rides every
+//!   [`Effect::AddWatch`]). This is the only guard on an arm the enumerate fence
+//!   never judged: a directory learned from a `Created` record is armed with no
+//!   enumerate in between, and inotify's `Created` carries no identity, so the
+//!   arm's own object guard passes whatever it opens.
+//!
+//! **The WALK seam is not latency on a kernel-recursive profile — it is the only
+//! observer there is.** A descending scope re-learns its boundaries on every
+//! cover's re-arm crawl; `Monitor::start_rearm` refuses outright when the scope
+//! does not descend, so a fanotify scope runs no enumerate at all and its source's
+//! own walks are the single place it ever fences a directory. Four walks drive it:
+//! the spawn seed walk, whose declines ride `RootMeta::declined` into the same
+//! world swap that seeds the baseline; the post-loss whole-map reseed and the
+//! moved-in subtree walk and the ADMISSION RESEED, all three of which run on the
+//! reader thread and reach
+//! [`on_walk_boundaries`](DriverCore::on_walk_boundaries) over the source's one
+//! ordered queue. What the walk read is what the set holds — the core
+//! re-derives nothing, because a walk's frame comes from a pinned fd no later
+//! path resolution could reproduce honestly.
+//!
+//! ## The admission reseed, and the one cover that WAITS
+//!
+//! The fourth walk is not only a seam. A fanotify source admits events by
+//! directory-handle MEMBERSHIP and its walks stop AT a mount, so the ground a
+//! departed mount reveals has no handles in the map: the source is blind to it,
+//! and no crawl will ever repair that (`Monitor::start_rearm` refuses a
+//! non-descending scope outright). A located cover alone would send the consumer
+//! to re-read ground the reader still drops every event on, with no loss signal,
+//! since an unknown handle is "provably outside the root".
+//!
+//! So on that ONE profile a departure's cover is PARKED
+//! ([`PendingAdmit`]) on a round trip — [`Effect::AdmitBoundaries`] out,
+//! [`on_admitted`](DriverCore::on_admitted) back — and reaches the consumer only
+//! once the source can see what it is being sent to look at. Every other backend
+//! covers in the same step it condemns; the gate is fanotify, not
+//! kernel-recursiveness, because FSEvents, RDCW and the USN journal all mark a
+//! tree or a volume rather than a set of handles.
+//!
+//! **The reseed is scoped to RECORDED boundaries, and that is licensed by one
+//! fact about the map.** Ground the watcher knew before a mount arrived is
+//! already in the map, and a mount landing over it does not take it out again:
+//! the mark's event mask carries no mount verb (`FAN_CREATE`/`DELETE`/`MODIFY`/
+//! `ATTRIB`/`RENAME`/`DELETE_SELF`/`MOVE_SELF`/`ONDIR`), so shadowing a directory
+//! emits nothing, the map's only removals are `forget` (a real delete or
+//! move-out), a whole-map `reseed`, and the orphan eviction that fires when a
+//! parent chain breaks — and a shadowed directory's parent chain is intact. So
+//! event-learned ground survives a shadow window and resumes on its own; only the
+//! ground the walk DECLINED — which is exactly what the coverage set records —
+//! was never mapped at all. The whole-map reseed is the one removal that can undo
+//! this (its walk stops at the live mount and drops what is under it), and that
+//! case lands back in the same place: the boundary is recorded, so its departure
+//! walks the revealed ground in.
+//!
+//! **A refusal records nothing, and that is deliberate.** A failed arm reaches
+//! the Monitor's `Err` arm, which emits a located `Rescan`, books a
+//! level-persistent slot deficit and drops the node — it queues no enumerate and
+//! calls no re-arm. For a MOUNT-BACKED crossing the recorder is this refresh's
+//! ARRIVAL side, whose cover re-arms a crawl that re-runs the decline, and the
+//! reconcile heals the deficit. For a DEVICE-ONLY crossing there is no row, no
+//! arrival and no crawl: the slot stays a deficit re-signalled ahead of every
+//! sync cookie — signalled, not silent — and that is the ACCEPTED terminal for
+//! that case, not an omission to be repaired later.
+//!
+//! **Device-only records have their own lifecycle, because the refresh cannot
+//! give them one.** They are exempt from the partition, so no frame ever
+//! condemns them; three mechanisms retire them instead, and each covers a case
+//! the others cannot:
+//!
+//! - [`retire_removed_boundaries`](DriverCore::retire_removed_boundaries) — a
+//!   compiled `Removed`/`MovedFrom`/`DeleteSelf`/`MoveSelf` says the location is
+//!   gone. Reads the EVENT STREAM, which is exactly what a loss window empties.
+//! - [`retire_relisted_boundaries`] — a complete enumerate of a directory is an
+//!   authoritative re-observation of its children (the DESCENDING profile's
+//!   generation, and the loss recovery's own re-listing runs it).
+//! - [`retire_unwalked_boundaries`] — a complete whole-root walk is the same
+//!   thing for the KERNEL-RECURSIVE profile, which runs no enumerate at all.
+//!
+//! **Whatever applies WALK-DERIVED state must know which root the walk ran under**,
+//! because a coverage set is relative to the scope's descent frame and a walk that
+//! ran under another one describes a different world. The appliers, and where each
+//! stands:
+//!
+//! - [`on_walk_boundaries`](DriverCore::on_walk_boundaries) and
+//!   [`on_root_recovered`](DriverCore::on_root_recovered) — the two messages that
+//!   carry a COMPLETE generation, and the two that retire from the exempt
+//!   partition. Both are checked against the root mount id their walk fenced
+//!   against, and the recovery (which answers a request) against the frame epoch it
+//!   was issued at as well.
+//! - [`on_stream_spawned`](DriverCore::on_stream_spawned),
+//!   [`on_root_replaced`](DriverCore::on_root_replaced) and the widen commit —
+//!   EXEMPT by construction: each installs `root_dev`/`root_mnt_id`/`frame_epoch`
+//!   from the same barrier read whose declines it records, so the generation and
+//!   the frame it is relative to cannot disagree.
+//! - [`on_admitted`](DriverCore::on_admitted) — already stamped: a reply whose
+//!   [`PendingAdmit::epoch`] is not the scope's puts nothing back.
+//! - [`on_mounts_refreshed`](DriverCore::on_mounts_refreshed) — stamped by
+//!   construction: `crate::os::mount_sample` takes the table and the root's stat
+//!   inside ONE proven-still mount-namespace generation, and a stale or cross-world
+//!   snapshot publishes neither.
+//! - the DESCENDING profile's enumerate declines ([`retire_relisted_boundaries`])
+//!   — unstamped and correctly so: it is a ONE-LEVEL generation on the profile
+//!   whose every cover re-arms a crawl that re-runs the very listing, so a frame
+//!   that moved under it costs one false condemnation that the next enumerate
+//!   repairs. The kernel-recursive profile has no such repair, which is why its
+//!   whole-root generation is the one that must be checked.
+//! - [`retire_removed_boundaries`](DriverCore::retire_removed_boundaries) and
+//!   [`record_probe_boundary`] — frame-FREE: neither carries a captured frame. The
+//!   first retires on a location the event stream saw vanish (a mountpoint cannot
+//!   be unlinked while a mount is on it), the second evaluates
+//!   [`ScopeFrame::crossed_by`] against the live frame at ingest.
+//!
+//! Above all three retirement mechanisms sits [`MAX_DEVICE_ONLY_BOUNDARIES`], an
+//! unconditional bound that holds when every one of them has failed. Without it a churning subvolume
+//! layout whose deletions were repeatedly lost retained one `PathBuf` per missed
+//! deletion for the life of the scope, and every linear scan of the set paid for
+//! it.
 
 use std::{
   collections::{BTreeMap, BTreeSet, VecDeque},
@@ -91,8 +437,8 @@ use tributary_proto::{
 use crate::{
   error::WatchRootError,
   os::{
-    BackendKind, BatchPayload, FsEventFlags, RawOsEvent, RootIdentity, RootMeta, SourceError,
-    SourceEvent,
+    BackendKind, BatchPayload, FsEventFlags, MountRow, RawOsEvent, RootIdentity, RootMeta,
+    ScopeFrame, SourceError, SourceEvent,
     linux::{RawLinuxEvent, WatchOutcome},
     transport::BudgetPermit,
     windows::RawWindowsEvent,
@@ -110,7 +456,7 @@ mod tests;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct ProbeId(u64);
 
-/// What an executed probe (an `lstat` of one path) found.
+/// What an executed probe (one no-follow stat of a path) found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProbeOutcome {
   /// The path does not exist.
@@ -124,6 +470,22 @@ pub(crate) enum ProbeOutcome {
     /// The device the object lives on; identity is minted only on the
     /// root's own device.
     dev: u64,
+    /// The object's MOUNT id, or `None` where the host answers none (below
+    /// Linux 5.8, the `STATX_MNT_ID` mask bit unset, or a non-Linux/fake
+    /// executor).
+    ///
+    /// Carried for exactly one reason, and it is a correctness one rather than
+    /// a convenience: [`record_probe_boundary`] records what a probe answer
+    /// reveals about a mount boundary (SEAM 4), and a boundary observation
+    /// with no mount id is one [`MountRecord::condemnable`] classifies as
+    /// DEVICE-ONLY — permanently exempt from every condemnation mechanism. A
+    /// probe that answered a device alone therefore minted an exempt record
+    /// for a mount it had no way to recognise as a mount, and a genuine mount
+    /// first observed by such a probe and departing before a refresh confirmed
+    /// a row at its location had its departure derived by nothing at all.
+    /// Answering the id keeps `None` meaning "the host cannot say", which is
+    /// the one reading the provenance partition is sound under.
+    mnt_id: Option<u64>,
   },
   /// The probe failed (permission, I/O); existence is unknowable.
   Failed,
@@ -146,12 +508,18 @@ pub(crate) enum RootLiveness {
   Unreadable,
 }
 
-/// One mount-table refresh result: the mount prefixes strictly under the root,
+/// One mount-table refresh result: the mount rows strictly under the root,
 /// whether the read was authoritative, and what the root itself re-stat'd to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MountRefresh {
-  /// Mount points observed strictly under the root.
-  pub(crate) mounts: Vec<PathBuf>,
+  /// The mount rows observed strictly under the root, at most one per location.
+  ///
+  /// Identity-bearing where the host can answer it ([`MountRow`]), which is what
+  /// makes this refresh the PRIMARY departure detector rather than a belt: a
+  /// mount replaced at an unchanged path shows up as an identity change and in
+  /// nothing else, and the class of mount created AFTER a watcher settles is
+  /// observed by no other seam at all.
+  pub(crate) mounts: Vec<MountRow>,
   /// Whether the live mount table could be read (device trust returns only
   /// with an authoritative read).
   pub(crate) authoritative: bool,
@@ -172,6 +540,477 @@ pub(crate) struct MountRefresh {
   /// leaves the captured value intact — a transient read miss never drops a known
   /// frame.
   pub(crate) root_mnt_id: Option<u64>,
+  /// WHICH INCARNATION of a mount the root was on when this refresh read it, where
+  /// the host can answer that at all ([`RootIncarnation`](crate::os::RootIncarnation)).
+  ///
+  /// [`root_mnt_id`](Self::root_mnt_id) is a value observed at one instant, and an
+  /// unmount plus a remount between two refreshes hands the new mount the id the
+  /// old one freed — so an id that MATCHES across the gap is not evidence the root
+  /// stayed put. This is the fact that is, and the scope's frame moves on it.
+  ///
+  /// `None` where nothing could answer: a host with no unique mount id and no
+  /// namespace generation, or a window this refresh could not prove quiet (a
+  /// token built out of two reads that straddle a transition would read as
+  /// continuity on the very next refresh). A `None` compares against nothing and
+  /// leaves the scope's last PROVEN token standing — the frame then moves on the
+  /// mount-id comparison alone, exactly as it did before this existed.
+  pub(crate) root_incarnation: Option<crate::os::RootIncarnation>,
+}
+
+/// One recorded boundary under a watched root: a [`MountRow`]'s facts plus the
+/// PROVENANCE that decides whether it may ever be condemned.
+///
+/// # The provenance partition
+///
+/// A fence decline does not imply a mountinfo row, and that asymmetry is the
+/// whole reason this type is not just a row. [`crosses_mount_boundary`] fires on
+/// `device_boundary || mount_boundary`, so a **btrfs subvolume** inside the root
+/// trips the DEVICE belt while carrying the root's own `mnt_id`: it is not a
+/// vfsmount, it has no mountinfo row EVER, and no read of the table will ever
+/// list it. Treating such a record's absence from a frame as a departure is a
+/// permanent cover storm — one cover per subvolume per tick, on every default
+/// snapper / Fedora / docker-btrfs layout.
+///
+/// So records are partitioned, and only one partition is condemnable:
+///
+/// - **mount-backed** — the record's `mnt_id` differs from the scope's
+///   `root_mnt_id`, OR a table read has confirmed a row at its location. This is
+///   the partition the departure detection is about.
+/// - **device-only** — `mnt_id` equal to the root's, or unknown, with no row
+///   ever seen. EXEMPT from condemnation. It is not a mount and cannot depart;
+///   its lifecycle is the ordinary event flow, since deleting a subvolume emits
+///   real delete events on its parent.
+///
+/// # Why provenance is an upgrade and never a birth-time verdict
+///
+/// [`row_confirmed`](Self::row_confirmed) is a STICKY upgrade rather than a
+/// classification taken once at record time, because the `mnt_id` disjunct is
+/// vacuous on the kernels that need it most. Below Linux 5.8 there is no
+/// `STATX_MNT_ID`: `root_mnt_id` is `None`, every row's `mnt_id` is `None`, and
+/// the disjunct answers "not mount-backed" for genuine vfsmounts as readily as
+/// for subvolumes. Freeze that at birth and every mount on those kernels — and
+/// on macOS, whose table answers no id either — is permanently exempt, which
+/// silently un-fixes #74 there. The row disjunct is what rescues them: a table
+/// read that LISTS a location proves a vfsmount is there, whatever the kernel
+/// will say about ids, and that proof outlives the read that made it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MountRecord {
+  /// Where the boundary is.
+  location: PathBuf,
+  /// The boundary's mount id, if anything that observed it could answer one.
+  mnt_id: Option<u64>,
+  /// The boundary's device, if anything that observed it could answer one.
+  dev: Option<u64>,
+  /// STICKY: an authoritative mount-table read has listed a row at this
+  /// location, so a vfsmount is (or was) really there. Set on the read that
+  /// records the row and on every later read that confirms it; never cleared
+  /// short of the record being dropped or the whole set replaced by a world
+  /// swap. This is the provenance upgrade — see the type doc.
+  row_confirmed: bool,
+}
+
+impl MountRecord {
+  /// Records a table row. A row IS the confirming evidence, so it enters
+  /// already upgraded — this is the row disjunct applied at the first moment it
+  /// can be.
+  fn confirmed(row: &MountRow) -> Self {
+    Self {
+      location: row.location.clone(),
+      mnt_id: row.mnt_id,
+      dev: row.dev,
+      row_confirmed: true,
+    }
+  }
+
+  /// Records a boundary a SEAM observed — a declined dir entry, an os-layer
+  /// walk's decline, a probe answer — rather than a table row. Enters NOT
+  /// row-confirmed: nothing has listed a mountinfo row here, so provenance rests
+  /// on the `mnt_id` disjunct alone until some later refresh confirms one.
+  ///
+  /// This is the constructor that first makes the device-only partition
+  /// non-empty. A btrfs subvolume reaches it carrying the ROOT's own mount id
+  /// (it trips the device belt, not the mount fence), which is exactly the shape
+  /// [`condemnable`](Self::condemnable) answers `false` to — and must keep
+  /// answering `false` to, or every tick covers and re-records it forever.
+  fn observed(location: PathBuf, dev: Option<u64>, mnt_id: Option<u64>) -> Self {
+    Self {
+      location,
+      mnt_id,
+      dev,
+      row_confirmed: false,
+    }
+  }
+
+  /// Whether this record may be CONDEMNED — covered and dropped — by a refresh
+  /// that no longer lists it.
+  ///
+  /// Evaluated against the scope's CURRENT frame, never a captured one: a
+  /// same-object re-mount moves `root_mnt_id`, and a record's provenance has to
+  /// follow the root it is relative to.
+  ///
+  /// **Passing the current frame is not enough on its own** — the RECORD's side
+  /// of the comparison is a captured absolute value, so when the root's id moves
+  /// under a live scope every subvolume record (whose id equalled the OLD root)
+  /// starts reading mount-backed and the whole exempt partition is condemned at
+  /// once. [`rebase_root_relative`] is what actually honours this doc: it moves
+  /// every non-row-confirmed record that WAS the root's id onto the new one,
+  /// before any condemnation reads them.
+  fn condemnable(&self, root_mnt_id: Option<u64>) -> bool {
+    self.row_confirmed
+      || matches!((self.mnt_id, root_mnt_id), (Some(mnt), Some(root)) if mnt != root)
+  }
+
+  /// Whether this exempt record is PROVEN to sit on the root's own mount — a
+  /// genuine subvolume, and the only thing that may leave the coverage set with
+  /// no cover and no re-observation.
+  ///
+  /// [`condemnable`](Self::condemnable) answering `false` does NOT mean "not a
+  /// mount", and reading it that way is the mistake this predicate exists to
+  /// stop. The exempt partition holds two populations that only look alike:
+  ///
+  /// - **proven** — both ids known and EQUAL. Nothing that is a vfsmount can
+  ///   carry the root's own mount id, so this record describes something the
+  ///   mount table will never list. It obliges nothing, ever, and no later
+  ///   observation can promote it.
+  /// - **ambiguous** — either id unknown. On pre-5.8 Linux, with the
+  ///   `STATX_MNT_ID` mask unset, or on any host whose frame could not be read,
+  ///   a GENUINE post-baseline vfsmount is recorded in exactly this shape and
+  ///   stays in it until an authoritative mountinfo row upgrades it
+  ///   ([`row_confirmed`](Self::row_confirmed)). That upgrade is the only thing
+  ///   standing between it and permanent exemption, and it can only reach a
+  ///   record that is still in the set.
+  ///
+  /// So the two are treated differently everywhere a record is dropped without
+  /// a cover: see [`make_room_for_device_only`].
+  fn proven_subvolume(&self, root_mnt_id: Option<u64>) -> bool {
+    !self.row_confirmed
+      && matches!((self.mnt_id, root_mnt_id), (Some(mnt), Some(root)) if mnt == root)
+  }
+
+  /// The OTHER half of the exempt partition: a record neither condemnable nor
+  /// proven — one of the two ids is unknown, so nothing here can tell a genuine
+  /// vfsmount from a same-mount subvolume.
+  ///
+  /// This is the population the scope-wide FAIL-CLOSED rule
+  /// ([`ScopeState::fails_closed`]) exists for, and the reason "exempt" may not
+  /// mean "silent". It is not a rare corner: on every Linux 4.11–5.7 host
+  /// `statx(STATX_MNT_ID)` does not exist, so the scope's frame is `None`, every
+  /// seam observation carries `mnt_id: None`, and EVERY seam record under the
+  /// root is ambiguous.
+  ///
+  /// The two halves of the exempt partition are therefore read very differently
+  /// on an absence: a PROVEN record stays silent forever (no vfsmount can carry
+  /// the root's own mount id, so its absence from a frame is evidence of
+  /// nothing), while the mere PRESENCE of an ambiguous one anywhere in the set
+  /// makes every authoritative refresh cover the whole root — whether or not that
+  /// particular record is in this frame, and without any per-record bookkeeping
+  /// at all.
+  ///
+  /// It is a question about the CURRENT frame, never a captured one, exactly as
+  /// [`condemnable`](Self::condemnable) is: an ambiguous record whose root later
+  /// answers an id stops being ambiguous, and the scope stops failing closed.
+  fn ambiguous(&self, root_mnt_id: Option<u64>) -> bool {
+    !self.condemnable(root_mnt_id) && !self.proven_subvolume(root_mnt_id)
+  }
+}
+
+/// Moves every record whose identity is RELATIVE to the root's mount frame onto
+/// the frame's new value — the step [`MountRecord::condemnable`]'s own doc
+/// promises ("a record's provenance has to follow the root it is relative to")
+/// and which passing the current frame alone cannot deliver.
+///
+/// # The state this repairs
+///
+/// A record's `mnt_id` is a captured ABSOLUTE value, but for the exempt
+/// partition its MEANING is relative: a btrfs subvolume is recorded carrying the
+/// root's own mount id, and that is the entire evidence that it is not a
+/// vfsmount. A same-object unmount+rebind of the root — supported, and the case
+/// `root_mnt_id`'s re-adoption exists for — moves the root's id, and from that
+/// moment every such record's id differs from the root's and reads MOUNT-BACKED.
+///
+/// The consequence is a false departure cover per subvolume on every such
+/// remount, and it used to be an indefinite rescan storm on a kernel-recursive
+/// scope: the departure retain removed the record, the admission walk correctly
+/// answered [`StillCovered`](crate::os::AdmitOutcome::StillCovered) (the
+/// subvolume is still there), the core put the UNCHANGED old-id record back, and
+/// the next refresh derived the same false departure again — forever. The
+/// put-back now re-records what the walk actually READ ([`restored_boundary`]),
+/// which lands the record back on the current frame and ends the repetition; this
+/// pass is still what stops the false condemnation, and its cover, from happening
+/// at all.
+///
+/// # Why `!row_confirmed` is the whole guard
+///
+/// A row-confirmed record's identity is absolute: a mountinfo line listed a
+/// vfsmount at that location and reported ITS id, which has nothing to do with
+/// the root's. Rebasing one would forge a subvolume out of a real mount. Only the
+/// seam-observed records can be root-relative, and among those only the ones that
+/// actually held the previous root's id are moved — an ambiguous record carrying
+/// no id at all has no relative identity to repair.
+///
+/// # Nothing PARKED needs this
+///
+/// [`PendingAdmit`] holds condemned records across a round trip, and none of them
+/// can be root-relative: parking requires the record to be condemnable (absolute
+/// — row-confirmed, or an id that differs from the root's) or ambiguous (one id
+/// unknown) against the frame IN FORCE when it was parked, and a record whose id
+/// equals that frame's root id is [`proven_subvolume`](MountRecord::proven_subvolume),
+/// which is neither. So the frame in force at parking is the "previous" frame at
+/// the next change, and no parked record is ever eligible.
+fn rebase_root_relative(records: &mut [MountRecord], previous: u64, current: u64) {
+  for record in records {
+    if !record.row_confirmed && record.mnt_id == Some(previous) {
+      record.mnt_id = Some(current);
+    }
+  }
+}
+
+/// Which record goes back into the coverage set when an admission answers
+/// [`StillCovered`](crate::os::AdmitOutcome::StillCovered) — the CONDEMNED one,
+/// or a fresh observation of whatever the walk actually found.
+///
+/// # Why the condemned record cannot simply be put back
+///
+/// `StillCovered` fires on [`ScopeFrame`](crate::os::ScopeFrame)'s two
+/// independent fences, so it means "a boundary is here", never "the same boundary
+/// is here". The shape that separates the two is ordinary: a real mount ON TOP OF
+/// a btrfs subvolume. The mount owns a mountinfo row, so its record is
+/// row-confirmed and therefore condemnable; when it departs, the walk re-opens the
+/// location and finds the SUBVOLUME — a different device, the ROOT's own mount id,
+/// and no table row ever.
+///
+/// Putting the condemned record back there restores `row_confirmed` over an
+/// object no mount table will ever list, and the state never converges: the next
+/// authoritative refresh finds that row absent, condemns it again, parks another
+/// admission, gets the same answer, and emits another cover — one round trip and
+/// one `Rescan` per tick for the life of the scope. It is the same indefinite
+/// storm [`rebase_root_relative`] exists to prevent, reached by a different door.
+///
+/// # The rule, and why each leg converges
+///
+/// The identity the walk read is the same `(dev, mnt_id)` a table row or a seam
+/// observation reports, so it can simply be believed:
+///
+/// - **it MATCHES the condemned record** (no known half disagrees — the same
+///   `(Some, Some)` discipline [`identity_changed`] applies everywhere else): the
+///   verdict was wrong about a live mount that never went anywhere, so the record
+///   goes back WHOLE. That is the only way to preserve the sticky
+///   [`row_confirmed`](MountRecord::row_confirmed) a re-observation would drop —
+///   which for a boundary carrying the root's own mount id is the difference
+///   between condemnable and permanently exempt. A host that answers no mount ids
+///   takes this leg for everything, which is the honest degrade: it cannot tell
+///   two incarnations apart, so it claims no replacement.
+/// - **it DIFFERS**: what is standing there is not what departed, and the record
+///   for it is exactly what a seam that observed it would record — NOT
+///   row-confirmed, carrying the observed identity and nothing inherited. For the
+///   subvolume that is a [`proven_subvolume`](MountRecord::proven_subvolume):
+///   exempt, so no later refresh condemns it, no further cover, and the very next
+///   refresh is silent. For a mount that REPLACED the departed one it is
+///   condemnable through the id disjunct, and the next authoritative refresh
+///   listing its row confirms it in place — no cover either way, because the
+///   cover for this transition has already gone out.
+///
+/// Nothing is inherited across the mismatch leg on purpose: a half the walk could
+/// not answer is unknown, and filling it from the record that just departed would
+/// claim the new object carries the old mount's identity.
+fn restored_boundary(
+  condemned: &MountRecord,
+  dev: Option<u64>,
+  mnt_id: Option<u64>,
+) -> MountRecord {
+  if identity_changed(condemned.dev, dev) || identity_changed(condemned.mnt_id, mnt_id) {
+    return MountRecord::observed(condemned.location.clone(), dev, mnt_id);
+  }
+  condemned.clone()
+}
+
+/// One departure whose cover is PARKED on an outstanding admission round trip —
+/// the fanotify half of the mount design, and the only place a cover this core
+/// derived does not reach the Monitor in the same step.
+///
+/// # Why a cover ever waits
+///
+/// fanotify admits events by directory-handle membership and its seed walk stops
+/// at a mount, so the ground a departed mount reveals has no handles in the map:
+/// the source is blind to it, and there is no crawl to fix that
+/// (`Monitor::start_rearm` refuses a non-descending scope outright). Emitting the
+/// cover first would tell the consumer to re-read ground the source still cannot
+/// see, and every mutation between that re-read and the eventual admission would
+/// drop silently. So the cover waits for the map, which is why this exists at
+/// all: the verdict is made here and the walk runs on the reader thread, so the
+/// two are a round trip and the cover has to survive it.
+///
+/// # It carries the whole record, not just the location
+///
+/// A CONDEMNED record is TAKEN out of the coverage set by the verdict that parks
+/// it, and one answer — [`StillCovered`](crate::os::AdmitOutcome::StillCovered)
+/// — means a boundary is standing at the location after all, so something must go
+/// back. The condemned record is held because it is the only thing that can go
+/// back when the verdict was simply WRONG about a mount that never left: a
+/// freshly-observed record enters NOT row-confirmed, which for a same-mount-id
+/// boundary is the difference between condemnable and permanently exempt.
+///
+/// It is not put back unconditionally. `StillCovered` also answers for a boundary
+/// that is NOT the one that departed — the subvolume a real mount was sitting on
+/// — and restoring a row-confirmed record over one of those never converges. The
+/// walk's own reading decides between the two; see [`restored_boundary`].
+///
+/// Only a CONDEMNED record is ever parked. An ambiguous record's absence parks
+/// nothing at all — it is not a departure verdict but the trigger for the
+/// scope-wide fail-closed rule ([`ScopeState::fails_closed`]), whose whole-root
+/// recovery carries its own admission and its own cover.
+///
+/// # What the put-back can and cannot reinstate
+///
+/// The re-record guard is what keeps a reply that was already in flight from
+/// undoing a discharge: if a seam recorded a fresh record at the location while
+/// the round trip was out, the guard finds it standing there and pushes nothing.
+/// One record per location, always.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingAdmit {
+  /// The round trip this cover waits on.
+  ticket: crate::os::AdmitTicket,
+  /// The record the departure verdict condemned, held intact for the refusal
+  /// path.
+  record: MountRecord,
+  /// The scope's [`frame_epoch`](ScopeState::frame_epoch) when this was parked.
+  /// A reply that comes back against a different one is answered by a whole-root
+  /// recovery instead of on its own terms — see
+  /// [`on_admitted`](DriverCore::on_admitted).
+  epoch: u64,
+}
+
+/// The ONE whole-root recovery round trip a scope has out — the root-scope
+/// sibling of [`PendingAdmit`], and held to the same rule: opened by the request,
+/// discharged by an ANSWER that was applied, and by nothing else.
+///
+/// It parks no record and no located cover, because a recovery's reply carries the
+/// whole root's cover itself. What it holds is what the two questions about an
+/// unanswered recovery need: which tickets its reply would discharge, and which
+/// world it was asked in. See [`ScopeState::pending_recovery`] for why the second
+/// one is both the anti-spin latch and the retry trigger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingRecovery {
+  /// The cutoff the reply must carry to discharge this round trip. Every ticket at
+  /// or below it is answered by that one reply.
+  ticket: crate::os::AdmitTicket,
+  /// The scope's [`frame_epoch`](ScopeState::frame_epoch) when this was issued.
+  /// The reply echoes it back, and the core applies nothing from a reply whose
+  /// echo is no longer the scope's.
+  epoch: u64,
+}
+
+/// The DISAGREEMENT one refused whole-root recovery was refused ON: the foreign
+/// root its walk fenced against, and the frame this scope held while refusing it.
+///
+/// Retained for one question and no other — **has this scope already re-asked
+/// under this exact disagreement?** — which is the question the suppression it
+/// replaces used to answer by PREDICTION. "A fresh request would be answered by a
+/// walk that reads the same root and is refused identically" is a claim about the
+/// SOURCE's world, and the core holds no reading of that at all: what it holds is
+/// one reply, evidence of where a walk stood at the moment it ran. A transient
+/// same-object self-bind makes that reply describe a mount that is already gone
+/// (the walk saw B; B departed; the root is back on the very mount object A it
+/// started on, so both its legacy id and its unique incarnation token are
+/// unchanged and no frame move can be observed) — and the prediction is then
+/// exactly wrong: the fresh walk reopens the path, reads A, and is ACCEPTED.
+///
+/// So the retry is not predicted away. It is spent, once, and the refusal that
+/// comes back from the request issued AFTERWARDS is the observation the
+/// prediction wanted: two walks, the second raised in full knowledge of the first,
+/// both fencing against the same foreign root while this scope held the same
+/// frame. Only then does [`DriverCore::on_root_recovered`] stop arming its own
+/// refresh on THIS leg — the edge that could otherwise turn the retry into a
+/// self-driven loop (refusal arms a read, the read re-asks, the re-ask is refused).
+/// What survives that is one recovery per REFRESH, which is the cost a
+/// [`fails_closed`](ScopeState::fails_closed) scope already pays by design, not
+/// one per scheduler round.
+///
+/// A DIFFERENT foreign root re-opens it, and that is not laxity: the source's
+/// world demonstrably moved between the two walks, so the second reply is fresh
+/// information rather than a repeat.
+///
+/// # It is only HALF the brake, and the other half is the need itself
+///
+/// This keys on a disagreement, so it reaches only the walked-id leg. An EPOCH
+/// mismatch has no key at all — the epoch is what moved, so no two refusals can
+/// ever share one — and the arming is itself what moves it. The arm is therefore
+/// gated on [`owes_whole_root`](ScopeState::owes_whole_root) as well: while a round
+/// trip stands in the world this scope still holds, nothing is owed a read, because
+/// that reply carries the generation, the cutoff and the cover together. See the
+/// module doc's bound/verdict rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RefusedWalk {
+  /// The root mount id the refused walk fenced its descent against.
+  walked: u64,
+  /// The scope's [`frame_epoch`](ScopeState::frame_epoch) at the refusal.
+  epoch: u64,
+}
+
+/// Why one mount refresh is being armed.
+///
+/// The two causes agree completely when nothing is in flight — both arm one
+/// read. They differ ONLY in what they say about a refresh that IS in flight,
+/// because they carry opposite evidence about its snapshot:
+///
+/// - an **invalidating** arming happened BECAUSE the world moved (a loss window,
+///   a root replace or widen, a birth), so the in-flight read may have sampled
+///   the far side of that transition — it is suspect, and
+///   [`refresh_stale`](ScopeState::refresh_stale) condemns it.
+/// - a **periodic** arming is pure cadence: nothing happened. The in-flight
+///   snapshot is exactly as good as the one this tick would take, so the tick
+///   coalesces onto it and lets it PUBLISH.
+///
+/// Conflating the two starves everything that publishes past
+/// [`on_mounts_refreshed`](DriverCore::on_mounts_refreshed)'s stale gate — the
+/// mount-table install, the frame adoption, and the departure diff. With refresh
+/// latency at or past the interval (a backed-up blocking pool, or simply a short
+/// interval — any nonzero duration is configurable), a tick that stale-marked
+/// would condemn EVERY completion in turn: each is discarded and re-armed, and
+/// the next tick condemns the next read. The root-death check survives that only
+/// because it is evaluated BEFORE the gate; the departure diff sits behind it,
+/// so the silence #74 exists to break would never be broken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefreshCause {
+  /// The world moved under the in-flight read: a loss signal, a root replace or
+  /// widen, or the birth arming. Condemns an outstanding snapshot.
+  Invalidating,
+  /// The periodic tick came due. Coalesces onto an outstanding read without
+  /// condemning it — and without ever CLEARING a condemnation an invalidating
+  /// arming already made.
+  Periodic,
+}
+
+/// HOW an arm that finds a whole-root recovery unserved schedules it — the one
+/// thing [`recover_if_unserved`](DriverCore::recover_if_unserved)'s three callers
+/// differ in, and deliberately the ONLY thing.
+///
+/// The decision itself (is a round trip already open in the world this scope
+/// holds? does the derived need stand? has this disagreement already been
+/// re-asked?) is the helper's, and is identical at all three sites. Five
+/// consecutive review rounds each found a different site's hand-written conjunct
+/// set incomplete, so there is now ONE set and a route beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryRoute {
+  /// Arm one invalidating mount refresh and let IT ask.
+  ///
+  /// The carrier for the two arms that dispute the FRAME — an autonomous
+  /// generation stamped in a world this scope has left, or a reply whose walk
+  /// fenced against a root this core does not hold. Asking on the spot there is
+  /// the spin: when the core may be the stale party, an immediate re-request is
+  /// answered by a walk reading the very same root — one whole-root reseed per
+  /// turn with no read of the live table between them. The refresh publishes a
+  /// frame first, so the retry is stamped with a world just read.
+  Refresh,
+  /// Ask the source on the spot, against the frame this scope already holds.
+  ///
+  /// The carrier for the arm that disputes nothing about the frame — a located
+  /// admission reply from a world this scope has left. The core is not the stale
+  /// party there (its own refresh is what moved the epoch), it holds a frame a
+  /// read has already published, and the dropped cover is owed NOW: routing it
+  /// through a refresh would re-derive a need whose only witness — the parked
+  /// ticket — this very arm is about to retire.
+  Ask,
 }
 
 /// One I/O obligation the driver task must execute for the core.
@@ -237,6 +1076,18 @@ pub(crate) enum Effect {
     /// leaves the arm unverified (identity was unavailable — a foreign-device or
     /// unrepresentable entry), exactly as the Monitor already reconciles.
     expected: Option<ExpectedObject>,
+    /// The scope's descent frame at the moment the arm was issued. The executor
+    /// stats the object it opened and REFUSES the arm when the landing sits
+    /// across this frame ([`ScopeFrame::crossed_by`]) — the prevention half of
+    /// the mount-boundary design, and the only one that runs on an arm the
+    /// enumerate fence never saw.
+    ///
+    /// Not the same guard as [`expected`](Self::AddWatch::expected), and it must
+    /// not be folded into it: `expected` is `None` for exactly the arms that
+    /// need this most (inotify's `Created` carries no identity), so a frame
+    /// check gated on a known object would be gated off precisely where the
+    /// boundary gets crossed.
+    frame: ScopeFrame,
   },
   /// Remove one per-directory kernel watch the Monitor dropped. Fire-and-
   /// forget: the Monitor's unwatch carries no result contract, and a wd the
@@ -267,6 +1118,101 @@ pub(crate) enum Effect {
     scope: ScopeId,
     /// The canonical root to enumerate mounts under.
     root: Arc<PathBuf>,
+  },
+  /// Ask `scope`'s live source to ADMIT the ground a departed mount revealed,
+  /// reporting the outcome back through
+  /// [`on_admitted`](DriverCore::on_admitted).
+  ///
+  /// The one effect whose whole purpose is to make the consumer WAIT. A departed
+  /// mount's cover is parked on each of these round trips and emitted only when the
+  /// answer lands, because a membership-admitting source (fanotify) is blind to the
+  /// revealed ground until its map learns it: cover first and the consumer's
+  /// re-read races ahead of admission, so every mutation in between drops on an
+  /// unknown handle with no loss signal at all.
+  ///
+  /// The driver routes it to the scope's source handle. A scope with no live
+  /// handle — or a reader thread already gone — resolves every round trip in it
+  /// [`Unreachable`](crate::os::AdmitOutcome::Unreachable) inline, so no parked
+  /// cover is left waiting on a reply that cannot come.
+  ///
+  /// # One BURST, indivisibly
+  ///
+  /// It carries the whole run of round trips ONE departure verdict opened, not one
+  /// of them, and the driver hands that run to the source under a single mailbox
+  /// post. A refresh can condemn many boundaries at once, and a source that could
+  /// observe a PREFIX of the burst would snapshot that prefix into a whole-root
+  /// recovery and take the remainder — arriving while that recovery's walk ran —
+  /// as a SECOND obligation, buying a second whole-root walk and a second report.
+  /// The boundary budget's supported floor is one permit, held until the driver
+  /// consumes the message, so the second report claims nothing and kills a source
+  /// that had nothing wrong with it. Publishing the burst whole is what makes the
+  /// reader's own fold ("a burst costs one walk") reachable at all.
+  AdmitBoundaries {
+    /// The scope whose source owns the admission map.
+    scope: ScopeId,
+    /// Every round trip this burst opens, in ticket order — each with the revealed
+    /// location its walk re-opens, the scope's descent frame at the moment the
+    /// departure was PARKED, and the scope's
+    /// [`frame_epoch`](ScopeState::frame_epoch) at that same moment.
+    ///
+    /// The walk re-opens the location and refuses the reseed when the object it
+    /// pinned sits across the ROOT's frame — a location still covered, or
+    /// re-covered since the refresh read the table — reading that root frame live
+    /// rather than taking the carried one, and refusing the request outright when
+    /// the two disagree (see
+    /// [`AdmitRequest::frame`](crate::os::AdmitRequest::frame)). The epoch rides so
+    /// a whole-root recovery that COLLAPSES a request can be stamped with it (see
+    /// [`AdmitRequest::epoch`](crate::os::AdmitRequest::epoch)).
+    requests: Vec<crate::os::AdmitRequest>,
+  },
+  /// Publish `scope`'s current [`frame_epoch`](ScopeState::frame_epoch) to its
+  /// live source.
+  ///
+  /// The one effect that opens no round trip and expects no answer. It exists so a
+  /// source that produces a whole-root generation WITHOUT being asked — fanotify's
+  /// post-loss reseed — can stamp that generation with a core-owned, monotone,
+  /// never-recycled count of worlds rather than with a mount id the kernel
+  /// re-issues lowest-free (see [`WalkReach::WholeRoot`](crate::os::WalkReach)).
+  ///
+  /// Emitted on every non-stale mount refresh rather than only on a frame CHANGE,
+  /// so a source spawned into a scope whose epoch has already moved is seeded by
+  /// that scope's next refresh instead of stamping a world it was never told about.
+  /// A scope with no live handle simply drops it: a source that is not there
+  /// produces no generation to stamp.
+  PublishFrame {
+    /// The scope whose source is being told.
+    scope: ScopeId,
+    /// The count of worlds this scope has adopted, as of now.
+    epoch: u64,
+  },
+  /// Ask `scope`'s live source for ONE WHOLE-ROOT recovery: reseed the entire
+  /// admission map from the root, report the complete generation the walk
+  /// produces, and answer with the cover — reported back through
+  /// [`on_root_recovered`](DriverCore::on_root_recovered).
+  ///
+  /// The root-scope form of [`AdmitBoundaries`](Self::AdmitBoundaries), emitted
+  /// where no located answer will do: the scope FAILS CLOSED (it holds a record
+  /// whose identity cannot say whether its boundary is still there), a departure
+  /// burst past [`MAX_PENDING_ADMITS`] collapsed, or the scope's own state says one
+  /// is still owed ([`ScopeState::owes_whole_root`]). It carries no location and no
+  /// frame because it addresses the root itself, which is on its own frame by
+  /// construction.
+  ///
+  /// The ticket is what makes it a CUTOFF rather than one more round trip: it is
+  /// minted from the same monotone counter, so every admission this scope opened
+  /// before it is subsumed and discharged by the one reply.
+  ///
+  /// A scope with no live handle resolves it inline through
+  /// [`on_recovery_unreachable`](DriverCore::on_recovery_unreachable) — the root
+  /// cover is emitted on the refresh's verdict alone, with no reseed behind it,
+  /// exactly as an unreachable admission degrades.
+  RecoverRoot {
+    /// The scope whose source owns the admission map.
+    scope: ScopeId,
+    /// The cutoff this recovery discharges and the frame epoch it is issued at —
+    /// the latter echoed back on the reply, which the core applies only while the
+    /// epoch is still its own ([`RootRecovery::epoch`](crate::os::RootRecovery)).
+    request: crate::os::RecoveryRequest,
   },
 }
 
@@ -1250,7 +2196,13 @@ enum ProbePurpose {
   /// it directly, and its answer goes straight back through
   /// [`Monitor::on_stat_result`], so it never parks an item or grounds a
   /// record.
-  SlotKind { req: ReqId },
+  SlotKind {
+    req: ReqId,
+    /// The path stat'd. Carried solely so a boundary-revealing answer can be
+    /// RECORDED (seam 4): `stat_result` discards the probed device by design,
+    /// and until this the answer's device had nowhere to go.
+    path: PathBuf,
+  },
 }
 
 #[derive(Debug)]
@@ -1353,6 +2305,156 @@ struct ScopeState {
   /// it (below Linux 5.8, or a non-Linux/fake source), and then the device check
   /// governs alone — the honest degrade.
   root_mnt_id: Option<u64>,
+  /// The last PROVEN incarnation token for the mount
+  /// [`root_mnt_id`](Self::root_mnt_id) names — what makes a frame move
+  /// observable when the id did not change.
+  ///
+  /// Overwritten only by a refresh that answered one, so an unprovable window
+  /// leaves the last proven token to be compared against, rather than a token
+  /// that would silently agree with whatever comes next. `None` until the first
+  /// refresh that can answer, and forever on a host that answers none.
+  root_incarnation: Option<crate::os::RootIncarnation>,
+  /// How many times this scope's descent frame has MOVED — bumped wherever
+  /// `root_dev`/`root_mnt_id` are installed, and never read for its value.
+  ///
+  /// It exists for one comparison: an admission round trip
+  /// ([`PendingAdmit`]) is opened against the frame in force at PARK time and
+  /// answered arbitrarily later, and everything the reply asks the core to do —
+  /// put a condemned record back, release a located cover — is only meaningful in
+  /// the world that frame describes. The executor refuses a request whose frame
+  /// the live root no longer has (it re-reads the root's frame beside the
+  /// location's, which is the only way a mount id comparison means anything), but
+  /// it cannot see a frame that moved AFTER its walk. This can, and it turns such
+  /// a reply into the whole-root recovery instead of a located answer.
+  ///
+  /// The two world swaps bump it too, though they also CLEAR the parked set, so
+  /// nothing there depends on it: bumping anyway keeps "the frame moved" and "the
+  /// epoch moved" the same statement, rather than one that happens to hold.
+  frame_epoch: u64,
+  /// The [`frame_epoch`](Self::frame_epoch) under which this scope's coverage set
+  /// was last VERIFIED by a complete whole-root generation — or seeded whole by a
+  /// world swap's own barrier read, which is the same kind of evidence taken at
+  /// the one moment the set is known to be complete.
+  ///
+  /// It is a WATERMARK, not a debt: it is advanced only where a generation was
+  /// actually applied, and there is no site that clears it or sets it forward on
+  /// anything but evidence. That is deliberate. The three rounds before this one
+  /// each found a different state transition that stranded a stored `recovery_owed`
+  /// boolean — set at one site, read at another, and lost by a third — and the
+  /// answer is not a fourth clearing site but a fact that no transition can
+  /// falsify: the set was verified in world N, and the scope is now in world M.
+  ///
+  /// What it makes derivable is [`generation_stale`](Self::generation_stale): a
+  /// scope holding boundaries the mount table cannot speak for, whose last
+  /// complete generation was taken in a world this scope has since left, is owed
+  /// another one — whether the previous one was refused, superseded, or never
+  /// asked for at all.
+  generation_epoch: u64,
+  /// EVIDENCE that a complete whole-root generation was produced and then NOT
+  /// applied here — set where one is discarded, cleared only where one lands.
+  ///
+  /// # It is not the boolean three rounds went to the trouble of deleting
+  ///
+  /// That one was an OBLIGATION: set by a transition that decided a recovery was
+  /// needed, and read at another site that had to remember to clear it. Every
+  /// round found a different path that set it and never cleared it, or cleared it
+  /// without doing the work.
+  ///
+  /// This is a record of something that HAPPENED, and it is discharged by exactly
+  /// one event — a complete generation being applied to this scope's coverage set
+  /// — which is the same discipline
+  /// [`pending_recovery`](Self::pending_recovery) already holds a round trip
+  /// with. There is no site that decides the need has passed; the only way it
+  /// clears is that the thing it asks for was done.
+  ///
+  /// # Why the derived predicate is not enough on its own
+  ///
+  /// [`generation_stale`](Self::generation_stale) asks whether the coverage set's
+  /// EXEMPT partition was verified in a world this scope has left, and it can only
+  /// read the records the set HOLDS. A rejected whole-root generation is precisely
+  /// the message that could have carried the FIRST exempt record — a btrfs
+  /// subvolume no mountinfo row lists — and its declines are dropped at the
+  /// rejection, so the set holds none and `holds_exempt_record` reads false. The
+  /// need is then invisible to every derivation, and the mount table can never
+  /// reconstruct it.
+  ///
+  /// The production window is a source adoption: the core's frame epoch has
+  /// already moved while a freshly spawned reader's mailbox still starts at zero,
+  /// so that reader's first autonomous generation is refused on the epoch before
+  /// the first [`PublishFrame`](Effect::PublishFrame) reaches it — and the refresh
+  /// that refusal arms reads the very same mount id, leaving the frame epoch equal
+  /// to the birth watermark. Nothing else in the state says a generation was ever
+  /// owed.
+  generation_rejected: bool,
+  /// The whole-root recovery round trip this scope has OUT and unanswered.
+  ///
+  /// The root-scope sibling of a [`PendingAdmit`], and held with the same
+  /// discipline: it is opened by the request and DISCHARGED by an answer that was
+  /// applied — a matching [`RootRecovery`](crate::os::RootRecovery) whose cutoff
+  /// dominates it, or an inline `Unreachable` resolution — never by a transition
+  /// that merely thought it was no longer needed. A reply whose stamps are not this
+  /// scope's leaves it standing, because such a reply applied nothing.
+  ///
+  /// It carries the epoch it was ISSUED at, and that is what makes it both the
+  /// in-flight suppressor and the retry trigger, with no third piece of state
+  /// between them:
+  ///
+  /// - issued in the world this scope still holds — the reply is coming and will
+  ///   carry the generation, the cutoff and the cover together, so a second
+  ///   request buys a duplicate whole-root walk and nothing else.
+  /// - issued in a world this scope has LEFT — its reply can never be applied
+  ///   here, so the round trip is owed again, and the frame the refresh just
+  ///   published is what the fresh request is stamped with.
+  ///
+  /// # It means OUTSTANDING, and nothing else
+  ///
+  /// It used to mean a second thing on top of that — an anti-spin latch, LEFT
+  /// STANDING after its one reply arrived and was refused, on the argument that a
+  /// fresh request would be answered identically. That argument is a prediction
+  /// about the SOURCE's world made from a value this core re-reads (its own frame,
+  /// unchanged), and it is the cadence rule's exact failure mode: the match was
+  /// read as confirmation. A transient same-object self-bind refutes it — the walk
+  /// fenced against a mount that departed before the refresh, the root is back on
+  /// the mount OBJECT it started on so neither its legacy id nor its unique
+  /// incarnation token moved, and the record then sat at the current epoch
+  /// suppressing every later refresh for the life of the scope, with the rejected
+  /// generation's evidence and its cutoff-covered recovery stranded behind it.
+  ///
+  /// So a reply that arrives and applies nothing DISCHARGES the round trip it
+  /// dominates: nothing more will ever come for it, and a record of an outstanding
+  /// request must not outlive the request. What bounds the retry is a separate
+  /// piece of retained evidence about the refusal itself
+  /// ([`refused_walk`](Self::refused_walk)) — an observation, not a prediction.
+  ///
+  /// Cleared by both world swaps along with the rest of the old world's state: the
+  /// round trip belongs to a root this scope no longer watches, and the swap's own
+  /// covering `Rescan` owes the consumer the whole new tree regardless.
+  pending_recovery: Option<PendingRecovery>,
+  /// The disagreement the LAST whole-root recovery was refused on, or `None` where
+  /// none has been — see [`RefusedWalk`].
+  ///
+  /// Read at exactly one site, and it decides one thing: whether
+  /// [`on_root_recovered`](DriverCore::on_root_recovered)'s mismatch arm arms its
+  /// own mount refresh. It never decides whether a recovery is OWED — that stays
+  /// [`owes_whole_root`](Self::owes_whole_root)'s, derived from what this scope
+  /// holds — so a stale record can cost at most one self-armed table read, never a
+  /// silence.
+  refused_walk: Option<RefusedWalk>,
+  /// The [`frame_epoch`](Self::frame_epoch) this scope has already PUBLISHED to
+  /// its live source ([`Effect::PublishFrame`]), or `None` for a source that has
+  /// been told nothing yet.
+  ///
+  /// Bookkeeping, never an obligation, and it fails in the safe direction by
+  /// construction: a publication that is somehow not delivered leaves the source
+  /// stamping an OLDER epoch, and an older stamp is refused rather than wrongly
+  /// applied. That is why it may be a plain "what I have said" record rather than
+  /// something that has to survive a transition — the worst it can cost is one
+  /// refused generation, which the derived need then asks for again.
+  ///
+  /// Reset to `None` wherever a FRESH source is adopted (the birth and both world
+  /// swaps): a new reader's mailbox starts at zero, so whatever the old one was
+  /// told says nothing about what this one knows.
+  published_epoch: Option<u64>,
   /// The root object's identity, captured at the spawn barrier. The mount
   /// refresh re-stats the root and compares against this: a `Missing` or
   /// mismatched read is a root death, lowered through the same self-event path
@@ -1360,22 +2462,123 @@ struct ScopeState {
   /// unmount signal, so the refresh cadence is their root-liveness check).
   /// `None` for a scope whose barrier read no identity (off-unix fakes).
   identity: Option<RootIdentity>,
-  /// Foreign-device prefixes under the root: seeded from the live mount
-  /// table at spawn, then maintained by Mount/Unmount events and probed
-  /// devices. Tiny in practice, so a linear scan beats indexing.
-  mounts: Vec<PathBuf>,
+  /// The AUTHORITATIVE mount table's locations under the root, as of the last
+  /// read that could take one — the REPLACEABLE half of the device-trust veto.
+  ///
+  /// Every row here came from one snapshot, and the next authoritative snapshot
+  /// replaces the whole vector rather than unioning onto it
+  /// ([`install_mount_table`]). It used to union, on the argument that absence
+  /// from a table must never GRANT trust — but the two components below were
+  /// conflated then, and the union was what actually leaked: every mountpoint a
+  /// host ever presented stayed here for the life of the scope, so a long-lived
+  /// scope on a container host retained one `PathBuf` per HISTORICAL mount and
+  /// paid a linear scan against that history on every refresh. Unbounded
+  /// residency is not a safe direction, it is a leak wearing one.
+  ///
+  /// Replacement is sound because the reads are SERIALIZED — [`arm_refresh`] lets
+  /// at most one be outstanding, so snapshot N+1 is read after N landed — and a
+  /// stale one publishes no table at all. A row absent from an authoritative read
+  /// is therefore a mount the host says is gone, which is exactly the fact that
+  /// makes the path root-device again. What replacement must NOT touch is a
+  /// prefix learned somewhere OTHER than a table snapshot, and that is why those
+  /// live in [`learned_mounts`](Self::learned_mounts) instead.
+  ///
+  /// Empty, always, on a backend that consumes no absence-based trust
+  /// ([`consumes_absence_trust`]) — the same predicate [`device_trusted`] gates
+  /// its absence leg on, so skipping the maintenance can never grant trust.
+  ///
+  /// Tiny in practice, so a linear scan beats indexing.
+  mount_table: Vec<PathBuf>,
+  /// Foreign-device prefixes this scope learned from something OTHER than a mount
+  /// table read — the INDEPENDENT half of the veto, and the one no snapshot may
+  /// remove.
+  ///
+  /// Two writers, both FSEvents-only by construction: [`apply_mount_add`] (an
+  /// in-band `Mount` flag word) and [`learn_device`] (a probe that read a foreign
+  /// device at a path). Neither is a mount-table row: the first can describe a
+  /// mount that arrived AFTER the snapshot in flight was read, and the second is a
+  /// path that may sit arbitrarily deep inside one. A table install that dropped
+  /// either would re-trust a subtree this scope has direct evidence is foreign.
+  ///
+  /// So the lifecycle is evidence-backed in both directions, and only in both
+  /// directions: an entry enters on an observation and leaves ONLY on the in-band
+  /// unmount word that proves its mount is gone (`deferred_unmounts`, applied at
+  /// [`settle`](DriverCore::settle)) or on a world swap, which retires the whole
+  /// world the prefix described. A cadence never removes one.
+  learned_mounts: Vec<PathBuf>,
   /// Whether `mounts` is backed by an authoritative read of the live mount
   /// table (the spawn seed, or a post-loss refresh). Without it, a path not
   /// covered by a known mount prefix proves nothing (the table is blind), so
   /// event-side device trust is refused. Revoked by every loss signal — a
   /// dropped window may have carried a mount transition.
   mounts_authoritative: bool,
+  /// The COVERAGE set: every boundary under the root this scope currently
+  /// believes is there, with the identity it was last observed at and the
+  /// provenance that says whether it may be condemned ([`MountRecord`]).
+  ///
+  /// Diffing the next authoritative table read against it in BOTH directions is
+  /// the primary mount detector:
+  ///
+  /// - a row here and gone from the read DEPARTED with no signal at all — #74's
+  ///   lazy unmount, which emits no `IN_UNMOUNT`, no hangup and no `Rescan`;
+  /// - a row in the read and absent here ARRIVED, shadowing ground the consumer
+  ///   may already have enumerated (`compile::fsevents`' `plan_mount` covers the
+  ///   arrival macOS signals, and the class of mount created after a watcher
+  ///   settles is observed by no seam at all);
+  /// - the same location at a different `(mnt_id, dev)` was REPLACED — the
+  ///   same-path remount, which a paths-only set cannot express.
+  ///
+  /// Deliberately SEPARATE from [`mounts`](Self::mounts), and deliberately not a
+  /// replacement for it. The table serves DEVICE TRUST, where a stale extra
+  /// prefix only ever vetoes (safe) and a missing one grants trust that was never
+  /// proven (unsafe) — so its install must stay a union. Coverage wants the
+  /// opposite direction: there the stale extra prefix is exactly what HIDES a
+  /// departure. Keeping the two apart lets this one shrink on a table read while
+  /// the trust table never does; nothing here ever reaches [`device_trusted`].
+  ///
+  /// What enters it, and what may be CONDEMNED from it, are two different
+  /// questions — that separation is the provenance partition on
+  /// [`MountRecord`], and dissolving it storms on every btrfs layout. Today
+  /// every record originates in a table read (an authoritative refresh, or a
+  /// world swap's own barrier read — the SAME `mounts_under` read, so the two
+  /// diff cleanly), which is why every record is presently mount-backed; the
+  /// device-only partition exists for the seam observations that are the only
+  /// thing that will ever see a subvolume, and is enforced from here so it
+  /// cannot be dissolved by a later change that never meets a btrfs root.
+  ///
+  /// Replaced whole on every world swap — never merely cleared. The old root's
+  /// table proves nothing about the new root's, but the new root's barrier read
+  /// proves plenty: the cold crawl declines coverage beneath every mount it
+  /// finds, and crawl and first refresh are unordered, so a prefix that departs
+  /// in that window is a departure nobody would otherwise ever derive (an empty
+  /// set installs the post-departure frame silently and stays silent forever
+  /// after). Seeding is conservative in the cover direction and touches no
+  /// authority: `mounts_authoritative` is unaffected by what lands here.
+  mounts_baseline: Vec<MountRecord>,
+  /// Departure covers PARKED on an outstanding admission round trip — see
+  /// [`PendingAdmit`]. Only ever non-empty on a fanotify scope, whose source is
+  /// the only one that admits by membership and can therefore be blind to ground
+  /// a departed mount revealed.
+  ///
+  /// Bounded by the boundaries actually recorded under the root: a record is
+  /// TAKEN OUT of [`mounts_baseline`](Self::mounts_baseline) by the same verdict
+  /// that parks it, so no later refresh can re-derive that departure and park a
+  /// second round trip for it. Every entry is retired by exactly one reply, by a
+  /// world swap, or by the scope's own death.
+  pending_admits: Vec<PendingAdmit>,
   /// An [`Effect::RefreshMounts`] is outstanding; repeated loss signals
   /// coalesce onto it instead of stacking effects.
   refresh_pending: bool,
-  /// A loss signal arrived while a refresh was in flight: that snapshot may
-  /// predate the newly-lost window, so its result is discarded and one more
-  /// refresh re-arms.
+  /// An INVALIDATING arming ([`RefreshCause::Invalidating`] — a loss signal, or
+  /// a world swap's own re-arm) landed while a refresh was in flight: that
+  /// snapshot may predate the newly-lost window, so its result is discarded and
+  /// one more refresh re-arms.
+  ///
+  /// The periodic tick pointedly does NOT set it. A tick carries no evidence
+  /// against the in-flight snapshot — it is a cadence, not a transition — and a
+  /// tick that condemned it would starve every publication behind
+  /// [`on_mounts_refreshed`](DriverCore::on_mounts_refreshed)'s stale gate for
+  /// as long as refresh latency stayed at or past the interval.
   refresh_stale: bool,
   /// A root REPLACE committed while a refresh was in flight: that snapshot
   /// describes the replaced world, so EVERYTHING it carries — the liveness
@@ -1401,11 +2604,12 @@ struct ScopeState {
   /// drops the Monitor's internal failure `Rescan` instead of emitting a public
   /// event for a registration no one owns.
   publicly_live: bool,
-  /// When this scope's root is next re-stat'd for liveness, for a
-  /// signal-silent-on-unmount backend (fanotify) under a non-zero interval.
-  /// `None` for every other backend, before the root goes live, and while the
-  /// tick is disabled — the loss-triggered refresh remains its own path. Seeded
-  /// once the birth refresh confirms the root alive and re-armed by
+  /// When this scope's mount table is next re-read (and its root re-stat'd),
+  /// for a profile [`liveness_ticked`](DriverCore::liveness_ticked) arms — the
+  /// Linux pair, inotify and fanotify — under a non-zero interval. `None` for
+  /// every other backend, before the root goes live, and while the tick is
+  /// disabled; the loss-triggered refresh remains its own path. Seeded once the
+  /// birth refresh confirms the root alive and re-armed by
   /// [`on_timeout`](DriverCore::on_timeout) after each tick fires.
   liveness_deadline: Option<Instant>,
   /// The retained cover this scope's per-directory coverage was last reconciled to by
@@ -1595,6 +2799,192 @@ impl ScopeState {
       .clone()
       .unwrap_or_else(|| Arc::new(self.requested.clone()))
   }
+
+  /// This scope's descent frame, as every arm carries it.
+  ///
+  /// Read LIVE at each emission, never captured once: a same-object re-mount
+  /// moves `root_mnt_id` and a replace/widen swaps both halves, and an arm must
+  /// be judged against the frame of the world that issued it. Both halves are
+  /// `None` before the stream spawns, which is the honest degrade — an arm with
+  /// nothing to fence against installs, exactly as [`crosses_mount_boundary`]
+  /// declines nothing under an unknown frame.
+  const fn frame(&self) -> ScopeFrame {
+    ScopeFrame {
+      root_dev: self.root_dev,
+      root_mnt_id: self.root_mnt_id,
+    }
+  }
+
+  /// Whether any DEVICE-ONLY record sits at a direct child of `dir` — the cheap
+  /// precondition [`DriverCore::on_enumerated`] asks before paying anything at
+  /// all for [`retire_relisted_boundaries`]'s bookkeeping.
+  ///
+  /// False for every scope whose records all came from mount-table rows, which
+  /// is every scope in production today, so an enumerate over a directory with
+  /// no exempt record under it does exactly the work it did before.
+  fn holds_device_only_under(&self, dir: &Path) -> bool {
+    let root_frame = self.root_mnt_id;
+    self
+      .mounts_baseline
+      .iter()
+      .any(|record| !record.condemnable(root_frame) && record.location.parent() == Some(dir))
+  }
+
+  /// **The fail-closed trigger.** Whether this scope holds ANY
+  /// [`ambiguous`](MountRecord::ambiguous) record — one whose identity cannot
+  /// tell a genuine vfsmount from a same-mount subvolume, on either side of the
+  /// comparison.
+  ///
+  /// While it answers `true`, every AUTHORITATIVE refresh covers the WHOLE root
+  /// (see [`DriverCore::on_mounts_refreshed`]). Not the ambiguous record's own
+  /// location, not once per record, not on a cadence: one root cover per frame
+  /// that was actually read, for as long as any ambiguity is held.
+  ///
+  /// # Why the trigger is scope-wide and the cover is root-wide
+  ///
+  /// An ambiguous record cannot say whether the boundary it names is still
+  /// there, and a refresh that does not list it cannot say either — the mount
+  /// table never lists a subvolume, and never lists a vfsmount whose row the
+  /// host cannot key by id. Three successive designs tried to pay for that
+  /// per record: covering once (permanent silent loss, once the one cover was
+  /// spent), covering on a generation cadence (the stamp was cleared by the
+  /// re-listing that the cover's own crawl produced), and latching a refusal
+  /// (one latch silenced every later refused boundary). Each failed the same
+  /// way, because on an id-less host a re-observation of an ambiguous boundary
+  /// is bit-for-bit identical whether it is the old mount or a new one. There is
+  /// no evidence to key a per-record decision to, so no per-record decision is
+  /// made.
+  ///
+  /// # The cost, stated plainly
+  ///
+  /// On a 4.11–5.7 kernel with btrfs subvolumes under the root this is a
+  /// PERMANENT per-refresh whole-root cover: the subvolume's record is ambiguous
+  /// forever, nothing can ever upgrade or condemn it, and so nothing ever clears
+  /// the trigger. That is accepted — correctness over cost — and documented on
+  /// [`root_liveness_interval`](crate::WatcherOptions::root_liveness_interval),
+  /// which is the knob that prices it.
+  ///
+  /// # Who never pays
+  ///
+  /// On Linux ≥ 5.8 this is `false` for the life of every scope: `root_mnt_id`
+  /// is read at spawn (a failure there is a spawn failure, not a `None`), and
+  /// every seam that mints a record reads the boundary's own id from the fd it
+  /// pinned — a `statx` that fails yields an incomplete walk or a `Failed` probe
+  /// and records nothing. So every record is row-confirmed, condemnable, or a
+  /// proven subvolume, and the ambiguous partition is empty.
+  fn fails_closed(&self) -> bool {
+    let root_frame = self.root_mnt_id;
+    self
+      .mounts_baseline
+      .iter()
+      .any(|record| record.ambiguous(root_frame))
+  }
+
+  /// Whether this scope holds ANY record the mount table cannot speak for — the
+  /// EXEMPT partition ([`MountRecord`]'s device-only half), which no mountinfo row
+  /// ever lists and which therefore only a complete whole-root generation can
+  /// reconcile.
+  ///
+  /// A scope holding none of them needs no generation at all: every record it has
+  /// is condemnable, so the table diff derives arrivals, replacements and
+  /// departures on its own, and a refused generation costs it nothing.
+  fn holds_exempt_record(&self) -> bool {
+    let root_frame = self.root_mnt_id;
+    self
+      .mounts_baseline
+      .iter()
+      .any(|record| !record.condemnable(root_frame))
+  }
+
+  /// Whether the coverage set's exempt partition was last verified in a world this
+  /// scope has since LEFT.
+  ///
+  /// This is the derived half of "a generation is owed". It fires without anyone
+  /// remembering the transition that made it true: a reply superseded before it
+  /// landed, a frame that moved with no report in flight at all — every one of
+  /// them is the same statement about the coverage set.
+  ///
+  /// # Deriving it is necessary and NOT sufficient, and the difference is evidence
+  ///
+  /// The derivation reads the coverage set, so it can only see boundaries the set
+  /// HOLDS. A whole-root generation that was produced and then discarded is the one
+  /// thing it is blind to: those declines are exactly what would have PUT the first
+  /// exempt record in the set, so after the rejection the set holds none,
+  /// `holds_exempt_record` reads false, and the frame epoch that a re-mount would
+  /// have moved sits equal to the birth watermark because the id never changed.
+  /// Nothing derivable says a generation is owed, and no later mount table can
+  /// reconstruct an exempt boundary — no row ever lists one.
+  ///
+  /// So a rejected generation is RETAINED as evidence
+  /// ([`generation_rejected`](Self::generation_rejected)) rather than re-derived,
+  /// and that is not the obligation boolean this design deleted: it is set by an
+  /// observation and discharged by exactly one event, a generation actually being
+  /// applied. Nothing decides the need has passed.
+  ///
+  /// The derived half stays because it fires for cases no rejection ever
+  /// witnessed: a reply superseded before it landed, a frame that moved with no
+  /// report in flight at all.
+  fn generation_stale(&self) -> bool {
+    self.generation_rejected
+      || (self.generation_epoch != self.frame_epoch && self.holds_exempt_record())
+  }
+
+  /// Whether any cover is PARKED on a round trip that cannot be answered on its
+  /// own terms any more — one opened in a world this scope has left.
+  ///
+  /// [`on_admitted`](DriverCore::on_admitted) makes the same judgement per reply,
+  /// but only for a reply that ARRIVES. A recovery whose cutoff the source has
+  /// already consumed answers those requests by cutoff, so if that recovery's own
+  /// reply is refused, no per-ticket reply will ever come for them and the covers
+  /// sit parked forever. Deriving it from the parked set itself is what makes that
+  /// unreachable: the tickets are still there to be seen.
+  fn parked_across_worlds(&self) -> bool {
+    self
+      .pending_admits
+      .iter()
+      .any(|parked| parked.epoch != self.frame_epoch)
+  }
+
+  /// **Whether a whole-root recovery is OWED** — derived from what this scope
+  /// holds, never remembered from the transition that made it true.
+  ///
+  /// Evaluated wherever a recovery could be issued rather than latched at one site
+  /// and read at another, which is the whole shape change: there is no debt to
+  /// strand, so no state transition can strand one.
+  ///
+  /// An outstanding round trip is consulted FIRST and answers on its own, in both
+  /// directions — see [`pending_recovery`](Self::pending_recovery). While one is
+  /// out in the world this scope still holds, its reply will carry the generation,
+  /// the cutoff and the cover together, so asking again buys a duplicate
+  /// whole-root walk and nothing else; once the world has moved out from under it,
+  /// that reply can never be applied here and the round trip is owed again
+  /// whatever else is true.
+  ///
+  /// # Why the retained evidence is not consulted ahead of the round trip
+  ///
+  /// It looks like it should be: [`generation_rejected`](Self::generation_rejected)
+  /// is retained evidence and the pending record is a value compared against a
+  /// re-read frame, so the cadence rule seems to order them the other way. It does
+  /// not, and the reason is that the two are not answering the same question. The
+  /// record answers *is one already out?* — a fact about a message, not a reading
+  /// of the world — and consulting the evidence ahead of it would issue a second
+  /// whole-root walk for every refresh that lands while the first one's reply is
+  /// still in flight, which is a far hotter spin than the one the ordering was
+  /// blamed for.
+  ///
+  /// What made the ordering look wrong was that the record did not mean
+  /// "outstanding" any more: a refused reply used to leave it standing. Restore its
+  /// one meaning — [`on_root_recovered`](DriverCore::on_root_recovered) discharges
+  /// the round trip its reply dominates, refused or applied — and a rejection lands
+  /// in the `None` arm, where the retained evidence has always been read. The
+  /// ordering needs no change; the field did.
+  fn owes_whole_root(&self) -> bool {
+    match self.pending_recovery {
+      Some(out) if out.epoch == self.frame_epoch => false,
+      Some(_) => true,
+      None => self.generation_stale() || self.parked_across_worlds(),
+    }
+  }
 }
 
 /// Where a path fell relative to its scope root.
@@ -1622,12 +3012,17 @@ pub(crate) struct DriverCore {
   /// asked for its listing — and is deliberately not re-derived on completion.
   /// It is not a second addressing map: nothing arms or opens by it (the
   /// executor lists through the directory's own anchor, which follows the inode
-  /// across a rename), and its one live consumer is the cold half of the
-  /// exclusion fence. A rename that moves the read directory across an exclusion
-  /// boundary is answered by the geometry pass's located repair
-  /// ([`reparent_geometry`](Self::reparent_geometry)), whose re-arm issues a
-  /// FRESH read against the destination; this in-flight one was compiled against
-  /// the pre-move world and is superseded rather than patched.
+  /// across a rename). Three passes read it, and each is a statement about the
+  /// world the read was ISSUED in rather than an address: the cold half of the
+  /// exclusion fence, seam 1's own [`record_boundary`], and the ONE-LEVEL
+  /// generation [`retire_relisted_boundaries`]. A rename that moves the read
+  /// directory across an exclusion boundary is answered by the geometry pass's
+  /// located repair ([`reparent_geometry`](Self::reparent_geometry)), whose re-arm
+  /// issues a FRESH read against the destination; this in-flight one was compiled
+  /// against the pre-move world and is superseded rather than patched. The two
+  /// coverage passes cost at most one stale record and one false condemnation on
+  /// that path, which the destination's own re-listing repairs — the same bound the
+  /// module doc states for the unstamped descending generation.
   enum_reqs: BTreeMap<ReqId, (ScopeId, Arc<PathBuf>)>,
   probes: BTreeMap<ProbeId, ProbeCtx>,
   effects: VecDeque<Effect>,
@@ -1673,15 +3068,22 @@ pub(crate) struct DriverCore {
   scope_seq: u64,
   probe_seq: u64,
   fence_seq: u64,
+  /// A monotone counter minting [`AdmitTicket`](crate::os::AdmitTicket)s for the
+  /// admission round trips a fanotify departure opens. Monotone across the whole
+  /// core (not per scope) so a reply from a world this scope has already replaced
+  /// can never collide with a ticket parked in the new one.
+  admit_seq: u64,
   /// A monotone counter minting move cookies for `FAN_RENAME` pairs. fanotify
   /// reports each rename atomically (both halves in one event), so the cookie
   /// only needs to pair the two records emitted adjacently — a fresh counter
   /// per rename suffices and never clashes across renames.
   cookie_seq: u64,
-  /// How often a signal-silent-on-unmount scope (fanotify) re-stats its root:
-  /// the composition's one timer (see the per-backend death-signal table in the
-  /// module docs). `Duration::ZERO` disables the tick — only the loss-triggered
-  /// refresh then detects a quiet unmount. Every non-fanotify scope ignores it.
+  /// How often a signal-silent scope (the Linux pair — see
+  /// [`liveness_ticked`](DriverCore::liveness_ticked)) re-reads its mount table
+  /// and re-stats its root: the composition's one timer (see the per-backend
+  /// signal table in the module docs). `Duration::ZERO` disables the tick — only
+  /// the loss-triggered refresh then detects a quiet unmount, at the root or
+  /// below it. Every scope the gate does not arm ignores it.
   root_liveness_interval: Duration,
   /// The caller's exclusion directories, applied to every scope this core owns
   /// (they are a watcher-wide option, not a per-root one). Empty is the common
@@ -1732,6 +3134,7 @@ impl DriverCore {
       scope_seq: 0,
       probe_seq: 0,
       fence_seq: 0,
+      admit_seq: 0,
       cookie_seq: 0,
       root_liveness_interval,
       exclusions: Vec::new(),
@@ -1854,25 +3257,39 @@ impl DriverCore {
     Some(path)
   }
 
-  /// Whether `profile` is a backend that emits NO in-band signal when its root
-  /// is unmounted — the gate for the periodic root-liveness tick.
+  /// Whether `profile` arms the periodic refresh — the gate for the one timer
+  /// this composition adds. TWO silences need it, and a profile arms if it has
+  /// either: a root unmount that emits no in-band signal, and a mount DEPARTURE
+  /// below the root that emits none.
   ///
-  /// The per-backend death-signal table (design §7; the module docs restate it):
+  /// The per-backend signal table (design §7; the module docs restate it):
   ///
-  /// | backend | root unmount | root delete/replace in-tree | tick needed |
-  /// |---|---|---|---|
-  /// | inotify (descending) | `IN_UNMOUNT` + `IN_IGNORED` | `IN_DELETE_SELF`/`IN_MOVE_SELF` | no |
-  /// | FSEvents (macOS) | `RootChanged` | `RootChanged` | no |
-  /// | fanotify (`FAN_MARK_FILESYSTEM`) | **SILENT** (fd goes quiet, mark holds the sb alive — L4.1) | `FAN_DELETE_SELF`/`FAN_MOVE_SELF` | **yes** |
-  /// | RDCW (Windows) | fatal source error on any terminal read completion | same signal | no |
-  /// | USN journal (Windows) | fatal source error on a failed journal read | `RootDeath` (the root's own FRN in a delete/rename record) | no |
+  /// | backend | root unmount | root delete/replace in-tree | mount departure BELOW the root | tick |
+  /// |---|---|---|---|---|
+  /// | inotify (descending) | `IN_UNMOUNT` + `IN_IGNORED` — but a LAZY unmount emits NOTHING | `IN_DELETE_SELF`/`IN_MOVE_SELF` | **SILENT** | **yes** |
+  /// | FSEvents (macOS) | `RootChanged` | `RootChanged` | the `UNMOUNT` flag word, lowered to `plan_mount`'s located cover | no |
+  /// | fanotify (`FAN_MARK_FILESYSTEM`) | **SILENT** (fd goes quiet, mark holds the sb alive — L4.1) | `FAN_DELETE_SELF`/`FAN_MOVE_SELF` | **SILENT** | **yes** |
+  /// | RDCW (Windows) | fatal source error on any terminal read completion | same signal | **SILENT** (deferred) | no |
+  /// | USN journal (Windows) | fatal source error on a failed journal read | `RootDeath` (the root's own FRN in a delete/rename record) | **SILENT** (deferred) | no |
   ///
-  /// Only fanotify's unmount is signal-silent, so only fanotify arms the tick;
-  /// its in-tree self-events and every other backend's death signal already
-  /// reach [`on_mounts_refreshed`](Self::on_mounts_refreshed)'s death mapping
-  /// (via a loss-triggered refresh) or the Monitor's self-event path directly.
+  /// This gate used to state *"only fanotify's unmount is signal-silent, so only
+  /// fanotify arms the tick"*, which #74 measured false: an inotify watch on a
+  /// subdirectory SURVIVED a lazy unmount and remount of its mount with no
+  /// delivery, no `Rescan`, and nothing else at all, for 120 s. `umount -l`
+  /// detaches the subtree from the namespace while the watch itself keeps the
+  /// superblock alive, so the `IN_UNMOUNT` the eager path emits never comes —
+  /// neither for the root (this tick's folded-in re-stat catches that) nor for
+  /// any mount below it (the mount-departure diff the same refresh runs catches
+  /// that; see [`on_mounts_refreshed`](Self::on_mounts_refreshed)).
+  ///
+  /// The two Windows rows share the below-root hole and are DEFERRED by owner
+  /// ruling, not by any property of this composition — everything the tick feeds
+  /// is profile-agnostic — so admitting them later is an edit to this `matches!`
+  /// plus their own cells. FSEvents is the one profile that genuinely needs
+  /// neither half: `RootChanged` covers its root and the `UNMOUNT` word covers
+  /// every departure below it.
   const fn liveness_ticked(profile: BackendKind) -> bool {
-    matches!(profile, BackendKind::Fanotify)
+    matches!(profile, BackendKind::Fanotify | BackendKind::Inotify)
   }
 
   /// Mints the next `FAN_RENAME` pairing cookie.
@@ -1914,9 +3331,19 @@ impl DriverCore {
         root: None,
         root_dev: None,
         root_mnt_id: None,
+        root_incarnation: None,
+        frame_epoch: 0,
+        generation_epoch: 0,
+        generation_rejected: false,
+        pending_recovery: None,
+        refused_walk: None,
+        published_epoch: None,
         identity: None,
-        mounts: Vec::new(),
+        mount_table: Vec::new(),
+        learned_mounts: Vec::new(),
         mounts_authoritative: false,
+        mounts_baseline: Vec::new(),
+        pending_admits: Vec::new(),
         refresh_pending: false,
         refresh_stale: false,
         refresh_world_stale: false,
@@ -2926,15 +4353,67 @@ impl DriverCore {
         state.root = Some(Arc::clone(&root));
         state.root_dev = Some(meta.root_dev);
         state.root_mnt_id = meta.root_mnt_id;
+        // The barrier reads no incarnation token (only a refresh does), so this
+        // world starts with none and the first refresh that answers one installs
+        // it. Nothing compares against a `None`.
+        state.root_incarnation = None;
+        state.frame_epoch = state.frame_epoch.wrapping_add(1);
+        // This world's set is COMPLETE the moment it is seeded — the barrier read
+        // below and this world's own seed walk are exactly the evidence a
+        // generation carries — and a fresh source has been told nothing yet. That
+        // seeding is itself an applied generation, so it discharges any evidence a
+        // rejected one left behind in the world being replaced.
+        state.generation_epoch = state.frame_epoch;
+        state.generation_rejected = false;
+        state.refused_walk = None;
+        state.published_epoch = None;
         state.identity = Some(meta.identity);
-        state.mounts = meta.mounts;
+        // The coverage baseline is SEEDED from the same barrier read, not left
+        // empty. Seeding it opens no authority — `mounts_authoritative` stays
+        // false until the birth refresh installs a real table read, and nothing
+        // derived from the baseline ever reaches [`device_trusted`] — but the
+        // seed IS evidence that a prefix was mounted, and the COLD CRAWL consumes
+        // that same fact independently: it reads the mount's foreign device and
+        // [`crosses_mount_boundary`] DECLINES to descend beneath it.
+        //
+        // Crawl and birth refresh are separate detached jobs with no start order
+        // between them, so a lazy unmount in the gap leaves the crawl's declined
+        // subtree unenumerated while the first authoritative read shows the
+        // prefix gone. With an EMPTY baseline that read derives nothing and
+        // installs the same empty frame, and so does every later one — coverage
+        // under the now-exposed directory stays dead indefinitely. Seeded, the
+        // read derives one conservative departure cover instead. Somebody WAS
+        // covered-for: coverage was DECLINED on the strength of that mount, which
+        // is exactly what makes its departure matter, and over-covering a region
+        // the crawl may have declined is the safe direction — a cover is only
+        // ever a cost.
+        //
+        // The seed IS a table read (the same `mounts_under` the refresh runs), so
+        // it enters row-confirmed and the first refresh diffs against it cleanly:
+        // a still-mounted row is merely CONFIRMED and covers nothing, while a
+        // departed one is condemnable on the strength of the row this seed saw.
+        // A probe-learned foreign-device prefix ([`learn_device`]) still never
+        // gets in.
+        state.mounts_baseline = meta.mounts.iter().map(MountRecord::confirmed).collect();
+        install_mount_table(state, meta.mounts.into_iter().map(|row| row.location));
+        // The old world's learned prefixes describe a root this scope no longer
+        // watches (a birth has none), so they go with the rest of that world. Nothing
+        // else may empty this set: see [`ScopeState::learned_mounts`].
+        state.learned_mounts.clear();
+        // SEAM 2: the boundaries this world's OWN seed walk declined, recorded in
+        // the same step that seeds the baseline from the barrier read — so the set
+        // is whole before the scope is live, never completed by a later message.
+        // These are the ONLY boundaries a kernel-recursive scope ever learns
+        // without a mount table: the walk is its only fence, and it runs once, at
+        // spawn. Empty on every backend that walks nothing.
+        record_declined(state, &meta.declined);
         // Born closed: the seed was read before the stream started, so a
         // mount appearing in that gap is in neither the seed nor the event
         // stream — the seed can only REDUCE trust. Authority arrives with
         // this birth refresh, whose post-live read the stream orders against
         // every later mount transition; until it installs, event-side
         // identity and cookies fail closed (the non-authoritative default).
-        Self::arm_refresh(&mut self.effects, scope, state);
+        Self::arm_refresh(&mut self.effects, scope, state, RefreshCause::Invalidating);
         match backend {
           // Kernel-recursive: the live stream IS the root's coverage, so the
           // spawn doubles as the root's watch-result AND the moment the caller's
@@ -2990,6 +4469,11 @@ impl DriverCore {
               name: Segment::new(name),
               path: root,
               expected,
+              // The ROOT is where the frame comes FROM, so it can never be
+              // across it: the check compares the landing to the meta this same
+              // spawn just installed. Carried anyway rather than special-cased,
+              // so exactly one rule governs every arm.
+              frame: state.frame(),
             });
           }
         }
@@ -3105,6 +4589,21 @@ impl DriverCore {
   /// has nothing to recover. This fence needs no backend gate — an enumerate only
   /// ever happens on a descending profile, and a descending backend by
   /// construction has no admission-time enforcement of its own.
+  ///
+  /// # Seam 1 — the decline is also an OBSERVATION
+  ///
+  /// The lowering below is the single site where a boundary-crossing dir entry is
+  /// declined, and it holds everything the coverage set wants: the location, the
+  /// entry's device, and its mount id. So each decline is RECORDED
+  /// ([`record_boundary`]), and this is the first place a DEVICE-ONLY record is
+  /// ever produced — a btrfs subvolume trips the belt with the root's own mount
+  /// id and has no mountinfo row, so the refresh will never see it and the
+  /// provenance partition must keep it out of every condemnation mechanism.
+  ///
+  /// The dir GATE is deliberate and stays. A file-target bind — the
+  /// `resolv.conf` class, ubiquitous in containers — is never declined here and
+  /// so is never recorded here; the mount refresh sees it regardless, and that is
+  /// the stated answer for non-directory targets rather than an accident.
   pub(crate) fn on_enumerated(&mut self, req: ReqId, raw: RawEnumerate) {
     let Some((scope, dir)) = self.enum_reqs.remove(&req) else {
       return;
@@ -3117,6 +4616,21 @@ impl DriverCore {
         };
         let mut listed = Vec::with_capacity(entries.len());
         let mut lossy = false;
+        // Collected while the scope is borrowed SHARED (the exclusion fence and
+        // the identity mint both read `self`), then recorded once the walk is
+        // over. Order is preserved, so the containment rule inside
+        // `record_boundary` sees the same set it would have seen entry by entry.
+        let mut declined: Vec<(PathBuf, u64, Option<u64>)> = Vec::new();
+        // SEAM 1's RETIRING half. A complete listing re-observes every child of
+        // this directory, which makes it the descending profile's generation for
+        // the DEVICE-ONLY partition — the one partition no refresh can ever
+        // retire. `reconcile` is empty unless this scope actually holds a
+        // device-only record at a child of `dir`, which is every scope in
+        // production today, so the per-entry work below costs nothing at all in
+        // the common case. An INCOMPLETE listing reconciles nothing: an absent
+        // name proves nothing about a read that was cut short.
+        let collect_kept = complete && state.holds_device_only_under(&dir);
+        let mut kept: Vec<PathBuf> = Vec::new();
         for entry in entries {
           let Ok(name) = core::str::from_utf8(&entry.name) else {
             // A non-UTF-8 name cannot become a `Segment` (the documented v1
@@ -3128,10 +4642,20 @@ impl DriverCore {
           };
           let path = dir.join(name);
           if self.excluded(&path) {
+            // Skipped BEFORE the fence, so this listing cannot say whether a
+            // boundary is there; an excluded child is never a candidate for
+            // retirement.
+            if collect_kept {
+              kept.push(path);
+            }
             continue;
           }
           let node = mint(state, &path, NonZeroU64::new(entry.ino), Some(entry.dev));
           let kind = if entry.kind.is_dir() && crosses_mount_boundary(state, &entry) {
+            if collect_kept {
+              kept.push(path.clone());
+            }
+            declined.push((path, entry.dev, entry.mnt_id));
             FileKind::Other
           } else {
             entry.kind
@@ -3141,6 +4665,29 @@ impl DriverCore {
             dir_entry = dir_entry.with_node(node);
           }
           listed.push(dir_entry);
+        }
+        // A lossy listing dropped a name it could not represent, so it is no
+        // more authoritative about absence than an incomplete one.
+        let reconcile = collect_kept && !lossy;
+        if (reconcile || !declined.is_empty())
+          && let Some(state) = self.scopes.get_mut(&scope)
+        {
+          // Retire BEFORE recording, so a boundary this very listing declined
+          // survives and a stale record cannot block the containment rule for a
+          // live boundary recorded under it.
+          if reconcile {
+            retire_relisted_boundaries(state, &dir, &kept);
+          }
+          // Recording owes the seam nothing back. A boundary the bound REFUSES is
+          // refused only when the device-only partition is full of AMBIGUOUS
+          // records, which is exactly the state in which every authoritative
+          // refresh already covers this whole root — so the listing is not
+          // degraded and no located cover is stood here. The seam that once did
+          // both needed a saturation latch to keep it from storming, and that
+          // latch silenced every refusal after the first.
+          for (location, dev, mnt_id) in declined {
+            record_boundary(state, &location, Some(dev), mnt_id);
+          }
         }
         if complete && !lossy {
           EnumerateResult::Ok(listed)
@@ -3204,7 +4751,15 @@ impl DriverCore {
     };
     // A slot stat answers the Monitor directly: it grounds no batch item, so it
     // resolves ahead of the park machinery and never touches a scope's park.
-    if let ProbePurpose::SlotKind { req } = ctx.purpose {
+    if let ProbePurpose::SlotKind { req, path } = ctx.purpose {
+      // SEAM 4, ahead of the answer: the probe just read a device for a path
+      // under the root, and `stat_result` is about to throw it away. A device
+      // the scope's frame calls foreign is a boundary observed at the only
+      // moment anything looked, so it is recorded before the answer lowers.
+      // Recording owes nothing back — see [`record_boundary`].
+      if let Some(state) = self.scopes.get_mut(&ctx.scope) {
+        record_probe_boundary(state, &path, outcome);
+      }
       self.monitor.on_stat_result(req, stat_result(outcome));
       self.drain_monitor();
       return;
@@ -3286,14 +4841,58 @@ impl DriverCore {
     state.root = Some(root);
     state.root_dev = Some(meta.root_dev);
     state.root_mnt_id = meta.root_mnt_id;
+    // A different root on a barrier read that answers no token: the old world's
+    // proven incarnation belongs to a mount this scope no longer watches, so it is
+    // dropped rather than compared against the new world's first refresh.
+    state.root_incarnation = None;
+    state.frame_epoch = state.frame_epoch.wrapping_add(1);
     state.identity = Some(meta.identity);
-    state.mounts = meta.mounts;
+    // The old world's departure baseline describes a table under a root this
+    // scope no longer watches, so it is REPLACED — not cleared — by this
+    // world's own barrier read, exactly as `on_stream_spawned` seeds a birth's
+    // (see the reasoning there). The replace's covering Rescan does not make the
+    // seed redundant: the re-enumeration that cover obliges IS the crawl that
+    // reads a mount's foreign device and declines beneath it, so it loses the
+    // same race to a lazy unmount that a birth crawl does. Nothing of the old
+    // world survives the swap, so no prefix that never belonged to this tree can
+    // be diffed against the new root's first read.
+    // The new world's set is COMPLETE the moment it is seeded — this barrier read
+    // and this world's own seed walk are exactly the evidence a generation carries
+    // — so the watermark is the world it was taken in, and the old world's
+    // outstanding round trip goes with the rest of that world's state: it addresses
+    // a root this scope no longer watches, and the swap's own covering `Rescan`
+    // owes the consumer the whole new tree regardless.
+    state.generation_epoch = state.frame_epoch;
+    state.generation_rejected = false;
+    state.pending_recovery = None;
+    state.refused_walk = None;
+    state.published_epoch = None;
+    state.mounts_baseline = meta.mounts.iter().map(MountRecord::confirmed).collect();
+    install_mount_table(state, meta.mounts.into_iter().map(|row| row.location));
+    // The old world's learned prefixes describe a root this scope no longer
+    // watches (a birth has none), so they go with the rest of that world. Nothing
+    // else may empty this set: see [`ScopeState::learned_mounts`].
+    state.learned_mounts.clear();
+    // SEAM 2: the boundaries this world's OWN seed walk declined, recorded in
+    // the same step that seeds the baseline from the barrier read — so the set
+    // is whole before the scope is live, never completed by a later message.
+    // These are the ONLY boundaries a kernel-recursive scope ever learns
+    // without a mount table: the walk is its only fence, and it runs once, at
+    // spawn. Empty on every backend that walks nothing.
+    record_declined(state, &meta.declined);
     // The old world's authority cannot vouch for the new root's mounts:
     // trust fails closed until the refresh this commit arms completes. A
     // refresh already in flight was addressed to the REPLACED root — mark it
     // cross-world so its completion (liveness verdict included) is discarded
     // rather than judging the new identity by the old object.
     state.refresh_world_stale = state.refresh_pending;
+    // Every cover PARKED on an outstanding admission round trip dies with the
+    // old world, `refresh_world_stale` style: the location it addresses is a
+    // path under a root this scope no longer watches, the reader that was going
+    // to answer it is being retired, and the swap's own covering `Rescan` owes
+    // the consumer the whole new tree regardless. Leaving one parked would hold a
+    // cover for a reply that can never arrive.
+    state.pending_admits.clear();
     // A replace commit ends any witnessed widen window outright: the fallback
     // route lands here with the tainted (or refused) window still recorded,
     // and the replacement's own spawn barrier re-established the binding from
@@ -3301,7 +4900,7 @@ impl DriverCore {
     // reservation (INV-ROOT leg (i)).
     state.pending_widen = None;
     state.mounts_authoritative = false;
-    Self::arm_refresh(&mut self.effects, scope, state);
+    Self::arm_refresh(&mut self.effects, scope, state, RefreshCause::Invalidating);
 
     // The cut: old-world parked work and probes are dominated, and the
     // Monitor turns the swap into the epoch-bumped covering Rescan.
@@ -3607,9 +5206,50 @@ impl DriverCore {
     state.root = Some(root);
     state.root_dev = Some(meta.root_dev);
     state.root_mnt_id = meta.root_mnt_id;
+    // A different root on a barrier read that answers no token: the old world's
+    // proven incarnation belongs to a mount this scope no longer watches, so it is
+    // dropped rather than compared against the new world's first refresh.
+    state.root_incarnation = None;
+    state.frame_epoch = state.frame_epoch.wrapping_add(1);
     state.identity = Some(meta.identity);
-    state.mounts = meta.mounts;
+    // The widened world's baseline, seeded from its own barrier read — the same
+    // swap `on_root_replaced` performs, and for the same reason: the ADDED
+    // ground is enumerated by the chain arm's cold read, which declines beneath
+    // any mount it finds there, so a lazy unmount racing that read is invisible
+    // to a baseline that starts empty. The old root's rows go with the old
+    // world; only this read's rows are diffed.
+    // The new world's set is COMPLETE the moment it is seeded — this barrier read
+    // and this world's own seed walk are exactly the evidence a generation carries
+    // — so the watermark is the world it was taken in, and the old world's
+    // outstanding round trip goes with the rest of that world's state: it addresses
+    // a root this scope no longer watches, and the swap's own covering `Rescan`
+    // owes the consumer the whole new tree regardless.
+    state.generation_epoch = state.frame_epoch;
+    state.generation_rejected = false;
+    state.pending_recovery = None;
+    state.refused_walk = None;
+    state.published_epoch = None;
+    state.mounts_baseline = meta.mounts.iter().map(MountRecord::confirmed).collect();
+    install_mount_table(state, meta.mounts.into_iter().map(|row| row.location));
+    // The old world's learned prefixes describe a root this scope no longer
+    // watches (a birth has none), so they go with the rest of that world. Nothing
+    // else may empty this set: see [`ScopeState::learned_mounts`].
+    state.learned_mounts.clear();
+    // SEAM 2: the boundaries this world's OWN seed walk declined, recorded in
+    // the same step that seeds the baseline from the barrier read — so the set
+    // is whole before the scope is live, never completed by a later message.
+    // These are the ONLY boundaries a kernel-recursive scope ever learns
+    // without a mount table: the walk is its only fence, and it runs once, at
+    // spawn. Empty on every backend that walks nothing.
+    record_declined(state, &meta.declined);
     state.refresh_world_stale = state.refresh_pending;
+    // Every cover PARKED on an outstanding admission round trip dies with the
+    // old world, `refresh_world_stale` style: the location it addresses is a
+    // path under a root this scope no longer watches, the reader that was going
+    // to answer it is being retired, and the swap's own covering `Rescan` owes
+    // the consumer the whole new tree regardless. Leaving one parked would hold a
+    // cover for a reply that can never arrive.
+    state.pending_admits.clear();
     // The witnessed window is CONSUMED by the commit (INV-ROOT): it was clean
     // through the taint gate above, the splice landed, and from here the
     // reserved id is a KNOWN root — its death records run the ordinary
@@ -3655,6 +5295,831 @@ impl DriverCore {
     WidenCommit::Committed(attempt)
   }
 
+  /// SEAM 2, live half: records the boundaries a source's own WALK declined —
+  /// the post-loss whole-map reseed, the moved-in subtree walk and the admission
+  /// reseed, all of which run on the reader thread and reach the core on the
+  /// source's one ordered queue.
+  ///
+  /// The SPAWN walk's declines do not come through here. They are pre-live facts
+  /// and ride [`RootMeta::declined`](crate::os::RootMeta) into the same world
+  /// swap that seeds the baseline from the barrier read, so a scope is never live
+  /// with a half-built set.
+  ///
+  /// # Why this exists at all, and only on a kernel-recursive profile
+  ///
+  /// A descending profile learns its boundaries from its own enumerates (seam 1):
+  /// every cover re-arms a crawl, and the crawl re-runs the decline. A
+  /// kernel-recursive mark runs no enumerate — `Monitor::start_rearm` refuses
+  /// outright on a non-descending scope — so the walk is the ONLY place fanotify
+  /// ever fences a directory, and a decline it dropped is a boundary nothing in
+  /// the system would see again.
+  ///
+  /// The core takes what the walk decided rather than deriving anything of its
+  /// own: the walk holds pinned fds and reads each child's frame from the object
+  /// it actually opened, which is evidence no later path-based re-derivation
+  /// could reproduce honestly.
+  ///
+  /// Provenance is [`record_boundary`]'s to settle, exactly as it is for seam 1
+  /// and seam 4 — a decline is not a mountinfo row, so every record enters
+  /// NOT row-confirmed and a btrfs subvolume among them stays exempt forever.
+  ///
+  /// # A WHOLE-ROOT report also RETIRES
+  ///
+  /// A complete walk from the root is not just a list of additions: it is a
+  /// generation, and the only one a kernel-recursive profile ever gets. The
+  /// mount table cannot retire a device-only record — the partition exists
+  /// precisely because a subvolume is absent from every frame by construction —
+  /// and the compiled-removal pass
+  /// ([`retire_removed_boundaries`](Self::retire_removed_boundaries)) reads the
+  /// event stream, which a loss window empties. So without this, one lost
+  /// deletion kept its record for the scope's life.
+  ///
+  /// The sweep runs BEFORE the recording, so a boundary this very walk declined
+  /// survives it and a stale record cannot block the containment rule for a live
+  /// boundary recorded under it.
+  ///
+  /// # A generation from a root this scope does not hold publishes NOTHING
+  ///
+  /// This is [`on_root_recovered`](Self::on_root_recovered)'s check on the OTHER
+  /// message that carries a whole-root generation, and it is the same defect: "what
+  /// this walk did not decline is not there any more" is a claim about a particular
+  /// ROOT MOUNT, and applied under a different one it retires records for
+  /// boundaries the walk never looked at. The partition it retires from is the one
+  /// the mount table cannot see, so nothing puts those records back and the
+  /// departure they would have witnessed becomes underivable — the revealed ground
+  /// is never admitted and its events drop with no signal at all.
+  ///
+  /// So a complete report is checked against the root mount id its walk fenced
+  /// against ([`WalkReach::WholeRoot`](crate::os::WalkReach)) and applies NEITHER
+  /// half on a mismatch. `None` on either side passes, as every unknown frame leg
+  /// does.
+  ///
+  /// **TWO stamps, not one.** The walked id alone was sufficient only against a
+  /// root that moved and stayed moved. Mount ids are allocated lowest-free, so a
+  /// root that went A → B → A is back on the id the core still holds while this
+  /// walk ran against the FIRST A — a mount that has since died — and the
+  /// comparison passes. So the report also carries the core's own frame EPOCH as
+  /// the source last heard it, sampled before the walk began
+  /// ([`WalkReach::WholeRoot`](crate::os::WalkReach)): a count of worlds, minted
+  /// core-side, that no reading of a recycled id can forge.
+  ///
+  /// # What a mismatch owes, and what it does not
+  ///
+  /// It does NOT owe a cover, and that is the one place this differs from
+  /// `on_root_recovered`: a whole-root report is produced only behind a loss, and
+  /// the `Overflow` sitting immediately behind it on the source's one ordered queue
+  /// covers the entire root whether or not the generation lands (the invariant
+  /// [`retire_unwalked_boundaries`] already states and relies on).
+  ///
+  /// It does owe a GENERATION, and the one thing it records is that the generation
+  /// EXISTED. Dropping this report is safe (the coverage set is left exactly as it
+  /// was, which is the state the core already trusted) but not complete: an exempt
+  /// boundary that appeared since the last generation is recorded nowhere, and the
+  /// declines that would have recorded it went out with the report. That is why the
+  /// need cannot be derived here from the set alone — the set is empty of exactly
+  /// the evidence the derivation looks for — and why the rejection retains it
+  /// ([`generation_rejected`](ScopeState::generation_rejected)), discharged only by
+  /// a generation that actually lands.
+  ///
+  /// What IS done here is arming a refresh, and the reason is exactly the hole the
+  /// previous version left. It used to arm none, on the argument that the
+  /// `Overflow` immediately behind this report runs
+  /// [`trust_lost`](Self::trust_lost) and arms one a message later. But boundary
+  /// reports deliberately do not advance the loss dedup position, so a later loss
+  /// can ride an OLDER `Overflow` already queued ahead of this report — whose
+  /// refresh can complete before this report is even ingested. With liveness
+  /// polling disabled there is then no later refresh at all, and the owed
+  /// generation is never asked for. Arming here costs at most one extra table read
+  /// (a following `Overflow` coalesces onto it), and buys the read that moves the
+  /// frame this report says is wrong.
+  ///
+  /// # Nothing is owed back at the bound
+  ///
+  /// A decline the bound REFUSES is a boundary this scope cannot derive a
+  /// departure for — but the bound only refuses when the device-only partition
+  /// is full of AMBIGUOUS records, and such a scope already covers its whole root
+  /// on every authoritative refresh ([`ScopeState::fails_closed`]). The
+  /// per-refusal `Overflow` this seam used to stand needed a saturation latch to
+  /// keep it from storming (it re-observes the same boundaries on every later
+  /// walk), and that latch silenced every refusal after the first.
+  pub(crate) fn on_walk_boundaries(
+    &mut self,
+    scope: ScopeId,
+    boundaries: crate::os::WalkBoundaries,
+    _now: Instant,
+  ) {
+    let Some(state) = self.scopes.get_mut(&scope) else {
+      return;
+    };
+    if let Some((walked, stamped)) = boundaries.reach.whole_root_stamp() {
+      // An unknown id on EITHER side passes, exactly as `on_root_recovered`'s own
+      // leg does; the epoch carries the check there. The epoch is compared for
+      // equality unconditionally — it is core-owned, so every host has one.
+      let walked_elsewhere = matches!(
+        (walked, state.root_mnt_id),
+        (Some(walked), Some(current)) if walked != current
+      );
+      if stamped != state.frame_epoch || walked_elsewhere {
+        // Neither half — see the section above. The DECLINES are dropped, and that
+        // is what has to be recorded: a complete generation existed and this scope
+        // did not get it, so whatever exempt boundary it was carrying is now in no
+        // set any derivation can read. Retaining the fact costs one bit and is
+        // discharged by exactly one event (a generation landing); deriving it
+        // instead reads a coverage set that this very rejection kept empty.
+        state.generation_rejected = true;
+        // And the SCHEDULING is the shared decision, not a conjunct spelled here:
+        // this report proves a generation was lost, never that a read is owed. A
+        // fanotify reader that sampled epoch N, took a current-epoch recovery
+        // request while its autonomous loss reseed was still running, and reported
+        // stamped N leaves `pending_recovery` already covering the missing
+        // generation at N+1 — and on a host whose incarnation token is the
+        // namespace counter (5.17–6.7: any mount anywhere reads as a frame move)
+        // the read this used to arm unconditionally moves the epoch before that
+        // open recovery replies, refusing it and buying a SECOND whole-root walk
+        // to replace the one already in flight.
+        //
+        // No key is spent: an autonomous report is unrequested, so no arming of
+        // this core's can produce another and there is no loop to bound — see
+        // [`recover_if_unserved`](Self::recover_if_unserved).
+        Self::recover_if_unserved(
+          &mut self.effects,
+          &mut self.admit_seq,
+          scope,
+          state,
+          None,
+          RecoveryRoute::Refresh,
+        );
+        return;
+      }
+      retire_unwalked_boundaries(state, &boundaries.declined);
+      // The set is now COMPLETE under the frame this scope holds, which is the one
+      // fact `generation_stale` reads. Advanced only here and on the recovery's own
+      // success path — the two sites that actually apply a generation, and the only
+      // two that may discharge the evidence a rejection left.
+      state.generation_epoch = state.frame_epoch;
+      state.generation_rejected = false;
+      state.refused_walk = None;
+    }
+    record_declined(state, &boundaries.declined);
+  }
+
+  /// Parks EVERY departed boundary's cover on a fresh admission round trip and
+  /// emits the ONE request that carries the whole burst.
+  ///
+  /// Takes `effects` and `admit_seq` beside `state` (like
+  /// [`arm_refresh`](Self::arm_refresh) takes `effects`) so it composes with a
+  /// `&mut ScopeState` borrowed out of `self.scopes`.
+  ///
+  /// Each location travels as the record's own absolute path, not as anything
+  /// derived from the root: it was recorded from a mount-table row (or a seam
+  /// observation) under this very root, and the walk addresses it directly.
+  ///
+  /// # Why the burst is ONE effect
+  ///
+  /// One refresh condemns a whole run of records at once, and the requests must
+  /// reach the source INDIVISIBLY: a source that can observe a prefix of the burst
+  /// snapshots that prefix into a whole-root recovery and takes the remainder as a
+  /// second obligation, buying a second whole-root walk and a second report — and
+  /// at the supported boundary budget of one, the second report kills a source that
+  /// had nothing wrong with it. Emitting one effect is what lets the driver hand
+  /// the run over under a single mailbox post (see
+  /// [`Effect::AdmitBoundaries`]).
+  ///
+  /// Empty in, nothing out: a verdict that condemned nothing emits no request.
+  fn park_admissions(
+    effects: &mut VecDeque<Effect>,
+    admit_seq: &mut u64,
+    scope: ScopeId,
+    state: &mut ScopeState,
+    departed: Vec<MountRecord>,
+  ) {
+    if departed.is_empty() {
+      return;
+    }
+    let requests = departed
+      .into_iter()
+      .map(|record| {
+        *admit_seq += 1;
+        let ticket = crate::os::AdmitTicket::new(*admit_seq);
+        let location = record.location.clone();
+        state.pending_admits.push(PendingAdmit {
+          ticket,
+          record,
+          epoch: state.frame_epoch,
+        });
+        crate::os::AdmitRequest {
+          ticket,
+          location,
+          // The frame this request is ISSUED against. Read off the scope's
+          // CURRENT state, which the refresh above has just re-adopted, so a root
+          // that re-mounted is compared against the mount it lives on now. The
+          // walk does not fence on it — it re-reads the root's own frame at
+          // execution time, beside the location's — but it refuses the request
+          // when the two disagree, which is what keeps a frame that moved during
+          // the round trip from being substituted for the one this scope's
+          // coverage set is relative to.
+          frame: ScopeFrame {
+            root_dev: state.root_dev,
+            root_mnt_id: state.root_mnt_id,
+          },
+          // The same epoch the park above recorded, on the wire this time: a
+          // recovery that collapses this request stamps its reply with it.
+          epoch: state.frame_epoch,
+        }
+      })
+      .collect();
+    effects.push_back(Effect::AdmitBoundaries { scope, requests });
+  }
+
+  /// Asks a fanotify scope's source for ONE whole-root recovery: reseed the
+  /// entire admission map from the root, report the complete generation that
+  /// walk produces, cover the whole root, and discharge every admission ticket at
+  /// or below the one this mints.
+  ///
+  /// # Why the root cover cannot simply be emitted here
+  ///
+  /// It is the same reason a located departure cover parks: fanotify admits by
+  /// directory-handle MEMBERSHIP, so ground the map has never seen is ground the
+  /// source cannot report on. A bare `Scope::Root` cover would send the consumer
+  /// to re-read a tree the source is partly blind to, and every mutation between
+  /// that re-read and some later reseed would drop on an unknown handle with no
+  /// loss signal at all. So the cover travels WITH the reseed, on the reply —
+  /// admission-before-cover, at root scope.
+  ///
+  /// # Ticket, not fire-and-forget
+  ///
+  /// The ticket is minted from the same monotone counter
+  /// [`park_admissions`](Self::park_admissions) uses, and that is what makes the
+  /// cutoff meaningful: every round trip this scope opened BEFORE this one has a
+  /// lower ticket, and the recovery subsumes all of them (a whole-map reseed
+  /// admits strictly more than any located walk, and its complete generation
+  /// re-records every boundary that is still live). Nothing is parked for it —
+  /// the reply carries the root cover itself.
+  ///
+  /// A scope with no live source resolves the round trip inline through
+  /// [`on_recovery_unreachable`](Self::on_recovery_unreachable), exactly as an
+  /// unreachable admission resolves.
+  ///
+  /// # Stamped with the frame it is issued against
+  ///
+  /// `epoch` is the scope's [`frame_epoch`](ScopeState::frame_epoch) NOW, and it
+  /// rides the round trip exactly as [`park_admissions`](Self::park_admissions)'
+  /// does. The reply echoes it back, and
+  /// [`on_root_recovered`](Self::on_root_recovered) applies nothing from a
+  /// recovery whose stamp is no longer the scope's — a reseed walked in a world
+  /// this scope has left describes a coverage set that is not the one it holds.
+  ///
+  /// # The round trip is RECORDED, and that is what replaces the debt
+  ///
+  /// [`pending_recovery`](ScopeState::pending_recovery) holds it until an answer
+  /// ARRIVES. While it stands with this scope's current epoch, no second recovery
+  /// is asked for — the reply that is coming carries the generation, the cutoff and
+  /// the cover together, so a duplicate walk is all a second request could buy. The
+  /// moment the frame moves out from under it, the same record says the reply can
+  /// never be applied and the round trip is owed again. One piece of state, both
+  /// directions, and nothing to clear.
+  ///
+  /// It is discharged by an answer, applied or refused, and not by one that was
+  /// merely useful: a refusal applies nothing but ends the round trip just as
+  /// surely, and a record kept past its own reply is a suppression resting on a
+  /// prediction rather than on anything outstanding — see
+  /// [`on_root_recovered`](Self::on_root_recovered).
+  ///
+  /// A recovery ALWAYS supersedes an older outstanding one: tickets are monotone,
+  /// so the newer cutoff discharges everything the older one would have.
+  fn request_root_recovery(
+    effects: &mut VecDeque<Effect>,
+    admit_seq: &mut u64,
+    scope: ScopeId,
+    state: &mut ScopeState,
+    epoch: u64,
+  ) {
+    *admit_seq += 1;
+    let ticket = crate::os::AdmitTicket::new(*admit_seq);
+    state.pending_recovery = Some(PendingRecovery { ticket, epoch });
+    effects.push_back(Effect::RecoverRoot {
+      scope,
+      request: crate::os::RecoveryRequest { ticket, epoch },
+    });
+  }
+
+  /// **The one decision behind every arm that schedules a whole-root recovery.**
+  ///
+  /// Three arms reach it, and each answers a message that applied NOTHING:
+  ///
+  /// | arm | the reply it refused | route |
+  /// |---|---|---|
+  /// | [`on_walk_boundaries`](Self::on_walk_boundaries) | an autonomous whole-root generation stamped in another world | [`Refresh`](RecoveryRoute::Refresh) |
+  /// | [`on_root_recovered`](Self::on_root_recovered) | a requested reseed's reply, epoch or walked id disputed | [`Refresh`](RecoveryRoute::Refresh) |
+  /// | [`on_admitted`](Self::on_admitted) | a located admission reply from a world this scope has left | [`Ask`](RecoveryRoute::Ask) |
+  ///
+  /// Each used to spell its own conjunct set, and five consecutive review rounds
+  /// each found a different one incomplete — an unconditional arm here, an
+  /// unconditional overwrite there, a missing re-ask brake on the third. The sets
+  /// were never SUPPOSED to differ: all three ask the identical question, *is the
+  /// whole-root round trip still unserved?*, and only the carrier differs. So the
+  /// question is asked in one place and the arms hand it evidence.
+  ///
+  /// # What it decides, in order
+  ///
+  /// 1. **Has this disagreement already been re-asked?** `disagreement` is the
+  ///    retained-evidence key ([`RefusedWalk`]) — same frame, same foreign root,
+  ///    so the second walk was raised in full knowledge of the first. It is
+  ///    RECORDED whether or not anything is scheduled (it is evidence about a
+  ///    reply that arrived, not about what this arm chose), and a repeat schedules
+  ///    nothing: the retry falls back to the refresh cadence, which is the one
+  ///    recovery per refresh a [`fails_closed`](ScopeState::fails_closed) scope
+  ///    already pays.
+  /// 2. **Is the need still unserved?**
+  ///    [`owes_whole_root`](ScopeState::owes_whole_root), whose FIRST arm is the
+  ///    case every one of those rounds missed: while a round trip stands in the
+  ///    world this scope still holds, its reply carries the generation, the cutoff
+  ///    and the cover TOGETHER, so scheduling anything can only move the frame out
+  ///    from under it and refuse it too. "A reply was refused" is a fact about the
+  ///    read that already happened; this is what says one is still owed.
+  ///
+  /// Nothing is silenced by declining: every arm that reaches here has already
+  /// retained the evidence that keeps the need derivable
+  /// ([`generation_rejected`](ScopeState::generation_rejected) on the two frame
+  /// arms; the standing recovery's own root cover on the third), so the moment the
+  /// round trip it deferred to is itself answered, the need is re-derived and
+  /// bought then.
+  ///
+  /// # Why only one arm carries a disagreement
+  ///
+  /// The key bounds ONE cycle: a refusal arms a read, the read re-derives the need
+  /// and re-asks, the re-ask is refused. Only a REQUESTED reply sits on it, so only
+  /// `on_root_recovered` passes a key. An autonomous report is unrequested —
+  /// nothing this core does produces another — and an admission reply answers a
+  /// ticket that is being retired, so neither can close a loop, and spending the
+  /// key at either would silence `on_root_recovered`'s own first genuine retry.
+  /// An EPOCH mismatch carries no key at any site: the epoch is what moved, so no
+  /// two refusals can ever share one.
+  ///
+  /// # Not the refresh's own decision
+  ///
+  /// [`on_mounts_refreshed`](Self::on_mounts_refreshed) is the CARRIER these arms
+  /// route to, not a fourth caller: it asks on a strictly wider disjunction (the
+  /// fail-closed rule and the departure collapse both demand a reseed with nothing
+  /// outstanding at all), and on a non-fanotify profile it answers the same need
+  /// with a root cover rather than a round trip.
+  ///
+  /// # This is the interim shape of a FOLD, not a fourth field
+  ///
+  /// The lifecycle is currently a product of eight fields mutated at eleven sites,
+  /// with the legal combinations enforced by prose — and every finding R11 through
+  /// R15 was either an illegal combination being representable or one of these
+  /// three arms carrying an incomplete conjunct set. Folding it into one enum is
+  /// the real fix and is a separate increment; this function exists so the three
+  /// arms cannot diverge again in the meantime, and it is written to be the thing
+  /// that fold's `match` REPLACES rather than something the fold then has to
+  /// reconcile with. The correspondence is exact:
+  ///
+  /// | the fold's state | how it is spelled today | this decision |
+  /// |---|---|---|
+  /// | `Out { ticket, epoch }`, `epoch == frame_epoch` | `pending_recovery` at the current epoch | schedule NOTHING — [`owes_whole_root`](ScopeState::owes_whole_root)'s first arm |
+  /// | `Out { .. }`, epoch moved | `pending_recovery` stamped in a world this scope left | schedule — the reply can never be applied |
+  /// | `Refused { disagreement, epoch }`, matching this reply | `refused_walk` equal to the incoming key | schedule NOTHING — the retry is already spent |
+  /// | `Owed(evidence)` | `generation_rejected`, or a cover parked across worlds | schedule |
+  /// | `Settled` | none of the above | schedule nothing; nothing is owed |
+  ///
+  /// So the body is two guards over one value, and the two writes it makes are the
+  /// fold's two transitions: recording the disagreement is `-> Refused`, and
+  /// [`request_root_recovery`](Self::request_root_recovery) is `-> Out`. The guards
+  /// are stated in an order the fold makes irrelevant — `Refused` and `Out` are
+  /// exclusive there, and where today's fields allow both at once they agree,
+  /// because both say a round trip has already been spent on this disagreement.
+  ///
+  /// Returns whether anything was scheduled.
+  fn recover_if_unserved(
+    effects: &mut VecDeque<Effect>,
+    admit_seq: &mut u64,
+    scope: ScopeId,
+    state: &mut ScopeState,
+    disagreement: Option<RefusedWalk>,
+    route: RecoveryRoute,
+  ) -> bool {
+    // `-> Refused`. Recorded whether or not anything is scheduled: it is evidence
+    // about a reply that ARRIVED, and what this arm chose does not change it.
+    let reasked = disagreement.is_some() && state.refused_walk == disagreement;
+    if disagreement.is_some() {
+      state.refused_walk = disagreement;
+    }
+    // The two guards. `reasked` is the `Refused` one, `owes_whole_root` folds
+    // `Out`-in-this-world, `Out`-elsewhere, `Owed` and `Settled` into the one
+    // answer they each already had.
+    if reasked || !state.owes_whole_root() {
+      return false;
+    }
+    match route {
+      RecoveryRoute::Refresh => {
+        Self::arm_refresh(effects, scope, state, RefreshCause::Invalidating);
+      }
+      RecoveryRoute::Ask => {
+        let epoch = state.frame_epoch;
+        Self::request_root_recovery(effects, admit_seq, scope, state, epoch);
+      }
+    }
+    true
+  }
+
+  /// Feeds ONE whole-root recovery back from a source: the complete generation
+  /// its reseed walk produced, the tickets it discharges, and the root cover it
+  /// owes — in that order, which is the same order every other walk driver
+  /// follows and for the same reason.
+  ///
+  /// 1. **the generation first.** The declines are recorded (and the records the
+  ///    walk did NOT decline retired) before anything makes the consumer re-read
+  ///    the ground, so a boundary is in the coverage set ahead of its own cover.
+  ///    This is also what restores the records the collapse dropped: a boundary
+  ///    the reseed re-declined is still live, and re-enters here.
+  /// 2. **the cutoff next.** Every parked cover at or below the cutoff is
+  ///    discharged in ONE retain — linear in the parked set, not one search per
+  ///    ticket. The located covers they held are dominated by the root cover
+  ///    below, so none is emitted.
+  /// 3. **the cover last** — a root-scope cover, and NOTHING ELSE.
+  ///
+  /// # Why this is not routed through the loss path
+  ///
+  /// It was, and that was a spin loop rather than a cost. A transport loss
+  /// re-arms the mount refresh ([`trust_lost`](Self::trust_lost)); a scope that
+  /// FAILS CLOSED answers every authoritative refresh with a recovery; so
+  /// recovery → loss → refresh → recovery turns over as fast as the driver can
+  /// run it, with a whole-map reseed and a root rescan on every iteration. The
+  /// accepted cost is ONE of those per liveness tick, not one per scheduler
+  /// round.
+  ///
+  /// Nothing is lost by leaving the loss semantics out. A reseed runs BETWEEN
+  /// two reads on the reader's own thread, so no event is dropped for it: the
+  /// kernel queue holds what arrives meanwhile, parked batches stay valid, and
+  /// the mount table this refresh just read is exactly as authoritative as it
+  /// was a statement ago. What the reseed does change is which ground the map
+  /// can see — and the root cover is the whole answer to that.
+  ///
+  /// # A recovery from a SUPERSEDED frame publishes NOTHING
+  ///
+  /// All three of the things above are relative to the frame the walk ran on. The
+  /// generation is a claim about where coverage ENDS under a particular root
+  /// mount; the cutoff drops parked round trips on the strength of that claim
+  /// dominating them; the cover tells the consumer the ground behind it is
+  /// admitted. A reseed that walked frame A while this scope has since adopted
+  /// frame B is none of those things for B — and the failure is silent both ways:
+  /// a nested mount B reveals is absent from A's map, so the cover promises ground
+  /// the source cannot see, while B's own boundaries are retired by a generation
+  /// that never looked at them.
+  ///
+  /// The race is ordinary. A recovery is a queued message behind a reader thread's
+  /// whole-tree walk; a mount refresh runs on the blocking pool and is ingested
+  /// the moment it lands. Nothing orders the two, and with a zero root-liveness
+  /// interval there may be no later refresh to correct the map at all.
+  ///
+  /// So the reply is checked against BOTH stamps before anything is applied — the
+  /// epoch it was ISSUED at ([`RootRecovery::epoch`](crate::os::RootRecovery)) and
+  /// the root mount id the walk actually fenced against
+  /// ([`root_mnt_id`](crate::os::RootRecovery::root_mnt_id)) — and a mismatch in
+  /// either applies NEITHER the generation NOR the cutoff. The two legs cover each
+  /// other: the epoch counts worlds core-side, so a re-mount that recycled its own
+  /// mount id cannot forge it, while the walked id speaks for the SOURCE, catching
+  /// a root that moved before this core ever ran the refresh that would bump an
+  /// epoch. Every parked round trip is left parked and answered on its own terms
+  /// ([`on_admitted`](Self::on_admitted) makes the same epoch judgement for each).
+  ///
+  /// What a mismatch OWES is a fresh recovery — the cover this reply was carrying
+  /// is still owed, and only a walk on the current frame may carry it — but it is
+  /// NOT asked for here. The generation is marked REJECTED
+  /// ([`generation_rejected`](ScopeState::generation_rejected)), because this
+  /// reply's declines were the only record of any exempt boundary that appeared
+  /// since the last one landed. The round trip this reply DOMINATES is discharged
+  /// ([`pending_recovery`](ScopeState::pending_recovery)): its one answer has come,
+  /// nothing further will ever be sent for that ticket, and a record whose whole
+  /// meaning is "a request is out" may not outlive the request — while a NEWER
+  /// request, minted after this reply was produced, sits above the cutoff and is
+  /// preserved. A mount refresh is armed IF the need is still unserved after that
+  /// discharge — a round trip still standing in this scope's own world already
+  /// carries everything the read would ask for again — and that refresh publishes a
+  /// frame and re-derives the need in the same disjunction the fail-closed rule and
+  /// the collapse use, so the fresh request is stamped with a frame just read
+  /// rather than the one being disputed.
+  ///
+  /// # The retry is spent, not predicted away
+  ///
+  /// The round trip used to be LEFT STANDING here, as an anti-spin latch: while
+  /// this scope held the same world, the argument ran, a fresh request would be
+  /// answered by a walk that reads the same root and is refused identically. That
+  /// is a claim about the SOURCE's world derived from a value this core re-reads
+  /// (its own frame, unchanged), and it is loudest exactly where it is wrong. On
+  /// Linux 6.8+ a transient same-object self-bind puts a mount B over the root, the
+  /// walk fences against B, and B departs before the refresh: the root is back on
+  /// the mount OBJECT it started on, so the legacy id AND the never-recycled
+  /// incarnation token both read unchanged, the epoch cannot move, and a record
+  /// standing at the current epoch suppressed every later refresh for the life of
+  /// the scope — the rejected generation's evidence and its cutoff-covered recovery
+  /// stranded with it. Nothing about the observations distinguishes that from a
+  /// source and a core that genuinely disagree; only a second walk does.
+  ///
+  /// So one retry is SPENT, and the refusal of the request spent on it is the
+  /// observation. This arm is the only edge that could turn that into a self-driven
+  /// loop — a refusal arms a read, the read re-derives the need and re-asks, the
+  /// re-ask is refused — and it is closed on BOTH legs. A disagreement this scope
+  /// has already re-asked under ([`RefusedWalk`] — same frame, same foreign root)
+  /// arms no read of its own; and no refusal at all arms one while a round trip
+  /// stands in the world this scope still holds
+  /// ([`owes_whole_root`](ScopeState::owes_whole_root)'s first arm), because that
+  /// reply carries the generation, the cutoff and the cover together and a read can
+  /// only move the frame out from under it and refuse it too. The second gate is
+  /// what the first cannot be: an EPOCH mismatch has no disagreement to key on — the
+  /// epoch is what moved — so `reasked` is false by construction there, and on a
+  /// pre-6.8 host, where any mount anywhere reads as a frame move, the cycle turned
+  /// over at whole-root-walk speed for as long as the namespace churned.
+  /// What is left is one recovery per REFRESH, which is precisely the cost a
+  /// [`fails_closed`](ScopeState::fails_closed) scope pays on every authoritative
+  /// refresh by design, and never one per scheduler round.
+  ///
+  /// Asking on the spot is still the spin, and that is why the refresh is the
+  /// carrier: when it is the walked id that disagrees the CORE may be the stale
+  /// party, so an immediate re-request would be answered by a walk that reads the
+  /// same id — one whole-root reseed per turn with no read of the live table
+  /// between them. Waiting for the refresh costs one round trip and puts a freshly
+  /// published frame under the retry.
+  ///
+  /// The arming is [`arm_refresh`](Self::arm_refresh) and deliberately not
+  /// [`trust_lost`](Self::trust_lost): a root that re-mounted invalidates this
+  /// scope's FRAME, not the locations its last table read listed, and routing a
+  /// recovery through the loss path is the spin the section above rejects.
+  pub(crate) fn on_root_recovered(
+    &mut self,
+    scope: ScopeId,
+    recovery: crate::os::RootRecovery,
+    now: Instant,
+  ) {
+    let Some(state) = self.scopes.get_mut(&scope) else {
+      return;
+    };
+    // An unknown id on EITHER side passes, exactly as every unknown leg of
+    // `ScopeFrame::crossed_by` does: below Linux 5.8 nothing reports a mount id,
+    // and reading unknown as "different" would reject every recovery such a host
+    // can produce. The epoch carries the check there.
+    let walked_elsewhere = match (recovery.root_mnt_id, state.root_mnt_id) {
+      (Some(walked), Some(current)) if walked != current => Some(walked),
+      _ => None,
+    };
+    if recovery.epoch != state.frame_epoch || walked_elsewhere.is_some() {
+      // Applied NOTHING, so the generation this reply carried is gone — the same
+      // evidence an autonomous report's rejection leaves, and for the same reason:
+      // its declines were the only record of an exempt boundary that appeared
+      // since the last one landed.
+      state.generation_rejected = true;
+      // The round trip is OVER. Its one reply has arrived; a refusal applies
+      // nothing, but nothing more will ever be sent for this ticket either, so a
+      // record that says "a request is out" must not survive it. Retired on the
+      // same cutoff test the accepted path uses — the reply answers the ticket it
+      // dominates and every ticket below — which is exactly what PRESERVES a newer
+      // request: one issued after this reply was produced sits above the cutoff and
+      // is still genuinely outstanding.
+      //
+      // Leaving it standing was a second meaning on one field, and a prediction
+      // besides: that a fresh request would be refused identically. A transient
+      // same-object self-bind makes that prediction wrong in the one direction that
+      // costs — the walk fenced against a mount that is already gone, the root is
+      // back on the mount OBJECT it started on so neither its legacy id nor its
+      // unique incarnation token moved, and the standing record then suppressed
+      // every later refresh for the life of the scope.
+      if state
+        .pending_recovery
+        .is_some_and(|out| out.ticket <= recovery.cutoff)
+      {
+        state.pending_recovery = None;
+      }
+      // So the retry is not predicted away — it is SPENT, and the refusal of the
+      // request spent on it is the observation the prediction wanted. This arm is
+      // the one edge that could make that a self-driven loop: a refusal arms a
+      // read, the read re-derives the need and re-asks, the re-ask is refused. It
+      // is broken by evidence rather than by a cadence — a disagreement this scope
+      // has ALREADY re-asked under (same frame, same foreign root, so the second
+      // walk was raised in full knowledge of the first) arms no further read of its
+      // own, and the retry falls back to the refresh cadence, which is the one
+      // recovery per refresh a `fails_closed` scope already pays.
+      //
+      // A DIFFERENT foreign root arms again: the source's world moved between the
+      // two walks, so the second reply is fresh information, not a repeat.
+      let disagreement = walked_elsewhere.map(|walked| RefusedWalk {
+        walked,
+        epoch: state.frame_epoch,
+      });
+      // And the arm NAMES the observation that proves it. `reasked` keys on a
+      // DISAGREEMENT, which covers only the walked-id leg: an EPOCH mismatch has no
+      // such key (the epoch is what moved, so no two refusals can ever share one),
+      // and the arming is itself what moves it — a refusal arms a read, the read
+      // finds the frame moved and bumps the epoch, the bump refuses the reply
+      // already in flight, and that refusal arms the next read. A pre-6.8 host
+      // reads any mount anywhere as a frame move
+      // ([`RootIncarnation::Namespace`](crate::os::RootIncarnation)), so a busy
+      // namespace turns that cycle over at whole-root-walk speed, with the reader
+      // walking instead of reading and `FAN_Q_OVERFLOW` behind it.
+      //
+      // "A reply was refused" is a fact about the read that ALREADY happened. What
+      // says a read is still OWED is [`ScopeState::owes_whole_root`], whose first
+      // arm is precisely this case: while a round trip stands in the world this
+      // scope still holds, its reply will carry the generation, the cutoff and the
+      // cover together, so the only thing a read could do is move the frame out
+      // from under it and refuse it too. Nothing is silenced by waiting — the
+      // rejection this arm just retained keeps the need derivable, so the moment
+      // that standing round trip is itself answered, this same site finds the need
+      // unserved and buys the read.
+      //
+      // Both halves of that live in [`recover_if_unserved`](Self::recover_if_unserved)
+      // now — this arm's own R14/R15 conjuncts are the set the two sibling arms
+      // were missing, and three copies of one decision is what let them diverge.
+      Self::recover_if_unserved(
+        &mut self.effects,
+        &mut self.admit_seq,
+        scope,
+        state,
+        disagreement,
+        RecoveryRoute::Refresh,
+      );
+      return;
+    }
+    retire_unwalked_boundaries(state, &recovery.declined);
+    record_declined(state, &recovery.declined);
+    // The set is COMPLETE under the frame this scope holds. Advanced only here and
+    // on the autonomous report's own accepted path — the two sites that apply a
+    // generation, and the only two that discharge a rejection's evidence.
+    state.generation_epoch = state.frame_epoch;
+    state.generation_rejected = false;
+    state.refused_walk = None;
+    state
+      .pending_admits
+      .retain(|parked| parked.ticket > recovery.cutoff);
+    // The outstanding round trip is discharged by a reply whose cutoff DOMINATES
+    // it — which is also what makes a superseded request self-resolving: an older
+    // reply that this one overtook was never applied, and this cutoff answers the
+    // ticket that older request minted along with everything below it. A reply
+    // whose cutoff falls short belongs to a request this scope has since replaced,
+    // so the newer one stays out.
+    if state
+      .pending_recovery
+      .is_some_and(|out| out.ticket <= recovery.cutoff)
+    {
+      state.pending_recovery = None;
+    }
+    self.monitor.on_overflow(Scope::Root(scope), now);
+    self.drain_monitor();
+  }
+
+  /// Resolves a whole-root recovery no source could take: there is no live
+  /// stream, so nothing will reseed and nothing will answer.
+  ///
+  /// The cover is still owed and is emitted on the refresh's own verdict alone —
+  /// exactly what [`AdmitOutcome::Unreachable`](crate::os::AdmitOutcome::Unreachable)
+  /// does for a located cover. What is NOT done here is retiring parked tickets:
+  /// a request that never reached a source discharges nothing, and each parked
+  /// round trip is resolved on its own terms (its own `Unreachable`, a world
+  /// swap, or the scope's death).
+  pub(crate) fn on_recovery_unreachable(&mut self, scope: ScopeId, now: Instant) {
+    let Some(state) = self.scopes.get_mut(&scope) else {
+      return;
+    };
+    // RESOLVED, not applied: no generation landed, so the coverage set's own
+    // watermark is untouched and a scope that still needs one will ask again on
+    // its next refresh. What ends here is the ROUND TRIP — nothing will ever
+    // answer a request no source took — and leaving it standing would suppress
+    // every later request for as long as the frame held still.
+    state.pending_recovery = None;
+    self.monitor.on_overflow(Scope::Root(scope), now);
+    self.drain_monitor();
+  }
+
+  /// Feeds one admission round trip's answer: retires the parked cover and does
+  /// whatever the answer still owes.
+  ///
+  /// This is the release half of admission-before-cover. The reply rides the
+  /// source's ONE ordered queue behind the map mutation that produced it, so a
+  /// cover emitted from here is a cover whose ground the source can already see.
+  ///
+  /// An unknown ticket is inert, and deliberately so — it is the shape every
+  /// stale reply takes. A world swap clears the parked set (the location belongs
+  /// to a root this scope no longer watches, and the swap's own covering `Rescan`
+  /// owns the whole new tree), so a reply from the retired world arrives against
+  /// no ticket; tickets are minted from a core-wide monotone counter, so it can
+  /// never collide with one the new world parked.
+  ///
+  /// The three answers and what each still owes are
+  /// [`AdmitOutcome`](crate::os::AdmitOutcome)'s; the one that is not just a
+  /// cover is [`StillCovered`](crate::os::AdmitOutcome::StillCovered), where a
+  /// boundary is still standing at the location and must go back into the set or
+  /// its own departure is underivable. WHICH record goes back is
+  /// [`restored_boundary`]'s decision, made against the identity the walk read off
+  /// the fd it pinned.
+  ///
+  /// A ticket the source discharged through a whole-root recovery never arrives
+  /// here at all: that recovery answers by CUTOFF
+  /// ([`on_root_recovered`](Self::on_root_recovered)), in one linear pass over
+  /// the parked set rather than one search per ticket.
+  ///
+  /// # A reply from a SUPERSEDED frame is not answered on its own terms
+  ///
+  /// The verdict that parked this round trip was taken against a descent frame,
+  /// and both things the reply can still ask for are relative to it: WHICH record
+  /// goes back ([`restored_boundary`] hands the walk's `(dev, mnt_id)` straight to
+  /// [`condemnable`](MountRecord::condemnable), which reads it against the root's
+  /// id) and whether a located cover may be released. A root that re-mounted
+  /// between the park and the reply moved that id, and
+  /// [`rebase_root_relative`] has already run over the records that were IN the
+  /// set — it cannot reach one still travelling on a reply. Put back unrebased, a
+  /// boundary carrying the OLD root's id reads mount-backed under the new frame,
+  /// is condemned by the next refresh, parks again, and is answered the same way.
+  ///
+  /// So a reply whose [`epoch`](PendingAdmit::epoch) is not the scope's current
+  /// one discharges into the whole-root recovery instead — via
+  /// [`recover_if_unserved`](Self::recover_if_unserved), because the recovery it
+  /// discharges into may ALREADY BE OUT. The refresh that moved the frame saw this
+  /// very ticket parked across worlds
+  /// ([`parked_across_worlds`](ScopeState::parked_across_worlds)) and asked for a
+  /// current-world recovery on the strength of it, with a cutoff that subsumes the
+  /// ticket; this reply can arrive after that. Overwriting
+  /// [`pending_recovery`](ScopeState::pending_recovery) unconditionally there made
+  /// the source owe a SECOND whole-root walk once it had begun the first — and at
+  /// the supported boundary budget of one, the second report kills a source that
+  /// had nothing wrong with it. The judgement is therefore taken while the ticket
+  /// is STILL PARKED, which is what keeps the derivation honest in the other
+  /// direction too: the parked ticket is the only witness that the need exists at
+  /// all, and retiring it first would leave the arm deriving `false` from a set it
+  /// had just emptied.
+  ///
+  /// Retiring it after is safe in every branch. If the standing recovery is
+  /// APPLIED, its root cover dominates the located one this reply was holding; if
+  /// it is REFUSED, the refusal retains
+  /// [`generation_rejected`](ScopeState::generation_rejected) and the need is
+  /// re-derived from that; if no source ever answers it,
+  /// [`on_recovery_unreachable`](Self::on_recovery_unreachable) emits the root
+  /// cover itself.
+  ///
+  /// The parked record is dropped and no located cover is emitted, exactly as the
+  /// departure COLLAPSE does, and for the same reason — the recovery's reseed
+  /// walks from the root on
+  /// the frame it reads there, its complete generation re-records every boundary
+  /// still live, and its root cover dominates every located one it stands in for.
+  ///
+  /// This is the half for a request that ALREADY RAN. A request still queued when
+  /// the frame moves is refused by the executor instead, which re-reads the root's
+  /// frame beside the location's and escalates a superseded one into the very same
+  /// recovery — so that one never reaches here at all, being discharged by the
+  /// recovery's cutoff.
+  pub(crate) fn on_admitted(
+    &mut self,
+    scope: ScopeId,
+    report: crate::os::AdmitReport,
+    now: Instant,
+  ) {
+    let Some(state) = self.scopes.get_mut(&scope) else {
+      return;
+    };
+    let Some(index) = state
+      .pending_admits
+      .iter()
+      .position(|parked| parked.ticket == report.ticket)
+    else {
+      return;
+    };
+    if state.pending_admits[index].epoch != state.frame_epoch {
+      // BEFORE the retire, so `owes_whole_root` can still see the ticket that is
+      // this need's only witness — and so it can see the recovery that may already
+      // serve it. No key: the dispute is an epoch move, which no two refusals can
+      // ever share.
+      Self::recover_if_unserved(
+        &mut self.effects,
+        &mut self.admit_seq,
+        scope,
+        state,
+        None,
+        RecoveryRoute::Ask,
+      );
+      state.pending_admits.remove(index);
+      return;
+    }
+    let parked = state.pending_admits.remove(index);
+    if let crate::os::AdmitOutcome::StillCovered { dev, mnt_id } = report.outcome {
+      // The lapse to the REPLACED handling: cover, and re-record in place. A
+      // boundary is standing there, and a live boundary that is not recorded has
+      // no derivable departure ever again. Guarded against a refresh that already
+      // re-recorded an arrival at the location while this round trip was out —
+      // one record per location, always.
+      if !state
+        .mounts_baseline
+        .iter()
+        .any(|record| record.location == parked.record.location)
+      {
+        state
+          .mounts_baseline
+          .push(restored_boundary(&parked.record, dev, mnt_id));
+      }
+    }
+    let cover = mount_cover(state, scope, &parked.record.location);
+    self.monitor.on_overflow(cover, now);
+    self.drain_monitor();
+  }
+
   /// Feeds a transport-level loss signal for `scope` (a dropped batch, the
   /// handle's overflow latch): parked work is dominated and dropped, and the
   /// Monitor turns the loss into an epoch-bumped `Rescan`.
@@ -3685,16 +6150,28 @@ impl DriverCore {
   /// mount table; repeated losses coalesce onto one outstanding refresh.
   fn trust_lost(effects: &mut VecDeque<Effect>, scope: ScopeId, state: &mut ScopeState) {
     state.mounts_authoritative = false;
-    Self::arm_refresh(effects, scope, state);
+    Self::arm_refresh(effects, scope, state, RefreshCause::Invalidating);
   }
 
   /// Arms one mount-table refresh for `scope`, coalescing onto an outstanding
-  /// one: a refresh raced by a newer arming re-runs once (`refresh_stale`)
-  /// instead of stacking effects. Serves both the birth refresh (authority is
-  /// never presumed at spawn) and every post-loss re-read.
-  fn arm_refresh(effects: &mut VecDeque<Effect>, scope: ScopeId, state: &mut ScopeState) {
+  /// one instead of stacking effects. Serves the birth refresh (authority is
+  /// never presumed at spawn), every post-loss re-read, and the periodic tick.
+  ///
+  /// What the coalescing DOES to the outstanding read is `cause`'s business (see
+  /// [`RefreshCause`]): an invalidating arming condemns it (`refresh_stale`, so
+  /// its completion is discarded and one fresh read re-runs), a periodic one
+  /// merely rides on it. Only the invalidating branch ever writes the flag, so a
+  /// tick can neither condemn a sound snapshot nor absolve a condemned one.
+  fn arm_refresh(
+    effects: &mut VecDeque<Effect>,
+    scope: ScopeId,
+    state: &mut ScopeState,
+    cause: RefreshCause,
+  ) {
     if state.refresh_pending {
-      state.refresh_stale = true;
+      if matches!(cause, RefreshCause::Invalidating) {
+        state.refresh_stale = true;
+      }
       return;
     }
     // No canonical root means no live stream: nothing to read yet, and the
@@ -3706,11 +6183,12 @@ impl DriverCore {
     effects.push_back(Effect::RefreshMounts { scope, root });
   }
 
-  /// (Re)arms the periodic root-liveness deadline for a signal-silent scope
-  /// whose root is live, or clears it when the tick does not apply (a non-
-  /// fanotify backend, `Duration::ZERO`, or a root not yet live). Called on
-  /// every alive mount-refresh completion so birth seeds it and each refresh
-  /// re-seeds it, and after [`on_timeout`](Self::on_timeout) fires a tick. Takes
+  /// (Re)arms the periodic refresh deadline for a signal-silent scope whose root
+  /// is live, or clears it when the tick does not apply (a profile
+  /// [`liveness_ticked`](Self::liveness_ticked) does not arm, `Duration::ZERO`,
+  /// or a root not yet live). Called on every alive mount-refresh completion so
+  /// birth seeds it and each refresh re-seeds it, and after
+  /// [`on_timeout`](Self::on_timeout) fires a tick. Takes
   /// `interval` explicitly (like [`arm_refresh`](Self::arm_refresh) takes
   /// `effects`) so it composes with a `&mut ScopeState` borrowed out of
   /// `self.scopes`.
@@ -3756,13 +6234,15 @@ impl DriverCore {
     // Root-liveness FIRST, unconditionally — BEFORE the stale gate. A dead root
     // is terminal: mount-set staleness is irrelevant to it (a root that vanished
     // at the read's snapshot vanished, full stop), so the death evidence must
-    // never be discarded by a stale flag. Under an interval shorter than refresh
-    // latency (or a backed-up pool) EVERY completion is stale-marked, so gating
-    // the death check on `!stale` would let a quiet unmount stay live forever —
-    // the exact hole the tick exists to close. The death lowers through the SAME
-    // self-event path a `RootChanged` probe uses (terminal Removed/Rescan, then
-    // registry reclamation). Only a barrier-known identity can be compared (an
-    // off-unix fake has none).
+    // never be discarded by a stale flag. A loss arriving faster than refresh
+    // latency stale-marks EVERY completion in turn, so gating the death check on
+    // `!stale` would let a quiet unmount stay live for as long as the losses keep
+    // coming — the exact hole the tick exists to close. (The tick itself does not
+    // contribute to that: it coalesces without condemning, so the diff BELOW the
+    // gate is not starved either — see [`RefreshCause`].) The death lowers through
+    // the SAME self-event path a `RootChanged` probe uses (terminal
+    // Removed/Rescan, then registry reclamation). Only a barrier-known identity
+    // can be compared (an off-unix fake has none).
     let death = state.identity.and_then(|expected| match refresh.root {
       // Present and unchanged: alive, continue to the mount table below.
       RootLiveness::Present(live) if live == expected => None,
@@ -3786,15 +6266,16 @@ impl DriverCore {
     // its commit by the witnessed window instead (INV-ROOT); this gate's sole
     // job is the negative verdict above — a mismatch runs the death funnel.
     //
-    // The stale gate governs EVERYTHING this
-    // snapshot carries — the mount-TABLE install below AND the descent FRAME adopted
-    // after it. A newer loss overlapped this read, so its snapshot may predate the
-    // lost window; `refresh_mounts` reads the table and re-stats the frame in ONE
-    // snapshot, so a stale table means an equally stale frame — publish neither.
-    // The table is discarded, one fresh refresh re-arms, and device trust stays
-    // closed. Liveness is already settled above (terminal regardless of stale), so a
-    // stale-but-alive completion only re-arms: the frame block and the table install
-    // below are BOTH the authoritative path.
+    // The stale gate governs EVERYTHING this snapshot carries — the mount-TABLE
+    // install below AND the descent FRAME adopted after it. A newer loss overlapped
+    // this read, so its snapshot may predate the lost window; `refresh_mounts` takes
+    // the table and the root's stat inside ONE proven-still mount-namespace
+    // generation (`crate::os::mount_sample` — the pair is rejected outright when the
+    // namespace moved across it), so a stale table means an equally stale frame:
+    // publish neither. The table is discarded, one fresh refresh re-arms, and device
+    // trust stays closed. Liveness is already settled above (terminal regardless of
+    // stale), so a stale-but-alive completion only re-arms: the frame block and the
+    // table install below are BOTH the authoritative path.
     if state.refresh_stale {
       state.refresh_stale = false;
       Self::trust_lost(&mut self.effects, scope, state);
@@ -3810,29 +6291,296 @@ impl DriverCore {
     // (`None`) must not drop a known frame to the device belt. Gated behind the stale
     // check above, so `state.root_mnt_id` is only ever the last AUTHORITATIVE frame —
     // the value `crosses_mount_boundary` consumes is never a stale/pre-window one.
+    //
+    // TWO legs, and the second is what makes the first honest. An id comparison
+    // observes a VALUE, and mount ids are allocated lowest-free: a root that went
+    // A -> B -> new-A between two refreshes is back on the id this scope still
+    // holds, the comparison passes, and the epoch — which every round trip is
+    // stamped with — never moves. A walk that ran against the FIRST A then arrives
+    // with both the legacy id and the epoch matching, its generation retiring
+    // exempt records the live root never presented while its reseeded map
+    // describes the dead incarnation. So the frame also moves on the INCARNATION
+    // token, which is a transition the host observed rather than a value this
+    // scope re-read (see [`RootIncarnation`](crate::os::RootIncarnation)).
+    //
+    // The token only ever ADDS a move. A refresh that answers none, or a host that
+    // has none, compares nothing and leaves this exactly the id check it has always
+    // been — which is what keeps every host without a mount namespace (and every
+    // fake) on the behaviour it had.
+    let previous_frame = state.root_mnt_id;
+    let incarnation_moved = matches!(
+      (state.root_incarnation, refresh.root_incarnation),
+      (Some(held), Some(read)) if held != read
+    );
+    if refresh.root_incarnation.is_some() {
+      state.root_incarnation = refresh.root_incarnation;
+    }
     let frame_changed = if let Some(mnt_id) = refresh.root_mnt_id {
       let changed = state.root_mnt_id != Some(mnt_id);
       state.root_mnt_id = Some(mnt_id);
-      changed
+      changed || incarnation_moved
     } else {
-      false
+      incarnation_moved
     };
+    // The one site where the frame can move under a LIVE parked round trip: the
+    // swaps clear the parked set, this does not. See [`ScopeState::frame_epoch`].
+    if frame_changed {
+      state.frame_epoch = state.frame_epoch.wrapping_add(1);
+    }
+    // The frame moved, so every ROOT-RELATIVE record must move with it — BEFORE
+    // any condemnation reads them. Without this the departure reconciliation
+    // below reads every live subvolume (recorded carrying the OLD root's id) as
+    // mount-backed and condemns the entire exempt partition on one supported
+    // unmount/rebind of the root — a false cover per subvolume, and on fanotify a
+    // whole admission round trip each. See [`rebase_root_relative`].
+    if let (true, Some(previous), Some(current)) =
+      (frame_changed, previous_frame, state.root_mnt_id)
+    {
+      rebase_root_relative(&mut state.mounts_baseline, previous, current);
+    }
 
     // Alive and current: (re)arm the liveness tick — the birth refresh seeds it
     // and every later refresh re-seeds it, regardless of whether the mount table
     // itself could be read below.
     Self::arm_liveness(state, interval, now);
 
+    let fanotify = state.profile == BackendKind::Fanotify;
+    // PUBLISH THE FRAME EPOCH. The source stamps its own unrequested whole-root
+    // generation with this, and a mount id cannot stand in for it (ids are
+    // allocated lowest-free, so a root that moved and came back carries the id the
+    // core still holds). Only fanotify produces such a generation, so only fanotify
+    // is told.
+    //
+    // Sent on the first non-stale refresh after a source is adopted and on every
+    // one that finds the epoch moved since — never repeatedly for a value already
+    // published. The first is what SEEDS a reader whose mailbox starts at zero into
+    // a scope whose epoch has already moved (the birth adoption, or a world swap);
+    // the rest is what keeps it current.
+    if fanotify && state.published_epoch != Some(state.frame_epoch) {
+      state.published_epoch = Some(state.frame_epoch);
+      self.effects.push_back(Effect::PublishFrame {
+        scope,
+        epoch: state.frame_epoch,
+      });
+    }
+
+    let mut covers: Vec<Scope> = Vec::new();
+    // Whether this refresh ends by asking the source for a whole-root recovery.
+    // Decided on BOTH branches below — the need is a question about what this scope
+    // holds and which world it holds it in, and the mount table answers neither.
+    let mut recover_root = false;
     if refresh.authoritative {
-      // UNION, never replacement: an existing entry is either a still-real mount (a
-      // later unmount event removes it) or a probed foreign-device prefix the
-      // snapshot cannot know about — keeping both only ever reduces trust, the safe
-      // direction. Probe-carried device evidence still decides what it can.
-      for mount in refresh.mounts {
-        if !state.mounts.iter().any(|m| m == &mount) {
-          state.mounts.push(mount);
+      let frame = refresh.mounts;
+      // The mount diff, in BOTH directions, taken against the coverage set
+      // BEFORE this frame installs. The two sets answer different questions and
+      // must not be merged: coverage asks what MOVED since the last read (so a
+      // stale extra prefix is precisely what hides a departed mount), trust asks
+      // what is foreign NOW (so a missing prefix grants trust never proven). The
+      // trust component this frame replaces below is one snapshot's rows; the
+      // prefixes that could not survive replacement are learned elsewhere and
+      // live elsewhere ([`ScopeState::learned_mounts`]), which is what lets the
+      // rows be replaced without buying coverage at trust's expense.
+      let mut covered: Vec<PathBuf> = Vec::new();
+      // Walking the FRAME: what arrived, what was replaced, and what this read
+      // CONFIRMS. Confirmation is the provenance upgrade — see [`MountRecord`];
+      // it is why a genuine vfsmount is condemnable on a kernel that answers no
+      // mount ids at all, and it must run on every read rather than only the one
+      // that first recorded the row.
+      // Planned against a location INDEX built once, then applied. The obvious
+      // shape — `find` per row — is O(rows x records) path comparisons on every
+      // refresh of every watched root, and a large mount namespace (containers,
+      // systemd private mounts, a snap-heavy desktop) has thousands of each: the
+      // driver is single-threaded, so that stalls every scope it owns and the
+      // stall itself induces the queue loss this whole file exists to avoid.
+      // Indexing makes it O((rows + records) log records).
+      //
+      // Two passes rather than one because the index borrows the very vector the
+      // apply mutates. The plan holds indices only, so the borrows end with the
+      // block. Vector ORDER is untouched — updates land in place, arrivals append
+      // in frame order — and that order is load-bearing: it is insertion order,
+      // which is what [`make_room_for_device_only`] evicts by.
+      let plan: Vec<FrameStep> = {
+        let located: BTreeMap<&Path, usize> = state
+          .mounts_baseline
+          .iter()
+          .enumerate()
+          .map(|(index, record)| (record.location.as_path(), index))
+          .collect();
+        // A row whose location a PRECEDING row in this same frame already
+        // arrived at. The type documents at most one row per location, so this
+        // is defensive — but the linear `find` it replaces would have seen the
+        // just-pushed record and treated the duplicate as a confirm, and a plan
+        // built off `located` alone would instead push a second record and a
+        // second cover. Keeping the old answer keeps a malformed frame harmless.
+        let mut arriving: BTreeSet<&Path> = BTreeSet::new();
+        frame
+          .iter()
+          .map(|row| {
+            let location = row.location.as_path();
+            match located.get(location) {
+              Some(&index) => FrameStep::Confirm(index),
+              None if arriving.insert(location) => FrameStep::Arrive,
+              None => FrameStep::Duplicate,
+            }
+          })
+          .collect()
+      };
+      for (row, step) in frame.iter().zip(&plan) {
+        let index = match step {
+          FrameStep::Confirm(index) => *index,
+          FrameStep::Arrive => {
+            // ARRIVAL. A mount that appears SHADOWS ground the consumer may
+            // already have enumerated, so it owes the same cover a departure
+            // does — this is what `compile::fsevents`' `plan_mount` plans for the
+            // arrival macOS signals in band, reached here from the table for the
+            // backends that signal nothing. Bounded per transition, never per
+            // tick: the record this installs is what makes the next read quiet.
+            state.mounts_baseline.push(MountRecord::confirmed(row));
+            covered.push(row.location.clone());
+            continue;
+          }
+          // The location already arrived from an earlier row carrying the same
+          // identity: confirming it again adopts nothing and covers nothing.
+          FrameStep::Duplicate => continue,
+        };
+        let record = &mut state.mounts_baseline[index];
+        if identity_changed(record.mnt_id, row.mnt_id) || identity_changed(record.dev, row.dev) {
+          // REPLACEMENT — the same-path remount. Cover it and RE-RECORD with the
+          // new identity: dropping it instead would leave a live mount unrecorded
+          // and its eventual departure underivable.
+          covered.push(row.location.clone());
         }
+        // A `Some` is adopted over a `None` either way (a known identity beats an
+        // unknown one and costs nothing to take), and a `None` never overwrites a
+        // `Some`: the same discipline `root_mnt_id`'s own adoption follows, so a
+        // read that could not answer an id never DROPS one already held.
+        record.mnt_id = row.mnt_id.or(record.mnt_id);
+        record.dev = row.dev.or(record.dev);
+        record.row_confirmed = true;
       }
+      // Walking the RECORDS: what departed. Only the mount-backed partition may
+      // be DROPPED. A device-only record — a btrfs subvolume, which trips the
+      // device belt with the root's own mount id and has no table row EVER — is
+      // absent from every frame by construction, so dropping and re-recording it
+      // would cover it on every single tick, forever.
+      //
+      // The exempt partition is not therefore SILENT, and reading it that way is
+      // what left #74 open on every 4.11–5.7 kernel. But nothing about an
+      // individual exempt record is decided here any more: an AMBIGUOUS record is
+      // simply RETAINED, and its mere existence anywhere in the set has already
+      // put this scope in the fail-closed state below, where the whole root is
+      // covered regardless of which locations this frame happened to list. Three
+      // per-record schemes died proving that no evidence exists to decide it
+      // per record — see [`ScopeState::fails_closed`].
+      //
+      // Condemned records are TAKEN here and disposed of below rather than covered
+      // inline: on a fanotify scope each one owes an admission round trip BEFORE
+      // its cover, and a `retain` closure can emit no effect. Taking them out is
+      // also what bounds the parking — a departure derived once is derivable no
+      // more.
+      let root_frame = state.root_mnt_id;
+      let mut departed: Vec<MountRecord> = Vec::new();
+      // The frame's locations as a SET, for the same reason the plan above uses
+      // an index: a linear scan of the frame per record is the other half of the
+      // O(rows x records) reconciliation. The set borrows `frame`, which the
+      // retain does not touch.
+      let present: BTreeSet<&Path> = frame.iter().map(|row| row.location.as_path()).collect();
+      state.mounts_baseline.retain(|record| {
+        if present.contains(record.location.as_path()) {
+          return true;
+        }
+        if !record.condemnable(root_frame) {
+          return true;
+        }
+        departed.push(record.clone());
+        false
+      });
+      // FAIL CLOSED, COLLAPSE, or an OWED recovery — the three states that answer
+      // with one whole-root recovery instead of anything located. One request
+      // between them, whichever combination holds: the recovery each wants is the
+      // same work.
+      //
+      // Fail-closed is read AFTER the reconciliation, so this frame's
+      // confirmations and drops have already settled which records are ambiguous:
+      // a row that upgraded the last id-less record clears the state on the very
+      // refresh that read it, and a seam observation that added one arms it on the
+      // very next.
+      //
+      // The collapse is the producer side of the admission bound. One refresh can
+      // condemn every mount under the root at once, and handing the source a run
+      // that long makes it allocate, queue and individually answer a request per
+      // departure — the burst the bound exists to absorb, absorbed nowhere. It is
+      // collapsed HERE, where the burst is produced, into the same single request.
+      //
+      // The owed recovery is DERIVED, not remembered
+      // ([`ScopeState::owes_whole_root`]): a coverage set last verified in a world
+      // this scope has left, or a cover parked on a round trip that world took
+      // with it. It is asked for against the frame THIS read just published, which
+      // is the whole reason it waits for one.
+      let recover = state.fails_closed()
+        || (fanotify
+          && (state.owes_whole_root()
+            || state.pending_admits.len() + departed.len() > MAX_PENDING_ADMITS));
+      if recover {
+        // The whole-root cover DOMINATES every located cover this frame computed
+        // — arrivals, replacements and departures alike — so those are dropped
+        // rather than emitted alongside it. On fanotify it also subsumes every
+        // admission round trip they would have opened: the recovery reseeds the
+        // whole map, which admits strictly more ground than one located walk per
+        // departure, and the recovery's own whole-root generation re-records every
+        // boundary that is still live — which is what makes dropping the condemned
+        // records here safe without a `StillCovered` lapse for each.
+        covered.clear();
+        drop(departed);
+        if fanotify {
+          recover_root = true;
+        } else {
+          covers.push(Scope::Root(scope));
+        }
+      } else if fanotify {
+        // Where a departure's cover goes. Every backend but fanotify covers here
+        // and now: its source sees the revealed ground the instant the mount
+        // leaves, so the cover is the whole obligation. FANOTIFY admits by
+        // directory-handle MEMBERSHIP and its seed walk stopped at the mount, so
+        // the revealed ground has no handles at all — covering now would send the
+        // consumer to re-read a subtree the source is still blind to, and every
+        // mutation until the next whole-map reseed would drop with no loss signal.
+        // There, the cover PARKS on an admission round trip and the reply releases
+        // it (see [`PendingAdmit`] and [`Effect::AdmitBoundaries`]).
+        Self::park_admissions(
+          &mut self.effects,
+          &mut self.admit_seq,
+          scope,
+          state,
+          departed,
+        );
+      } else {
+        covered.extend(departed.into_iter().map(|record| record.location));
+      }
+      // Lowered AFTER the set is settled: `lower` reads only the scope root,
+      // which this refresh does not touch, so the order is free and taking it
+      // here keeps the borrow of the set and the borrow of the state apart.
+      covers.extend(covered.iter().map(|path| mount_cover(state, scope, path)));
+      // REPLACEMENT, and it is the whole table component. The union that stood
+      // here kept every location the host ever presented, for the life of the
+      // scope: on a container host cycling mount namespaces that is one `PathBuf`
+      // per historical mountpoint plus a linear scan of that history per current
+      // row per refresh, and "a stale prefix only vetoes" does not bound it.
+      //
+      // What the union was protecting is real, and it now lives in
+      // [`ScopeState::learned_mounts`] where no snapshot can reach it: an in-band
+      // mount word (a mount that may postdate the read in flight) and a probed
+      // foreign device (a path no row will ever name). What is left here is one
+      // snapshot's rows, and a row absent from an AUTHORITATIVE read is a mount the
+      // host says is gone — the very fact that makes the path root-device again.
+      // The reads are serialized (at most one outstanding, and a stale one
+      // publishes no table at all), so this read is strictly newer than the one it
+      // replaces; and on a backend with no absence-trust consumer the component
+      // stays empty, which [`device_trusted`] reads as no trust rather than as
+      // total trust.
+      //
+      // The enriched rows change nothing here: trust reads LOCATIONS.
+      install_mount_table(state, frame.iter().map(|row| row.location.clone()));
       state.mounts_authoritative = true;
     } else {
       // The live table could not be read, so this refresh installs no table — and a
@@ -3840,10 +6588,62 @@ impl DriverCore {
       // would keep proving paths root-device by their ABSENCE from a table we just
       // failed to re-read across the very mount change this refresh was meant to
       // reconcile. Close it: absence from an unreadable table is not evidence of
-      // in-root-device. The trust-REDUCING learned prefixes in `state.mounts` are
-      // kept (they only ever veto trust, never grant it) for the next authoritative
-      // refresh to union onto.
+      // in-root-device. Both veto components are KEPT — this read witnessed no
+      // departure, and a table it could not see condemns nothing — so the last
+      // authoritative rows stand for the next authoritative read to replace, and
+      // the learned prefixes stand until their own evidence retires them. The
+      // coverage set is kept for the same
+      // reason and diffed by the next authoritative read: a read that could not
+      // see the table has not witnessed anything arrive or depart, and treating
+      // its empty result as a diff would report the whole table gone on one bad
+      // read.
       state.mounts_authoritative = false;
+      // The owed recovery is judged HERE TOO, and that is not symmetry for its own
+      // sake. Confining the discharge to the authoritative branch is what left a
+      // rejected cutoff with no retry at all: with `root_liveness_interval` zero —
+      // a supported setting — or a persistently unreadable mountinfo, the one
+      // refresh a mismatch arms comes back here, closes trust, schedules nothing,
+      // and the collapsed admissions stay parked forever with neither their
+      // generation nor a root cover ever published.
+      //
+      // Nothing about the need depends on the table. The frame was adopted above
+      // this branch (out of the root's own `statx`, which a failed table read does
+      // not touch), so the request this issues is stamped with a frame just read —
+      // exactly what waiting for a refresh was ever for.
+      recover_root = fanotify && state.owes_whole_root();
+    }
+
+    // ONE request, whichever branch decided it, and stamped with the frame this
+    // refresh has just published: the request names the world its reply will be
+    // judged against.
+    if recover_root {
+      let epoch = state.frame_epoch;
+      Self::request_root_recovery(&mut self.effects, &mut self.admit_seq, scope, state, epoch);
+    }
+
+    let kernel_recursive = state.profile.is_kernel_recursive();
+
+    // One COVER per mount transition — never a delivery. A bind mount, or a
+    // mount in another namespace, can make the same directory appear and
+    // disappear with the watched object itself unchanged, so a synthesized
+    // record would fabricate an event that did not happen; a cover only obliges
+    // re-enumeration, and over-sending one is a cost rather than a bug. This is
+    // the same shape (and the same reasoning) as `compile::fsevents`'
+    // `plan_mount`, which plans `Planned::Over(located(..))` for the volume
+    // change macOS does signal — in BOTH directions, as this does.
+    //
+    // Sent for a KERNEL-RECURSIVE profile too, unlike the frame replay below:
+    // that replay is skipped there because only a descending scope consumes
+    // `root_mnt_id` at all, whereas a mount transition changes what the tree
+    // CONTAINS — the directory a departed mount was covering is visible again
+    // and its contents were never enumerated; the ground an arriving mount
+    // shadows was enumerated and is now something else — which one recursive
+    // mark leaves just as unread as per-directory watches do.
+    if !covers.is_empty() {
+      for cover in covers {
+        self.monitor.on_overflow(cover, now);
+      }
+      self.drain_monitor();
     }
 
     // A CHANGED frame means a same-object re-mount moved the root to a different
@@ -3855,7 +6655,7 @@ impl DriverCore {
     // the root under the now-authoritative frame. The loss that drove this refresh
     // also rescans, but that rescan races AHEAD of this completion and reads the
     // pre-adoption frame; this replay reruns it once the frame is current.
-    if frame_changed && !state.profile.is_kernel_recursive() {
+    if frame_changed && !kernel_recursive {
       self.monitor.on_overflow(Scope::Root(scope), now);
       self.drain_monitor();
     }
@@ -3937,10 +6737,10 @@ impl DriverCore {
 
   /// Advances time: resolves rename halves whose pairing window elapsed,
   /// re-arms refused parked deliveries whose retry deadline passed, and fires
-  /// the periodic root-liveness re-stat for every signal-silent scope whose
-  /// tick came due (the ONE timer the fanotify composition adds — a quiet
-  /// unmount produces neither a birth nor a loss refresh, so without this the
-  /// death would never be observed).
+  /// the periodic mount refresh for every signal-silent scope whose tick came
+  /// due (the ONE timer this composition adds — a quiet unmount produces neither
+  /// a birth nor a loss refresh, so without this neither the root's death nor a
+  /// departed mount below it would ever be observed).
   pub(crate) fn on_timeout(&mut self, now: Instant) {
     self.monitor.handle_timeout(now);
     for state in self.scopes.values_mut() {
@@ -3959,10 +6759,18 @@ impl DriverCore {
       }
     }
     // Fire due liveness ticks: each arms the existing `RefreshMounts` (whose
-    // completion runs the root-death mapping) and re-arms the deadline for the
-    // next interval. Collected first so `arm_refresh` can take `&mut effects`
-    // while each scope is mutated in turn. A refresh already in flight coalesces
-    // (arm_refresh sets `refresh_stale`), so a tick never stacks effects.
+    // completion runs the root-death mapping AND the departure diff) and re-arms
+    // the deadline for the next interval. Collected first so `arm_refresh` can
+    // take `&mut effects` while each scope is mutated in turn.
+    //
+    // A refresh already in flight coalesces — `RefreshCause::Periodic`, so the
+    // tick rides that read rather than condemning it. The deadline still
+    // advances here, so a coalesced tick loses no obligation: the read it rode
+    // publishes (installing the table, adopting the frame, deriving departures)
+    // and re-seeds the deadline itself on its alive completion, so the cadence
+    // simply re-bases off whichever of the two lands later. Condemning it
+    // instead is what starves the whole publication path once refresh latency
+    // reaches the interval (see [`RefreshCause`]).
     let interval = self.root_liveness_interval;
     let due: Vec<ScopeId> = self
       .scopes
@@ -3976,7 +6784,7 @@ impl DriverCore {
       .collect();
     for scope in due {
       if let Some(state) = self.scopes.get_mut(&scope) {
-        Self::arm_refresh(&mut self.effects, scope, state);
+        Self::arm_refresh(&mut self.effects, scope, state, RefreshCause::Periodic);
         Self::arm_liveness(state, interval, now);
       }
     }
@@ -4227,8 +7035,111 @@ impl DriverCore {
         batch
       }
     };
+    // BEFORE the fence, and before anything is fed: a record naming a vanished
+    // object must be addressed against the tree as it stood when the record was
+    // produced, and the fence is free to drop records whose truth about the
+    // filesystem this pass still wants.
+    self.retire_removed_boundaries(state, &batch);
     self.fence_exclusions(state, scope, &mut batch, now);
     batch
+  }
+
+  /// Drops every DEVICE-ONLY boundary record whose location this read says is
+  /// gone — the lifecycle the provenance partition leaves them, made real.
+  ///
+  /// # The debt this pays, and the part it CANNOT pay
+  ///
+  /// The refresh cannot remove a device-only record: the whole point of the
+  /// partition is that a btrfs subvolume is absent from every frame by
+  /// construction, so condemning it there is a cover storm. The design's answer —
+  /// *"its lifecycle is the ordinary event flow, since deleting a subvolume emits
+  /// real delete events on the parent"* — was true about the filesystem and false
+  /// about the code until this pass existed: the events arrived and no one
+  /// consumed them.
+  ///
+  /// This pass reads the EVENT STREAM, which is exactly what a loss window
+  /// empties. A deletion dropped by an overflow is a deletion this pass never
+  /// sees, and before the generations existed that record stood for the scope's
+  /// life. Two other mechanisms cover that gap — [`retire_relisted_boundaries`]
+  /// on a descending profile and [`retire_unwalked_boundaries`] on a
+  /// kernel-recursive one, both driven by the re-observation the loss recovery
+  /// already runs — and [`MAX_DEVICE_ONLY_BOUNDARIES`] bounds the set
+  /// unconditionally when every one of them has failed. The remaining removal
+  /// path, [`settle`](Self::settle)'s signalled-unmount `retain`, serves the
+  /// FSEvents `UNMOUNT` word and reaches nothing else.
+  ///
+  /// # Which records, and which kinds
+  ///
+  /// Only the device-only partition. A mount-backed record's removal is the
+  /// REFRESH's job and it does it with a cover; short-circuiting it here would
+  /// silence a departure cover that the primary detector owes — so this pass
+  /// asks [`MountRecord::condemnable`] and skips everything it answers `true`
+  /// for. That also makes the pass provably inert over the state the refresh
+  /// alone produces, where every record is row-confirmed.
+  ///
+  /// Four kinds say an object left a location: `Removed` and `MovedFrom` for a
+  /// named child, `DeleteSelf` and `MoveSelf` for a watched directory itself.
+  /// `Ignored` is deliberately NOT among them — it is watch lifecycle, not object
+  /// lifecycle, and fires on the driver's OWN prune, where nothing on disk moved
+  /// at all.
+  ///
+  /// A drop is at-or-under the vanished path: a boundary inside a directory that
+  /// went away went away with it.
+  ///
+  /// # No cover is owed
+  ///
+  /// The record that drives the drop IS the coverage — a delete or a move-out is
+  /// delivered to the consumer on its own account. The reasoning deliberately
+  /// does NOT lean on "an exempt record obliges nothing": exempt does not mean
+  /// not-a-mount ([`MountRecord::proven_subvolume`]), and a genuine vfsmount is
+  /// recorded in exactly that shape on a host that answers no mount ids. It
+  /// leans on what the driving record proves instead — a mountpoint cannot be
+  /// unlinked or renamed while a mount is on it, so a location this pass hears
+  /// vanish is a location whose boundary was already detached, and the ground
+  /// the detach revealed left with the directory. Should a boundary somehow
+  /// survive at the location, the enumerate that re-reads the parent re-declines
+  /// it and seam 1 records it again.
+  fn retire_removed_boundaries(&self, state: &mut ScopeState, batch: &PendingBatch) {
+    let root_frame = state.root_mnt_id;
+    // Nothing exempt to drop: the pass is a pure no-op over a set the refresh
+    // alone built, so it never walks a read for it.
+    if !state
+      .mounts_baseline
+      .iter()
+      .any(|record| !record.condemnable(root_frame))
+    {
+      return;
+    }
+    let mut gone: Vec<PathBuf> = Vec::new();
+    for planned in batch
+      .items
+      .iter()
+      .flat_map(|item| item.planned.iter())
+      .chain(batch.trailing.iter())
+    {
+      let Planned::Rec(rec) = planned else {
+        continue;
+      };
+      if !matches!(
+        rec.kind(),
+        RecordKind::Removed | RecordKind::MovedFrom | RecordKind::DeleteSelf | RecordKind::MoveSelf
+      ) {
+        continue;
+      }
+      if let Some(path) = self.anchored_path(state, rec.watch(), rec.target()) {
+        gone.push(path);
+      }
+    }
+    if gone.is_empty() {
+      return;
+    }
+    // This pass runs on EVERY compiled batch, so the containment test is the one
+    // place a per-event cost can compound: a delete-heavy batch and a scope at
+    // the record bound make the naive scan `records x vanished` per batch.
+    let gone: BTreeSet<&Path> = gone.iter().map(PathBuf::as_path).collect();
+    state.mounts_baseline.retain(|record| {
+      record.condemnable(root_frame) || !under_any_prefix(&gone, &record.location)
+    });
   }
 
   /// Drops every compiled input the caller's exclusions cover — the live half of
@@ -4693,7 +7604,21 @@ impl DriverCore {
       Self::feed(monitor, planned, now);
     }
     for path in deferred {
-      state.mounts.retain(|m| m != &path);
+      // BOTH halves. The word is evidence the mount is gone, which is the one
+      // thing that may retire a learned prefix — and leaving the matching table
+      // row standing until the next snapshot would keep vetoing on a mount the
+      // source has already announced departed.
+      state.learned_mounts.retain(|m| m != &path);
+      state.mount_table.retain(|m| m != &path);
+      // The coverage set follows the SIGNALLED removal too. Every path
+      // deferred here came from an unmount word whose `plan_mount` already
+      // planned the located cover for it, so leaving it recorded would make the
+      // next authoritative read derive a departure that was covered in band —
+      // one duplicate cover per signalled unmount. Dropping it can only ever
+      // shrink the diff, and only for departures a backend announced.
+      state
+        .mounts_baseline
+        .retain(|record| record.location != path);
     }
   }
 
@@ -4886,7 +7811,9 @@ impl DriverCore {
               None => vec![Planned::Over(located(state.watch, target))],
             }
           }
-          ProbeOutcome::Present { kind, file_id, dev } => {
+          ProbeOutcome::Present {
+            kind, file_id, dev, ..
+          } => {
             learn_device(state, &path, dev);
             let proven = content.maybe_created(flags.item_created());
             let node = mint(state, &path, file_id, Some(dev));
@@ -4939,6 +7866,7 @@ impl DriverCore {
             kind,
             file_id: probed,
             dev,
+            ..
           } => {
             learn_device(state, &path, dev);
             // Identity binding: the cookie and its published evidence derive
@@ -5151,6 +8079,7 @@ impl DriverCore {
               name: Segment::new(name),
               path: root,
               expected,
+              frame: state.frame(),
             });
           } else if let Some(child) = cmd.target().as_child() {
             let parent = child.parent();
@@ -5181,6 +8110,16 @@ impl DriverCore {
                 .and_then(|state| state.root_dev)
                 .map(|dev| ExpectedObject { dev, ino: id.get() })
             });
+            // THE arm this design exists to refuse. A child learned from a
+            // `Created` record was never enumerated, so `crosses_mount_boundary`
+            // never judged it and `expected` above is `None` (inotify's
+            // `Created` carries no identity) — leaving the executor's own object
+            // guard vacuous. The frame is what the executor judges it on.
+            let frame = self
+              .scopes
+              .get(&scope)
+              .map(ScopeState::frame)
+              .unwrap_or_default();
             self.effects.push_back(Effect::AddWatch {
               scope,
               watch: cmd.id(),
@@ -5189,6 +8128,7 @@ impl DriverCore {
               name,
               path,
               expected,
+              frame,
             });
           }
         }
@@ -5332,7 +8272,13 @@ impl DriverCore {
             continue;
           };
           let path = parent_path.join(child.name().as_str());
-          let probe = self.mint_probe(scope, ProbePurpose::SlotKind { req: cmd.req() });
+          let probe = self.mint_probe(
+            scope,
+            ProbePurpose::SlotKind {
+              req: cmd.req(),
+              path: path.clone(),
+            },
+          );
           self.effects.push_back(Effect::Probe { probe, path });
         }
         other => {
@@ -5551,6 +8497,33 @@ fn record_proved(
   Some(rec)
 }
 
+/// The cover ONE mount transition at `path` lowers to — the single mapping the
+/// mount design's covers use, so the refresh's own arrival/departure/replacement
+/// covers and the admission round trip's parked one can never lower differently.
+///
+/// [`Lowered::Root`] and [`Lowered::Outside`] name the two cases that address no
+/// location: the root itself (whose own mount changes are the death gate's
+/// business and the frame replay's, not this diff's) and a path that will not
+/// lower — a mount point under the root with a non-UTF-8 component. Both
+/// over-cover the whole root, exactly as `compile::fsevents`' `plan_mount` does
+/// for its own un-lowerable volume change.
+///
+/// **This site is where representability is ALLOWED to matter, and the only one.**
+/// The coverage set is keyed by `PathBuf` and screens on raw containment
+/// ([`strictly_under_root`]), so an unrepresentable boundary is recorded like any
+/// other and its departure is derived like any other; it is here — where a
+/// location has to be spelled for a consumer — that the answer degrades. Moving
+/// that decision back to the record is the R7 F1 defect: `Outside` there is
+/// silence, whereas `Outside` here is a whole-root `Rescan`.
+fn mount_cover(state: &ScopeState, scope: ScopeId, path: &Path) -> Scope {
+  match lower(state, path) {
+    // The ordinary case: a mount BELOW the root moved, so everything under that
+    // location needs re-enumeration.
+    Lowered::Target(location) => located(state.watch, Some(location)),
+    Lowered::Root | Lowered::Outside => Scope::Root(scope),
+  }
+}
+
 /// A located subtree overflow at `target` under `watch` (the watch itself
 /// when `target` is `None`).
 fn located(watch: WatchId, target: Option<Location>) -> Scope {
@@ -5623,6 +8596,464 @@ fn crosses_mount_boundary(state: &ScopeState, entry: &RawDirEntry) -> bool {
     (Some(root_mnt), Some(entry_mnt)) if root_mnt != entry_mnt
   );
   device_boundary || mount_boundary
+}
+
+/// Whether one half of a recorded mount's identity CHANGED between what was
+/// recorded and what a table read now reports.
+///
+/// A change is two KNOWN values that disagree. `None` is unknown, never
+/// different: a record and a row can carry different halves of the truth simply
+/// because different observers answered them (a probe reads a device but no
+/// mount id; a `getfsstat` row reads neither; a mountinfo line reads both), and
+/// reading that as a replacement would cover a mount nothing did to. The same
+/// `(Some, Some)` discipline [`crosses_mount_boundary`] fences on and
+/// `root_mnt_id`'s adoption follows — on a host that answers no ids at all, the
+/// same-path remount is simply not observable, which is the honest degrade
+/// rather than a silently disabled check.
+const fn identity_changed(recorded: Option<u64>, observed: Option<u64>) -> bool {
+  matches!((recorded, observed), (Some(was), Some(now)) if was != now)
+}
+
+/// What one mount-table row means for the coverage set, decided against a
+/// location index built ONCE per refresh rather than by scanning the records per
+/// row. Carries indices only, so the index it was planned from can be dropped
+/// before the set is mutated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameStep {
+  /// A record already stands at this row's location, at this index: adopt the
+  /// row's identity, upgrade its provenance, and cover it if the identity
+  /// CHANGED.
+  Confirm(usize),
+  /// No record stands there: this row is an arrival, and owes a cover.
+  Arrive,
+  /// An earlier row in this same frame already arrived at this location. Inert —
+  /// the record it pushed already carries this row's identity.
+  Duplicate,
+}
+
+/// Records one boundary a SEAM observed into the coverage set — the latency half
+/// of the mount design, and for the device-only class the ONLY half.
+///
+/// The seams (a declined dir entry, an os-layer walk's decline, a
+/// boundary-bearing probe answer) see a boundary at the moment the watcher's own
+/// machinery touched it, ahead of the next table read. What that buys differs by
+/// partition — and, on a kernel-recursive profile, by seam: the WALK is not
+/// latency there but the sole observer of every boundary, since that profile runs
+/// no enumerate whose fence could learn one. Conflating the partitions is what
+/// the design's provenance rule exists to prevent:
+///
+/// - for a **vfsmount** it is LATENCY only. The refresh sees every mount this
+///   sees, so without a seam record a boundary observed now merely waits for the
+///   next tick to enter the set — and only a departure INSIDE that window is
+///   missed. With one, that window closes.
+/// - for a **device-only** boundary — a btrfs subvolume, which trips the device
+///   belt carrying the root's OWN mount id — a seam is the only observer there
+///   will ever be. `/proc/self/mountinfo` has no row for it and never will, so
+///   it enters not-row-confirmed and [`MountRecord::condemnable`] keeps it out
+///   of every condemnation mechanism.
+///
+/// # Three rules, each of which a naive version gets wrong
+///
+/// **Strictly under the root — tested on the RAW path.** A record AT the root
+/// could never be matched by a frame (`parse_mountinfo` filters the root's own
+/// row out), so a condemnable one would be covered and re-recorded on every
+/// single tick. [`strictly_under_root`] is the whole test, and it is
+/// `Path`-component-wise rather than protocol-representable ON PURPOSE.
+///
+/// This set is INTERNAL and keyed by `PathBuf`. Nothing here addresses a
+/// consumer, so nothing here needs a location the protocol can spell — and
+/// requiring one dropped observations that were fully identified. A Linux
+/// pathname is arbitrary bytes, so a mount can perfectly well sit at a location
+/// with a non-UTF-8 component; the [`Lowered::Target`] guard this replaced
+/// classified every such observation [`Lowered::Outside`] and returned, which
+/// meant a fanotify walk that DECLINED that boundary — reporting its raw path and
+/// its mount identity, the only witness there will ever be for a mount that
+/// arrived after the spawn table snapshot — recorded nothing at all. A lazy
+/// departure below it then produced neither an admission nor a cover, and the
+/// revealed subtree stayed absent from the FID map with its events silently
+/// rejected.
+///
+/// Lowering belongs at COVER EMISSION, where it already has a safe degrade:
+/// [`mount_cover`] answers `Scope::Root` for a location it cannot spell, so an
+/// unrepresentable boundary costs a WHOLE-ROOT cover rather than silence. That is
+/// strictly the over-covering direction, which is the one this design takes
+/// everywhere else too.
+///
+/// **Fill in, never overwrite — over the UNKNOWN.** An existing record keeps the
+/// identity it holds; a seam only supplies a half that is still unknown.
+/// Observers differ in capability (a probe answers a device but no mount id), so
+/// adopting a fresher value would drop a known half to unknown on one path and,
+/// worse, would let a seam quietly ALIGN a record with a mount that replaced the
+/// one it describes — silencing the refresh's replacement cover, which is the
+/// only thing that sees a same-path remount at all.
+///
+/// That rule is about `unknown -> known`, and it must not swallow
+/// `known -> DIFFERENT known`, which is the distinct fact [`identity_changed`]
+/// already names: two `Some` halves that disagree are a REPLACEMENT, the same
+/// reading the refresh's own [`FrameStep::Confirm`] arm gives a row that
+/// disagrees with the record it lands on. The REFRESH delivers that cover, so
+/// this seam leaves it alone and merely fills in — the paragraph above is
+/// exactly why. There is no seam-side promptness arm: one existed, keyed to a
+/// per-record absence claim, and it went with the claim. A scope that cannot
+/// tell one incarnation from another covers its whole root every refresh
+/// instead ([`ScopeState::fails_closed`]), which is strictly stronger than any
+/// cover this seam could have stood.
+///
+/// **Nothing beneath a boundary already recorded.** Ground under a live recorded
+/// boundary is already declined, so a second record there addresses coverage
+/// nobody has, and when that boundary departs its cover dominates the whole
+/// subtree. It is the containment [`learn_device`] applies to the trust table,
+/// and it hides no real mount — the refresh's arrival walk records rows
+/// DIRECTLY, never through here.
+///
+/// This rule was once documented as the set's GROWTH BOUND, and it never was
+/// one. It refuses a record BENEATH an existing one and says nothing about a
+/// record ABOVE it or BESIDE it: `/r/a` still enters a set already holding
+/// `/r/a/b`, and a flat run of siblings — `/r/a`, `/r/b`, `/r/c`, one per
+/// subvolume ever created and deleted — is contained by nothing at all. The real
+/// bound is [`MAX_DEVICE_ONLY_BOUNDARIES`], enforced below; the reconciliation
+/// that keeps the set ACCURATE rather than merely bounded is
+/// [`retire_unwalked_boundaries`] (kernel-recursive) and
+/// [`retire_relisted_boundaries`] (descending).
+///
+/// # Nothing is owed back to the caller
+///
+/// This returns nothing, and that is a claim rather than an omission. Every
+/// outcome — recorded, filled in, contained, re-observed unchanged, or refused at
+/// the bound — leaves the caller nothing to do. The refusal in particular:
+/// [`make_room_for_device_only`] only ever refuses when the device-only partition
+/// is FULL of ambiguous records (a proven subvolume would have been evicted to
+/// make room), and a scope holding even one ambiguous record already covers its
+/// whole root on every authoritative refresh. The dominating cover the caller
+/// used to stand for a refusal is therefore already standing, once per refresh,
+/// for as long as the refusal can recur.
+fn record_boundary(state: &mut ScopeState, location: &Path, dev: Option<u64>, mnt_id: Option<u64>) {
+  if !strictly_under_root(state, location) {
+    return;
+  }
+  if let Some(record) = state
+    .mounts_baseline
+    .iter_mut()
+    .find(|record| record.location == location)
+  {
+    // Fill in over the UNKNOWN only. A known half is never moved by a seam, even
+    // by an observation that disagrees with it: adopting there would align the
+    // record with the mount that REPLACED the one it describes, silencing the
+    // refresh's replacement cover, which is the only observer a same-path remount
+    // has.
+    record.dev = record.dev.or(dev);
+    record.mnt_id = record.mnt_id.or(mnt_id);
+    return;
+  }
+  if state
+    .mounts_baseline
+    .iter()
+    .any(|record| location.starts_with(&record.location))
+  {
+    return;
+  }
+  let record = MountRecord::observed(location.to_path_buf(), dev, mnt_id);
+  // The HARD BOUND, applied to the device-only partition alone and applied
+  // BEFORE the push so the set can never exceed it even for an instant. A
+  // mount-backed record is not bounded here: the refresh owns its removal and
+  // does it with a cover, and the number of live vfsmounts under a root is the
+  // kernel's business rather than this set's.
+  //
+  // Room is made by evicting a PROVEN subvolume, never an ambiguous record that
+  // an authoritative row could still upgrade into a departure witness. When
+  // there is no proven record to evict the partition is full of possible
+  // witnesses, and THIS observation is refused instead — the direction that
+  // over-covers rather than the one that loses a cover. See
+  // [`make_room_for_device_only`].
+  if !record.condemnable(state.root_mnt_id)
+    && !make_room_for_device_only(state, MAX_DEVICE_ONLY_BOUNDARIES)
+  {
+    // Refused, and refused SILENTLY on purpose. Room is only ever short of a
+    // proven subvolume to evict when the device-only partition is full of
+    // AMBIGUOUS records — so the scope is already failing closed, and every
+    // authoritative refresh is already covering the whole root, which dominates
+    // anything a per-refusal announcement could have stood. The old announcement
+    // was latched per saturation episode precisely because it would otherwise
+    // storm, and that latch was itself a finding: one refusal silenced every
+    // later one for the life of the episode.
+    return;
+  }
+  state.mounts_baseline.push(record);
+}
+
+/// The most DEVICE-ONLY boundary records one scope may hold at once.
+///
+/// This is the set's real growth bound, and it holds UNCONDITIONALLY — when
+/// every reconciliation path has failed, when the event stream that carries
+/// deletions is lost, when the walk that would establish a generation never runs.
+/// The reconciliations keep the set accurate; this keeps it finite.
+///
+/// Sized so it binds only pathology: a real btrfs/snapper/docker layout under one
+/// watched root holds tens of subvolumes, not thousands, and every genuine
+/// vfsmount is row-confirmed by the first authoritative refresh and so is not in
+/// this partition at all. A scope that reaches the bound is one where distinct
+/// boundary locations churned past every reconciliation, and holding 1024 of them
+/// is strictly better than holding all of them forever.
+///
+/// WHICH 1024 is [`make_room_for_device_only`]'s decision, and it is not simply
+/// "the most recent": a record that could still be upgraded into a departure
+/// witness is kept and the new observation refused instead, because an extra
+/// arrival cover is a cost and a lost departure cover is a hole.
+const MAX_DEVICE_ONLY_BOUNDARIES: usize = 1024;
+
+/// The most departure covers one fanotify scope may hold PARKED on admission
+/// round trips at once. A refresh that would push past it collapses its whole
+/// departure set into one [`Effect::RecoverRoot`] instead.
+///
+/// The burst this bounds is real and it is the namespace's: one refresh can
+/// condemn every mount under the root at once (a container teardown, a
+/// `umount -R`, an automounter expiring a tree). Each parked entry is a
+/// `PathBuf` plus a request the source must queue, walk and answer individually
+/// — and the answering side searches the parked vector per reply, so an
+/// unbounded burst is quadratic on top of unbounded.
+///
+/// The collapse is not a weaker answer. A whole-map reseed walks strictly more
+/// ground than the located walks it replaces, its complete generation re-records
+/// every boundary that is still live (which is what a `StillCovered` would have
+/// done, one at a time), and the root cover behind it dominates every located
+/// cover it stands in for.
+///
+/// Sized so it binds only the burst: a handful of simultaneous departures is
+/// ordinary and each deserves its own located walk and its own precise cover,
+/// while sixty-four at once is a namespace-scale event whose one recovery is both
+/// cheaper and stronger. Deliberately the same number the source's own backlog
+/// cap uses, so the producer collapses before the consumer ever has to.
+const MAX_PENDING_ADMITS: usize = 64;
+
+/// Frees a slot in the device-only partition for one more record, or answers
+/// `false` when it could not without dropping a record that may yet owe a cover
+/// — the eviction half of [`MAX_DEVICE_ONLY_BOUNDARIES`].
+///
+/// # What may be evicted, and what may NOT
+///
+/// An earlier version of this evicted the oldest record the partition held, on
+/// the reasoning that "exempt from condemnation" means "obliges no cover, so
+/// dropping one costs at most an extra arrival cover". That reasoning reads
+/// [`MountRecord::condemnable`]`== false` as "not a mount", and it is not:
+/// the exempt partition holds two populations
+/// ([`MountRecord::proven_subvolume`]).
+///
+/// - A **proven** record — both mount ids known and equal — describes something
+///   no mountinfo read will ever list. No later observation can promote it, so
+///   it can never become the witness for a cover, and it leaves silently.
+/// - An **ambiguous** record — either id unknown — is the exact shape a GENUINE
+///   post-baseline vfsmount takes on a host that answers no mount ids, until an
+///   authoritative row upgrades it to row-confirmed and therefore condemnable.
+///   Dropping it discards the only thing that upgrade can reach.
+///
+/// So ambiguous records are never evicted. The set is bounded at the INTAKE side
+/// instead: when the partition is full of records that might yet owe a cover, the
+/// new observation is refused (`false`) rather than an old witness discarded.
+///
+/// # Why refusing the new observation loses nothing
+///
+/// A refused observation is not a missed boundary. The fence that declined it
+/// reads the scope's FRAME, never this set, so descent is still stopped there;
+/// and the set's only jobs for an exempt record are to SUPPRESS a later arrival
+/// cover at that location and to block a redundant record beneath it. Refusing
+/// therefore only ever causes MORE covering — the next authoritative refresh
+/// finds no record at the location, reads its row as an ARRIVAL, covers it, and
+/// records it row-confirmed, from which point its departure is covered like any
+/// other vfsmount's. That is the same over-signal direction the design accepts
+/// for arrival covers generally.
+///
+/// # The bound still binds on a host that answers no mount ids
+///
+/// There, EVERY record is ambiguous, so nothing is ever evicted — and the set is
+/// still hard-bounded, because the refusal above caps intake at
+/// [`MAX_DEVICE_ONLY_BOUNDARIES`]. "Never evict ambiguous" and "hold a finite
+/// set" are only in tension if eviction is the only bound; making the intake the
+/// bound resolves it without ever paying for the fresh observation with a
+/// witness. The stale contents are reclaimed by the reconciliations that exist
+/// for exactly that ([`retire_unwalked_boundaries`],
+/// [`retire_relisted_boundaries`], [`DriverCore::retire_removed_boundaries`]) —
+/// this is the floor under them, not a substitute for them.
+///
+/// Oldest-first among the proven records because `mounts_baseline` is in
+/// insertion order, so the ones most likely to be stale are at the front.
+fn make_room_for_device_only(state: &mut ScopeState, cap: usize) -> bool {
+  let root_frame = state.root_mnt_id;
+  let device_only = state
+    .mounts_baseline
+    .iter()
+    .filter(|record| !record.condemnable(root_frame))
+    .count();
+  // One slot must be free for the caller's push, so the partition has to end
+  // BELOW the cap, not at it.
+  let mut excess = device_only.saturating_sub(cap.saturating_sub(1));
+  if excess == 0 {
+    return true;
+  }
+  state.mounts_baseline.retain(|record| {
+    if excess > 0 && record.proven_subvolume(root_frame) {
+      excess -= 1;
+      return false;
+    }
+    true
+  });
+  excess == 0
+}
+
+/// Whether `path` is AT or UNDER any member of `prefixes` — the containment test
+/// every retire pass makes, against a set built once for the whole pass.
+///
+/// The obvious spelling is `prefixes.iter().any(|p| path.starts_with(p))`, which
+/// is linear in the set for EVERY record and turns each pass into
+/// O(records x prefixes). Two of these passes run at event rate (one per compiled
+/// batch, one per directory listing), so that product is the shape that stalls a
+/// single-threaded driver. Probing `path`'s own ancestors against an ordered set
+/// is O(depth log prefixes) instead, and it is the same predicate:
+/// `a.starts_with(b)` holds exactly when some ancestor-or-self of `a` equals `b`.
+fn under_any_prefix(prefixes: &BTreeSet<&Path>, path: &Path) -> bool {
+  path.ancestors().any(|ancestor| prefixes.contains(ancestor))
+}
+
+/// Retires every DEVICE-ONLY record a COMPLETE whole-root walk did not decline —
+/// the generation half of the device-only lifecycle, on the profile that has no
+/// other.
+///
+/// A kernel-recursive scope runs no enumerate, so
+/// [`retire_relisted_boundaries`]'s re-listing never happens there; and the mount
+/// table cannot retire a device-only record by construction. That left the
+/// compiled-removal pass ([`DriverCore::retire_removed_boundaries`]) as the sole
+/// removal path, and a loss window that swallowed a deletion left its record
+/// standing for the scope's life. A complete walk from the root is the answer
+/// already available: it declines every boundary that is still there, so anything
+/// device-only it did NOT decline is not there any more.
+///
+/// Two exclusions, both load-bearing:
+///
+/// - **mount-backed records are untouched.** Their removal is the refresh's, and
+///   it owes a cover; retiring one here would silence the departure cover the
+///   primary detector is responsible for.
+/// - **nothing UNDER a decline is retired.** A walk stops at a boundary, so it
+///   observed nothing below one and may not speak for it. Reachable through the
+///   containment rule's one gap — a record ABOVE an existing one is accepted —
+///   so it is guarded rather than argued away.
+///
+/// # Why no cover is owed — and it is NOT "exempt records oblige nothing"
+///
+/// Exempt does not mean not-a-mount ([`MountRecord::proven_subvolume`]): on a
+/// host that answers no mount ids a genuine vfsmount is recorded in exactly the
+/// exempt shape, and if one of THOSE departs, the ground it revealed does owe a
+/// cover. What discharges it here is the CALLER, not the partition. There are
+/// exactly two, and each carries its own root-wide cover:
+///
+/// - the reader's POST-LOSS reseed, which enqueues a root-wide `Overflow`
+///   immediately BEHIND its [`WalkReach::WholeRoot`](crate::os::WalkReach) report
+///   on the source's one ordered queue;
+/// - the whole-root RECOVERY, whose generation and root cover are the same
+///   indivisible message ([`DriverCore::on_root_recovered`]).
+///
+/// So every retirement this pass makes is followed, in order, by a cover over the
+/// entire root — which dominates any located cover a departed boundary could have
+/// owed. A future caller that reports a complete generation WITHOUT a covering
+/// loss behind it breaks that and must supply its own cover.
+///
+/// Neither caller's generation reaches this pass unchecked: both are judged
+/// against the root mount id their walk fenced against before anything is retired,
+/// because "everything still standing under the root" names a particular root
+/// mount and this pass deletes from the one partition nothing else can restore.
+fn retire_unwalked_boundaries(state: &mut ScopeState, declined: &[crate::os::DeclinedBoundary]) {
+  let root_frame = state.root_mnt_id;
+  if !state
+    .mounts_baseline
+    .iter()
+    .any(|record| !record.condemnable(root_frame))
+  {
+    return;
+  }
+  let observed: BTreeSet<&Path> = declined
+    .iter()
+    .map(|boundary| boundary.location.as_path())
+    .collect();
+  state.mounts_baseline.retain(|record| {
+    if record.condemnable(root_frame) {
+      return true;
+    }
+    under_any_prefix(&observed, &record.location)
+  });
+}
+
+/// Retires every DEVICE-ONLY record at a DIRECT CHILD of `dir` that a complete,
+/// non-lossy listing of `dir` did not decline — the generation half of the
+/// device-only lifecycle on a DESCENDING profile.
+///
+/// A listing is authoritative about exactly one level: it names every child of
+/// `dir` that exists. So a device-only record at a child the listing did not
+/// name is a boundary whose directory is gone, and one at a child the listing
+/// named WITHOUT declining is a location that is no longer a boundary at all
+/// (the subvolume was deleted and an ordinary directory took its place). Either
+/// way nothing else would ever drop it once a loss window ate the deletion
+/// record the compiled-removal pass reads.
+///
+/// `kept` is every child path this listing DECLINED or EXCLUDED. An exclusion is
+/// there for honesty rather than necessity: an excluded child is never recorded
+/// through any seam, so it should never be a candidate — but the listing skips
+/// it before the fence, so it cannot be read as "seen and not a boundary".
+///
+/// Callers must skip an INCOMPLETE or lossy listing entirely: an absent name
+/// proves nothing when the read was cut short.
+///
+/// # Why no cover is owed
+///
+/// NOT because an exempt record obliges nothing — it may be a genuine vfsmount
+/// recorded on a host that answers no mount ids
+/// ([`MountRecord::proven_subvolume`]) — but because the LISTING that retires it
+/// is itself the re-observation. A child that stopped being a boundary comes back
+/// from this very read as an ordinary directory, so the Monitor's own
+/// reconciliation arms it and enumerates it (a listed directory with no child
+/// watch is armed additively), and the ground the departure revealed is read on
+/// that crawl. A child the read did not name at all is gone, and there is no
+/// ground under it to re-read. Should a boundary somehow still be there, the very
+/// next enumerate re-declines it and seam 1 records it again.
+fn retire_relisted_boundaries(state: &mut ScopeState, dir: &Path, kept: &[PathBuf]) {
+  let root_frame = state.root_mnt_id;
+  // The listing's names as a SET: a directory with many children and a scope at
+  // the record bound would otherwise pay `children x records` comparisons per
+  // enumerate. Exact membership, not containment — a listing speaks for its own
+  // level only.
+  let kept: BTreeSet<&Path> = kept.iter().map(PathBuf::as_path).collect();
+  state.mounts_baseline.retain(|record| {
+    if record.condemnable(root_frame) {
+      return true;
+    }
+    if record.location.parent() != Some(dir) {
+      return true;
+    }
+    kept.contains(record.location.as_path())
+  });
+}
+
+/// Records every boundary an os-layer WALK declined — SEAM 2's landing site, and
+/// the ONE body both halves of the seam use, so the spawn walk and the live walks
+/// can never record on different terms.
+///
+/// Each decline goes through [`record_boundary`] like every other seam
+/// observation: strictly under the root, filling in only halves still unknown,
+/// and nothing beneath a boundary already recorded. Nothing here mints a
+/// confirmation — a walk's fence is not a mountinfo row, so a record it creates
+/// enters NOT row-confirmed and the provenance partition decides the rest.
+///
+/// A walk never produces a decline BENEATH one of its own: a declined directory is
+/// not descended, so nothing under it is ever reached to be declined again. The
+/// containment rule therefore only ever fires here against a boundary some other
+/// observer recorded first, and one walk's declines are always mutually
+/// incomparable.
+fn record_declined(state: &mut ScopeState, declined: &[crate::os::DeclinedBoundary]) {
+  for boundary in declined {
+    record_boundary(
+      state,
+      &boundary.location,
+      Some(boundary.dev),
+      boundary.mnt_id,
+    );
+  }
 }
 
 /// The retained prefixes in `new` the PREVIOUS applied cover `prev` did not already cover —
@@ -5739,7 +9170,75 @@ fn device_trusted(state: &ScopeState, path: &Path, dev: Option<u64>) -> bool {
     (Some(_), None) => return false,
     (None, _) => {}
   }
-  state.mounts_authoritative && !state.mounts.iter().any(|m| path.starts_with(m))
+  consumes_absence_trust(state.profile)
+    && state.mounts_authoritative
+    && !state.mount_table.iter().any(|m| path.starts_with(m))
+    && !state.learned_mounts.iter().any(|m| path.starts_with(m))
+}
+
+/// **Whether `backend` has any consumer of ABSENCE-based device trust** — the
+/// `dev: None` leg of [`device_trusted`], where a path is proven root-device by
+/// no mount prefix covering it.
+///
+/// Stated as a predicate rather than left as prose because it decides two things
+/// that must never disagree: whether the mount table is MAINTAINED
+/// ([`install_mount_table`]) and whether it may be READ. Gating the read on the
+/// same answer is what makes skipping the maintenance safe — a backend that stops
+/// building the table cannot then be granted trust by its emptiness, and one that
+/// grows a consumer without flipping this fails CLOSED (no absence trust) rather
+/// than open.
+///
+/// The four-way argument, which is the whole content of the answer:
+///
+/// - **FSEvents** — the one `true`. Its lowering mints records straight from a
+///   flag word's fileID with no device read anywhere in the path
+///   ([`record_from_event`] -> [`mint`] with `dev: None`), and its settlement
+///   grants a vanished rename half its pairing cookie under a table VETO
+///   ([`DriverCore::grant_evidenced_cookies`]). It is also the only backend that
+///   FEEDS the table anything but a snapshot: mount and unmount arrive in band as
+///   flag words. Consumer, writer and evidence source are all the same backend.
+/// - **inotify** — descending, and its boundary question is answered by the
+///   enumerate fence, which reads a real `dev` (and where the host has one, a
+///   mount id) off the fd it pinned. Every identity it mints comes from that read
+///   or from a probe, so `dev` is `Some` and [`device_trusted`] returns on the
+///   direct-evidence arm before the table is consulted at all.
+/// - **fanotify** — kernel-recursive with membership-only admission: it holds no
+///   node identity to mint, and its map admits by directory-handle membership,
+///   which the seed and reseed walks establish by walking. Absence from a table
+///   grants it nothing it could use.
+/// - **RDCW and USN (Windows)** — a watch is scoped to one VOLUME by
+///   construction: RDCW's handle and the USN journal cursor are both per-volume,
+///   so nothing under the root can be on a foreign device and the question the
+///   table answers does not arise. There is no `/proc/self/mountinfo` equivalent
+///   feeding one either.
+///
+/// Written as an exhaustive match so a new backend cannot be added without
+/// answering it — the same discipline [`feeds_at_classify`] carries.
+const fn consumes_absence_trust(backend: BackendKind) -> bool {
+  match backend {
+    BackendKind::FsEvents => true,
+    BackendKind::Inotify | BackendKind::Fanotify | BackendKind::Rdcw | BackendKind::UsnJournal => {
+      false
+    }
+  }
+}
+
+/// Installs one authoritative mount table's locations, REPLACING the last one.
+///
+/// The single write path for [`mount_table`](ScopeState::mount_table) — the
+/// spawn barrier's seed, both world swaps' and the authoritative refresh's — so
+/// the replacement discipline and the per-backend gate are stated once and
+/// cannot drift between the four.
+///
+/// The gate CLEARS as well as skips: a scope whose profile resolved to a
+/// non-consuming backend after registering under a provisional one
+/// ([`DriverCore::on_stream_spawned`]'s reprofile) must not keep rows a
+/// provisional profile installed.
+fn install_mount_table(state: &mut ScopeState, rows: impl IntoIterator<Item = PathBuf>) {
+  state.mount_table.clear();
+  if consumes_absence_trust(state.profile) {
+    state.mount_table.extend(rows);
+  }
 }
 
 /// Applies one MOUNT event's trust-reducing prefix add. Runs in `compile`'s
@@ -5747,24 +9246,143 @@ fn device_trusted(state: &ScopeState, path: &Path, dev: Option<u64>) -> bool {
 /// same-batch rename under the just-mounted volume already sees the foreign
 /// prefix. The trust-increasing dual (an unmount's removal) is deferred to
 /// settlement instead: see the monotone-within-batch rule in `compile`.
+///
+/// Contained on the RAW path ([`strictly_under_root`]), like [`record_boundary`]
+/// and like [`learn_device`] just below — this table is a set of `PathBuf`
+/// prefixes that only ever REDUCES trust, so refusing an entry it cannot spell
+/// as a protocol location would grant trust the observation just denied. The
+/// representability gate that stood here was the same one [`record_boundary`]
+/// carried, and it failed in the same direction.
 fn apply_mount_add(state: &mut ScopeState, ev: &RawOsEvent) {
-  if !matches!(lower(state, &ev.path), Lowered::Target(_)) {
+  if !strictly_under_root(state, &ev.path) {
     return;
   }
-  if !state.mounts.iter().any(|m| m == &ev.path) {
-    state.mounts.push(ev.path.clone());
+  // Into the LEARNED half, and deduped only against that half. A word describes a
+  // mount that may have arrived after the snapshot currently in flight was read,
+  // so pairing it with a table row would let that install drop it; kept
+  // independent, it is removed by exactly one thing — the unmount word for the
+  // same path, deferred to settlement — which is what bounds this set to the
+  // mounts that are actually live.
+  if !state.learned_mounts.iter().any(|m| m == &ev.path) {
+    state.learned_mounts.push(ev.path.clone());
   }
 }
 
 /// Records a probed foreign-device path as a mount prefix, so later
 /// event-side identities under it degrade to `None` instead of colliding.
+///
+/// Into the LEARNED half: this is a path the probe read a device at, not a
+/// mountpoint, so no table row need ever name it and an install that replaced it
+/// away would re-trust a subtree a stat proved foreign. Deduped against BOTH
+/// halves — a path already covered by a live table row or an existing learned
+/// prefix adds no veto — which is also what bounds the set: the first prefix
+/// learned under a volume absorbs every deeper path on it.
 fn learn_device(state: &mut ScopeState, path: &Path, dev: u64) {
   if let Some(root_dev) = state.root_dev
     && dev != root_dev
-    && !state.mounts.iter().any(|m| path.starts_with(m))
+    && !state.mount_table.iter().any(|m| path.starts_with(m))
+    && !state.learned_mounts.iter().any(|m| path.starts_with(m))
   {
-    state.mounts.push(path.to_path_buf());
+    state.learned_mounts.push(path.to_path_buf());
   }
+}
+
+/// SEAM 4: records the boundary a probe answer revealed, if it revealed one.
+///
+/// A probe answers BOTH halves the fence reads — the device and, where the host
+/// can say, the mount id ([`ProbeOutcome::Present`]) — so the boundary question
+/// it puts to [`ScopeFrame::crossed_by`] is the same two-fence truth table
+/// [`crosses_mount_boundary`] applies to a dir entry, and the record it mints
+/// carries the same identity a listing's decline would.
+///
+/// **That the id is asked for at all is the correctness point, not a detail.** A
+/// probe that answered a device alone recorded every boundary with
+/// `mnt_id: None`, and an id-less record is precisely what
+/// [`MountRecord::condemnable`] reads as DEVICE-ONLY — permanently exempt from
+/// both condemnation mechanisms. So a genuine mount that arrived after the
+/// baseline, was first observed by a slot stat, and departed before any refresh
+/// confirmed a row at its location was condemned by nothing: the departure cover
+/// the ground was owed never fired. Minting an exempt record from an observation
+/// that could not tell a vfsmount from a same-mount subvolume is the defect;
+/// asking for the id is the fix, and it leaves `None` meaning only "this host
+/// answers no mount ids" — the reading the dynamic provenance upgrade is sound
+/// under.
+///
+/// Only a `Present` answer carries either fact. `Missing` and `Failed` observe
+/// nothing about a boundary — a path that is absent or unreadable says nothing
+/// about what is mounted there — so they record nothing rather than guessing in
+/// either direction.
+///
+/// # Why the SLOT-STAT answer and not every probe answer
+///
+/// The slot stat is the probe whose device is genuinely DISCARDED: `stat_result`
+/// consumes the kind and the inode and drops the rest. The FSEvents grounding
+/// probes (`ProbePurpose::Ambiguous`, `ProbePurpose::Rename`) already consume
+/// theirs — [`learn_device`] for trust, [`mint`] and [`cookie_for`] for identity
+/// — and recording them here would buy nothing and cost two things it should
+/// not:
+///
+/// - **retirement.** A device-only record is retired by a compiled removal
+///   ([`DriverCore::retire_removed_boundaries`]), by a complete re-listing of its
+///   parent ([`retire_relisted_boundaries`]) or by a complete whole-root walk
+///   ([`retire_unwalked_boundaries`]). An FSEvents removal reaches none of them:
+///   it is not compiled — it is GROUNDED by the very probe that would have
+///   recorded the boundary, one stage later — and that profile runs neither
+///   enumerates nor walks. Records from that path would have no seam that ever
+///   drops them, leaving only the hard bound.
+/// - **growth.** Those probes fire per event, so a long-lived watcher over a
+///   mounted volume would accrete one record per distinct path ever probed.
+///
+/// Neither costs coverage on the platform that issues them: macOS signals its
+/// volume changes IN BAND (`compile::fsevents`' `plan_mount` covers arrival and
+/// departure alike), so the latency a seam buys there is already bought. The
+/// slot stat, by contrast, only ever fires on a descending profile — the Monitor
+/// stats a slot a LISTING left unclassifiable — which is exactly the profile
+/// whose enumerates re-observe the location and whose removals compile.
+fn record_probe_boundary(state: &mut ScopeState, path: &Path, outcome: ProbeOutcome) {
+  let ProbeOutcome::Present { dev, mnt_id, .. } = outcome else {
+    return;
+  };
+  if !state.frame().crossed_by(Some(dev), mnt_id) {
+    return;
+  }
+  record_boundary(state, path, Some(dev), mnt_id);
+}
+
+/// Whether one byte separates path COMPONENTS on this platform.
+///
+/// `/` everywhere, and `\\` in addition on Windows, where it is the primary
+/// separator and the one `Path::join` writes. Reading only `/` there made this
+/// whole lowering answer [`Lowered::Outside`] for every path any `join` had
+/// built — the containment tests below all use `Path`'s own component-wise
+/// comparison and were correct already, so this byte scan was the one place that
+/// disagreed with the platform about what a path is. `\\` is a legal FILENAME
+/// byte on Unix, so the extra separator is strictly `cfg`-gated rather than
+/// accepted everywhere.
+const fn is_separator_byte(byte: u8) -> bool {
+  byte == b'/' || (cfg!(windows) && byte == b'\\')
+}
+
+/// Whether `path` is a STRICT descendant of the scope root — the containment
+/// every internal `PathBuf`-keyed table screens on.
+///
+/// `Path::starts_with` compares COMPONENTS, so `/r/bc` is not under `/r/b` and a
+/// platform's own separators are the platform's business; the raw byte scan
+/// [`lower`] performs exists only because a protocol [`Location`] has to be built
+/// out of `str` segments, and it is not needed to answer containment.
+///
+/// **It deliberately says nothing about representability.** [`lower`] answers
+/// [`Lowered::Outside`] for a path with any non-UTF-8 component, and the tables
+/// that screened on `Lowered::Target` therefore DROPPED observations about real
+/// ground — silently, and in the direction that loses coverage. A location the
+/// protocol cannot spell is a problem for whatever ADDRESSES the consumer, and
+/// that is the cover ([`mount_cover`], which degrades to the whole root), never
+/// the record.
+fn strictly_under_root(state: &ScopeState, path: &Path) -> bool {
+  let Some(root) = state.root.as_deref() else {
+    return false;
+  };
+  path != root && path.starts_with(root)
 }
 
 /// Lowers an absolute event path to its place under the scope root.
@@ -5784,7 +9402,7 @@ fn lower(state: &ScopeState, path: &Path) -> Lowered {
   };
   let rest = match rest {
     [] => return Lowered::Root,
-    [b'/', tail @ ..] => tail,
+    [byte, tail @ ..] if is_separator_byte(*byte) => tail,
     // The root "/" already ends with the separator, so its descendants
     // arrive without a leading one ("/tmp/a" strips to "tmp/a").
     tail if root_bytes == b"/" => tail,
@@ -5792,7 +9410,7 @@ fn lower(state: &ScopeState, path: &Path) -> Lowered {
     _ => return Lowered::Outside,
   };
   let mut segments = Vec::new();
-  for part in rest.split(|&b| b == b'/') {
+  for part in rest.split(|&byte| is_separator_byte(byte)) {
     if part.is_empty() {
       continue;
     }

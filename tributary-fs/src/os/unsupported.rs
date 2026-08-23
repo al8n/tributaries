@@ -2,7 +2,7 @@
 //! execute foreign calls: spawning always fails with
 //! [`SourceError::Unsupported`], so a handle can never exist.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::{EventReceiver, ResumeToken, RootMeta, SourceConfig, SourceError};
 
@@ -22,7 +22,7 @@ impl Source {
 }
 
 /// The mount table cannot be read on a platform with no backend.
-pub(crate) fn mounts_under(root: &Path) -> Option<Vec<PathBuf>> {
+pub(crate) fn mounts_under(root: &Path) -> Option<Vec<crate::os::MountRow>> {
   let _ = root;
   None
 }
@@ -47,6 +47,8 @@ impl SourceHandle {
 
 #[cfg(test)]
 mod tests {
+  use std::path::PathBuf;
+
   use super::*;
 
   #[test]

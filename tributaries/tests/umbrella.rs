@@ -859,7 +859,14 @@ async fn sync_resolves_once_pre_call_changes_are_deliverable() {
   let mut rescanned = false;
   while let Some(event) = w.next().now_or_never().flatten() {
     if event.kind().is_rescan() {
+      // Not held to the artifact rule, and the same reason as its twin in
+      // `indexer_shaped.rs`: the umbrella never classifies a `Rescan` against the
+      // reserved namespace, because it names no object and masking one would hide
+      // a coverage loss inside the namespace whose events it may have eaten. A
+      // LOCATED `Rescan` may therefore name the cookie directory itself. The rule
+      // below is about DELIVERED CHANGES.
       rescanned = true;
+      continue;
     }
     if let Some(leaf) = event.key().last().and_then(|c| c.to_str()) {
       assert!(

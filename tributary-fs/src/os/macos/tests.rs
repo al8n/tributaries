@@ -57,6 +57,15 @@ fn recv_until(
         }));
       }
       Ok(SourceMessage::Overflow(_ack)) => overflow = true,
+      Ok(SourceMessage::Admitted(report)) => {
+        panic!("FSEvents keeps no admission map and answers no reseed: {report:?}")
+      }
+      Ok(SourceMessage::RootRecovered(recovery, _)) => {
+        panic!("FSEvents keeps no admission map and recovers none: {recovery:?}")
+      }
+      Ok(SourceMessage::Boundaries(declined, _)) => {
+        panic!("FSEvents walks no tree and declines no boundary: {declined:?}")
+      }
       Ok(SourceMessage::Fatal(err)) => panic!("stream died: {err}"),
       Err(async_channel::TryRecvError::Empty) => thread::sleep(Duration::from_millis(10)),
       Err(async_channel::TryRecvError::Closed) => break,
@@ -385,8 +394,15 @@ fn the_mount_table_reader_fails_closed_on_every_unbounded_shape() {
 fn the_live_mount_table_is_still_readable() {
   let mounts = mounts_under(Path::new("/")).expect("the live mount table reads");
   assert!(
-    mounts.iter().all(|path| path != Path::new("/")),
+    mounts.iter().all(|row| row.location != Path::new("/")),
     "the root itself is not a mount UNDER the root"
+  );
+  assert!(
+    mounts
+      .iter()
+      .all(|row| row.mnt_id.is_none() && row.dev.is_none()),
+    "getfsstat answers no mount id and no device, and the rows say so rather \
+     than inventing one"
   );
   let dir = unique_dir("mounts");
   assert_eq!(
@@ -662,6 +678,15 @@ fn over_budget_batches_signal_one_inband_overflow() {
     match rx.try_recv() {
       Ok(SourceMessage::Overflow(ack)) => break ack,
       Ok(SourceMessage::Batch(_)) => {}
+      Ok(SourceMessage::Admitted(report)) => {
+        panic!("FSEvents keeps no admission map and answers no reseed: {report:?}")
+      }
+      Ok(SourceMessage::RootRecovered(recovery, _)) => {
+        panic!("FSEvents keeps no admission map and recovers none: {recovery:?}")
+      }
+      Ok(SourceMessage::Boundaries(declined, _)) => {
+        panic!("FSEvents walks no tree and declines no boundary: {declined:?}")
+      }
       Ok(SourceMessage::Fatal(err)) => panic!("stream died: {err}"),
       Err(_) => {
         assert!(
@@ -687,12 +712,21 @@ fn over_budget_batches_signal_one_inband_overflow() {
   while let Ok(msg) = rx.try_recv() {
     match msg {
       SourceMessage::Batch(_) => last_was_overflow = false,
+      SourceMessage::RootRecovered(recovery, _) => {
+        panic!("FSEvents keeps no admission map and recovers none: {recovery:?}")
+      }
       SourceMessage::Overflow(_) => {
         assert!(
           !last_was_overflow,
           "adjacent losses (no batch between) must dedup onto one Overflow"
         );
         last_was_overflow = true;
+      }
+      SourceMessage::Admitted(report) => {
+        panic!("FSEvents keeps no admission map and answers no reseed: {report:?}")
+      }
+      SourceMessage::Boundaries(declined, _) => {
+        panic!("FSEvents walks no tree and declines no boundary: {declined:?}")
       }
       SourceMessage::Fatal(err) => panic!("stream died: {err}"),
     }
@@ -711,6 +745,15 @@ fn over_budget_batches_signal_one_inband_overflow() {
     match rx.try_recv() {
       Ok(SourceMessage::Overflow(_)) => break,
       Ok(SourceMessage::Batch(_)) => {}
+      Ok(SourceMessage::Admitted(report)) => {
+        panic!("FSEvents keeps no admission map and answers no reseed: {report:?}")
+      }
+      Ok(SourceMessage::RootRecovered(recovery, _)) => {
+        panic!("FSEvents keeps no admission map and recovers none: {recovery:?}")
+      }
+      Ok(SourceMessage::Boundaries(declined, _)) => {
+        panic!("FSEvents walks no tree and declines no boundary: {declined:?}")
+      }
       Ok(SourceMessage::Fatal(err)) => panic!("stream died: {err}"),
       Err(_) => {
         assert!(

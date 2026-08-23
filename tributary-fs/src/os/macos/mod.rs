@@ -306,6 +306,7 @@ impl Source {
       // device check (the settled single-device policy) on this backend.
       root_mnt_id: None,
       mounts,
+      declined: Vec::new(),
       identity,
       ancestors,
       backend: super::BackendKind::FsEvents,
@@ -442,12 +443,18 @@ where
   }
 }
 
-/// The mount points strictly under `root`, read from the live mount table
+/// The mount rows strictly under `root`, read from the live mount table
 /// (`getfsstat`). `None` means the table could not be read — the caller must
 /// then treat device boundaries as UNKNOWN rather than absent. Each mount
 /// path is run through the same filesystem-representation transform as event
 /// paths, so prefix comparison cannot drift on Unicode normalization.
-pub(crate) fn mounts_under(root: &std::path::Path) -> Option<Vec<PathBuf>> {
+///
+/// Every row carries `None` for both identity fields: `statfs` reports no mount
+/// id, and inventing one from `f_fsid` would hand the core a value it would
+/// compare as an identity. macOS is the platform that signals
+/// its volume changes in band anyway (`plan_mount`), so the table here is a
+/// belt whose locations are the whole of what it can honestly say.
+pub(crate) fn mounts_under(root: &std::path::Path) -> Option<Vec<crate::os::MountRow>> {
   use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
   // getfsstat into an owned buffer: the getmntinfo convenience wrapper hands
   // out one shared per-process buffer and is not thread-safe — concurrent
@@ -463,15 +470,26 @@ pub(crate) fn mounts_under(root: &std::path::Path) -> Option<Vec<PathBuf>> {
   // SAFETY: getfsstat writes at most `bytes` and reports exactly the entries it
   // initialized.
   let entries = unsafe { read_mount_table::<libc::statfs, _>(count, read) }?;
-  let mut mounts = Vec::new();
+  let mut mounts: Vec<crate::os::MountRow> = Vec::new();
   for entry in &entries {
     let name = &entry.f_mntonname;
     let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
     let bytes: Vec<u8> = name[..len].iter().map(|&c| c as u8).collect();
     let path = PathBuf::from(OsStr::from_bytes(&bytes));
     let path = ffi::fs_representation_of(&path).unwrap_or(path);
-    if path.starts_with(root) && path.as_path() != root {
-      mounts.push(path);
+    if !path.starts_with(root) || path.as_path() == root {
+      continue;
+    }
+    // One row per location, as on Linux: a stacked mount would otherwise list
+    // the same path twice, and the core keys its coverage set by location.
+    // Every row here carries the same (absent) identity, so which duplicate
+    // survives is immaterial — that only one does is not.
+    if !mounts.iter().any(|m| m.location == path) {
+      mounts.push(crate::os::MountRow {
+        location: path,
+        mnt_id: None,
+        dev: None,
+      });
     }
   }
   Some(mounts)

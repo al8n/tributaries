@@ -207,21 +207,23 @@ impl WatcherOptions {
   pub const DEFAULT_BACKEND: Backend = Backend::Auto;
 
   /// The default periodic root-liveness interval (30 s) — the detection-latency
-  /// bound for a signal-silent unmount. A `FAN_MARK_FILESYSTEM`-watched
-  /// superblock unmounted out from under the watch emits NO kernel signal (the
-  /// L4.1 finding), so a periodic root re-stat is its only unmount detection;
-  /// every other backend (inotify's `IN_UNMOUNT`/`IN_IGNORED`, FSEvents'
-  /// `RootChanged`, and both Windows backends' own fatal-source-error report on
-  /// a lost root or volume) signals root death in-band and ignores this knob.
-  /// See [`root_liveness_interval`](Self::root_liveness_interval).
+  /// bound for a signal-silent unmount, at the watched root or below it. A
+  /// `FAN_MARK_FILESYSTEM`-watched superblock unmounted out from under the watch
+  /// emits NO kernel signal (the L4.1 finding), and a LAZY unmount
+  /// (`umount -l`/`MNT_DETACH`) emits none under inotify either, so both Linux
+  /// backends need the periodic re-read. FSEvents signals both cases in band
+  /// (`RootChanged` for the root, an `UNMOUNT` flag word for a volume below it)
+  /// and ignores this knob; the Windows backends report a lost root as a fatal
+  /// source error and likewise never arm it. See
+  /// [`root_liveness_interval`](Self::root_liveness_interval).
   pub const DEFAULT_ROOT_LIVENESS_INTERVAL: Duration = Duration::from_secs(30);
 
   /// The largest periodic root-liveness interval (one day).
   ///
   /// The interval is armed as a deadline (`now + interval`) whose arithmetic
   /// SATURATES, so an enormous one does not crash — it silently arms a deadline
-  /// that never fires, disabling fanotify's only unmount detector while looking
-  /// configured. [`Duration::ZERO`](Duration::ZERO) is how a caller says
+  /// that never fires, disabling the Linux backends' only silent-unmount detector
+  /// while looking configured. [`Duration::ZERO`](Duration::ZERO) is how a caller says
   /// "disabled"; anything past a day is the accidental spelling of it, and gets
   /// a typed refusal instead. One day is also the ceiling
   /// [`effective_move_window`](Self::effective_move_window) stands on: deadline
@@ -546,23 +548,61 @@ impl WatcherOptions {
     self
   }
 
-  /// The periodic root-liveness interval — the detection-latency bound for a
-  /// signal-silent root unmount.
+  /// The periodic root-liveness interval — the detection-latency bound for an
+  /// unmount no kernel signal announces, whether it takes the watched root or a
+  /// mount below it.
   ///
-  /// A fanotify (`FAN_MARK_FILESYSTEM`) root unmounted out from under the watch
-  /// delivers no kernel signal (the mark holds the superblock alive and the fd
-  /// goes quiet — the L4.1 finding), so the driver re-stats such a root on this
-  /// cadence and lowers its death (a terminal
-  /// [`Rescan`](crate::EventKind::Rescan) and registry reclamation) when the
-  /// path no longer names the watched object. This is the WORST-CASE latency:
-  /// an unmount is also caught immediately by any loss signal (which already
-  /// re-reads the mount table), so the tick only bounds the quiet case.
+  /// Each tick re-stats the root AND re-reads the mount table, which covers two
+  /// silences:
   ///
-  /// Only signal-silent-on-unmount backends consult it — fanotify. inotify
-  /// (`IN_UNMOUNT`/`IN_IGNORED`), FSEvents (`RootChanged`), and both Windows
-  /// backends (a fatal source error the moment the root or its volume is gone)
-  /// surface root death in-band and never arm this tick, so the knob is inert
-  /// for them.
+  /// - **the root itself.** A fanotify (`FAN_MARK_FILESYSTEM`) root unmounted out
+  ///   from under the watch delivers nothing (the mark holds the superblock alive
+  ///   and the fd goes quiet — the L4.1 finding), and a LAZY unmount
+  ///   (`umount -l`/`MNT_DETACH`) is equally silent under inotify, since the watch
+  ///   itself keeps the superblock alive and no `IN_UNMOUNT` is ever sent. The
+  ///   re-stat lowers the death — a terminal [`Rescan`](crate::EventKind::Rescan)
+  ///   and registry reclamation — once the path no longer names the watched
+  ///   object.
+  /// - **a mount BELOW the root.** Its departure kills coverage under it and is
+  ///   just as silent; the table re-read notices the prefix is gone and delivers
+  ///   one covering [`Rescan`](crate::EventKind::Rescan) located at it, obliging
+  ///   re-enumeration of that subtree.
+  ///
+  /// This is the WORST-CASE latency: both are also caught immediately by any loss
+  /// signal (which already re-reads the mount table), so the tick only bounds the
+  /// quiet case.
+  ///
+  /// # On a kernel that answers no mount ids, a tick can cost a WHOLE-ROOT rescan
+  ///
+  /// Every departure above is bounded by ONE interval, on every host — there is
+  /// no class that waits several ticks. What varies is the SCOPE of the cover a
+  /// tick emits.
+  ///
+  /// On Linux 4.11–5.7 there is no `statx(STATX_MNT_ID)`, so a boundary the
+  /// watcher's own descent found cannot be told apart from a filesystem-internal
+  /// one — a btrfs subvolume, which no mount table lists and which never departs.
+  /// Nothing observable distinguishes "that mount departed" from "that subvolume
+  /// is exactly where it always was", and no amount of re-observation ever will.
+  /// The watcher therefore FAILS CLOSED: while it holds any such boundary, every
+  /// tick that manages to read the mount table emits ONE
+  /// [`Rescan`](crate::EventKind::Rescan) covering the whole watched root, rather
+  /// than guessing at a located one.
+  ///
+  /// **That cost is permanent for as long as the boundary is held.** A root with
+  /// btrfs subvolumes under it on such a kernel is re-read by the consumer once
+  /// per interval, for the life of the watch. Raising the interval is the knob
+  /// that prices it; [`Duration::ZERO`] disables the tick entirely, at the cost
+  /// below.
+  ///
+  /// On Linux 5.8 and later the class is EMPTY — every boundary the watcher
+  /// records carries a mount id, and so does the root — and the covers are
+  /// located at the mount that actually departed. The fanotify backend needs 5.17
+  /// regardless, so it never pays this at all.
+  ///
+  /// Only the Linux backends consult it — inotify and fanotify. FSEvents signals
+  /// both cases in band (`RootChanged` for the root, an `UNMOUNT` flag word for a
+  /// volume below it) and the Windows backends report a lost root as a fatal
+  /// source error, so the knob is inert for all three.
   ///
   /// [`Duration::ZERO`] DISABLES the tick: a quiet unmount is then observed only
   /// at the next loss-triggered refresh (or never, if none occurs) — the
@@ -631,6 +671,12 @@ impl WatcherOptions {
   /// forces inotify (the fall-back path), and under a forced [`Backend::Fanotify`]
   /// every root is the typed viability error. It is never silently normalized to a
   /// live one-node map.
+  ///
+  /// It counts ADMITTED MAP DIRECTORIES and nothing else. A mount boundary the
+  /// seed walk declines to descend never becomes a map node, so it is not charged
+  /// here — a root holding one boundary still seeds under a cap of one. (The
+  /// walk's own report of those boundaries is bounded too, by a separate internal
+  /// walk-output limit that this option does not spend.)
   ///
   /// Ignored by inotify, RDCW, and macOS (none of the three keeps a
   /// fanotify-style admission map); the Windows USN journal reads the same cap
