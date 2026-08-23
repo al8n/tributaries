@@ -21,7 +21,8 @@ use agnostic_lite::{
 use tributary_proto::{FileKind, IoClass, ScopeId, Segment, WatchId};
 
 use super::{
-  CookieFile, CookieRemoval, CookieWriteError, FsOps, ScopeRegistry, SourceControl, SpawnedSource,
+  CookieDir, CookieFile, CookieRemoval, CookieResidue, CookieWriteError, FsOps, ScopeRegistry,
+  SourceControl, SpawnedSource,
 };
 use crate::{
   core::{ExpectedObject, MountRefresh, ProbeOutcome, RawDirEntry, RawEnumerate, RootLiveness},
@@ -196,6 +197,19 @@ struct FakeState {
   /// recovered — the per-scope-recovery re-arm fairness cells. Checked after the
   /// hold and before the global countdown knob and the unlink.
   cookie_remove_failure_prefixes: Mutex<Vec<PathBuf>>,
+  /// Cookie DIRECTORIES whose disposal fails persistently, keyed by the
+  /// directory's own path — a same-uid peer that planted a file inside it, a
+  /// read-only volume, a filter driver. The host this crate is developed on keeps
+  /// ONE shared cookie directory whose real disposal can never fail (see
+  /// `CookieDir::dispose`), so a cell that has to exercise a SURVIVING directory
+  /// — the directory-only obligation, its `RemoveFailed` parking, and its
+  /// convergence on a later retry — has no other way to produce one.
+  cookie_dispose_failure_dirs: Mutex<Vec<PathBuf>>,
+  /// Cookie directory disposals that reached the blocking pool — the observable
+  /// that separates "the retry disposed" from "the retry did nothing", and the
+  /// counterpart to `cookie_remove_dispatches` for the other half of a
+  /// retirement.
+  cookie_dispose_dispatches: AtomicUsize,
   /// Cookie directories that CANONICALIZE elsewhere — the fake's model of an
   /// intermediate symlink. A spelled directory maps to the real path it resolves
   /// to, so `write_cookie` can mirror the production canonicalize-and-verify: a
@@ -357,6 +371,8 @@ impl Default for FakeState {
       cookie_remove_hold: Mutex::default(),
       cookie_remove_confirm_hold: Mutex::default(),
       cookie_remove_failure_prefixes: Mutex::default(),
+      cookie_dispose_failure_dirs: Mutex::default(),
+      cookie_dispose_dispatches: AtomicUsize::new(0),
       canonical_dirs: Mutex::default(),
       resume_token: Mutex::default(),
       spawn_resume_points: Mutex::default(),
@@ -471,6 +487,13 @@ impl FakeFs {
       |node| RootIdentity::new(node.dev, node.ino.into()),
     );
     CookieFile::new(path, identity)
+  }
+
+  /// The same landing in the shape the LEDGER holds: a residue whose file half is
+  /// still owed. What a claim, a self-reap, or a hand-built obligation record
+  /// takes.
+  pub(crate) fn cookie_residue_at(&self, path: impl AsRef<Path>) -> CookieResidue {
+    CookieResidue::File(self.cookie_at(path))
   }
 
   /// Every regular file at or under `prefix`, for tree-equality oracles.
@@ -987,6 +1010,55 @@ impl FakeFs {
       .lock()
       .unwrap()
       .retain(|armed| armed != prefix);
+  }
+
+  /// Fails the disposal of the cookie directory at `dir`, PERSISTENTLY — a
+  /// same-uid peer holding a file inside it, or a volume that refuses the
+  /// disposition. This is the only way to produce a directory that SURVIVES its
+  /// obligation's cookie on a host whose real disposal cannot fail.
+  ///
+  /// This knob and the two below it are gated to the `directory_only` cells' own
+  /// gate — their only callers — so none of the three is dead code anywhere it
+  /// exists. Under Miri those cells are gated out, so these are too; the two
+  /// state fields they reach stay live through `dispose_cookie_dir`.
+  #[cfg(all(
+    not(miri),
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+  ))]
+  pub(crate) fn fail_cookie_disposal_of(&self, dir: impl AsRef<Path>) {
+    self
+      .state
+      .cookie_dispose_failure_dirs
+      .lock()
+      .unwrap()
+      .push(dir.as_ref().to_path_buf());
+  }
+
+  /// Clears a directory armed by
+  /// [`fail_cookie_disposal_of`](Self::fail_cookie_disposal_of) — whatever was
+  /// holding it went away, so the next retry converges.
+  #[cfg(all(
+    not(miri),
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+  ))]
+  pub(crate) fn clear_cookie_disposal_failure_of(&self, dir: impl AsRef<Path>) {
+    let dir = dir.as_ref();
+    self
+      .state
+      .cookie_dispose_failure_dirs
+      .lock()
+      .unwrap()
+      .retain(|armed| armed != dir);
+  }
+
+  /// Cookie directory disposals attempted so far — the observable for "the retry
+  /// of a directory-only obligation ran the disposal and nothing else".
+  #[cfg(all(
+    not(miri),
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+  ))]
+  pub(crate) fn cookie_dispose_dispatches(&self) -> usize {
+    self.state.cookie_dispose_dispatches.load(Ordering::SeqCst)
   }
 
   /// Makes every live fake handle mint `token` as its resume point — a
@@ -1974,7 +2046,7 @@ impl FsOps for FakeFs {
     if let Some(kind) = *self.state.cookie_write_strand.lock().unwrap() {
       return Err(CookieWriteError {
         source: std::io::Error::new(kind, "cookie write left an unresolved file"),
-        residue: Some(Box::new(file)),
+        residue: Some(Box::new(CookieResidue::File(file))),
       });
     }
     Ok(file)
@@ -2060,6 +2132,35 @@ impl FsOps for FakeFs {
     } else {
       CookieRemoval::Unlinked
     })
+  }
+
+  /// The DIRECTORY half of a retirement, with a failure knob the real disposal
+  /// on this crate's development host cannot offer: `CookieDir::dispose` there is
+  /// a no-op success, so a cell that needs a directory to SURVIVE its obligation
+  /// — the state the whole directory-only residue exists for — can only get one
+  /// from here.
+  ///
+  /// The directory itself is never touched: a cell hands in a real `CookieDir` it
+  /// minted for the purpose and cleans it up itself, so this models the verdict
+  /// without modeling the filesystem.
+  fn dispose_cookie_dir(&self, dir: &CookieDir) -> Result<(), std::io::Error> {
+    self
+      .state
+      .cookie_dispose_dispatches
+      .fetch_add(1, Ordering::SeqCst);
+    if self
+      .state
+      .cookie_dispose_failure_dirs
+      .lock()
+      .unwrap()
+      .iter()
+      .any(|armed| armed == dir.path())
+    {
+      return Err(std::io::Error::other(
+        "cookie directory disposal refused (something is still inside it)",
+      ));
+    }
+    Ok(())
   }
 
   fn take_enumerate_anchor(&self, watch: WatchId) -> Option<Self::Anchor> {

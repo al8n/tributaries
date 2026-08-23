@@ -17,32 +17,42 @@ use std::{
   path::Path,
 };
 
-use windows_sys::Win32::{
-  Foundation::{
-    ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_IO_PENDING, ERROR_NO_MORE_FILES,
-    ERROR_NOT_SUPPORTED, GENERIC_READ, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
-  },
-  Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO, FILE_DISPOSITION_FLAG_DELETE,
-    FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OVERLAPPED, FILE_ID_INFO,
-    FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_CREATION,
-    FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_ACCESS,
-    FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SECURITY, FILE_NOTIFY_CHANGE_SIZE,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_DISK, FileAttributeTagInfo,
-    FileBasicInfo, FileDispositionInfo, FileDispositionInfoEx, FileIdExtdDirectoryInfo,
-    FileIdExtdDirectoryRestartInfo, FileIdInfo, GetFileInformationByHandleEx, GetFileType,
-    OPEN_EXISTING, ReadDirectoryChangesExW, ReadDirectoryChangesW,
-    ReadDirectoryNotifyExtendedInformation, SetFileInformationByHandle,
-  },
-  System::{
-    IO::{
-      CancelIoEx, CreateIoCompletionPort, DeviceIoControl, GetOverlappedResult,
-      GetQueuedCompletionStatus, OVERLAPPED, PostQueuedCompletionStatus,
+use windows_sys::{
+  Wdk::{
+    Foundation::OBJECT_ATTRIBUTES,
+    Storage::FileSystem::{
+      FILE_CREATE, FILE_DIRECTORY_FILE, FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
     },
-    Ioctl::{
-      FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL, READ_USN_JOURNAL_DATA_V1,
-      USN_JOURNAL_DATA_V1,
+  },
+  Win32::{
+    Foundation::{
+      ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_IO_PENDING, ERROR_NO_MORE_FILES,
+      ERROR_NOT_SUPPORTED, GENERIC_READ, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
+      OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING, WAIT_TIMEOUT,
+    },
+    Storage::FileSystem::{
+      CreateFileW, DELETE, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO,
+      FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO,
+      FILE_DISPOSITION_INFO_EX, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+      FILE_FLAG_OVERLAPPED, FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_ATTRIBUTES,
+      FILE_NOTIFY_CHANGE_CREATION, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
+      FILE_NOTIFY_CHANGE_LAST_ACCESS, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SECURITY,
+      FILE_NOTIFY_CHANGE_SIZE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+      FILE_TYPE_DISK, FileAttributeTagInfo, FileBasicInfo, FileDispositionInfo,
+      FileDispositionInfoEx, FileIdExtdDirectoryInfo, FileIdExtdDirectoryRestartInfo, FileIdInfo,
+      GetFileInformationByHandleEx, GetFileType, OPEN_EXISTING, ReadDirectoryChangesExW,
+      ReadDirectoryChangesW, ReadDirectoryNotifyExtendedInformation, SYNCHRONIZE,
+      SetFileInformationByHandle,
+    },
+    System::{
+      IO::{
+        CancelIoEx, CreateIoCompletionPort, DeviceIoControl, GetOverlappedResult,
+        GetQueuedCompletionStatus, IO_STATUS_BLOCK, OVERLAPPED, PostQueuedCompletionStatus,
+      },
+      Ioctl::{
+        FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL, READ_USN_JOURNAL_DATA_V1,
+        USN_JOURNAL_DATA_V1,
+      },
     },
   },
 };
@@ -76,6 +86,23 @@ const _: () = {
   assert!(notify::STREAM_NAME == FILE_NOTIFY_CHANGE_STREAM_NAME);
   assert!(notify::STREAM_SIZE == FILE_NOTIFY_CHANGE_STREAM_SIZE);
   assert!(notify::STREAM_WRITE == FILE_NOTIFY_CHANGE_STREAM_WRITE);
+};
+
+/// The same pin for the `NTSTATUS` values the cookie directory's create decides
+/// on by name. The mint's whole retry rule hangs off
+/// `STATUS_OBJECT_NAME_COLLISION` in particular: spell that literal wrong in the
+/// host-compiled vocabulary and an occupied candidate stops reaching the loop as
+/// `AlreadyExists`, which no host cell could notice because the value never
+/// reaches one from a kernel.
+const _: () = {
+  use windows_sys::Win32::Foundation::{
+    STATUS_ACCESS_DENIED, STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_EXISTS,
+  };
+
+  use super::security::nt_status;
+  assert!(nt_status::OBJECT_NAME_COLLISION == STATUS_OBJECT_NAME_COLLISION);
+  assert!(nt_status::OBJECT_NAME_EXISTS == STATUS_OBJECT_NAME_EXISTS);
+  assert!(nt_status::ACCESS_DENIED == STATUS_ACCESS_DENIED);
 };
 
 /// The `(VolumeSerialNumber, FILE_ID_128)` identity of an open object — the
@@ -211,12 +238,16 @@ pub(crate) fn identity_of(handle: BorrowedHandle<'_>) -> io::Result<HandleIdenti
 /// delete offers no such guarantee, which is why every removal that has a handle
 /// should come through here.
 ///
-/// POSIX semantics are asked for first, so the directory entry disappears at
-/// once even while other handles (the cookie's own pinned create) are still
-/// open. Where the filesystem or the OS build has no such flag, the classic
-/// disposition is the fallback and the entry instead survives until the last
-/// handle to the object closes — the object is unreachable by name either way,
-/// since the name is refused to every opener from this point on.
+/// POSIX semantics are asked for first: the link leaves the visible namespace as
+/// soon as the handle the disposition was set through — THIS one — is closed, and
+/// no OTHER open handle (the cookie's own pinned create) delays it. How long the
+/// name stands is therefore the caller's choice of how long to hold that handle —
+/// a cookie removal deletes through a local it drops as it returns, while a cookie
+/// directory's disposal deletes through a handle its obligation may still be
+/// sharing (see `driver::CookieDir`). Where the filesystem or the OS build has no
+/// such flag, the classic disposition is the fallback and the entry instead
+/// survives until the last handle to the object closes — the object is unreachable
+/// by name either way, since the name is refused to every opener from this point on.
 pub(crate) fn delete_by_handle(handle: BorrowedHandle<'_>) -> io::Result<()> {
   let raw = handle.as_raw_handle() as HANDLE;
   let ex = FILE_DISPOSITION_INFO_EX {
@@ -450,9 +481,13 @@ pub(super) fn cancel_io(handle: BorrowedHandle<'_>) {
   let _ = unsafe { CancelIoEx(handle.as_raw_handle() as HANDLE, std::ptr::null()) };
 }
 
-/// Whether the open object is a reparse point (junction, symlink, mount) —
-/// the containment boundary the seed walk never descends.
-pub(super) fn is_reparse_point(handle: BorrowedHandle<'_>) -> io::Result<bool> {
+/// The open object's `(FileAttributes, ReparseTag)`, in ONE query.
+///
+/// Both facts come off the same sample deliberately: `FILE_ATTRIBUTE_TAG_INFO`
+/// answers them together, and a caller that reads the attribute to learn whether
+/// the object is a reparse point AT ALL and the tag to learn WHICH one must not
+/// take those from two queries that could describe two different states.
+pub(super) fn attributes_and_tag(handle: BorrowedHandle<'_>) -> io::Result<(u32, u32)> {
   let mut info: FILE_ATTRIBUTE_TAG_INFO = unsafe { std::mem::zeroed() };
   // SAFETY: `info` is a properly-sized, writable FILE_ATTRIBUTE_TAG_INFO and
   // the class constant matches the struct; the handle is live for the call.
@@ -467,8 +502,280 @@ pub(super) fn is_reparse_point(handle: BorrowedHandle<'_>) -> io::Result<bool> {
   if ok == 0 {
     return Err(io::Error::last_os_error());
   }
+  Ok((info.FileAttributes, info.ReparseTag))
+}
+
+/// Whether the open object is a reparse point (junction, symlink, mount) —
+/// the containment boundary the seed walk never descends.
+pub(super) fn is_reparse_point(handle: BorrowedHandle<'_>) -> io::Result<bool> {
   const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-  Ok(info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+  let (attributes, _) = attributes_and_tag(handle)?;
+  Ok(attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+}
+
+/// Opens the directory a cookie directory will be created INSIDE, purely so the
+/// create can be anchored beneath it.
+///
+/// Nothing is ever read or written through this handle. It is the
+/// `RootDirectory` of the create's `OBJECT_ATTRIBUTES`, which is what lets that
+/// create name only a LEAF and resolve no path at all — see
+/// [`create_directory_at`], which is where the anchoring earns its keep.
+///
+/// The requested access is ZERO, and that is the whole requirement rather than a
+/// shortcut. Microsoft defines `RootDirectory` only as the directory a relative
+/// `ObjectName` is resolved against and specifies no access for it; name
+/// resolution checks `FILE_TRAVERSE` against each INTERMEDIATE component of the
+/// path, never against the root the walk starts from — and this create names a
+/// bare leaf, so there is no intermediate component at all. The right the create
+/// truly needs on this directory is `FILE_ADD_SUBDIRECTORY`, and the create
+/// itself checks that, against the parent's security descriptor rather than
+/// against anything this handle was granted.
+///
+/// So do NOT add `FILE_LIST_DIRECTORY` back. Enumerating is a right this handle
+/// never exercises, and Windows makes listing a directory and creating a
+/// subdirectory in it INDEPENDENT rights. A watched descendant whose ACL permits
+/// the create and denies the listing would fail this open, killing every
+/// sync-cookie write beneath it before the mint ever ran.
+/// `FILE_TRAVERSE` is no safer: a right named in `dwDesiredAccess` is checked
+/// against the DACL of the object BEING OPENED, and `SeChangeNotifyPrivilege` —
+/// held by essentially everyone — only skips the checks on a path's intermediate
+/// directories, so it buys no relief for a traverse denied on this one. Any bit
+/// beyond zero can only turn a create this process is permitted to make into
+/// `ACCESS_DENIED`.
+///
+/// That is the rule every mask in the cookie path is written to, not a special
+/// case for this one: derive the bits from the operations the handle actually
+/// performs, and refuse a right on the grounds that it is unused rather than
+/// keep it on the grounds that it is permitted. [`create_directory_at`] and
+/// `driver::CookieDir`'s own two opens each carry the same derivation.
+///
+/// `FILE_FLAG_BACKUP_SEMANTICS` is required for a handle on a directory at all,
+/// and total sharing keeps this handle — like every other one here — from
+/// pinning the tree against a peer's rename or delete.
+///
+/// This open is BY PATH and follows reparse points exactly as the `create_dir`
+/// it replaced did, so a component swapped in between the caller's
+/// `canonicalize` and this call is still followed. That residual is the caller's
+/// (see `FsOps::write_cookie`) and is deliberately not widened here: what the
+/// anchor removes is everything BELOW it, because the leaf is never looked up
+/// twice.
+pub(crate) fn open_cookie_parent(path: &Path) -> io::Result<OwnedHandle> {
+  let path = wide(path);
+  // SAFETY: `path` is NUL-terminated and outlives the call; null security
+  // attributes and template are the documented "none".
+  let raw = unsafe {
+    CreateFileW(
+      path.as_ptr(),
+      0,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+      std::ptr::null(),
+      OPEN_EXISTING,
+      FILE_FLAG_BACKUP_SEMANTICS,
+      std::ptr::null_mut(),
+    )
+  };
+  if raw == INVALID_HANDLE_VALUE {
+    return Err(io::Error::last_os_error());
+  }
+  // SAFETY: freshly returned by a successful CreateFileW and owned by no one
+  // else; OwnedHandle takes over closure.
+  Ok(unsafe { OwnedHandle::from_raw_handle(raw as _) })
+}
+
+/// CREATES a directory named `leaf` directly inside the directory `parent`
+/// refers to, and answers the handle THAT CREATE produced.
+///
+/// One call binds the name and yields the object, which is the whole point.
+/// `CreateDirectoryW` returns no handle — Microsoft documents that obtaining one
+/// means opening the name again — and between those two calls a peer with write
+/// access to the parent can unlink the new directory and stand its own there, so
+/// the retained handle would describe an object this process never made and the
+/// disposal at retirement would destroy it. `NtCreateFile` has no such window:
+/// the handle it returns IS the object it created.
+///
+/// The parameters, and why each is what it is:
+///
+/// * `FILE_CREATE` fails if the name exists at all, so nothing pre-existing can
+///   ever be adopted and no reparse point can be followed into. An occupied name
+///   comes back as `AlreadyExists`, which is exactly what the mint loop retries
+///   on (`driver::mint_step`).
+/// * `FILE_DIRECTORY_FILE` makes the created object a directory, so there is no
+///   later verdict to take about what kind of object this is.
+/// * `FILE_SYNCHRONOUS_IO_NONALERT` keeps the handle synchronous, and is also
+///   what puts `SYNCHRONIZE` in the access mask — see the derivation below.
+/// * `FILE_OPEN_REPARSE_POINT` is deliberately NOT here, and its absence takes
+///   nothing away. `FILE_CREATE` fails on a pre-existing leaf of ANY kind, a
+///   reparse point included, so the no-follow guarantee is already total without
+///   it. What the flag could add is a failure: it is not among the options
+///   Microsoft documents as compatible with `FILE_DIRECTORY_FILE`, so a driver
+///   holding to that contract can reject the whole create with
+///   `STATUS_INVALID_PARAMETER` — which `security::nt_create` reads as `Failed`
+///   rather than a collision, so the mint would abort and every sync-cookie
+///   write on such a filesystem would fail.
+/// * `OBJ_CASE_INSENSITIVE` is what makes an occupied name collide the way
+///   Windows resolves names. Unlike Win32, which always sets it, the NT layer
+///   leaves the name match to the kernel's own case policy without it — so on a
+///   system where that resolves case-sensitively, a differently-cased spelling
+///   of a candidate would NOT collide and the mint would bind a case-variant
+///   sibling of a directory somebody else owns. Asking for it makes the
+///   collision the same fact on every system.
+/// * Sharing is total, so retaining the handle pins nothing: a peer may still
+///   delete or rename the tree around it, exactly as the cookie file's own
+///   retained handle already allows.
+///
+/// The security descriptor is null, so the new directory inherits the parent's
+/// access-control list — the same thing `create_dir` did, and the reason the
+/// contract on `driver::CookieDir` says the directory takes no permission away
+/// on this platform.
+///
+/// # The access mask, derived from what the handle DOES
+///
+/// `DELETE | SYNCHRONIZE`, and each bit is there because an operation this call
+/// performs cannot proceed without it. That is the test the mask is written
+/// against — not whether a right sounds related to a directory, and not whether
+/// the create's contract permits it. "Legal" and "required" are different
+/// questions, and only the second one keeps a permitted create off
+/// `ACCESS_DENIED`.
+///
+/// The handle this returns performs exactly ONE operation for its whole life:
+/// the delete disposition [`delete_by_handle`] sets at retirement.
+/// `driver::CookieDir` holds it for nothing else — no attribute read, no
+/// enumeration, no identity read, and no reparse verdict, since the mint takes
+/// its answer from this create's own `NTSTATUS` instead. So:
+///
+/// * `DELETE` is what that disposition requires. `NtSetInformationFile`
+///   documents it for both classes [`delete_by_handle`] can set —
+///   `FileDispositionInformation` and `FileDispositionInformationEx` each say
+///   the caller must have opened the file with the DELETE flag set in
+///   `DesiredAccess` — and `SetFileInformationByHandle` says the same for the
+///   Win32 spelling. It is MANDATORY rather than opportunistic: a volume or ACL
+///   that refuses it fails the CREATE — a loud, bounded, typed write failure —
+///   instead of yielding a directory this process can never clean up. The
+///   deleted reading (retry without `DELETE` and carry on) leaked one directory
+///   per obligation, forever and uncounted, precisely because a fresh one is
+///   minted each time.
+/// * `SYNCHRONIZE` is what `FILE_SYNCHRONOUS_IO_NONALERT` requires:
+///   `NtCreateFile` states that if that flag is set, the SYNCHRONIZE flag must
+///   be set in `DesiredAccess`. It is the create OPTION's requirement rather
+///   than an operation's, and it is the reason the option is worth naming at
+///   all here.
+///
+/// And nothing else. `FILE_READ_ATTRIBUTES` stood here and is deliberately
+/// gone: what it authorises is the attribute-reading query classes
+/// (`FileBasicInformation`, `FileAttributeTagInformation`,
+/// `FileNetworkOpenInformation` — the ones `NtQueryInformationFile` names it
+/// for), and this handle issues none of them. A right the create merely MAY ask
+/// for is not thereby one it needs: Windows makes creating a subdirectory and
+/// reading a directory's attributes independent rights, so an ACL that grants
+/// `FILE_ADD_SUBDIRECTORY` and `DELETE` while denying attribute reads would
+/// fail this create outright — and with it every sync-cookie write beneath that
+/// directory, which is the whole cost of one unused bit. Do NOT add it back,
+/// and do not add `FILE_LIST_DIRECTORY` or `FILE_TRAVERSE` either:
+/// [`open_cookie_parent`] states the same rule for the anchor, whose requested
+/// access is zero for exactly this reason.
+pub(crate) fn create_directory_at(
+  parent: BorrowedHandle<'_>,
+  leaf: &str,
+) -> io::Result<OwnedHandle> {
+  use crate::os::windows::security::{self, NtCreate};
+
+  let name: Vec<u16> = leaf.encode_utf16().collect();
+  // A `UNICODE_STRING` measures BYTES, not code units, in a `u16` — so the
+  // conversion is checked rather than cast. A cookie directory's name is ~36
+  // characters, so this can only fire on a name nothing in this crate mints.
+  let bytes = u16::try_from(size_of_val(name.as_slice())).map_err(|_| {
+    io::Error::new(
+      io::ErrorKind::InvalidInput,
+      "a cookie directory name longer than a UNICODE_STRING can measure",
+    )
+  })?;
+  let unicode = UNICODE_STRING {
+    Length: bytes,
+    MaximumLength: bytes,
+    Buffer: name.as_ptr().cast_mut(),
+  };
+  let attributes = OBJECT_ATTRIBUTES {
+    Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+    RootDirectory: parent.as_raw_handle() as HANDLE,
+    ObjectName: &raw const unicode,
+    Attributes: OBJ_CASE_INSENSITIVE,
+    SecurityDescriptor: std::ptr::null(),
+    SecurityQualityOfService: std::ptr::null(),
+  };
+  let mut status_block: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+  let mut opened: HANDLE = std::ptr::null_mut();
+  // SAFETY: every pointer handed over is to a live local that outlives the call,
+  // and the kernel reads or writes each exactly as documented.
+  //
+  // * `&raw mut opened` is a writable `HANDLE` the call fills in on success.
+  // * `&raw const attributes` is a fully initialized `OBJECT_ATTRIBUTES` whose
+  //   `Length` is its own `size_of`, which is how the kernel versions it.
+  // * `attributes.ObjectName` points at `unicode`, a live `UNICODE_STRING` bound
+  //   to a local — not a temporary — so it is not dropped before the call.
+  // * `unicode.Buffer` points at `name`, a `Vec<u16>` bound to a local for the
+  //   same reason, and `Length`/`MaximumLength` are its size in BYTES (checked
+  //   into `u16` above), which is the unit `UNICODE_STRING` is defined in. The
+  //   buffer is only read: this create takes a name, it does not return one.
+  // * `attributes.RootDirectory` is borrowed for the call by the type system.
+  // * A null security descriptor and null quality-of-service are the documented
+  //   "none" (inherit the parent's ACL, no impersonation).
+  // * `&raw mut status_block` is a writable, zeroed `IO_STATUS_BLOCK`.
+  // * A null allocation size and a null extended-attribute buffer with length 0
+  //   are the documented "none" for both.
+  let status = unsafe {
+    NtCreateFile(
+      &raw mut opened,
+      DELETE | SYNCHRONIZE,
+      &raw const attributes,
+      &raw mut status_block,
+      std::ptr::null(),
+      FILE_ATTRIBUTE_NORMAL,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+      FILE_CREATE,
+      FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+      std::ptr::null(),
+      0,
+    )
+  };
+  // Taken over BEFORE the verdict below, so no arm of it can leak a handle the
+  // kernel did hand back — including the informational name status, which is a
+  // success by NT's severity rule and still not this call's own directory.
+  let handle = (status >= 0 && !opened.is_null()).then(||
+    // SAFETY: a success-severity `NtCreateFile` wrote a fresh handle owned by no
+    // one else into `opened`; `OwnedHandle` takes over its closure.
+    unsafe { OwnedHandle::from_raw_handle(opened as _) });
+
+  match security::nt_create(status) {
+    NtCreate::Bound => handle
+      .ok_or_else(|| io::Error::other("NtCreateFile reported success without returning a handle")),
+    // Nothing was created, so nothing behind that name is this call's to enter
+    // or to remove: the handle — if the kernel returned one at all — is closed
+    // here and the name is left exactly as it was found.
+    NtCreate::Collided => Err(io::Error::new(
+      io::ErrorKind::AlreadyExists,
+      "the cookie directory's name was already bound",
+    )),
+    NtCreate::Denied => Err(io::Error::new(
+      io::ErrorKind::PermissionDenied,
+      "creating a cookie directory was denied",
+    )),
+    NtCreate::Failed => {
+      // SAFETY: `RtlNtStatusToDosError` reads no memory beyond its argument and
+      // cannot fail; it is the documented lowering of an `NTSTATUS` to the Win32
+      // error code `io::Error` speaks.
+      let code = unsafe { RtlNtStatusToDosError(status) };
+      Err(if code == 0 {
+        // No Win32 code for this status. Reporting it as error 0 would render
+        // the failure as "the operation completed successfully".
+        io::Error::other(format!(
+          "creating a cookie directory failed with NTSTATUS {:#010x}",
+          status as u32
+        ))
+      } else {
+        io::Error::from_raw_os_error(code as i32)
+      })
+    }
+  }
 }
 
 /// What `FSCTL_QUERY_USN_JOURNAL` reports about a volume's live journal.
