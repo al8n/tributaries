@@ -41,7 +41,7 @@ iradix = "0.3"
 # words in cookie file names still reveals nothing about the seed behind them. Pure
 # computation with no OS dependency, so — unlike `getrandom` below — it needs no target
 # gate and builds for `wasm32-unknown-unknown` unchanged.
-rand_chacha = "0.9"
+rand_chacha = "0.10"
 thiserror = "2"
 tributary-fs = { version = "0.1", path = "../tributary-fs", optional = true }
 tributary-proto = { version = "0.1", path = "../tributary-proto" }
