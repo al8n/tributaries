@@ -2392,10 +2392,11 @@ fn a_still_covered_admission_lapses_to_the_replaced_handling() {
 /// frame asks` with `left: 0, right: 1` — the check is intact but nothing ever
 /// makes it fire, which is the half a cell written only against `on_admitted`
 /// would miss.
-/// MUTATION WITNESS (overwrite unconditionally, the R15 F3 shape): replace the
-/// `recover_if_unserved` call with a bare `request_root_recovery` and this FAILS
-/// at `and the reply itself asks for nothing further` with `left: 1, right: 0` —
-/// a duplicate whole-root walk queued behind one already running.
+/// MUTATION WITNESS (overwrite unconditionally, the R15 F3 shape): drop the
+/// `state.owes_whole_root()` guard from `on_admitted`'s superseded arm, leaving a
+/// bare `request_root_recovery`, and this FAILS at `and the reply itself asks for
+/// nothing further` carrying a second `RecoverRoot` — a duplicate whole-root walk
+/// queued behind one already running.
 #[test]
 fn an_admission_answered_after_the_frame_moved_recovers_the_whole_root() {
   let (mut core, scope) = live_core_fanotify(vec![row("/r/vol", 77, 9)], Some(42));
@@ -2511,11 +2512,11 @@ fn an_admission_answered_after_the_frame_moved_recovers_the_whole_root() {
 /// DISCARDED), on a set this very arm had just emptied.
 ///
 /// MUTATION WITNESS (retire before judging): move `state.pending_admits.remove(index)`
-/// above the `recover_if_unserved` call and this FAILS at `the arm asks: nothing
-/// is serving the need` with `left: 0, right: 1` — the cover dropped and no
-/// reseed ever asked for, on a scope with no tick to save it.
-/// MUTATION WITNESS (never ask): delete the `recover_if_unserved` call and it
-/// FAILS at the same site with the same values.
+/// above `on_admitted`'s `if state.owes_whole_root()` block and this FAILS at `the
+/// arm asks: nothing is serving the need` with `left: 0, right: 1` — the cover
+/// dropped and no reseed ever asked for, on a scope with no tick to save it.
+/// MUTATION WITNESS (never ask): delete that block and it FAILS at the same site
+/// with the same values.
 #[test]
 fn an_admission_answered_with_no_recovery_standing_asks_for_one() {
   // No tick: every request in this cell is one some site explicitly made.
@@ -4164,9 +4165,8 @@ fn identity_minting_respects_devices_and_mounts() {
     root_dev: Some(1),
     root_mnt_id: None,
     frame_epoch: 0,
-    generation_epoch: 0,
+    generation: Generation::Verified { epoch: 0 },
     pending_recovery: None,
-    refused_walk: None,
     published_epoch: None,
     identity: Some(crate::os::RootIdentity::new(1, 1)),
     mount_table: vec![PathBuf::from("/r/vol")],
@@ -4186,7 +4186,6 @@ fn identity_minting_respects_devices_and_mounts() {
     settle_floor: None,
     pending_widen: None,
     root_incarnation: None,
-    generation_rejected: false,
   };
   let fid = NonZeroU64::new(7);
   assert!(mint(&state, Path::new("/r/a"), fid, None).is_some());
@@ -4213,9 +4212,8 @@ fn blind_mount_table_refuses_event_side_trust() {
     root_dev: Some(1),
     root_mnt_id: None,
     frame_epoch: 0,
-    generation_epoch: 0,
+    generation: Generation::Verified { epoch: 0 },
     pending_recovery: None,
-    refused_walk: None,
     published_epoch: None,
     identity: Some(crate::os::RootIdentity::new(1, 1)),
     mount_table: Vec::new(),
@@ -4235,7 +4233,6 @@ fn blind_mount_table_refuses_event_side_trust() {
     settle_floor: None,
     pending_widen: None,
     root_incarnation: None,
-    generation_rejected: false,
   };
   let fid = NonZeroU64::new(7);
   assert!(
@@ -6028,9 +6025,8 @@ mod lowering {
       root_dev: Some(1),
       root_mnt_id: None,
       frame_epoch: 0,
-      generation_epoch: 0,
+      generation: Generation::Verified { epoch: 0 },
       pending_recovery: None,
-      refused_walk: None,
       published_epoch: None,
       identity: Some(crate::os::RootIdentity::new(1, 1)),
       mount_table: Vec::new(),
@@ -6050,7 +6046,6 @@ mod lowering {
       settle_floor: None,
       pending_widen: None,
       root_incarnation: None,
-      generation_rejected: false,
     }
   }
 
@@ -15415,10 +15410,10 @@ mod kernel_recursive_fanotify {
   /// the very watermark the need is read from.
   ///
   /// MUTATION WITNESS (the applied generation is not banked): drop
-  /// `state.generation_epoch = state.frame_epoch;` from `on_root_recovered`'s
-  /// success path and this FAILS at `the refresh the refusal armed asks for
-  /// nothing` with `left: 1, right: 0` — the whole-root walk and `Rescan` the
-  /// finding is about, on a map that was already current.
+  /// `state.generation_applied();` from `on_root_recovered`'s success path and this
+  /// FAILS at `the refresh the refusal armed asks for nothing` with `left: 1,
+  /// right: 0` — the whole-root walk and `Rescan` the finding is about, on a map
+  /// that was already current.
   /// MUTATION WITNESS (the refused reply is applied anyway): remove the `return`
   /// from the mismatch arm so the stale reply falls through, and it FAILS at `the
   /// refused reply retires nothing` — `/r/keep` deleted by a walk of a world this
@@ -16175,17 +16170,20 @@ mod kernel_recursive_fanotify {
   /// has passed. The second half of this cell is that discharge, because evidence
   /// that never clears is a whole-root walk per refresh forever.
   ///
-  /// MUTATION WITNESS (derive it instead): drop the `self.generation_rejected ||`
-  /// disjunct from `ScopeState::generation_stale` and this FAILS at `the rejected
-  /// generation is asked for again` with `left: 0, right: 1` — the scope sits with
-  /// an unverified exempt partition and asks for nothing, forever.
-  /// MUTATION WITNESS (never discharged): drop `state.generation_rejected = false;`
-  /// from `on_root_recovered`'s applied path and this FAILS at `the discharge is
-  /// the generation LANDING` carrying `[RecoverRoot { .. request: RecoveryRequest
-  /// { ticket: AdmitTicket(2), epoch: 1 } }]` — a whole-root reseed bought on every
+  /// MUTATION WITNESS (derive it instead): make `ScopeState::generation_stale`'s
+  /// `Generation::Lost` arm derive rather than answer — `Generation::Lost { .. } =>
+  /// self.holds_exempt_record()` — and this FAILS at `staging: and it arms the read
+  /// that would settle the frame` with `left: 0, right: 1`. The loss goes
+  /// unrecorded, so the arm that would buy the read finds nothing owed and the R13
+  /// assertion behind it never runs: the scope sits with an unverified exempt
+  /// partition and asks for nothing, forever.
+  /// MUTATION WITNESS (never discharged): drop `state.generation_applied();` from
+  /// `on_root_recovered`'s applied path and this FAILS at `the discharge is the
+  /// generation LANDING` carrying `[RecoverRoot { .. request: RecoveryRequest {
+  /// ticket: AdmitTicket(2), epoch: 1 } }]` — a whole-root reseed bought on every
   /// refresh for the life of the scope.
   #[test]
-  fn a_generation_rejected_before_the_first_exempt_record_is_still_owed() {
+  fn a_generation_lost_before_the_first_exempt_record_is_still_owed() {
     // The source-adoption window, staged out of the birth alone: the spawn bumps
     // the frame epoch to its first world while a fresh reader's mailbox is still
     // at zero.
@@ -16862,13 +16860,13 @@ mod kernel_recursive_fanotify {
   /// not.
   ///
   /// MUTATION WITNESS (arm unconditionally, the shape before this): drop the
-  /// `recover_if_unserved` call in `on_walk_boundaries`' mismatch arm for a bare
-  /// `arm_refresh` and this FAILS at `a rejection a live round trip already
-  /// answers arms no read` with `left: 1, right: 0`.
-  /// MUTATION WITNESS (never arm): delete the call outright and it FAILS at
-  /// `staging: with nothing outstanding the rejection buys its read` with `left:
-  /// 0, right: 1` — the R13 hole, an owed generation nobody ever asks for once the
-  /// tick is off.
+  /// `state.owes_whole_root()` guard from `on_walk_boundaries`' mismatch arm,
+  /// leaving a bare `arm_refresh`, and this FAILS at `a rejection a live round trip
+  /// already answers arms no read` with `left: 1, right: 0`.
+  /// MUTATION WITNESS (never arm): delete that guarded `arm_refresh` outright and
+  /// it FAILS at `staging: with nothing outstanding the rejection buys its read`
+  /// with `left: 0, right: 1` — the R13 hole, an owed generation nobody ever asks
+  /// for once the tick is off.
   #[test]
   fn a_rejected_autonomous_report_arms_no_read_behind_a_live_round_trip() {
     // No tick at all: every read here is one some site explicitly armed.
@@ -16950,26 +16948,26 @@ mod kernel_recursive_fanotify {
     );
   }
 
-  /// **R15, the consolidation itself.** All three arms that schedule a whole-root
-  /// recovery take ONE decision, so one staging refuses all three.
+  /// **One decision, three arms.** All three arms that schedule a whole-root
+  /// recovery ask the identical question — [`is one still
+  /// unserved?`](ScopeState::owes_whole_root) — so one staging refuses all three.
   ///
-  /// Five consecutive review rounds each found a different one of these arms
-  /// incomplete — `on_walk_boundaries` armed unconditionally, `on_admitted`
+  /// A different one of them was found incomplete each round while each spelled its
+  /// own conjunct set: `on_walk_boundaries` armed unconditionally, `on_admitted`
   /// overwrote a round trip already out, `on_root_recovered` was fixed a round
-  /// earlier and its siblings were not — because each spelled its own conjuncts
-  /// over the same question. This drives all three against ONE standing
-  /// current-world recovery: whichever of them stops routing through
-  /// [`recover_if_unserved`](DriverCore::recover_if_unserved) fails at its own
-  /// labelled assertion.
+  /// earlier and its siblings were not. This drives all three against ONE standing
+  /// current-world recovery: whichever of them stops consulting
+  /// [`owes_whole_root`](ScopeState::owes_whole_root) fails at its own labelled
+  /// assertion.
   ///
-  /// MUTATION WITNESS (arm A bypasses): give `on_walk_boundaries`' mismatch arm a
-  /// bare `arm_refresh` and this FAILS at `ARM A (a rejected autonomous
-  /// generation)` with `left: 1, right: 0`.
-  /// MUTATION WITNESS (arm B bypasses): give `on_root_recovered`'s mismatch arm a
-  /// bare `arm_refresh` and it FAILS at `ARM B (a refused recovery reply)` with
-  /// `left: 1, right: 0`.
-  /// MUTATION WITNESS (arm C bypasses): give `on_admitted`'s superseded arm a bare
-  /// `request_root_recovery` and it FAILS at `ARM C (a superseded admission
+  /// MUTATION WITNESS (arm A bypasses): drop the `owes_whole_root()` guard from
+  /// `on_walk_boundaries`' mismatch arm and this FAILS at `ARM A (a rejected
+  /// autonomous generation)` with `left: 1, right: 0`.
+  /// MUTATION WITNESS (arm B bypasses): drop the `!reasked && owes_whole_root()`
+  /// guard from `on_root_recovered`'s mismatch arm and it FAILS at `ARM B (a
+  /// refused recovery reply)` with `left: 1, right: 0`.
+  /// MUTATION WITNESS (arm C bypasses): drop the `owes_whole_root()` guard from
+  /// `on_admitted`'s superseded arm and it FAILS at `ARM C (a superseded admission
   /// reply)` with `left: 1, right: 0`.
   #[test]
   fn all_three_recovery_arms_defer_to_one_standing_round_trip() {
@@ -17086,6 +17084,268 @@ mod kernel_recursive_fanotify {
       parked_admits(&core, scope),
       0,
       "and no cover is left parked on a reply that can never come"
+    );
+  }
+
+  /// **An `Unreachable` resolution ends the ROUND TRIP and nothing else.** The
+  /// refusal key survives it, because a request no source ever took is not an
+  /// observation about anybody's world.
+  ///
+  /// `pending_recovery` and [`Generation`] answer different questions, so the one
+  /// site that resolves a request nothing answered writes only the first. Dropping
+  /// the key there would look harmless — it is "just" a retry brake — and it
+  /// reopens the loop R14 closed: the refusal arms a table read, the read re-derives
+  /// the need and re-asks, the re-ask is refused, and with an unreachable in the
+  /// cycle there is no landed generation anywhere to make either walk fresh
+  /// information. Two walks that fenced against the same foreign root while this
+  /// scope held the same frame are still two walks, whatever happened to the request
+  /// in between.
+  ///
+  /// Both directions, because the key is an OBSERVATION and not a mute button: the
+  /// SAME disagreement falls back to the refresh cadence, and a DIFFERENT foreign
+  /// root arms again — the source's world demonstrably moved between the two walks.
+  ///
+  /// MUTATION WITNESS (the key goes with the round trip): add `state.generation =
+  /// Generation::Lost { refused: None };` to `DriverCore::on_recovery_unreachable`
+  /// and this FAILS at `a repeat across an unreachable arms no read of its own`
+  /// with `left: 1, right: 0` — the refusal arming the read that produces the next
+  /// refusal, with no cadence anywhere in the cycle.
+  /// MUTATION WITNESS (key PRESENCE, not the key itself): make
+  /// `ScopeState::generation_lost` compute `let reasked = disagreement.is_some() &&
+  /// held.is_some();` and it FAILS at `a DIFFERENT foreign root re-opens the
+  /// arming` with `left: 0, right: 1` — one refusal silencing this arm for every
+  /// later disagreement, however far the source's world has moved.
+  #[test]
+  fn an_unreachable_resolution_keeps_the_refusal_key() {
+    // No tick: every read below is one some site explicitly armed.
+    let (mut core, scope) = spawned_fanotify_polling(Duration::ZERO, Some(42), Vec::new());
+    let refresh = |token: u64| incarnate_refresh(Vec::new(), true, Some(42), Some(unique(token)));
+    core.on_mounts_refreshed(scope, refresh(1), at(0));
+    assert!(
+      obliged(&drain(&mut core)).is_empty(),
+      "staging: empty baseline"
+    );
+
+    // A generation is lost, so a recovery is owed and the refresh buys it.
+    core.on_walk_boundaries(
+      scope,
+      whole_root_walk_on(Some(42), 0, vec![subvolume_decline("/r/vol", 99, 42)]),
+      at(1),
+    );
+    drain(&mut core);
+    core.on_mounts_refreshed(scope, refresh(1), at(2));
+    let effects = drain(&mut core);
+    let first = recoveries(&effects);
+    assert_eq!(
+      first.len(),
+      1,
+      "staging: the owed recovery goes out: {effects:?}"
+    );
+
+    let refuse = |core: &mut DriverCore, request: crate::os::RecoveryRequest, walked, now| {
+      core.on_root_recovered(
+        scope,
+        crate::os::RootRecovery {
+          declined: Vec::new(),
+          cutoff: request.ticket,
+          epoch: request.epoch,
+          root_mnt_id: Some(walked),
+        },
+        now,
+      );
+      drain(core)
+    };
+
+    // Refused on foreign root 77. Nothing was keyed before, so the retry is spent
+    // here and the read it buys is what puts a freshly published frame under it.
+    let refused = refuse(&mut core, first[0], 77, at(3));
+    assert_eq!(
+      refresh_requests(&refused),
+      1,
+      "staging: the FIRST refusal buys a read: {refused:?}"
+    );
+
+    // The retry goes out — and NO SOURCE TAKES IT. The round trip ends with no
+    // walk, no generation, and no reading of anybody's world.
+    core.on_mounts_refreshed(scope, refresh(1), at(4));
+    let effects = drain(&mut core);
+    let spent = recoveries(&effects);
+    assert_eq!(
+      spent.len(),
+      1,
+      "staging: the retry goes out on the frame that read published: {effects:?}"
+    );
+    core.on_recovery_unreachable(scope, at(5));
+    let resolved = drain(&mut core);
+    assert!(
+      emits(&resolved)
+        .iter()
+        .any(|change| change.kind().is_rescan()),
+      "staging: the cover is never stranded behind a reply that cannot come: \
+       {resolved:?}"
+    );
+
+    // The need is still owed, so the next refresh asks again.
+    core.on_mounts_refreshed(scope, refresh(1), at(6));
+    let effects = drain(&mut core);
+    let reasked = recoveries(&effects);
+    assert_eq!(
+      reasked.len(),
+      1,
+      "staging: an unreachable resolution ends the request, never the need: \
+       {effects:?}"
+    );
+
+    // Refused on the SAME foreign root, the same frame. The unreachable resolved a
+    // request; it observed nothing, so this is still the second walk raised in full
+    // knowledge of the first.
+    let repeat = refuse(&mut core, reasked[0], 77, at(7));
+    assert_eq!(
+      refresh_requests(&repeat),
+      0,
+      "a repeat across an unreachable arms no read of its own: a request no source \
+       took is not an observation of anybody's world, so nothing about it makes \
+       either walk fresh information: {repeat:?}"
+    );
+    assert!(
+      recoveries(&repeat).is_empty(),
+      "and nothing is asked for on the spot either: {repeat:?}"
+    );
+
+    // Bounded, not silenced — and a DIFFERENT foreign root is fresh information.
+    core.on_mounts_refreshed(scope, refresh(1), at(8));
+    let effects = drain(&mut core);
+    let moved = recoveries(&effects);
+    assert_eq!(
+      moved.len(),
+      1,
+      "staging: the refresh cadence still re-derives the need: {effects:?}"
+    );
+    let elsewhere = refuse(&mut core, moved[0], 88, at(9));
+    assert_eq!(
+      refresh_requests(&elsewhere),
+      1,
+      "a DIFFERENT foreign root re-opens the arming: the source's world moved \
+       between the two walks, so the second reply is fresh information rather than \
+       a repeat: {elsewhere:?}"
+    );
+  }
+
+  /// **A generation that LANDS discharges the refusal key with the evidence it was
+  /// lost with**, so the next refusal on a foreign root this scope has seen before
+  /// is fresh information and buys its own read.
+  ///
+  /// The key bounds ONE cycle — refusal arms a read, the read re-asks, the re-ask is
+  /// refused — and that cycle needs both walks to have run with nothing landing in
+  /// between. A complete generation applied to the coverage set is exactly what
+  /// makes a later disagreement a new fact: the set was verified after the first
+  /// refusal, so a walk that disputes the frame now is disputing a frame this scope
+  /// has evidence for.
+  ///
+  /// Keeping the key past a landing is a SILENCE with no cadence to escape it: the
+  /// arm would decline forever on a disagreement observed once, arbitrarily long
+  /// ago, whatever landed since.
+  ///
+  /// The contrast is `a_repeated_refusal_arms_no_read_of_its_own`, which drives the
+  /// same two refusals on the same foreign root with NO generation between them and
+  /// pins the opposite answer.
+  ///
+  /// MUTATION WITNESS (the landing discharges nothing): drop
+  /// `state.generation_applied();` from `on_root_recovered`'s applied path and this
+  /// FAILS at `a refusal after a landed generation buys its read` with `left: 0,
+  /// right: 1` — the retry brake latched shut for the life of the scope on one
+  /// disagreement seen once.
+  ///
+  /// The other direction has no mutation: a key held beside a
+  /// [`Generation::Verified`] is unrepresentable, so the landing cannot half-clear.
+  #[test]
+  fn an_applied_generation_drops_the_refusal_key() {
+    // No tick: every read below is one some site explicitly armed.
+    let (mut core, scope) = spawned_fanotify_polling(Duration::ZERO, Some(42), Vec::new());
+    let refresh = |token: u64| incarnate_refresh(Vec::new(), true, Some(42), Some(unique(token)));
+    core.on_mounts_refreshed(scope, refresh(1), at(0));
+    assert!(
+      obliged(&drain(&mut core)).is_empty(),
+      "staging: empty baseline"
+    );
+
+    let lose = |core: &mut DriverCore, now| {
+      core.on_walk_boundaries(
+        scope,
+        whole_root_walk_on(Some(42), 0, vec![subvolume_decline("/r/vol", 99, 42)]),
+        now,
+      );
+      drain(core)
+    };
+    let refuse = |core: &mut DriverCore, request: crate::os::RecoveryRequest, now| {
+      core.on_root_recovered(
+        scope,
+        crate::os::RootRecovery {
+          declined: Vec::new(),
+          cutoff: request.ticket,
+          epoch: request.epoch,
+          root_mnt_id: Some(77),
+        },
+        now,
+      );
+      drain(core)
+    };
+
+    lose(&mut core, at(1));
+    core.on_mounts_refreshed(scope, refresh(1), at(2));
+    let effects = drain(&mut core);
+    let first = recoveries(&effects);
+    assert_eq!(
+      first.len(),
+      1,
+      "staging: the owed recovery goes out: {effects:?}"
+    );
+    let refused = refuse(&mut core, first[0], at(3));
+    assert_eq!(
+      refresh_requests(&refused),
+      1,
+      "staging: the first refusal on foreign root 77 buys a read and keys on it: \
+       {refused:?}"
+    );
+
+    // The retry goes out and this time it LANDS: a complete generation, applied.
+    core.on_mounts_refreshed(scope, refresh(1), at(4));
+    let effects = drain(&mut core);
+    let retry = recoveries(&effects);
+    assert_eq!(retry.len(), 1, "staging: the retry goes out: {effects:?}");
+    let applied = answer_captured_recovery(
+      &mut core,
+      scope,
+      retry[0],
+      vec![subvolume_decline("/r/vol", 99, 42)],
+      at(5),
+    );
+    assert_eq!(
+      recorded(&core, scope),
+      vec![(PathBuf::from("/r/vol"), Some(42), Some(99))],
+      "staging: the generation landed — the exempt boundary is in the set: \
+       {applied:?}"
+    );
+
+    // A later loss, and a later refusal on the very foreign root the key held.
+    lose(&mut core, at(6));
+    core.on_mounts_refreshed(scope, refresh(1), at(7));
+    let effects = drain(&mut core);
+    let third = recoveries(&effects);
+    assert_eq!(
+      third.len(),
+      1,
+      "staging: the fresh loss is owed a generation and the refresh buys it: \
+       {effects:?}"
+    );
+    let refused = refuse(&mut core, third[0], at(8));
+    assert_eq!(
+      refresh_requests(&refused),
+      1,
+      "a refusal after a landed generation buys its read: the key bounds one \
+       cycle of refusal-arms-read-re-asks, and a complete generation applied \
+       between the two walks is what makes this disagreement a new fact rather \
+       than the same one twice: {refused:?}"
     );
   }
 }

@@ -44,9 +44,9 @@
 //!   only read the records the set HOLDS. A rejected whole-root generation is
 //!   precisely the message that would have put the FIRST exempt record there, so
 //!   after the rejection the set is empty of exactly the evidence the derivation
-//!   looks for. The answer is not a fourth clearing site but retained evidence
-//!   ([`generation_rejected`](ScopeState::generation_rejected)), set by an
-//!   observation and discharged by ONE event — a generation actually landing.
+//!   looks for. The answer is not one more clearing site but retained evidence
+//!   ([`Generation::Lost`]), set by an observation and discharged by ONE event — a
+//!   generation actually landing.
 //! - **A value the kernel RECYCLES is not a world counter.** Mount ids are
 //!   allocated lowest-free, so a root that went A → B → A is back on the id a
 //!   refresh still holds and the comparison passes. The frame moves on an
@@ -122,16 +122,21 @@
 //! must name the need.
 //!
 //! **And the site is not one site.** Three arms schedule a whole-root recovery —
-//! an autonomous generation rejected ([`on_walk_boundaries`](DriverCore::on_walk_boundaries)),
+//! an autonomous generation lost ([`on_walk_boundaries`](DriverCore::on_walk_boundaries)),
 //! a requested reply refused ([`on_root_recovered`](DriverCore::on_root_recovered)),
 //! a located admission reply from a world this scope has left
-//! ([`on_admitted`](DriverCore::on_admitted)) — and each spelled its own conjuncts,
-//! so five consecutive review rounds each found a different one incomplete: one
-//! armed unconditionally, one overwrote a round trip already out, one derived the
-//! need from a set it had just emptied. Naming the need is not enough if three
-//! copies name it differently, so the decision is
-//! [`recover_if_unserved`](DriverCore::recover_if_unserved) and the arms differ
-//! only in the CARRIER they route to ([`RecoveryRoute`]).
+//! ([`on_admitted`](DriverCore::on_admitted)) — and each once spelled its own
+//! conjunct set over the same question, so a different one of them was found
+//! incomplete each round: one armed unconditionally, one overwrote a round trip
+//! already out, one derived the need from a set it had just emptied. Naming the
+//! need is not enough if three copies name it differently, so all three now read
+//! ONE predicate over TWO values whose product is entirely legal
+//! ([`Generation`] and [`pending_recovery`](ScopeState::pending_recovery)):
+//! `transition; if owes_whole_root() { carrier }`. They differ only in the carrier
+//! — a mount refresh for the two that dispute the FRAME (the core may be the stale
+//! party, so an immediate re-request would be answered by a walk reading the very
+//! same root), and a request on the spot for the one that disputes nothing about
+//! it, whose need is witnessed by a parked ticket the arm is about to retire.
 //!
 //! # Mount-refresh publication
 //!
@@ -947,6 +952,98 @@ struct RefusedWalk {
   epoch: u64,
 }
 
+/// **What this scope holds about the last COMPLETE whole-root generation** — one
+/// value, so no combination of its parts can be illegal.
+///
+/// It stands beside [`pending_recovery`](ScopeState::pending_recovery), which says
+/// whether a round trip is OUTSTANDING and nothing else. The two answer different
+/// questions — what the coverage set was last verified by, and whether a request is
+/// in flight — so every element of their product is a legal state and neither has
+/// to be reconciled against the other at a transition. What is NOT representable is
+/// a refusal key held by a scope whose generation is verified, the one combination
+/// no site may produce and that prose used to be all that forbade.
+///
+/// The whole value is written by two transitions
+/// ([`generation_applied`](ScopeState::generation_applied),
+/// [`generation_lost`](ScopeState::generation_lost)) and read by one predicate
+/// ([`generation_stale`](ScopeState::generation_stale)) plus the one arm that asks
+/// whether a disagreement has already been re-asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Generation {
+  /// The coverage set was verified by a complete generation applied under
+  /// `frame_epoch == epoch` — or seeded whole by a world swap's own barrier read,
+  /// which is the same kind of evidence taken at the one moment the set is known
+  /// to be complete.
+  ///
+  /// A WATERMARK, not a debt. It advances only where a generation was actually
+  /// applied, and no site clears it or moves it forward on anything else. That is
+  /// deliberate: a stored `recovery_owed` boolean — set at one site, read at
+  /// another, lost by a third — is stranded by whichever transition nobody
+  /// enumerated, and the answer is not one more clearing site but a fact no
+  /// transition can falsify. The set was verified in world N; the scope is now in
+  /// world M.
+  ///
+  /// What it makes derivable is [`generation_stale`](ScopeState::generation_stale):
+  /// a scope holding boundaries the mount table cannot speak for, whose last
+  /// complete generation was taken in a world it has since left, is owed another
+  /// one — whether the previous one was refused, superseded, or never asked for at
+  /// all.
+  Verified {
+    /// The [`frame_epoch`](ScopeState::frame_epoch) the generation was applied
+    /// under.
+    epoch: u64,
+  },
+  /// A complete generation was produced and NOT applied here: retained EVIDENCE,
+  /// set where one is discarded and discharged by exactly one event — a generation
+  /// landing.
+  ///
+  /// It is not an obligation flag wearing a new name. An obligation is decided by a
+  /// transition and then has to be remembered and cleared, and every path that
+  /// forgets either half strands it. This is a record of something that HAPPENED,
+  /// held to the discipline [`pending_recovery`](ScopeState::pending_recovery)
+  /// holds a round trip with: no site decides the need has passed, and the only way
+  /// it clears is that the thing it asks for was done.
+  ///
+  /// # Why the derived half is not enough on its own
+  ///
+  /// [`generation_stale`](ScopeState::generation_stale)'s derivation asks whether
+  /// the coverage set's EXEMPT partition was verified in a world this scope has
+  /// left, and it can only read the records the set HOLDS. A rejected whole-root
+  /// generation is precisely the message that could have carried the FIRST exempt
+  /// record — a btrfs subvolume no mountinfo row lists — and its declines are
+  /// dropped at the rejection, so the set holds none and
+  /// [`holds_exempt_record`](ScopeState::holds_exempt_record) reads false. The need
+  /// is then invisible to every derivation, and no later mount table can
+  /// reconstruct it.
+  ///
+  /// The production window is a source adoption: the core's frame epoch has already
+  /// moved while a freshly spawned reader's mailbox still starts at zero, so that
+  /// reader's first autonomous generation is refused on the epoch before the first
+  /// [`PublishFrame`](Effect::PublishFrame) reaches it — and the refresh that
+  /// refusal arms reads the very same mount id, leaving the frame epoch equal to
+  /// the birth watermark. Nothing else in the state says a generation was ever
+  /// owed.
+  Lost {
+    /// The disagreement the last REQUESTED recovery was refused ON, or `None` where
+    /// none has been — see [`RefusedWalk`] for why a refusal is SPENT once rather
+    /// than predicted away.
+    ///
+    /// It lives HERE because a refusal always loses the generation and a generation
+    /// landing clears both: the two facts have exactly one lifetime between them,
+    /// and a key held beside a verified watermark would be a state no site may
+    /// produce.
+    ///
+    /// Only the walked-id leg has a key. An EPOCH mismatch has none — the epoch is
+    /// what moved, so no two refusals can ever share one — and the key decides one
+    /// thing: whether [`on_root_recovered`](DriverCore::on_root_recovered)'s
+    /// mismatch arm arms its own mount refresh. It never decides whether a recovery
+    /// is OWED, which stays [`owes_whole_root`](ScopeState::owes_whole_root)'s and
+    /// is derived from what this scope holds, so a stale key costs at most one
+    /// self-armed table read and never a silence.
+    refused: Option<RefusedWalk>,
+  },
+}
+
 /// Why one mount refresh is being armed.
 ///
 /// The two causes agree completely when nothing is in flight — both arm one
@@ -979,38 +1076,6 @@ enum RefreshCause {
   /// condemning it — and without ever CLEARING a condemnation an invalidating
   /// arming already made.
   Periodic,
-}
-
-/// HOW an arm that finds a whole-root recovery unserved schedules it — the one
-/// thing [`recover_if_unserved`](DriverCore::recover_if_unserved)'s three callers
-/// differ in, and deliberately the ONLY thing.
-///
-/// The decision itself (is a round trip already open in the world this scope
-/// holds? does the derived need stand? has this disagreement already been
-/// re-asked?) is the helper's, and is identical at all three sites. Five
-/// consecutive review rounds each found a different site's hand-written conjunct
-/// set incomplete, so there is now ONE set and a route beside it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RecoveryRoute {
-  /// Arm one invalidating mount refresh and let IT ask.
-  ///
-  /// The carrier for the two arms that dispute the FRAME — an autonomous
-  /// generation stamped in a world this scope has left, or a reply whose walk
-  /// fenced against a root this core does not hold. Asking on the spot there is
-  /// the spin: when the core may be the stale party, an immediate re-request is
-  /// answered by a walk reading the very same root — one whole-root reseed per
-  /// turn with no read of the live table between them. The refresh publishes a
-  /// frame first, so the retry is stamped with a world just read.
-  Refresh,
-  /// Ask the source on the spot, against the frame this scope already holds.
-  ///
-  /// The carrier for the arm that disputes nothing about the frame — a located
-  /// admission reply from a world this scope has left. The core is not the stale
-  /// party there (its own refresh is what moved the epoch), it holds a frame a
-  /// read has already published, and the dropped cover is owed NOW: routing it
-  /// through a refresh would re-derive a need whose only witness — the parked
-  /// ticket — this very arm is about to retire.
-  Ask,
 }
 
 /// One I/O obligation the driver task must execute for the core.
@@ -2331,61 +2396,15 @@ struct ScopeState {
   /// nothing there depends on it: bumping anyway keeps "the frame moved" and "the
   /// epoch moved" the same statement, rather than one that happens to hold.
   frame_epoch: u64,
-  /// The [`frame_epoch`](Self::frame_epoch) under which this scope's coverage set
-  /// was last VERIFIED by a complete whole-root generation — or seeded whole by a
-  /// world swap's own barrier read, which is the same kind of evidence taken at
-  /// the one moment the set is known to be complete.
+  /// What this scope holds about its coverage set's last COMPLETE whole-root
+  /// generation: the world it was verified in, or the evidence that one was
+  /// produced and lost — see [`Generation`], which carries the rationale for both
+  /// halves and for the refusal key that rides the second.
   ///
-  /// It is a WATERMARK, not a debt: it is advanced only where a generation was
-  /// actually applied, and there is no site that clears it or sets it forward on
-  /// anything but evidence. That is deliberate. The three rounds before this one
-  /// each found a different state transition that stranded a stored `recovery_owed`
-  /// boolean — set at one site, read at another, and lost by a third — and the
-  /// answer is not a fourth clearing site but a fact that no transition can
-  /// falsify: the set was verified in world N, and the scope is now in world M.
-  ///
-  /// What it makes derivable is [`generation_stale`](Self::generation_stale): a
-  /// scope holding boundaries the mount table cannot speak for, whose last
-  /// complete generation was taken in a world this scope has since left, is owed
-  /// another one — whether the previous one was refused, superseded, or never
-  /// asked for at all.
-  generation_epoch: u64,
-  /// EVIDENCE that a complete whole-root generation was produced and then NOT
-  /// applied here — set where one is discarded, cleared only where one lands.
-  ///
-  /// # It is not the boolean three rounds went to the trouble of deleting
-  ///
-  /// That one was an OBLIGATION: set by a transition that decided a recovery was
-  /// needed, and read at another site that had to remember to clear it. Every
-  /// round found a different path that set it and never cleared it, or cleared it
-  /// without doing the work.
-  ///
-  /// This is a record of something that HAPPENED, and it is discharged by exactly
-  /// one event — a complete generation being applied to this scope's coverage set
-  /// — which is the same discipline
-  /// [`pending_recovery`](Self::pending_recovery) already holds a round trip
-  /// with. There is no site that decides the need has passed; the only way it
-  /// clears is that the thing it asks for was done.
-  ///
-  /// # Why the derived predicate is not enough on its own
-  ///
-  /// [`generation_stale`](Self::generation_stale) asks whether the coverage set's
-  /// EXEMPT partition was verified in a world this scope has left, and it can only
-  /// read the records the set HOLDS. A rejected whole-root generation is precisely
-  /// the message that could have carried the FIRST exempt record — a btrfs
-  /// subvolume no mountinfo row lists — and its declines are dropped at the
-  /// rejection, so the set holds none and `holds_exempt_record` reads false. The
-  /// need is then invisible to every derivation, and the mount table can never
-  /// reconstruct it.
-  ///
-  /// The production window is a source adoption: the core's frame epoch has
-  /// already moved while a freshly spawned reader's mailbox still starts at zero,
-  /// so that reader's first autonomous generation is refused on the epoch before
-  /// the first [`PublishFrame`](Effect::PublishFrame) reaches it — and the refresh
-  /// that refusal arms reads the very same mount id, leaving the frame epoch equal
-  /// to the birth watermark. Nothing else in the state says a generation was ever
-  /// owed.
-  generation_rejected: bool,
+  /// Written only by [`generation_applied`](Self::generation_applied) and
+  /// [`generation_lost`](Self::generation_lost), so there is no raw write to
+  /// enumerate and no partial update to strand.
+  generation: Generation,
   /// The whole-root recovery round trip this scope has OUT and unanswered.
   ///
   /// The root-scope sibling of a [`PendingAdmit`], and held with the same
@@ -2422,24 +2441,14 @@ struct ScopeState {
   ///
   /// So a reply that arrives and applies nothing DISCHARGES the round trip it
   /// dominates: nothing more will ever come for it, and a record of an outstanding
-  /// request must not outlive the request. What bounds the retry is a separate
-  /// piece of retained evidence about the refusal itself
-  /// ([`refused_walk`](Self::refused_walk)) — an observation, not a prediction.
+  /// request must not outlive the request. What bounds the retry is retained
+  /// evidence about the refusal itself, held on the generation it lost
+  /// ([`Generation::Lost`]) — an observation, not a prediction.
   ///
   /// Cleared by both world swaps along with the rest of the old world's state: the
   /// round trip belongs to a root this scope no longer watches, and the swap's own
   /// covering `Rescan` owes the consumer the whole new tree regardless.
   pending_recovery: Option<PendingRecovery>,
-  /// The disagreement the LAST whole-root recovery was refused on, or `None` where
-  /// none has been — see [`RefusedWalk`].
-  ///
-  /// Read at exactly one site, and it decides one thing: whether
-  /// [`on_root_recovered`](DriverCore::on_root_recovered)'s mismatch arm arms its
-  /// own mount refresh. It never decides whether a recovery is OWED — that stays
-  /// [`owes_whole_root`](Self::owes_whole_root)'s, derived from what this scope
-  /// holds — so a stale record can cost at most one self-armed table read, never a
-  /// silence.
-  refused_walk: Option<RefusedWalk>,
   /// The [`frame_epoch`](Self::frame_epoch) this scope has already PUBLISHED to
   /// its live source ([`Effect::PublishFrame`]), or `None` for a source that has
   /// been told nothing yet.
@@ -2896,37 +2905,80 @@ impl ScopeState {
       .any(|record| !record.condemnable(root_frame))
   }
 
-  /// Whether the coverage set's exempt partition was last verified in a world this
-  /// scope has since LEFT.
+  /// Whether a complete whole-root generation is owed the coverage set — either
+  /// because one was LOST, or because the last one that landed was taken in a
+  /// world this scope has since left.
   ///
-  /// This is the derived half of "a generation is owed". It fires without anyone
-  /// remembering the transition that made it true: a reply superseded before it
-  /// landed, a frame that moved with no report in flight at all — every one of
-  /// them is the same statement about the coverage set.
+  /// The two arms are not two spellings of one test, and neither covers the other.
   ///
-  /// # Deriving it is necessary and NOT sufficient, and the difference is evidence
-  ///
-  /// The derivation reads the coverage set, so it can only see boundaries the set
-  /// HOLDS. A whole-root generation that was produced and then discarded is the one
+  /// The derived arm fires without anyone remembering the transition that made it
+  /// true — a reply superseded before it landed, a frame that moved with no report
+  /// in flight at all — but it reads the coverage set, so it can only see
+  /// boundaries the set HOLDS. A generation produced and then discarded is the one
   /// thing it is blind to: those declines are exactly what would have PUT the first
   /// exempt record in the set, so after the rejection the set holds none,
-  /// `holds_exempt_record` reads false, and the frame epoch that a re-mount would
-  /// have moved sits equal to the birth watermark because the id never changed.
-  /// Nothing derivable says a generation is owed, and no later mount table can
-  /// reconstruct an exempt boundary — no row ever lists one.
+  /// [`holds_exempt_record`](Self::holds_exempt_record) reads false, and the frame
+  /// epoch a re-mount would have moved sits equal to the birth watermark because
+  /// the id never changed. No later mount table can reconstruct an exempt boundary
+  /// — no row ever lists one.
   ///
-  /// So a rejected generation is RETAINED as evidence
-  /// ([`generation_rejected`](Self::generation_rejected)) rather than re-derived,
-  /// and that is not the obligation boolean this design deleted: it is set by an
-  /// observation and discharged by exactly one event, a generation actually being
-  /// applied. Nothing decides the need has passed.
-  ///
-  /// The derived half stays because it fires for cases no rejection ever
-  /// witnessed: a reply superseded before it landed, a frame that moved with no
-  /// report in flight at all.
+  /// So a lost generation is RETAINED as evidence ([`Generation::Lost`]) rather
+  /// than re-derived, and the derived arm stays for the cases no loss ever
+  /// witnessed.
   fn generation_stale(&self) -> bool {
-    self.generation_rejected
-      || (self.generation_epoch != self.frame_epoch && self.holds_exempt_record())
+    match self.generation {
+      Generation::Lost { .. } => true,
+      Generation::Verified { epoch } => epoch != self.frame_epoch && self.holds_exempt_record(),
+    }
+  }
+
+  /// The disagreement this scope's last refused recovery was refused on, or `None`
+  /// — for a `Verified` generation there is none by construction, which is the
+  /// state [`Generation`] makes unrepresentable rather than merely unwritten.
+  fn refused_key(&self) -> Option<RefusedWalk> {
+    match self.generation {
+      Generation::Lost { refused } => refused,
+      Generation::Verified { .. } => None,
+    }
+  }
+
+  /// **A complete generation was APPLIED to this coverage set under the frame this
+  /// scope holds** — the watermark advances, and any evidence a lost one left,
+  /// refusal key included, is discharged by the one event that may discharge it.
+  ///
+  /// Called at exactly the sites that apply one: the two accept paths
+  /// ([`on_walk_boundaries`](DriverCore::on_walk_boundaries),
+  /// [`on_root_recovered`](DriverCore::on_root_recovered)) and the three world
+  /// swaps, whose barrier read seeds a set that is complete the moment it exists.
+  /// Nowhere else may write the watermark forward, which is what keeps it evidence
+  /// rather than a debt somebody remembered to clear.
+  fn generation_applied(&mut self) {
+    self.generation = Generation::Verified {
+      epoch: self.frame_epoch,
+    };
+  }
+
+  /// **A complete generation was produced and NOT applied here** — the evidence is
+  /// retained, and `disagreement` (where the refusal HAS a key) becomes the key the
+  /// next refusal is measured against.
+  ///
+  /// Returns whether this refusal REPEATS the key already held: same frame, same
+  /// foreign root, so the walk that produced it was raised in full knowledge of the
+  /// first refusal and a third read changes nothing (see [`RefusedWalk`]). The
+  /// comparison is against the key held BEFORE this call, because a key overwritten
+  /// first would compare against itself and never report a repeat.
+  ///
+  /// A refusal with no key — an epoch mismatch, or an autonomous report nobody
+  /// requested — keeps whatever key was held rather than clearing it: only a
+  /// generation LANDING discharges evidence, and an unrelated refusal is not one.
+  #[must_use = "a repeated refusal must not arm a read of its own; the caller decides on this"]
+  fn generation_lost(&mut self, disagreement: Option<RefusedWalk>) -> bool {
+    let held = self.refused_key();
+    let reasked = disagreement.is_some() && held == disagreement;
+    self.generation = Generation::Lost {
+      refused: disagreement.or(held),
+    };
+    reasked
   }
 
   /// Whether any cover is PARKED on a round trip that cannot be answered on its
@@ -2962,9 +3014,9 @@ impl ScopeState {
   ///
   /// # Why the retained evidence is not consulted ahead of the round trip
   ///
-  /// It looks like it should be: [`generation_rejected`](Self::generation_rejected)
-  /// is retained evidence and the pending record is a value compared against a
-  /// re-read frame, so the cadence rule seems to order them the other way. It does
+  /// It looks like it should be: [`Generation::Lost`] is retained evidence and the
+  /// pending record is a value compared against a re-read frame, so the cadence
+  /// rule seems to order them the other way. It does
   /// not, and the reason is that the two are not answering the same question. The
   /// record answers *is one already out?* — a fact about a message, not a reading
   /// of the world — and consulting the evidence ahead of it would issue a second
@@ -3333,10 +3385,8 @@ impl DriverCore {
         root_mnt_id: None,
         root_incarnation: None,
         frame_epoch: 0,
-        generation_epoch: 0,
-        generation_rejected: false,
+        generation: Generation::Verified { epoch: 0 },
         pending_recovery: None,
-        refused_walk: None,
         published_epoch: None,
         identity: None,
         mount_table: Vec::new(),
@@ -4363,9 +4413,7 @@ impl DriverCore {
         // generation carries — and a fresh source has been told nothing yet. That
         // seeding is itself an applied generation, so it discharges any evidence a
         // rejected one left behind in the world being replaced.
-        state.generation_epoch = state.frame_epoch;
-        state.generation_rejected = false;
-        state.refused_walk = None;
+        state.generation_applied();
         state.published_epoch = None;
         state.identity = Some(meta.identity);
         // The coverage baseline is SEEDED from the same barrier read, not left
@@ -4862,10 +4910,8 @@ impl DriverCore {
     // outstanding round trip goes with the rest of that world's state: it addresses
     // a root this scope no longer watches, and the swap's own covering `Rescan`
     // owes the consumer the whole new tree regardless.
-    state.generation_epoch = state.frame_epoch;
-    state.generation_rejected = false;
+    state.generation_applied();
     state.pending_recovery = None;
-    state.refused_walk = None;
     state.published_epoch = None;
     state.mounts_baseline = meta.mounts.iter().map(MountRecord::confirmed).collect();
     install_mount_table(state, meta.mounts.into_iter().map(|row| row.location));
@@ -5224,10 +5270,8 @@ impl DriverCore {
     // outstanding round trip goes with the rest of that world's state: it addresses
     // a root this scope no longer watches, and the swap's own covering `Rescan`
     // owes the consumer the whole new tree regardless.
-    state.generation_epoch = state.frame_epoch;
-    state.generation_rejected = false;
+    state.generation_applied();
     state.pending_recovery = None;
-    state.refused_walk = None;
     state.published_epoch = None;
     state.mounts_baseline = meta.mounts.iter().map(MountRecord::confirmed).collect();
     install_mount_table(state, meta.mounts.into_iter().map(|row| row.location));
@@ -5378,8 +5422,7 @@ impl DriverCore {
   /// declines that would have recorded it went out with the report. That is why the
   /// need cannot be derived here from the set alone — the set is empty of exactly
   /// the evidence the derivation looks for — and why the rejection retains it
-  /// ([`generation_rejected`](ScopeState::generation_rejected)), discharged only by
-  /// a generation that actually lands.
+  /// ([`Generation::Lost`]), discharged only by a generation that actually lands.
   ///
   /// What IS done here is arming a refresh, and the reason is exactly the hole the
   /// previous version left. It used to arm none, on the argument that the
@@ -5426,39 +5469,38 @@ impl DriverCore {
         // set any derivation can read. Retaining the fact costs one bit and is
         // discharged by exactly one event (a generation landing); deriving it
         // instead reads a coverage set that this very rejection kept empty.
-        state.generation_rejected = true;
-        // And the SCHEDULING is the shared decision, not a conjunct spelled here:
-        // this report proves a generation was lost, never that a read is owed. A
-        // fanotify reader that sampled epoch N, took a current-epoch recovery
-        // request while its autonomous loss reseed was still running, and reported
-        // stamped N leaves `pending_recovery` already covering the missing
-        // generation at N+1 — and on a host whose incarnation token is the
-        // namespace counter (5.17–6.7: any mount anywhere reads as a frame move)
-        // the read this used to arm unconditionally moves the epoch before that
-        // open recovery replies, refusing it and buying a SECOND whole-root walk
-        // to replace the one already in flight.
         //
-        // No key is spent: an autonomous report is unrequested, so no arming of
-        // this core's can produce another and there is no loop to bound — see
-        // [`recover_if_unserved`](Self::recover_if_unserved).
-        Self::recover_if_unserved(
-          &mut self.effects,
-          &mut self.admit_seq,
-          scope,
-          state,
-          None,
-          RecoveryRoute::Refresh,
-        );
+        // No key is spent, and none is cleared: an autonomous report is
+        // UNREQUESTED, so no arming of this core's can produce another and there is
+        // no loop to bound, while a key held from an earlier refused REQUEST still
+        // describes a disagreement only a landing generation answers. That is also
+        // why the answer is DISCARDED here and nowhere else: with nothing this core
+        // did able to produce a repeat, there is no cycle for `reasked` to bound.
+        let _ = state.generation_lost(None);
+        // And the read is a VERDICT, so it names the observation that proves it.
+        // This report proves a generation was lost; what says a READ is owed is
+        // `owes_whole_root`. A fanotify reader that sampled epoch N, took a
+        // current-epoch recovery request while its autonomous loss reseed was still
+        // running, and reported stamped N leaves `pending_recovery` already
+        // covering the missing generation at N+1 — and on a host whose incarnation
+        // token is the namespace counter (5.17–6.7: any mount anywhere reads as a
+        // frame move) the read this used to arm unconditionally moves the epoch
+        // before that open recovery replies, refusing it and buying a SECOND
+        // whole-root walk to replace the one already in flight.
+        //
+        // Nothing is silenced by declining: the evidence just retained keeps the
+        // need derivable, so whichever site next finds it unserved buys the read.
+        if state.owes_whole_root() {
+          Self::arm_refresh(&mut self.effects, scope, state, RefreshCause::Invalidating);
+        }
         return;
       }
       retire_unwalked_boundaries(state, &boundaries.declined);
       // The set is now COMPLETE under the frame this scope holds, which is the one
-      // fact `generation_stale` reads. Advanced only here and on the recovery's own
-      // success path — the two sites that actually apply a generation, and the only
-      // two that may discharge the evidence a rejection left.
-      state.generation_epoch = state.frame_epoch;
-      state.generation_rejected = false;
-      state.refused_walk = None;
+      // fact `generation_stale` reads. One of only two message sites that apply a
+      // generation, and therefore one of only two that may discharge the evidence a
+      // loss left — the refusal key with it.
+      state.generation_applied();
     }
     record_declined(state, &boundaries.declined);
   }
@@ -5603,126 +5645,6 @@ impl DriverCore {
     });
   }
 
-  /// **The one decision behind every arm that schedules a whole-root recovery.**
-  ///
-  /// Three arms reach it, and each answers a message that applied NOTHING:
-  ///
-  /// | arm | the reply it refused | route |
-  /// |---|---|---|
-  /// | [`on_walk_boundaries`](Self::on_walk_boundaries) | an autonomous whole-root generation stamped in another world | [`Refresh`](RecoveryRoute::Refresh) |
-  /// | [`on_root_recovered`](Self::on_root_recovered) | a requested reseed's reply, epoch or walked id disputed | [`Refresh`](RecoveryRoute::Refresh) |
-  /// | [`on_admitted`](Self::on_admitted) | a located admission reply from a world this scope has left | [`Ask`](RecoveryRoute::Ask) |
-  ///
-  /// Each used to spell its own conjunct set, and five consecutive review rounds
-  /// each found a different one incomplete — an unconditional arm here, an
-  /// unconditional overwrite there, a missing re-ask brake on the third. The sets
-  /// were never SUPPOSED to differ: all three ask the identical question, *is the
-  /// whole-root round trip still unserved?*, and only the carrier differs. So the
-  /// question is asked in one place and the arms hand it evidence.
-  ///
-  /// # What it decides, in order
-  ///
-  /// 1. **Has this disagreement already been re-asked?** `disagreement` is the
-  ///    retained-evidence key ([`RefusedWalk`]) — same frame, same foreign root,
-  ///    so the second walk was raised in full knowledge of the first. It is
-  ///    RECORDED whether or not anything is scheduled (it is evidence about a
-  ///    reply that arrived, not about what this arm chose), and a repeat schedules
-  ///    nothing: the retry falls back to the refresh cadence, which is the one
-  ///    recovery per refresh a [`fails_closed`](ScopeState::fails_closed) scope
-  ///    already pays.
-  /// 2. **Is the need still unserved?**
-  ///    [`owes_whole_root`](ScopeState::owes_whole_root), whose FIRST arm is the
-  ///    case every one of those rounds missed: while a round trip stands in the
-  ///    world this scope still holds, its reply carries the generation, the cutoff
-  ///    and the cover TOGETHER, so scheduling anything can only move the frame out
-  ///    from under it and refuse it too. "A reply was refused" is a fact about the
-  ///    read that already happened; this is what says one is still owed.
-  ///
-  /// Nothing is silenced by declining: every arm that reaches here has already
-  /// retained the evidence that keeps the need derivable
-  /// ([`generation_rejected`](ScopeState::generation_rejected) on the two frame
-  /// arms; the standing recovery's own root cover on the third), so the moment the
-  /// round trip it deferred to is itself answered, the need is re-derived and
-  /// bought then.
-  ///
-  /// # Why only one arm carries a disagreement
-  ///
-  /// The key bounds ONE cycle: a refusal arms a read, the read re-derives the need
-  /// and re-asks, the re-ask is refused. Only a REQUESTED reply sits on it, so only
-  /// `on_root_recovered` passes a key. An autonomous report is unrequested —
-  /// nothing this core does produces another — and an admission reply answers a
-  /// ticket that is being retired, so neither can close a loop, and spending the
-  /// key at either would silence `on_root_recovered`'s own first genuine retry.
-  /// An EPOCH mismatch carries no key at any site: the epoch is what moved, so no
-  /// two refusals can ever share one.
-  ///
-  /// # Not the refresh's own decision
-  ///
-  /// [`on_mounts_refreshed`](Self::on_mounts_refreshed) is the CARRIER these arms
-  /// route to, not a fourth caller: it asks on a strictly wider disjunction (the
-  /// fail-closed rule and the departure collapse both demand a reseed with nothing
-  /// outstanding at all), and on a non-fanotify profile it answers the same need
-  /// with a root cover rather than a round trip.
-  ///
-  /// # This is the interim shape of a FOLD, not a fourth field
-  ///
-  /// The lifecycle is currently a product of eight fields mutated at eleven sites,
-  /// with the legal combinations enforced by prose — and every finding R11 through
-  /// R15 was either an illegal combination being representable or one of these
-  /// three arms carrying an incomplete conjunct set. Folding it into one enum is
-  /// the real fix and is a separate increment; this function exists so the three
-  /// arms cannot diverge again in the meantime, and it is written to be the thing
-  /// that fold's `match` REPLACES rather than something the fold then has to
-  /// reconcile with. The correspondence is exact:
-  ///
-  /// | the fold's state | how it is spelled today | this decision |
-  /// |---|---|---|
-  /// | `Out { ticket, epoch }`, `epoch == frame_epoch` | `pending_recovery` at the current epoch | schedule NOTHING — [`owes_whole_root`](ScopeState::owes_whole_root)'s first arm |
-  /// | `Out { .. }`, epoch moved | `pending_recovery` stamped in a world this scope left | schedule — the reply can never be applied |
-  /// | `Refused { disagreement, epoch }`, matching this reply | `refused_walk` equal to the incoming key | schedule NOTHING — the retry is already spent |
-  /// | `Owed(evidence)` | `generation_rejected`, or a cover parked across worlds | schedule |
-  /// | `Settled` | none of the above | schedule nothing; nothing is owed |
-  ///
-  /// So the body is two guards over one value, and the two writes it makes are the
-  /// fold's two transitions: recording the disagreement is `-> Refused`, and
-  /// [`request_root_recovery`](Self::request_root_recovery) is `-> Out`. The guards
-  /// are stated in an order the fold makes irrelevant — `Refused` and `Out` are
-  /// exclusive there, and where today's fields allow both at once they agree,
-  /// because both say a round trip has already been spent on this disagreement.
-  ///
-  /// Returns whether anything was scheduled.
-  fn recover_if_unserved(
-    effects: &mut VecDeque<Effect>,
-    admit_seq: &mut u64,
-    scope: ScopeId,
-    state: &mut ScopeState,
-    disagreement: Option<RefusedWalk>,
-    route: RecoveryRoute,
-  ) -> bool {
-    // `-> Refused`. Recorded whether or not anything is scheduled: it is evidence
-    // about a reply that ARRIVED, and what this arm chose does not change it.
-    let reasked = disagreement.is_some() && state.refused_walk == disagreement;
-    if disagreement.is_some() {
-      state.refused_walk = disagreement;
-    }
-    // The two guards. `reasked` is the `Refused` one, `owes_whole_root` folds
-    // `Out`-in-this-world, `Out`-elsewhere, `Owed` and `Settled` into the one
-    // answer they each already had.
-    if reasked || !state.owes_whole_root() {
-      return false;
-    }
-    match route {
-      RecoveryRoute::Refresh => {
-        Self::arm_refresh(effects, scope, state, RefreshCause::Invalidating);
-      }
-      RecoveryRoute::Ask => {
-        let epoch = state.frame_epoch;
-        Self::request_root_recovery(effects, admit_seq, scope, state, epoch);
-      }
-    }
-    true
-  }
-
   /// Feeds ONE whole-root recovery back from a source: the complete generation
   /// its reseed walk produced, the tickets it discharges, and the root cover it
   /// owes — in that order, which is the same order every other walk driver
@@ -5786,10 +5708,9 @@ impl DriverCore {
   ///
   /// What a mismatch OWES is a fresh recovery — the cover this reply was carrying
   /// is still owed, and only a walk on the current frame may carry it — but it is
-  /// NOT asked for here. The generation is marked REJECTED
-  /// ([`generation_rejected`](ScopeState::generation_rejected)), because this
-  /// reply's declines were the only record of any exempt boundary that appeared
-  /// since the last one landed. The round trip this reply DOMINATES is discharged
+  /// NOT asked for here. The generation is recorded LOST
+  /// ([`Generation::Lost`]), because this reply's declines were the only record of
+  /// any exempt boundary that appeared since the last one landed. The round trip this reply DOMINATES is discharged
   /// ([`pending_recovery`](ScopeState::pending_recovery)): its one answer has come,
   /// nothing further will ever be sent for that ticket, and a record whose whole
   /// meaning is "a request is out" may not outlive the request — while a NEWER
@@ -5864,11 +5785,29 @@ impl DriverCore {
       _ => None,
     };
     if recovery.epoch != state.frame_epoch || walked_elsewhere.is_some() {
+      // So the retry is not predicted away — it is SPENT, and the refusal of the
+      // request spent on it is the observation the prediction wanted. This arm is
+      // the one edge that could make that a self-driven loop: a refusal arms a
+      // read, the read re-derives the need and re-asks, the re-ask is refused. It
+      // is broken by evidence rather than by a cadence — a disagreement this scope
+      // has ALREADY re-asked under (same frame, same foreign root, so the second
+      // walk was raised in full knowledge of the first) arms no further read of its
+      // own, and the retry falls back to the refresh cadence, which is the one
+      // recovery per refresh a `fails_closed` scope already pays.
+      //
+      // A DIFFERENT foreign root arms again: the source's world moved between the
+      // two walks, so the second reply is fresh information, not a repeat.
+      let disagreement = walked_elsewhere.map(|walked| RefusedWalk {
+        walked,
+        epoch: state.frame_epoch,
+      });
       // Applied NOTHING, so the generation this reply carried is gone — the same
       // evidence an autonomous report's rejection leaves, and for the same reason:
-      // its declines were the only record of an exempt boundary that appeared
-      // since the last one landed.
-      state.generation_rejected = true;
+      // its declines were the only record of an exempt boundary that appeared since
+      // the last one landed. The disagreement rides it, keyed against the one held
+      // BEFORE this refusal, which is what makes `reasked` a comparison of two
+      // walks rather than of a key with itself.
+      let reasked = state.generation_lost(disagreement);
       // The round trip is OVER. Its one reply has arrived; a refusal applies
       // nothing, but nothing more will ever be sent for this ticket either, so a
       // record that says "a request is out" must not survive it. Retired on the
@@ -5890,22 +5829,6 @@ impl DriverCore {
       {
         state.pending_recovery = None;
       }
-      // So the retry is not predicted away — it is SPENT, and the refusal of the
-      // request spent on it is the observation the prediction wanted. This arm is
-      // the one edge that could make that a self-driven loop: a refusal arms a
-      // read, the read re-derives the need and re-asks, the re-ask is refused. It
-      // is broken by evidence rather than by a cadence — a disagreement this scope
-      // has ALREADY re-asked under (same frame, same foreign root, so the second
-      // walk was raised in full knowledge of the first) arms no further read of its
-      // own, and the retry falls back to the refresh cadence, which is the one
-      // recovery per refresh a `fails_closed` scope already pays.
-      //
-      // A DIFFERENT foreign root arms again: the source's world moved between the
-      // two walks, so the second reply is fresh information, not a repeat.
-      let disagreement = walked_elsewhere.map(|walked| RefusedWalk {
-        walked,
-        epoch: state.frame_epoch,
-      });
       // And the arm NAMES the observation that proves it. `reasked` keys on a
       // DISAGREEMENT, which covers only the walked-id leg: an EPOCH mismatch has no
       // such key (the epoch is what moved, so no two refusals can ever share one),
@@ -5927,27 +5850,17 @@ impl DriverCore {
       // that standing round trip is itself answered, this same site finds the need
       // unserved and buys the read.
       //
-      // Both halves of that live in [`recover_if_unserved`](Self::recover_if_unserved)
-      // now — this arm's own R14/R15 conjuncts are the set the two sibling arms
-      // were missing, and three copies of one decision is what let them diverge.
-      Self::recover_if_unserved(
-        &mut self.effects,
-        &mut self.admit_seq,
-        scope,
-        state,
-        disagreement,
-        RecoveryRoute::Refresh,
-      );
+      if !reasked && state.owes_whole_root() {
+        Self::arm_refresh(&mut self.effects, scope, state, RefreshCause::Invalidating);
+      }
       return;
     }
     retire_unwalked_boundaries(state, &recovery.declined);
     record_declined(state, &recovery.declined);
-    // The set is COMPLETE under the frame this scope holds. Advanced only here and
-    // on the autonomous report's own accepted path — the two sites that apply a
-    // generation, and the only two that discharge a rejection's evidence.
-    state.generation_epoch = state.frame_epoch;
-    state.generation_rejected = false;
-    state.refused_walk = None;
+    // The set is COMPLETE under the frame this scope holds. One of only two message
+    // sites that apply a generation, and therefore one of only two that discharge
+    // the evidence a loss left — the refusal key with it.
+    state.generation_applied();
     state
       .pending_admits
       .retain(|parked| parked.ticket > recovery.cutoff);
@@ -6031,9 +5944,9 @@ impl DriverCore {
   /// is condemned by the next refresh, parks again, and is answered the same way.
   ///
   /// So a reply whose [`epoch`](PendingAdmit::epoch) is not the scope's current
-  /// one discharges into the whole-root recovery instead — via
-  /// [`recover_if_unserved`](Self::recover_if_unserved), because the recovery it
-  /// discharges into may ALREADY BE OUT. The refresh that moved the frame saw this
+  /// one discharges into the whole-root recovery instead — and asks for one only if
+  /// [`owes_whole_root`](ScopeState::owes_whole_root) still says so, because the
+  /// recovery it discharges into may ALREADY BE OUT. The refresh that moved the frame saw this
   /// very ticket parked across worlds
   /// ([`parked_across_worlds`](ScopeState::parked_across_worlds)) and asked for a
   /// current-world recovery on the strength of it, with a cutoff that subsumes the
@@ -6049,8 +5962,7 @@ impl DriverCore {
   ///
   /// Retiring it after is safe in every branch. If the standing recovery is
   /// APPLIED, its root cover dominates the located one this reply was holding; if
-  /// it is REFUSED, the refusal retains
-  /// [`generation_rejected`](ScopeState::generation_rejected) and the need is
+  /// it is REFUSED, the refusal retains [`Generation::Lost`] and the need is
   /// re-derived from that; if no source ever answers it,
   /// [`on_recovery_unreachable`](Self::on_recovery_unreachable) emits the root
   /// cover itself.
@@ -6085,16 +5997,19 @@ impl DriverCore {
     if state.pending_admits[index].epoch != state.frame_epoch {
       // BEFORE the retire, so `owes_whole_root` can still see the ticket that is
       // this need's only witness — and so it can see the recovery that may already
-      // serve it. No key: the dispute is an epoch move, which no two refusals can
-      // ever share.
-      Self::recover_if_unserved(
-        &mut self.effects,
-        &mut self.admit_seq,
-        scope,
-        state,
-        None,
-        RecoveryRoute::Ask,
-      );
+      // serve it. No generation was lost here (this reply carried none) and no key
+      // is spent: the dispute is an epoch move, which no two refusals can ever
+      // share.
+      //
+      // Asked on the spot rather than through a refresh: this arm disputes nothing
+      // about the frame — the core's OWN refresh is what moved the epoch — so it
+      // holds a frame a read has already published, and routing through another
+      // read would re-derive the need from the very witness this arm is about to
+      // retire.
+      if state.owes_whole_root() {
+        let epoch = state.frame_epoch;
+        Self::request_root_recovery(&mut self.effects, &mut self.admit_seq, scope, state, epoch);
+      }
       state.pending_admits.remove(index);
       return;
     }
