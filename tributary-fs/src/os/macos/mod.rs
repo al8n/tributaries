@@ -449,9 +449,9 @@ where
 /// path is run through the same filesystem-representation transform as event
 /// paths, so prefix comparison cannot drift on Unicode normalization.
 ///
-/// Every row carries `None` for both identity fields: `statfs` reports no mount
-/// id, and inventing one from `f_fsid` would hand the core a value it would
-/// compare as an identity. macOS is the platform that signals
+/// Every row carries `None` for all three identity fields: `statfs` reports no
+/// mount id and no parent, and inventing one from `f_fsid` would hand the core a
+/// value it would compare as an identity. macOS is the platform that signals
 /// its volume changes in band anyway (`plan_mount`), so the table here is a
 /// belt whose locations are the whole of what it can honestly say.
 pub(crate) fn mounts_under(root: &std::path::Path) -> Option<Vec<crate::os::MountRow>> {
@@ -480,14 +480,18 @@ pub(crate) fn mounts_under(root: &std::path::Path) -> Option<Vec<crate::os::Moun
     if !path.starts_with(root) || path.as_path() == root {
       continue;
     }
-    // One row per location, as on Linux: a stacked mount would otherwise list
-    // the same path twice, and the core keys its coverage set by location.
-    // Every row here carries the same (absent) identity, so which duplicate
-    // survives is immaterial — that only one does is not.
+    // One row per location — unlike Linux, which returns every member of a
+    // stack. These rows carry NO id, so the core keys each of them by its
+    // rendered location: a stacked mount listed twice would be one key twice,
+    // which the census drops on the way in anyway and which would otherwise
+    // read as one mount arriving and departing twice. Every row here carries
+    // the same (absent) identity, so which duplicate survives is immaterial —
+    // that only one does is not.
     if !mounts.iter().any(|m| m.location == path) {
       mounts.push(crate::os::MountRow {
         location: path,
         mnt_id: None,
+        parent_id: None,
         dev: None,
       });
     }

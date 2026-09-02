@@ -731,36 +731,57 @@ impl RootIdentity {
   }
 }
 
-/// One row of a live mount table, strictly under a watched root: WHERE the
-/// mount lands plus whatever IDENTITY the host can answer for it.
+/// One row of a live mount table, at a location strictly under a watched root:
+/// WHERE the mount lands plus whatever IDENTITY the host can answer for it.
 ///
-/// Linux reads both identity fields off `/proc/self/mountinfo`, which carries
-/// them on every row it already parses — field 1 is the mount id, field 3 the
-/// `major:minor` of the mounted filesystem. That is what makes the table an
-/// OBSERVER rather than a list of paths: a mount replaced by a different mount
-/// at the SAME location is a change in `(mnt_id, dev)` and in nothing else, so
-/// a paths-only read cannot see it at all.
+/// Linux reads all three identity fields off `/proc/self/mountinfo`, which
+/// carries them on every row it already parses — field 1 is the mount id,
+/// field 2 the parent mount's id, field 3 the `major:minor` of the mounted
+/// filesystem. That is what makes the table an OBSERVER rather than a list of
+/// paths: a mount replaced by a different mount at the SAME location is a
+/// change in `(mnt_id, parent_id, dev)` and in nothing else, so a paths-only
+/// read cannot see it at all.
 ///
-/// Every other host answers `None` for both. macOS' `getfsstat` reports no
+/// Several rows can share one LOCATION — a stack, a `mount --move` onto an
+/// occupied mount point, two mounts propagated side by side — and on Linux
+/// every one of them is a row here, each with its own id. Nothing in this type
+/// or in its producer says which of them a path lookup reaches; the core keys
+/// its census by identity, so it does not need to be told.
+///
+/// Every other host answers `None` for all three. macOS' `getfsstat` reports no
 /// mount id, Windows reads no table, and the fakes have no namespace — so they
 /// say so rather than inventing a value, and the consumers degrade honestly
-/// (see the core's provenance partition, written for exactly this `None` and
-/// for the pre-5.8 Linux kernels that share it).
+/// (the core's census key falls back to the rendered location for a row with no
+/// id, and an unknown half never reads as a difference).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MountRow {
-  /// The mount point — where the mount is visible in the namespace.
+  /// The mount point — where the kernel rendered this mount's path.
+  ///
+  /// A best-effort LABEL, not a key: `show_mountinfo` renders each row's path
+  /// by its own `seq_path_root` call, so a rename can land between two rows of
+  /// one read. The core carries it as a cover-location hint and keys on the
+  /// identity below.
   pub(crate) location: PathBuf,
   /// The mount's own id, unique among LIVE mounts. `None` where the host
-  /// answers none.
+  /// answers none, or where the field would not parse.
   ///
   /// This is the LEGACY (non-unique) id, allocated lowest-free, so an unmount
   /// and a mount between two reads hand the new mount the just-freed id almost
-  /// deterministically. Two reads can therefore agree on `(location, mnt_id,
-  /// dev)` across a swap of one bind for a different bind of the same source.
-  /// That costs a missed re-cover of ground which was DECLINED and dark
-  /// throughout, and breaks no claim any consumer makes; `STATX_MNT_ID_UNIQUE`
-  /// (Linux 6.8) is the upgrade where a future reader can require it.
+  /// deterministically. `parent_id` narrows that window — the recycled id has
+  /// to have been re-attached under the SAME mount as well — without closing
+  /// it; `STATX_MNT_ID_UNIQUE` (Linux 6.8) is the upgrade where a future reader
+  /// can require a genuinely unique one.
   pub(crate) mnt_id: Option<u64>,
+  /// The id of the mount this one is attached to. `None` where the host answers
+  /// none, or where the field would not parse.
+  ///
+  /// Held as IDENTITY, never as hierarchy. It is COMPARED — two reads that
+  /// agree on a mount id but not on its parent are looking at two different
+  /// vfsmounts, one of which inherited the other's recycled id — and it is
+  /// never WALKED: nothing resolves it to another row, climbs a chain of them,
+  /// or derives from the graph these links describe which mount a lookup
+  /// reaches.
+  pub(crate) parent_id: Option<u64>,
   /// The device of the filesystem mounted here, packed the way `dev_t` packs
   /// `major:minor`. `None` where the host answers none.
   pub(crate) dev: Option<u64>,

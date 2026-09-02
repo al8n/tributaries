@@ -16,11 +16,13 @@ fn watch(n: u64) -> WatchId {
 }
 
 /// One expected parse result, spelled the way mountinfo spells it: the mount
-/// point, the mount id (field 1), and the `major:minor` (field 3).
-fn row(location: &str, mnt_id: u64, major: u64, minor: u64) -> crate::os::MountRow {
+/// point, the mount id (field 1), the PARENT mount's id (field 2), and the
+/// `major:minor` (field 3).
+fn row(location: &str, mnt_id: u64, parent_id: u64, major: u64, minor: u64) -> crate::os::MountRow {
   crate::os::MountRow {
     location: std::path::PathBuf::from(location),
     mnt_id: Some(mnt_id),
+    parent_id: Some(parent_id),
     dev: Some(super::makedev(major, minor)),
   }
 }
@@ -107,13 +109,20 @@ fn draining_wd_attributes_nothing_until_ignored() {
   assert!(!table.contains(3));
 }
 
+/// Only rows STRICTLY under the root come back: the root's own row, its
+/// ancestors and every mount outside its cone are all filtered out.
+///
+/// The ancestors were RETAINED while the parse resolved visibility — a shadowing
+/// sibling can sit at the root or above it — and with no resolution left there is
+/// nothing to ask them. Retaining them now would only allocate a mount point per
+/// ancestor, per refresh, per watched root, for rows no consumer can use: a
+/// boundary AT or ABOVE the root is not a boundary inside it.
+///
+/// MUTATION WITNESS (cone restored): retain `root.starts_with(&path)` as well and
+/// this FAILS at `nothing at or above the root is a row` — the rootfs and `/mnt/a`
+/// itself both back in the answer.
 #[test]
 fn mountinfo_extracts_mounts_strictly_under_root() {
-  // Parent ids are the kernel's, not a placeholder: `/mnt/a`'s parent is the
-  // mount that CONTAINS `/mnt/a`, and the rootfs names itself. A fixture that
-  // makes `/` a SIBLING of `/mnt/a` describes an overmount on `/` — which really
-  // does hide everything beneath it — so the shape has to be spelled honestly for
-  // the visibility resolution to be asked the question this cell means to ask.
   let content = "\
 25 25 0:35 / / rw,relatime shared:4 - ext4 /dev/root rw
 36 25 0:32 / /mnt/a rw,relatime shared:1 - tmpfs tmpfs rw
@@ -125,24 +134,32 @@ malformed line
   let mounts = parse_mountinfo(content.as_bytes(), Path::new("/mnt/a"));
   assert_eq!(
     mounts,
-    vec![row("/mnt/a/inner", 37, 0, 33)],
-    "the root's own row and its ancestors are READ — the visibility resolution \
-     needs them — and then filtered out, while a mount outside the root's cone \
-     never enters at all"
+    vec![row("/mnt/a/inner", 37, 36, 0, 33)],
+    "nothing at or above the root is a row, a mount outside its cone never \
+     enters, and a line short of five fields is skipped"
   );
 }
 
-/// The parse keeps the two IDENTITY fields it used to discard, and both are on
-/// every line it was already scanning: field 1 is the mount id and field 3 the
-/// `major:minor`. Without them the table is paths-only and a mount REPLACED at
-/// an unchanged path is invisible to every reader of it — the same-path remount
-/// case the core's coverage set closes by comparing `(mnt_id, dev)`.
+/// The parse keeps the three IDENTITY fields it used to discard, and all three
+/// are on every line it was already scanning: field 1 is the mount id, field 2
+/// the id of the mount this one hangs off, and field 3 the `major:minor`. Without
+/// them the table is paths-only and a mount REPLACED at an unchanged path is
+/// invisible to every reader of it.
+///
+/// The parent travels as IDENTITY, not as hierarchy — nothing here resolves it to
+/// another row — and it is what narrows the window a lowest-free mount id leaves
+/// open: a recycled id re-attached under a DIFFERENT mount is a different
+/// vfsmount, which the core reads as a replacement rather than as continuity.
 ///
 /// The device is packed the way `dev_t` packs it, so the number a row carries is
 /// the number a `stat` on that filesystem reports rather than a private encoding
 /// that only ever compares against itself.
+///
+/// MUTATION WITNESS (parent dropped): write `parent_id: None` in the pushed row
+/// and this FAILS at `each row carries its own ids and device` — the half that
+/// tells a recycled id from a continuous one, silently absent.
 #[test]
-fn mountinfo_carries_the_mount_id_and_device_of_every_row() {
+fn mountinfo_carries_the_identity_of_every_row() {
   let content = "\
 36 25 0:32 / /mnt rw,relatime shared:1 - tmpfs tmpfs rw
 41 36 259:3 / /mnt/nvme rw,relatime shared:9 - ext4 /dev/nvme0n1p3 rw
@@ -151,8 +168,11 @@ fn mountinfo_carries_the_mount_id_and_device_of_every_row() {
   let mounts = parse_mountinfo(content.as_bytes(), Path::new("/mnt"));
   assert_eq!(
     mounts,
-    vec![row("/mnt/nvme", 41, 259, 3), row("/mnt/bind", 42, 0, 57)],
-    "each row carries its own mount id and device, not just its location"
+    vec![
+      row("/mnt/nvme", 41, 36, 259, 3),
+      row("/mnt/bind", 42, 36, 0, 57)
+    ],
+    "each row carries its own ids and device, not just its location"
   );
   assert_eq!(
     mounts[0].dev,
@@ -162,90 +182,105 @@ fn mountinfo_carries_the_mount_id_and_device_of_every_row() {
   );
 }
 
-/// **Stacked mounts put several rows at one mount point, and only the TOP is
-/// visible** — so the top is the row whose identity belongs on the table, and the
-/// one whose departure the core has to be able to see.
+/// **Several rows can render ONE mount point, and every one of them comes back**
+/// — with its own id, at that same location, in file order.
 ///
-/// The top is named by the PARENT CHAIN (field 2), not by line order: mounting
-/// over an occupied mount point descends into whatever is visible there, so a
-/// stacked mount's parent is the mount directly beneath it and the group forms a
-/// chain whose top is the one row that is no other member's parent. Keying
-/// first-wins (or pushing both) records the SHADOWED mount's identity against the
-/// visible location: every later read would then see the same location at a
-/// different `(mnt_id, dev)` and diff the visible mount straight back out as a
-/// replacement, once per tick, forever.
+/// Two shapes, both ordinary and both stable. A plain STACK is a chain: each
+/// member is mounted on the one below it, so each names the one below as its
+/// parent. The second shape is not a chain at all — mount `A` at `/root/x/y`,
+/// mount `C` over `/root/x`, then mount `B` at the `y` that `C` now shows there:
+/// `A` hangs off the root mount and `B` off `C`, so neither is the other's
+/// parent, yet both render `/root/x/y`.
 ///
-/// This is the ordinary stack, where the chain and the line order AGREE (nothing
-/// was moved, so the newer mount is both on top and listed last). Its companion
-/// below is the case where they disagree.
+/// Naming ONE of them was the whole of the old design, and every rule for it (line
+/// order, the parent chain, a same-path group, the full parent graph) was found
+/// wrong on a shape the previous rule had not considered, because the kernel
+/// exports no visibility to be faithful to. Returning all of them retires the
+/// question: the core keys its census by mount id, so two rows at one location
+/// are two keys, and each one's own arrival, move and departure is a transition
+/// on its own key. A hidden member's transition costs one redundant cover of
+/// ground that was covered anyway — the safe direction, and the only cost.
 ///
-/// MUTATION WITNESS (cover inverted): mark the CHILD rather than the parent in
-/// `resolve_visibility`'s covered pass (`covered[index] = true`) and this FAILS at
-/// `the mount on TOP of the stack` with `left: [MountRow { location: "/mnt/stack",
-/// mnt_id: Some(40), dev: Some(44) }]` — the hidden mount recorded over the
-/// visible one.
-/// MUTATION WITNESS (cover dropped): never set it at all (`let covered = vec![false;
-/// rows.len()];`) and this FAILS at the same site with `left: [MountRow { location:
-/// "/mnt/stack", mnt_id: None, dev: None }]` — both members of a plain stack read
-/// as visible, so the location degrades to unknown and its replacement is
-/// invisible from then on.
-/// MUTATION WITNESS (line order): answering each group with its last row
-/// (`rows[*group.last().expect("non-empty")].0.clone()`) leaves this cell GREEN,
-/// and that is deliberate — here the chain and the line order agree, so this cell
-/// alone would not have caught R8 F1. The companion below is the one that
-/// separates them.
+/// MUTATION WITNESS (grouping restored): collapse rows by location, keeping the
+/// last at each — and this FAILS at `every member of the stack is a row` with a
+/// single-element `left`, which is one mount whose departure would never be
+/// derived.
 #[test]
-fn mountinfo_selects_the_top_of_a_stack_by_its_parent_chain() {
+fn mountinfo_returns_every_row_at_one_location() {
   // 44 is mounted OVER 40 at `/mnt/stack`, so 44's parent is 40 — not the `/mnt`
   // that carries the mount point's directory entry.
-  let content = "\
+  let stack = "\
 36 25 0:32 / /mnt rw,relatime shared:1 - tmpfs tmpfs rw
-40 36 0:44 / /mnt/stack rw,relatime shared:5 - tmpfs shadowed rw
-44 40 0:48 / /mnt/stack rw,relatime shared:6 - tmpfs visible rw
+40 36 0:44 / /mnt/stack rw,relatime shared:5 - tmpfs lower rw
+44 40 0:48 / /mnt/stack rw,relatime shared:6 - tmpfs upper rw
 ";
-  let mounts = parse_mountinfo(content.as_bytes(), Path::new("/mnt"));
+  let mounts = parse_mountinfo(stack.as_bytes(), Path::new("/mnt"));
   assert_eq!(
     mounts,
-    vec![row("/mnt/stack", 44, 0, 48)],
-    "one row per location, and it is the mount on TOP of the stack"
+    vec![
+      row("/mnt/stack", 40, 36, 0, 44),
+      row("/mnt/stack", 44, 40, 0, 48),
+    ],
+    "every member of the stack is a row, with its own id and the location they \
+     share"
+  );
+  assert_ne!(
+    mounts[0].mnt_id, mounts[1].mnt_id,
+    "and the two are told apart by the only thing that tells them apart"
+  );
+
+  // The rootfs (self-parented, as the initial namespace spells it) carries the
+  // plain directory `/root`; `A` and the overmount `C` both hang off it, and `B`
+  // hangs off `C`. Creation order lists `A` first, exactly as it happened.
+  let unrelated = "\
+1 1 0:1 / / rw,relatime shared:1 - ext4 /dev/root rw
+40 1 0:44 / /root/x/y rw,relatime shared:5 - tmpfs first rw
+41 1 0:45 / /root/x rw,relatime shared:6 - tmpfs overmount rw
+42 41 0:46 / /root/x/y rw,relatime shared:7 - tmpfs revealed rw
+43 1 0:47 / /root/other rw,relatime shared:8 - tmpfs elsewhere rw
+";
+  assert_eq!(
+    parse_mountinfo(unrelated.as_bytes(), Path::new("/root")),
+    vec![
+      row("/root/x/y", 40, 1, 0, 44),
+      row("/root/x", 41, 1, 0, 45),
+      row("/root/x/y", 42, 41, 0, 46),
+      row("/root/other", 43, 1, 0, 47),
+    ],
+    "two rows at one mount point that are not a stack at all are still simply \
+     two rows, and the unrelated mount beside them is untouched"
   );
 }
 
-/// **R8 F1.** The line order of `/proc/self/mountinfo` is mount CREATION order,
-/// and `mount --move` re-parents a mount without minting a new one — so a mount
-/// moved onto an occupied mount point keeps its OLDER id and is listed BEFORE the
-/// newer mount it now hides. Line order and stack order disagree, and last-row-wins
-/// then records the HIDDEN mount's identity against the visible location.
+/// **Issue #74's transition, at a stacked mount point.** The line order of
+/// `/proc/self/mountinfo` is mount CREATION order, and `mount --move`
+/// re-parents a mount without minting a new one — so a mount moved onto an
+/// occupied mount point keeps its OLDER id and is listed BEFORE the mount it now
+/// hides.
 ///
-/// What that costs is issue #74's entire transition. Lazily unmounting the visible
-/// mount leaves the hidden one exactly where it was, so a last-row-wins parse reads
-/// the SAME `(mnt_id, dev)` before and after: the core sees no replacement, fires
-/// no cover, and the subtree the departure revealed stays dark for the life of the
-/// scope. The second half of this cell is that transition, taken across the two
-/// tables a real `umount -l` produces.
+/// A parse that answered one row per location had to decide which of the two, and
+/// deciding by line order recorded the HIDDEN mount: lazily unmounting the other
+/// then left the selected row byte-identical across both reads, the core saw no
+/// transition, fired no cover, and the revealed subtree stayed dark for the life
+/// of the scope. With both rows returned there is nothing to decide — the
+/// departed mount's id is simply absent from the second read, whichever of the
+/// two it was.
 ///
-/// MUTATION WITNESS (line order): answer each group with its last row
-/// (`rows[*group.last().expect("non-empty")].0.clone()`) and this FAILS at `the
-/// departure of the visible mount is a TRANSITION`, `left != right` with both
-/// sides `[MountRow { location: "/mnt/vol", mnt_id: Some(55), dev: Some(44) }]` —
-/// two reads straddling an unmount that cannot be told apart, and below it the
-/// hidden mount recorded against the path the moved mount owns.
-/// MUTATION WITNESS (cover inverted): mark the CHILD rather than the parent
-/// (`covered[index] = true`) and this FAILS at the same site with `left: [MountRow
-/// { location: "/mnt/vol", mnt_id: Some(55), dev: Some(44) }]` — the cover read
-/// backwards lands on the hidden mount too, so the cell pins the DIRECTION of the
-/// resolution and not merely that field 2 was touched.
+/// MUTATION WITNESS (grouping restored): collapse by location keeping the last row
+/// at each and this FAILS at `the departure is a TRANSITION the two reads carry`,
+/// `left != right` with both sides `[MountRow { .., mnt_id: Some(55), .. }]` —
+/// two reads straddling an unmount that cannot be told apart.
 #[test]
-fn mountinfo_selects_the_visible_mount_when_a_move_lists_it_first() {
+fn a_stacked_mounts_departure_is_a_transition_between_two_reads() {
   // 55 was mounted at `/mnt/vol`; 20 — older, created elsewhere long before — was
-  // then `mount --move`d onto the same mount point, so 20's parent is 55 and 20 is
-  // what a lookup of `/mnt/vol` reaches. Creation order lists 20 first.
+  // then `mount --move`d onto the same mount point, so 20's parent is 55.
+  // Creation order lists 20 first.
   let stacked = "\
 20 55 0:48 / /mnt/vol rw,relatime shared:7 - tmpfs moved rw
 36 25 0:32 / /mnt rw,relatime shared:1 - tmpfs tmpfs rw
 55 36 0:44 / /mnt/vol rw,relatime shared:3 - tmpfs hidden rw
 ";
-  let mounts = parse_mountinfo(stacked.as_bytes(), Path::new("/mnt"));
+  let before = parse_mountinfo(stacked.as_bytes(), Path::new("/mnt"));
 
   // `umount -l /mnt/vol` detaches the moved mount; the mount it hid is revealed.
   let unstacked = "\
@@ -254,283 +289,75 @@ fn mountinfo_selects_the_visible_mount_when_a_move_lists_it_first() {
 ";
   let after = parse_mountinfo(unstacked.as_bytes(), Path::new("/mnt"));
 
-  // The TRANSITION is asserted first: it is what the finding costs, so it is what
-  // a line-order selection has to trip on.
+  // Asserted FIRST: it is what the defect costs, so it is what a parse that
+  // collapses the location has to trip on.
   assert_ne!(
-    mounts, after,
-    "the departure of the visible mount is a TRANSITION the two reads carry — the \
-     only thing that makes the core cover the ground it revealed"
+    before, after,
+    "the departure is a TRANSITION the two reads carry — the only thing that \
+     makes the core cover the ground it revealed"
   );
   assert_eq!(
-    mounts,
-    vec![row("/mnt/vol", 20, 0, 48)],
-    "the VISIBLE mount of the stack is the moved one, however early its older id \
-     puts it in the file"
+    before,
+    vec![
+      row("/mnt/vol", 20, 55, 0, 48),
+      row("/mnt/vol", 55, 36, 0, 44),
+    ],
+    "both members come back in FILE order, however creation order arranged them"
   );
   assert_eq!(
     after,
-    vec![row("/mnt/vol", 55, 0, 44)],
-    "and the revealed mount is what the next read answers"
+    vec![row("/mnt/vol", 55, 36, 0, 44)],
+    "and the survivor is byte-identical, so the diff names exactly the mount \
+     that left"
   );
 }
 
-/// **R10 F1.** Two rows can render ONE mount point without being one stack, and
-/// the arrangement is legal, ordinary and STABLE: mount `A` at `/root/x/y`, mount
-/// `C` over `/root/x`, then mount `B` at the `y` that `C` now shows there. `A`
-/// hangs off the root mount and `B` off `C`, so neither is the other's parent and
-/// no rule about a same-path GROUP can separate them — yet only `B` is reachable,
-/// because `C` covers the directory `A`'s mount point sits in.
+/// A torn read can list one mount id TWICE — the kernel drops the namespace lock
+/// between the `read(2)` calls that generate the file, so a mount can be rendered
+/// once, moved, and rendered again. The parse returns both rows: it validates no
+/// uniqueness and drops nothing, because a row it dropped is a location it would
+/// never answer for.
 ///
-/// Grouping by the rendered path and refusing the whole read where the group did
-/// not decide answered this by turning the detector OFF. The topology is stable,
-/// so the refusal repeats on every later tick: every refresh non-authoritative,
-/// the arrival/departure diff never run, and issue #74 silently reopened for every
-/// unrelated mount under that root until someone dismantles the arrangement. The
-/// mount GRAPH decides it instead — `C` shadows `A` because they share a parent
-/// and `C` renders a proper ancestor — and the table stays authoritative.
-///
-/// MUTATION WITNESS (shadowing dropped): never mark it (`let shadowed = vec![false;
-/// rows.len()];`, the sweep deleted) and this FAILS at `the mount a lookup of the
-/// shared path REACHES` with `left: Some(MountRow { location: "/root/x/y", mnt_id:
-/// None, dev: None })` — `A` stays a candidate, the location decides nothing, and
-/// its replacement is invisible from then on.
-/// MUTATION WITNESS (self-parent not excluded): drop the `parent_of[index] ==
-/// Some(index)` skip in the shadow sweep and this FAILS at `the mount a lookup of
-/// the shared path REACHES` with `left: None` — the rootfs names ITSELF as its
-/// parent and renders `/`, so counting it among its own children's siblings
-/// shadows every mount on the host and the table comes back EMPTY. Same
-/// detector-off failure, reached from the opposite direction; the `/root/other`
-/// assertion below is the one that says so in as many words.
+/// Deduplication belongs to the census, which is where the key exists: `census_of`
+/// keeps the FIRST row of a repeated key, so one mount enters one census once
+/// however many times a torn table named it. Doing it here instead would mean
+/// choosing between two locations for one id, which is the same guess the whole
+/// visibility resolution was.
 #[test]
-fn mountinfo_resolves_two_rows_at_one_path_through_the_mount_graph() {
-  // The rootfs (self-parented, as the initial namespace spells it) carries the
-  // plain directory `/root`; `A` and the overmount `C` both hang off it, and `B`
-  // hangs off `C`. Creation order lists `A` first, exactly as it happened.
-  let content = "\
-1 1 0:1 / / rw,relatime shared:1 - ext4 /dev/root rw
-40 1 0:44 / /root/x/y rw,relatime shared:5 - tmpfs first rw
-41 1 0:45 / /root/x rw,relatime shared:6 - tmpfs overmount rw
-42 41 0:46 / /root/x/y rw,relatime shared:7 - tmpfs revealed rw
-43 1 0:47 / /root/other rw,relatime shared:8 - tmpfs unrelated rw
-";
-  let mounts = parse_mountinfo(content.as_bytes(), Path::new("/root"));
-
-  let at = |path: &str| {
-    mounts
-      .iter()
-      .find(|mount| mount.location.as_path() == std::path::Path::new(path))
-      .cloned()
-  };
-  assert_eq!(
-    at("/root/x/y"),
-    Some(row("/root/x/y", 42, 0, 46)),
-    "the mount a lookup of the shared path REACHES is the one under the \
-     overmount, and it is named with its own identity — a location answered \
-     `None` here can never report a replacement again"
-  );
-  assert_eq!(
-    at("/root/x"),
-    Some(row("/root/x", 41, 0, 45)),
-    "the overmount itself is a row like any other"
-  );
-  assert_eq!(
-    at("/root/other"),
-    Some(row("/root/other", 43, 0, 47)),
-    "every unrelated mount under the root is still answered — the whole cost of \
-     the refusal this replaces was that it took THESE down with it"
-  );
-  assert_eq!(
-    mounts,
-    vec![
-      row("/root/x", 41, 0, 45),
-      row("/root/x/y", 42, 0, 46),
-      row("/root/other", 43, 0, 47),
-    ],
-    "and the shadowed row is not a second entry at its location: one row per \
-     mount point, in first-appearance order"
-  );
-
-  // The transition the detector exists for, taken over the SAME topology: `B`
-  // departs, and `A` — which was there all along — becomes reachable again.
-  let after = "\
-1 1 0:1 / / rw,relatime shared:1 - ext4 /dev/root rw
-40 1 0:44 / /root/x/y rw,relatime shared:5 - tmpfs first rw
-41 1 0:45 / /root/x rw,relatime shared:6 - tmpfs overmount rw
-43 1 0:47 / /root/other rw,relatime shared:8 - tmpfs unrelated rw
-";
-  let revealed = parse_mountinfo(after.as_bytes(), Path::new("/root"));
-  assert_ne!(
-    mounts, revealed,
-    "the departure is a TRANSITION the two reads carry, which is the only thing \
-     that makes the core cover the ground it revealed"
-  );
-  assert_eq!(
-    revealed
-      .iter()
-      .find(|mount| mount.location.as_path() == std::path::Path::new("/root/x/y"))
-      .cloned(),
-    None,
-    "and with the overmount still standing, `A`'s mount point is still covered \
-     by it, so the location is gone from the table rather than back at `A`"
-  );
-}
-
-/// **R9 F1, revised by R10 F1.** Where the mount graph does not decide a location,
-/// that LOCATION degrades — its identity is unknown — and the READ stays
-/// authoritative.
-///
-/// The rule this replaces refused the whole table, chosen as the honest degrade
-/// over a file-order guess. It is honest, and for a TORN read it is even
-/// self-correcting, because the next read is coherent. But a refusal is not
-/// self-correcting for an arrangement that is simply THERE: two mounts attached
-/// side by side at one mount point are legal and stable, so every later read
-/// refuses too, and #74 detection is off for that whole root indefinitely. The
-/// cost is not confined to the ambiguous location, which is what made it the wrong
-/// trade.
-///
-/// A per-location unknown costs exactly what the mixed-observer identity rule
-/// already costs everywhere else: an unknown half never reads as "different", so a
-/// REPLACEMENT at that location fires no cover. Its ARRIVAL and its DEPARTURE are
-/// still transitions, every other location is answered exactly as before, and no
-/// wrong baseline is installed — which is what the file-order guess did.
-///
-/// The third fixture is a TORN read, and it is the one that separates this from a
-/// rule about unparsable ids: every row parses, and the chain is broken only
-/// because the read MISSED the mount in the middle of it.
-///
-/// MUTATION WITNESS (whole-read refusal reinstated): answer `Vec::new()` from
-/// `parse_mountinfo` as soon as any group holds more than one member and this
-/// FAILS at `an unrelated mount under the same root is untouched` with `left:
-/// None` — the finding itself, and the reason the refusal had to go.
-/// MUTATION WITNESS (file-order guess reinstated): answer the group with
-/// `rows[*group.last().expect("non-empty")].0.clone()` and this FAILS at `an
-/// undecidable location names NO identity` with `left: Some(MountRow { location:
-/// "/mnt/stack", mnt_id: Some(44), dev: Some(48) })` — a baseline the next read
-/// has no reason to agree with, installed from evidence that carries no order.
-#[test]
-fn mountinfo_degrades_an_undecidable_location_and_not_the_read() {
-  let unknown_at = |path: &str, dev: Option<u64>| crate::os::MountRow {
-    location: std::path::PathBuf::from(path),
-    mnt_id: None,
-    dev,
-  };
-  let at = |mounts: &[crate::os::MountRow], path: &str| {
-    mounts
-      .iter()
-      .find(|mount| mount.location.as_path() == std::path::Path::new(path))
-      .cloned()
-  };
-
-  // A group holding a row whose id will not parse: nothing can name it as a
-  // parent, so nothing can be shown to cover it, and it stays a candidate beside
-  // the real one.
-  let unparsable = "\
-36 25 0:32 / /mnt rw,relatime shared:1 - tmpfs tmpfs rw
-zz 36 0:44 / /mnt/stack rw,relatime shared:5 - tmpfs unparsable rw
-44 36 0:48 / /mnt/stack rw,relatime shared:6 - tmpfs beside rw
-45 36 0:50 / /mnt/other rw,relatime shared:8 - tmpfs unrelated rw
-";
-  let mounts = parse_mountinfo(unparsable.as_bytes(), Path::new("/mnt"));
-  // Asserted FIRST: this is what refusing the read cost, so a refusal has to trip
-  // here rather than on the ambiguous location it was refused for.
-  assert_eq!(
-    at(&mounts, "/mnt/other"),
-    Some(row("/mnt/other", 45, 0, 50)),
-    "an unrelated mount under the same root is untouched: the read is \
-     AUTHORITATIVE, so every other location's arrival and departure still \
-     derive"
-  );
-  assert_eq!(
-    at(&mounts, "/mnt/stack"),
-    Some(unknown_at("/mnt/stack", None)),
-    "an undecidable location names NO identity — neither candidate's, because \
-     the evidence carries no order between them"
-  );
-
-  // The departure of the whole undecidable location is still a transition — the
-  // degrade costs the REPLACEMENT at that location and nothing else.
-  let gone = "\
-36 25 0:32 / /mnt rw,relatime shared:1 - tmpfs tmpfs rw
-45 36 0:50 / /mnt/other rw,relatime shared:8 - tmpfs unrelated rw
-";
-  assert_ne!(
-    mounts,
-    parse_mountinfo(gone.as_bytes(), Path::new("/mnt")),
-    "an undecidable location that DEPARTS is still a transition the two reads \
-     carry"
-  );
-
-  // Two mounts attached side by side at one mount point, neither below the other.
-  // Legal, stable, and the shape that made the whole-read refusal permanent.
-  let beside = "\
-36 25 0:32 / /mnt rw,relatime shared:1 - tmpfs tmpfs rw
-44 36 0:48 / /mnt/stack rw,relatime shared:6 - tmpfs one rw
-45 36 0:48 / /mnt/stack rw,relatime shared:7 - tmpfs two rw
-";
-  assert_eq!(
-    parse_mountinfo(beside.as_bytes(), Path::new("/mnt")),
-    vec![unknown_at("/mnt/stack", Some(super::makedev(0, 48)))],
-    "two candidates and no evidence of an order between them decide nothing — \
-     but the DEVICE survives where every candidate agrees on it, since whichever \
-     one a lookup reaches is on that device"
-  );
-
-  // THE TEAR. 20 sits on 55 which sits on 12, all three at `/mnt/vol` — and the
-  // read straddled an unmount, so the row for 55 is simply not in the buffer.
-  // 20's parent is now unresolvable and 12 is covered by nothing, so both stand.
+fn mountinfo_returns_both_rows_of_a_torn_read_with_a_duplicate_id() {
   let torn = "\
-12 36 0:44 / /mnt/vol rw,relatime shared:3 - tmpfs bottom rw
-20 55 0:48 / /mnt/vol rw,relatime shared:7 - tmpfs visible rw
 36 25 0:32 / /mnt rw,relatime shared:1 - tmpfs tmpfs rw
+44 36 0:48 / /mnt/before rw,relatime shared:5 - tmpfs twice rw
+44 36 0:48 / /mnt/after rw,relatime shared:5 - tmpfs twice rw
 ";
   assert_eq!(
     parse_mountinfo(torn.as_bytes(), Path::new("/mnt")),
-    vec![unknown_at("/mnt/vol", None)],
-    "a chain whose MIDDLE the read missed installs NO identity — a guess there \
-     would install the bottom of the stack as the baseline, and the visible \
-     mount's departure would never be told"
-  );
-
-  // A row that names ITSELF as its parent is its own anchor and nobody's sibling,
-  // so it stays a candidate beside the row that really hangs off `/mnt`.
-  let self_parented = "\
-36 25 0:32 / /mnt rw,relatime shared:1 - tmpfs tmpfs rw
-10 10 0:44 / /mnt/stack rw,relatime shared:5 - tmpfs itself rw
-11 36 0:48 / /mnt/stack rw,relatime shared:6 - tmpfs beside rw
-";
-  assert_eq!(
-    parse_mountinfo(self_parented.as_bytes(), Path::new("/mnt")),
-    vec![unknown_at("/mnt/stack", None)],
-    "a self-referencing parent id covers nobody, so the location still has two \
-     candidates and still decides nothing"
-  );
-
-  // The control: the same three mounts with nothing missing decide, so the
-  // degrade above is about the broken chain and not about stacking as such.
-  let whole = "\
-12 36 0:44 / /mnt/vol rw,relatime shared:3 - tmpfs bottom rw
-20 55 0:48 / /mnt/vol rw,relatime shared:7 - tmpfs visible rw
-36 25 0:32 / /mnt rw,relatime shared:1 - tmpfs tmpfs rw
-55 12 0:46 / /mnt/vol rw,relatime shared:5 - tmpfs middle rw
-";
-  assert_eq!(
-    parse_mountinfo(whole.as_bytes(), Path::new("/mnt")),
-    vec![row("/mnt/vol", 20, 0, 48)],
-    "an intact chain still names its top, however the file orders it"
+    vec![
+      row("/mnt/before", 44, 36, 0, 48),
+      row("/mnt/after", 44, 36, 0, 48),
+    ],
+    "both rows come back verbatim — the parse refuses nothing and resolves \
+     nothing, and the census keys and dedupes them"
   );
 }
 
 /// A line short of five fields is skipped, but a line whose LOCATION parses and
 /// whose identity does not is kept with that identity unknown. The location is
 /// the load-bearing half — losing it under-covers a real mount — while an
-/// unknown id is exactly the honest `None` every non-Linux table reports, and
-/// the core's provenance partition is written for it.
+/// unknown id is exactly the honest `None` every non-Linux table reports, and an
+/// unknown half never reads as a difference anywhere it is compared.
+///
+/// Each of the four fields degrades on its own: an unparsable mount id leaves the
+/// row keyed by its location, an unparsable PARENT leaves the replacement test
+/// deciding on the device alone, and either half of `major:minor` takes only the
+/// device with it.
 #[test]
 fn mountinfo_keeps_a_row_whose_identity_will_not_parse() {
   let content = "\
 zz 25 0:32 / /mnt/bad-id rw,relatime shared:1 - tmpfs tmpfs rw
 37 25 nope / /mnt/bad-dev rw,relatime shared:2 - tmpfs tmpfs rw
 38 25 0:x / /mnt/bad-minor rw,relatime shared:3 - tmpfs tmpfs rw
+39 -1 0:37 / /mnt/bad-parent rw,relatime shared:4 - tmpfs tmpfs rw
 ";
   let mounts = parse_mountinfo(content.as_bytes(), Path::new("/mnt"));
   assert_eq!(
@@ -539,17 +366,26 @@ zz 25 0:32 / /mnt/bad-id rw,relatime shared:1 - tmpfs tmpfs rw
       crate::os::MountRow {
         location: std::path::PathBuf::from("/mnt/bad-id"),
         mnt_id: None,
+        parent_id: Some(25),
         dev: Some(super::makedev(0, 32)),
       },
       crate::os::MountRow {
         location: std::path::PathBuf::from("/mnt/bad-dev"),
         mnt_id: Some(37),
+        parent_id: Some(25),
         dev: None,
       },
       crate::os::MountRow {
         location: std::path::PathBuf::from("/mnt/bad-minor"),
         mnt_id: Some(38),
+        parent_id: Some(25),
         dev: None,
+      },
+      crate::os::MountRow {
+        location: std::path::PathBuf::from("/mnt/bad-parent"),
+        mnt_id: Some(39),
+        parent_id: None,
+        dev: Some(super::makedev(0, 37)),
       },
     ],
     "an unparsable identity field is UNKNOWN, never a dropped row"
@@ -560,7 +396,7 @@ zz 25 0:32 / /mnt/bad-id rw,relatime shared:1 - tmpfs tmpfs rw
 fn mountinfo_unescapes_octal_fields() {
   let content = "36 25 0:32 / /mnt/with\\040space rw shared:1 - tmpfs tmpfs rw\n";
   let mounts = parse_mountinfo(content.as_bytes(), Path::new("/mnt"));
-  assert_eq!(mounts, vec![row("/mnt/with space", 36, 0, 32)]);
+  assert_eq!(mounts, vec![row("/mnt/with space", 36, 25, 0, 32)]);
 }
 
 /// **R8 F2.** mountinfo escapes exactly FOUR bytes inside a path field — space,
@@ -609,9 +445,9 @@ fn mountinfo_keeps_the_raw_whitespace_bytes_of_a_mount_point() {
   assert_eq!(
     mounts,
     vec![
-      row("/mnt/we\u{0b}i\u{0c}r\u{0d}d", 36, 0, 32),
-      row("/mnt/with space", 37, 0, 33),
-      row("/mnt/doubled", 38, 0, 34),
+      row("/mnt/we\u{0b}i\u{0c}r\u{0d}d", 36, 25, 0, 32),
+      row("/mnt/with space", 37, 25, 0, 33),
+      row("/mnt/doubled", 38, 25, 0, 34),
     ],
     "every raw whitespace byte is path data, an octal triple is the only escape, \
      and a doubled DELIMITER still shifts nothing"
@@ -671,13 +507,14 @@ fn mountinfo_parses_a_non_utf8_mount_point_and_keeps_the_rows_around_it() {
   assert_eq!(
     mounts,
     vec![
-      row("/mnt/before", 36, 0, 32),
+      row("/mnt/before", 36, 25, 0, 32),
       crate::os::MountRow {
         location: odd_mount_point(),
         mnt_id: Some(37),
+        parent_id: Some(25),
         dev: Some(super::makedev(0, 33)),
       },
-      row("/mnt/after", 38, 0, 34),
+      row("/mnt/after", 38, 25, 0, 34),
     ],
     "a non-UTF-8 mount point is a row like any other, and it does not take the \
      rows around it down with it"
@@ -722,9 +559,7 @@ fn a_mountinfo_file_with_a_non_utf8_mount_point_still_reads_authoritative() {
   ));
   let mut content: Vec<u8> = Vec::new();
   content.extend_from_slice(b"36 25 0:32 / /mnt rw shared:1 - tmpfs tmpfs rw\n");
-  // Parented on `/mnt`'s own mount, as the kernel records a mount INSIDE it. A
-  // fixture that made the two siblings would describe an overmount on `/mnt`,
-  // which really does hide what is under it.
+  // Parented on `/mnt`'s own mount, as the kernel records a mount INSIDE it.
   content.extend_from_slice(b"37 36 0:33 / /mnt/od\xffd rw shared:2 - ext4 /dev/loop0 rw\n");
   std::fs::write(&path, &content).expect("the fixture table writes");
 
@@ -736,6 +571,7 @@ fn a_mountinfo_file_with_a_non_utf8_mount_point_still_reads_authoritative() {
     Some(vec![crate::os::MountRow {
       location: odd_mount_point(),
       mnt_id: Some(37),
+      parent_id: Some(36),
       dev: Some(super::makedev(0, 33)),
     }]),
     "the read stays AUTHORITATIVE over a table no decode accepts: `None` here is \
@@ -745,9 +581,9 @@ fn a_mountinfo_file_with_a_non_utf8_mount_point_still_reads_authoritative() {
 
 /// A missing file answers `None` — the honest unreadable-table signal the
 /// authority rule is built on, kept distinct from "the bytes were surprising",
-/// and since R10 F1 the ONLY thing that produces it: a location the mount graph
-/// cannot decide degrades its own identity and leaves the read authoritative
-/// (`mountinfo_degrades_an_undecidable_location_and_not_the_read`).
+/// and the ONLY thing that produces it. The parse decides nothing and refuses
+/// nothing, so no arrangement of mounts and no malformed line can make a readable
+/// table answer `None` here.
 #[test]
 fn an_unreadable_mountinfo_file_answers_none() {
   let missing = std::env::temp_dir().join(format!(
@@ -761,67 +597,45 @@ fn an_unreadable_mountinfo_file_answers_none() {
   );
 }
 
-/// **R9 F3.** Resolving which mount a path reaches must stay near-linear in the
-/// table, because the retained cone can be the whole namespace.
+/// Parsing a table must stay near-linear in its rows, because a watched root of
+/// `/` sees the whole namespace and Linux permits `fs.mount-max` — 100 000 by
+/// default — mounts in one.
 ///
-/// Nothing bounds a mount point's stack below the namespace's own limit: every
-/// `mount --bind X /r/vol` adds one more row at the SAME location, and Linux
-/// permits `fs.mount-max` — 100 000 by default — mounts per namespace. The
-/// selection this replaces asked "is this row the parent of any OTHER member?" by
-/// scanning the group once per member, so a full stack cost 10^10 comparisons,
-/// per refresh, per watched root, on the blocking pool. A driver stalled there is
-/// how the queue loss the whole mount design exists to avoid actually happens.
+/// Nothing bounds a single mount point's stack below that limit either: every
+/// `mount --bind X /r/vol` adds one more row at the SAME location. Two shapes
+/// this parse has already worn were quadratic in exactly that case — asking, per
+/// member, whether any OTHER member named it as a parent — and a full stack then
+/// cost 10^10 comparisons, per refresh, per watched root, on the blocking pool.
+/// A driver stalled there is how the queue loss the whole mount design exists to
+/// avoid actually happens. One pass per line, one row pushed per line, is what
+/// this pins.
 ///
 /// # The cost verdict is a RATIO, and it is calibrated by the run itself
 ///
-/// An absolute wall clock cannot state this property, and the first version of
+/// An absolute wall clock cannot state this property, and an early version of
 /// this cell tried. It has to sit above the linear form on the slowest
 /// instrumented build and below the quadratic form on the fastest native one, and
-/// those two bounds are a factor of eight apart here: the linear parse of the full
-/// stack takes 0.26 s natively and **3.4 s under TSan** (both measured), against
-/// 41 s for the quadratic form. A ceiling with real margin over TSan has almost
-/// none left under the defect, and the same ceiling was a hard RED under miri,
-/// where the token stack alone took 19.7 s.
+/// those two bounds are nearly an order of magnitude apart here: the linear parse
+/// of a full stack took 0.26 s natively and 3.4 s under TSan (both measured),
+/// against 41 s for a quadratic form. A ceiling with real margin over TSan has
+/// almost none left under the defect, and the same ceiling was a hard RED under
+/// miri.
 ///
 /// So the cell measures the SAME work at two sizes an octave apart and asks how
-/// the cost grew. A linear resolution grows with the input — about 8x. A quadratic
-/// one grows with its square — about 64x. The threshold sits between them, and
-/// because both halves are measured on the machine that is running them, no
-/// interpreter, sanitizer, container or loaded runner moves the verdict: it
-/// divides out.
+/// the cost grew. A linear parse grows with the input — about 8x. A quadratic one
+/// grows with its square — about 64x. The threshold sits between them, and
+/// because both halves are measured on the machine running them, no interpreter,
+/// sanitizer, container or loaded runner moves the verdict: it divides out.
 ///
-/// Under miri the sizes drop to a token stack — one 32-bit address space is shared
-/// by the whole shard — and the RATIO is skipped there, because at eight rows the
-/// fixed costs are the measurement. The verdict that survives at both sizes is
-/// which row is the top, and that is asserted unconditionally.
-///
-/// MUTATION WITNESS (id index dropped): resolve each row's parent by SCANNING —
-/// `rows.iter().position(|(row, _)| row.mnt_id == Some(id))` in place of the
-/// `by_id` lookup — and this FAILS at `the cost of resolving a stack grows with
-/// the stack, not with its square` — `12500 rows took 442.78625ms, 100000 rows
-/// took 26.887857709s, a factor of 60.7`. The indexed form measures 8.7 on the
-/// same machine, so the threshold has ~2.8x of margin below it and ~2.5x above,
-/// and every machine-speed constant divides out of the ratio — which an absolute
-/// ceiling could not do here.
-/// MUTATION WITNESS (uniqueness dropped): answer an undecidable location with its
-/// first candidate — `rows[group[0]].0.clone()` in place of the unknown-identity
-/// row — and this FAILS at `a location of this shape still names NO identity` with
-/// `left: [MountRow { location: "/mnt/vol", mnt_id: Some(2212498), dev:
-/// Some(50331898) }]`. That is the shortcut a rewrite invites, and it installs a
-/// baseline from evidence that carries no order at all.
+/// Under miri the sizes drop to a token stack — one 32-bit address space is
+/// shared by the whole shard — and the RATIO is skipped there, because at sixteen
+/// rows the fixed costs are the measurement. What is asserted unconditionally at
+/// both sizes is that every member came back.
 #[test]
-fn the_top_of_a_full_namespace_stack_is_selected_in_linear_time() {
+fn a_full_namespace_stack_is_parsed_in_linear_time() {
   // The kernel's own default `fs.mount-max`, and an octave below it. Miri gets a
   // token stack: the interpreted cost of the real one would fall on the shard
   // that shares a single 32-bit address space.
-  //
-  // FOUR is the FLOOR for the smaller size, not an arbitrary token. The last
-  // group below splits it into two independent chains, so anything under four
-  // leaves a chain of one row — a group that DECIDES, and an assertion that then
-  // reads as a defect. It did: at one row the miri leg failed at `a group of this
-  // shape that does NOT decide is still refused` while every native gate stayed
-  // green, which is exactly why the interpreted shard is RUN and not merely
-  // listed.
   let (small, big): (u64, u64) = if cfg!(miri) {
     (4, 16)
   } else {
@@ -830,7 +644,7 @@ fn the_top_of_a_full_namespace_stack_is_selected_in_linear_time() {
 
   // One mount point's whole stack as mountinfo spells it, plus the elapsed of the
   // PARSE alone — the fixture is built outside the measurement.
-  fn resolve(members: u64, base: u64) -> (std::time::Duration, Vec<crate::os::MountRow>) {
+  fn parse(members: u64, base: u64) -> (std::time::Duration, Vec<crate::os::MountRow>) {
     let mut table = String::from("36 25 0:32 / /mnt rw,relatime shared:1 - tmpfs tmpfs rw\n");
     for member in 0..members {
       // Each mount sits on the one below it, so the group is one chain; the
@@ -847,24 +661,30 @@ fn the_top_of_a_full_namespace_stack_is_selected_in_linear_time() {
     (started.elapsed(), mounts)
   }
 
-  let top_of = |base: u64, members: u64| {
-    vec![crate::os::MountRow {
-      location: std::path::PathBuf::from("/mnt/vol"),
-      mnt_id: Some(base + members - 1),
-      dev: Some(super::makedev(0, 40 + members - 1)),
-    }]
+  let whole_stack = |base: u64, members: u64| -> Vec<crate::os::MountRow> {
+    (0..members)
+      .map(|member| {
+        row(
+          "/mnt/vol",
+          base + member,
+          if member == 0 { 36 } else { base + member - 1 },
+          0,
+          40 + member,
+        )
+      })
+      .collect()
   };
 
-  let (small_elapsed, small_mounts) = resolve(small, 1_100_000);
-  let (big_elapsed, big_mounts) = resolve(big, 2_200_000);
+  let (small_elapsed, small_mounts) = parse(small, 1_100_000);
+  let (big_elapsed, big_mounts) = parse(big, 2_200_000);
   assert_eq!(
     small_mounts,
-    top_of(1_100_000, small),
-    "the top of the stack is the one row no other member names as its parent"
+    whole_stack(1_100_000, small),
+    "every member of the stack is a row of its own, in file order"
   );
   assert_eq!(
     big_mounts,
-    top_of(2_200_000, big),
+    whole_stack(2_200_000, big),
     "and that holds at the namespace's own limit, however deep the stack is"
   );
 
@@ -874,38 +694,10 @@ fn the_top_of_a_full_namespace_stack_is_selected_in_linear_time() {
   let grew = big_elapsed.as_secs_f64() / small_elapsed.as_secs_f64().max(f64::MIN_POSITIVE);
   assert!(
     cfg!(miri) || grew < 24.0,
-    "the cost of resolving a stack grows with the stack, not with its square — \
+    "the cost of parsing a stack grows with the stack, not with its square — \
      this refresh runs on the blocking pool, and a driver stalled there is the \
      queue loss the mount design exists to avoid ({small} rows took \
      {small_elapsed:?}, {big} rows took {big_elapsed:?}, a factor of {grew:.1})"
-  );
-
-  // A group of the same shape split into two independent chains at the one mount
-  // point: two unreferenced candidates and no evidence of an order between them.
-  // A linear pass that answers the first candidate it finds resolves this as
-  // confidently as the decidable stacks above, and F1's whole rejection is gone
-  // with it.
-  let split: u64 = 2_200_000;
-  let mut ambiguous = String::from("36 25 0:32 / /mnt rw,relatime shared:1 - tmpfs tmpfs rw\n");
-  for member in 0..small {
-    let id = split + member;
-    // The even members form one chain, the odd members the other, and each
-    // chain's base hangs off `/mnt`.
-    let parent = if member < 2 { 36 } else { id - 2 };
-    ambiguous.push_str(&format!(
-      "{id} {parent} 0:{} / /mnt/vol rw,relatime shared:9 - tmpfs stacked rw\n",
-      40 + member
-    ));
-  }
-  assert_eq!(
-    parse_mountinfo(ambiguous.as_bytes(), Path::new("/mnt")),
-    vec![crate::os::MountRow {
-      location: std::path::PathBuf::from("/mnt/vol"),
-      mnt_id: None,
-      dev: None,
-    }],
-    "a location of this shape still names NO identity — the indexed pass \
-     validates uniqueness, it does not stop at the first candidate"
   );
 }
 
@@ -931,7 +723,7 @@ fn the_top_of_a_full_namespace_stack_is_selected_in_linear_time() {
 /// MUTATION WITNESS (accept the unstable pair): answer `(sample.rows, sample.root)`
 /// unconditionally in `coherent_mount_sample` and this FAILS at `a namespace that
 /// never held still answers NO table` with `left: Some([MountRow { location:
-/// "/mnt/c", mnt_id: Some(3), dev: Some(3) }]), right: None`.
+/// "/mnt/c", mnt_id: Some(3), parent_id: None, dev: Some(3) }]), right: None`.
 /// MUTATION WITNESS (drop the retry): take exactly one sample (`let sample =
 /// take();` with the loop deleted) and this FAILS at `staging: the unstable
 /// attempt is re-taken` with `left: 1, right: 2` — one lost race permanently
@@ -948,6 +740,7 @@ fn a_mount_sample_the_namespace_moved_under_is_not_a_table() {
         vec![crate::os::MountRow {
           location: std::path::PathBuf::from(at),
           mnt_id: Some(root),
+          parent_id: None,
           dev: Some(root),
         }]
       }),
@@ -975,6 +768,7 @@ fn a_mount_sample_the_namespace_moved_under_is_not_a_table() {
       [crate::os::MountRow {
         location: std::path::PathBuf::from("/mnt/b"),
         mnt_id: Some(2),
+        parent_id: None,
         dev: Some(2),
       }]
       .as_slice()
@@ -1015,9 +809,8 @@ fn a_mount_sample_the_namespace_moved_under_is_not_a_table() {
   );
 
   // Stable and unreadable: not a tear, so re-reading it would only pay for the
-  // same answer twice more. (Since R10 F1 this is the ONLY way rows come back
-  // `None` — the parse always answers a table, degrading a location it cannot
-  // decide rather than the sample.)
+  // same answer twice more. (This is the ONLY way rows come back `None` — the
+  // parse always answers a table, whatever the bytes hold.)
   let taken = std::cell::Cell::new(0u64);
   let crate::os::MountReading { rows, .. } =
     super::coherent_mount_sample(super::MAX_MOUNT_SAMPLE_ATTEMPTS, || {
@@ -1213,7 +1006,7 @@ fn mountinfo_unescape_survives_an_out_of_range_octal_triple() {
   let mounts = parse_mountinfo(content, Path::new("/mnt"));
   assert_eq!(
     mounts,
-    vec![row("/mnt/hi\\777there", 36, 0, 32)],
+    vec![row("/mnt/hi\\777there", 36, 25, 0, 32)],
     "an out-of-range triple is not an escape the kernel wrote, so it stays as \
      the four bytes it is"
   );

@@ -224,13 +224,14 @@ fn loc(parts: &[&str]) -> Location {
 /// descendant arm by construction, whereas a `Created` for one entry proved only
 /// that one read had reached the consumer.
 /// A mount-table row with no identity — the fake reads no namespace, so its
-/// rows answer `None` for the mount id and the device exactly as macOS'
-/// `getfsstat` and a pre-5.8 Linux kernel do. The driver suites here care only
+/// rows answer `None` for the mount id, its parent and the device exactly as
+/// macOS' `getfsstat` and a pre-5.8 Linux kernel do. The driver suites here care only
 /// WHERE a mount is; identity is exercised in the core's own cells.
 fn bare_mount(location: &str) -> crate::os::MountRow {
   crate::os::MountRow {
     location: PathBuf::from(location),
     mnt_id: None,
+    parent_id: None,
     dev: None,
   }
 }
@@ -2626,6 +2627,7 @@ mod descending {
       vec![crate::os::MountRow {
         location: PathBuf::from("/r/sub"),
         mnt_id: Some(42),
+        parent_id: None,
         dev: Some(9),
       }],
       true,

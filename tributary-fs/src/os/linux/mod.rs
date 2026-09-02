@@ -458,15 +458,14 @@ const fn makedev(major: u64, minor: u64) -> u64 {
     | (minor & 0x0000_00ff)
 }
 
-/// Parses `/proc/self/mountinfo` content into the mount rows strictly under
-/// `root` (PURE — the reader lives in the cfg'd `mounts_under`).
+/// Parses `/proc/self/mountinfo` content into EVERY mount row strictly under
+/// `root`, in FILE order (PURE — the reader lives in the cfg'd `mounts_under`).
 ///
 /// Four fields of every line are read, and all four are already on the line
-/// being scanned: field 1 is the mount ID, field 2 the PARENT mount's ID, field 3
-/// the `major:minor` of the mounted filesystem, and field 5 the mount point. Three
-/// are kept on the row; the parent resolves VISIBILITY (below). Identity is what
-/// lets the core see a mount REPLACED at an unchanged path, which a paths-only
-/// read cannot express at all.
+/// being scanned: field 1 is the mount ID, field 2 the PARENT mount's ID, field
+/// 3 the `major:minor` of the mounted filesystem, and field 5 the mount point.
+/// All four are kept on the row. Identity is what lets the core see a mount
+/// REPLACED at an unchanged path, which a paths-only read cannot express at all.
 ///
 /// A line with fewer than five space-separated fields is skipped (the seed is
 /// trust-reducing only, so omission fails toward closed trust, never toward false
@@ -474,94 +473,45 @@ const fn makedev(major: u64, minor: u64) -> u64 {
 /// the load-bearing half and it parsed, so the row is kept with that identity
 /// `None` — the same honest-unknown the non-Linux tables report.
 ///
-/// # Which mount a path REACHES is a question about the mount graph, not about
-/// the rendered path
+/// # Every row, and no claim about which one a lookup REACHES
 ///
-/// Several rows can render the same mount point, and only the one a path lookup
-/// actually reaches is the one whose identity belongs on the table and whose
-/// departure the core must see.
+/// Several rows can render one mount point: an ordinary stack, a `mount --move`
+/// onto an occupied mount point, two mounts propagated side by side. All of them
+/// come back, each with its own id, and nothing here decides which is visible.
 ///
-/// **Line order does not identify it.** A namespace's rows are emitted in mount
-/// CREATION order (an ID-keyed walk of the namespace since 6.8, insertion order
-/// before it), and `mount --move` re-parents a mount without minting a new one: a
-/// mount moved onto an occupied mount point keeps its older ID and is therefore
-/// listed BEFORE the newer mount it now hides. Last-row-wins then records the
-/// HIDDEN mount, and lazily unmounting the visible one leaves the selected row
-/// byte-identical across the two reads — no transition, no cover, and the revealed
-/// subtree stays dark, which is issue #74's whole failure.
+/// That is the design and not a gap. The kernel exports no visibility — only a
+/// parent link and a rendered label — so every rule for deriving it here was a
+/// MODEL of a structure `/proc` does not publish, and a model is faithful until
+/// the next arrangement. Each refinement (line order, then the parent chain,
+/// then a same-path group, then the whole parent graph) was found wrong on an
+/// arrangement the previous one had not considered, and every wrong answer was a
+/// mount whose departure the core could then never see.
 ///
-/// **Neither does the rendered path GROUP them.** Two rows can render one path
-/// without being one stack at all, and this is an ordinary, stable arrangement:
-/// mount `A` at `/root/x/y`, then mount `C` over `/root/x`, then mount `B` at the
-/// `y` inside `C`. `A` and `B` both render `/root/x/y` — the kernel prints a
-/// mount point by prepending mount-point dentries up the PARENT chain, which says
-/// nothing about whether an ancestor is covered — yet `A` hangs under the root
-/// mount and `B` under `C`, so neither is the other's parent and no rule about a
-/// same-path group can decide between them. `A` is nevertheless unreachable,
-/// because `C` covers the directory its mount point sits in.
+/// The core does not need the answer. It keys its census by mount ID, so two
+/// rows at one location are simply two rows, and each one's arrival, move and
+/// departure is a transition on its own key. What a visibility resolution bought
+/// — one identity per location, so that a location-keyed set could be diffed —
+/// is exactly what identity-keying makes unnecessary. What it cost was a class
+/// of silent misses whenever the model and the kernel disagreed. A hidden
+/// mount's transition now costs at most one redundant cover of ground that was
+/// already covered, which is the safe direction.
 ///
-/// So visibility is resolved on the GRAPH the rows describe, with three
-/// predicates read off field 2 and the mount points, and the answer filtered to
-/// the watched root afterwards:
+/// The namespace-generation bracket the read is taken inside ([`mount_sample`])
+/// certifies exactly the facts kept here and nothing else: every topology change
+/// takes `namespace_sem` for write and bumps `ns->event`, so an unchanged count
+/// across the read makes the ID SET coherent. It certifies nothing about the
+/// labels, because `show_mountinfo` renders each row's path by its own
+/// `seq_path_root` call — which is why a location is a cover-location HINT and
+/// the identity is the key.
 ///
-/// - **covered** — some row names this row as its parent and renders the SAME
-///   path, so it is attached at this mount's own root dentry and every lookup that
-///   arrives here continues into it. `lock_mount` follows the mount at a path, so
-///   an overmount's parent is the mount directly beneath it.
-/// - **shadowed** — some row with the SAME parent renders a PROPER ANCESTOR of
-///   this row's path, so within that shared parent this row's mount point sits
-///   under a directory another mount has covered, and no lookup ever reaches it.
-///   This is what decides `A` above. A SELF-parented row is nobody's sibling: the
-///   rootfs names itself on the initial namespace and renders `/`, so counting it
-///   among its own children's siblings would shadow every mount on the host.
-/// - **reachable** — not shadowed, and its parent is either absent from the table
-///   (an anchor: a container's `/` names a parent outside its own namespace, and
-///   the rootfs names itself) or reachable AND enterable — a stack member, which
-///   renders its parent's own path, rides the parent's reachability, while a row
-///   deeper inside the parent needs that parent not to be covered.
+/// # Strictly UNDER the root, and nothing else retained
 ///
-/// A row is VISIBLE when it is reachable and not covered, and two visible rows can
-/// never render one path — a lookup of that path resolves to exactly one mount.
-///
-/// # Rows OUTSIDE the root are read, and exactly which ones
-///
-/// The three predicates reach above the watched root: `A`'s shadowing sibling `C`
-/// may sit at the root itself or higher, and every parent chain climbs out of the
-/// root eventually. Retaining the whole namespace to answer that would allocate a
-/// mount point per row on a host with thousands of them, per refresh, per watched
-/// root — so the retained set is closed rather than complete: rows under the root,
-/// PLUS rows on the root's own ancestor chain.
-///
-/// That is closed under all three predicates. A row's parent always renders an
-/// ancestor-or-self of the row's own path (the path is built by prepending inside
-/// the parent), a stacked row renders its parent's path, and a shadowing sibling
-/// renders a proper ancestor — so every row that can bear on an under-root row is
-/// itself under the root or on its ancestor chain. A mount at `/var` cannot
-/// shadow anything under `/home/x`, and nothing outside the cone is ever asked
-/// about.
-///
-/// # Where the graph does NOT decide, the LOCATION degrades — not the read
-///
-/// A location can still end with two visible candidates: two rows attached side by
-/// side at one mount point (propagation can make them, and mountinfo carries no
-/// order between them), a row whose id will not parse (nothing can name it as a
-/// parent, so nothing can cover it), or a chain a TORN read broke by omitting a
-/// member. Such a location is emitted ONCE with its identity UNKNOWN — `mnt_id`
-/// `None`, and `dev` only where every candidate agrees, since whichever is visible
-/// carries that device.
-///
-/// **The whole read is no longer refused for it, and that reversal is the point.**
-/// Refusing was chosen as the honest degrade over a file-order guess, and it is
-/// honest — but it is also PERMANENT for a stable topology. `A`/`C`/`B` above is
-/// legal and stays put; a read refused for it is refused on every later tick too,
-/// so every refresh is non-authoritative, the arrival/departure diff never runs,
-/// and #74 detection is silently off for every unrelated mount under that root
-/// until someone unmounts the arrangement. A per-location unknown costs only what
-/// the mixed-observer identity rule already costs everywhere else: an unknown half
-/// never reads as "different", so a REPLACEMENT at that one location fires no
-/// cover, while its arrival, its departure, and every other location on the host
-/// are answered exactly as before. It also installs no wrong baseline, which is
-/// what the file-order guess did.
+/// `path.starts_with(root) && path != root`. The root's own row and its
+/// ancestors were retained while the visibility predicates needed to reach above
+/// the root — a shadowing sibling can sit at the root or higher — and with no
+/// predicates there is nothing left to ask them. The retained set is now the
+/// answer set, so a namespace with thousands of rows allocates only the rows
+/// this root actually has.
 ///
 /// # Bytes, never a `&str` — one non-UTF-8 mount point must not blind the table
 ///
@@ -581,11 +531,7 @@ const fn makedev(major: u64, minor: u64) -> u64 {
 /// watched root's own names were.
 #[cfg(any(unix, test))]
 pub(crate) fn parse_mountinfo(content: &[u8], root: &Path) -> Vec<crate::os::MountRow> {
-  // Every retained row in FILE order, each paired with the parent id (field 2)
-  // that resolves the mount graph. Selection cannot run per line: a row's
-  // visibility depends on rows anywhere else in the file, so the graph has to be
-  // COMPLETE before any location's answer is known.
-  let mut rows: Vec<(crate::os::MountRow, Option<u64>)> = Vec::new();
+  let mut rows: Vec<crate::os::MountRow> = Vec::new();
   // Split on the RAW newline: mountinfo octal-escapes `\n` inside its path
   // fields (`\012`), so no line boundary can fall inside a mount point.
   for line in content.split(|byte| *byte == b'\n') {
@@ -633,234 +579,20 @@ pub(crate) fn parse_mountinfo(content: &[u8], root: &Path) -> Vec<crate::os::Mou
     };
     #[cfg(not(unix))]
     let path = PathBuf::from(String::from_utf8_lossy(&bytes).into_owned());
-    // The retained CONE: under the root, or on its ancestor chain. Closed under
-    // every visibility predicate, and bounded by the root's depth rather than by
-    // the namespace's size — see the doc.
-    if !(path.starts_with(root) || root.starts_with(&path)) {
+    // STRICTLY under the root. `Path::starts_with` compares COMPONENTS, so
+    // `/rooted` is not under `/root`, and the root's own row is excluded because
+    // a mount AT the root is not a boundary inside it.
+    if !path.starts_with(root) || path.as_path() == root {
       continue;
     }
-    rows.push((
-      crate::os::MountRow {
-        location: path,
-        mnt_id,
-        dev,
-      },
+    rows.push(crate::os::MountRow {
+      location: path,
+      mnt_id,
       parent_id,
-    ));
+      dev,
+    });
   }
-  let visible = resolve_visibility(&rows);
-  // Group the VISIBLE rows strictly under the root by mount point, each group in
-  // file order and the GROUPS in first-appearance order — the order the core's
-  // coverage set treats as insertion order. Indexed rather than scanned per row:
-  // a container namespace can put thousands of rows under one watched root, and
-  // the driver that parses them is single-threaded.
-  let mut slots: std::collections::BTreeMap<&Path, usize> = std::collections::BTreeMap::new();
-  let mut groups: Vec<Vec<usize>> = Vec::new();
-  for (index, (row, _)) in rows.iter().enumerate() {
-    if !visible[index] || !row.location.starts_with(root) || row.location.as_path() == root {
-      continue;
-    }
-    match slots.get(row.location.as_path()) {
-      Some(&slot) => groups[slot].push(index),
-      None => {
-        slots.insert(row.location.as_path(), groups.len());
-        groups.push(vec![index]);
-      }
-    }
-  }
-  groups
-    .iter()
-    .map(|group| {
-      let first = &rows[group[0]].0;
-      let [only] = group[..] else {
-        // UNDECIDED at this location, and nowhere else: one row, identity
-        // unknown. `dev` survives where every candidate agrees on it — whichever
-        // of them a lookup reaches is on that device — while a differing `dev` and
-        // the mount id are both dropped, because naming one candidate here would
-        // install a baseline the next read has no reason to agree with.
-        let dev = group
-          .iter()
-          .map(|&index| rows[index].0.dev)
-          .reduce(|left, right| if left == right { left } else { None })
-          .flatten();
-        return crate::os::MountRow {
-          location: first.location.clone(),
-          mnt_id: None,
-          dev,
-        };
-      };
-      rows[only].0.clone()
-    })
-    .collect()
-}
-
-/// Whether each row of `rows` is the mount a lookup of its own mount point
-/// REACHES — the `covered` / `shadowed` / `reachable` resolution
-/// [`parse_mountinfo`] documents, over the whole retained cone rather than over a
-/// same-path group.
-///
-/// # Linear-ish, because the cone can be the whole namespace
-///
-/// A watched root of `/` retains every row, and Linux permits 100 000 mounts per
-/// namespace by default; this runs per refresh, per watched root, on the blocking
-/// pool, so a quadratic shape here delays event processing into the queue loss the
-/// mount machinery exists to avoid. Every pass is therefore indexed or sorted:
-/// ids resolve through one map, shadowing is one sort plus a linear ancestor sweep
-/// per parent group, and reachability is memoized so each row is resolved once —
-/// `O(n log n)` in the retained rows.
-///
-/// # Nothing here recurses
-///
-/// The parent links come from a file, not from a kernel walk, so they need not
-/// form a tree: `/`'s row names ITSELF as its parent on the initial namespace, and
-/// a torn read can leave a longer cycle. Reachability is resolved with an explicit
-/// chain and an in-progress mark, so a cycle terminates (its entry point is read as
-/// an anchor) instead of overflowing the stack on a hostile `/proc`.
-#[cfg(any(unix, test))]
-fn resolve_visibility(rows: &[(crate::os::MountRow, Option<u64>)]) -> Vec<bool> {
-  // Mount id -> row. `None` for an id two rows claim: no two LIVE mounts share
-  // one, so a duplicate is a torn or malformed table and resolves nothing, which
-  // leaves both rows' children anchored rather than mis-parented.
-  let mut by_id: std::collections::BTreeMap<u64, Option<usize>> = std::collections::BTreeMap::new();
-  for (index, (row, _)) in rows.iter().enumerate() {
-    if let Some(id) = row.mnt_id {
-      by_id
-        .entry(id)
-        .and_modify(|slot| *slot = None)
-        .or_insert(Some(index));
-    }
-  }
-  let parent_of: Vec<Option<usize>> = rows
-    .iter()
-    .map(|(_, parent)| parent.and_then(|id| by_id.get(&id).copied().flatten()))
-    .collect();
-  // COVERED: a row names this one as its parent AND renders the same path, so it
-  // is attached at this mount's own root dentry and every lookup that reaches
-  // here continues into it. A self-parented row does not cover itself.
-  let mut covered = vec![false; rows.len()];
-  for (index, parent) in parent_of.iter().enumerate() {
-    if let Some(parent) = *parent
-      && parent != index
-      && rows[parent].0.location == rows[index].0.location
-    {
-      covered[parent] = true;
-    }
-  }
-  // SHADOWED: a SIBLING (same parent id — the raw field, so rows whose shared
-  // parent is outside the retained cone are still siblings) renders a PROPER
-  // ANCESTOR of this row's path. Within one parent mount, a rendered-path
-  // ancestor IS a mount-point-dentry ancestor, so that sibling covers the
-  // directory this row's mount point sits in.
-  //
-  // One sort, then a stack sweep per group: `Path` orders by COMPONENT, so a
-  // path's descendants are exactly the run that follows it, and the stack holds
-  // the ancestors still open. Byte order would not do — `/a-b` sorts between
-  // `/a` and `/a/b` — and the sweep would break its own runs.
-  let mut order: Vec<usize> = (0..rows.len()).collect();
-  order.sort_unstable_by(|&left, &right| {
-    rows[left]
-      .1
-      .cmp(&rows[right].1)
-      .then_with(|| rows[left].0.location.cmp(&rows[right].0.location))
-  });
-  let mut shadowed = vec![false; rows.len()];
-  let mut group: Option<u64> = None;
-  let mut open: Vec<usize> = Vec::new();
-  for &index in &order {
-    // A row whose parent field did not parse is provably nobody's sibling.
-    let Some(parent) = rows[index].1 else {
-      continue;
-    };
-    // Nor is a row that names ITSELF — the rootfs does, on the initial namespace
-    // (`mnt_parent == mnt`), and it renders `/`, which is a proper ancestor of
-    // every mount point beneath it. Left in the group it would shadow its own
-    // children and empty the table. It is their PARENT, and the reachability pass
-    // reads it as one.
-    if parent_of[index] == Some(index) {
-      continue;
-    }
-    if group != Some(parent) {
-      group = Some(parent);
-      open.clear();
-    }
-    while let Some(&top) = open.last() {
-      if rows[index].0.location.starts_with(&rows[top].0.location) {
-        break;
-      }
-      open.pop();
-    }
-    if let Some(&top) = open.last()
-      && rows[top].0.location != rows[index].0.location
-    {
-      shadowed[index] = true;
-    }
-    open.push(index);
-  }
-  // REACHABLE, memoized up the parent chain.
-  let mut reach = vec![Reach::Unknown; rows.len()];
-  let mut chain: Vec<usize> = Vec::new();
-  for start in 0..rows.len() {
-    if reach[start] != Reach::Unknown {
-      continue;
-    }
-    chain.clear();
-    let mut cursor = start;
-    // Climb to the first row whose answer does not depend on another unresolved
-    // one: shadowed (decided outright), an anchor, a self-parent, an already
-    // resolved row, or a row already on THIS chain (a cycle).
-    loop {
-      reach[cursor] = Reach::InProgress;
-      chain.push(cursor);
-      if shadowed[cursor] {
-        break;
-      }
-      let Some(parent) = parent_of[cursor] else {
-        break;
-      };
-      if parent == cursor || reach[parent] != Reach::Unknown {
-        break;
-      }
-      cursor = parent;
-    }
-    // Unwind from the top of the chain, so every row's parent is already settled
-    // by the time the row itself is read.
-    for &index in chain.iter().rev() {
-      let reachable = !shadowed[index]
-        && match parent_of[index] {
-          Some(parent) if parent != index => match reach[parent] {
-            // A stack member renders its parent's own path and rides its
-            // reachability; anything deeper inside the parent additionally needs
-            // that parent not to be covered.
-            Reach::Yes => rows[index].0.location == rows[parent].0.location || !covered[parent],
-            Reach::No => false,
-            // The chain closed on a row still being resolved: a parent cycle, which
-            // no namespace produces and only a malformed table can. Read as an
-            // anchor, so the resolution terminates and the location's own
-            // candidate count answers it.
-            Reach::Unknown | Reach::InProgress => true,
-          },
-          _ => true,
-        };
-      reach[index] = if reachable { Reach::Yes } else { Reach::No };
-    }
-  }
-  (0..rows.len())
-    .map(|index| reach[index] == Reach::Yes && !covered[index])
-    .collect()
-}
-
-/// Where one row sits in [`resolve_visibility`]'s memoized reachability pass.
-#[cfg(any(unix, test))]
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Reach {
-  /// Not resolved, and not on the chain being resolved.
-  Unknown,
-  /// On the chain currently being resolved — seeing this again is a parent cycle.
-  InProgress,
-  /// A lookup reaches this mount's mount point.
-  Yes,
-  /// It does not.
-  No,
+  rows
 }
 
 /// The mount rows strictly under `root`, read from `/proc/self/mountinfo`.
@@ -870,11 +602,11 @@ enum Reach {
 /// Read as BYTES. `read_to_string` made one non-UTF-8 mount point ANYWHERE in
 /// the namespace answer `None` here, which marks every refresh non-authoritative
 /// and silently retires the mount arrival/departure diff for every watched root
-/// on the host — see [`parse_mountinfo`]. `None` is now reserved for a read that
-/// genuinely failed, and for nothing else: an arrangement the mount graph cannot
-/// decide degrades that LOCATION's identity to unknown and leaves the table
-/// authoritative, because refusing a read that a STABLE topology will produce
-/// again on every later tick turns the honest degrade into a permanent one.
+/// on the host — see [`parse_mountinfo`]. `None` is reserved for a read that
+/// genuinely failed, and for nothing else: the parse decides nothing and refuses
+/// nothing, so no arrangement of mounts can make a readable table answer `None`
+/// here. A refusal a STABLE topology reproduces is not an honest degrade but a
+/// permanent one, and this read has no way left to make one.
 ///
 /// This is the SEED reader — the spawn barriers, whose table is trust-reducing
 /// only. The REFRESH goes through [`mount_sample`], which additionally proves the

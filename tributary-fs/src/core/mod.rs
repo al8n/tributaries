@@ -612,6 +612,17 @@ struct CensusRow {
   location: PathBuf,
   /// The device mounted here, where the host answers one.
   dev: Option<u64>,
+  /// The id of the mount this one hangs off, where the host answers one — the
+  /// second half of the same-place REPLACEMENT test, and never a link to walk.
+  ///
+  /// A legacy mount id is allocated lowest-free, so an unmount and a mount
+  /// inside one window hand the new mount the id the old one freed; if it also
+  /// landed at the same location on the same device, the device comparison
+  /// alone reads continuity. Its PARENT is another vfsmount unless it was
+  /// mounted onto the very same one, so comparing both NARROWS that window.
+  /// It does not close it — `STATX_MNT_ID_UNIQUE` (6.8) is what closes it — and
+  /// narrowing costs at most a redundant cover.
+  parent_id: Option<u64>,
 }
 
 /// What a census row is diffed ON — the mount's own id wherever the host answers
@@ -724,12 +735,12 @@ impl Standing {
 /// the row's own mount id where the host answers one and by its rendered location
 /// where it does not.
 ///
-/// A repeated KEY is dropped, keeping the first. Ids are unique among live mounts
-/// and today's parse yields at most one row per location, so a repeat is a
-/// malformed read rather than a stacked mount — and keeping it would put one
-/// mount in the census twice, where the next diff would derive its arrival twice
-/// and its departure twice. Several rows at one LOCATION are ordinary and stay
-/// (that is what keys them apart).
+/// A repeated KEY is dropped, keeping the FIRST. Ids are unique among live
+/// mounts, so a repeated `Id` is a torn or malformed read and never a stacked
+/// mount — and keeping it would put one mount in the census twice, where the
+/// next diff would derive its arrival twice and its departure twice. Several
+/// rows at one LOCATION are ordinary and all stay: a Linux stack lists one row
+/// per member, each with its own id, and the id is what keys them apart.
 fn census_of(rows: &[MountRow]) -> Vec<CensusRow> {
   let mut seen: BTreeSet<Key> = BTreeSet::new();
   rows
@@ -743,6 +754,7 @@ fn census_of(rows: &[MountRow]) -> Vec<CensusRow> {
         key,
         location: row.location.clone(),
         dev: row.dev,
+        parent_id: row.parent_id,
       })
     })
     .collect()
@@ -2460,7 +2472,8 @@ struct ScopeState {
   ///   settles is observed by no seam at all);
   /// - the same key at a NEW location MOVED — covered at both, which is also what
   ///   makes cross-read id recycling benign;
-  /// - the same key at the same location on a different device was REPLACED.
+  /// - the same key at the same location, on a different device or hanging off
+  ///   a different mount, was REPLACED.
   ///
   /// **Condemn on a transition, never on an absence.** A btrfs subvolume has no
   /// row and never will, so it is in no census, so it transitions in none: the
@@ -6264,10 +6277,23 @@ impl DriverCore {
               covered.push(was.location.clone());
               covered.push(row.location.clone());
             }
-            // REPLACEMENT — the same key at the same place on a different device.
-            // Two KNOWN devices that disagree, never a half this read could not
-            // answer: see [`identity_changed`].
-            Some(was) if identity_changed(was.dev, row.dev) => {
+            // REPLACEMENT — the same key at the same place, and something about
+            // the mount itself differs: its DEVICE, or the MOUNT IT HANGS OFF.
+            // Two KNOWN values that disagree on either half, never a half this
+            // read could not answer: see [`identity_changed`].
+            //
+            // The parent half is what the legacy mount id alone cannot say. Ids
+            // are allocated lowest-free, so a mount that departs and one that
+            // arrives inside one window hand the newcomer the freed id; if it
+            // also landed at the same location on the same device, the device
+            // comparison reads continuity and the ground it shadows is never
+            // covered. Its parent is a different vfsmount unless it was mounted
+            // onto the very same one, so reading BOTH turns that silent match
+            // into a cover.
+            Some(was)
+              if identity_changed(was.dev, row.dev)
+                || identity_changed(was.parent_id, row.parent_id) =>
+            {
               covered.push(row.location.clone());
             }
             Some(_) => {}

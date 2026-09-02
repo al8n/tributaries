@@ -171,17 +171,31 @@ fn bare(location: &str) -> MountRow {
   MountRow {
     location: PathBuf::from(location),
     mnt_id: None,
+    parent_id: None,
     dev: None,
   }
 }
 
 /// A table row carrying the identity `/proc/self/mountinfo` supplies on a
-/// kernel that answers mount ids.
+/// kernel that answers mount ids, with the PARENT left unanswered — an unknown
+/// half never reads as a difference, so a cell that says nothing about parenting
+/// gets exactly the verdicts the device alone decides. The cells that exercise
+/// re-parenting use [`row_under`].
 fn row(location: &str, mnt_id: u64, dev: u64) -> MountRow {
   MountRow {
     location: PathBuf::from(location),
     mnt_id: Some(mnt_id),
+    parent_id: None,
     dev: Some(dev),
+  }
+}
+
+/// A table row that also names the mount it hangs off — field 2 of a mountinfo
+/// line.
+fn row_under(location: &str, mnt_id: u64, parent_id: u64, dev: u64) -> MountRow {
+  MountRow {
+    parent_id: Some(parent_id),
+    ..row(location, mnt_id, dev)
   }
 }
 
@@ -1876,44 +1890,60 @@ fn a_replaced_mount_covers_and_re_records_the_new_identity() {
   );
 }
 
-/// **R8 F1, end to end.** The same-path remount above is driven from hand-built
-/// rows; this drives the identical mechanism from the BYTES `/proc/self/mountinfo`
-/// hands back, because the defect was in which row of a stack the parse selects
-/// and a hand-built frame cannot express a stack at all.
+/// **Issue #74 over a STACK, driven from the BYTES `/proc/self/mountinfo` hands
+/// back** — the same-path remount above works from hand-built rows, and a
+/// hand-built frame cannot express a stack at all.
 ///
 /// A mount MOVED onto an occupied mount point keeps its older id, so mountinfo —
-/// which lists a namespace in mount creation order — prints the VISIBLE mount
-/// FIRST and the one it hides last. Selecting by line order therefore records the
-/// hidden mount, and `umount -l` of the visible one produces two reads the core
-/// cannot tell apart: no replacement, no cover, and the subtree the departure
-/// revealed stays dark for the life of the scope — issue #74's exact failure,
-/// reached with the table fully readable and every refresh authoritative.
+/// which lists a namespace in mount creation order — prints it BEFORE the mount
+/// it now hides. Every member of the stack is its own row here, so nothing has to
+/// decide which of them a lookup reaches: each has its own id, and `umount -l` of
+/// one is that id's departure whichever member it was.
 ///
-/// MUTATION WITNESS: restore line-order selection in `parse_mountinfo` — answer
-/// each location's group with `rows[*group.last().unwrap()].0.clone()` instead of
-/// resolving visibility — and this FAILS at `the departure of the VISIBLE mount is
-/// covered` with `left: 0` — the silent loss itself.
+/// **Several rows at one location, one cover.** The consumer re-reads a place,
+/// not a vfsmount, so the covers are deduplicated by location before they lower:
+/// two members arriving is one cover, one of them departing is one cover, and the
+/// whole stack departing at once is one cover. What scales with the stack is the
+/// census, not the consumer's work.
+///
+/// MUTATION WITNESS (per-location grouping restored in `parse_mountinfo`): answer
+/// each location with its LAST row and this FAILS at `the departure of one member
+/// is covered` with `left: 0` — the selected row byte-identical across an unmount
+/// the core then cannot see, which is the silent loss itself.
+/// MUTATION WITNESS (dedup dropped): remove `dedup_locations(&mut covered)` and
+/// this FAILS at `two members arriving at ONE location is ONE cover` with `left:
+/// 2` — one re-read of the same ground per member of the stack.
 #[test]
-fn a_lazily_unmounted_visible_mount_over_a_stack_is_covered() {
+fn a_stack_at_one_location_is_covered_once_per_transition() {
   // 55 is mounted at `/r/vol`; 20 — older, created elsewhere — is then
-  // `mount --move`d on top of it, so 20 is what `/r/vol` reaches and 20's parent
-  // is 55. Creation order lists 20 first.
-  let stacked = crate::os::linux::parse_mountinfo(
-    b"20 55 0:48 / /r/vol rw,relatime shared:7 - tmpfs moved rw\n\
-      36 25 0:32 / /r rw,relatime shared:1 - ext4 /dev/root rw\n\
-      55 36 0:44 / /r/vol rw,relatime shared:3 - tmpfs hidden rw\n",
-    Path::new("/r"),
-  );
+  // `mount --move`d on top of it, so 20's parent is 55. Creation order lists 20
+  // first.
+  let stacked = || {
+    crate::os::linux::parse_mountinfo(
+      b"20 55 0:48 / /r/vol rw,relatime shared:7 - tmpfs moved rw\n\
+        36 25 0:32 / /r rw,relatime shared:1 - ext4 /dev/root rw\n\
+        55 36 0:44 / /r/vol rw,relatime shared:3 - tmpfs hidden rw\n",
+      Path::new("/r"),
+    )
+  };
   let (mut core, scope) = live_core();
-  core.on_mounts_refreshed(scope, alive_refresh(stacked, true), at(1));
+  core.on_mounts_refreshed(scope, alive_refresh(stacked(), true), at(1));
+  let effects = drain(&mut core);
   assert_eq!(
-    emits(&drain(&mut core)).len(),
+    emits(&effects).len(),
     1,
-    "staging: the stack is one arrival at one location"
+    "two members arriving at ONE location is ONE cover — the consumer re-reads \
+     a place, not a vfsmount: {effects:?}"
   );
-  // Read now, asserted BELOW the cover: the cover is what the finding costs, so a
-  // line-order selection has to trip on the cover rather than on this.
-  let arrival = recorded(&core, scope);
+  assert_eq!(
+    recorded(&core, scope),
+    vec![
+      (PathBuf::from("/r/vol"), Some(20), Some(0x30)),
+      (PathBuf::from("/r/vol"), Some(55), Some(0x2c)),
+    ],
+    "and BOTH members are in the census, each keyed by its own id — that is \
+     what makes either one's departure derivable"
+  );
 
   // `umount -l /r/vol` detaches the moved mount and reveals the one beneath it.
   let revealed = crate::os::linux::parse_mountinfo(
@@ -1927,20 +1957,108 @@ fn a_lazily_unmounted_visible_mount_over_a_stack_is_covered() {
   assert_eq!(
     emitted.len(),
     1,
-    "the departure of the VISIBLE mount is covered — the ground it hid is now \
-     reachable and nothing else will ever say so: {effects:?}"
+    "the departure of one member is covered — the ground it hid is now reachable \
+     and nothing else will ever say so: {effects:?}"
   );
   assert!(emitted[0].kind().is_rescan());
   assert_eq!(emitted[0].location(), &loc(&["vol"]));
   assert_eq!(
-    arrival,
-    vec![(PathBuf::from("/r/vol"), Some(20), Some(0x30))],
-    "the VISIBLE mount's identity is what the arrival recorded"
-  );
-  assert_eq!(
     recorded(&core, scope),
     vec![(PathBuf::from("/r/vol"), Some(55), Some(0x2c))],
-    "and the revealed mount is re-recorded, so ITS departure stays derivable"
+    "and the survivor stays recorded, so ITS departure stays derivable"
+  );
+
+  // The whole stack leaving AT ONCE is still one cover: a fresh scope, seeded
+  // with both members, reading an empty table.
+  let (mut core, scope) = live_core();
+  core.on_mounts_refreshed(scope, alive_refresh(stacked(), true), at(1));
+  let _ = drain(&mut core);
+  core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(2));
+  let effects = drain(&mut core);
+  let emitted = emits(&effects);
+  assert_eq!(
+    emitted.len(),
+    1,
+    "two departures at ONE location is ONE cover: {effects:?}"
+  );
+  assert_eq!(emitted[0].location(), &loc(&["vol"]));
+  assert!(
+    recorded(&core, scope).is_empty(),
+    "and the census is empty, because both members really did leave"
+  );
+}
+
+/// A mount id is allocated LOWEST-FREE, so a mount that departs and one that
+/// arrives inside a single refresh window hand the newcomer the id the other
+/// freed. If it also lands at the same location on the same device — a bind of
+/// the same source, re-taken over a different mount — the device comparison reads
+/// CONTINUITY, no cover fires, and the ground the newcomer shadows is never
+/// re-read.
+///
+/// Field 2 is what says otherwise: the mount a row hangs off. A recycled id
+/// re-attached under a different mount is a different vfsmount whatever id it
+/// inherited, so reading BOTH halves turns that silent match into a replacement.
+/// It NARROWS the window rather than closing it — the same id, the same parent,
+/// the same location and the same device is still continuity below 6.8, where
+/// `STATX_MNT_ID_UNIQUE` closes it — and narrowing costs at most one redundant
+/// cover of ground that was covered anyway.
+///
+/// The parent is compared, never walked: nothing resolves it to another census
+/// row or climbs a chain of them.
+///
+/// MUTATION WITNESS: drop the `identity_changed(was.parent_id, row.parent_id)`
+/// disjunct from the replacement arm and this FAILS at `the re-parented mount is
+/// covered` with `left: 0` — the silent match itself.
+#[test]
+fn a_recycled_mount_id_under_a_new_parent_is_a_replacement() {
+  let (mut core, scope) = live_core();
+  core.on_mounts_refreshed(
+    scope,
+    alive_refresh(vec![row_under("/r/vol", 41, 36, 7)], true),
+    at(1),
+  );
+  let _ = drain(&mut core);
+
+  // The same id at the same location on the same device, hanging off a DIFFERENT
+  // mount — everything a device comparison can see is unchanged.
+  core.on_mounts_refreshed(
+    scope,
+    alive_refresh(vec![row_under("/r/vol", 41, 55, 7)], true),
+    at(2),
+  );
+  let effects = drain(&mut core);
+  let emitted = emits(&effects);
+  assert_eq!(
+    emitted.len(),
+    1,
+    "the re-parented mount is covered: {effects:?}"
+  );
+  assert!(emitted[0].kind().is_rescan());
+  assert_eq!(emitted[0].location(), &loc(&["vol"]));
+
+  // Bounded per TRANSITION: the census re-recorded the new parent, so reading the
+  // same table again is quiet.
+  core.on_mounts_refreshed(
+    scope,
+    alive_refresh(vec![row_under("/r/vol", 41, 55, 7)], true),
+    at(3),
+  );
+  assert!(
+    emits(&drain(&mut core)).is_empty(),
+    "the replacement is covered once, not on every later refresh"
+  );
+
+  // An UNKNOWN half never reads as a difference. A host that answers no parent
+  // at all (macOS, a fake, a row whose field 2 would not parse) fires nothing
+  // here — the same honest degrade the device half already makes.
+  core.on_mounts_refreshed(
+    scope,
+    alive_refresh(vec![row("/r/vol", 41, 7)], true),
+    at(4),
+  );
+  assert!(
+    emits(&drain(&mut core)).is_empty(),
+    "an unanswered parent is unknown, never different"
   );
 }
 
