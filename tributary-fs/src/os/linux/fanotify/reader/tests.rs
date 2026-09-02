@@ -339,8 +339,8 @@ fn one_entry_walk() -> WalkSeed {
 /// the only difference between a walk that fences nothing and one that fences a
 /// submount. Both triples are here because the two decline sites answer different
 /// amounts: the device belt runs BEFORE the mount id is read (`mnt_id: None`,
-/// device-only and exempt), the mount fence runs after (`mnt_id: Some`, and
-/// condemnable without waiting for a row).
+/// which the core can only record as an ambiguity), the mount fence runs after
+/// (`mnt_id: Some`, which the core decides outright).
 fn walk_declining(declined: Vec<DeclinedBoundary>) -> WalkSeed {
   WalkSeed {
     entries: vec![SeedEntry::root(fid(1), Path::new("/root"))],

@@ -123,10 +123,10 @@ fn alive_refresh(mounts: Vec<MountRow>, authoritative: bool) -> MountRefresh {
 }
 
 /// The same, carrying the root's CURRENT mount frame — what a real Linux refresh
-/// answers and what `on_mounts_refreshed` adopts. A cell needs it before any
-/// record under the root can be MOUNT-BACKED at all: the partition compares a
-/// record's id against the scope's, and a scope with no id of its own reads every
-/// record as device-only.
+/// answers and what `on_mounts_refreshed` adopts. A cell needs it before any seam
+/// entry under the root can be `Mount` or `SameMount` at all: `Standing::decide`
+/// compares the boundary's id against the scope's, and a scope with no id of its
+/// own reads every entry `Unknown`.
 fn framed_refresh(
   mounts: Vec<MountRow>,
   authoritative: bool,
@@ -185,37 +185,59 @@ fn row(location: &str, mnt_id: u64, dev: u64) -> MountRow {
   }
 }
 
-/// The recorded coverage set of `scope`, as `(location, mnt_id, dev)` — what a
-/// cell reads to prove a record was re-recorded with a NEW identity rather than
-/// dropped, or left untouched by a condemnation path.
+/// Everything `scope` holds about boundaries under its root — the CENSUS rows
+/// first, in read order, then the LEDGER entries in insertion order — as
+/// `(location, mnt_id, dev)`.
+///
+/// The two structures answer different questions, but almost every cell here asks
+/// the one they answer together: what does this scope believe stands under its
+/// root, and with which identity. `mnt_id` is the census KEY where the host
+/// answered one and the entry's own `Standing` otherwise, so a `SameMount` entry
+/// reads back as the root's id exactly as the seam read it.
+///
+/// `dev` is a census fact ONLY, and reads `None` for every ledger entry — the
+/// ledger stores no device, because nothing joins on one. A cell asserting a
+/// device is therefore asserting about a row, which is where the same-place
+/// replacement is decided.
 fn recorded(core: &DriverCore, scope: ScopeId) -> Vec<(PathBuf, Option<u64>, Option<u64>)> {
-  core
-    .scopes
-    .get(&scope)
-    .expect("scope is live")
-    .mounts_baseline
+  let state = core.scopes.get(&scope).expect("scope is live");
+  state
+    .census
     .iter()
-    .map(|record| (record.location.clone(), record.mnt_id, record.dev))
+    .map(|row| {
+      let id = match row.key {
+        Key::Id(id) => Some(id),
+        Key::Location(_) => None,
+      };
+      (row.location.clone(), id, row.dev)
+    })
+    .chain(state.ledger.iter().map(|entry| {
+      let id = match entry.standing {
+        Standing::Mount(id) => Some(id),
+        Standing::SameMount => state.root_mnt_id,
+        Standing::Unknown => None,
+      };
+      (entry.location.clone(), id, None)
+    }))
     .collect()
 }
 
-/// The recorded locations, BORROWED — [`recorded`] without its per-record
+/// The recorded locations, BORROWED — [`recorded`] without its per-entry
 /// `PathBuf` clone, for the cells that only ask how many there are, which is
 /// first, or whether one is present.
 ///
 /// The clone matters at one place in this suite and it matters a lot there: the
-/// cells that hold the device-only partition at `MAX_DEVICE_ONLY_BOUNDARIES`
-/// read it several times, and each read used to allocate a thousand paths. An
-/// interpreted 32-bit run pays for every one of those out of the single 4 GB
-/// address space the whole shard shares, which is where `fs-rest` exhausted it.
+/// cells that hold the ledger at `MAX_BOUNDARIES` read it several times, and each
+/// read used to allocate a thousand paths. An interpreted 32-bit run pays for
+/// every one of those out of the single 4 GB address space the whole shard
+/// shares, which is where `fs-rest` exhausted it.
 fn recorded_locations(core: &DriverCore, scope: ScopeId) -> Vec<&Path> {
-  core
-    .scopes
-    .get(&scope)
-    .expect("scope is live")
-    .mounts_baseline
+  let state = core.scopes.get(&scope).expect("scope is live");
+  state
+    .census
     .iter()
-    .map(|record| record.location.as_path())
+    .map(|row| row.location.as_path())
+    .chain(state.ledger.iter().map(|entry| entry.location.as_path()))
     .collect()
 }
 
@@ -985,25 +1007,28 @@ fn a_departed_mount_covers_its_located_subtree() {
   );
 }
 
-/// F3: the refresh reconciles through a location INDEX instead of a scan per row,
-/// and the index must preserve everything the scan decided — including the two
-/// things an index gets wrong for free.
+/// The refresh diffs through a KEY INDEX instead of a scan per row, and the index
+/// must decide everything the scan did — including the two things an index gets
+/// wrong for free.
 ///
 /// The scan was `find` per row over the records and then a scan of the FRAME per
-/// record: O(rows x records) path comparisons on every refresh of every root, which
-/// a container's or a systemd host's mount namespace makes into a driver stall, and
-/// a stalled single-threaded driver is how the queue loss this file exists to avoid
-/// actually happens.
+/// record: O(rows x records) comparisons on every refresh of every root, which a
+/// container's or a systemd host's mount namespace makes into a driver stall, and
+/// a stalled single-threaded driver is how the queue loss this file exists to
+/// avoid actually happens.
 ///
-/// The frame here interleaves an ARRIVAL ahead of two CONFIRMS on purpose. A plan
-/// built once from the pre-refresh vector must stay valid across the push the
-/// arrival makes (appending moves nothing), and the resulting ORDER is load-bearing
-/// rather than cosmetic: `mounts_baseline` is in insertion order, and that order is
-/// what the device-only bound evicts by.
+/// The frame here interleaves an ARRIVAL ahead of two unchanged rows on purpose,
+/// and repeats the arrival's row. The census is the read's own order, so an
+/// interleave must not reorder or duplicate anything, and TWO transitions at one
+/// location must not buy two covers: `/r/a` is listed under a new mount id, which
+/// is a departure and an arrival at that one place.
+///
+/// MUTATION WITNESS (drop the key dedup in `census_of`): the repeated row enters
+/// the census twice and this FAILS at `the census is the read's own order`.
 #[test]
-fn the_refresh_reconciles_through_an_index_without_disturbing_record_order() {
+fn the_refresh_diffs_through_a_key_index_without_disturbing_read_order() {
   let (mut core, scope) = live_core();
-  // Two recorded mounts, in this insertion order.
+  // Two listed mounts, in this read order.
   core.on_mounts_refreshed(
     scope,
     alive_refresh(vec![row("/r/a", 10, 100), row("/r/b", 11, 101)], true),
@@ -1015,11 +1040,10 @@ fn the_refresh_reconciles_through_an_index_without_disturbing_record_order() {
     "staging: two arrivals, each covered once"
   );
 
-  // One frame carrying, IN THIS ORDER: an arrival, a replacement at the FIRST
-  // recorded location, an unchanged confirm, and a DUPLICATE of the arrival's row
-  // (the type says at most one row per location; the scan treated a duplicate as a
-  // confirm of what it had just pushed, and an index must not turn it into a second
-  // record and a second cover).
+  // One frame carrying, IN THIS ORDER: an arrival, a NEW mount id at the first
+  // listed location, an unchanged row, and a DUPLICATE of the arrival's row (ids
+  // are unique among live mounts, so a repeat is malformed — and it must not
+  // become a second row and a second cover).
   core.on_mounts_refreshed(
     scope,
     alive_refresh(
@@ -1038,23 +1062,22 @@ fn the_refresh_reconciles_through_an_index_without_disturbing_record_order() {
   assert_eq!(
     emitted.iter().map(|c| c.location()).collect::<Vec<_>>(),
     vec![&loc(&["new"]), &loc(&["a"])],
-    "one cover for the arrival and one for the replacement, IN FRAME ORDER, and \
-     the duplicate row adds neither: {effects:?}"
+    "one cover for the arrival and one for the key change at /r/a, IN FRAME \
+     ORDER, and the duplicate row adds neither: {effects:?}"
   );
   assert_eq!(
     recorded(&core, scope),
     vec![
+      (PathBuf::from("/r/new"), Some(12), Some(102)),
       (PathBuf::from("/r/a"), Some(99), Some(100)),
       (PathBuf::from("/r/b"), Some(11), Some(101)),
-      (PathBuf::from("/r/new"), Some(12), Some(102)),
     ],
-    "the incumbents keep their places and their indices, the replacement is \
-     re-recorded in place with the NEW identity, and the arrival appends — \
-     insertion order is what the device-only bound evicts by"
+    "the census is the read's own order, written wholesale — no in-place update, \
+     no index to keep valid across a push, and no duplicate key"
   );
 
-  // The departure side reads the frame through a set for the same reason. `/r/b`
-  // alone survives; the other two are condemned.
+  // The departure side reads the new census through a set for the same reason.
+  // `/r/b` alone survives; the other two are gone.
   core.on_mounts_refreshed(
     scope,
     alive_refresh(vec![row("/r/b", 11, 101)], true),
@@ -1064,13 +1087,78 @@ fn the_refresh_reconciles_through_an_index_without_disturbing_record_order() {
   let emitted = emits(&effects);
   assert_eq!(
     emitted.iter().map(|c| c.location()).collect::<Vec<_>>(),
-    vec![&loc(&["a"]), &loc(&["new"])],
-    "both departures are covered, in RECORD order: {effects:?}"
+    vec![&loc(&["new"]), &loc(&["a"])],
+    "both departures are covered, in CENSUS order: {effects:?}"
   );
   assert_eq!(
     recorded(&core, scope),
     vec![(PathBuf::from("/r/b"), Some(11), Some(101))],
-    "and only the row the frame still lists is kept"
+    "and only the row the read still lists is kept"
+  );
+}
+
+/// **Cell (b): the same mount at a NEW location covers BOTH.** A move reveals the
+/// ground it left and shadows the ground it landed on, and the consumer is owed a
+/// re-read of each.
+///
+/// `mount --move` produces this, and so — indistinguishably — does a
+/// `Location`-keyed host's mount departing at one place while another arrives at
+/// a second. Covering both is what makes the ambiguity harmless.
+///
+/// It is also what makes cross-read id RECYCLING benign. Mount ids are allocated
+/// lowest-free, so a mount that departs and another that arrives inside one
+/// refresh window can share an id; keyed alone, that reads as "nothing happened".
+/// Read WITH the location, it reads as a move — and a move covers the old
+/// location, which is exactly the cover the real departure owed.
+///
+/// MUTATION WITNESS (cover only the new location): drop `covered.push(was
+/// .location.clone())` from the move arm and this FAILS at `the ground the mount
+/// LEFT is covered` — the revealed subtree silent, which is #74 by another door.
+/// MUTATION WITNESS (cover on a PRESENCE rather than a transition): make the
+/// unchanged arm push a cover too, and this FAILS at `a move is a transition
+/// between two observations, derived once` — one cover per live mount per tick,
+/// forever, which is the storm the whole rule exists to make unreachable.
+#[test]
+fn the_same_mount_at_a_new_location_covers_both() {
+  let (mut core, scope) = live_core();
+  core.on_mounts_refreshed(scope, alive_refresh(vec![row("/r/a", 10, 99)], true), at(1));
+  let effects = drain(&mut core);
+  assert_eq!(
+    emits(&effects)
+      .iter()
+      .map(|c| c.location())
+      .collect::<Vec<_>>(),
+    vec![&loc(&["a"])],
+    "staging: one arrival, covered at the location the read rendered: {effects:?}"
+  );
+
+  // The SAME mount, rendered somewhere else. Nothing arrived and nothing left.
+  core.on_mounts_refreshed(scope, alive_refresh(vec![row("/r/b", 10, 99)], true), at(2));
+  let effects = drain(&mut core);
+  let covers: Vec<&Location> = emits(&effects).iter().map(|c| c.location()).collect();
+  assert!(
+    covers.contains(&&loc(&["a"])),
+    "the ground the mount LEFT is covered — revealed, and never enumerated: \
+     {effects:?}"
+  );
+  assert!(
+    covers.contains(&&loc(&["b"])),
+    "and so is the ground it landed on — shadowed, and enumerated as something \
+     else: {effects:?}"
+  );
+  assert_eq!(covers.len(), 2, "two locations, two covers: {effects:?}");
+  assert_eq!(
+    recorded(&core, scope),
+    vec![(PathBuf::from("/r/b"), Some(10), Some(99))],
+    "and it is ONE mount throughout — the key never changed, so the census holds \
+     a single row, at its new location"
+  );
+
+  // And the move is spent: the same read again derives nothing.
+  core.on_mounts_refreshed(scope, alive_refresh(vec![row("/r/b", 10, 99)], true), at(3));
+  assert!(
+    emits(&drain(&mut core)).is_empty(),
+    "a move is a transition between two observations, derived once"
   );
 }
 
@@ -1856,7 +1944,8 @@ fn a_lazily_unmounted_visible_mount_over_a_stack_is_covered() {
   );
 }
 
-/// The PROVENANCE PARTITION, from the side that storms without it.
+/// CONDEMN ON A TRANSITION, NEVER ON AN ABSENCE, from the side that storms
+/// without it — cell (d)'s `SameMount` half, and cell (c)'s belt half beside it.
 ///
 /// A fence decline does not imply a mountinfo row. `crosses_mount_boundary`
 /// fires on `device_boundary || mount_boundary`, so a **btrfs subvolume** inside
@@ -1864,107 +1953,100 @@ fn a_lazily_unmounted_visible_mount_over_a_stack_is_covered() {
 /// not a vfsmount: it has no mountinfo row EVER, no read of the table will list
 /// it, and `openat2(RESOLVE_NO_XDEV)` opens it without complaint.
 ///
-/// Condemning such a record on its absence from a frame is a permanent cover
-/// storm — one cover per subvolume per tick, on every default snapper / Fedora /
-/// docker-btrfs layout. So the device-only partition is EXEMPT, and its
-/// lifecycle is the ordinary event flow instead (deleting a subvolume emits real
-/// deletes on its parent).
+/// So it never enters a census, so it transitions in none, so nothing condemns
+/// it. Covering it on its ABSENCE from a read would be a permanent cover storm —
+/// one cover per subvolume per tick, on every default snapper / Fedora /
+/// docker-btrfs layout — and it is structurally unreachable here rather than
+/// suppressed by a predicate.
 ///
-/// The contrasting record in the same scope pins that the exemption is drawn at
-/// PROVENANCE and not at "unconfirmed": an unconfirmed record whose `mnt_id`
-/// differs from the root's is a genuine vfsmount observed by something other
-/// than the table, and it is condemned.
+/// The `Mount(77)` entry beside it pins the other half: a seam-observed vfsmount
+/// the census never listed IS covered by the first read that does not list it,
+/// and is gone from the ledger afterwards.
 ///
-/// # Every record here is PROVEN or mount-backed, deliberately
+/// # Nothing here is `Unknown`, deliberately
 ///
-/// There is no ambiguous record in this scope, and that is what lets the cell
-/// read located covers at all: an ambiguous one anywhere in the set would put the
-/// scope in the fail-closed state, where every authoritative refresh covers the
-/// whole root and no located cover is emitted (see
-/// `ScopeState::fails_closed`, and the cells that own that rule). So this is also
-/// the ≥5.8 evidence in miniature — a scope whose every record carries an id
-/// pays nothing for the id-less design at all.
+/// Both entries were decided from two known ids, which is what lets the cell read
+/// a LOCATED cover at all: one `Unknown` entry anywhere would put the scope in
+/// the fail-closed state, where every authoritative refresh covers the whole root
+/// and no located cover is emitted (see `ScopeState::fails_closed`, and the cells
+/// that own that rule). So this is also the ≥5.8 evidence in miniature — a scope
+/// whose every seam could answer an id pays nothing for the id-less design at
+/// all.
+///
+/// MUTATION WITNESS (condemn on an absence): make the join drop a `SameMount`
+/// entry the census did not list — `Standing::SameMount => false` with a
+/// `departed.push` beside it — and the first refresh emits two covers, which
+/// FAILS at `staging: the mount-backed entry is condemned, and nothing else is`.
 #[test]
-fn a_device_only_record_survives_every_refresh_untouched() {
-  // The two device-only records, and the shape of what re-observes them: the
-  // seams (an enumerate decline, a walk, a probe answer) are the ONLY thing that
-  // ever sees a subvolume, and they go on seeing it for as long as it is there.
-  let device_only = || {
-    [
-      // A subvolume: the ROOT's mount id, a foreign device, and no row ever.
-      MountRecord {
-        location: PathBuf::from("/r/subvol"),
-        mnt_id: Some(42),
-        dev: Some(99),
-        row_confirmed: false,
-      },
-    ]
+fn a_same_mount_entry_survives_every_refresh_untouched() {
+  // The subvolume, and the shape of what re-observes it: the seams (an enumerate
+  // decline, a walk, a probe answer) are the ONLY thing that ever sees one, and
+  // they go on seeing it for as long as it is there.
+  let subvolume = || LedgerEntry {
+    location: PathBuf::from("/r/subvol"),
+    standing: Standing::SameMount,
   };
 
   let (mut core, scope) = live_core();
   {
     let state = core.scopes.get_mut(&scope).expect("scope is live");
     state.root_mnt_id = Some(42);
-    state.mounts_baseline.extend(device_only());
-    // A real vfsmount seen by something that is not the table: unconfirmed, but
-    // its mount id differs from the root's, so it IS mount-backed.
-    state.mounts_baseline.push(MountRecord {
+    state.ledger.push(subvolume());
+    // A real vfsmount seen by something that is not the table: no census has
+    // keyed it, and its mount id differs from the root's, so it is the belt.
+    state.ledger.push(LedgerEntry {
       location: PathBuf::from("/r/seam"),
-      mnt_id: Some(77),
-      dev: Some(97),
-      row_confirmed: false,
+      standing: Standing::Mount(77),
     });
   }
 
-  // The table lists none of the three, and never will list the first two.
+  // The table lists neither, and never will list the first.
   core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(1));
   let effects = drain(&mut core);
   let emitted = emits(&effects);
   assert_eq!(
     emitted.len(),
     1,
-    "the mount-backed record is condemned, and nothing else is: {effects:?}"
+    "staging: the mount-backed entry is condemned, and nothing else is: {effects:?}"
   );
   assert_eq!(
     emitted[0].location(),
     &loc(&["seam"]),
-    "and the cover is LOCATED — with no ambiguity held, the scope is not failing \
-     closed and pays no root cover at all: {emitted:?}"
+    "and the cover is LOCATED — with nothing `Unknown` held, the scope is not \
+     failing closed and pays no root cover at all: {emitted:?}"
   );
   assert!(
     !emitted.iter().any(|c| c.location() == &loc(&["subvol"])),
-    "the PROVEN subvolume covers nothing: no vfsmount can carry the root's \
-     own mount id, so its absence proves nothing at all: {effects:?}"
+    "the SAME-MOUNT boundary covers nothing: no vfsmount can carry the root's \
+     own mount id, so its absence from a census proves nothing at all: {effects:?}"
   );
 
-  // Every later tick reads the same absent table, with the seam re-observing
-  // both boundaries in between — which is the steady state on any btrfs layout,
-  // and where an unpartitioned set storms FOREVER: it would cover and drop what
-  // the seam records straight back, once per subvolume per tick, for the life of
-  // the scope.
+  // Every later tick reads the same absent table, with the seam re-observing the
+  // subvolume in between — which is the steady state on any btrfs layout, and
+  // where a set that condemned on an absence would storm FOREVER: it would cover
+  // and drop what the seam records straight back, once per subvolume per tick,
+  // for the life of the scope.
   for tick in 2..6 {
     let state = core.scopes.get_mut(&scope).expect("scope is live");
-    for record in device_only() {
-      if !state
-        .mounts_baseline
-        .iter()
-        .any(|held| held.location == record.location)
-      {
-        state.mounts_baseline.push(record);
-      }
+    if !state
+      .ledger
+      .iter()
+      .any(|held| held.location.as_path() == Path::new("/r/subvol"))
+    {
+      state.ledger.push(subvolume());
     }
     core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(tick));
     assert!(
       emits(&drain(&mut core)).is_empty(),
-      "tick {tick}: a device-only record is not a departure, ever — this is \
+      "tick {tick}: a same-mount boundary is not a departure, ever — this is \
        where a per-tick storm would show"
     );
   }
   assert_eq!(
     recorded(&core, scope),
-    vec![(PathBuf::from("/r/subvol"), Some(42), Some(99))],
-    "and it survives UNTOUCHED — exempt from the mechanism, not merely quiet \
-     about it"
+    vec![(PathBuf::from("/r/subvol"), Some(42), None)],
+    "and it survives UNTOUCHED — never joined, never condemned; the vfsmount \
+     entry beside it is spent and gone"
   );
 }
 
@@ -2272,33 +2354,31 @@ fn a_fanotify_departure_parks_its_cover_until_admission_completes() {
   assert_eq!(parked_admits(&core, scope), 0, "and the round trip retires");
 }
 
-/// The refusal, and the design's own precondition: a location the walk finds
-/// STILL COVERED by the SAME boundary — the refresh raced a live mount, or a
-/// remount re-covered it in between — lapses to the REPLACED handling. Cover, and
-/// re-record in place.
+/// Cell (e): a location the walk finds STILL COVERED is a SEAM OBSERVATION of
+/// whatever is standing there — recorded on its own terms, covering nothing — and
+/// the next read that does not list it covers it.
 ///
-/// The re-record must restore the record WHOLE, provenance included, and this
-/// cell is built so that nothing else would do. The boundary's mount id EQUALS
-/// the root's, so [`MountRecord::condemnable`]'s id disjunct answers `false` for
-/// it and the row confirmation is the ONLY thing that makes it condemnable.
-/// Re-observe it instead of putting it back and it enters not-row-confirmed —
-/// device-only, permanently exempt — and its real departure, later, is
-/// underivable forever. So the second departure below is the assertion that
-/// matters.
+/// Nothing was revealed, so the consumer has no new ground to read: `crossed_by`
+/// refused because a boundary is at the location, and the ground beneath it is as
+/// hidden as it was before the mount left. What the walk DID produce is an
+/// identity read off the fd it pinned, and that is exactly what a decline or a
+/// probe answer produces — so it goes through `record_boundary`, which decides
+/// its `Standing` from the two ids and holds it as the belt for the window before
+/// the next census.
 ///
-/// **How a row-confirmed record comes to carry the root's own mount id.** Not
-/// from a row that reported one: a coherent mountinfo read cannot list a mount
-/// under the root carrying the root's own id, which is the invariant
-/// `crate::os::mount_sample` now enforces. It comes from the OTHER direction —
-/// the record's id was read by a SEAM, and the row that confirmed it answered no
-/// id at all (an unparsable field 1, which the parser keeps as the honest
-/// unknown, or any table that answers no ids). `row.mnt_id.or(record.mnt_id)`
-/// keeps the seam's value and the confirmation still sticks. The device belt is
-/// what makes the walk refuse, exactly as it would for the object this shape
-/// describes.
+/// A live boundary that is not recorded has no derivable departure ever again,
+/// which is why the answer carries what the walk read at all. The second half of
+/// this cell is that derivation.
+///
+/// MUTATION WITNESS (cover on the refusal): emit `mount_cover` from the
+/// `StillCovered` arm and this FAILS at `nothing was revealed, so nothing is
+/// covered`.
+/// MUTATION WITNESS (record nothing): drop the `record_boundary` call and this
+/// FAILS at `and the boundary is in the LEDGER` — and, one refresh later, at `the
+/// entry the walk left is the belt`, which is the coverage the finding costs.
 #[test]
-fn a_still_covered_admission_lapses_to_the_replaced_handling() {
-  let (mut core, scope) = live_core_fanotify(vec![row("/r/vol", 42, 9)], Some(42));
+fn a_still_covered_admission_records_what_the_walk_read_and_covers_nothing() {
+  let (mut core, scope) = live_core_fanotify(vec![row("/r/vol", 77, 9)], Some(42));
   let refresh = |mounts: Vec<MountRow>| MountRefresh {
     mounts,
     authoritative: true,
@@ -2315,39 +2395,43 @@ fn a_still_covered_admission_lapses_to_the_replaced_handling() {
     scope,
     crate::os::AdmitReport {
       ticket: first[0].0,
-      // What the walk read off the fd it pinned, and it MATCHES the condemned
-      // record: the boundary that is there is the boundary that was recorded.
+      // What the walk read off the fd it pinned: a boundary whose mount id
+      // differs from the root's, standing where the census said nothing is.
       outcome: crate::os::AdmitOutcome::StillCovered {
         dev: Some(9),
-        mnt_id: Some(42),
+        mnt_id: Some(77),
       },
     },
     at(2),
   );
   let effects = drain(&mut core);
-  let emitted = emits(&effects);
-  assert_eq!(
-    emitted.len(),
-    1,
-    "a refusal still covers — the location was condemned once and the consumer \
-     is owed the re-read either way: {effects:?}"
+  assert!(
+    emits(&effects).is_empty(),
+    "nothing was revealed, so nothing is covered — the ground under the boundary \
+     the walk found is as hidden as it was: {effects:?}"
   );
-  assert_eq!(emitted[0].location(), &loc(&["vol"]));
+  assert_eq!(parked_admits(&core, scope), 0, "and the round trip retires");
   assert_eq!(
     recorded(&core, scope),
-    vec![(PathBuf::from("/r/vol"), Some(42), Some(9))],
-    "and the boundary is BACK in the set: a live boundary that is not recorded \
-     has no derivable departure ever again"
+    vec![(PathBuf::from("/r/vol"), Some(77), None)],
+    "and the boundary is in the LEDGER, with the identity the walk read"
   );
 
-  // The proof that the record came back WHOLE and not merely re-observed: its
-  // mount id is the root's, so only the sticky row confirmation can condemn it.
+  // The derivation the recording bought. No census has ever keyed 77, so this
+  // read's join is the one place its departure was ever derivable.
   core.on_mounts_refreshed(scope, refresh(Vec::new()), at(3));
+  let effects = drain(&mut core);
+  let parked = admissions(&effects);
   assert_eq!(
-    admissions(&drain(&mut core)).len(),
+    parked.len(),
     1,
-    "the restored record is still CONDEMNABLE, which a re-observation (entering \
-     not-row-confirmed, mount id equal to the root's) would not be"
+    "the entry the walk left is the belt: the first read that does not list its \
+     id derives the departure: {effects:?}"
+  );
+  assert_eq!(parked[0].1, PathBuf::from("/r/vol"));
+  assert!(
+    recorded(&core, scope).is_empty(),
+    "and the entry is spent — derived once, never twice"
   );
 }
 
@@ -2360,9 +2444,9 @@ fn a_still_covered_admission_lapses_to_the_replaced_handling() {
 /// The sequence is the mount-id recycling one, spelled as the kernel allocates:
 /// ids are LOWEST-FREE, so the departure that frees `/r/vol`'s id 77 hands it
 /// straight to the root's own same-object re-mount. The reply then carries the
-/// identity the walk read against the OLD root id 42, and putting the record back
-/// on it lands a boundary in the set carrying an id that is nobody's root — one
-/// that [`rebase_root_relative`] has already run past and can never reach again.
+/// identity the walk read against the OLD root id 42, and deciding a `Standing`
+/// from it under the NEW frame answers a question about a world this scope has
+/// left.
 ///
 /// The whole-root recovery is the answer instead, and it is the same answer the
 /// departure COLLAPSE gives for the same reason: its reseed walks from the root
@@ -2573,39 +2657,28 @@ fn an_admission_answered_with_no_recovery_standing_asks_for_one() {
   );
 }
 
-/// **R9 F2.** A `StillCovered` says a boundary is standing at the location — never
-/// that the SAME boundary is. Restore the departed mount's own record over one
-/// that is not it and the state never converges.
+/// A `StillCovered` says a boundary is standing at the location — never that the
+/// SAME boundary is. Believe the identity the walk read and the state converges;
+/// believe the identity that departed and it never does.
 ///
 /// The shape is ordinary and this cell is it end to end: a real mount ON TOP OF a
-/// btrfs subvolume. The mount owns a mountinfo row, so its record is row-confirmed
-/// and condemnable; when it departs, the walk re-opens the location and finds the
-/// SUBVOLUME — another device, the ROOT's own mount id, and no table row ever.
-/// `crossed_by` fires on the device leg, so the answer is `StillCovered`, and
-/// putting the row-confirmed record back there makes every later authoritative
-/// refresh find that row absent, condemn it again, park another admission, get the
-/// same answer, and emit another `Rescan`: one round trip and one cover per tick,
-/// for the life of the scope.
+/// btrfs subvolume. The mount owns a mountinfo row, so a census keys it; when it
+/// departs, the walk re-opens the location and finds the SUBVOLUME — another
+/// device, the ROOT's own mount id, and no table row ever. `crossed_by` fires on
+/// the device leg, so the answer is `StillCovered`, and recording the DEPARTED
+/// mount's identity there would make every later authoritative refresh find that
+/// id absent, derive the departure again, park another admission, get the same
+/// answer, and start over: one round trip per tick, for the life of the scope.
 ///
-/// **A cell that only checked the first cover would pass with the defect present**,
-/// which is why the assertion that matters is the SECOND refresh emitting nothing.
-/// Convergence is the property; the first cover is owed either way.
+/// **A cell that only checked the recording would pass with the defect present**,
+/// which is why the assertion that matters is the SECOND refresh deriving
+/// nothing. Convergence is the property.
 ///
-/// MUTATION WITNESS (restore the condemned record whole): make `restored_boundary`
-/// answer `condemned.clone()` unconditionally and this FAILS at `the state
-/// CONVERGES` with `left: 1, right: 0` — the second identical refresh deriving the
-/// same departure again, which is the storm itself.
-/// MUTATION WITNESS (keep the provenance while adopting the identity): answer
-/// `MountRecord { row_confirmed: true, ..MountRecord::observed(..) }` and this
-/// FAILS at the same site with the same values — proving the fix is the
-/// PROVENANCE, not merely the identity: a row-confirmed record at a location no
-/// mount table will ever list is condemnable forever.
-/// MUTATION WITNESS (the other direction — always re-observe): drop the match
-/// check so every refusal enters not-row-confirmed and
-/// `a_still_covered_admission_lapses_to_the_replaced_handling` FAILS at
-/// `tributary-fs/src/core/tests.rs:1920` with `left: 0, right: 1` — a boundary
-/// the walk found UNCHANGED demoted to device-only, and its real departure
-/// underivable from then on. The two cells fence the rule from both sides.
+/// MUTATION WITNESS (read the walk's two equal ids as a mount): drop the
+/// `SameMount` arm from `Standing::decide` so two known ids that AGREE decide
+/// `Mount` like any others, and this FAILS at `the state CONVERGES` with `left:
+/// 1, right: 0` — the second identical refresh deriving the same departure
+/// again, which is the storm itself.
 #[test]
 fn a_mount_departing_off_a_subvolume_converges_to_the_boundary_beneath_it() {
   // The mount that is about to depart: its own id, its own device.
@@ -2624,7 +2697,7 @@ fn a_mount_departing_off_a_subvolume_converges_to_the_boundary_beneath_it() {
   assert_eq!(
     requested.len(),
     1,
-    "staging: the row left the table, so the mount is condemned and its cover \
+    "staging: the row left the table, so the departure is derived and its cover \
      parks: {effects:?}"
   );
 
@@ -2643,24 +2716,19 @@ fn a_mount_departing_off_a_subvolume_converges_to_the_boundary_beneath_it() {
     at(2),
   );
   let effects = drain(&mut core);
-  let emitted = emits(&effects);
-  assert_eq!(
-    emitted.len(),
-    1,
-    "the departure is covered once — a real mount did leave: {effects:?}"
+  assert!(
+    emits(&effects).is_empty(),
+    "the ground is still hidden, so nothing is covered: {effects:?}"
   );
-  assert_eq!(emitted[0].location(), &loc(&["sub"]));
-  // Read now, asserted BELOW the convergence: what the set holds is the
-  // MECHANISM, and the convergence is what the finding costs, so the cover storm
-  // has to trip on the storm rather than on a record readout a later refactor
-  // could weaken.
-  let restored = recorded(&core, scope);
+  // Read now, asserted BELOW the convergence: what the ledger holds is the
+  // MECHANISM, and the convergence is what the finding costs, so the storm has to
+  // trip on the storm rather than on a readout a later refactor could weaken.
+  let recorded_after_reply = recorded(&core, scope);
 
-  // THE ASSERTION. The same authoritative table, again: with the record correctly
-  // device-only it is exempt from condemnation, so the refresh finds nothing to
-  // derive. With the departed mount's row-confirmed record back in its place this
-  // is a second departure, a second round trip, and a second cover — and then a
-  // third, and a fourth.
+  // THE ASSERTION. The same authoritative table, again: the entry is
+  // `SameMount`, so it joins no census and the read derives nothing at all. With
+  // the DEPARTED mount's identity recorded in its place this is a second
+  // departure and a second round trip — and then a third, and a fourth.
   core.on_mounts_refreshed(scope, refresh(Vec::new()), at(3));
   let effects = drain(&mut core);
   assert_eq!(
@@ -2671,8 +2739,8 @@ fn a_mount_departing_off_a_subvolume_converges_to_the_boundary_beneath_it() {
   );
   assert!(
     emits(&effects).is_empty(),
-    "and emits nothing — not the located cover, and not the whole-root cover a \
-     scope holding an AMBIGUOUS record would owe: {effects:?}"
+    "and emits nothing — not a located cover, and not the whole-root cover a \
+     scope holding an `Unknown` entry would owe: {effects:?}"
   );
 
   // A third, because "converges" is a claim about every later refresh and not
@@ -2685,16 +2753,16 @@ fn a_mount_departing_off_a_subvolume_converges_to_the_boundary_beneath_it() {
   );
   assert_eq!(
     recorded(&core, scope),
-    vec![(PathBuf::from("/r/sub"), Some(42), Some(9))],
+    vec![(PathBuf::from("/r/sub"), Some(42), None)],
     "with the boundary still recorded, so a seam that later observes it change \
      has something to change"
   );
   assert_eq!(
-    restored,
+    recorded_after_reply,
     recorded(&core, scope),
-    "and what went back at the reply is what is still standing: the boundary \
-     that is THERE — the subvolume the walk read off its own fd, not the mount \
-     that departed"
+    "and what the reply recorded is what is still standing: the boundary that is \
+     THERE — the subvolume the walk read off its own fd, not the mount that \
+     departed"
   );
 }
 
@@ -2765,7 +2833,7 @@ fn a_root_recovery_discharges_the_parked_ticket_and_restores_the_witness() {
   );
   assert_eq!(
     recorded(&core, scope),
-    vec![(PathBuf::from("/r/vol"), Some(77), Some(9))],
+    vec![(PathBuf::from("/r/vol"), Some(77), None)],
     "the recovery's generation re-records what is still live, so its next \
      departure is still derivable — the witness a dropped report would have lost"
   );
@@ -2788,9 +2856,9 @@ fn a_root_recovery_discharges_the_parked_ticket_and_restores_the_witness() {
 ///
 /// Sixty-five boundaries, one past the pending-admission bound, so one refresh
 /// that finds the table empty condemns more than the bound allows and the whole
-/// run becomes ONE recovery instead of a located walk each. Their ids are all
-/// distinct from the root's and all row-confirmed, so every one of them really is
-/// condemnable and the collapse is reached on evidence rather than on a shortcut.
+/// run becomes ONE recovery instead of a located walk each. Every one of them is
+/// a distinct census key, so every one really is a departure transition and the
+/// collapse is reached on evidence rather than on a shortcut.
 fn collapsing_burst() -> Vec<MountRow> {
   (0..=(MAX_PENDING_ADMITS as u64))
     .map(|n| row(&format!("/r/m{n}"), 200 + n, 9))
@@ -2975,7 +3043,7 @@ fn a_recovery_from_a_world_two_turns_back_publishes_nothing_and_converges() {
   assert_eq!(emitted[0].location(), &loc(&[]), "over the whole root");
   assert_eq!(
     recorded(&core, scope),
-    vec![(PathBuf::from("/r/subvol"), Some(42), Some(99))],
+    vec![(PathBuf::from("/r/subvol"), Some(42), None)],
     "with the generation installed this time"
   );
 
@@ -3184,7 +3252,7 @@ fn a_recovery_with_no_walked_mount_id_is_judged_on_its_epoch_alone() {
   let effects = drain(&mut core);
   assert_eq!(
     recorded(&core, scope),
-    vec![(PathBuf::from("/r/subvol"), Some(42), Some(99))],
+    vec![(PathBuf::from("/r/subvol"), Some(42), None)],
     "an id-less report on the CURRENT epoch is applied: unknown PASSES, exactly \
      as it does at every other frame fence, or this host could never recover at \
      all"
@@ -3386,22 +3454,27 @@ fn a_kernel_recursive_non_fanotify_departure_covers_with_no_round_trip() {
   assert_eq!(parked_admits(&core, scope), 0, "and parks nothing");
 }
 
-/// Provenance is a DYNAMIC UPGRADE keyed by location, never a birth-time
-/// classification — and this is the case that proves why.
+/// Cell (f): an ID-LESS host keys its census BY LOCATION, and a departure by
+/// path still covers — parity with the id-answering host, not a degrade to
+/// silence.
 ///
-/// Below Linux 5.8 there is no `STATX_MNT_ID`: the scope's frame is `None` and
-/// so is every row's. The `mnt_id != root_mnt_id` disjunct is therefore vacuous
-/// on those kernels — it answers "not mount-backed" for a genuine vfsmount
-/// exactly as readily as for a subvolume — and macOS, whose `getfsstat` reports
-/// no id either, is the same shape.
+/// macOS `getfsstat` answers no mount id, and neither does any fake. `Key` is
+/// the honest degrade there: the rendered location IS the key, so a row that
+/// stops being listed is a departure and a row at a new location is an arrival —
+/// the same two transitions an id-keyed census derives, reached by the only fact
+/// the host will answer.
 ///
-/// Classify at birth and every mount on those hosts is permanently exempt, which
-/// silently un-fixes #74 there. The ROW DISJUNCT is the whole of what rescues
-/// them: a table read that LISTS a location proves a vfsmount is there whatever
-/// the kernel will say about ids, and that proof is sticky, so the frame that
-/// no longer lists it can condemn it.
+/// What such a host CANNOT observe is a same-path remount with an unchanged
+/// device, because nothing about the two reads differs. That is stated as a
+/// residual rather than papered over, and it is strictly narrower than the class
+/// this cell holds.
+///
+/// MUTATION WITNESS (require an id to key a row): drop the `Key::Location` arm so
+/// an id-less row is skipped, and this FAILS at `staging: the arrival covers and
+/// records` with `left: 0, right: 1` — every mount on every id-less host silently
+/// unobservable, which is #74 un-fixed there.
 #[test]
-fn a_pre_5_8_mount_is_condemnable_on_its_row_alone() {
+fn an_id_less_host_covers_a_departure_by_path() {
   let (mut core, scope) = live_core();
   assert_eq!(
     core.scopes.get(&scope).expect("scope is live").root_mnt_id,
@@ -3409,8 +3482,8 @@ fn a_pre_5_8_mount_is_condemnable_on_its_row_alone() {
     "staging: the scope frame is unknown, as it is below 5.8"
   );
 
-  // Every identity this host can report is `None`, so nothing about this row
-  // distinguishes it from a subvolume — except that the table listed it.
+  // Every identity this host can report is `None`, so the row's own rendered
+  // location is the only thing two reads can be compared on.
   core.on_mounts_refreshed(scope, alive_refresh(vec![bare("/r/vol")], true), at(1));
   let effects = drain(&mut core);
   assert_eq!(
@@ -3425,51 +3498,51 @@ fn a_pre_5_8_mount_is_condemnable_on_its_row_alone() {
   assert_eq!(
     emitted.len(),
     1,
-    "the row it was recorded from is what makes it condemnable: {effects:?}"
+    "the location key this read no longer carries is the departure: {effects:?}"
   );
   assert!(emitted[0].kind().is_rescan());
   assert_eq!(emitted[0].location(), &loc(&["vol"]));
   assert!(
     recorded(&core, scope).is_empty(),
-    "condemned means covered AND dropped"
+    "covered AND gone from the census — derived once, never twice"
   );
 }
 
-/// The upgrade is not a property of the read that first recorded a row — it runs
-/// on every confirming read. A record that entered the set BEFORE any table read
-/// (a seam observation, on a host that answers no mount ids) is exempt from the
-/// DROP until a frame confirms its location, and condemnable from then on.
+/// Cell (d), the `Unknown` half: an entry a seam recorded on a host that answers
+/// no mount ids fails the whole scope closed until a census row STANDS at its
+/// location, and clears the moment one does.
 ///
-/// It is also the whole ARC of the fail-closed rule in one trace. While the
-/// ambiguous record is held, every authoritative refresh covers the WHOLE ROOT —
-/// not once, not on a cadence, every one. The row that finally lists the location
-/// upgrades the record, the ambiguous partition empties, the root covers STOP,
-/// and from then on the location's departure is covered precisely, at its own
-/// location, like any other mount-backed record's.
+/// It is the whole ARC of the fail-closed rule in one trace. While the entry is
+/// held, every authoritative refresh covers the WHOLE ROOT — not once, not on a
+/// cadence, every one. The read that finally lists the location clears the entry
+/// on the very refresh that read it, the root covers STOP, and from then on that
+/// location's departure is covered precisely, at its own location, like any other
+/// census row's.
 ///
-/// MUTATION WITNESS (liveness): disable the trigger (narrow `fails_closed` so no
-/// record satisfies it) and this FAILS at `tick 1: every authoritative refresh
-/// covers the whole root while an ambiguity is held` with `left: 0, right: 1`.
-/// MUTATION WITNESS (cost): read the trigger BEFORE the reconciliation, so a row
-/// that confirms the last ambiguous record cannot clear it on the refresh that
-/// read it, and this FAILS at `the row ENDS the fail-closed state`.
+/// MUTATION WITNESS (liveness): narrow `fails_closed` so no entry satisfies it,
+/// and this FAILS at `tick 1: every authoritative refresh covers the whole root
+/// while an ambiguity is held` with `left: 0, right: 1`.
+/// MUTATION WITNESS (cost): read the trigger BEFORE the ledger join, so a row
+/// standing where the last `Unknown` entry sat cannot clear it on the refresh
+/// that read it, and this FAILS at `and the arrival is LOCATED, not the root
+/// cover a held ambiguity buys` — a whole-root cover one refresh later than the
+/// evidence that ended it.
 #[test]
-fn a_confirming_frame_upgrades_an_exempt_record() {
+fn an_unknown_entry_fails_the_scope_closed_until_a_row_stands_at_its_location() {
   let (mut core, scope) = live_core();
   core
     .scopes
     .get_mut(&scope)
     .expect("scope is live")
-    .mounts_baseline
-    .push(MountRecord {
+    .ledger
+    .push(LedgerEntry {
       location: PathBuf::from("/r/vol"),
-      mnt_id: None,
-      dev: Some(98),
-      row_confirmed: false,
+      standing: Standing::Unknown,
     });
 
-  // Absent from this frame, and exempt from the DROP: nothing has proven a
-  // vfsmount there. The scope FAILS CLOSED while it holds it.
+  // Listed by no census, and joined by none: nothing has proven a vfsmount
+  // there, and nothing has proven one is not. The scope FAILS CLOSED while it
+  // holds the entry.
   for tick in 1..=3 {
     core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(tick));
     let effects = drain(&mut core);
@@ -3483,34 +3556,47 @@ fn a_confirming_frame_upgrades_an_exempt_record() {
     assert_eq!(
       emitted[0].location(),
       &loc(&[]),
-      "tick {tick}: and it is the ROOT, not the ambiguous record's own location \
-       — no per-record evidence exists to aim it with: {emitted:?}"
+      "tick {tick}: and it is the ROOT, not the entry's own location — no \
+       per-entry evidence exists to aim it with: {emitted:?}"
     );
     assert_eq!(
       recorded(&core, scope),
-      vec![(PathBuf::from("/r/vol"), None, Some(98))],
-      "tick {tick}: and the record is RETAINED, which is what keeps the row that \
-       may still confirm it able to reach it"
+      vec![(PathBuf::from("/r/vol"), None, None)],
+      "tick {tick}: and the entry is RETAINED, which is what keeps the row that \
+       may still stand there able to clear it"
     );
   }
 
-  // A NON-authoritative refresh installs no frame and diffs nothing, so it
-  // witnesses no absence and owes no cover — the fail-closed rule is about
-  // frames actually read, not about ticks.
+  // A NON-authoritative refresh installs no census and diffs nothing, so it
+  // witnesses no absence and owes no cover — the fail-closed rule is about reads
+  // actually taken, not about ticks.
   core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), false), at(4));
   assert!(
     emits(&drain(&mut core)).is_empty(),
     "a refresh that could not read the table observed nothing to fail closed over"
   );
 
-  // The table lists it. That is the proof, and it outlives the read that made it.
+  // The table lists it, id-lessly — a `Location` key at exactly that place.
   core.on_mounts_refreshed(scope, alive_refresh(vec![bare("/r/vol")], true), at(5));
   let effects = drain(&mut core);
-  assert!(
-    emits(&effects).is_empty(),
+  let emitted = emits(&effects);
+  assert_eq!(
+    emitted.len(),
+    1,
     "the row ENDS the fail-closed state on the very refresh that read it: the \
-     record is row-confirmed, the ambiguous partition is empty, and a confirm \
-     covers nothing: {effects:?}"
+     census owns the location, the ledger entry is dropped, and what is left is \
+     the row's own ARRIVAL: {effects:?}"
+  );
+  assert_eq!(
+    emitted[0].location(),
+    &loc(&["vol"]),
+    "and the arrival is LOCATED, not the root cover a held ambiguity buys: \
+     {emitted:?}"
+  );
+  assert_eq!(
+    recorded(&core, scope),
+    vec![(PathBuf::from("/r/vol"), None, None)],
+    "the ledger entry is gone and the census row stands in its place"
   );
 
   core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(6));
@@ -3519,18 +3605,17 @@ fn a_confirming_frame_upgrades_an_exempt_record() {
   assert_eq!(
     emitted.len(),
     1,
-    "the upgrade made the same record condemnable: {effects:?}"
+    "and the census now derives the departure the ledger never could: {effects:?}"
   );
   assert_eq!(
     emitted[0].location(),
     &loc(&["vol"]),
-    "and its departure is covered PRECISELY — the root-wide cost is paid only \
-     while an ambiguity is actually held: {emitted:?}"
+    "covered PRECISELY — the root-wide cost is paid only while an ambiguity is \
+     actually held: {emitted:?}"
   );
   assert!(
     recorded(&core, scope).is_empty(),
-    "and THAT absence drops it — the row-confirmed partition is the one that \
-     leaves the set"
+    "and the departed row leaves the census with its cover"
   );
 }
 
@@ -3545,10 +3630,10 @@ fn a_confirming_frame_upgrades_an_exempt_record() {
 /// probe reads at the only moment anything looked at that path.
 ///
 /// This scope's own frame carries NO mount id (`live_core` spawns without one —
-/// macOS, pre-5.8 Linux, every fake), so the record is device-only here whatever
-/// the probe answered, and the row disjunct is what upgrades it. That is the
-/// degrade, not the design: the sibling cell stages a scope whose frame IS known
-/// and shows the same probe minting a condemnable record.
+/// macOS, pre-5.8 Linux, every fake), so the entry is `Unknown` here whatever the
+/// probe answered, and only a census row standing at its location occupies it.
+/// That is the degrade, not the design: the sibling cell stages a scope whose
+/// frame IS known and shows the same probe deciding `Mount`.
 #[test]
 fn a_probe_answer_records_the_boundary_its_stat_discards() {
   fn req(n: u64) -> ReqId {
@@ -3583,7 +3668,7 @@ fn a_probe_answer_records_the_boundary_its_stat_discards() {
   slot_stat(&mut core, scope, 1, "/r/vol", 99, at(1));
   assert_eq!(
     recorded(&core, scope),
-    vec![(PathBuf::from("/r/vol"), None, Some(99))],
+    vec![(PathBuf::from("/r/vol"), None, None)],
     "the foreign device the stat discards is recorded — with no mount id, \
      because this host answers none"
   );
@@ -3618,17 +3703,28 @@ fn a_probe_answer_records_the_boundary_its_stat_discards() {
     );
   }
 
-  // A frame that LISTS it upgrades it, exactly as it upgrades any other exempt
-  // record, and from then on its departure is derivable — precisely, because the
-  // upgrade also emptied the ambiguous partition.
+  // A read whose census STANDS at the location occupies the entry, whatever keys
+  // that row, and from then on the location's departure is the census's to derive
+  // — precisely, because the entry that failed the scope closed is gone. The row
+  // is itself an arrival and owes its own cover.
   core.on_mounts_refreshed(
     scope,
     alive_refresh(vec![row("/r/vol", 77, 99)], true),
     at(5),
   );
-  assert!(
-    emits(&drain(&mut core)).is_empty(),
-    "the row confirms the record it lands on and ends the fail-closed state"
+  let effects = drain(&mut core);
+  let emitted = emits(&effects);
+  assert_eq!(
+    emitted.len(),
+    1,
+    "the row occupies the entry and ends the fail-closed state on the very \
+     refresh that read it, leaving its own arrival: {effects:?}"
+  );
+  assert_eq!(
+    emitted[0].location(),
+    &loc(&["vol"]),
+    "and the arrival is LOCATED, not the root cover a held ambiguity buys: \
+     {emitted:?}"
   );
   core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(6));
   let effects = drain(&mut core);
@@ -3658,7 +3754,7 @@ fn a_probe_answer_records_the_boundary_its_stat_discards() {
 /// which lists nothing either: a listed row would fire an ARRIVAL cover that the
 /// departure assertion could not be told apart from.
 #[test]
-fn a_mount_seen_only_by_a_probe_is_still_condemnable() {
+fn a_mount_seen_only_by_a_probe_still_has_its_departure_derived() {
   fn slot_stat(core: &mut DriverCore, scope: ScopeId, path: &str, dev: u64, mnt_id: Option<u64>) {
     let probe = core.mint_probe(
       scope,
@@ -3681,8 +3777,8 @@ fn a_mount_seen_only_by_a_probe_is_still_condemnable() {
 
   let (mut core, scope) = live_core();
   // The BASELINE: authoritative, listing nothing, and adopting the root's own
-  // mount frame — without which the scope reads every record as device-only and
-  // the sequence below cannot be staged at all.
+  // mount frame — without which the scope decides every entry `Unknown` and the
+  // sequence below cannot be staged at all.
   core.on_mounts_refreshed(scope, framed_refresh(Vec::new(), true, Some(42)), at(1));
   assert!(
     drain(&mut core).is_empty(),
@@ -3699,7 +3795,7 @@ fn a_mount_seen_only_by_a_probe_is_still_condemnable() {
   drain(&mut core);
   assert_eq!(
     recorded(&core, scope),
-    vec![(PathBuf::from("/r/vol"), Some(77), Some(99))],
+    vec![(PathBuf::from("/r/vol"), Some(77), None)],
     "the probe records the mount id it read beside the device — a record with \
      both halves is one the partition can classify"
   );
@@ -3723,7 +3819,7 @@ fn a_mount_seen_only_by_a_probe_is_still_condemnable() {
   // root's own mount id — stays exempt across the identical refresh.
   slot_stat(&mut core, scope, "/r/sub", 99, Some(42));
   drain(&mut core);
-  let held = vec![(PathBuf::from("/r/sub"), Some(42), Some(99))];
+  let held = vec![(PathBuf::from("/r/sub"), Some(42), None)];
   assert_eq!(recorded(&core, scope), held, "staging: recorded exempt");
   core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(3));
   let effects = drain(&mut core);
@@ -4172,7 +4268,8 @@ fn identity_minting_respects_devices_and_mounts() {
     mount_table: vec![PathBuf::from("/r/vol")],
     learned_mounts: Vec::new(),
     mounts_authoritative: true,
-    mounts_baseline: Vec::new(),
+    census: Vec::new(),
+    ledger: Vec::new(),
     pending_admits: Vec::new(),
     refresh_pending: false,
     refresh_stale: false,
@@ -4219,7 +4316,8 @@ fn blind_mount_table_refuses_event_side_trust() {
     mount_table: Vec::new(),
     learned_mounts: Vec::new(),
     mounts_authoritative: false,
-    mounts_baseline: Vec::new(),
+    census: Vec::new(),
+    ledger: Vec::new(),
     pending_admits: Vec::new(),
     refresh_pending: false,
     refresh_stale: false,
@@ -5834,6 +5932,53 @@ fn spawn_rejection_emits_nothing_public() {
   assert!(emits(&drain(&mut core)).is_empty());
 }
 
+/// The cover/park deduplication, in isolation: repeated locations collapse to
+/// their FIRST occurrence and the surviving order is untouched.
+///
+/// It is a pure function, and it is tested as one because in 2a its caller-level
+/// consequence is not observable. On the cover side the Monitor coalesces two
+/// identical overflows, so an emitted-cover assertion reads green with the
+/// deduplication gone; on the parked side two departures at one location are
+/// unreachable, because an observation at a location a census row stands at is
+/// Occupied at intake and a census keys at most one row per location today. The
+/// rule is here for the diff's own contract and for 2b, where several rows per
+/// location become ordinary and a location really can transition twice in one
+/// read.
+///
+/// MUTATION WITNESS: make `dedup_locations` a no-op and this FAILS at `two
+/// transitions at one place collapse to one`.
+/// MUTATION WITNESS (order): `sort` + `dedup` instead, and this FAILS at `two
+/// transitions at one place collapse to one` with `left: ["/r/a", "/r/b",
+/// "/r/c"]` — the right SET, in path order rather than in the order the
+/// transitions were derived.
+#[test]
+fn dedup_locations_keeps_the_first_of_each_place_in_order() {
+  let p = |s: &str| PathBuf::from(s);
+  let mut none: Vec<PathBuf> = Vec::new();
+  dedup_locations(&mut none);
+  assert!(none.is_empty(), "empty in, empty out");
+
+  let mut one = vec![p("/r/a")];
+  dedup_locations(&mut one);
+  assert_eq!(one, vec![p("/r/a")], "a single place is untouched");
+
+  // The shape the diff produces: an arrival at `/r/b`, a move out of `/r/a`, and
+  // a second transition naming `/r/a` again.
+  let mut many = vec![p("/r/b"), p("/r/a"), p("/r/c"), p("/r/a"), p("/r/b")];
+  dedup_locations(&mut many);
+  assert_eq!(
+    many,
+    vec![p("/r/b"), p("/r/a"), p("/r/c")],
+    "two transitions at one place collapse to one"
+  );
+  assert_eq!(
+    many.first(),
+    Some(&p("/r/b")),
+    "and the survivors keep the order the diff produced them in — a cover set is \
+     not sorted, it is derived"
+  );
+}
+
 /// The set-cover broadening-delta rule, in isolation and cross-platform: the
 /// retained prefixes a re-issued cover must re-arm are exactly those the PREVIOUS applied cover
 /// did not already cover — never keyed on which watches happen to survive, so growing back to a
@@ -6032,7 +6177,8 @@ mod lowering {
       mount_table: Vec::new(),
       learned_mounts: Vec::new(),
       mounts_authoritative: true,
-      mounts_baseline: Vec::new(),
+      census: Vec::new(),
+      ledger: Vec::new(),
       pending_admits: Vec::new(),
       refresh_pending: false,
       refresh_stale: false,
@@ -6528,58 +6674,54 @@ mod descending {
     (core, scope, req, watch)
   }
 
-  /// Puts `records` straight into the device-only partition, in insertion order
-  /// — which is the order eviction reads.
+  /// Puts `entries` straight into the ledger, in insertion order — which is the
+  /// order eviction reads.
   ///
   /// BUILT rather than listed, and that is a footprint decision. Filling the
-  /// partition to [`MAX_DEVICE_ONLY_BOUNDARIES`] through an enumerate costs some
-  /// seven allocations per entry plus a containment scan against every incumbent
-  /// — quadratic in a bound of 1024 — and an interpreted 32-bit run pays for all
-  /// of it out of the single 4 GB address space the whole shard shares. That is
+  /// ledger to [`MAX_BOUNDARIES`] through an enumerate costs some seven
+  /// allocations per entry plus a containment scan against every incumbent —
+  /// quadratic in a bound of 1024 — and an interpreted 32-bit run pays for all of
+  /// it out of the single 4 GB address space the whole shard shares. That is
   /// where `fs-rest` exhausted it.
   ///
   /// It costs the cells that use it nothing, because none of them is ABOUT the
-  /// fill: their subject is what the bound DECIDES once the partition is full,
-  /// and for that the incumbents only have to BE there in the right shape.
-  /// Filling one from a real listing IS
-  /// [`the_device_only_partition_is_hard_bounded_and_evicts_the_oldest`]'s
-  /// subject, and that cell keeps its listing.
+  /// fill: their subject is what the bound DECIDES once the ledger is full, and
+  /// for that the incumbents only have to BE there in the right shape. Filling
+  /// one from a real listing IS
+  /// [`the_ledger_is_hard_bounded_and_evicts_the_oldest`]'s subject, and that
+  /// cell keeps its listing.
   fn saturate(
     core: &mut DriverCore,
     scope: ScopeId,
-    records: impl IntoIterator<Item = MountRecord>,
+    entries: impl IntoIterator<Item = LedgerEntry>,
   ) {
     core
       .scopes
       .get_mut(&scope)
       .expect("scope is live")
-      .mounts_baseline
-      .extend(records);
+      .ledger
+      .extend(entries);
   }
 
-  /// One AMBIGUOUS record: a device, and no mount id on EITHER side of the
-  /// comparison, so nothing can tell a genuine vfsmount from a subvolume. This
-  /// is the shape that may never be evicted — a later row can still upgrade it
-  /// into a departure witness — and therefore the shape that forces the bound to
-  /// refuse instead.
-  fn ambiguous_at(location: impl Into<PathBuf>) -> MountRecord {
-    MountRecord {
+  /// One `Unknown` entry: a device, and a seam that could answer no mount id on
+  /// EITHER side of the comparison, so nothing can tell a genuine vfsmount from a
+  /// subvolume. This is the shape that may never be evicted — it is the only
+  /// witness a departure there will ever have — and therefore the shape that
+  /// forces the bound to refuse instead.
+  fn ambiguous_at(location: impl Into<PathBuf>) -> LedgerEntry {
+    LedgerEntry {
       location: location.into(),
-      mnt_id: None,
-      dev: Some(99),
-      row_confirmed: false,
+      standing: Standing::Unknown,
     }
   }
 
-  /// One PROVEN subvolume: the ROOT's own mount id on a foreign device. No
-  /// mountinfo read will ever list it, so no observation can promote it — which
-  /// is what makes it the only record free to evict.
-  fn proven_at(location: impl Into<PathBuf>, root_mnt_id: u64) -> MountRecord {
-    MountRecord {
+  /// One `SameMount` entry: the ROOT's own mount id on a foreign device. No
+  /// mountinfo read will ever list it, so nothing can promote it into a witness —
+  /// which is what makes it the only entry free to evict.
+  fn proven_at(location: impl Into<PathBuf>) -> LedgerEntry {
+    LedgerEntry {
       location: location.into(),
-      mnt_id: Some(root_mnt_id),
-      dev: Some(99),
-      row_confirmed: false,
+      standing: Standing::SameMount,
     }
   }
 
@@ -7351,15 +7493,15 @@ mod descending {
   /// mount-backed half of it.
   ///
   /// `core::on_enumerated` is the single site where a boundary-crossing dir entry
-  /// is lowered to `FileKind::Other`, and it holds everything the coverage set
-  /// wants — the location, the entry's device, and its mount id. Recording there
-  /// closes the LATENCY window the refresh alone leaves open: a mount observed at
-  /// second *t* would otherwise wait for the next tick to enter the set, and a
-  /// departure inside that window would be underivable.
+  /// is lowered to `FileKind::Other`, and it holds everything the ledger wants —
+  /// the location, the entry's device, and its mount id. Recording there closes
+  /// the LATENCY window the census alone leaves open: a mount observed at second
+  /// *t* would otherwise wait for the next tick to be keyed, and a departure
+  /// inside that window would be underivable.
   ///
-  /// Provenance follows the partition, not the seam: this entry's mount id
-  /// differs from the root's, so it is MOUNT-BACKED and condemnable the moment a
-  /// frame stops listing it — exactly as if the table had recorded it.
+  /// The `Standing` is the seam's own two ids: this entry's mount id differs from
+  /// the root's, so it is `Mount`, and the first read that does not key it is its
+  /// departure — exactly as if a census had listed it.
   #[test]
   fn an_enumerate_decline_records_a_mount_backed_boundary() {
     let (mut core, scope, req, _root) = live_descending_mnt(42);
@@ -7376,7 +7518,7 @@ mod descending {
     let _ = drain(&mut core);
     assert_eq!(
       recorded(&core, scope),
-      vec![(PathBuf::from("/r/bound"), Some(77), Some(1))],
+      vec![(PathBuf::from("/r/bound"), Some(77), None)],
       "the DECLINED entry enters the coverage set, with the identity the \
        enumerate read — and only it: a descended sibling is not a boundary"
     );
@@ -7399,22 +7541,104 @@ mod descending {
     );
   }
 
-  /// SEAM 1 again, for the class the refresh will NEVER see — and the reason the
-  /// provenance partition exists at all.
+  /// INTAKE OCCUPANCY, by LOCATION: a seam re-declining a boundary a census row
+  /// already stands at records nothing — and that is what keeps the pre-5.8
+  /// floor kernel out of a permanent fail-closed.
+  ///
+  /// On Linux 4.11-5.7 the two halves of the identity come from different places
+  /// and only one of them answers: `/proc/self/mountinfo` has carried mount ids
+  /// since forever, so every census row there is `Id`-keyed, while
+  /// `statx(STATX_MNT_ID)` does not exist, so every seam answers `None` and every
+  /// entry it could mint is `Unknown`. The id leg of the occupancy rule therefore
+  /// never fires on that kernel, and without the LOCATION leg every ordinary
+  /// enumerate of a directory holding a listed mount would push an `Unknown`
+  /// entry and fail the whole scope closed until the next refresh's join dropped
+  /// it — a whole-root cover per refresh, for as long as anything under the root
+  /// is being listed.
+  ///
+  /// The scope here is exactly that host in miniature: a frame that DOES answer an
+  /// id (so the fail-closed is attributable to the seam and not to the frame),
+  /// a census row that is `Id`-keyed, and a listing whose entry answers no id at
+  /// all.
+  ///
+  /// MUTATION WITNESS: drop the location leg (`row.location == location`) from
+  /// `record_boundary`'s occupancy test and this FAILS at `the ledger stays
+  /// empty` — and, one read later, at `and the scope does not fail closed`, which
+  /// is the cost.
+  #[test]
+  fn a_decline_at_a_location_the_census_stands_at_records_nothing() {
+    let (mut core, scope, req, _root) = live_descending_mnt(42);
+    core.on_enumerated(req, listed(Vec::new()));
+    let _ = drain(&mut core);
+    core.on_mounts_refreshed(
+      scope,
+      framed_refresh(vec![row("/r/vol", 77, 99)], true, Some(42)),
+      at(1),
+    );
+    let effects = drain(&mut core);
+    assert_eq!(
+      emits(&effects).len(),
+      1,
+      "staging: the census keys the mount and covers its arrival: {effects:?}"
+    );
+
+    // The arrival's own re-arm crawl lists the root again, and the fence declines
+    // the mount it already knows about — with NO mount id, because this host
+    // answers none at a seam.
+    let relist = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, path, .. } if path.as_path() == Path::new("/r") => Some(*req),
+        _ => None,
+      })
+      .expect("the arrival's cover re-arms and re-reads the root");
+    core.on_enumerated(
+      relist,
+      listed(vec![RawDirEntry {
+        name: b"vol".to_vec(),
+        kind: FileKind::Dir,
+        dev: 99,
+        ino: 7,
+        mnt_id: None,
+      }]),
+    );
+    let _ = drain(&mut core);
+    assert_eq!(
+      recorded(&core, scope),
+      vec![(PathBuf::from("/r/vol"), Some(77), Some(99))],
+      "the ledger stays empty: a census row STANDS at that location, so the \
+       observation is Occupied at intake whatever its standing"
+    );
+
+    // And the cost, if it had not been: the next authoritative read would answer
+    // one whole-root recovery instead of nothing at all.
+    core.on_mounts_refreshed(
+      scope,
+      framed_refresh(vec![row("/r/vol", 77, 99)], true, Some(42)),
+      at(2),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).is_empty(),
+      "and the scope does not fail closed — an unchanged census over an empty \
+       ledger derives and recovers nothing: {effects:?}"
+    );
+  }
+
+  /// SEAM 1 again, for the class no census will EVER list.
   ///
   /// A btrfs subvolume trips the DEVICE belt while carrying the root's own mount
   /// id. It is not a vfsmount: `/proc/self/mountinfo` has no row for it and never
   /// will, and `openat2(RESOLVE_NO_XDEV)` opens it without complaint. So seam 1
-  /// is its only observer — and, dissolve the partition, its absence from every
-  /// frame reads as a departure on every single tick: one cover plus one re-arm
-  /// crawl per subvolume per tick, on every default snapper / Fedora /
-  /// docker-btrfs layout.
+  /// is its only observer — and, condemn on an absence rather than a transition,
+  /// its absence from every census reads as a departure on every single tick: one
+  /// cover plus one re-arm crawl per subvolume per tick, on every default snapper
+  /// / Fedora / docker-btrfs layout.
   ///
-  /// This is the first place in the system that a DEVICE-ONLY record is actually
-  /// produced. Stage 1 built the exemption over a partition that was empty in
-  /// production; from here it is not.
+  /// This is the first place in the system that a `SameMount` entry is actually
+  /// produced.
   #[test]
-  fn an_enumerate_decline_records_an_exempt_device_only_boundary() {
+  fn an_enumerate_decline_records_an_exempt_same_mount_boundary() {
     let (mut core, scope, req, _root) = live_descending_mnt(42);
     core.on_enumerated(
       req,
@@ -7424,7 +7648,7 @@ mod descending {
     let _ = drain(&mut core);
     assert_eq!(
       recorded(&core, scope),
-      vec![(PathBuf::from("/r/subvol"), Some(42), Some(99))],
+      vec![(PathBuf::from("/r/subvol"), Some(42), None)],
       "the decline records it — nothing else ever will"
     );
 
@@ -7439,7 +7663,7 @@ mod descending {
     }
     assert_eq!(
       recorded(&core, scope),
-      vec![(PathBuf::from("/r/subvol"), Some(42), Some(99))],
+      vec![(PathBuf::from("/r/subvol"), Some(42), None)],
       "and it survives UNTOUCHED — exempt from the mechanism, not merely quiet \
        about it"
     );
@@ -7458,9 +7682,10 @@ mod descending {
   /// The refusal's terminal is the second half, and the design ACCEPTS it: a
   /// failed arm reaches the Monitor's `Err` arm, which emits a located `Rescan`,
   /// books a level-persistent slot deficit and drops the node. It queues no
-  /// enumerate and calls no re-arm — so for a DEVICE-ONLY crossing (no row, no
-  /// refresh arrival, no crawl) nothing re-records anything, and the slot stays a
-  /// deficit re-signalled ahead of every sync cookie. Signalled, not silent.
+  /// enumerate and calls no re-arm — so for a crossing no census will ever list
+  /// (no row, no arrival, no crawl) nothing re-records anything, and the slot
+  /// stays a deficit re-signalled ahead of every sync cookie. Signalled, not
+  /// silent.
   #[test]
   fn a_created_childs_arm_carries_the_frame_and_its_refusal_stands_a_deficit() {
     let (mut core, scope, req, root_watch) = live_descending_mnt(42);
@@ -7518,8 +7743,8 @@ mod descending {
       !effects.iter().any(
         |e| matches!(e, Effect::Enumerate { path, .. } if path.as_path() == Path::new("/r/subvol"))
       ),
-      "and it summons no re-enumerate — the recorder for a mount-backed \
-       crossing is the refresh's ARRIVAL side, and a device-only one has none: \
+      "and it summons no re-enumerate — the recorder for a boundary a census \
+       will key is the next read's ARRIVAL side, and an exempt one has none: \
        {effects:?}"
     );
     assert!(
@@ -7529,30 +7754,38 @@ mod descending {
     );
   }
 
-  /// The DEVICE-ONLY REMOVAL PATH — the debt seam 1 incurs by producing these
-  /// records at all.
+  /// The LEDGER's REMOVAL PATH — the debt seam 1 incurs by producing entries at
+  /// all.
   ///
-  /// Nothing else can drop one. The refresh cannot, by the partition; the only
-  /// other removal is settlement's signalled-unmount `retain`, which serves the
-  /// FSEvents `UNMOUNT` word alone. The design's answer is that their lifecycle
-  /// is "the ordinary event flow, since deleting a subvolume emits real delete
-  /// events on the parent" — true about the filesystem, and false about the code
-  /// until a seam consumed those events. Without it the set grows monotonically
-  /// for the life of a scope, reset only at a world swap.
+  /// Nothing else can drop an exempt one. No census lists a subvolume, and the
+  /// only other removal is settlement's signalled-unmount `retain`, which serves
+  /// the FSEvents `UNMOUNT` word alone. The design's answer is that their
+  /// lifecycle is "the ordinary event flow, since deleting a subvolume emits real
+  /// delete events on the parent" — true about the filesystem, and false about
+  /// the code until a seam consumed those events. Without it the ledger grows
+  /// monotonically for the life of a scope, reset only at a world swap.
   ///
-  /// The contrasting record pins the pass to the partition: a MOUNT-BACKED record
-  /// at a vanished location is left alone, because its removal is the refresh's
-  /// job and the refresh pays a departure COVER for it that this pass would
-  /// silently skip.
+  /// It runs over the WHOLE ledger, with no standing test, and the `Mount(77)`
+  /// entry here is why that is sound rather than merely uniform: the driving
+  /// record proves the LOCATION is gone — a mountpoint cannot be unlinked while a
+  /// mount is on it — so the boundary was already detached and the ground it
+  /// revealed left with the directory. Nothing the census owns is reachable from
+  /// here, because a ledger entry is by construction something no census keys.
+  ///
+  /// MUTATION WITNESS (the pass never runs): return early from
+  /// `retire_removed_boundaries` unconditionally and this FAILS at `both entries
+  /// die with their locations` — both still held, and the ledger growing by one
+  /// `PathBuf` per deleted boundary for the life of the scope.
   #[test]
-  fn a_removed_location_drops_its_device_only_record() {
+  fn a_removed_location_drops_its_ledger_entry() {
     let (mut core, scope, req, root_watch) = live_descending_mnt(42);
     core.on_enumerated(
       req,
       listed(vec![
-        // The subvolume: device-only, exempt, and nobody's to remove but this.
+        // The subvolume: the root's own mount id on a foreign device, so
+        // `SameMount`, and nobody's to remove but this.
         entry_on_mount("subvol", FileKind::Dir, 99, 20, 42),
-        // A real bind: mount-backed, and the refresh's business.
+        // A real bind seen before any census keyed it: `Mount(77)`, the belt.
         entry_on_mount("bound", FileKind::Dir, 1, 21, 77),
       ]),
     );
@@ -7571,24 +7804,115 @@ mod descending {
       ],
       at(1),
     );
-    let _ = drain(&mut core);
+    let effects = drain(&mut core);
+    assert!(
+      recorded(&core, scope).is_empty(),
+      "both entries die with their locations: a mountpoint cannot be unlinked \
+       while a mount is on it, so each delete proves the boundary was already \
+       detached"
+    );
     assert_eq!(
-      recorded(&core, scope),
-      vec![(PathBuf::from("/r/bound"), Some(77), Some(1))],
-      "the device-only record dies with its location; the mount-backed one is \
-       left for the refresh, which owes it a departure cover"
+      emits(&effects).len(),
+      2,
+      "and no cover is owed for either — the deletes themselves are what the \
+       consumer is told: {effects:?}"
     );
 
-    // And the refresh still pays that cover, on the record this pass spared.
+    // Nothing is left to re-derive: the next authoritative read over an empty
+    // table has no census row and no entry to condemn.
     core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(2));
     let effects = drain(&mut core);
-    let emitted = emits(&effects);
-    assert_eq!(
-      emitted.len(),
-      1,
-      "the mount-backed departure is still derivable: {effects:?}"
+    assert!(
+      emits(&effects).is_empty(),
+      "and the read that follows derives nothing at all: {effects:?}"
     );
-    assert_eq!(emitted[0].location(), &loc(&["bound"]));
+  }
+
+  /// **Cell (a): the case #74 v4 was written for.** A mount at `R/a/x`, then
+  /// `mv R/a R/b`, then a lazy unmount of `R/b/x` — and the departure cover lands
+  /// at `R/b/x`, where the ground actually is.
+  ///
+  /// The bug reproduces with NO torn read at all, which is why path-keying rather
+  /// than tearing is the defect. `rename(2)` bumps no mount-namespace generation,
+  /// so `mounts_poll` never fires and the next census renders the row under its
+  /// NEW label — while a path-keyed set still names the old one. Diffed that way,
+  /// the departure is derived against a stale `R/a/x`, the cover goes to a
+  /// directory that no longer exists, and the revealed ground at `R/b/x` is never
+  /// covered by anything at all.
+  ///
+  /// Identity is what makes the two reads comparable, and the rename repair is
+  /// what keeps the HINT honest: the paired `Moved` the core already compiles and
+  /// delivers re-roots every location at-or-under the source before the change
+  /// leaves.
+  ///
+  /// MUTATION WITNESS (no rebase): delete the `rebase_hints` call from
+  /// `route_event` and this FAILS at `and the hint moved with the directory` —
+  /// the census still naming `/r/a/x`, which one read later is the cover landing
+  /// at a directory that no longer exists while `R/b/x` stays dark.
+  #[test]
+  fn a_renamed_directory_moves_the_hint_a_later_departure_covers() {
+    let (mut core, scope, req, root_watch) = live_descending_mnt(42);
+    core.on_enumerated(req, listed(Vec::new()));
+    let _ = drain(&mut core);
+
+    // The census keys the mount by its own id, and renders it under `a`.
+    core.on_mounts_refreshed(
+      scope,
+      framed_refresh(vec![row("/r/a/x", 77, 99)], true, Some(42)),
+      at(1),
+    );
+    let effects = drain(&mut core);
+    assert_eq!(
+      emits(&effects)
+        .iter()
+        .filter(|c| c.location() == &loc(&["a", "x"]))
+        .count(),
+      1,
+      "staging: the arrival is covered at the location the read rendered: \
+       {effects:?}"
+    );
+
+    // `mv /r/a /r/b`, paired in the Monitor's window by its native cookie.
+    core.on_inotify_events(
+      scope,
+      vec![
+        inotify(&[root_watch], IN_MOVED_FROM | IN_ISDIR, 9, Some(b"a")),
+        inotify(&[root_watch], IN_MOVED_TO | IN_ISDIR, 9, Some(b"b")),
+      ],
+      at(2),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects)
+        .iter()
+        .any(|c| c.kind().moved_from() == Some(&loc(&["a"])) && c.location() == &loc(&["b"])),
+      "staging: the halves pair into one `Moved`: {effects:?}"
+    );
+    assert_eq!(
+      recorded(&core, scope),
+      vec![(PathBuf::from("/r/b/x"), Some(77), Some(99))],
+      "and the hint moved with the directory — the KEY did not, because a mount \
+       id is absolute"
+    );
+
+    // `umount -l /r/b/x`: no `IN_UNMOUNT`, no hangup, no `Rescan`. The read that
+    // no longer keys 77 is the only observer there is.
+    core.on_mounts_refreshed(scope, framed_refresh(Vec::new(), true, Some(42)), at(3));
+    let effects = drain(&mut core);
+    let covers: Vec<&Location> = emits(&effects)
+      .iter()
+      .filter(|c| c.kind().is_rescan())
+      .map(|c| c.location())
+      .collect();
+    assert!(
+      covers.contains(&&loc(&["b", "x"])),
+      "the cover lands where the ground is: {effects:?}"
+    );
+    assert!(
+      !covers.contains(&&loc(&["a", "x"])),
+      "and never at the label the mount table last rendered before the rename: \
+       {effects:?}"
+    );
   }
 
   /// F3's class: the retire passes test containment against a SET built once per
@@ -7658,7 +7982,7 @@ mod descending {
     let _ = drain(&mut core);
     assert_eq!(
       recorded(&core, scope),
-      vec![(PathBuf::from("/r/gone2"), Some(42), Some(99))],
+      vec![(PathBuf::from("/r/gone2"), Some(42), None)],
       "the record AT the vanished path and the one UNDER it both go; the string \
        neighbour is a different directory and stays"
     );
@@ -7799,7 +8123,7 @@ mod descending {
     let _ = drain(&mut core);
 
     // The next enumerate still fences on the captured frame (42): a mount-77 child is
-    // still a boundary (the fence did not degrade to device-only).
+    // still a boundary (the fence did not degrade to the device belt alone).
     core.on_watch_installed(
       sub_arm,
       core.arm_attempt(sub_arm),
@@ -12557,19 +12881,19 @@ mod descending {
     let _ = drain(core);
   }
 
-  /// F3, descending half: a COMPLETE re-listing RETIRES the device-only records
-  /// at children it did not decline.
+  /// A COMPLETE re-listing RETIRES the ledger entries at children it did not
+  /// decline — the descending profile's generation.
   ///
-  /// The device-only partition had exactly one removal path — a compiled
-  /// `Removed`/`MovedFrom` in the event stream — and a loss window is precisely
-  /// what empties that stream. So repeated creation and deletion of distinct flat
+  /// An exempt entry had exactly one removal path — a compiled `Removed`/
+  /// `MovedFrom` in the event stream — and a loss window is precisely what
+  /// empties that stream. So repeated creation and deletion of distinct flat
   /// subvolumes, each deletion lost, retained one `PathBuf` per missed deletion
-  /// for the scope's whole life and made every linear scan of the set slower.
+  /// for the scope's whole life and made every linear scan of the ledger slower.
   /// The listing that the loss's own recovery already runs is the answer: it
-  /// names every child of the directory, so a device-only record at a child it
-  /// did not name is a boundary whose directory is gone.
+  /// names every child of the directory, so an entry at a child it did not name
+  /// is a boundary whose directory is gone.
   #[test]
-  fn a_complete_relisting_retires_the_device_only_records_it_did_not_decline() {
+  fn a_complete_relisting_retires_the_ledger_entries_it_did_not_decline() {
     let (mut core, scope, req, root_watch) = live_descending_mnt(42);
     // Three flat subvolumes: another device, but the ROOT's own mount id — the
     // device leg is what declines them, and the partition exempts them.
@@ -12607,7 +12931,7 @@ mod descending {
     );
     assert_eq!(
       recorded(&core, scope),
-      vec![(PathBuf::from("/r/a"), Some(42), Some(99))],
+      vec![(PathBuf::from("/r/a"), Some(42), None)],
       "the two the listing did not name are retired; the one it re-declined stays"
     );
   }
@@ -12678,23 +13002,22 @@ mod descending {
     );
     assert_eq!(
       recorded(&core, scope),
-      vec![(PathBuf::from("/r/a"), Some(42), Some(99))],
+      vec![(PathBuf::from("/r/a"), Some(42), None)],
       "a child the fence no longer declines is not a boundary any more"
     );
   }
 
-  /// F3's UNCONDITIONAL half: the device-only partition is HARD BOUNDED, so the
-  /// set is finite even where every reconciliation path fails.
+  /// The ledger is HARD BOUNDED, so it is finite even where every reconciliation
+  /// path fails.
   ///
   /// The containment rule inside `record_boundary` was once documented as the
-  /// growth bound and never was one: it refuses a record BENEATH an existing one
+  /// growth bound and never was one: it refuses an entry BENEATH an existing one
   /// and says nothing about a flat run of siblings, which is exactly the shape a
   /// churning subvolume layout produces.
   ///
-  /// Eviction is oldest-first and safe in the cover direction: a device-only
-  /// record obliges no cover (it is exempt from condemnation), so dropping one
-  /// can only ever cause an extra arrival cover, never withhold one that was
-  /// owed.
+  /// Eviction is oldest-first and safe in the cover direction: a `SameMount`
+  /// entry joins no census and can never become a witness, so dropping one can
+  /// only ever cause an extra arrival cover, never withhold one that was owed.
   ///
   /// # The bound is crossed by BUILDING the incumbents, not by listing them
   ///
@@ -12709,52 +13032,52 @@ mod descending {
   /// What that costs in coverage is stated rather than assumed: **nothing in the
   /// intake path branches on a listing's SIZE.** `on_enumerated` walks entries one
   /// at a time and calls `record_boundary` per declined child, and `record_boundary`
-  /// calls [`make_room_for_device_only`] per push — so a listing of 1030 exercises
-  /// the same decisions as a listing of 12 against a set already near the bound,
+  /// calls [`make_room_in_ledger`] per push — so a listing of 1030 exercises
+  /// the same decisions as a listing of 12 against a ledger already near the bound,
   /// 1030 times instead of 12. The 12 that still ride the seam keep the seam in the
   /// path being tested. The one thing genuinely no longer walked at full scale is
-  /// the containment scan's `records x entries` cost, which is a performance
+  /// the containment scan's `entries x children` cost, which is a performance
   /// property this cell never asserted and which no assertion here reads.
   ///
   /// The incumbents sit under `/r/held` rather than at `/r`, exactly as
-  /// [`the_bound_refuses_a_new_record_before_it_evicts_an_unproven_witness`]'s do:
-  /// a complete listing of `/r` speaks for its OWN level, so records parented
-  /// there would have to be re-named by it merely to survive its relisting sweep.
+  /// [`the_bound_refuses_a_new_entry_before_it_evicts_a_witness`]'s do: a
+  /// complete listing of `/r` speaks for its OWN level, so entries parented there
+  /// would have to be re-named by it merely to survive its relisting sweep.
   ///
   /// MUTATION WITNESS (bound removed): pass `usize::MAX` as the cap in
-  /// `record_boundary`'s `make_room_for_device_only` call, so every observation
+  /// `record_boundary`'s `make_room_in_ledger` call, so every observation
   /// pushes, and this FAILS at `the set stops at the bound instead of growing with
   /// the churn` with `left: 1030, right: 1024` — the unbounded growth the bound
   /// exists for.
   /// MUTATION WITNESS (eviction newest-first): make the retain in
-  /// `make_room_for_device_only` walk from the tail (`retain` over a reversed
+  /// `make_room_in_ledger` walk from the tail (`retain` over a reversed
   /// vector, re-reversed after) and this FAILS at `the six OLDEST records were
   /// evicted` with `left: "/r/held/d0"` — the record most likely to be stale kept
   /// and the freshest observation dropped.
   #[test]
-  fn the_device_only_partition_is_hard_bounded_and_evicts_the_oldest() {
+  fn the_ledger_is_hard_bounded_and_evicts_the_oldest() {
     // FIXED LITERALS, tied to the bound by a COMPILE-TIME guard rather than
     // derived from it. A cell in this class once sized its burst off
-    // `MAX_DEVICE_ONLY_BOUNDARIES`, so raising the constant silently rebuilt it
+    // `MAX_BOUNDARIES`, so raising the constant silently rebuilt it
     // at 65 537 rows and hung instead of failing. Here a changed bound breaks the
     // BUILD, and the verdict below never re-parameterises itself.
     const PRELOADED: usize = 1018;
     const LISTED: usize = 12;
     const EVICTED: usize = 6;
     const {
-      assert!(PRELOADED + LISTED == MAX_DEVICE_ONLY_BOUNDARIES + EVICTED);
-      assert!(PRELOADED < MAX_DEVICE_ONLY_BOUNDARIES);
+      assert!(PRELOADED + LISTED == MAX_BOUNDARIES + EVICTED);
+      assert!(PRELOADED < MAX_BOUNDARIES);
       assert!(EVICTED > 0);
     }
 
     let (mut core, scope, req, _root) = live_descending_mnt(42);
-    // PROVEN subvolumes — the root's own mount id on a foreign device — which is
-    // the only population `make_room_for_device_only` may evict, and therefore
-    // the partition whose eviction ORDER this cell is about.
+    // `SameMount` entries — the root's own mount id on a foreign device — which
+    // is the only population `make_room_in_ledger` may evict, and therefore the
+    // one whose eviction ORDER this cell is about.
     saturate(
       &mut core,
       scope,
-      (0..PRELOADED).map(|n| proven_at(format!("/r/held/d{n}"), 42)),
+      (0..PRELOADED).map(|n| proven_at(format!("/r/held/d{n}"))),
     );
 
     let entries: Vec<RawDirEntry> = (PRELOADED..PRELOADED + LISTED)
@@ -12776,7 +13099,7 @@ mod descending {
     let held = recorded_locations(&core, scope);
     assert_eq!(
       held.len(),
-      MAX_DEVICE_ONLY_BOUNDARIES,
+      MAX_BOUNDARIES,
       "the set stops at the bound instead of growing with the churn"
     );
     assert_eq!(
@@ -12796,19 +13119,17 @@ mod descending {
   /// departure witness — so it is kept and the NEW observation is refused, and
   /// the departure cover it eventually owes still arrives.
   ///
-  /// `MountRecord::condemnable == false` covers two populations that only look
-  /// alike. A record PROVEN to share the root's mount is a subvolume and can
-  /// never be promoted. A record with an unknown id is what a GENUINE
-  /// post-baseline vfsmount looks like on pre-5.8 / mask-absent Linux until an
-  /// authoritative row confirms it — and the eviction that read the two as one
+  /// The exempt entries are two populations that only look alike. A `SameMount`
+  /// entry is a subvolume and can never be promoted. An `Unknown` entry is what a
+  /// GENUINE post-census vfsmount looks like on pre-5.8 / mask-absent Linux until
+  /// a row stands at its location — and the eviction that read the two as one
   /// dropped the second silently.
   ///
-  /// Staged so the departure assertion cannot read an ARRIVAL cover by mistake:
-  /// the row is SEEDED by a refresh whose silence is asserted (a confirm covers
-  /// nothing — an eviction would have made that same read an arrival and covered
-  /// it), and only the read AFTER that is the departure.
+  /// Staged so the departure assertion cannot be confused with the arrival: the
+  /// row is SEEDED by one refresh, whose single located ARRIVAL cover is
+  /// asserted, and only the read AFTER that is the departure.
   #[test]
-  fn the_bound_refuses_a_new_record_before_it_evicts_an_unproven_witness() {
+  fn the_bound_refuses_a_new_entry_before_it_evicts_a_witness() {
     // No mount ids anywhere: the scope has no frame, so EVERY record is exempt
     // and ambiguous — the host where the bound is under the most pressure and
     // where the eviction was most wrong.
@@ -12824,12 +13145,12 @@ mod descending {
     saturate(
       &mut core,
       scope,
-      (0..MAX_DEVICE_ONLY_BOUNDARIES).map(|n| ambiguous_at(format!("/r/held/b{n}"))),
+      (0..MAX_BOUNDARIES).map(|n| ambiguous_at(format!("/r/held/b{n}"))),
     );
     let held = recorded_locations(&core, scope);
     assert_eq!(
       held.len(),
-      MAX_DEVICE_ONLY_BOUNDARIES,
+      MAX_BOUNDARIES,
       "staging: the partition is exactly at the bound, and every record is \
        ambiguous — none carries an id, and neither does the scope"
     );
@@ -12854,7 +13175,7 @@ mod descending {
     let held = recorded_locations(&core, scope);
     assert_eq!(
       held.len(),
-      MAX_DEVICE_ONLY_BOUNDARIES,
+      MAX_BOUNDARIES,
       "the bound still binds — intake is what stops, not the set that grows"
     );
     assert!(
@@ -12876,10 +13197,10 @@ mod descending {
     core.on_mounts_refreshed(scope, alive_refresh(vec![bare("/r/held/b0")], true), at(3));
     let _ = drain(&mut core);
 
-    // The mount departs. Row-confirmed is condemnable on any kernel, so the
-    // record LEAVES the set — the witness the bound refused to evict did its
-    // job. The cover itself is root-wide, because 1023 ambiguous records are
-    // still held and this scope is paying the fail-closed cost for them.
+    // The mount departs. A census key that stops being listed is a departure on
+    // any kernel, so the row LEAVES the census — the witness the bound refused to
+    // evict did its job. The cover itself is root-wide, because 1023 `Unknown`
+    // entries are still held and this scope is paying the fail-closed cost.
     core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(4));
     let effects = drain(&mut core);
     let held = recorded_locations(&core, scope);
@@ -12905,30 +13226,30 @@ mod descending {
   /// F1's other half: a record PROVEN to share the root's mount still evicts
   /// silently, and it is preferred over an older AMBIGUOUS one.
   ///
-  /// A proven record describes something no mountinfo read will ever list, so no
-  /// observation can promote it and it can never become a witness. That is what
-  /// makes it — and only it — free to drop.
+  /// A `SameMount` entry describes something no mountinfo read will ever list, so
+  /// nothing can promote it and it can never become a witness. That is what makes
+  /// it — and only it — free to drop.
   #[test]
-  fn eviction_prefers_a_proven_subvolume_over_an_older_unproven_record() {
+  fn eviction_prefers_a_same_mount_entry_over_an_older_unknown_one() {
     let (mut core, scope, req, _root) = live_descending_mnt(42);
-    // The birth read first, and EMPTY, so the partition below is built into a
+    // The birth read first, and EMPTY, so the ledger below is built into a
     // settled scope rather than racing a listing that would speak for the root's
     // own level.
     core.on_enumerated(req, listed(Vec::new()));
     let _ = drain(&mut core);
-    // The OLDEST record is ambiguous (no id answered for it), then the partition
-    // is filled to the bound with proven subvolumes — built, not listed, because
+    // The OLDEST entry is `Unknown` (no id answered for it), then the ledger is
+    // filled to the bound with `SameMount` entries — built, not listed, because
     // this cell is about which of them EVICTION takes (see `saturate`).
     saturate(
       &mut core,
       scope,
       std::iter::once(ambiguous_at("/r/amb"))
-        .chain((0..MAX_DEVICE_ONLY_BOUNDARIES - 1).map(|n| proven_at(format!("/r/p{n}"), 42))),
+        .chain((0..MAX_BOUNDARIES - 1).map(|n| proven_at(format!("/r/p{n}")))),
     );
     let held = recorded_locations(&core, scope);
     assert_eq!(
       held.len(),
-      MAX_DEVICE_ONLY_BOUNDARIES,
+      MAX_BOUNDARIES,
       "staging: at the bound, one ambiguous record at the FRONT"
     );
     assert_eq!(
@@ -12952,11 +13273,7 @@ mod descending {
       at(1),
     );
     let held = recorded_locations(&core, scope);
-    assert_eq!(
-      held.len(),
-      MAX_DEVICE_ONLY_BOUNDARIES,
-      "the bound still binds"
-    );
+    assert_eq!(held.len(), MAX_BOUNDARIES, "the bound still binds");
     assert!(
       held.contains(&Path::new("/r/amb")),
       "the ambiguous record is passed over even though it is the oldest"
@@ -12972,25 +13289,23 @@ mod descending {
     );
   }
 
-  /// **F2's class member**: after the root's frame moves, a rebased subvolume
-  /// record must still read DEVICE-ONLY everywhere a record's provenance is asked
-  /// — not only at `condemnable` but at `proven_subvolume`,
-  /// `holds_device_only_under`, and the retire pass they gate.
+  /// A `SameMount` entry survives the root's frame moving, and the re-listing
+  /// still owns its removal — cell (g)'s claim on the DESCENDING profile, where
+  /// the re-listing is the removal path.
   ///
-  /// A record whose id equals the root's is a subvolume, and that identity is
-  /// RELATIVE: a same-object re-mount of the root moves `root_mnt_id`, and
-  /// without rebasing, every one of those predicates flips at once. The record
-  /// would be condemned and covered as a departure, and its real removal path —
-  /// the re-listing that names its parent's children — would then never see it,
-  /// because the retire pass deliberately refuses to touch a mount-backed record
-  /// (that removal is the refresh's, and it owes a cover).
+  /// The seam decided `SameMount` from two ids it read at one instant, and a
+  /// same-object re-mount of the root moves neither of them. Under the predicate
+  /// this replaced — `mnt_id == root_mnt_id`, re-asked on every read — the entry
+  /// flipped to mount-backed the moment the root moved, was condemned and covered
+  /// as a departure, and its real removal path never saw it again because the
+  /// retire pass refused to touch anything mount-backed.
   ///
   /// This profile DOES replay the root under a changed frame (a descending scope
   /// re-classifies every child against the new frame), so a root-wide cover here
   /// is expected and correct. What may not appear is a cover LOCATED at the
   /// subvolume: that one could only be a departure verdict.
   #[test]
-  fn a_rebased_subvolume_stays_device_only_for_the_retire_pass() {
+  fn a_same_mount_entry_survives_a_root_frame_change_for_the_retire_pass() {
     let (mut core, scope, req, root_watch) = live_descending_mnt(42);
     core.on_enumerated(
       req,
@@ -12999,7 +13314,7 @@ mod descending {
     let _ = drain(&mut core);
     assert_eq!(
       recorded(&core, scope),
-      vec![(PathBuf::from("/r/sub"), Some(42), Some(99))],
+      vec![(PathBuf::from("/r/sub"), Some(42), None)],
       "staging: a proven subvolume — the ROOT's own mount id, another device"
     );
 
@@ -13016,15 +13331,15 @@ mod descending {
     );
     assert_eq!(
       recorded(&core, scope),
-      vec![(PathBuf::from("/r/sub"), Some(43), Some(99))],
-      "REBASED onto the frame it is relative to, so it is still proven"
+      vec![(PathBuf::from("/r/sub"), Some(43), None)],
+      "the entry is untouched — its standing was decided at the seam and no \
+       later frame re-decides it"
     );
 
     // The frame replay's own re-arm re-reads the root, and by then the subvolume
     // has been deleted, so the complete listing names no child at all. That
-    // re-listing is the descending profile's removal path for a device-only
-    // record — and it is guarded to skip anything mount-backed, so a record left
-    // misclassified by the re-mount would never leave the set at all.
+    // re-listing is the descending profile's removal path for a ledger entry, and
+    // it is the only one this entry has.
     core.on_watch_installed(
       root_watch,
       core.arm_attempt(root_watch),
@@ -13042,18 +13357,18 @@ mod descending {
     assert!(
       recorded(&core, scope).is_empty(),
       "the retire pass still owns it: a re-listing that does not name the child \
-       retires the rebased record, silently"
+       retires the entry, silently"
     );
   }
 
   /// **R6, the refusal half on SEAM 1**: a boundary the bound refuses leaves the
   /// listing CLEAN, and the scope's fail-closed state is what pays for it.
   ///
-  /// The bound only ever refuses when the device-only partition is full of
-  /// AMBIGUOUS records — a proven subvolume would have been evicted to make room
-  /// — and a scope holding even one ambiguous record already covers its whole
-  /// root on every authoritative refresh. That cover strictly dominates anything
-  /// this seam could stand for the refusal, so standing one is pure duplication.
+  /// The bound only ever refuses when the ledger is full of witnesses — a
+  /// `SameMount` entry would have been evicted to make room — and a scope holding
+  /// even one `Unknown` entry already covers its whole root on every
+  /// authoritative refresh. That cover strictly dominates anything this seam
+  /// could stand for the refusal, so standing one is pure duplication.
   ///
   /// It was not free duplication, either. The announcement had to be LATCHED per
   /// saturation episode or it stormed (every later enumerate re-observes the same
@@ -13098,13 +13413,13 @@ mod descending {
       saturate(
         &mut core,
         scope,
-        (0..MAX_DEVICE_ONLY_BOUNDARIES - 1).map(|n| ambiguous_at(format!("/r/held/b{n}"))),
+        (0..MAX_BOUNDARIES - 1).map(|n| ambiguous_at(format!("/r/held/b{n}"))),
       );
       core.on_enumerated(req, listed(one_boundary()));
       let effects = drain(&mut core);
       assert_eq!(
         recorded_locations(&core, scope).len(),
-        MAX_DEVICE_ONLY_BOUNDARIES,
+        MAX_BOUNDARIES,
         "control: there was room, and the observation took it"
       );
       assert!(
@@ -13120,13 +13435,13 @@ mod descending {
     saturate(
       &mut core,
       scope,
-      (0..MAX_DEVICE_ONLY_BOUNDARIES).map(|n| ambiguous_at(format!("/r/held/b{n}"))),
+      (0..MAX_BOUNDARIES).map(|n| ambiguous_at(format!("/r/held/b{n}"))),
     );
     core.on_enumerated(req, listed(one_boundary()));
     let effects = drain(&mut core);
     assert_eq!(
       recorded_locations(&core, scope).len(),
-      MAX_DEVICE_ONLY_BOUNDARIES,
+      MAX_BOUNDARIES,
       "the bound still binds — intake is what stops, not the set that grows"
     );
     assert!(
@@ -13244,7 +13559,7 @@ mod kernel_recursive_fanotify {
 
   /// What the walk's MOUNT fence declines: a `mount --bind` of a same-superblock
   /// directory, so the device belt cannot see it and only the differing mount id
-  /// marks it. Both halves known, so it is mount-backed and condemnable at once.
+  /// marks it. Both halves known, so the seam decides `Mount` at once.
   fn bind_decline(location: &str, mnt_id: u64) -> crate::os::DeclinedBoundary {
     crate::os::DeclinedBoundary {
       location: PathBuf::from(location),
@@ -13255,8 +13570,8 @@ mod kernel_recursive_fanotify {
 
   /// What the walk's DEVICE BELT declines: a btrfs subvolume. It is on another
   /// device but on the ROOT'S OWN MOUNT — that is what a subvolume is — so the
-  /// walk's `statx` answers `root_mnt_id`, and the record is device-only, exempt,
-  /// and confirmable by no mountinfo row ever.
+  /// walk's `statx` answers `root_mnt_id`, so the seam decides `SameMount`: no
+  /// mountinfo row will ever list it and no census will ever own it.
   ///
   /// The id is not optional decoration. The walk reads it for EVERY decline, both
   /// fences alike, so a decline carrying no id would model a host that answers no
@@ -14227,8 +14542,8 @@ mod kernel_recursive_fanotify {
     assert_eq!(
       recorded(&core, scope),
       vec![
-        (PathBuf::from("/r/bound"), Some(77), Some(1)),
-        (PathBuf::from("/r/subvol"), Some(42), Some(99)),
+        (PathBuf::from("/r/bound"), Some(77), None),
+        (PathBuf::from("/r/subvol"), Some(42), None),
       ],
       "both declines are recorded with the identity the WALK read — no frame has \
        been diffed yet, so nothing else could have put them here"
@@ -14241,9 +14556,9 @@ mod kernel_recursive_fanotify {
     let effects = drain(&mut core);
     assert_eq!(
       recorded(&core, scope),
-      vec![(PathBuf::from("/r/subvol"), Some(42), Some(99))],
-      "condemned means dropped at the verdict; the device-only decline is not \
-       condemnable at all"
+      vec![(PathBuf::from("/r/subvol"), Some(42), None)],
+      "the derived departure leaves at the verdict; the `SameMount` decline \
+       joins no census at all"
     );
     // The cover is PARKED on the admission round trip this profile owes (the map
     // has no handles for the ground the bind's departure revealed), and lands on
@@ -14253,7 +14568,7 @@ mod kernel_recursive_fanotify {
     assert_eq!(
       emitted.len(),
       1,
-      "only the mount-backed decline is condemnable: {effects:?}"
+      "only the `Mount` decline is a departure witness: {effects:?}"
     );
     assert!(emitted[0].kind().is_rescan());
     assert_eq!(
@@ -14263,15 +14578,14 @@ mod kernel_recursive_fanotify {
     );
   }
 
-  /// The DEVICE-ONLY half of the spawn driver, held against every condemnation
-  /// path there is — the shape that storms without the provenance partition.
+  /// The EXEMPT half of the spawn driver, held against every condemnation path
+  /// there is — the shape that storms if an absence were read as a departure.
   ///
-  /// A btrfs subvolume trips the walk's DEVICE belt. The belt runs before the
-  /// `statx` that would answer a mount id, so the walk surfaces a device and no
-  /// id — and `/proc/self/mountinfo` has no row for a subvolume and never will,
-  /// so no refresh can ever upgrade it. Condemn it on its absence from a frame
-  /// and every tick covers and re-records it, forever, on every default snapper /
-  /// Fedora / docker-btrfs layout.
+  /// A btrfs subvolume trips the walk's DEVICE belt while carrying the root's own
+  /// mount id, so the seam decides `SameMount` — and `/proc/self/mountinfo` has no
+  /// row for one and never will, so no census can ever key it. Read its absence
+  /// from a census as a departure and every tick covers and re-records it,
+  /// forever, on every default snapper / Fedora / docker-btrfs layout.
   ///
   /// The re-declining walks in the loop are the steady state, not decoration: on
   /// this profile a reseed or a moved-in subtree walk re-observes the same
@@ -14281,7 +14595,7 @@ mod kernel_recursive_fanotify {
   fn a_walk_declined_subvolume_survives_every_condemnation_path() {
     let (mut core, scope) =
       spawned_fanotify(Some(42), vec![subvolume_decline("/r/subvol", 99, 42)]);
-    let held = vec![(PathBuf::from("/r/subvol"), Some(42), Some(99))];
+    let held = vec![(PathBuf::from("/r/subvol"), Some(42), None)];
     assert_eq!(
       recorded(&core, scope),
       held,
@@ -14322,9 +14636,9 @@ mod kernel_recursive_fanotify {
   /// admission reseed will attach to as well, since it runs on the same reader
   /// thread with the same result type.
   ///
-  /// Provenance is settled here exactly as it is for a spawn decline: a walk's
-  /// fence is not a mountinfo row, so a live decline is condemnable only when its
-  /// own mount id says so.
+  /// The `Standing` is settled here exactly as it is for a spawn decline: a
+  /// walk's fence is not a mountinfo row, so a live decline is a departure
+  /// witness only when its own mount id says so.
   #[test]
   fn a_live_walks_declines_enter_the_set_through_the_queue() {
     let (mut core, scope) = spawned_fanotify(Some(42), Vec::new());
@@ -14354,8 +14668,8 @@ mod kernel_recursive_fanotify {
     assert_eq!(
       recorded(&core, scope),
       vec![
-        (PathBuf::from("/r/bound"), Some(77), Some(1)),
-        (PathBuf::from("/r/moved/sub"), Some(42), Some(99)),
+        (PathBuf::from("/r/bound"), Some(77), None),
+        (PathBuf::from("/r/moved/sub"), Some(42), None),
       ],
       "both live walks land in the same set the spawn walk seeds"
     );
@@ -14364,8 +14678,8 @@ mod kernel_recursive_fanotify {
     let effects = drain(&mut core);
     assert_eq!(
       recorded(&core, scope),
-      vec![(PathBuf::from("/r/moved/sub"), Some(42), Some(99))],
-      "and the move-in walk's device-only decline is untouched"
+      vec![(PathBuf::from("/r/moved/sub"), Some(42), None)],
+      "and the move-in walk's exempt decline is untouched"
     );
     let effects = answer_one_admission(&mut core, scope, &effects, at(2));
     let emitted = emits(&effects);
@@ -14462,10 +14776,10 @@ mod kernel_recursive_fanotify {
   /// ever confirms a row at its location.
   ///
   /// This is the class the device belt's missing `statx` opened. A walk decline
-  /// recorded with `mnt_id: None` is what [`MountRecord::condemnable`] reads as
-  /// DEVICE-ONLY — permanently exempt — so the refresh that no longer lists the
-  /// location emitted neither a cover nor an admission request, and the walk had
-  /// never seeded the revealed subtree into the FID map. The source is then blind
+  /// recorded with `mnt_id: None` is `Unknown`, which joins no census — so the
+  /// refresh that no longer listed the location emitted neither a located cover
+  /// nor an admission request, and the walk had never seeded the revealed subtree
+  /// into the FID map. The source is then blind
   /// to that ground with no loss signal, until some unrelated whole-map reseed
   /// happens to run: #74's own bug class, reintroduced in a narrow window.
   ///
@@ -14474,7 +14788,7 @@ mod kernel_recursive_fanotify {
   /// assertion from the departure cover the cell exists to read — the false green
   /// this suite has already produced twice.
   #[test]
-  fn a_mount_seen_only_by_a_live_walk_is_still_condemnable() {
+  fn a_mount_seen_only_by_a_live_walk_still_has_its_departure_derived() {
     let (mut core, scope) = spawned_fanotify(Some(42), Vec::new());
     // The BASELINE: authoritative, and listing nothing at all.
     core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(0));
@@ -14501,7 +14815,7 @@ mod kernel_recursive_fanotify {
     );
     assert_eq!(
       recorded(&core, scope),
-      vec![(PathBuf::from("/r/vol"), Some(77), Some(99))],
+      vec![(PathBuf::from("/r/vol"), Some(77), None)],
       "the walk's decline carries the mount id it read from the pinned fd"
     );
 
@@ -14528,9 +14842,9 @@ mod kernel_recursive_fanotify {
   }
 
   /// The control leg for the cell above, and the reason the fix is a `statx`
-  /// rather than "treat an id-less decline as condemnable": the SUBVOLUME the
-  /// belt also declines carries the ROOT'S OWN mount id, stays exempt, and costs
-  /// no cover on any tick.
+  /// rather than "treat an id-less decline as a departure witness": the SUBVOLUME
+  /// the belt also declines carries the ROOT'S OWN mount id, decides `SameMount`,
+  /// and costs no cover on any tick.
   #[test]
   fn a_subvolume_seen_by_the_same_belt_stays_exempt() {
     let (mut core, scope) = spawned_fanotify(Some(42), Vec::new());
@@ -14545,7 +14859,7 @@ mod kernel_recursive_fanotify {
       partial_walk(vec![subvolume_decline("/r/sub", 99, 42)]),
       at(1),
     );
-    let held = vec![(PathBuf::from("/r/sub"), Some(42), Some(99))];
+    let held = vec![(PathBuf::from("/r/sub"), Some(42), None)];
     assert_eq!(recorded(&core, scope), held, "staging: recorded exempt");
 
     core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(1));
@@ -14563,17 +14877,23 @@ mod kernel_recursive_fanotify {
     );
   }
 
-  /// F3, kernel-recursive half: a COMPLETE whole-root walk is a GENERATION, and
-  /// device-only records it did not decline are retired.
+  /// A COMPLETE whole-root walk is a GENERATION, and every ledger entry it did
+  /// not decline is retired.
   ///
-  /// Nothing else can retire one here. The mount table cannot — the partition
-  /// exists because a subvolume is absent from every frame by construction — and
+  /// Nothing else can retire an exempt one here. No census lists a subvolume, and
   /// the compiled-removal pass reads the event stream, which is exactly what a
   /// loss window empties. So before this, one deletion lost to an overflow kept
-  /// its `PathBuf` for the scope's whole life, and every linear scan of the set
-  /// paid for it.
+  /// its `PathBuf` for the scope's whole life, and every linear scan of the
+  /// ledger paid for it.
+  ///
+  /// It runs over the WHOLE ledger, and the `Mount(77)` entry here is retired
+  /// with the rest: a walk that ran to completion from the root declined every
+  /// boundary that is still there, so one it did not decline is not there any
+  /// more — whatever the seam's two ids said it was. That is sound because the
+  /// ledger holds nothing a census owns, and because both callers carry their own
+  /// root-wide cover behind the report.
   #[test]
-  fn a_whole_root_walk_retires_the_device_only_records_it_did_not_decline() {
+  fn a_whole_root_walk_retires_the_ledger_entries_it_did_not_decline() {
     let (mut core, scope) = spawned_fanotify(Some(42), Vec::new());
     core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(0));
     assert!(
@@ -14596,7 +14916,7 @@ mod kernel_recursive_fanotify {
     assert_eq!(
       recorded(&core, scope).len(),
       4,
-      "staging: four records, three of them exempt"
+      "staging: four entries, three of them exempt"
     );
 
     // A PARTIAL walk retires nothing, whatever it declines: it saw one subtree.
@@ -14625,18 +14945,15 @@ mod kernel_recursive_fanotify {
     );
     assert_eq!(
       recorded(&core, scope),
-      vec![
-        (PathBuf::from("/r/a"), Some(42), Some(99)),
-        (PathBuf::from("/r/bound"), Some(77), Some(1)),
-      ],
-      "the two the walk did not decline are retired; the one it did survives, \
-       and the MOUNT-BACKED record is untouched — its removal is the refresh's, \
-       and it owes a cover this pass may not silence"
+      vec![(PathBuf::from("/r/a"), Some(42), None)],
+      "everything the complete walk did not decline is retired — the two \
+       subvolumes it no longer saw AND the bind, which a walk that reached every \
+       live boundary would have declined; only the one it did decline survives"
     );
     assert!(
       drain(&mut core).is_empty(),
-      "retiring an exempt record is not an event: it was never condemnable, so \
-       its presence obliged no cover and its absence withholds none"
+      "retiring is not an event: the callers of a complete generation each carry \
+       a root-wide cover of their own behind the report"
     );
 
     // An EMPTY whole-root walk is a generation too — the state the reconciliation
@@ -14650,10 +14967,9 @@ mod kernel_recursive_fanotify {
       ),
       at(1),
     );
-    assert_eq!(
-      recorded(&core, scope),
-      vec![(PathBuf::from("/r/bound"), Some(77), Some(1))],
-      "no boundary anywhere under the root retires the last exempt record"
+    assert!(
+      recorded(&core, scope).is_empty(),
+      "no boundary anywhere under the root retires the last entry"
     );
   }
 
@@ -14726,7 +15042,7 @@ mod kernel_recursive_fanotify {
     );
     assert_eq!(
       recorded(&core, scope),
-      vec![(location.clone(), Some(77), Some(9))],
+      vec![(location.clone(), Some(77), None)],
       "the declined boundary is RECORDED: the set is keyed by PathBuf, and the \
        walk answered both halves of its identity"
     );
@@ -14752,8 +15068,8 @@ mod kernel_recursive_fanotify {
     let held = recorded(&core, scope);
     assert!(
       !held.iter().any(|(path, ..)| path == Path::new("/r")),
-      "a boundary AT the root is still refused: no frame can ever match it, so a \
-       condemnable one would be covered and re-recorded on every tick: {held:?}"
+      "a boundary AT the root is still refused: no census can ever key it, so \
+       one would fail the scope closed for its whole life: {held:?}"
     );
     assert!(
       !held
@@ -14764,7 +15080,7 @@ mod kernel_recursive_fanotify {
     assert_eq!(
       held.len(),
       1,
-      "and the set is otherwise untouched: {held:?}"
+      "and the ledger is otherwise untouched: {held:?}"
     );
 
     // The departure. The record is mount-backed (its id is not the root's), so
@@ -14804,11 +15120,12 @@ mod kernel_recursive_fanotify {
   ///
   /// The seam has only a DOMINATING cover to give — a root-wide one — because a
   /// `record_boundary` observation carries no location the core may act on. The
-  /// refresh, arriving at the same fact through `FrameStep::Confirm`, covers the
-  /// BOUNDARY: one located `Rescan` instead of a re-read of the entire tree. So
-  /// the seam fills in and stays quiet, and the record deliberately keeps the
-  /// identity it holds so that the refresh can still SEE the disagreement when
-  /// the row lands.
+  /// next authoritative read, arriving at the same fact as a census ARRIVAL,
+  /// covers the BOUNDARY: one located `Rescan` instead of a re-read of the entire
+  /// tree. So the seam stays quiet, and the entry standing at the location is
+  /// left exactly as its own seam decided it — the containment rule refuses the
+  /// second observation rather than letting it align the entry with whatever
+  /// replaced what it describes.
   ///
   /// There was once an exception here, standing a prompt cover when the record
   /// carried an outstanding absence claim. It went with the claim: a scope that
@@ -14828,7 +15145,7 @@ mod kernel_recursive_fanotify {
       partial_walk(vec![idless_decline("/r/vol", 99)]),
       at(1),
     );
-    let held = vec![(PathBuf::from("/r/vol"), None, Some(99))];
+    let held = vec![(PathBuf::from("/r/vol"), None, None)];
     assert_eq!(
       recorded(&core, scope),
       held,
@@ -14887,16 +15204,16 @@ mod kernel_recursive_fanotify {
   /// It is the same defect [`DriverCore::on_root_recovered`] gates, on the other
   /// message that carries a complete generation. "What this walk did not decline
   /// is not there any more" names a particular ROOT MOUNT; applied under a
-  /// different one it deletes records for boundaries the walk never looked at —
-  /// and it deletes them from the one partition the mount table cannot see, so
+  /// different one it deletes entries for boundaries the walk never looked at —
+  /// and it deletes them from the one structure no mount table can rebuild, so
   /// nothing puts them back, no later departure there is derivable, the ground
   /// such a departure would reveal is never admitted, and its events drop with no
   /// signal at all.
   ///
   /// The RECORDING half goes with it, for the reason a superseded admission reply
-  /// is not put back either: a boundary read against another root enters carrying
-  /// an id `rebase_root_relative` has already run past, reads mount-backed under
-  /// the live frame, and is condemned by the next refresh.
+  /// records nothing either: a boundary read against another root has its
+  /// `Standing` decided against that root's id, which says nothing about this
+  /// one.
   ///
   /// **What the mismatch owes is a generation, not a cover.** A complete report is
   /// produced only behind a loss, and the `Overflow` immediately behind it on the
@@ -15015,7 +15332,7 @@ mod kernel_recursive_fanotify {
     );
     assert_eq!(
       recorded(&core, scope),
-      vec![(PathBuf::from("/r/a"), Some(77), Some(99))],
+      vec![(PathBuf::from("/r/a"), Some(77), None)],
       "and THAT generation lands: `/r/b` retires on a walk of the root this \
        scope actually holds"
     );
@@ -15040,14 +15357,14 @@ mod kernel_recursive_fanotify {
   /// the walk incomplete and reaches the core as no report at all — and every
   /// unknown frame leg in this design PASSES. It has to: below Linux 5.8 nothing
   /// in the system reports a mount id, so reading unknown as "different" would
-  /// leave such a host with no way to retire a device-only record ever again —
+  /// leave such a host with no way to retire an exempt entry ever again —
   /// the growth the generation exists to bound. The core-owned EPOCH beside it
   /// carries the check there, which is exactly why the id leg may degrade.
   ///
   /// MUTATION WITNESS (unknown read as different): compare with `walked !=
   /// state.root_mnt_id` in `on_walk_boundaries` and this FAILS at `an unknown
   /// frame PASSES` — the retirement refused, and with it the only removal path
-  /// the exempt partition has.
+  /// an exempt entry has.
   /// MUTATION WITNESS (every report disputes the frame): hoist the mismatch arm's
   /// `arm_refresh` above the `if` in `on_walk_boundaries`, so an APPLIED
   /// generation arms a read too, and it FAILS at `an applied generation disputes
@@ -15148,8 +15465,8 @@ mod kernel_recursive_fanotify {
     assert_eq!(
       recorded(&core, scope),
       vec![
-        (PathBuf::from("/r/a/deep"), Some(42), Some(99)),
-        (PathBuf::from("/r/a"), Some(42), Some(98)),
+        (PathBuf::from("/r/a/deep"), Some(42), None),
+        (PathBuf::from("/r/a"), Some(42), None),
       ],
       "the walk stopped AT `/r/a`, so it observed nothing below it and retires \
        nothing there"
@@ -15162,10 +15479,10 @@ mod kernel_recursive_fanotify {
   /// Linux allocates mount ids lowest-free. A root that goes A → B → A is back on
   /// the very id the core holds, while a generation still queued from the FIRST A
   /// describes a mount that no longer exists — and "what this walk did not decline
-  /// is not there any more" then retires device-only records for boundaries the
-  /// live incarnation never showed it. The mount table cannot restore that
-  /// partition, so those departures become underivable: the ground is never
-  /// admitted and its events drop with no signal at all.
+  /// is not there any more" then retires ledger entries for boundaries the live
+  /// incarnation never showed it. No mount table can restore them, so those
+  /// departures become underivable: the ground is never admitted and its events
+  /// drop with no signal at all.
   ///
   /// The second stamp is the core's own frame EPOCH, published down the control
   /// mailbox and sampled by the walk before it starts. It counts WORLDS, core-side,
@@ -15433,7 +15750,7 @@ mod kernel_recursive_fanotify {
     );
     assert_eq!(
       recorded(&core, scope),
-      vec![(PathBuf::from("/r/keep"), Some(42), Some(99))],
+      vec![(PathBuf::from("/r/keep"), Some(42), None)],
       "staging: one exempt record only a whole-root generation can retire"
     );
 
@@ -15475,9 +15792,9 @@ mod kernel_recursive_fanotify {
     let refused = drain(&mut core);
     assert_eq!(
       recorded(&core, scope),
-      // Root-relative, so each frame move REBASED it onto the id the root now
-      // carries — the record is the same record, and it is still there.
-      vec![(PathBuf::from("/r/keep"), Some(88), Some(99))],
+      // The seam decided its standing once, so no frame move touches it: the
+      // entry is the same entry, and it is still there.
+      vec![(PathBuf::from("/r/keep"), Some(88), None)],
       "the refused reply retires nothing: it walked a world this scope has left"
     );
     assert_eq!(
@@ -15502,7 +15819,7 @@ mod kernel_recursive_fanotify {
     );
     assert_eq!(
       recorded(&core, scope),
-      vec![(PathBuf::from("/r/other"), Some(88), Some(97))],
+      vec![(PathBuf::from("/r/other"), Some(88), None)],
       "the dominating reply's generation lands: what it did not decline is gone, \
        and what it did enters"
     );
@@ -15637,11 +15954,11 @@ mod kernel_recursive_fanotify {
   /// MUTATION WITNESS (never): disable the trigger and this FAILS at `exactly one
   /// whole-root recovery was asked for` with `left: 0, right: 1` — the silent-loss
   /// direction, and #74's own bug class on every 4.11–5.7 host.
-  /// MUTATION WITNESS (once): SPEND the obligation instead of holding it (mark
-  /// the records row-confirmed as the recovery goes out — the `bool` shape the
-  /// first design used) and it FAILS at `tick 3: and nothing LOCATED is asked for
-  /// either`: the record turns condemnable, the next refresh reads a departure
-  /// that never happened, and every one after it is silent.
+  /// MUTATION WITNESS (once): SPEND the obligation instead of holding it (drop
+  /// the entries as the recovery goes out — the `bool` shape the first design
+  /// used) and it FAILS at `tick 3: and nothing LOCATED is asked for either`: the
+  /// scope stops failing closed, the next refresh derives nothing, and every one
+  /// after it is silent.
   /// MUTATION WITNESS (routing): emit `Scope::Root` from the refresh instead of
   /// asking the source and it FAILS at `tick 2: nothing reaches the consumer on
   /// the verdict itself` — the consumer gets a cover for ground the FID map does
@@ -15652,7 +15969,7 @@ mod kernel_recursive_fanotify {
   /// table read, the read fails closed again, and the pair turns over as fast as
   /// the driver can run it.
   #[test]
-  fn an_ambiguous_record_recovers_the_whole_root_on_every_authoritative_refresh() {
+  fn an_unknown_entry_recovers_the_whole_root_on_every_authoritative_refresh() {
     let (mut core, scope) = spawned_fanotify(None, Vec::new());
     core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(0));
     assert!(
@@ -15669,7 +15986,7 @@ mod kernel_recursive_fanotify {
       partial_walk(vec![idless_decline("/r/vol", 99)]),
       at(1),
     );
-    let held = vec![(PathBuf::from("/r/vol"), None, Some(99))];
+    let held = vec![(PathBuf::from("/r/vol"), None, None)];
     assert_eq!(
       recorded(&core, scope),
       held,
@@ -15750,17 +16067,17 @@ mod kernel_recursive_fanotify {
   ///
   /// This is the cell that proves the fail-closed cost is not paid on modern
   /// kernels. `root_mnt_id` is read at spawn (a failure there is a spawn failure,
-  /// not a `None`), and every seam that mints a record reads the boundary's own id
-  /// from the fd it pinned — a `statx` that fails yields an incomplete walk or a
-  /// `Failed` probe and records nothing. So on Linux ≥ 5.8 a record is
-  /// row-confirmed, condemnable, or a proven subvolume, and never ambiguous.
+  /// not a `None`), and every seam that records reads the boundary's own id from
+  /// the fd it pinned — a `statx` that fails yields an incomplete walk or a
+  /// `Failed` probe and records nothing. So on Linux ≥ 5.8 an entry is `Mount` or
+  /// `SameMount`, and never `Unknown`.
   ///
   /// The fanotify backend requires `FAN_REPORT_TARGET_FID` (5.17), so it cannot
   /// run on a host that pays the cost at all — but the routing above must still be
   /// right, because the departure COLLAPSE reaches it on any kernel.
   ///
-  /// MUTATION WITNESS: make `fails_closed` answer `true` for a proven subvolume
-  /// as well (drop the `proven_subvolume` term from `ambiguous`) and this FAILS at
+  /// MUTATION WITNESS: make `fails_closed` answer `true` for a `SameMount` entry
+  /// as well (use `is_exempt` instead of the `Unknown` match) and this FAILS at
   /// `no whole-root recovery is ever asked for` with a non-empty left — every
   /// btrfs layout on every modern kernel would pay the id-less cost.
   #[test]
@@ -15810,7 +16127,7 @@ mod kernel_recursive_fanotify {
     );
     assert_eq!(
       recorded(&core, scope),
-      vec![(PathBuf::from("/r/subvol"), Some(42), Some(99))],
+      vec![(PathBuf::from("/r/subvol"), Some(42), None)],
       "and the proven subvolume is untouched by any of it"
     );
   }
@@ -15905,7 +16222,7 @@ mod kernel_recursive_fanotify {
     );
     assert_eq!(
       recorded(&core, scope),
-      vec![(PathBuf::from("/r/m0"), Some(100), Some(200))],
+      vec![(PathBuf::from("/r/m0"), Some(100), None)],
       "and the still-live boundary comes back as a fresh observation — the \
        witness a per-ticket `StillCovered` would have restored one at a time"
     );
@@ -15973,7 +16290,7 @@ mod kernel_recursive_fanotify {
   #[test]
   fn a_recorded_boundary_absorbs_what_is_observed_beneath_it() {
     let (mut core, scope) = spawned_fanotify(None, vec![idless_decline("/r/b", 99)]);
-    let held = vec![(PathBuf::from("/r/b"), None, Some(99))];
+    let held = vec![(PathBuf::from("/r/b"), None, None)];
     assert_eq!(
       recorded(&core, scope),
       held,
@@ -15994,30 +16311,30 @@ mod kernel_recursive_fanotify {
     );
   }
 
-  /// **F2**: a same-object re-mount of the ROOT moves `root_mnt_id`, and every
-  /// record whose identity is RELATIVE to it must move with it.
+  /// A same-object re-mount of the ROOT moves `root_mnt_id`, and a `SameMount`
+  /// entry does not move with it — because its standing was never a function of
+  /// the live root's id in the first place.
   ///
-  /// A subvolume is recorded carrying the ROOT's own mount id — that is the whole
-  /// evidence that it is not a vfsmount. The record's copy of that id is an
-  /// absolute captured value, so the moment the root's own id changes, every live
-  /// subvolume record differs from the root's and reads MOUNT-BACKED. Passing the
-  /// CURRENT frame to `condemnable` (which its doc already demands) is not enough
-  /// on its own; the records have to be rebased.
+  /// The seam read two ids at one instant and they agreed. That is a fact, and a
+  /// fact does not need maintaining. The predicate this replaced re-asked
+  /// `mnt_id == root_mnt_id` on every read, so the moment the root's own id
+  /// changed, every live subvolume entry read mount-backed at once and a whole
+  /// rebase pass existed only to walk that back.
   ///
-  /// On this profile the consequence is not one bad cover but an indefinite
-  /// storm: the departure retain removes the record, the admission walk correctly
-  /// answers `StillCovered` (the subvolume is still there), the core puts the
-  /// UNCHANGED old-id record back, and the next refresh derives the same false
+  /// On this profile the consequence was not one bad cover but an indefinite
+  /// storm: the departure retain removed the record, the admission walk correctly
+  /// answered `StillCovered` (the subvolume is still there), the core put the
+  /// UNCHANGED old-id record back, and the next refresh derived the same false
   /// departure again — forever. So the second refresh is asserted as well as the
   /// first: the first proves the misclassification is gone, the second proves the
   /// loop that fed it is gone with it.
   ///
-  /// Every frame is empty of rows, so nothing here can be an arrival cover; and
+  /// Every read here is empty of rows, so nothing can be an arrival cover; and
   /// this profile suppresses the `frame_changed` re-enumerate replay (one
   /// recursive mark already covers the whole subtree), so a cover here could only
   /// be a departure verdict.
   #[test]
-  fn a_root_remount_rebases_its_subvolume_records_instead_of_condemning_them() {
+  fn a_root_remount_leaves_its_same_mount_entries_alone() {
     let (mut core, scope) = spawned_fanotify(Some(42), Vec::new());
     core.on_mounts_refreshed(scope, framed_refresh(Vec::new(), true, Some(42)), at(0));
     assert!(
@@ -16032,8 +16349,8 @@ mod kernel_recursive_fanotify {
     );
     assert_eq!(
       recorded(&core, scope),
-      vec![(PathBuf::from("/r/sub"), Some(42), Some(99))],
-      "staging: a PROVEN subvolume — the root's own mount id, on another device"
+      vec![(PathBuf::from("/r/sub"), Some(42), None)],
+      "staging: a `SameMount` entry — the root's own mount id, on another device"
     );
 
     // `umount -l /r && mount --bind <same object> /r`: identity unchanged, so the
@@ -16047,9 +16364,9 @@ mod kernel_recursive_fanotify {
     );
     assert_eq!(
       recorded(&core, scope),
-      vec![(PathBuf::from("/r/sub"), Some(43), Some(99))],
-      "the record follows the root it is relative to — REBASED onto the new \
-       frame, so it is still proven rather than newly mount-backed"
+      vec![(PathBuf::from("/r/sub"), Some(43), None)],
+      "the entry is untouched: `SameMount` was decided at the seam, so no later \
+       frame can turn it into a departure witness"
     );
 
     // The second read is where the storm lived: `StillCovered` used to reinsert
@@ -16063,85 +16380,158 @@ mod kernel_recursive_fanotify {
     );
     assert_eq!(
       recorded(&core, scope),
-      vec![(PathBuf::from("/r/sub"), Some(43), Some(99))],
-      "one record, once, still proven"
+      vec![(PathBuf::from("/r/sub"), Some(43), None)],
+      "one entry, once, still `SameMount`"
     );
   }
 
-  /// **F2's class guard**, from the other side: a ROW-CONFIRMED record is NOT
-  /// rebased, because its identity is ABSOLUTE rather than root-relative.
+  /// A PARKED cover's location is a hint like any other, and a rename that moves
+  /// the ground while the round trip is out moves it too.
   ///
-  /// A mountinfo line listed a vfsmount at that location and reported ITS mount
-  /// id, which has nothing to do with the root's. Moving that id when the ROOT
-  /// re-mounts corrupts the one thing the replacement check compares against: the
-  /// very next read that lists the row reads a changed identity and fires a
-  /// same-path-remount cover for a mount nothing did to. So the rebase is guarded
-  /// on `!row_confirmed`, and this is the cell that holds the guard.
+  /// The departure is derived, its cover parks on an admission, and only then does
+  /// the directory above it get renamed. Unrebased, the reply releases the cover at
+  /// a path that no longer exists — `mount_cover` lowers it to a located `Rescan`
+  /// the consumer re-reads nothing for, while the revealed ground at the new path
+  /// stays dark. It is #74's own shape inside the admission window.
   ///
-  /// The record is constructed directly, and deliberately given the id the root
-  /// held before the re-mount — a real mountinfo row can never carry the root's
-  /// own mount id, so nothing else can stage the one shape the guard is about.
-  /// Mount ids RECYCLE eagerly (lowest-free), which is what makes the collision
-  /// worth guarding rather than dismissing.
+  /// Nothing else reads the parked location: the reply is matched by TICKET, so
+  /// moving it is the whole repair.
+  ///
+  /// MUTATION WITNESS: skip `state.pending_admits` in `rebase_hints` and this
+  /// FAILS at `the released cover lands where the ground is` — the Rescan comes
+  /// out at the stale `a/x`.
   #[test]
-  fn a_root_remount_does_not_rebase_a_row_confirmed_record() {
+  fn a_rename_moves_a_parked_covers_location_too() {
     let (mut core, scope) = spawned_fanotify(Some(42), Vec::new());
-    core.on_mounts_refreshed(scope, framed_refresh(Vec::new(), true, Some(42)), at(0));
-    assert!(
-      obliged(&drain(&mut core)).is_empty(),
-      "staging: empty baseline"
+    core.on_mounts_refreshed(
+      scope,
+      framed_refresh(vec![row("/r/a/x", 77, 99)], true, Some(42)),
+      at(0),
     );
+    let effects = drain(&mut core);
+    assert_eq!(
+      emits(&effects).len(),
+      1,
+      "staging: the census keys the mount and covers its arrival: {effects:?}"
+    );
+
+    // `umount -l /r/a/x`: the read no longer keys 77, so the departure parks.
+    core.on_mounts_refreshed(scope, framed_refresh(Vec::new(), true, Some(42)), at(1));
+    let parked_effects = drain(&mut core);
+    let parked = admissions(&parked_effects);
+    assert_eq!(
+      parked.len(),
+      1,
+      "staging: the cover parks: {parked_effects:?}"
+    );
+    assert_eq!(parked[0].1, PathBuf::from("/r/a/x"));
+
+    // `mv /r/a /r/b` WHILE the round trip is out.
+    feed(
+      &mut core,
+      scope,
+      vec![RawLinuxEvent::Fanotify(AdmittedEvent {
+        mask: FanMask::new(FAN_RENAME),
+        path: None,
+        rename: Some(AdmittedRename {
+          old_path: PathBuf::from("/r/a"),
+          new_path: PathBuf::from("/r/b"),
+        }),
+      })],
+    );
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects)
+        .iter()
+        .any(|c| c.kind().moved_from() == Some(&loc(&["a"])) && c.location() == &loc(&["b"])),
+      "staging: the rename pairs into one `Moved`: {effects:?}"
+    );
+
+    // The reply releases the cover, and it must land on the ground as it stands
+    // NOW.
+    let effects = answer_one_admission(&mut core, scope, &parked_effects, at(2));
+    let emitted = emits(&effects);
+    assert_eq!(emitted.len(), 1, "one released cover: {effects:?}");
+    assert_eq!(
+      emitted[0].location(),
+      &loc(&["b", "x"]),
+      "the released cover lands where the ground is, not at the label the \
+       departure was derived under: {emitted:?}"
+    );
+  }
+
+  /// Cell (g): a ROOT FRAME CHANGE with an unchanged table covers nothing at all.
+  ///
+  /// Mount ids are ABSOLUTE. A census row's key is the mount's own id and a
+  /// ledger entry's `Standing` was decided from the two ids one seam read at one
+  /// instant — neither is relative to the root's frame, so a same-object remount
+  /// of the root (unmount + rebind: the identity is unchanged, so the death gate
+  /// passes) moves nothing this scope holds. The census survives the change and
+  /// the very same table diffs to silence.
+  ///
+  /// That is the whole reason the root-relative rebase pass is gone rather than
+  /// generalised. The predicate it repaired asked `mnt_id == root_mnt_id` on
+  /// every read, so when the root's id moved, every subvolume record started
+  /// reading mount-backed at once and the rebase existed only to walk that back —
+  /// a maintenance pass for a derivation that should never have been re-derived.
+  ///
+  /// MUTATION WITNESS (drop the census on a frame change): clear `state.census`
+  /// when `frame_changed`, and this FAILS at `an unchanged table covers nothing`
+  /// — every row reads as an arrival.
+  #[test]
+  fn a_root_frame_change_with_an_unchanged_table_covers_nothing() {
+    let (mut core, scope) = spawned_fanotify(Some(42), Vec::new());
+    let table = || vec![row("/r/a", 10, 99), row("/r/b", 11, 98)];
+    core.on_mounts_refreshed(scope, framed_refresh(table(), true, Some(42)), at(0));
+    let effects = drain(&mut core);
+    assert_eq!(
+      emits(&effects).len(),
+      2,
+      "staging: both rows arrive and both are covered: {effects:?}"
+    );
+
+    // The root re-mounts onto 43. The table is byte-for-byte what it was.
+    core.on_mounts_refreshed(scope, framed_refresh(table(), true, Some(43)), at(1));
+    let effects = drain(&mut core);
+    assert!(
+      obliged(&effects).is_empty(),
+      "an unchanged table covers nothing across a root frame change — no cover, \
+       no admission, and no recovery: {effects:?}"
+    );
+    assert_eq!(
+      recorded(&core, scope),
+      vec![
+        (PathBuf::from("/r/a"), Some(10), Some(99)),
+        (PathBuf::from("/r/b"), Some(11), Some(98)),
+      ],
+      "and the census is the one the read installed, unrebased"
+    );
+
+    // With a SAME-MOUNT entry beside it — a subvolume recorded carrying the
+    // OLD root's id — the frame change is still silent about it. A design that
+    // re-derived provenance from the live root would read every one of these as
+    // mount-backed the instant the root moved, and condemn the lot.
     core
       .scopes
       .get_mut(&scope)
       .expect("scope is live")
-      .mounts_baseline
-      .push(MountRecord {
-        location: PathBuf::from("/r/vol"),
-        mnt_id: Some(42),
-        dev: Some(99),
-        row_confirmed: true,
+      .ledger
+      .push(LedgerEntry {
+        location: PathBuf::from("/r/subvol"),
+        standing: Standing::SameMount,
       });
-
-    // The root re-mounts onto 43, and the SAME read still lists the mount's own
-    // row, unchanged. Nothing happened to `/r/vol`, so nothing may be covered —
-    // but a rebase written on the id alone has just rewritten the record's mount
-    // id to 43, and this row's 42 then reads as a replacement.
-    core.on_mounts_refreshed(
-      scope,
-      framed_refresh(vec![row("/r/vol", 42, 99)], true, Some(43)),
-      at(1),
-    );
+    core.on_mounts_refreshed(scope, framed_refresh(table(), true, Some(44)), at(2));
     let effects = drain(&mut core);
     assert!(
       emits(&effects).is_empty() && admissions(&effects).is_empty(),
-      "a row-confirmed record's identity is ABSOLUTE: the root's re-mount moves \
-       it nowhere, so its own unchanged row is a confirm and not a replacement: \
-       {effects:?}"
+      "no false departure per subvolume: a `SameMount` entry joins no census, so \
+       a frame that moved under it condemns nothing: {effects:?}"
     );
     assert_eq!(
-      recorded(&core, scope),
-      vec![(PathBuf::from("/r/vol"), Some(42), Some(99))],
-      "and the identity the row proved is the identity still held"
+      recorded(&core, scope).last(),
+      Some(&(PathBuf::from("/r/subvol"), Some(44), None)),
+      "and it is held, untouched, under whichever frame the root is on now"
     );
-
-    // It stays condemnable, which is the other half of "not rebased": the frame
-    // that stops listing it is its departure, cover and all.
-    core.on_mounts_refreshed(scope, framed_refresh(Vec::new(), true, Some(43)), at(2));
-    let effects = drain(&mut core);
-    assert!(
-      recorded(&core, scope).is_empty(),
-      "a row-confirmed record is condemnable on ANY frame: {effects:?}"
-    );
-    let effects = answer_one_admission(&mut core, scope, &effects, at(3));
-    let emitted = emits(&effects);
-    assert_eq!(
-      emitted.len(),
-      1,
-      "and the departure is covered — never silently rebased into exemption: \
-       {effects:?}"
-    );
-    assert_eq!(emitted[0].location(), &loc(&["vol"]));
   }
 
   /// **R13 F1.** A whole-root generation REJECTED before this scope ever recorded
@@ -16259,7 +16649,7 @@ mod kernel_recursive_fanotify {
     );
     assert_eq!(
       recorded(&core, scope),
-      vec![(PathBuf::from("/r/vol"), Some(42), Some(99))],
+      vec![(PathBuf::from("/r/vol"), Some(42), None)],
       "and the exempt boundary finally enters the set: {effects:?}"
     );
 
@@ -16515,7 +16905,7 @@ mod kernel_recursive_fanotify {
     );
     assert_eq!(
       recorded(&core, scope),
-      vec![(PathBuf::from("/r/vol"), Some(42), Some(99))],
+      vec![(PathBuf::from("/r/vol"), Some(42), None)],
       "the exempt boundary the refused generation was carrying finally lands: \
        {effects:?}"
     );
@@ -16831,7 +17221,7 @@ mod kernel_recursive_fanotify {
     );
     assert_eq!(
       recorded(&core, scope),
-      vec![(PathBuf::from("/r/vol"), Some(42), Some(99))],
+      vec![(PathBuf::from("/r/vol"), Some(42), None)],
       "and the exempt boundary lands: {effects:?}"
     );
   }
@@ -16943,7 +17333,7 @@ mod kernel_recursive_fanotify {
     );
     assert_eq!(
       recorded(&core, scope),
-      vec![(PathBuf::from("/r/vol"), Some(42), Some(99))],
+      vec![(PathBuf::from("/r/vol"), Some(42), None)],
       "the exempt boundary lands on the reply that was already coming: {effects:?}"
     );
   }
@@ -17322,7 +17712,7 @@ mod kernel_recursive_fanotify {
     );
     assert_eq!(
       recorded(&core, scope),
-      vec![(PathBuf::from("/r/vol"), Some(42), Some(99))],
+      vec![(PathBuf::from("/r/vol"), Some(42), None)],
       "staging: the generation landed — the exempt boundary is in the set: \
        {applied:?}"
     );

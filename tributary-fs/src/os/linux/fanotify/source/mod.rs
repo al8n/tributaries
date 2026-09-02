@@ -1707,15 +1707,16 @@ fn descend(
     // rather than only the one whose own comparison needs it.
     //
     // This read used to sit BELOW the device belt, so a foreign-device decline was
-    // recorded with `mnt_id: None` — and an id-less record is what
-    // `MountRecord::condemnable` reads as device-only, i.e. permanently EXEMPT from
-    // every condemnation mechanism. That minted an exempt record from an observation
-    // that could not tell a real vfsmount from a same-mount subvolume, and the
-    // failure was reachable: a genuine mount that arrives after the spawn baseline,
-    // is first observed by a LIVE walk, and departs before any mountinfo refresh
-    // confirms a row at its location is then condemned by nothing at all — no
-    // departure cover, no admission request, and a revealed subtree the walk never
-    // seeded into the FID map. Fanotify goes silently blind there until some
+    // recorded with `mnt_id: None` — and an id-less observation is one the core's
+    // ledger can only hold as `Standing::Unknown`, which joins no census and is
+    // cleared only by a row standing at its location. That recorded an ambiguity
+    // from an observation that COULD tell a real vfsmount from a same-mount
+    // subvolume, and the failure was reachable: a genuine mount that arrives after
+    // the spawn census, is first observed by a LIVE walk, and departs before any
+    // mountinfo refresh lists it has its departure derived by nothing precise at
+    // all — no located cover, no admission request, and a revealed subtree the
+    // walk never seeded into the FID map. Fanotify goes silently blind there until
+    // some
     // unrelated whole-map reseed. The rule this now encodes, once, for every fence
     // in this walk: NEVER mint an exempt record from an observation that could not
     // have distinguished the two.

@@ -2363,8 +2363,9 @@ mod descending {
   async fn a_live_walks_declined_boundary_rides_the_lane_and_departs_from_the_set() {
     // The root sits on mount 42; the walk's decline names mount 77 — a
     // `mount --bind` of a same-superblock directory, which the device belt cannot
-    // see. Both halves known and unequal, so it is mount-backed and condemnable
-    // without waiting for a row to confirm it (and no row ever will).
+    // see. Both halves known and unequal, so the seam decides `Mount(77)` and the
+    // first census that does not key 77 derives its departure (and no census ever
+    // will key it).
     let fs = FakeFs::with_root_mnt_id(1, 42);
     fs.answer_refresh(Vec::new(), true);
     let rig = fanotify_rig_ticking(fs);
@@ -2541,17 +2542,15 @@ mod descending {
     );
   }
 
-  /// F3 on the WIRE: a WHOLE-ROOT walk report is a GENERATION, and it retires the
-  /// device-only records that walk did not decline — end to end on the real loop,
-  /// through the source's own ordered lane.
+  /// A WHOLE-ROOT walk report is a GENERATION, and it retires the ledger entries
+  /// that walk did not decline — end to end on the real loop, through the
+  /// source's own ordered lane.
   ///
-  /// The retirement itself emits nothing (a device-only record was never
-  /// condemnable, so its presence obliged no cover and its absence withholds
-  /// none), so the cell reads it through the ONE thing the record's presence does
-  /// change: a later table row at the same location is an ARRIVAL when no record
-  /// stands there, and merely a confirmation when one does. The row is given
-  /// exactly the identity the record held, so a record that SURVIVED would be
-  /// confirmed in silence — the two outcomes cannot be confused.
+  /// The retirement itself emits nothing (the callers of a complete generation
+  /// each carry a root-wide cover of their own behind the report), so the cell
+  /// reads it through the ONE thing an entry's presence does change: a later
+  /// table row at the same location is an ARRIVAL either way, but an entry that
+  /// SURVIVED is still held beside it and one that was retired is not.
   #[tokio::test(flavor = "multi_thread")]
   async fn a_whole_root_walk_report_retires_a_stale_device_only_record() {
     // Root on mount 42. The decline below names the SAME mount id on a different

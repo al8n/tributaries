@@ -218,81 +218,108 @@
 //! one.** A mount created after the watcher settles is seen by nothing else: no
 //! enumerate runs (there is no event), the fanotify walk is spawn-only, and no
 //! arm fires. So [`on_mounts_refreshed`](DriverCore::on_mounts_refreshed) diffs
-//! each authoritative read against
-//! [`mounts_baseline`](ScopeState::mounts_baseline) — the coverage set — and
-//! feeds one LOCATED COVER per transition, in BOTH directions:
+//! each authoritative read against the CENSUS the last one left
+//! ([`ScopeState::census`]) and feeds one LOCATED COVER per transition:
 //!
-//! - **departure**, a recorded mount-backed row gone from the read: cover, then
-//!   drop it;
-//! - **arrival**, a row absent from the set: cover — an appearing mount shadows
-//!   ground the consumer may already have enumerated, which is why
-//!   `compile::fsevents` covers the arrivals macOS signals — then record it;
-//! - **replacement**, a location whose `(mnt_id, dev)` changed: cover, and
-//!   re-record with the NEW identity. This is the same-path remount, and it is
-//!   why the set carries identity at all; `/proc/self/mountinfo` supplies both
-//!   fields on every row it already parses.
+//! - **departure**, a key gone from the read: cover at the census's location for
+//!   it;
+//! - **arrival**, a key absent from the census: cover — an appearing mount
+//!   shadows ground the consumer may already have enumerated, which is why
+//!   `compile::fsevents` covers the arrivals macOS signals;
+//! - **move**, the same key rendered somewhere else: cover BOTH, since the ground
+//!   it left is revealed and the ground it landed on is shadowed;
+//! - **replacement**, the same key at the same location on a different device:
+//!   cover.
 //!
 //! Nothing derived here touches the trust components at all, and that separation
 //! is what the two sets exist for: coverage asks what MOVED since the last read,
 //! trust asks what is foreign NOW, and their safety directions are opposite. The
 //! trust table's own replacement discipline is stated above.
 //!
-//! Which records may be CONDEMNED is a separate question from which enter, and
-//! the answer is the provenance partition on [`MountRecord`] — without it, a
-//! btrfs subvolume (device belt, root's own mount id, no table row ever) reads
-//! as departed on every single tick.
+//! ## Identity is the key, the path is a hint
 //!
-//! **Exempt from the DROP is not exempt from the COVER, and on an id-less host
-//! the scope FAILS CLOSED.** The exempt partition holds two populations, and
-//! reading them as one leaves #74 open on every kernel below 5.8. A record PROVEN
-//! to carry the root's own mount id is a subvolume and is silent forever. A
-//! record with an id unknown on either side is AMBIGUOUS — and on 4.11–5.7, where
-//! `statx(STATX_MNT_ID)` does not exist, that is the shape EVERY seam record
-//! takes, genuine vfsmounts included. One that lazy-unmounts before the next
-//! refresh leaves that refresh no row to upgrade it with, so nothing condemns it
-//! and the revealed subtree would stay dark.
+//! The census is keyed by the row's own mount id wherever the host answers one
+//! ([`Key`]), and #74 is the reason. `/proc/self/mountinfo` renders each row's
+//! path by its own `seq_path_root` call, and the namespace-generation bracket the
+//! read is taken inside certifies `(mnt_id, dev)` and nothing about the label —
+//! so the table is a coherent source of mount IDENTITY and a best-effort source
+//! of mount LOCATION. Keyed by the label instead, the bug reproduces with no torn
+//! read at all: a mount at `R/a/x`, then `mv R/a R/b`, then a lazy unmount of
+//! `R/b/x` derives the departure against a stale `R/a/x` and never covers the
+//! ground revealed at `R/b/x`.
 //!
-//! The answer is ONE scope-wide rule, not per-record bookkeeping:
+//! Locations survive as COVER-LOCATION HINTS, re-rooted the moment the core
+//! learns a directory moved ([`rebase_hints`](DriverCore::rebase_hints)) and
+//! lowered through [`mount_cover`], which degrades to the whole root for a hint
+//! it cannot spell — over-cover, never silence.
 //!
-//! > **While a scope holds ANY ambiguous record, every AUTHORITATIVE refresh
+//! ## Condemn on a TRANSITION, never on an ABSENCE
+//!
+//! Which boundaries may be covered-and-dropped is not a property any of them
+//! carries. A btrfs subvolume (device belt, root's own mount id, no table row
+//! ever) is in no census, so it transitions in none, so nothing here ever
+//! condemns it — the cover storm that a per-record provenance partition once
+//! existed to prevent is structurally impossible, with no partition at all. A
+//! key's PRESENCE obliges nothing; only a transition between two observations
+//! does.
+//!
+//! What a census cannot speak for is held in the LEDGER
+//! ([`ScopeState::ledger`]), and only a seam ever puts anything there. Each entry
+//! carries the [`Standing`] its own seam decided from the two ids it read, and
+//! that decision is a fact about one instant rather than a predicate re-evaluated
+//! against a root frame that moves:
+//!
+//! - [`Standing::Mount`] — an id that differs from the root's: a vfsmount seen
+//!   before any census listed it. It is the departure BELT for exactly the window
+//!   between that seam and the next authoritative read, which is where the join
+//!   spends it: listed, the census owns every later transition; unlisted, this is
+//!   the one place that departure was ever derivable.
+//! - [`Standing::SameMount`] — the ROOT's own mount id: a subvolume. No row will
+//!   ever list it, so it joins nothing and is condemned by nothing; the event
+//!   stream and the generations retire it.
+//! - [`Standing::Unknown`] — one id unanswerable, which is EVERY seam observation
+//!   on Linux 4.11–5.7 until stage 3 reads ids from `fdinfo`, genuine vfsmounts
+//!   included. Nothing can tell those two apart, so the scope pays for the
+//!   ambiguity at the coarsest granularity there is:
+//!
+//! > **While a scope holds ANY `Unknown` entry, every AUTHORITATIVE refresh
 //! > covers the WHOLE ROOT** ([`ScopeState::fails_closed`]).
 //!
 //! Three earlier designs tried to bound this per record — a spent-once `bool`, a
 //! generation stamp with a cadence, a saturation latch — and each produced a
 //! fresh defect, because on a host that answers no mount ids the storm sequence
 //! and the silent-loss sequence are the SAME sequence of observations: absent
-//! from every frame, re-declined by every crawl. No predicate over a per-record
-//! observation can separate them. The scope-wide rule does not try: it pays for
-//! every ambiguity at once, at the coarsest granularity there is.
+//! from every census, re-declined by every crawl. No predicate over a per-entry
+//! observation can separate them. The scope-wide rule does not try.
 //!
 //! **The cost is real and accepted.** On a 4.11–5.7 kernel whose root holds btrfs
-//! subvolumes, the record for each subvolume is ambiguous forever — no row will
-//! ever confirm it and no id will ever prove it — so the scope covers its whole
-//! root on every authoritative refresh, for the scope's life. That is
-//! correctness bought at a permanent per-refresh root cover, and it is the
-//! deliberate trade; see
+//! subvolumes, every seam entry is `Unknown` and only a census row standing at
+//! its location clears one — and no row ever stands at a subvolume — so the scope
+//! covers its whole root on every authoritative refresh, for as long as it holds
+//! one. That is correctness bought
+//! at a permanent per-refresh root cover, and it is the deliberate trade; see
 //! [`root_liveness_interval`](crate::WatcherOptions::root_liveness_interval).
 //!
-//! **Who actually pays is narrow.** On Linux ≥ 5.8 the ambiguous partition is
+//! **Who actually pays is narrow.** On Linux ≥ 5.8 the `Unknown` population is
 //! provably EMPTY: `root_mnt_id` is read at spawn or the source does not start,
 //! and every seam that records a boundary reads the id from the fd it already
-//! pinned (a `statx` that FAILS never mints a record at all). So a record is
-//! either row-confirmed, or id-bearing and therefore condemnable or proven — and
-//! `fails_closed` answers `false` for the life of the scope. The fanotify backend
-//! requires `FAN_REPORT_TARGET_FID` (5.17), so it can never run on a host that
-//! pays this at all.
+//! pinned (a `statx` that FAILS never mints an entry at all). So every entry is
+//! decided `Mount` or `SameMount`, and `fails_closed` answers `false` for the life
+//! of the scope. The fanotify backend requires `FAN_REPORT_TARGET_FID` (5.17), so
+//! it can never run on a host that pays this at all.
 //!
-//! A refusal at [`MAX_DEVICE_ONLY_BOUNDARIES`] needs no announcement of its own
-//! for the same reason: the bound only refuses when the partition is FULL of
-//! ambiguous records, which is exactly the state that already covers the whole
-//! root every refresh.
+//! A refusal at [`MAX_BOUNDARIES`] needs no announcement of its own for the same
+//! reason: the bound only refuses when the ledger is full of entries that may yet
+//! owe a cover, which on an id-less host is exactly the state that already covers
+//! the whole root every refresh.
 //!
-//! A world swap (spawn, replace, widen) SEEDS the set from its own barrier
-//! read rather than emptying it. The barrier read opens no authority, but the cold
-//! crawl that follows the swap declines coverage beneath every mount it finds, and
-//! the two are unordered detached jobs — so a prefix that departs in that window
-//! leaves an unenumerated subtree that an empty set could never make
-//! derivable, at that refresh or any later one.
+//! A world swap (spawn, replace, widen) SEEDS the census from its own barrier
+//! read rather than emptying it, and empties the ledger with the world it
+//! described. The barrier read opens no authority, but the cold crawl that follows
+//! the swap declines coverage beneath every mount it finds, and the two are
+//! unordered detached jobs — so a prefix that departs in that window leaves an
+//! unenumerated subtree that an empty census could never make derivable, at that
+//! refresh or any later one.
 //!
 //! ## Beside the detector: LATENCY seams, and PREVENTION
 //!
@@ -301,11 +328,11 @@
 //! - **latency seams** — the enumerate decline (`on_enumerated`), the os-layer
 //!   WALKS ([`on_walk_boundaries`](DriverCore::on_walk_boundaries)) and a
 //!   boundary-bearing probe answer ([`record_probe_boundary`]) record what they
-//!   observe into the same set ([`record_boundary`]). For a vfsmount that is
-//!   latency ONLY: the refresh sees everything they see, so a seam merely closes
-//!   the window between an observation and the next tick. For a DEVICE-ONLY
-//!   boundary they are the sole observers there will ever be, and what they
-//!   record there is never condemned.
+//!   observe into the LEDGER ([`record_boundary`]). For a vfsmount that is
+//!   latency ONLY: the next census keys everything they see, so a seam merely
+//!   closes the window between an observation and that read. For a boundary no
+//!   census will ever list they are the sole observers there will ever be, and
+//!   what they record there transitions in no census and is condemned by none.
 //! - **prevention** — an arm that would land ACROSS the scope frame is REFUSED
 //!   by the executor rather than installed ([`ScopeFrame`] rides every
 //!   [`Effect::AddWatch`]). This is the only guard on an arm the enumerate fence
@@ -354,8 +381,8 @@
 //! move-out), a whole-map `reseed`, and the orphan eviction that fires when a
 //! parent chain breaks — and a shadowed directory's parent chain is intact. So
 //! event-learned ground survives a shadow window and resumes on its own; only the
-//! ground the walk DECLINED — which is exactly what the coverage set records —
-//! was never mapped at all. The whole-map reseed is the one removal that can undo
+//! ground the walk DECLINED — which is exactly what the ledger records — was
+//! never mapped at all. The whole-map reseed is the one removal that can undo
 //! this (its walk stops at the live mount and drops what is under it), and that
 //! case lands back in the same place: the boundary is recorded, so its departure
 //! walks the revealed ground in.
@@ -363,17 +390,16 @@
 //! **A refusal records nothing, and that is deliberate.** A failed arm reaches
 //! the Monitor's `Err` arm, which emits a located `Rescan`, books a
 //! level-persistent slot deficit and drops the node — it queues no enumerate and
-//! calls no re-arm. For a MOUNT-BACKED crossing the recorder is this refresh's
-//! ARRIVAL side, whose cover re-arms a crawl that re-runs the decline, and the
-//! reconcile heals the deficit. For a DEVICE-ONLY crossing there is no row, no
-//! arrival and no crawl: the slot stays a deficit re-signalled ahead of every
-//! sync cookie — signalled, not silent — and that is the ACCEPTED terminal for
-//! that case, not an omission to be repaired later.
+//! calls no re-arm. For a boundary a census will key the recorder is the next
+//! read's ARRIVAL side, whose cover re-arms a crawl that re-runs the decline, and
+//! the reconcile heals the deficit. For one no census will ever list there is no
+//! row, no arrival and no crawl: the slot stays a deficit re-signalled ahead of
+//! every sync cookie — signalled, not silent — and that is the ACCEPTED terminal
+//! for that case, not an omission to be repaired later.
 //!
-//! **Device-only records have their own lifecycle, because the refresh cannot
-//! give them one.** They are exempt from the partition, so no frame ever
-//! condemns them; three mechanisms retire them instead, and each covers a case
-//! the others cannot:
+//! **The EXEMPT ledger entries have their own lifecycle, because no census can
+//! give them one.** Three mechanisms retire them, and each covers a case the
+//! others cannot:
 //!
 //! - [`retire_removed_boundaries`](DriverCore::retire_removed_boundaries) — a
 //!   compiled `Removed`/`MovedFrom`/`DeleteSelf`/`MoveSelf` says the location is
@@ -385,14 +411,14 @@
 //!   thing for the KERNEL-RECURSIVE profile, which runs no enumerate at all.
 //!
 //! **Whatever applies WALK-DERIVED state must know which root the walk ran under**,
-//! because a coverage set is relative to the scope's descent frame and a walk that
-//! ran under another one describes a different world. The appliers, and where each
-//! stands:
+//! because a walk's declines are relative to the scope's descent frame and a walk
+//! that ran under another one describes a different world. The appliers, and where
+//! each stands:
 //!
 //! - [`on_walk_boundaries`](DriverCore::on_walk_boundaries) and
 //!   [`on_root_recovered`](DriverCore::on_root_recovered) — the two messages that
-//!   carry a COMPLETE generation, and the two that retire from the exempt
-//!   partition. Both are checked against the root mount id their walk fenced
+//!   carry a COMPLETE generation, and the two that retire the exempt ledger
+//!   entries. Both are checked against the root mount id their walk fenced
 //!   against, and the recovery (which answers a request) against the frame epoch it
 //!   was issued at as well.
 //! - [`on_stream_spawned`](DriverCore::on_stream_spawned),
@@ -401,7 +427,7 @@
 //!   from the same barrier read whose declines it records, so the generation and
 //!   the frame it is relative to cannot disagree.
 //! - [`on_admitted`](DriverCore::on_admitted) — already stamped: a reply whose
-//!   [`PendingAdmit::epoch`] is not the scope's puts nothing back.
+//!   [`PendingAdmit::epoch`] is not the scope's records nothing.
 //! - [`on_mounts_refreshed`](DriverCore::on_mounts_refreshed) — stamped by
 //!   construction: `crate::os::mount_sample` takes the table and the root's stat
 //!   inside ONE proven-still mount-namespace generation, and a stale or cross-world
@@ -418,11 +444,11 @@
 //!   be unlinked while a mount is on it), the second evaluates
 //!   [`ScopeFrame::crossed_by`] against the live frame at ingest.
 //!
-//! Above all three retirement mechanisms sits [`MAX_DEVICE_ONLY_BOUNDARIES`], an
+//! Above all three retirement mechanisms sits [`MAX_BOUNDARIES`], an
 //! unconditional bound that holds when every one of them has failed. Without it a churning subvolume
 //! layout whose deletions were repeatedly lost retained one `PathBuf` per missed
-//! deletion for the life of the scope, and every linear scan of the set paid for
-//! it.
+//! deletion for the life of the scope, and every linear scan of the ledger paid
+//! for it.
 
 use std::{
   collections::{BTreeMap, BTreeSet, VecDeque},
@@ -481,15 +507,13 @@ pub(crate) enum ProbeOutcome {
     ///
     /// Carried for exactly one reason, and it is a correctness one rather than
     /// a convenience: [`record_probe_boundary`] records what a probe answer
-    /// reveals about a mount boundary (SEAM 4), and a boundary observation
-    /// with no mount id is one [`MountRecord::condemnable`] classifies as
-    /// DEVICE-ONLY — permanently exempt from every condemnation mechanism. A
-    /// probe that answered a device alone therefore minted an exempt record
-    /// for a mount it had no way to recognise as a mount, and a genuine mount
-    /// first observed by such a probe and departing before a refresh confirmed
-    /// a row at its location had its departure derived by nothing at all.
+    /// reveals about a mount boundary (SEAM 4), and a boundary observation with
+    /// no mount id enters the ledger [`Standing::Unknown`] on a host that
+    /// answers ids — indistinguishable from a subvolume, and failing the whole
+    /// scope closed. A probe that answered a device alone therefore made every
+    /// boundary it saw ambiguous on a kernel that could have named it exactly.
     /// Answering the id keeps `None` meaning "the host cannot say", which is
-    /// the one reading the provenance partition is sound under.
+    /// the one reading [`Standing::decide`] is sound under.
     mnt_id: Option<u64>,
   },
   /// The probe failed (permission, I/O); existence is unknowable.
@@ -562,271 +586,181 @@ pub(crate) struct MountRefresh {
   pub(crate) root_incarnation: Option<crate::os::RootIncarnation>,
 }
 
-/// One recorded boundary under a watched root: a [`MountRow`]'s facts plus the
-/// PROVENANCE that decides whether it may ever be condemned.
+/// One row of the CENSUS: what an authoritative mount-table read observed, keyed
+/// by the thing two successive reads may be diffed on.
 ///
-/// # The provenance partition
+/// # Identity is the key, the path is a hint
 ///
-/// A fence decline does not imply a mountinfo row, and that asymmetry is the
-/// whole reason this type is not just a row. [`crosses_mount_boundary`] fires on
-/// `device_boundary || mount_boundary`, so a **btrfs subvolume** inside the root
-/// trips the DEVICE belt while carrying the root's own `mnt_id`: it is not a
-/// vfsmount, it has no mountinfo row EVER, and no read of the table will ever
-/// list it. Treating such a record's absence from a frame as a departure is a
-/// permanent cover storm — one cover per subvolume per tick, on every default
-/// snapper / Fedora / docker-btrfs layout.
+/// `/proc/self/mountinfo` renders every row's path by its own `seq_path_root`
+/// call, and the namespace-generation bracket the read is taken inside certifies
+/// the row's `(mnt_id, dev)` and nothing about its label — so the table is a
+/// coherent source of mount IDENTITY and a best-effort source of mount LOCATION.
+/// A set keyed by the label leaves #74 open with no torn read at all: a mount at
+/// `R/a/x`, then `mv R/a R/b`, then a lazy unmount of `R/b/x`, derives its
+/// departure at the stale `R/a/x` and never covers the ground revealed at
+/// `R/b/x`.
 ///
-/// So records are partitioned, and only one partition is condemnable:
-///
-/// - **mount-backed** — the record's `mnt_id` differs from the scope's
-///   `root_mnt_id`, OR a table read has confirmed a row at its location. This is
-///   the partition the departure detection is about.
-/// - **device-only** — `mnt_id` equal to the root's, or unknown, with no row
-///   ever seen. EXEMPT from condemnation. It is not a mount and cannot depart;
-///   its lifecycle is the ordinary event flow, since deleting a subvolume emits
-///   real delete events on its parent.
-///
-/// # Why provenance is an upgrade and never a birth-time verdict
-///
-/// [`row_confirmed`](Self::row_confirmed) is a STICKY upgrade rather than a
-/// classification taken once at record time, because the `mnt_id` disjunct is
-/// vacuous on the kernels that need it most. Below Linux 5.8 there is no
-/// `STATX_MNT_ID`: `root_mnt_id` is `None`, every row's `mnt_id` is `None`, and
-/// the disjunct answers "not mount-backed" for genuine vfsmounts as readily as
-/// for subvolumes. Freeze that at birth and every mount on those kernels — and
-/// on macOS, whose table answers no id either — is permanently exempt, which
-/// silently un-fixes #74 there. The row disjunct is what rescues them: a table
-/// read that LISTS a location proves a vfsmount is there, whatever the kernel
-/// will say about ids, and that proof outlives the read that made it.
+/// So the key is the identity, and the location is carried as the COVER-LOCATION
+/// hint — rebased when the core learns the directory it names was renamed
+/// ([`rebase_moved`]) and lowered through [`mount_cover`], which degrades to the
+/// whole root for a hint it cannot spell.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct MountRecord {
-  /// Where the boundary is.
+struct CensusRow {
+  /// What identifies this row across two reads.
+  key: Key,
+  /// Where this read rendered it.
   location: PathBuf,
-  /// The boundary's mount id, if anything that observed it could answer one.
-  mnt_id: Option<u64>,
-  /// The boundary's device, if anything that observed it could answer one.
+  /// The device mounted here, where the host answers one.
   dev: Option<u64>,
-  /// STICKY: an authoritative mount-table read has listed a row at this
-  /// location, so a vfsmount is (or was) really there. Set on the read that
-  /// records the row and on every later read that confirms it; never cleared
-  /// short of the record being dropped or the whole set replaced by a world
-  /// swap. This is the provenance upgrade — see the type doc.
-  row_confirmed: bool,
 }
 
-impl MountRecord {
-  /// Records a table row. A row IS the confirming evidence, so it enters
-  /// already upgraded — this is the row disjunct applied at the first moment it
-  /// can be.
-  fn confirmed(row: &MountRow) -> Self {
-    Self {
-      location: row.location.clone(),
-      mnt_id: row.mnt_id,
-      dev: row.dev,
-      row_confirmed: true,
+/// What a census row is diffed ON — the mount's own id wherever the host answers
+/// one, and its rendered location where none exists.
+///
+/// The two are never mixed for one row: a row HAS an id or it does not, so
+/// `Location` is the honest degrade for a host whose table answers no ids at all
+/// (macOS `getfsstat`, a fake) rather than a fallback within one read. A key
+/// CHANGE at one location — `Location(L)` becoming `Id(x)` because a host started
+/// answering ids — reads as a departure plus an arrival at the same `L`, which
+/// the cover deduplication collapses into the single cover it is.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Key {
+  /// The mount's own id, unique among live mounts.
+  Id(u64),
+  /// The rendered location, where the host answers no mount id. A same-path
+  /// remount is then observable only through the row's device, and a mount that
+  /// MOVES reads as one departure plus one arrival — the honest degrade, and
+  /// still two covers.
+  Location(PathBuf),
+}
+
+/// One boundary a SEAM observed, held only for as long as no census row speaks
+/// for it.
+///
+/// # Why anything is held at all
+///
+/// [`crosses_mount_boundary`] fires on `device_boundary || mount_boundary`, so a
+/// **btrfs subvolume** inside the root trips the DEVICE belt while carrying the
+/// root's own mount id: it is not a vfsmount, it has no mountinfo row EVER, and
+/// no read of the table will ever list it. A mount, by contrast, is listed by
+/// every read — but only from the next one, so a seam that observed one closes
+/// the window between the observation and that read.
+///
+/// Two obligations, one type, and the [`Standing`] decided at the seam is what
+/// separates them: the mount half is a departure BELT the census takes over on
+/// its first read, and the subvolume half is a boundary the census can never
+/// speak for at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LedgerEntry {
+  /// Where the boundary is — the cover-location hint, rebased on a rename
+  /// exactly as a census row's is.
+  location: PathBuf,
+  /// What the seam's own two ids said this boundary is.
+  ///
+  /// The device the seam also read is deliberately NOT held. A census row is
+  /// diffed on its device (that is the same-place replacement), but an entry is
+  /// joined by ID or by the location a row stands at, and neither reads a device
+  /// — so storing one would be a field nothing decides anything from.
+  standing: Standing,
+}
+
+/// What a seam's own reading said a boundary IS — decided once, at the seam,
+/// from the two ids it read, and never re-derived from a value some later
+/// observation put in this scope's state.
+///
+/// # Why the seam decides and nothing re-decides
+///
+/// The predicate this replaced asked `mnt_id == root_mnt_id` on every read, over
+/// a `root_mnt_id` that moves under a live scope (a same-object unmount + rebind
+/// of the root is supported) — so every subvolume's record started reading
+/// mount-backed at once, and a rebase pass existed solely to walk that back. Both
+/// ids are read at the seam, against the frame in force there; a comparison of
+/// two values from the same instant is a fact, and a fact does not need
+/// maintaining.
+///
+/// The `None` trap the old birth-time verdict fell into was reading `None ==
+/// None` as "not mount-backed". Here an unanswerable id is its own standing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Standing {
+  /// The seam read an id that DIFFERS from the root's: a vfsmount, observed
+  /// before any census listed it. The census owns it from its next read — either
+  /// by listing it (nothing owed) or by not listing it, which is the departure
+  /// this entry is the belt for.
+  Mount(u64),
+  /// The seam read the ROOT's own mount id: a btrfs subvolume, or anything else
+  /// on the root's own mount. No mountinfo row will ever list it, so it joins no
+  /// census and is condemned by none; it leaves only by the event stream or by a
+  /// complete generation.
+  SameMount,
+  /// One of the two ids was unanswerable — the whole of Linux 4.11–5.7, where
+  /// `statx(STATX_MNT_ID)` does not exist, and any host whose frame could not be
+  /// read. Nothing here can tell a genuine vfsmount from a same-mount subvolume,
+  /// so the scope FAILS CLOSED while one is held
+  /// ([`ScopeState::fails_closed`]) rather than guessing in either direction.
+  Unknown,
+}
+
+impl Standing {
+  /// What the seam's two ids decide, and the whole of the decision: two known
+  /// ids that agree put the boundary on the root's own mount, two that disagree
+  /// name another one, and an unanswerable half is its own answer.
+  const fn decide(root_mnt_id: Option<u64>, mnt_id: Option<u64>) -> Self {
+    match (root_mnt_id, mnt_id) {
+      (Some(root), Some(mnt)) if root == mnt => Self::SameMount,
+      (Some(_), Some(mnt)) => Self::Mount(mnt),
+      _ => Self::Unknown,
     }
   }
 
-  /// Records a boundary a SEAM observed — a declined dir entry, an os-layer
-  /// walk's decline, a probe answer — rather than a table row. Enters NOT
-  /// row-confirmed: nothing has listed a mountinfo row here, so provenance rests
-  /// on the `mnt_id` disjunct alone until some later refresh confirms one.
-  ///
-  /// This is the constructor that first makes the device-only partition
-  /// non-empty. A btrfs subvolume reaches it carrying the ROOT's own mount id
-  /// (it trips the device belt, not the mount fence), which is exactly the shape
-  /// [`condemnable`](Self::condemnable) answers `false` to — and must keep
-  /// answering `false` to, or every tick covers and re-records it forever.
-  fn observed(location: PathBuf, dev: Option<u64>, mnt_id: Option<u64>) -> Self {
-    Self {
-      location,
-      mnt_id,
-      dev,
-      row_confirmed: false,
-    }
-  }
-
-  /// Whether this record may be CONDEMNED — covered and dropped — by a refresh
-  /// that no longer lists it.
-  ///
-  /// Evaluated against the scope's CURRENT frame, never a captured one: a
-  /// same-object re-mount moves `root_mnt_id`, and a record's provenance has to
-  /// follow the root it is relative to.
-  ///
-  /// **Passing the current frame is not enough on its own** — the RECORD's side
-  /// of the comparison is a captured absolute value, so when the root's id moves
-  /// under a live scope every subvolume record (whose id equalled the OLD root)
-  /// starts reading mount-backed and the whole exempt partition is condemned at
-  /// once. [`rebase_root_relative`] is what actually honours this doc: it moves
-  /// every non-row-confirmed record that WAS the root's id onto the new one,
-  /// before any condemnation reads them.
-  fn condemnable(&self, root_mnt_id: Option<u64>) -> bool {
-    self.row_confirmed
-      || matches!((self.mnt_id, root_mnt_id), (Some(mnt), Some(root)) if mnt != root)
-  }
-
-  /// Whether this exempt record is PROVEN to sit on the root's own mount — a
-  /// genuine subvolume, and the only thing that may leave the coverage set with
-  /// no cover and no re-observation.
-  ///
-  /// [`condemnable`](Self::condemnable) answering `false` does NOT mean "not a
-  /// mount", and reading it that way is the mistake this predicate exists to
-  /// stop. The exempt partition holds two populations that only look alike:
-  ///
-  /// - **proven** — both ids known and EQUAL. Nothing that is a vfsmount can
-  ///   carry the root's own mount id, so this record describes something the
-  ///   mount table will never list. It obliges nothing, ever, and no later
-  ///   observation can promote it.
-  /// - **ambiguous** — either id unknown. On pre-5.8 Linux, with the
-  ///   `STATX_MNT_ID` mask unset, or on any host whose frame could not be read,
-  ///   a GENUINE post-baseline vfsmount is recorded in exactly this shape and
-  ///   stays in it until an authoritative mountinfo row upgrades it
-  ///   ([`row_confirmed`](Self::row_confirmed)). That upgrade is the only thing
-  ///   standing between it and permanent exemption, and it can only reach a
-  ///   record that is still in the set.
-  ///
-  /// So the two are treated differently everywhere a record is dropped without
-  /// a cover: see [`make_room_for_device_only`].
-  fn proven_subvolume(&self, root_mnt_id: Option<u64>) -> bool {
-    !self.row_confirmed
-      && matches!((self.mnt_id, root_mnt_id), (Some(mnt), Some(root)) if mnt == root)
-  }
-
-  /// The OTHER half of the exempt partition: a record neither condemnable nor
-  /// proven — one of the two ids is unknown, so nothing here can tell a genuine
-  /// vfsmount from a same-mount subvolume.
-  ///
-  /// This is the population the scope-wide FAIL-CLOSED rule
-  /// ([`ScopeState::fails_closed`]) exists for, and the reason "exempt" may not
-  /// mean "silent". It is not a rare corner: on every Linux 4.11–5.7 host
-  /// `statx(STATX_MNT_ID)` does not exist, so the scope's frame is `None`, every
-  /// seam observation carries `mnt_id: None`, and EVERY seam record under the
-  /// root is ambiguous.
-  ///
-  /// The two halves of the exempt partition are therefore read very differently
-  /// on an absence: a PROVEN record stays silent forever (no vfsmount can carry
-  /// the root's own mount id, so its absence from a frame is evidence of
-  /// nothing), while the mere PRESENCE of an ambiguous one anywhere in the set
-  /// makes every authoritative refresh cover the whole root — whether or not that
-  /// particular record is in this frame, and without any per-record bookkeeping
-  /// at all.
-  ///
-  /// It is a question about the CURRENT frame, never a captured one, exactly as
-  /// [`condemnable`](Self::condemnable) is: an ambiguous record whose root later
-  /// answers an id stops being ambiguous, and the scope stops failing closed.
-  fn ambiguous(&self, root_mnt_id: Option<u64>) -> bool {
-    !self.condemnable(root_mnt_id) && !self.proven_subvolume(root_mnt_id)
+  /// Whether no census will ever speak for this entry — the population only a
+  /// complete generation can reconcile, and the one the retirement passes and
+  /// [`ScopeState::holds_exempt_record`] are about.
+  const fn is_exempt(self) -> bool {
+    matches!(self, Self::SameMount | Self::Unknown)
   }
 }
 
-/// Moves every record whose identity is RELATIVE to the root's mount frame onto
-/// the frame's new value — the step [`MountRecord::condemnable`]'s own doc
-/// promises ("a record's provenance has to follow the root it is relative to")
-/// and which passing the current frame alone cannot deliver.
+/// The census one authoritative read produces: one row per table row, keyed by
+/// the row's own mount id where the host answers one and by its rendered location
+/// where it does not.
 ///
-/// # The state this repairs
-///
-/// A record's `mnt_id` is a captured ABSOLUTE value, but for the exempt
-/// partition its MEANING is relative: a btrfs subvolume is recorded carrying the
-/// root's own mount id, and that is the entire evidence that it is not a
-/// vfsmount. A same-object unmount+rebind of the root — supported, and the case
-/// `root_mnt_id`'s re-adoption exists for — moves the root's id, and from that
-/// moment every such record's id differs from the root's and reads MOUNT-BACKED.
-///
-/// The consequence is a false departure cover per subvolume on every such
-/// remount, and it used to be an indefinite rescan storm on a kernel-recursive
-/// scope: the departure retain removed the record, the admission walk correctly
-/// answered [`StillCovered`](crate::os::AdmitOutcome::StillCovered) (the
-/// subvolume is still there), the core put the UNCHANGED old-id record back, and
-/// the next refresh derived the same false departure again — forever. The
-/// put-back now re-records what the walk actually READ ([`restored_boundary`]),
-/// which lands the record back on the current frame and ends the repetition; this
-/// pass is still what stops the false condemnation, and its cover, from happening
-/// at all.
-///
-/// # Why `!row_confirmed` is the whole guard
-///
-/// A row-confirmed record's identity is absolute: a mountinfo line listed a
-/// vfsmount at that location and reported ITS id, which has nothing to do with
-/// the root's. Rebasing one would forge a subvolume out of a real mount. Only the
-/// seam-observed records can be root-relative, and among those only the ones that
-/// actually held the previous root's id are moved — an ambiguous record carrying
-/// no id at all has no relative identity to repair.
-///
-/// # Nothing PARKED needs this
-///
-/// [`PendingAdmit`] holds condemned records across a round trip, and none of them
-/// can be root-relative: parking requires the record to be condemnable (absolute
-/// — row-confirmed, or an id that differs from the root's) or ambiguous (one id
-/// unknown) against the frame IN FORCE when it was parked, and a record whose id
-/// equals that frame's root id is [`proven_subvolume`](MountRecord::proven_subvolume),
-/// which is neither. So the frame in force at parking is the "previous" frame at
-/// the next change, and no parked record is ever eligible.
-fn rebase_root_relative(records: &mut [MountRecord], previous: u64, current: u64) {
-  for record in records {
-    if !record.row_confirmed && record.mnt_id == Some(previous) {
-      record.mnt_id = Some(current);
-    }
-  }
+/// A repeated KEY is dropped, keeping the first. Ids are unique among live mounts
+/// and today's parse yields at most one row per location, so a repeat is a
+/// malformed read rather than a stacked mount — and keeping it would put one
+/// mount in the census twice, where the next diff would derive its arrival twice
+/// and its departure twice. Several rows at one LOCATION are ordinary and stay
+/// (that is what keys them apart).
+fn census_of(rows: &[MountRow]) -> Vec<CensusRow> {
+  let mut seen: BTreeSet<Key> = BTreeSet::new();
+  rows
+    .iter()
+    .filter_map(|row| {
+      let key = match row.mnt_id {
+        Some(id) => Key::Id(id),
+        None => Key::Location(row.location.clone()),
+      };
+      seen.insert(key.clone()).then(|| CensusRow {
+        key,
+        location: row.location.clone(),
+        dev: row.dev,
+      })
+    })
+    .collect()
 }
 
-/// Which record goes back into the coverage set when an admission answers
-/// [`StillCovered`](crate::os::AdmitOutcome::StillCovered) — the CONDEMNED one,
-/// or a fresh observation of whatever the walk actually found.
+/// Re-roots every location at-or-under `from` onto `to` — the rename repair, run
+/// over the census and the ledger together.
 ///
-/// # Why the condemned record cannot simply be put back
-///
-/// `StillCovered` fires on [`ScopeFrame`](crate::os::ScopeFrame)'s two
-/// independent fences, so it means "a boundary is here", never "the same boundary
-/// is here". The shape that separates the two is ordinary: a real mount ON TOP OF
-/// a btrfs subvolume. The mount owns a mountinfo row, so its record is
-/// row-confirmed and therefore condemnable; when it departs, the walk re-opens the
-/// location and finds the SUBVOLUME — a different device, the ROOT's own mount id,
-/// and no table row ever.
-///
-/// Putting the condemned record back there restores `row_confirmed` over an
-/// object no mount table will ever list, and the state never converges: the next
-/// authoritative refresh finds that row absent, condemns it again, parks another
-/// admission, gets the same answer, and emits another cover — one round trip and
-/// one `Rescan` per tick for the life of the scope. It is the same indefinite
-/// storm [`rebase_root_relative`] exists to prevent, reached by a different door.
-///
-/// # The rule, and why each leg converges
-///
-/// The identity the walk read is the same `(dev, mnt_id)` a table row or a seam
-/// observation reports, so it can simply be believed:
-///
-/// - **it MATCHES the condemned record** (no known half disagrees — the same
-///   `(Some, Some)` discipline [`identity_changed`] applies everywhere else): the
-///   verdict was wrong about a live mount that never went anywhere, so the record
-///   goes back WHOLE. That is the only way to preserve the sticky
-///   [`row_confirmed`](MountRecord::row_confirmed) a re-observation would drop —
-///   which for a boundary carrying the root's own mount id is the difference
-///   between condemnable and permanently exempt. A host that answers no mount ids
-///   takes this leg for everything, which is the honest degrade: it cannot tell
-///   two incarnations apart, so it claims no replacement.
-/// - **it DIFFERS**: what is standing there is not what departed, and the record
-///   for it is exactly what a seam that observed it would record — NOT
-///   row-confirmed, carrying the observed identity and nothing inherited. For the
-///   subvolume that is a [`proven_subvolume`](MountRecord::proven_subvolume):
-///   exempt, so no later refresh condemns it, no further cover, and the very next
-///   refresh is silent. For a mount that REPLACED the departed one it is
-///   condemnable through the id disjunct, and the next authoritative refresh
-///   listing its row confirms it in place — no cover either way, because the
-///   cover for this transition has already gone out.
-///
-/// Nothing is inherited across the mismatch leg on purpose: a half the walk could
-/// not answer is unknown, and filling it from the record that just departed would
-/// claim the new object carries the old mount's identity.
-fn restored_boundary(
-  condemned: &MountRecord,
-  dev: Option<u64>,
-  mnt_id: Option<u64>,
-) -> MountRecord {
-  if identity_changed(condemned.dev, dev) || identity_changed(condemned.mnt_id, mnt_id) {
-    return MountRecord::observed(condemned.location.clone(), dev, mnt_id);
-  }
-  condemned.clone()
+/// A [`Key::Location`] key IS a location and moves with it; a [`Key::Id`] key is
+/// absolute and does not. That asymmetry is the point: an id-keyed row survives a
+/// rename as the same row with a new hint, while an id-less host's row is simply
+/// a path and follows the path.
+fn rebase_moved(location: &mut PathBuf, from: &Path, to: &Path) -> bool {
+  let Ok(rest) = location.strip_prefix(from) else {
+    return false;
+  };
+  *location = to.join(rest);
+  true
 }
 
 /// One departure whose cover is PARKED on an outstanding admission round trip —
@@ -845,39 +779,29 @@ fn restored_boundary(
 /// all: the verdict is made here and the walk runs on the reader thread, so the
 /// two are a round trip and the cover has to survive it.
 ///
-/// # It carries the whole record, not just the location
+/// # It carries a LOCATION, not a record
 ///
-/// A CONDEMNED record is TAKEN out of the coverage set by the verdict that parks
-/// it, and one answer — [`StillCovered`](crate::os::AdmitOutcome::StillCovered)
-/// — means a boundary is standing at the location after all, so something must go
-/// back. The condemned record is held because it is the only thing that can go
-/// back when the verdict was simply WRONG about a mount that never left: a
-/// freshly-observed record enters NOT row-confirmed, which for a same-mount-id
-/// boundary is the difference between condemnable and permanently exempt.
+/// The verdict that parks it is a TRANSITION between two censuses, and a
+/// transition is spent the moment it is derived: there is no record to hold and
+/// nothing to put back. What the round trip still needs is the place the cover
+/// must land, and one answer — [`StillCovered`](crate::os::AdmitOutcome::StillCovered)
+/// — is a fresh SEAM observation of whatever is standing there, which enters the
+/// ledger on its own terms through [`record_boundary`] like any other seam's.
 ///
-/// It is not put back unconditionally. `StillCovered` also answers for a boundary
-/// that is NOT the one that departed — the subvolume a real mount was sitting on
-/// — and restoring a row-confirmed record over one of those never converges. The
-/// walk's own reading decides between the two; see [`restored_boundary`].
-///
-/// Only a CONDEMNED record is ever parked. An ambiguous record's absence parks
-/// nothing at all — it is not a departure verdict but the trigger for the
-/// scope-wide fail-closed rule ([`ScopeState::fails_closed`]), whose whole-root
-/// recovery carries its own admission and its own cover.
-///
-/// # What the put-back can and cannot reinstate
-///
-/// The re-record guard is what keeps a reply that was already in flight from
-/// undoing a discharge: if a seam recorded a fresh record at the location while
-/// the round trip was out, the guard finds it standing there and pushes nothing.
-/// One record per location, always.
+/// That is what ended an indefinite storm the put-back it replaced produced. A
+/// real mount ON TOP OF a btrfs subvolume departs; the walk re-opens the location
+/// and finds the subvolume, whose id is the root's own; restoring the departed
+/// mount's row over it made every later refresh find that row absent, condemn it
+/// again, park again, and emit one cover per tick for the life of the scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingAdmit {
   /// The round trip this cover waits on.
   ticket: crate::os::AdmitTicket,
-  /// The record the departure verdict condemned, held intact for the refusal
-  /// path.
-  record: MountRecord,
+  /// Where the departure was derived — where the cover lands when the reply
+  /// releases it. Rebased on a rename like every other hint
+  /// ([`rebase_hints`](DriverCore::rebase_hints)), because the ground can move
+  /// while the round trip is out.
+  location: PathBuf,
   /// The scope's [`frame_epoch`](ScopeState::frame_epoch) when this was parked.
   /// A reply that comes back against a different one is answered by a whole-root
   /// recovery instead of on its own terms — see
@@ -2521,59 +2445,76 @@ struct ScopeState {
   /// event-side device trust is refused. Revoked by every loss signal — a
   /// dropped window may have carried a mount transition.
   mounts_authoritative: bool,
-  /// The COVERAGE set: every boundary under the root this scope currently
-  /// believes is there, with the identity it was last observed at and the
-  /// provenance that says whether it may be condemned ([`MountRecord`]).
+  /// The CENSUS: the mount rows the last AUTHORITATIVE read observed, keyed by
+  /// identity ([`CensusRow`]).
   ///
-  /// Diffing the next authoritative table read against it in BOTH directions is
-  /// the primary mount detector:
+  /// Two successive censuses diffed BY KEY are the primary mount detector, and
+  /// every verdict it produces is a TRANSITION between two observations rather
+  /// than anything this scope stored as an obligation:
   ///
-  /// - a row here and gone from the read DEPARTED with no signal at all — #74's
+  /// - a key here and gone from the read DEPARTED with no signal at all — #74's
   ///   lazy unmount, which emits no `IN_UNMOUNT`, no hangup and no `Rescan`;
-  /// - a row in the read and absent here ARRIVED, shadowing ground the consumer
+  /// - a key in the read and absent here ARRIVED, shadowing ground the consumer
   ///   may already have enumerated (`compile::fsevents`' `plan_mount` covers the
   ///   arrival macOS signals, and the class of mount created after a watcher
   ///   settles is observed by no seam at all);
-  /// - the same location at a different `(mnt_id, dev)` was REPLACED — the
-  ///   same-path remount, which a paths-only set cannot express.
+  /// - the same key at a NEW location MOVED — covered at both, which is also what
+  ///   makes cross-read id recycling benign;
+  /// - the same key at the same location on a different device was REPLACED.
+  ///
+  /// **Condemn on a transition, never on an absence.** A btrfs subvolume has no
+  /// row and never will, so it is in no census, so it transitions in none: the
+  /// cover storm a provenance partition once existed to prevent is structurally
+  /// impossible here, with no partition at all.
   ///
   /// Deliberately SEPARATE from [`mounts`](Self::mounts), and deliberately not a
   /// replacement for it. The table serves DEVICE TRUST, where a stale extra
   /// prefix only ever vetoes (safe) and a missing one grants trust that was never
   /// proven (unsafe) — so its install must stay a union. Coverage wants the
   /// opposite direction: there the stale extra prefix is exactly what HIDES a
-  /// departure. Keeping the two apart lets this one shrink on a table read while
-  /// the trust table never does; nothing here ever reaches [`device_trusted`].
+  /// departure. Keeping the two apart lets this one be replaced on a table read
+  /// while the trust table never shrinks; nothing here ever reaches
+  /// [`device_trusted`].
   ///
-  /// What enters it, and what may be CONDEMNED from it, are two different
-  /// questions — that separation is the provenance partition on
-  /// [`MountRecord`], and dissolving it storms on every btrfs layout. Today
-  /// every record originates in a table read (an authoritative refresh, or a
-  /// world swap's own barrier read — the SAME `mounts_under` read, so the two
-  /// diff cleanly), which is why every record is presently mount-backed; the
-  /// device-only partition exists for the seam observations that are the only
-  /// thing that will ever see a subvolume, and is enforced from here so it
-  /// cannot be dissolved by a later change that never meets a btrfs root.
+  /// Replaced whole by every authoritative read and by every world swap's barrier
+  /// read — never merely cleared. The old root's table proves nothing about the
+  /// new root's, but the new root's barrier read proves plenty: the cold crawl
+  /// declines coverage beneath every mount it finds, and crawl and first refresh
+  /// are unordered, so a prefix that departs in that window is a departure nobody
+  /// would otherwise ever derive (an empty census reads the post-departure table
+  /// as an arrival-only frame and stays silent about the ground). Seeding is
+  /// conservative in the cover direction and touches no authority:
+  /// `mounts_authoritative` is unaffected by what lands here.
   ///
-  /// Replaced whole on every world swap — never merely cleared. The old root's
-  /// table proves nothing about the new root's, but the new root's barrier read
-  /// proves plenty: the cold crawl declines coverage beneath every mount it
-  /// finds, and crawl and first refresh are unordered, so a prefix that departs
-  /// in that window is a departure nobody would otherwise ever derive (an empty
-  /// set installs the post-departure frame silently and stays silent forever
-  /// after). Seeding is conservative in the cover direction and touches no
-  /// authority: `mounts_authoritative` is unaffected by what lands here.
-  mounts_baseline: Vec<MountRecord>,
+  /// A root FRAME change rebases nothing here. Mount ids are absolute, so the
+  /// census survives a same-object remount of the root and the next read diffs
+  /// against it — a remount that moved no mount is then quiet, rather than
+  /// covering every mount under the root as an arrival.
+  census: Vec<CensusRow>,
+  /// The LEDGER: the boundaries a SEAM observed that no census row speaks for
+  /// ([`LedgerEntry`]).
+  ///
+  /// It holds exactly what the census cannot. A [`Standing::Mount`] entry is a
+  /// vfsmount seen before any census listed it, and the belt for the window
+  /// between the two — the census takes it over on its very next read. A
+  /// [`Standing::SameMount`] entry is a subvolume the census will never list, and
+  /// only the event stream or a complete generation retires it. A
+  /// [`Standing::Unknown`] entry is a host that cannot tell those apart, and it
+  /// fails the scope closed until a census row stands at its location.
+  ///
+  /// Bounded by [`MAX_BOUNDARIES`], which holds when every reconciliation has
+  /// failed.
+  ledger: Vec<LedgerEntry>,
   /// Departure covers PARKED on an outstanding admission round trip — see
   /// [`PendingAdmit`]. Only ever non-empty on a fanotify scope, whose source is
   /// the only one that admits by membership and can therefore be blind to ground
   /// a departed mount revealed.
   ///
-  /// Bounded by the boundaries actually recorded under the root: a record is
-  /// TAKEN OUT of [`mounts_baseline`](Self::mounts_baseline) by the same verdict
-  /// that parks it, so no later refresh can re-derive that departure and park a
-  /// second round trip for it. Every entry is retired by exactly one reply, by a
-  /// world swap, or by the scope's own death.
+  /// Bounded by the transitions actually derivable under the root: the census
+  /// row (or ledger entry) whose disappearance parks one is gone from the state
+  /// by the same step, so no later refresh can re-derive that departure and park
+  /// a second round trip for it. Every entry is retired by exactly one reply, by
+  /// a world swap, or by the scope's own death.
   pending_admits: Vec<PendingAdmit>,
   /// An [`Effect::RefreshMounts`] is outstanding; repeated loss signals
   /// coalesce onto it instead of stacking effects.
@@ -2824,85 +2765,85 @@ impl ScopeState {
     }
   }
 
-  /// Whether any DEVICE-ONLY record sits at a direct child of `dir` — the cheap
+  /// Whether any EXEMPT ledger entry sits at a direct child of `dir` — the cheap
   /// precondition [`DriverCore::on_enumerated`] asks before paying anything at
   /// all for [`retire_relisted_boundaries`]'s bookkeeping.
   ///
-  /// False for every scope whose records all came from mount-table rows, which
-  /// is every scope in production today, so an enumerate over a directory with
-  /// no exempt record under it does exactly the work it did before.
-  fn holds_device_only_under(&self, dir: &Path) -> bool {
-    let root_frame = self.root_mnt_id;
+  /// Exempt is [`Standing::SameMount`] or [`Standing::Unknown`]: the entries a
+  /// census never takes over, and therefore the only ones a listing has to
+  /// reconcile. A [`Standing::Mount`] entry is dropped by the very next
+  /// authoritative refresh's join whatever a listing does, so it is not worth a
+  /// per-entry scan of every enumerate to catch one earlier.
+  ///
+  /// False for every scope holding no seam-observed subvolume, which is every
+  /// scope in production today, so an enumerate over a directory with no exempt
+  /// entry under it does exactly the work it did before.
+  fn holds_exempt_under(&self, dir: &Path) -> bool {
     self
-      .mounts_baseline
+      .ledger
       .iter()
-      .any(|record| !record.condemnable(root_frame) && record.location.parent() == Some(dir))
+      .any(|entry| entry.standing.is_exempt() && entry.location.parent() == Some(dir))
   }
 
-  /// **The fail-closed trigger.** Whether this scope holds ANY
-  /// [`ambiguous`](MountRecord::ambiguous) record — one whose identity cannot
-  /// tell a genuine vfsmount from a same-mount subvolume, on either side of the
-  /// comparison.
+  /// **The fail-closed trigger.** Whether this scope holds any
+  /// [`Standing::Unknown`] entry — a boundary whose seam could not tell a genuine
+  /// vfsmount from a same-mount subvolume, because one of the two ids was
+  /// unanswerable.
   ///
   /// While it answers `true`, every AUTHORITATIVE refresh covers the WHOLE root
-  /// (see [`DriverCore::on_mounts_refreshed`]). Not the ambiguous record's own
-  /// location, not once per record, not on a cadence: one root cover per frame
-  /// that was actually read, for as long as any ambiguity is held.
+  /// (see [`DriverCore::on_mounts_refreshed`]). Not the entry's own location, not
+  /// once per entry, not on a cadence: one root cover per frame that was actually
+  /// read, for as long as any such entry is held.
   ///
   /// # Why the trigger is scope-wide and the cover is root-wide
   ///
-  /// An ambiguous record cannot say whether the boundary it names is still
-  /// there, and a refresh that does not list it cannot say either — the mount
-  /// table never lists a subvolume, and never lists a vfsmount whose row the
-  /// host cannot key by id. Three successive designs tried to pay for that
-  /// per record: covering once (permanent silent loss, once the one cover was
-  /// spent), covering on a generation cadence (the stamp was cleared by the
-  /// re-listing that the cover's own crawl produced), and latching a refusal
-  /// (one latch silenced every later refused boundary). Each failed the same
-  /// way, because on an id-less host a re-observation of an ambiguous boundary
-  /// is bit-for-bit identical whether it is the old mount or a new one. There is
-  /// no evidence to key a per-record decision to, so no per-record decision is
-  /// made.
+  /// An `Unknown` entry cannot say whether the boundary it names is still there,
+  /// and a census that stands nowhere at its location cannot say either — the mount table
+  /// never lists a subvolume, and never lists a vfsmount whose row the host
+  /// cannot key by id. Three successive designs tried to pay for that per entry:
+  /// covering once (permanent silent loss, once the one cover was spent),
+  /// covering on a generation cadence (the stamp was cleared by the re-listing
+  /// that the cover's own crawl produced), and latching a refusal (one latch
+  /// silenced every later refused boundary). Each failed the same way, because on
+  /// an id-less host a re-observation of such a boundary is bit-for-bit identical
+  /// whether it is the old mount or a new one. There is no evidence to key a
+  /// per-entry decision to, so no per-entry decision is made.
   ///
   /// # The cost, stated plainly
   ///
   /// On a 4.11–5.7 kernel with btrfs subvolumes under the root this is a
-  /// PERMANENT per-refresh whole-root cover: the subvolume's record is ambiguous
-  /// forever, nothing can ever upgrade or condemn it, and so nothing ever clears
-  /// the trigger. That is accepted — correctness over cost — and documented on
+  /// PERMANENT per-refresh whole-root cover: every seam entry there is `Unknown`,
+  /// and only a census row at the location or a retirement pass clears one. That
+  /// is accepted — correctness over cost — and documented on
   /// [`root_liveness_interval`](crate::WatcherOptions::root_liveness_interval),
   /// which is the knob that prices it.
   ///
   /// # Who never pays
   ///
-  /// On Linux ≥ 5.8 this is `false` for the life of every scope: `root_mnt_id`
-  /// is read at spawn (a failure there is a spawn failure, not a `None`), and
-  /// every seam that mints a record reads the boundary's own id from the fd it
-  /// pinned — a `statx` that fails yields an incomplete walk or a `Failed` probe
-  /// and records nothing. So every record is row-confirmed, condemnable, or a
-  /// proven subvolume, and the ambiguous partition is empty.
+  /// On Linux ≥ 5.8 this is `false` for the life of every scope: `root_mnt_id` is
+  /// read at spawn (a failure there is a spawn failure, not a `None`), and every
+  /// seam that records reads the boundary's own id from the fd it pinned — a
+  /// `statx` that fails yields an incomplete walk or a `Failed` probe and records
+  /// nothing. So every entry is decided `Mount` or `SameMount`, and the `Unknown`
+  /// population is empty.
   fn fails_closed(&self) -> bool {
-    let root_frame = self.root_mnt_id;
     self
-      .mounts_baseline
+      .ledger
       .iter()
-      .any(|record| record.ambiguous(root_frame))
+      .any(|entry| matches!(entry.standing, Standing::Unknown))
   }
 
-  /// Whether this scope holds ANY record the mount table cannot speak for — the
-  /// EXEMPT partition ([`MountRecord`]'s device-only half), which no mountinfo row
-  /// ever lists and which therefore only a complete whole-root generation can
-  /// reconcile.
+  /// Whether this scope holds ANY boundary the mount table cannot speak for — the
+  /// EXEMPT entries ([`Standing::SameMount`] and [`Standing::Unknown`]), which no
+  /// mountinfo row ever lists and which therefore only a complete whole-root
+  /// generation can reconcile.
   ///
-  /// A scope holding none of them needs no generation at all: every record it has
-  /// is condemnable, so the table diff derives arrivals, replacements and
-  /// departures on its own, and a refused generation costs it nothing.
+  /// A scope holding none of them needs no generation at all: everything it holds
+  /// is either a census row or a [`Standing::Mount`] entry the next join settles,
+  /// so the table diff derives arrivals, replacements and departures on its own
+  /// and a refused generation costs it nothing.
   fn holds_exempt_record(&self) -> bool {
-    let root_frame = self.root_mnt_id;
-    self
-      .mounts_baseline
-      .iter()
-      .any(|record| !record.condemnable(root_frame))
+    self.ledger.iter().any(|entry| entry.standing.is_exempt())
   }
 
   /// Whether a complete whole-root generation is owed the coverage set — either
@@ -3392,7 +3333,8 @@ impl DriverCore {
         mount_table: Vec::new(),
         learned_mounts: Vec::new(),
         mounts_authoritative: false,
-        mounts_baseline: Vec::new(),
+        census: Vec::new(),
+        ledger: Vec::new(),
         pending_admits: Vec::new(),
         refresh_pending: false,
         refresh_stale: false,
@@ -4437,12 +4379,15 @@ impl DriverCore {
         // ever a cost.
         //
         // The seed IS a table read (the same `mounts_under` the refresh runs), so
-        // it enters row-confirmed and the first refresh diffs against it cleanly:
-        // a still-mounted row is merely CONFIRMED and covers nothing, while a
-        // departed one is condemnable on the strength of the row this seed saw.
-        // A probe-learned foreign-device prefix ([`learn_device`]) still never
-        // gets in.
-        state.mounts_baseline = meta.mounts.iter().map(MountRecord::confirmed).collect();
+        // the first refresh diffs against it cleanly: a still-mounted row's key is
+        // in both censuses and covers nothing, while a departed one is a
+        // transition on the strength of the row this seed saw. The LEDGER is
+        // emptied with the old world rather than seeded — nothing a seam observed
+        // under the previous root describes this one — and this world's own seed
+        // walk refills it below. A probe-learned foreign-device prefix
+        // ([`learn_device`]) still never gets in.
+        state.census = census_of(&meta.mounts);
+        state.ledger.clear();
         install_mount_table(state, meta.mounts.into_iter().map(|row| row.location));
         // The old world's learned prefixes describe a root this scope no longer
         // watches (a birth has none), so they go with the rest of that world. Nothing
@@ -4641,12 +4586,12 @@ impl DriverCore {
   /// # Seam 1 — the decline is also an OBSERVATION
   ///
   /// The lowering below is the single site where a boundary-crossing dir entry is
-  /// declined, and it holds everything the coverage set wants: the location, the
+  /// declined, and it holds everything the ledger wants: the location, the
   /// entry's device, and its mount id. So each decline is RECORDED
-  /// ([`record_boundary`]), and this is the first place a DEVICE-ONLY record is
-  /// ever produced — a btrfs subvolume trips the belt with the root's own mount
-  /// id and has no mountinfo row, so the refresh will never see it and the
-  /// provenance partition must keep it out of every condemnation mechanism.
+  /// ([`record_boundary`]), and this is the first place a [`Standing::SameMount`]
+  /// entry is ever produced — a btrfs subvolume trips the belt with the root's
+  /// own mount id and has no mountinfo row, so no census will ever list it and
+  /// none can ever condemn it.
   ///
   /// The dir GATE is deliberate and stays. A file-target bind — the
   /// `resolv.conf` class, ubiquitous in containers — is never declined here and
@@ -4668,16 +4613,16 @@ impl DriverCore {
         // the identity mint both read `self`), then recorded once the walk is
         // over. Order is preserved, so the containment rule inside
         // `record_boundary` sees the same set it would have seen entry by entry.
-        let mut declined: Vec<(PathBuf, u64, Option<u64>)> = Vec::new();
+        let mut declined: Vec<(PathBuf, Option<u64>)> = Vec::new();
         // SEAM 1's RETIRING half. A complete listing re-observes every child of
         // this directory, which makes it the descending profile's generation for
-        // the DEVICE-ONLY partition — the one partition no refresh can ever
-        // retire. `reconcile` is empty unless this scope actually holds a
-        // device-only record at a child of `dir`, which is every scope in
-        // production today, so the per-entry work below costs nothing at all in
-        // the common case. An INCOMPLETE listing reconciles nothing: an absent
-        // name proves nothing about a read that was cut short.
-        let collect_kept = complete && state.holds_device_only_under(&dir);
+        // the EXEMPT ledger entries — the ones no census can ever retire.
+        // `reconcile` is empty unless this scope actually holds such an entry at a
+        // child of `dir`, which is every scope in production today, so the
+        // per-entry work below costs nothing at all in the common case. An
+        // INCOMPLETE listing reconciles nothing: an absent name proves nothing
+        // about a read that was cut short.
+        let collect_kept = complete && state.holds_exempt_under(&dir);
         let mut kept: Vec<PathBuf> = Vec::new();
         for entry in entries {
           let Ok(name) = core::str::from_utf8(&entry.name) else {
@@ -4703,7 +4648,7 @@ impl DriverCore {
             if collect_kept {
               kept.push(path.clone());
             }
-            declined.push((path, entry.dev, entry.mnt_id));
+            declined.push((path, entry.mnt_id));
             FileKind::Other
           } else {
             entry.kind
@@ -4726,15 +4671,12 @@ impl DriverCore {
           if reconcile {
             retire_relisted_boundaries(state, &dir, &kept);
           }
-          // Recording owes the seam nothing back. A boundary the bound REFUSES is
-          // refused only when the device-only partition is full of AMBIGUOUS
-          // records, which is exactly the state in which every authoritative
-          // refresh already covers this whole root — so the listing is not
-          // degraded and no located cover is stood here. The seam that once did
-          // both needed a saturation latch to keep it from storming, and that
-          // latch silenced every refusal after the first.
-          for (location, dev, mnt_id) in declined {
-            record_boundary(state, &location, Some(dev), mnt_id);
+          // Recording owes the seam nothing back — see [`record_boundary`]. The
+          // seam that once stood a located cover for a refused observation needed
+          // a saturation latch to keep it from storming, and that latch silenced
+          // every refusal after the first.
+          for (location, mnt_id) in declined {
+            record_boundary(state, &location, mnt_id);
           }
         }
         if complete && !lossy {
@@ -4913,7 +4855,8 @@ impl DriverCore {
     state.generation_applied();
     state.pending_recovery = None;
     state.published_epoch = None;
-    state.mounts_baseline = meta.mounts.iter().map(MountRecord::confirmed).collect();
+    state.census = census_of(&meta.mounts);
+    state.ledger.clear();
     install_mount_table(state, meta.mounts.into_iter().map(|row| row.location));
     // The old world's learned prefixes describe a root this scope no longer
     // watches (a birth has none), so they go with the rest of that world. Nothing
@@ -5273,7 +5216,8 @@ impl DriverCore {
     state.generation_applied();
     state.pending_recovery = None;
     state.published_epoch = None;
-    state.mounts_baseline = meta.mounts.iter().map(MountRecord::confirmed).collect();
+    state.census = census_of(&meta.mounts);
+    state.ledger.clear();
     install_mount_table(state, meta.mounts.into_iter().map(|row| row.location));
     // The old world's learned prefixes describe a root this scope no longer
     // watches (a birth has none), so they go with the rest of that world. Nothing
@@ -5363,17 +5307,15 @@ impl DriverCore {
   /// it actually opened, which is evidence no later path-based re-derivation
   /// could reproduce honestly.
   ///
-  /// Provenance is [`record_boundary`]'s to settle, exactly as it is for seam 1
-  /// and seam 4 — a decline is not a mountinfo row, so every record enters
-  /// NOT row-confirmed and a btrfs subvolume among them stays exempt forever.
+  /// The [`Standing`] is [`record_boundary`]'s to settle from the ids the walk
+  /// read, exactly as it is for seam 1 and seam 4.
   ///
   /// # A WHOLE-ROOT report also RETIRES
   ///
   /// A complete walk from the root is not just a list of additions: it is a
   /// generation, and the only one a kernel-recursive profile ever gets. The
-  /// mount table cannot retire a device-only record — the partition exists
-  /// precisely because a subvolume is absent from every frame by construction —
-  /// and the compiled-removal pass
+  /// mount table cannot retire an exempt ledger entry — a subvolume is absent
+  /// from every census by construction — and the compiled-removal pass
   /// ([`retire_removed_boundaries`](Self::retire_removed_boundaries)) reads the
   /// event stream, which a loss window empties. So without this, one lost
   /// deletion kept its record for the scope's life.
@@ -5439,9 +5381,10 @@ impl DriverCore {
   /// # Nothing is owed back at the bound
   ///
   /// A decline the bound REFUSES is a boundary this scope cannot derive a
-  /// departure for — but the bound only refuses when the device-only partition
-  /// is full of AMBIGUOUS records, and such a scope already covers its whole root
-  /// on every authoritative refresh ([`ScopeState::fails_closed`]). The
+  /// departure for — but the bound only refuses when the ledger is full of
+  /// entries that may yet owe a cover, and on a host that cannot key them such a
+  /// scope already covers its whole root on every authoritative refresh
+  /// ([`ScopeState::fails_closed`]). The
   /// per-refusal `Overflow` this seam used to stand needed a saturation latch to
   /// keep it from storming (it re-observes the same boundaries on every later
   /// walk), and that latch silenced every refusal after the first.
@@ -5512,9 +5455,10 @@ impl DriverCore {
   /// [`arm_refresh`](Self::arm_refresh) takes `effects`) so it composes with a
   /// `&mut ScopeState` borrowed out of `self.scopes`.
   ///
-  /// Each location travels as the record's own absolute path, not as anything
-  /// derived from the root: it was recorded from a mount-table row (or a seam
-  /// observation) under this very root, and the walk addresses it directly.
+  /// Each location travels as the absolute path the transition was derived at,
+  /// not as anything re-derived from the root: it came off a census row (or a
+  /// ledger entry) under this very root, rebased onto any rename the core saw,
+  /// and the walk addresses it directly.
   ///
   /// # Why the burst is ONE effect
   ///
@@ -5533,20 +5477,19 @@ impl DriverCore {
     admit_seq: &mut u64,
     scope: ScopeId,
     state: &mut ScopeState,
-    departed: Vec<MountRecord>,
+    departed: Vec<PathBuf>,
   ) {
     if departed.is_empty() {
       return;
     }
     let requests = departed
       .into_iter()
-      .map(|record| {
+      .map(|location| {
         *admit_seq += 1;
         let ticket = crate::os::AdmitTicket::new(*admit_seq);
-        let location = record.location.clone();
         state.pending_admits.push(PendingAdmit {
           ticket,
-          record,
+          location: location.clone(),
           epoch: state.frame_epoch,
         });
         crate::os::AdmitRequest {
@@ -5918,12 +5861,14 @@ impl DriverCore {
   /// never collide with one the new world parked.
   ///
   /// The three answers and what each still owes are
-  /// [`AdmitOutcome`](crate::os::AdmitOutcome)'s; the one that is not just a
-  /// cover is [`StillCovered`](crate::os::AdmitOutcome::StillCovered), where a
-  /// boundary is still standing at the location and must go back into the set or
-  /// its own departure is underivable. WHICH record goes back is
-  /// [`restored_boundary`]'s decision, made against the identity the walk read off
-  /// the fd it pinned.
+  /// [`AdmitOutcome`](crate::os::AdmitOutcome)'s. Two of them cover.
+  /// [`StillCovered`](crate::os::AdmitOutcome::StillCovered) does not: the ground
+  /// is still hidden, so there is nothing revealed to re-read, and what the walk
+  /// found is a fresh SEAM observation that enters the ledger through
+  /// [`record_boundary`] on its own terms — its own identity, its own
+  /// [`Standing`], nothing inherited from the transition that parked the trip. A
+  /// boundary that is standing and unrecorded has no derivable departure ever
+  /// again, which is the whole reason the answer carries what the walk read.
   ///
   /// A ticket the source discharged through a whole-root recovery never arrives
   /// here at all: that recovery answers by CUTOFF
@@ -5933,15 +5878,11 @@ impl DriverCore {
   /// # A reply from a SUPERSEDED frame is not answered on its own terms
   ///
   /// The verdict that parked this round trip was taken against a descent frame,
-  /// and both things the reply can still ask for are relative to it: WHICH record
-  /// goes back ([`restored_boundary`] hands the walk's `(dev, mnt_id)` straight to
-  /// [`condemnable`](MountRecord::condemnable), which reads it against the root's
-  /// id) and whether a located cover may be released. A root that re-mounted
-  /// between the park and the reply moved that id, and
-  /// [`rebase_root_relative`] has already run over the records that were IN the
-  /// set — it cannot reach one still travelling on a reply. Put back unrebased, a
-  /// boundary carrying the OLD root's id reads mount-backed under the new frame,
-  /// is condemned by the next refresh, parks again, and is answered the same way.
+  /// and both things the reply can still ask for are relative to it: what a
+  /// `StillCovered` answer's ids MEAN (a [`Standing`] is the walk's id read
+  /// against the root's, and a root that re-mounted between the park and the
+  /// reply moved the root's half) and whether a located cover may be released
+  /// against a world this scope still holds.
   ///
   /// So a reply whose [`epoch`](PendingAdmit::epoch) is not the scope's current
   /// one discharges into the whole-root recovery instead — and asks for one only if
@@ -5967,7 +5908,7 @@ impl DriverCore {
   /// [`on_recovery_unreachable`](Self::on_recovery_unreachable) emits the root
   /// cover itself.
   ///
-  /// The parked record is dropped and no located cover is emitted, exactly as the
+  /// The parked ticket is dropped and no located cover is emitted, exactly as the
   /// departure COLLAPSE does, and for the same reason — the recovery's reseed
   /// walks from the root on
   /// the frame it reads there, its complete generation re-records every boundary
@@ -6014,23 +5955,17 @@ impl DriverCore {
       return;
     }
     let parked = state.pending_admits.remove(index);
-    if let crate::os::AdmitOutcome::StillCovered { dev, mnt_id } = report.outcome {
-      // The lapse to the REPLACED handling: cover, and re-record in place. A
-      // boundary is standing there, and a live boundary that is not recorded has
-      // no derivable departure ever again. Guarded against a refresh that already
-      // re-recorded an arrival at the location while this round trip was out —
-      // one record per location, always.
-      if !state
-        .mounts_baseline
-        .iter()
-        .any(|record| record.location == parked.record.location)
-      {
-        state
-          .mounts_baseline
-          .push(restored_boundary(&parked.record, dev, mnt_id));
-      }
+    if let crate::os::AdmitOutcome::StillCovered { mnt_id, .. } = report.outcome {
+      // Nothing was revealed and nothing is covered: the walk found the location
+      // still hidden, so the consumer has no new ground to read. What the walk DID
+      // find is a seam observation like any other — it goes through
+      // [`record_boundary`], which decides its [`Standing`] from the ids the walk
+      // read, refuses it if the census already owns that id, and contains it
+      // beneath anything already recorded.
+      record_boundary(state, &parked.location, mnt_id);
+      return;
     }
-    let cover = mount_cover(state, scope, &parked.record.location);
+    let cover = mount_cover(state, scope, &parked.location);
     self.monitor.on_overflow(cover, now);
     self.drain_monitor();
   }
@@ -6222,7 +6157,6 @@ impl DriverCore {
     // has none, compares nothing and leaves this exactly the id check it has always
     // been — which is what keeps every host without a mount namespace (and every
     // fake) on the behaviour it had.
-    let previous_frame = state.root_mnt_id;
     let incarnation_moved = matches!(
       (state.root_incarnation, refresh.root_incarnation),
       (Some(held), Some(read)) if held != read
@@ -6242,17 +6176,12 @@ impl DriverCore {
     if frame_changed {
       state.frame_epoch = state.frame_epoch.wrapping_add(1);
     }
-    // The frame moved, so every ROOT-RELATIVE record must move with it — BEFORE
-    // any condemnation reads them. Without this the departure reconciliation
-    // below reads every live subvolume (recorded carrying the OLD root's id) as
-    // mount-backed and condemns the entire exempt partition on one supported
-    // unmount/rebind of the root — a false cover per subvolume, and on fanotify a
-    // whole admission round trip each. See [`rebase_root_relative`].
-    if let (true, Some(previous), Some(current)) =
-      (frame_changed, previous_frame, state.root_mnt_id)
-    {
-      rebase_root_relative(&mut state.mounts_baseline, previous, current);
-    }
+    // A frame change rebases NOTHING. Mount ids are absolute — a census row's key
+    // and a ledger entry's [`Standing`] were both decided against the ids read at
+    // one instant, and a root that moved to another mount changes neither. So the
+    // census survives the change and the read below diffs against it: a same-object
+    // remount that moved no mount under the root is quiet, where dropping the
+    // census would have covered every one of them as an arrival.
 
     // Alive and current: (re)arm the liveness tick — the birth refresh seeds it
     // and every later refresh re-seeds it, regardless of whether the mount table
@@ -6296,130 +6225,133 @@ impl DriverCore {
       // live elsewhere ([`ScopeState::learned_mounts`]), which is what lets the
       // rows be replaced without buying coverage at trust's expense.
       let mut covered: Vec<PathBuf> = Vec::new();
-      // Walking the FRAME: what arrived, what was replaced, and what this read
-      // CONFIRMS. Confirmation is the provenance upgrade — see [`MountRecord`];
-      // it is why a genuine vfsmount is condemnable on a kernel that answers no
-      // mount ids at all, and it must run on every read rather than only the one
-      // that first recorded the row.
-      // Planned against a location INDEX built once, then applied. The obvious
-      // shape — `find` per row — is O(rows x records) path comparisons on every
-      // refresh of every watched root, and a large mount namespace (containers,
-      // systemd private mounts, a snap-heavy desktop) has thousands of each: the
-      // driver is single-threaded, so that stalls every scope it owns and the
-      // stall itself induces the queue loss this whole file exists to avoid.
-      // Indexing makes it O((rows + records) log records).
+      // THE CENSUS DIFF, by KEY, old against new. The refresh's whole output is
+      // a pure function of two observations: nothing was stored as an obligation
+      // between them, and nothing is condemned on an ABSENCE — only on a
+      // transition. A btrfs subvolume has no row in either census, so it
+      // transitions in neither and is silent here forever, with no partition and
+      // no per-record provenance to keep it that way.
       //
-      // Two passes rather than one because the index borrows the very vector the
-      // apply mutates. The plan holds indices only, so the borrows end with the
-      // block. Vector ORDER is untouched — updates land in place, arrivals append
-      // in frame order — and that order is load-bearing: it is insertion order,
-      // which is what [`make_room_for_device_only`] evicts by.
-      let plan: Vec<FrameStep> = {
-        let located: BTreeMap<&Path, usize> = state
-          .mounts_baseline
-          .iter()
-          .enumerate()
-          .map(|(index, record)| (record.location.as_path(), index))
-          .collect();
-        // A row whose location a PRECEDING row in this same frame already
-        // arrived at. The type documents at most one row per location, so this
-        // is defensive — but the linear `find` it replaces would have seen the
-        // just-pushed record and treated the duplicate as a confirm, and a plan
-        // built off `located` alone would instead push a second record and a
-        // second cover. Keeping the old answer keeps a malformed frame harmless.
-        let mut arriving: BTreeSet<&Path> = BTreeSet::new();
-        frame
-          .iter()
-          .map(|row| {
-            let location = row.location.as_path();
-            match located.get(location) {
-              Some(&index) => FrameStep::Confirm(index),
-              None if arriving.insert(location) => FrameStep::Arrive,
-              None => FrameStep::Duplicate,
-            }
-          })
-          .collect()
-      };
-      for (row, step) in frame.iter().zip(&plan) {
-        let index = match step {
-          FrameStep::Confirm(index) => *index,
-          FrameStep::Arrive => {
+      // Planned against an index built ONCE, then applied. The obvious shape — a
+      // `find` per row — is O(rows x rows) key comparisons on every refresh of
+      // every watched root, and a large mount namespace (containers, systemd
+      // private mounts, a snap-heavy desktop) has thousands of rows: the driver is
+      // single-threaded, so that stalls every scope it owns and the stall itself
+      // induces the queue loss this whole file exists to avoid.
+      let census = census_of(&frame);
+      // Departures travel separately from the located covers to the disposal
+      // below: on a fanotify scope each one owes an admission round trip BEFORE
+      // its cover, and no `retain`/`for` here can emit an effect.
+      let mut departed: Vec<PathBuf> = Vec::new();
+      {
+        let held: BTreeMap<&Key, &CensusRow> =
+          state.census.iter().map(|row| (&row.key, row)).collect();
+        for row in &census {
+          match held.get(&row.key) {
             // ARRIVAL. A mount that appears SHADOWS ground the consumer may
-            // already have enumerated, so it owes the same cover a departure
-            // does — this is what `compile::fsevents`' `plan_mount` plans for the
+            // already have enumerated, so it owes the same cover a departure does
+            // — this is what `compile::fsevents`' `plan_mount` plans for the
             // arrival macOS signals in band, reached here from the table for the
             // backends that signal nothing. Bounded per transition, never per
-            // tick: the record this installs is what makes the next read quiet.
-            state.mounts_baseline.push(MountRecord::confirmed(row));
-            covered.push(row.location.clone());
-            continue;
+            // tick: this census is what makes the next read quiet.
+            None => covered.push(row.location.clone()),
+            // MOVE — the same mount, rendered somewhere else. BOTH locations are
+            // covered: the ground it left is revealed and the ground it landed on
+            // is shadowed. This is also what makes cross-read id recycling benign,
+            // since a recycled id that landed elsewhere reads as a move and covers
+            // the old location exactly as the departure it really was.
+            Some(was) if was.location != row.location => {
+              covered.push(was.location.clone());
+              covered.push(row.location.clone());
+            }
+            // REPLACEMENT — the same key at the same place on a different device.
+            // Two KNOWN devices that disagree, never a half this read could not
+            // answer: see [`identity_changed`].
+            Some(was) if identity_changed(was.dev, row.dev) => {
+              covered.push(row.location.clone());
+            }
+            Some(_) => {}
           }
-          // The location already arrived from an earlier row carrying the same
-          // identity: confirming it again adopts nothing and covers nothing.
-          FrameStep::Duplicate => continue,
-        };
-        let record = &mut state.mounts_baseline[index];
-        if identity_changed(record.mnt_id, row.mnt_id) || identity_changed(record.dev, row.dev) {
-          // REPLACEMENT — the same-path remount. Cover it and RE-RECORD with the
-          // new identity: dropping it instead would leave a live mount unrecorded
-          // and its eventual departure underivable.
-          covered.push(row.location.clone());
         }
-        // A `Some` is adopted over a `None` either way (a known identity beats an
-        // unknown one and costs nothing to take), and a `None` never overwrites a
-        // `Some`: the same discipline `root_mnt_id`'s own adoption follows, so a
-        // read that could not answer an id never DROPS one already held.
-        record.mnt_id = row.mnt_id.or(record.mnt_id);
-        record.dev = row.dev.or(record.dev);
-        record.row_confirmed = true;
+        // DEPARTURE — a key this read did not list. #74's lazy unmount, which
+        // emits no `IN_UNMOUNT`, no hangup and no `Rescan`. Covered at the OLD
+        // row's location, which is the rebased hint rather than the label this
+        // read rendered: a mount whose directory was renamed between the two reads
+        // is covered where it actually stands ([`rebase_moved`]).
+        let read: BTreeSet<&Key> = census.iter().map(|row| &row.key).collect();
+        departed.extend(
+          state
+            .census
+            .iter()
+            .filter(|was| !read.contains(&was.key))
+            .map(|was| was.location.clone()),
+        );
       }
-      // Walking the RECORDS: what departed. Only the mount-backed partition may
-      // be DROPPED. A device-only record — a btrfs subvolume, which trips the
-      // device belt with the root's own mount id and has no table row EVER — is
-      // absent from every frame by construction, so dropping and re-recording it
-      // would cover it on every single tick, forever.
+      state.census = census;
+      // THE LEDGER JOIN, re-derived from the census this read just installed and
+      // retained across nothing. Each entry answers one question — does the census
+      // speak for me now? — and the answer is a fact about two observations rather
+      // than a state some earlier step wrote down.
       //
-      // The exempt partition is not therefore SILENT, and reading it that way is
-      // what left #74 open on every 4.11–5.7 kernel. But nothing about an
-      // individual exempt record is decided here any more: an AMBIGUOUS record is
-      // simply RETAINED, and its mere existence anywhere in the set has already
-      // put this scope in the fail-closed state below, where the whole root is
-      // covered regardless of which locations this frame happened to list. Three
-      // per-record schemes died proving that no evidence exists to decide it
-      // per record — see [`ScopeState::fails_closed`].
-      //
-      // Condemned records are TAKEN here and disposed of below rather than covered
-      // inline: on a fanotify scope each one owes an admission round trip BEFORE
-      // its cover, and a `retain` closure can emit no effect. Taking them out is
-      // also what bounds the parking — a departure derived once is derivable no
-      // more.
-      let root_frame = state.root_mnt_id;
-      let mut departed: Vec<MountRecord> = Vec::new();
-      // The frame's locations as a SET, for the same reason the plan above uses
-      // an index: a linear scan of the frame per record is the other half of the
-      // O(rows x records) reconciliation. The set borrows `frame`, which the
-      // retain does not touch.
-      let present: BTreeSet<&Path> = frame.iter().map(|row| row.location.as_path()).collect();
-      state.mounts_baseline.retain(|record| {
-        if present.contains(record.location.as_path()) {
-          return true;
+      // A `Mount` entry leaves either way, and that is the belt working rather
+      // than the belt being thrown away: it existed for exactly the window between
+      // the seam that saw the mount and the first census that could, and this is
+      // that census. Listed, the census owns the departure from here on; unlisted,
+      // the mount went in that very window and this is the only place its
+      // departure will ever be derivable.
+      {
+        let mut ids: BTreeSet<u64> = BTreeSet::new();
+        let mut located: BTreeSet<&Path> = BTreeSet::new();
+        for row in &state.census {
+          if let Key::Id(id) = row.key {
+            ids.insert(id);
+          }
+          located.insert(row.location.as_path());
         }
-        if !record.condemnable(root_frame) {
-          return true;
-        }
-        departed.push(record.clone());
-        false
-      });
+        state.ledger.retain(|entry| match entry.standing {
+          Standing::Mount(id) => {
+            if !ids.contains(&id) {
+              departed.push(entry.location.clone());
+            }
+            false
+          }
+          // An `Unknown` entry is OCCUPIED once any census row stands at its
+          // location, whatever keys that row. The entry's whole job is to be the
+          // only witness a departure there could have, and a row at the location
+          // ends that: from here on the census derives that place's departure,
+          // its move and its replacement, and if what the seam saw was something
+          // else UNDER the row, the row's own departure cover re-reveals it and
+          // the crawl re-declines it.
+          //
+          // Matching only an id-less row would leave the floor kernel — 4.11-5.7,
+          // where `/proc/self/mountinfo` has always carried mount ids and
+          // `statx(STATX_MNT_ID)` does not exist — with every seam entry
+          // `Unknown`, every census row `Id`-keyed, and nothing that could ever
+          // clear one: a whole-root cover per refresh for the life of the scope,
+          // on a kernel range that pays none today.
+          Standing::Unknown => !located.contains(entry.location.as_path()),
+          // A `SameMount` entry joins nothing, ever. No mountinfo read will list
+          // a subvolume, so its absence from a census is evidence of nothing and
+          // its presence in the ledger obliges nothing.
+          Standing::SameMount => true,
+        });
+      }
+      // One cover per PLACE. Two transitions can name one location — a key change
+      // at a single `L` is a departure and an arrival there, a move can land where
+      // something else left — and the consumer owes one re-read either way. Bounded
+      // by the transitions rather than by the rows, which is what makes the clone
+      // per entry free in every frame that moved nothing.
+      dedup_locations(&mut covered);
+      dedup_locations(&mut departed);
       // FAIL CLOSED, COLLAPSE, or an OWED recovery — the three states that answer
       // with one whole-root recovery instead of anything located. One request
       // between them, whichever combination holds: the recovery each wants is the
       // same work.
       //
-      // Fail-closed is read AFTER the reconciliation, so this frame's
-      // confirmations and drops have already settled which records are ambiguous:
-      // a row that upgraded the last id-less record clears the state on the very
-      // refresh that read it, and a seam observation that added one arms it on the
-      // very next.
+      // Fail-closed is read AFTER the join, so this census has already settled
+      // which entries are still `Unknown`: a row that stands where the last id-less
+      // entry sat clears the state on the very refresh that read it, and a seam
+      // observation that added one arms it on the very next.
       //
       // The collapse is the producer side of the admission bound. One refresh can
       // condemn every mount under the root at once, and handing the source a run
@@ -6437,16 +6369,15 @@ impl DriverCore {
           && (state.owes_whole_root()
             || state.pending_admits.len() + departed.len() > MAX_PENDING_ADMITS));
       if recover {
-        // The whole-root cover DOMINATES every located cover this frame computed
-        // — arrivals, replacements and departures alike — so those are dropped
-        // rather than emitted alongside it. On fanotify it also subsumes every
-        // admission round trip they would have opened: the recovery reseeds the
-        // whole map, which admits strictly more ground than one located walk per
-        // departure, and the recovery's own whole-root generation re-records every
-        // boundary that is still live — which is what makes dropping the condemned
-        // records here safe without a `StillCovered` lapse for each.
+        // The whole-root cover DOMINATES every located cover this census computed
+        // — arrivals, moves, replacements and departures alike — so those are
+        // dropped rather than emitted alongside it. On fanotify it also subsumes
+        // every admission round trip they would have opened: the recovery reseeds
+        // the whole map, which admits strictly more ground than one located walk
+        // per departure, and the recovery's own whole-root generation re-records
+        // every boundary that is still live.
         covered.clear();
-        drop(departed);
+        departed.clear();
         if fanotify {
           recover_root = true;
         } else {
@@ -6470,11 +6401,13 @@ impl DriverCore {
           departed,
         );
       } else {
-        covered.extend(departed.into_iter().map(|record| record.location));
+        covered.extend(departed);
+        dedup_locations(&mut covered);
       }
-      // Lowered AFTER the set is settled: `lower` reads only the scope root,
-      // which this refresh does not touch, so the order is free and taking it
-      // here keeps the borrow of the set and the borrow of the state apart.
+      // Lowered AFTER the census and the ledger are settled: `lower` reads only
+      // the scope root, which this refresh does not touch, so the order is free
+      // and taking it here keeps the borrow of the sets and the borrow of the
+      // state apart.
       covers.extend(covered.iter().map(|path| mount_cover(state, scope, path)));
       // REPLACEMENT, and it is the whole table component. The union that stood
       // here kept every location the host ever presented, for the life of the
@@ -6959,14 +6892,14 @@ impl DriverCore {
     batch
   }
 
-  /// Drops every DEVICE-ONLY boundary record whose location this read says is
-  /// gone — the lifecycle the provenance partition leaves them, made real.
+  /// Drops every LEDGER entry whose location this read says is gone — the
+  /// lifecycle no census can give them, made real.
   ///
   /// # The debt this pays, and the part it CANNOT pay
   ///
-  /// The refresh cannot remove a device-only record: the whole point of the
-  /// partition is that a btrfs subvolume is absent from every frame by
-  /// construction, so condemning it there is a cover storm. The design's answer —
+  /// No census can remove an exempt ledger entry: a btrfs subvolume is absent
+  /// from every one by construction, so condemning it there is a cover storm.
+  /// The design's answer —
   /// *"its lifecycle is the ordinary event flow, since deleting a subvolume emits
   /// real delete events on the parent"* — was true about the filesystem and false
   /// about the code until this pass existed: the events arrived and no one
@@ -6978,19 +6911,18 @@ impl DriverCore {
   /// life. Two other mechanisms cover that gap — [`retire_relisted_boundaries`]
   /// on a descending profile and [`retire_unwalked_boundaries`] on a
   /// kernel-recursive one, both driven by the re-observation the loss recovery
-  /// already runs — and [`MAX_DEVICE_ONLY_BOUNDARIES`] bounds the set
-  /// unconditionally when every one of them has failed. The remaining removal
-  /// path, [`settle`](Self::settle)'s signalled-unmount `retain`, serves the
-  /// FSEvents `UNMOUNT` word and reaches nothing else.
+  /// already runs — and [`MAX_BOUNDARIES`] bounds the ledger unconditionally when
+  /// every one of them has failed. The remaining removal path,
+  /// [`settle`](Self::settle)'s signalled-unmount `retain`, serves the FSEvents
+  /// `UNMOUNT` word and reaches nothing else.
   ///
-  /// # Which records, and which kinds
+  /// # Which entries, and which kinds
   ///
-  /// Only the device-only partition. A mount-backed record's removal is the
-  /// REFRESH's job and it does it with a cover; short-circuiting it here would
-  /// silence a departure cover that the primary detector owes — so this pass
-  /// asks [`MountRecord::condemnable`] and skips everything it answers `true`
-  /// for. That also makes the pass provably inert over the state the refresh
-  /// alone produces, where every record is row-confirmed.
+  /// The LEDGER only, and all of it. A census row's removal is the next
+  /// authoritative read's job and it does it with a cover; short-circuiting that
+  /// here would silence a departure cover the primary detector owes — so this
+  /// pass does not touch the census at all. That also makes it provably inert
+  /// over the state a refresh alone produces, whose ledger is empty.
   ///
   /// Four kinds say an object left a location: `Removed` and `MovedFrom` for a
   /// named child, `DeleteSelf` and `MoveSelf` for a watched directory itself.
@@ -7005,24 +6937,22 @@ impl DriverCore {
   ///
   /// The record that drives the drop IS the coverage — a delete or a move-out is
   /// delivered to the consumer on its own account. The reasoning deliberately
-  /// does NOT lean on "an exempt record obliges nothing": exempt does not mean
-  /// not-a-mount ([`MountRecord::proven_subvolume`]), and a genuine vfsmount is
-  /// recorded in exactly that shape on a host that answers no mount ids. It
-  /// leans on what the driving record proves instead — a mountpoint cannot be
-  /// unlinked or renamed while a mount is on it, so a location this pass hears
-  /// vanish is a location whose boundary was already detached, and the ground
-  /// the detach revealed left with the directory. Should a boundary somehow
-  /// survive at the location, the enumerate that re-reads the parent re-declines
-  /// it and seam 1 records it again.
+  /// does NOT lean on "a ledger entry obliges nothing": a genuine vfsmount is
+  /// recorded in exactly the same shape on a host that answers no mount ids
+  /// ([`Standing::Unknown`]). It leans on what the driving record proves instead
+  /// — a mountpoint cannot be unlinked or renamed while a mount is on it, so a
+  /// location this pass hears vanish is a location whose boundary was already
+  /// detached, and the ground the detach revealed left with the directory. Should
+  /// a boundary somehow survive at the location, the enumerate that re-reads the
+  /// parent re-declines it and seam 1 records it again.
+  ///
+  /// It runs over the LEDGER only, and over all of it. The census is the mount
+  /// table's, and a row this pass could reach is one whose departure the next
+  /// authoritative read will derive and cover — removing it here would replace
+  /// that cover with silence.
   fn retire_removed_boundaries(&self, state: &mut ScopeState, batch: &PendingBatch) {
-    let root_frame = state.root_mnt_id;
-    // Nothing exempt to drop: the pass is a pure no-op over a set the refresh
-    // alone built, so it never walks a read for it.
-    if !state
-      .mounts_baseline
-      .iter()
-      .any(|record| !record.condemnable(root_frame))
-    {
+    // Nothing recorded: the pass is a pure no-op, so it never walks a read for it.
+    if state.ledger.is_empty() {
       return;
     }
     let mut gone: Vec<PathBuf> = Vec::new();
@@ -7050,11 +6980,11 @@ impl DriverCore {
     }
     // This pass runs on EVERY compiled batch, so the containment test is the one
     // place a per-event cost can compound: a delete-heavy batch and a scope at
-    // the record bound make the naive scan `records x vanished` per batch.
+    // the ledger bound make the naive scan `entries x vanished` per batch.
     let gone: BTreeSet<&Path> = gone.iter().map(PathBuf::as_path).collect();
-    state.mounts_baseline.retain(|record| {
-      record.condemnable(root_frame) || !under_any_prefix(&gone, &record.location)
-    });
+    state
+      .ledger
+      .retain(|entry| !under_any_prefix(&gone, &entry.location));
   }
 
   /// Drops every compiled input the caller's exclusions cover — the live half of
@@ -7525,15 +7455,14 @@ impl DriverCore {
       // source has already announced departed.
       state.learned_mounts.retain(|m| m != &path);
       state.mount_table.retain(|m| m != &path);
-      // The coverage set follows the SIGNALLED removal too. Every path
+      // The census and the ledger follow the SIGNALLED removal too. Every path
       // deferred here came from an unmount word whose `plan_mount` already
       // planned the located cover for it, so leaving it recorded would make the
       // next authoritative read derive a departure that was covered in band —
       // one duplicate cover per signalled unmount. Dropping it can only ever
       // shrink the diff, and only for departures a backend announced.
-      state
-        .mounts_baseline
-        .retain(|record| record.location != path);
+      state.census.retain(|row| row.location != path);
+      state.ledger.retain(|entry| entry.location != path);
     }
   }
 
@@ -7929,6 +7858,60 @@ impl DriverCore {
     }
   }
 
+  /// Re-roots every cover-location hint at-or-under `from` onto `to` — the census
+  /// rows and the ledger entries together.
+  ///
+  /// Both ends are absolute paths built the way every other hint is: the scope
+  /// root joined with the change's own root-relative [`Location`]. A move whose
+  /// source or destination is the ROOT itself is not this pass's business — the
+  /// root's own identity is the death gate's — and is skipped rather than
+  /// re-rooting everything the scope holds onto one of its own descendants.
+  ///
+  /// An id-keyed census row's KEY is absolute and does not move; a
+  /// [`Key::Location`] one IS the location and moves with it, or the next read on
+  /// an id-less host would diff the same mount against itself under two names and
+  /// derive a departure plus an arrival where nothing was mounted or unmounted.
+  ///
+  /// Three sets carry hints and all three move: the census, the ledger, and the
+  /// admissions parked on a round trip.
+  fn rebase_hints(state: &mut ScopeState, from: &Location, to: &Location) {
+    if from.is_empty() || to.is_empty() {
+      return;
+    }
+    let Some(root) = state.root.as_deref() else {
+      return;
+    };
+    let absolute = |location: &Location| {
+      let mut path = root.to_path_buf();
+      for segment in location.segments() {
+        path.push(segment.as_str());
+      }
+      path
+    };
+    let (from, to) = (absolute(from), absolute(to));
+    if from == to {
+      return;
+    }
+    for row in &mut state.census {
+      if rebase_moved(&mut row.location, &from, &to)
+        && let Key::Location(key) = &mut row.key
+      {
+        *key = row.location.clone();
+      }
+    }
+    for entry in &mut state.ledger {
+      rebase_moved(&mut entry.location, &from, &to);
+    }
+    // A PARKED location is a cover hint like any other: it is where the released
+    // cover lands, and a rename that moves the ground while the round trip is out
+    // would otherwise land it on a directory that no longer exists. Nothing else
+    // reads it — the reply is matched by TICKET — so moving it is the whole
+    // repair.
+    for parked in &mut state.pending_admits {
+      rebase_moved(&mut parked.location, &from, &to);
+    }
+  }
+
   /// Drains the Monitor to a fixpoint: actions become effects, changes route
   /// through the per-scope lag protocol. Events drain first — a root-death
   /// `Rescan` must route while its scope's lag state still exists.
@@ -8220,6 +8203,25 @@ impl DriverCore {
       }
       return;
     };
+    // THE RENAME REPAIR, and it is the reason #74 reproduces with no torn read at
+    // all. A mount's identity does not change when the directory it is under is
+    // renamed, and the mount table is never told: `rename(2)` bumps no namespace
+    // generation, so a census taken after the `mv` still renders the row under its
+    // NEW label while everything this scope holds names the old one. Left
+    // unrepaired, a mount at `R/a/x` under an `R/a -> R/b` rename departs into a
+    // cover at `R/a/x`, and the ground revealed at `R/b/x` is never covered at
+    // all.
+    //
+    // So a paired move re-roots every hint at-or-under it, in the same step the
+    // core learns of it and BEFORE the change leaves. It runs for a scope that is
+    // not publicly live and for one that is lagged, because the rename happened
+    // either way and the hints are internal state, not delivery.
+    //
+    // `learned_mounts` is deliberately NOT rebased here: a stale learned prefix
+    // only ever VETOES trust, which is the safe direction.
+    if let Some(from) = change.kind().moved_from() {
+      Self::rebase_hints(state, from, change.location());
+    }
     // NEVER-LIVE FENCE: a scope whose public delivery never began owes the
     // consumer nothing — its watch() resolved Err (a spawn failure, a final-root
     // rejection, or a descending ROOT-ARM failure) and the caller never received
@@ -8424,12 +8426,11 @@ fn record_proved(
 /// for its own un-lowerable volume change.
 ///
 /// **This site is where representability is ALLOWED to matter, and the only one.**
-/// The coverage set is keyed by `PathBuf` and screens on raw containment
-/// ([`strictly_under_root`]), so an unrepresentable boundary is recorded like any
-/// other and its departure is derived like any other; it is here — where a
-/// location has to be spelled for a consumer — that the answer degrades. Moving
-/// that decision back to the record is the R7 F1 defect: `Outside` there is
-/// silence, whereas `Outside` here is a whole-root `Rescan`.
+/// Every internal table screens on RAW containment ([`strictly_under_root`]), so
+/// an unrepresentable boundary is recorded like any other and its departure is
+/// derived like any other; it is here — where a location has to be spelled for a
+/// consumer — that the answer degrades. Moving that decision back to the record
+/// makes `Outside` silence, where `Outside` here is a whole-root `Rescan`.
 fn mount_cover(state: &ScopeState, scope: ScopeId, path: &Path) -> Scope {
   match lower(state, path) {
     // The ordinary case: a mount BELOW the root moved, so everything under that
@@ -8529,64 +8530,48 @@ const fn identity_changed(recorded: Option<u64>, observed: Option<u64>) -> bool 
   matches!((recorded, observed), (Some(was), Some(now)) if was != now)
 }
 
-/// What one mount-table row means for the coverage set, decided against a
-/// location index built ONCE per refresh rather than by scanning the records per
-/// row. Carries indices only, so the index it was planned from can be dropped
-/// before the set is mutated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FrameStep {
-  /// A record already stands at this row's location, at this index: adopt the
-  /// row's identity, upgrade its provenance, and cover it if the identity
-  /// CHANGED.
-  Confirm(usize),
-  /// No record stands there: this row is an arrival, and owes a cover.
-  Arrive,
-  /// An earlier row in this same frame already arrived at this location. Inert —
-  /// the record it pushed already carries this row's identity.
-  Duplicate,
-}
-
-/// Records one boundary a SEAM observed into the coverage set — the latency half
-/// of the mount design, and for the device-only class the ONLY half.
+/// Records one boundary a SEAM observed into the LEDGER — the latency half of
+/// the mount design, and for the boundaries a census never lists the only half.
 ///
 /// The seams (a declined dir entry, an os-layer walk's decline, a
-/// boundary-bearing probe answer) see a boundary at the moment the watcher's own
-/// machinery touched it, ahead of the next table read. What that buys differs by
-/// partition — and, on a kernel-recursive profile, by seam: the WALK is not
-/// latency there but the sole observer of every boundary, since that profile runs
-/// no enumerate whose fence could learn one. Conflating the partitions is what
-/// the design's provenance rule exists to prevent:
+/// boundary-bearing probe answer, an admission that found the location still
+/// covered) see a boundary at the moment the watcher's own machinery touched it,
+/// ahead of the next table read. What that buys differs by [`Standing`], and on a
+/// kernel-recursive profile by seam: the WALK is not latency there but the sole
+/// observer of every boundary, since that profile runs no enumerate whose fence
+/// could learn one.
 ///
-/// - for a **vfsmount** it is LATENCY only. The refresh sees every mount this
-///   sees, so without a seam record a boundary observed now merely waits for the
-///   next tick to enter the set — and only a departure INSIDE that window is
-///   missed. With one, that window closes.
-/// - for a **device-only** boundary — a btrfs subvolume, which trips the device
-///   belt carrying the root's OWN mount id — a seam is the only observer there
-///   will ever be. `/proc/self/mountinfo` has no row for it and never will, so
-///   it enters not-row-confirmed and [`MountRecord::condemnable`] keeps it out
-///   of every condemnation mechanism.
+/// - for a [`Standing::Mount`] it is LATENCY only. The next census sees every
+///   mount this sees, so without a seam entry a boundary observed now merely
+///   waits for the next tick to be keyed — and only a departure INSIDE that
+///   window is missed. With one, that window closes, and the entry is spent on
+///   the very census that closes it.
+/// - for a [`Standing::SameMount`] boundary — a btrfs subvolume, which trips the
+///   device belt carrying the root's OWN mount id — a seam is the only observer
+///   there will ever be. `/proc/self/mountinfo` has no row for it and never will.
+/// - a [`Standing::Unknown`] entry is either of those on a host that cannot say
+///   which, and it fails the whole scope closed until a census row stands where
+///   it does.
 ///
-/// # Three rules, each of which a naive version gets wrong
+/// # Four rules, each of which a naive version gets wrong
 ///
-/// **Strictly under the root — tested on the RAW path.** A record AT the root
-/// could never be matched by a frame (`parse_mountinfo` filters the root's own
-/// row out), so a condemnable one would be covered and re-recorded on every
-/// single tick. [`strictly_under_root`] is the whole test, and it is
-/// `Path`-component-wise rather than protocol-representable ON PURPOSE.
+/// **Strictly under the root — tested on the RAW path.** An entry AT the root
+/// could never be matched by a census (`parse_mountinfo` filters the root's own
+/// row out), so it would fail the scope closed forever on a host with no ids.
+/// [`strictly_under_root`] is the whole test, and it is `Path`-component-wise
+/// rather than protocol-representable ON PURPOSE.
 ///
 /// This set is INTERNAL and keyed by `PathBuf`. Nothing here addresses a
 /// consumer, so nothing here needs a location the protocol can spell — and
 /// requiring one dropped observations that were fully identified. A Linux
 /// pathname is arbitrary bytes, so a mount can perfectly well sit at a location
-/// with a non-UTF-8 component; the [`Lowered::Target`] guard this replaced
-/// classified every such observation [`Lowered::Outside`] and returned, which
-/// meant a fanotify walk that DECLINED that boundary — reporting its raw path and
-/// its mount identity, the only witness there will ever be for a mount that
-/// arrived after the spawn table snapshot — recorded nothing at all. A lazy
-/// departure below it then produced neither an admission nor a cover, and the
-/// revealed subtree stayed absent from the FID map with its events silently
-/// rejected.
+/// with a non-UTF-8 component; a [`Lowered::Target`] guard classified every such
+/// observation [`Lowered::Outside`] and returned, which meant a fanotify walk
+/// that DECLINED that boundary — reporting its raw path and its mount identity,
+/// the only witness there will ever be for a mount that arrived after the spawn
+/// census — recorded nothing at all. A lazy departure below it then produced
+/// neither an admission nor a cover, and the revealed subtree stayed absent from
+/// the FID map with its events silently rejected.
 ///
 /// Lowering belongs at COVER EMISSION, where it already has a safe degrade:
 /// [`mount_cover`] answers `Scope::Root` for a location it cannot spell, so an
@@ -8594,127 +8579,123 @@ enum FrameStep {
 /// strictly the over-covering direction, which is the one this design takes
 /// everywhere else too.
 ///
-/// **Fill in, never overwrite — over the UNKNOWN.** An existing record keeps the
-/// identity it holds; a seam only supplies a half that is still unknown.
-/// Observers differ in capability (a probe answers a device but no mount id), so
-/// adopting a fresher value would drop a known half to unknown on one path and,
-/// worse, would let a seam quietly ALIGN a record with a mount that replaced the
-/// one it describes — silencing the refresh's replacement cover, which is the
-/// only thing that sees a same-path remount at all.
-///
-/// That rule is about `unknown -> known`, and it must not swallow
-/// `known -> DIFFERENT known`, which is the distinct fact [`identity_changed`]
-/// already names: two `Some` halves that disagree are a REPLACEMENT, the same
-/// reading the refresh's own [`FrameStep::Confirm`] arm gives a row that
-/// disagrees with the record it lands on. The REFRESH delivers that cover, so
-/// this seam leaves it alone and merely fills in — the paragraph above is
-/// exactly why. There is no seam-side promptness arm: one existed, keyed to a
-/// per-record absence claim, and it went with the claim. A scope that cannot
-/// tell one incarnation from another covers its whole root every refresh
-/// instead ([`ScopeState::fails_closed`]), which is strictly stronger than any
-/// cover this seam could have stood.
+/// **Nothing the CENSUS already owns** — a row STANDING at this location, or one
+/// already keyed by this observation's own id. Either way the census derives that
+/// place's departure, its move and its replacement on its own, and a ledger entry
+/// beside it would derive the same departure a second time or fail the scope
+/// closed over ground a row already speaks for. This is the rule that keeps the
+/// two structures disjoint, and it is what lets every retirement pass run over
+/// the whole ledger with no partition test at all.
 ///
 /// **Nothing beneath a boundary already recorded.** Ground under a live recorded
-/// boundary is already declined, so a second record there addresses coverage
+/// boundary is already declined, so a second entry there addresses coverage
 /// nobody has, and when that boundary departs its cover dominates the whole
 /// subtree. It is the containment [`learn_device`] applies to the trust table,
-/// and it hides no real mount — the refresh's arrival walk records rows
-/// DIRECTLY, never through here.
+/// and it hides no real mount — a census row is keyed DIRECTLY, never through
+/// here. It is also what makes a re-observation at an existing entry's location
+/// inert: a `Path` prefix is inclusive, so the entry standing there keeps the
+/// [`Standing`] its own seam decided rather than adopting a later reading. That
+/// direction is the safe one — an entry demoted from `Mount` to `SameMount` by a
+/// second observation would lose the departure belt it is held for, and one
+/// promoted out of `Unknown` would clear a fail-closed on a reading that cannot
+/// prove the boundary is the same one.
 ///
 /// This rule was once documented as the set's GROWTH BOUND, and it never was
-/// one. It refuses a record BENEATH an existing one and says nothing about a
-/// record ABOVE it or BESIDE it: `/r/a` still enters a set already holding
-/// `/r/a/b`, and a flat run of siblings — `/r/a`, `/r/b`, `/r/c`, one per
-/// subvolume ever created and deleted — is contained by nothing at all. The real
-/// bound is [`MAX_DEVICE_ONLY_BOUNDARIES`], enforced below; the reconciliation
-/// that keeps the set ACCURATE rather than merely bounded is
+/// one. It refuses an entry BENEATH an existing one and says nothing about one
+/// ABOVE it or BESIDE it: `/r/a` still enters a ledger already holding `/r/a/b`,
+/// and a flat run of siblings — `/r/a`, `/r/b`, `/r/c`, one per subvolume ever
+/// created and deleted — is contained by nothing at all. The real bound is
+/// [`MAX_BOUNDARIES`], enforced below; the reconciliation that keeps the ledger
+/// ACCURATE rather than merely bounded is the census join plus
 /// [`retire_unwalked_boundaries`] (kernel-recursive) and
 /// [`retire_relisted_boundaries`] (descending).
 ///
 /// # Nothing is owed back to the caller
 ///
 /// This returns nothing, and that is a claim rather than an omission. Every
-/// outcome — recorded, filled in, contained, re-observed unchanged, or refused at
+/// outcome — recorded, owned by the census, contained, re-observed, or refused at
 /// the bound — leaves the caller nothing to do. The refusal in particular:
-/// [`make_room_for_device_only`] only ever refuses when the device-only partition
-/// is FULL of ambiguous records (a proven subvolume would have been evicted to
-/// make room), and a scope holding even one ambiguous record already covers its
-/// whole root on every authoritative refresh. The dominating cover the caller
-/// used to stand for a refusal is therefore already standing, once per refresh,
-/// for as long as the refusal can recur.
-fn record_boundary(state: &mut ScopeState, location: &Path, dev: Option<u64>, mnt_id: Option<u64>) {
+/// [`make_room_in_ledger`] only ever refuses when the ledger is FULL of witnesses
+/// that may still owe a cover, which on any host that answers ids means a
+/// thousand live subvolume observations and on one that does not means the scope
+/// is already covering its whole root on every authoritative refresh.
+fn record_boundary(state: &mut ScopeState, location: &Path, mnt_id: Option<u64>) {
   if !strictly_under_root(state, location) {
     return;
   }
-  if let Some(record) = state
-    .mounts_baseline
-    .iter_mut()
-    .find(|record| record.location == location)
-  {
-    // Fill in over the UNKNOWN only. A known half is never moved by a seam, even
-    // by an observation that disagrees with it: adopting there would align the
-    // record with the mount that REPLACED the one it describes, silencing the
-    // refresh's replacement cover, which is the only observer a same-path remount
-    // has.
-    record.dev = record.dev.or(dev);
-    record.mnt_id = record.mnt_id.or(mnt_id);
+  let standing = Standing::decide(state.root_mnt_id, mnt_id);
+  // OCCUPIED, on either of the two facts a census can offer: a row STANDING at
+  // this location, or a row already keyed by this observation's own id.
+  //
+  // The location leg is not a convenience. On Linux 4.11-5.7 every census row is
+  // `Id`-keyed (mountinfo has always carried mount ids) and every seam answers
+  // none (`statx(STATX_MNT_ID)` does not exist), so the id leg never fires there
+  // — and without the location leg every enumerate that re-declines a mount the
+  // census already lists would push an `Unknown` entry and fail the whole scope
+  // closed until the next refresh's join dropped it again. One whole-root cover
+  // per refresh, for as long as anything under the root is being listed. It is
+  // the same rule the join applies, one step earlier, and it is what keeps the
+  // ledger to what the census cannot speak for.
+  //
+  // The id leg still earns its place: an observation whose id the census keys
+  // ELSEWHERE is a mount the next read will derive a move for, and recording it
+  // here would derive that move's departure a second time.
+  if state.census.iter().any(|row| {
+    row.location == location
+      || matches!((&row.key, standing), (Key::Id(a), Standing::Mount(b)) if *a == b)
+  }) {
     return;
   }
   if state
-    .mounts_baseline
+    .ledger
     .iter()
-    .any(|record| location.starts_with(&record.location))
+    .any(|entry| location.starts_with(&entry.location))
   {
     return;
   }
-  let record = MountRecord::observed(location.to_path_buf(), dev, mnt_id);
-  // The HARD BOUND, applied to the device-only partition alone and applied
-  // BEFORE the push so the set can never exceed it even for an instant. A
-  // mount-backed record is not bounded here: the refresh owns its removal and
-  // does it with a cover, and the number of live vfsmounts under a root is the
-  // kernel's business rather than this set's.
-  //
-  // Room is made by evicting a PROVEN subvolume, never an ambiguous record that
-  // an authoritative row could still upgrade into a departure witness. When
-  // there is no proven record to evict the partition is full of possible
-  // witnesses, and THIS observation is refused instead — the direction that
-  // over-covers rather than the one that loses a cover. See
-  // [`make_room_for_device_only`].
-  if !record.condemnable(state.root_mnt_id)
-    && !make_room_for_device_only(state, MAX_DEVICE_ONLY_BOUNDARIES)
-  {
-    // Refused, and refused SILENTLY on purpose. Room is only ever short of a
-    // proven subvolume to evict when the device-only partition is full of
-    // AMBIGUOUS records — so the scope is already failing closed, and every
-    // authoritative refresh is already covering the whole root, which dominates
-    // anything a per-refusal announcement could have stood. The old announcement
-    // was latched per saturation episode precisely because it would otherwise
-    // storm, and that latch was itself a finding: one refusal silenced every
-    // later one for the life of the episode.
+  // The HARD BOUND, applied BEFORE the push so the ledger can never exceed it
+  // even for an instant. Room is made by evicting a proven `SameMount` entry —
+  // one nothing can ever promote into a departure witness — and never a `Mount`
+  // or `Unknown` one. When there is nothing but witnesses to evict, THIS
+  // observation is refused instead: the direction that over-covers rather than
+  // the one that loses a cover. See [`make_room_in_ledger`].
+  if !make_room_in_ledger(state, MAX_BOUNDARIES) {
+    // Refused, and refused SILENTLY on purpose. The fence that declined this
+    // boundary reads the scope's FRAME, never the ledger, so descent is still
+    // stopped there; and on a host that cannot key its witnesses the scope is
+    // already failing closed, which covers the whole root on every authoritative
+    // refresh and dominates anything a per-refusal announcement could stand. The
+    // announcement this replaced was latched per saturation episode precisely
+    // because it would otherwise storm, and that latch was itself a finding: one
+    // refusal silenced every later one for the life of the episode.
     return;
   }
-  state.mounts_baseline.push(record);
+  state.ledger.push(LedgerEntry {
+    location: location.to_path_buf(),
+    standing,
+  });
 }
 
-/// The most DEVICE-ONLY boundary records one scope may hold at once.
+/// The most boundary entries one scope's ledger may hold at once.
 ///
-/// This is the set's real growth bound, and it holds UNCONDITIONALLY — when
+/// This is the ledger's real growth bound, and it holds UNCONDITIONALLY — when
 /// every reconciliation path has failed, when the event stream that carries
 /// deletions is lost, when the walk that would establish a generation never runs.
-/// The reconciliations keep the set accurate; this keeps it finite.
+/// The census join and the retirement passes keep the ledger accurate; this keeps
+/// it finite.
 ///
 /// Sized so it binds only pathology: a real btrfs/snapper/docker layout under one
 /// watched root holds tens of subvolumes, not thousands, and every genuine
-/// vfsmount is row-confirmed by the first authoritative refresh and so is not in
-/// this partition at all. A scope that reaches the bound is one where distinct
-/// boundary locations churned past every reconciliation, and holding 1024 of them
-/// is strictly better than holding all of them forever.
+/// vfsmount on an id-answering host is taken over by the first authoritative
+/// census and so is not held here at all. A scope that reaches the bound is one
+/// where distinct boundary locations churned past every reconciliation, and
+/// holding 1024 of them is strictly better than holding all of them forever.
 ///
-/// WHICH 1024 is [`make_room_for_device_only`]'s decision, and it is not simply
-/// "the most recent": a record that could still be upgraded into a departure
-/// witness is kept and the new observation refused instead, because an extra
-/// arrival cover is a cost and a lost departure cover is a hole.
-const MAX_DEVICE_ONLY_BOUNDARIES: usize = 1024;
+/// WHICH 1024 is [`make_room_in_ledger`]'s decision, and it is not simply "the
+/// most recent": an entry that could still be the witness for a departure cover
+/// is kept and the new observation refused instead, because an extra arrival
+/// cover is a cost and a lost departure cover is a hole.
+const MAX_BOUNDARIES: usize = 1024;
 
 /// The most departure covers one fanotify scope may hold PARKED on admission
 /// round trips at once. A refresh that would push past it collapses its whole
@@ -8740,78 +8721,89 @@ const MAX_DEVICE_ONLY_BOUNDARIES: usize = 1024;
 /// cap uses, so the producer collapses before the consumer ever has to.
 const MAX_PENDING_ADMITS: usize = 64;
 
-/// Frees a slot in the device-only partition for one more record, or answers
-/// `false` when it could not without dropping a record that may yet owe a cover
-/// — the eviction half of [`MAX_DEVICE_ONLY_BOUNDARIES`].
+/// Frees a slot in the ledger for one more entry, or answers `false` when it
+/// could not without dropping one that may yet owe a cover — the eviction half of
+/// [`MAX_BOUNDARIES`].
 ///
 /// # What may be evicted, and what may NOT
 ///
-/// An earlier version of this evicted the oldest record the partition held, on
-/// the reasoning that "exempt from condemnation" means "obliges no cover, so
-/// dropping one costs at most an extra arrival cover". That reasoning reads
-/// [`MountRecord::condemnable`]`== false` as "not a mount", and it is not:
-/// the exempt partition holds two populations
-/// ([`MountRecord::proven_subvolume`]).
+/// An earlier version of this evicted the oldest entry outright, on the reasoning
+/// that a boundary the mount table cannot condemn "obliges no cover, so dropping
+/// one costs at most an extra arrival cover". That reads "the census will not
+/// speak for it" as "it is not a mount", and it is not:
 ///
-/// - A **proven** record — both mount ids known and equal — describes something
-///   no mountinfo read will ever list. No later observation can promote it, so
-///   it can never become the witness for a cover, and it leaves silently.
-/// - An **ambiguous** record — either id unknown — is the exact shape a GENUINE
-///   post-baseline vfsmount takes on a host that answers no mount ids, until an
-///   authoritative row upgrades it to row-confirmed and therefore condemnable.
-///   Dropping it discards the only thing that upgrade can reach.
+/// - a [`Standing::SameMount`] entry — both ids known and EQUAL — describes
+///   something no mountinfo read will ever list. Nothing can promote it, so it
+///   can never become the witness for a cover, and it leaves silently.
+/// - a [`Standing::Unknown`] entry is the exact shape a GENUINE post-census
+///   vfsmount takes on a host that answers no mount ids. Dropping it discards the
+///   only witness a departure there will ever have.
+/// - a [`Standing::Mount`] entry is a witness by construction: it is the belt for
+///   the window between the seam that saw the mount and the census that will take
+///   it over.
 ///
-/// So ambiguous records are never evicted. The set is bounded at the INTAKE side
-/// instead: when the partition is full of records that might yet owe a cover, the
-/// new observation is refused (`false`) rather than an old witness discarded.
+/// So only `SameMount` is evicted. The ledger is bounded at the INTAKE side
+/// instead: when it holds nothing but entries that might yet owe a cover, the new
+/// observation is refused (`false`) rather than a witness discarded.
 ///
 /// # Why refusing the new observation loses nothing
 ///
 /// A refused observation is not a missed boundary. The fence that declined it
-/// reads the scope's FRAME, never this set, so descent is still stopped there;
-/// and the set's only jobs for an exempt record are to SUPPRESS a later arrival
-/// cover at that location and to block a redundant record beneath it. Refusing
-/// therefore only ever causes MORE covering — the next authoritative refresh
-/// finds no record at the location, reads its row as an ARRIVAL, covers it, and
-/// records it row-confirmed, from which point its departure is covered like any
-/// other vfsmount's. That is the same over-signal direction the design accepts
-/// for arrival covers generally.
+/// reads the scope's FRAME, never this ledger, so descent is still stopped there;
+/// and the ledger's only jobs for an entry are to hold a departure witness the
+/// census cannot, to block a redundant entry beneath it, and to fail the scope
+/// closed. Refusing therefore only ever causes MORE covering — a mount refused
+/// here is keyed by the next census as an ARRIVAL, covered, and its departure
+/// covered like any other from then on. That is the same over-signal direction
+/// the design accepts for arrival covers generally.
 ///
 /// # The bound still binds on a host that answers no mount ids
 ///
-/// There, EVERY record is ambiguous, so nothing is ever evicted — and the set is
-/// still hard-bounded, because the refusal above caps intake at
-/// [`MAX_DEVICE_ONLY_BOUNDARIES`]. "Never evict ambiguous" and "hold a finite
-/// set" are only in tension if eviction is the only bound; making the intake the
-/// bound resolves it without ever paying for the fresh observation with a
-/// witness. The stale contents are reclaimed by the reconciliations that exist
-/// for exactly that ([`retire_unwalked_boundaries`],
-/// [`retire_relisted_boundaries`], [`DriverCore::retire_removed_boundaries`]) —
-/// this is the floor under them, not a substitute for them.
+/// There, EVERY entry is `Unknown`, so nothing is ever evicted — and the ledger
+/// is still hard-bounded, because the refusal above caps intake at
+/// [`MAX_BOUNDARIES`]. "Never evict a witness" and "hold a finite set" are only in
+/// tension if eviction is the only bound; making the intake the bound resolves it
+/// without ever paying for a fresh observation with a witness. The stale contents
+/// are reclaimed by the passes that exist for exactly that
+/// ([`retire_unwalked_boundaries`], [`retire_relisted_boundaries`],
+/// [`DriverCore::retire_removed_boundaries`]) and by the census join — this is
+/// the floor under them, not a substitute for them.
 ///
-/// Oldest-first among the proven records because `mounts_baseline` is in
-/// insertion order, so the ones most likely to be stale are at the front.
-fn make_room_for_device_only(state: &mut ScopeState, cap: usize) -> bool {
-  let root_frame = state.root_mnt_id;
-  let device_only = state
-    .mounts_baseline
-    .iter()
-    .filter(|record| !record.condemnable(root_frame))
-    .count();
-  // One slot must be free for the caller's push, so the partition has to end
-  // BELOW the cap, not at it.
-  let mut excess = device_only.saturating_sub(cap.saturating_sub(1));
+/// Oldest-first among the `SameMount` entries because the ledger is in insertion
+/// order, so the ones most likely to be stale are at the front.
+fn make_room_in_ledger(state: &mut ScopeState, cap: usize) -> bool {
+  // One slot must be free for the caller's push, so the ledger has to end BELOW
+  // the cap, not at it.
+  let mut excess = state.ledger.len().saturating_sub(cap.saturating_sub(1));
   if excess == 0 {
     return true;
   }
-  state.mounts_baseline.retain(|record| {
-    if excess > 0 && record.proven_subvolume(root_frame) {
+  state.ledger.retain(|entry| {
+    if excess > 0 && matches!(entry.standing, Standing::SameMount) {
       excess -= 1;
       return false;
     }
     true
   });
   excess == 0
+}
+
+/// Collapses repeated locations to their FIRST occurrence, in place, preserving
+/// order — the cover set and the parked set are sets of PLACES.
+///
+/// Two transitions can name one location: a key change at a single `L` is a
+/// departure and an arrival there, and a move can land where something else left.
+/// The consumer owes one re-read either way, and on fanotify one round trip.
+///
+/// The clone per surviving entry is bounded by the TRANSITIONS rather than by the
+/// rows, so a frame in which nothing moved — every frame, on a settled host —
+/// allocates nothing at all.
+fn dedup_locations(locations: &mut Vec<PathBuf>) {
+  if locations.len() < 2 {
+    return;
+  }
+  let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
+  locations.retain(|location| seen.insert(location.clone()));
 }
 
 /// Whether `path` is AT or UNDER any member of `prefixes` — the containment test
@@ -8828,36 +8820,34 @@ fn under_any_prefix(prefixes: &BTreeSet<&Path>, path: &Path) -> bool {
   path.ancestors().any(|ancestor| prefixes.contains(ancestor))
 }
 
-/// Retires every DEVICE-ONLY record a COMPLETE whole-root walk did not decline —
-/// the generation half of the device-only lifecycle, on the profile that has no
-/// other.
+/// Retires every LEDGER entry a COMPLETE whole-root walk did not decline — the
+/// generation half of the ledger's lifecycle, on the profile that has no other.
 ///
 /// A kernel-recursive scope runs no enumerate, so
-/// [`retire_relisted_boundaries`]'s re-listing never happens there; and the mount
-/// table cannot retire a device-only record by construction. That left the
+/// [`retire_relisted_boundaries`]'s re-listing never happens there; and no census
+/// can retire an entry the mount table will never list. That left the
 /// compiled-removal pass ([`DriverCore::retire_removed_boundaries`]) as the sole
-/// removal path, and a loss window that swallowed a deletion left its record
+/// removal path, and a loss window that swallowed a deletion left its entry
 /// standing for the scope's life. A complete walk from the root is the answer
 /// already available: it declines every boundary that is still there, so anything
-/// device-only it did NOT decline is not there any more.
+/// the ledger holds that it did NOT decline is not there any more.
 ///
-/// Two exclusions, both load-bearing:
+/// It runs over the WHOLE ledger, with no standing test: the ledger holds nothing
+/// the census owns ([`record_boundary`] refuses that at intake and the join drops
+/// it), so there is no partition here whose removal could silence a cover the
+/// census is responsible for.
 ///
-/// - **mount-backed records are untouched.** Their removal is the refresh's, and
-///   it owes a cover; retiring one here would silence the departure cover the
-///   primary detector is responsible for.
-/// - **nothing UNDER a decline is retired.** A walk stops at a boundary, so it
-///   observed nothing below one and may not speak for it. Reachable through the
-///   containment rule's one gap — a record ABOVE an existing one is accepted —
-///   so it is guarded rather than argued away.
+/// One exclusion, and it is load-bearing: **nothing UNDER a decline is retired.**
+/// A walk stops at a boundary, so it observed nothing below one and may not speak
+/// for it. Reachable through the containment rule's one gap — an entry ABOVE an
+/// existing one is accepted — so it is guarded rather than argued away.
 ///
-/// # Why no cover is owed — and it is NOT "exempt records oblige nothing"
+/// # Why no cover is owed — and it is NOT "these entries oblige nothing"
 ///
-/// Exempt does not mean not-a-mount ([`MountRecord::proven_subvolume`]): on a
-/// host that answers no mount ids a genuine vfsmount is recorded in exactly the
-/// exempt shape, and if one of THOSE departs, the ground it revealed does owe a
-/// cover. What discharges it here is the CALLER, not the partition. There are
-/// exactly two, and each carries its own root-wide cover:
+/// On a host that answers no mount ids a genuine vfsmount is recorded in exactly
+/// the same shape as a subvolume ([`Standing::Unknown`]), and if one of THOSE
+/// departs, the ground it revealed does owe a cover. What discharges it here is
+/// the CALLER. There are exactly two, and each carries its own root-wide cover:
 ///
 /// - the reader's POST-LOSS reseed, which enqueues a root-wide `Overflow`
 ///   immediately BEHIND its [`WalkReach::WholeRoot`](crate::os::WalkReach) report
@@ -8873,39 +8863,35 @@ fn under_any_prefix(prefixes: &BTreeSet<&Path>, path: &Path) -> bool {
 /// Neither caller's generation reaches this pass unchecked: both are judged
 /// against the root mount id their walk fenced against before anything is retired,
 /// because "everything still standing under the root" names a particular root
-/// mount and this pass deletes from the one partition nothing else can restore.
+/// mount and this pass deletes what nothing else can restore.
 fn retire_unwalked_boundaries(state: &mut ScopeState, declined: &[crate::os::DeclinedBoundary]) {
-  let root_frame = state.root_mnt_id;
-  if !state
-    .mounts_baseline
-    .iter()
-    .any(|record| !record.condemnable(root_frame))
-  {
+  if state.ledger.is_empty() {
     return;
   }
   let observed: BTreeSet<&Path> = declined
     .iter()
     .map(|boundary| boundary.location.as_path())
     .collect();
-  state.mounts_baseline.retain(|record| {
-    if record.condemnable(root_frame) {
-      return true;
-    }
-    under_any_prefix(&observed, &record.location)
-  });
+  state
+    .ledger
+    .retain(|entry| under_any_prefix(&observed, &entry.location));
 }
 
-/// Retires every DEVICE-ONLY record at a DIRECT CHILD of `dir` that a complete,
+/// Retires every LEDGER entry at a DIRECT CHILD of `dir` that a complete,
 /// non-lossy listing of `dir` did not decline — the generation half of the
-/// device-only lifecycle on a DESCENDING profile.
+/// ledger's lifecycle on a DESCENDING profile.
 ///
 /// A listing is authoritative about exactly one level: it names every child of
-/// `dir` that exists. So a device-only record at a child the listing did not
-/// name is a boundary whose directory is gone, and one at a child the listing
-/// named WITHOUT declining is a location that is no longer a boundary at all
-/// (the subvolume was deleted and an ordinary directory took its place). Either
-/// way nothing else would ever drop it once a loss window ate the deletion
-/// record the compiled-removal pass reads.
+/// `dir` that exists. So an entry at a child the listing did not name is a
+/// boundary whose directory is gone, and one at a child the listing named
+/// WITHOUT declining is a location that is no longer a boundary at all (the
+/// subvolume was deleted and an ordinary directory took its place). Either way
+/// nothing else would ever drop it once a loss window ate the deletion record
+/// the compiled-removal pass reads.
+///
+/// It runs over the whole ledger, with no standing test, for the reason
+/// [`retire_unwalked_boundaries`] states: the ledger holds nothing the census
+/// owns.
 ///
 /// `kept` is every child path this listing DECLINED or EXCLUDED. An exclusion is
 /// there for honesty rather than necessity: an excluded child is never recorded
@@ -8917,10 +8903,9 @@ fn retire_unwalked_boundaries(state: &mut ScopeState, declined: &[crate::os::Dec
 ///
 /// # Why no cover is owed
 ///
-/// NOT because an exempt record obliges nothing — it may be a genuine vfsmount
-/// recorded on a host that answers no mount ids
-/// ([`MountRecord::proven_subvolume`]) — but because the LISTING that retires it
-/// is itself the re-observation. A child that stopped being a boundary comes back
+/// NOT because a ledger entry obliges nothing — it may be a genuine vfsmount
+/// recorded on a host that answers no mount ids ([`Standing::Unknown`]) — but
+/// because the LISTING that retires it is itself the re-observation. A child that stopped being a boundary comes back
 /// from this very read as an ordinary directory, so the Monitor's own
 /// reconciliation arms it and enumerates it (a listed directory with no child
 /// watch is armed additively), and the ground the departure revealed is read on
@@ -8928,20 +8913,16 @@ fn retire_unwalked_boundaries(state: &mut ScopeState, declined: &[crate::os::Dec
 /// ground under it to re-read. Should a boundary somehow still be there, the very
 /// next enumerate re-declines it and seam 1 records it again.
 fn retire_relisted_boundaries(state: &mut ScopeState, dir: &Path, kept: &[PathBuf]) {
-  let root_frame = state.root_mnt_id;
   // The listing's names as a SET: a directory with many children and a scope at
-  // the record bound would otherwise pay `children x records` comparisons per
+  // the ledger bound would otherwise pay `children x entries` comparisons per
   // enumerate. Exact membership, not containment — a listing speaks for its own
   // level only.
   let kept: BTreeSet<&Path> = kept.iter().map(PathBuf::as_path).collect();
-  state.mounts_baseline.retain(|record| {
-    if record.condemnable(root_frame) {
+  state.ledger.retain(|entry| {
+    if entry.location.parent() != Some(dir) {
       return true;
     }
-    if record.location.parent() != Some(dir) {
-      return true;
-    }
-    kept.contains(record.location.as_path())
+    kept.contains(entry.location.as_path())
   });
 }
 
@@ -8950,10 +8931,10 @@ fn retire_relisted_boundaries(state: &mut ScopeState, dir: &Path, kept: &[PathBu
 /// can never record on different terms.
 ///
 /// Each decline goes through [`record_boundary`] like every other seam
-/// observation: strictly under the root, filling in only halves still unknown,
-/// and nothing beneath a boundary already recorded. Nothing here mints a
-/// confirmation — a walk's fence is not a mountinfo row, so a record it creates
-/// enters NOT row-confirmed and the provenance partition decides the rest.
+/// observation: strictly under the root, nothing the census already owns, and
+/// nothing beneath a boundary already recorded. Nothing here keys a census row —
+/// a walk's fence is not a mountinfo row — so what it creates is a ledger entry
+/// whose [`Standing`] the walk's own two ids decide.
 ///
 /// A walk never produces a decline BENEATH one of its own: a declined directory is
 /// not descended, so nothing under it is ever reached to be declined again. The
@@ -8962,12 +8943,7 @@ fn retire_relisted_boundaries(state: &mut ScopeState, dir: &Path, kept: &[PathBu
 /// incomparable.
 fn record_declined(state: &mut ScopeState, declined: &[crate::os::DeclinedBoundary]) {
   for boundary in declined {
-    record_boundary(
-      state,
-      &boundary.location,
-      Some(boundary.dev),
-      boundary.mnt_id,
-    );
+    record_boundary(state, &boundary.location, boundary.mnt_id);
   }
 }
 
@@ -9212,16 +9188,13 @@ fn learn_device(state: &mut ScopeState, path: &Path, dev: u64) {
 ///
 /// **That the id is asked for at all is the correctness point, not a detail.** A
 /// probe that answered a device alone recorded every boundary with
-/// `mnt_id: None`, and an id-less record is precisely what
-/// [`MountRecord::condemnable`] reads as DEVICE-ONLY — permanently exempt from
-/// both condemnation mechanisms. So a genuine mount that arrived after the
-/// baseline, was first observed by a slot stat, and departed before any refresh
-/// confirmed a row at its location was condemned by nothing: the departure cover
-/// the ground was owed never fired. Minting an exempt record from an observation
-/// that could not tell a vfsmount from a same-mount subvolume is the defect;
-/// asking for the id is the fix, and it leaves `None` meaning only "this host
-/// answers no mount ids" — the reading the dynamic provenance upgrade is sound
-/// under.
+/// `mnt_id: None`, which [`Standing::decide`] can only read as
+/// [`Standing::Unknown`] — a boundary that fails the whole scope closed on a
+/// kernel able to name it exactly, and that no census join can ever clear except
+/// by a row standing at its location. Recording an ambiguity from an observation
+/// that COULD tell a vfsmount from a same-mount subvolume is the defect; asking
+/// for the id is the fix, and it leaves `None` meaning only "this host answers no
+/// mount ids".
 ///
 /// Only a `Present` answer carries either fact. `Missing` and `Failed` observe
 /// nothing about a boundary — a path that is absent or unreadable says nothing
@@ -9237,13 +9210,13 @@ fn learn_device(state: &mut ScopeState, path: &Path, dev: u64) {
 /// — and recording them here would buy nothing and cost two things it should
 /// not:
 ///
-/// - **retirement.** A device-only record is retired by a compiled removal
+/// - **retirement.** An exempt ledger entry is retired by a compiled removal
 ///   ([`DriverCore::retire_removed_boundaries`]), by a complete re-listing of its
 ///   parent ([`retire_relisted_boundaries`]) or by a complete whole-root walk
 ///   ([`retire_unwalked_boundaries`]). An FSEvents removal reaches none of them:
 ///   it is not compiled — it is GROUNDED by the very probe that would have
 ///   recorded the boundary, one stage later — and that profile runs neither
-///   enumerates nor walks. Records from that path would have no seam that ever
+///   enumerates nor walks. Entries from that path would have no seam that ever
 ///   drops them, leaving only the hard bound.
 /// - **growth.** Those probes fire per event, so a long-lived watcher over a
 ///   mounted volume would accrete one record per distinct path ever probed.
@@ -9261,7 +9234,7 @@ fn record_probe_boundary(state: &mut ScopeState, path: &Path, outcome: ProbeOutc
   if !state.frame().crossed_by(Some(dev), mnt_id) {
     return;
   }
-  record_boundary(state, path, Some(dev), mnt_id);
+  record_boundary(state, path, mnt_id);
 }
 
 /// Whether one byte separates path COMPONENTS on this platform.

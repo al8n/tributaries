@@ -1239,15 +1239,16 @@ fn seed_from_fd_fences_on_the_handed_mount_frame_not_a_stale_one() {
 ///
 /// This is the regression the belt once was. The `statx` sat BELOW the belt, so a
 /// foreign-device decline was recorded with `mnt_id: None` — and an id-less
-/// record is what `MountRecord::condemnable` reads as DEVICE-ONLY, i.e.
-/// permanently exempt from every condemnation mechanism. That minted an exempt
-/// record from an observation that could not tell a real vfsmount from a
-/// same-mount subvolume. The failure it produced was reachable: a genuine mount
-/// arriving after the spawn baseline, first observed by a LIVE walk, and departing
-/// before any refresh confirmed a row at its location was condemned by nothing —
-/// no cover, no admission reseed, and a revealed subtree never seeded into the FID
-/// map. The core half of that sequence is
-/// `core::tests::linux_fanotify::a_mount_seen_only_by_a_live_walk_is_still_condemnable`.
+/// observation is one the core's ledger can only hold as `Standing::Unknown`,
+/// which joins no census and fails the whole scope closed while it is held. That
+/// recorded an ambiguity from an observation that could perfectly well tell a
+/// real vfsmount from a same-mount subvolume. The failure it produced was
+/// reachable: a genuine mount arriving after the spawn census, first observed by
+/// a LIVE walk, and departing before any refresh listed it had its departure
+/// derived by nothing precise — no located cover, no admission reseed, and a
+/// revealed subtree never seeded into the FID map. The core half of that sequence
+/// is
+/// `core::tests::kernel_recursive_fanotify::a_mount_seen_only_by_a_live_walk_still_has_its_departure_derived`.
 ///
 /// A `None` here is now reserved for its one honest meaning: the host answers no
 /// mount ids at all. This cell skips loudly rather than passing vacuously on such

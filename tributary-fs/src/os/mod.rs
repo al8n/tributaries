@@ -771,13 +771,13 @@ pub(crate) struct MountRow {
 ///
 /// Deliberately NOT a [`MountRow`], though the two carry the same three facts.
 /// A row is a mountinfo line: proof that a vfsmount is (or was) at that
-/// location, and therefore the evidence that makes a record CONDEMNABLE. A
-/// decline is only "the walk's fence said stop here" — which a btrfs subvolume
-/// trips on the device belt while carrying the walk root's own mount id, with
-/// no row, ever. Keeping the two types apart is what stops a future reader from
-/// feeding a decline into `MountRecord::confirmed` and re-opening the cover
-/// storm the provenance partition exists to prevent (see the core's
-/// `MountRecord`).
+/// location, and therefore something a CENSUS can key and derive transitions
+/// for. A decline is only "the walk's fence said stop here" — which a btrfs
+/// subvolume trips on the device belt while carrying the walk root's own mount
+/// id, with no row, ever. Keeping the two types apart is what stops a future
+/// reader from feeding a decline into the census and re-opening the cover storm
+/// that "condemn on a transition, never on an absence" exists to prevent (see the
+/// core's `CensusRow` and `LedgerEntry`).
 ///
 /// The fields mirror what the fence actually reads at the moment it declines,
 /// and no more:
@@ -788,12 +788,13 @@ pub(crate) struct MountRow {
 ///   walk pinned — so a `None` here means the HOST answers no mount ids
 ///   (`statx` succeeded with the `STATX_MNT_ID` bit unset: below 5.8, or the mask
 ///   missing), never that this observer did not ask. That distinction is
-///   load-bearing. An id-less record is what `MountRecord::condemnable` reads as
-///   device-only and therefore permanently exempt, so recording one from an
-///   observation that COULD have answered the id — as the device belt once did,
-///   being checked before the `statx` — mints a permanently-exempt record for a
-///   genuine vfsmount and loses its departure entirely. A `statx` that FAILS
-///   yields an incomplete walk instead; it never reaches this type.
+///   load-bearing. An id-less observation is one the core can only record
+///   `Standing::Unknown`, which joins no census and fails the whole scope closed
+///   while it is held, so producing one from an observation that COULD have
+///   answered the id — as the device belt once did, being checked before the
+///   `statx` — buys a whole-root cover per refresh in place of a precise
+///   departure. A `statx` that FAILS yields an incomplete walk instead; it never
+///   reaches this type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DeclinedBoundary {
   /// The absolute path of the declined child.
