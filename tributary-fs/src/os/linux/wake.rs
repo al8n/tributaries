@@ -129,9 +129,9 @@ impl WakeState {
     }
   }
 
-  /// Unconditionally increments the eventfd counter (shutdown, where no wake
-  /// elision applies). The write result is ignored: a full counter already
-  /// guarantees a pending wake.
+  /// Unconditionally increments the eventfd counter — shutdown, and the
+  /// fanotify admission reseed, where no wake elision applies. The write result
+  /// is ignored: a full counter already guarantees a pending wake.
   pub(crate) fn wake(&self) {
     let _ = rustix::io::write(&self.event, &1u64.to_ne_bytes());
   }
@@ -146,9 +146,27 @@ impl WakeState {
     self.shutdown.store(true, Ordering::Relaxed);
   }
 
+  /// Whether this reader is (or is committing to) a block — the park half of the
+  /// lost-wakeup handshake, for the cells that have to show a wait ARMED it before
+  /// blocking and cleared it on every exit.
+  #[cfg(test)]
+  pub(crate) fn is_parked(&self) -> bool {
+    self.parked.load(Ordering::Relaxed)
+  }
+
   /// Whether teardown has requested shutdown — the inotify reader's between-ops
   /// preemption check inside a control batch.
   pub(crate) fn shutdown_requested(&self) -> bool {
     self.shutdown.load(Ordering::Relaxed)
+  }
+}
+
+/// Returned transport credit wakes a reader exactly as a control message does,
+/// and through the same handshake: the slot is given back before this runs (the
+/// "enqueue" half), so a reader that parked after failing to claim one is woken,
+/// and a reader that is demonstrably running pays no syscall.
+impl crate::os::transport::BoundaryCredit for WakeState {
+  fn boundary_released(&self) {
+    self.wake_if_parked();
   }
 }

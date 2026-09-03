@@ -31,6 +31,12 @@ struct Model {
   /// order, plus the terminal fatal count.
   processed: Vec<(u64, Kind)>,
   fatals: usize,
+  /// Declined boundaries the driver step consumed (SEAM 2's out-of-band lane).
+  boundaries: usize,
+  /// Admission-reseed replies the driver step consumed — the other out-of-band
+  /// lane, counted here so a cell can prove it too rides the queue without
+  /// touching the budget, the dedup position, or the resume staging.
+  admissions: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +73,24 @@ impl Model {
       SourceMessage::Overflow(ack) => {
         drop(ack);
         self.processed.push((pos, Kind::Overflow));
+      }
+      // Outside the BATCH budget and the dedup machinery entirely: no batch slot
+      // to release, no resume candidate to publish, no ack to drop. Its own
+      // independent permit is released by this arm's drop, exactly as the
+      // driver's ingest releases it. Counted so a cell can prove it reached the
+      // driver and changed nothing on the way.
+      SourceMessage::Boundaries(boundaries, permit) => {
+        self.boundaries += boundaries.declined.len();
+        drop(permit);
+      }
+      // Out of band for the same reasons, and counted for the same reason.
+      SourceMessage::Admitted(_) => self.admissions += 1,
+      // The whole-root recovery carries boundary evidence on a boundary permit,
+      // so it is priced exactly as a boundary report here — the declines it
+      // carries are the same generation, and the permit is released the same way.
+      SourceMessage::RootRecovered(recovery, permit) => {
+        self.boundaries += recovery.declined.len();
+        drop(permit);
       }
       SourceMessage::Fatal(_) => self.fatals += 1,
     }
@@ -382,6 +406,190 @@ fn a_batch_between_losses_elects_a_fresh_overflow_behind_it() {
   );
   while model.step_driver() {}
   assert!(!transport.overflow_pending(), "the drained queue re-arms");
+}
+
+/// The WHOLE-ROOT RECOVERY is priced exactly as a boundary report: an independent
+/// permit, no batch slot, no effect on the loss dedup position.
+///
+/// It carries a loss's worth of meaning — the core turns it into a root cover —
+/// but it is still not a `Batch`: it delivers no events and stages no resume
+/// position, so pricing it as one would end a pending `Overflow`'s run and make
+/// two adjacent losses enqueue two signals where one covers the ground.
+///
+/// The PERMIT is the half that is not merely symmetry. This message is
+/// non-droppable — a refused permit kills the source rather than losing the
+/// witness it carries — so it has to be able to claim one on a transport whose
+/// batch budget is exhausted, which is exactly what an independent counter buys.
+#[test]
+fn a_root_recovery_rides_out_of_band_on_its_own_permit() {
+  let transport = TransportState::new(4);
+  let mut model = Model::default();
+  forward_batch(&transport, Vec::new(), true, |msg| model.send(msg));
+  assert!(transport.overflow_pending(), "staging: a loss is pending");
+
+  let permit = BudgetPermit::acquire_boundaries(&transport)
+    .expect("the boundary budget has room for the recovery");
+  model.send(SourceMessage::RootRecovered(
+    crate::os::RootRecovery {
+      declined: vec![crate::os::DeclinedBoundary {
+        location: PathBuf::from("/r/bound"),
+        dev: 1,
+        mnt_id: Some(77),
+      }],
+      cutoff: crate::os::AdmitTicket::new(9),
+      epoch: 3,
+      root_mnt_id: Some(42),
+    },
+    permit,
+  ));
+  assert!(
+    transport.overflow_pending(),
+    "a recovery does not supersede the pending Overflow's run"
+  );
+  assert_eq!(
+    transport.in_flight(),
+    0,
+    "and it holds no BATCH permit: it exerts none of a batch's back-pressure"
+  );
+  assert_eq!(
+    transport.boundaries_in_flight(),
+    1,
+    "but it does hold its own independent permit — the message is non-droppable, \
+     so it must be able to claim one when the batch budget is spent"
+  );
+
+  while model.step_driver() {}
+  assert_eq!(
+    model.boundaries, 1,
+    "and its generation reached the driver, priced exactly as a report's is"
+  );
+  assert_eq!(
+    transport.boundaries_in_flight(),
+    0,
+    "with the permit released at ingest"
+  );
+}
+
+/// SEAM 2's message is OUT OF BAND, and this is the property that decides it
+/// belongs there.
+///
+/// A walk's declines are not events: they hold no budget permit, stage no resume
+/// position, and — the part that would bite — must not advance the loss dedup
+/// position. Priced as a `Batch` they would end a pending `Overflow`'s run, so
+/// two adjacent losses with a walk between them would enqueue TWO signals where
+/// one covers the ground, and a boundary observation that delivers nothing to the
+/// consumer would be paying for a rescan.
+///
+/// The contrast is deliberate: this is the same schedule as
+/// [`a_batch_between_losses_elects_a_fresh_overflow_behind_it`], with the batch
+/// replaced by a boundary message, and it must reach the OPPOSITE verdict.
+#[test]
+fn a_boundary_message_between_losses_neither_supersedes_nor_costs_a_permit() {
+  let transport = TransportState::new(4);
+  let mut model = Model::default();
+  // loss1 → Overflow1.
+  forward_batch(&transport, Vec::new(), true, |msg| model.send(msg));
+  assert!(transport.overflow_pending());
+
+  // A live walk's declines land behind the pending Overflow, exactly as the
+  // fanotify reader puts them there.
+  let permit = BudgetPermit::acquire_boundaries(&transport)
+    .expect("the boundary budget has room for the first report");
+  model.send(SourceMessage::Boundaries(
+    crate::os::WalkBoundaries {
+      declined: vec![crate::os::DeclinedBoundary {
+        location: PathBuf::from("/r/bound"),
+        dev: 1,
+        mnt_id: Some(77),
+      }],
+      reach: crate::os::WalkReach::Partial,
+    },
+    permit,
+  ));
+  assert!(
+    transport.overflow_pending(),
+    "a boundary observation does not supersede the pending Overflow's run — it \
+     carries nothing the rescan would have to re-cover"
+  );
+  assert_eq!(
+    transport.in_flight(),
+    0,
+    "and it holds no BATCH permit: it exerts none of a batch's back-pressure"
+  );
+  assert_eq!(
+    transport.boundaries_in_flight(),
+    1,
+    "but it does hold its own independent permit — the queue is unbounded, so an \
+     unpermitted report would be an unbounded one"
+  );
+
+  // loss2, adjacent to loss1 across the boundary message, still collapses.
+  forward_batch(&transport, Vec::new(), true, |msg| model.send(msg));
+  let kinds: Vec<&Msg> = model.queue.iter().map(|(_, m)| m).collect();
+  assert!(
+    matches!(
+      kinds.as_slice(),
+      [SourceMessage::Overflow(_), SourceMessage::Boundaries(..)]
+    ),
+    "one Overflow covers both losses; the boundary message rides between them: {kinds:?}"
+  );
+
+  while model.step_driver() {}
+  assert_eq!(
+    model.boundaries, 1,
+    "the declined boundary still reached the driver"
+  );
+}
+
+/// The ADMISSION REPLY is out of band on exactly the same terms, and it must be:
+/// it releases a cover the core parked on a departed mount, and pricing it as a
+/// batch would let a reply that happened to fall between two losses advance the
+/// dedup position and MUTE the second `Overflow` — silencing a real loss behind a
+/// message that delivers nothing to the consumer at all.
+///
+/// Same schedule as the boundary cell above, with the boundary message replaced
+/// by the reply, and the same verdict.
+#[test]
+fn an_admission_reply_between_losses_neither_supersedes_nor_costs_a_permit() {
+  let transport = TransportState::new(4);
+  let mut model = Model::default();
+  // loss1 → Overflow1.
+  forward_batch(&transport, Vec::new(), true, |msg| model.send(msg));
+  assert!(transport.overflow_pending());
+
+  // The reader answered an admission round trip, exactly where it puts it.
+  model.send(SourceMessage::Admitted(crate::os::AdmitReport {
+    ticket: crate::os::AdmitTicket::new(1),
+    outcome: crate::os::AdmitOutcome::Admitted,
+  }));
+  assert!(
+    transport.overflow_pending(),
+    "an admission reply does not supersede the pending Overflow's run — it \
+     carries nothing the rescan would have to re-cover"
+  );
+  assert_eq!(
+    transport.in_flight(),
+    0,
+    "and it holds no budget permit: the queue's memory bound is about batches"
+  );
+
+  // loss2, adjacent to loss1 across the reply, still collapses.
+  forward_batch(&transport, Vec::new(), true, |msg| model.send(msg));
+  let kinds: Vec<&Msg> = model.queue.iter().map(|(_, m)| m).collect();
+  assert!(
+    matches!(
+      kinds.as_slice(),
+      [SourceMessage::Overflow(_), SourceMessage::Admitted(_)]
+    ),
+    "one Overflow covers both losses; the reply rides between them: {kinds:?}"
+  );
+
+  while model.step_driver() {}
+  assert_eq!(
+    model.admissions, 1,
+    "and the reply still reached the driver, which is what retires the core's \
+     parked cover"
+  );
 }
 
 /// The dedup still collapses ADJACENT losses — nothing enqueued between them —

@@ -55,15 +55,20 @@
 //!   all, so a 4.11–5.5 kernel still pins, starts the reader, AND reads the ancestor
 //!   chain without ever hitting an unhandled
 //!   `ENOSYS`. `statx`'s mount id (`STATX_MNT_ID`, 5.8) is a masked read
-//!   ([`root_mount_id`] here, and the driver's `stat_sample`) that yields `Ok(None)`
-//!   — the device-belt fence — on a 4.11–5.7 kernel rather than failing. The scope
-//!   fence rests on one invariant: **a `None` mount frame means `statx` SUCCEEDED
-//!   without the `STATX_MNT_ID` bit (a pre-5.8 belt), and NEVER that `statx`
-//!   failed.** A `statx` failure is always a spawn failure ([`require_statx`] fails
-//!   closed on EVERY error, and the mount-id capture turns `Err` into a spawn
-//!   refusal) or a walk failure — so the belt is never reached by silently
-//!   swallowing a denied `statx`, which would disable the fence. `inotify_init` and
-//!   `eventfd` are far below the floor.
+//!   ([`root_mount_id`] here, and the driver's `stat_sample`) whose MISS on a
+//!   4.11–5.7 kernel hands the read to `/proc/self/fdinfo`, which has printed the
+//!   same legacy `mnt_id:` for every open fd — `O_PATH` included — since 3.15,
+//!   below this floor. A mount id is therefore ANSWERED on every supported host,
+//!   and the once-permanent 4.11–5.7 device-belt degrade has no trigger left on an
+//!   ordinary mount; which of the two reads answers is settled ONCE per process
+//!   (see [`root_mount_id`]). The scope fence rests on one invariant: **a `None`
+//!   mount frame means the host answered no mount id ANYWHERE it could be asked —
+//!   neither the `statx` mask nor fdinfo — and NEVER that a read failed.** A
+//!   failed read is always a spawn failure ([`require_statx`] fails closed on
+//!   EVERY error, and the mount-id capture turns `Err` into a spawn refusal) or a
+//!   walk failure — so the belt is never reached by silently swallowing a denied
+//!   `statx` or an unreadable `/proc`, which would disable the fence.
+//!   `inotify_init` and `eventfd` are far below the floor.
 //! - **fanotify: 5.17+** (the `FAN_REPORT_TARGET_FID` / `FAN_RENAME` composite,
 //!   design §4), well above the `statx` floor, so the up-front gate never trips on
 //!   it. Every fanotify-only call — including the seed walk's `openat2` roots in
@@ -364,42 +369,210 @@ pub(crate) use crate::driver::excluded;
 
 /// Unescapes one `/proc/self/mountinfo` field: the kernel encodes space, tab,
 /// newline, and backslash as `\ooo` octal triples.
+///
+/// Takes RAW BYTES because a Linux pathname is raw bytes. The field arrives
+/// straight off the read buffer with no decode in between, so a mount point that
+/// is not valid UTF-8 — a legal name on every Linux filesystem — passes through
+/// as itself instead of failing the read that contains it.
 // Byte-level OsStr construction is a unix capability; the parser rides the
 // same gate as `RootIdentity::new` so non-unix lib targets (wasm) skip it.
 #[cfg(any(unix, test))]
-fn unescape_mountinfo(field: &str) -> Vec<u8> {
-  let bytes = field.as_bytes();
-  let mut out = Vec::with_capacity(bytes.len());
+fn unescape_mountinfo(field: &[u8]) -> Vec<u8> {
+  let mut out = Vec::with_capacity(field.len());
   let mut at = 0;
-  while at < bytes.len() {
-    if bytes[at] == b'\\' && at + 3 < bytes.len() {
-      let octal = &bytes[at + 1..at + 4];
+  while at < field.len() {
+    if field[at] == b'\\' && at + 3 < field.len() {
+      let octal = &field[at + 1..at + 4];
       if octal.iter().all(|b| (b'0'..=b'7').contains(b)) {
-        let value = (octal[0] - b'0') * 64 + (octal[1] - b'0') * 8 + (octal[2] - b'0');
-        out.push(value);
-        at += 4;
-        continue;
+        // WIDENED before the arithmetic. Three octal digits span `0..=0o777`, and
+        // computing `(octal[0] - b'0') * 64` in `u8` OVERFLOWS — a debug-build
+        // panic — for any leading digit above 3. The kernel only ever writes
+        // `\040`, `\011`, `\012` and `\134`, but this parser now reads whatever
+        // bytes `/proc` handed back, so the out-of-range triple is left VERBATIM
+        // rather than wrapped into a different byte.
+        let value = u32::from(octal[0] - b'0') * 64
+          + u32::from(octal[1] - b'0') * 8
+          + u32::from(octal[2] - b'0');
+        if let Ok(byte) = u8::try_from(value) {
+          out.push(byte);
+          at += 4;
+          continue;
+        }
       }
     }
-    out.push(bytes[at]);
+    out.push(field[at]);
     at += 1;
   }
   out
 }
 
-/// Parses `/proc/self/mountinfo` content into the mount points strictly under
-/// `root` (PURE — the reader lives in the cfg'd `mounts_under`).
+/// One SPACE-separated field of a mountinfo line, byte-wise.
 ///
-/// The mount point is the fifth whitespace-separated field; malformed lines
-/// are skipped (the seed is trust-reducing only, so omission fails toward
-/// closed trust, never toward false authority).
+/// **The delimiter is the literal `0x20` and nothing else.** mountinfo escapes
+/// exactly four bytes inside its path fields — space, tab, newline and backslash,
+/// as `\040`, `\011`, `\012` and `\134` — and separates its own fields with
+/// single spaces. Every OTHER ASCII whitespace byte is a legal pathname byte the
+/// kernel emits RAW: carriage return `0x0d`, form feed `0x0c` and vertical tab
+/// `0x0b` all name perfectly ordinary directories. Splitting on
+/// `u8::is_ascii_whitespace` — what `str::split_whitespace` did before this parser
+/// read bytes — TRUNCATES such a mount point at the first `0x0c` or `0x0d` (that
+/// predicate's set is tab, newline, form feed, carriage return and space; `0x0b`
+/// survives it by accident, under no rule that protects it) and records the row at
+/// a PHANTOM location. Because a successful read is AUTHORITATIVE, the phantom is
+/// admitted and covered like any other row, while the real revealed subtree is
+/// never mapped at all.
+///
+/// Empty runs are still skipped, so a doubled space cannot shift the POSITIONAL
+/// field indices this parser addresses by. The filter is scoped to the delimiter:
+/// a run of raw `\r`, `\v` or `\f` inside a field is not a separator at all, so
+/// none of them can be dropped out of a path either.
 #[cfg(any(unix, test))]
-pub(crate) fn parse_mountinfo(content: &str, root: &Path) -> Vec<PathBuf> {
-  let mut mounts = Vec::new();
-  for line in content.lines() {
-    let Some(field) = line.split_whitespace().nth(4) else {
+fn mountinfo_fields(line: &[u8]) -> impl Iterator<Item = &[u8]> {
+  line
+    .split(|byte| *byte == b' ')
+    .filter(|field| !field.is_empty())
+}
+
+/// Parses one mountinfo NUMERIC field, byte-wise and strictly: the whole field
+/// must be ASCII digits and fit a `u64`.
+///
+/// `str::parse::<u64>` answered exactly this before the parser read bytes, and
+/// keeping it strict is what preserves the honest-unknown rule — `zz`, the `x` of
+/// `0:x` and a signed field all answer `None`, which the caller records as an
+/// unknown identity rather than a dropped row.
+#[cfg(any(unix, test))]
+fn parse_mountinfo_u64(field: &[u8]) -> Option<u64> {
+  if field.is_empty() || !field.iter().all(u8::is_ascii_digit) {
+    return None;
+  }
+  let mut value: u64 = 0;
+  for byte in field {
+    value = value.checked_mul(10)?.checked_add(u64::from(byte - b'0'))?;
+  }
+  Some(value)
+}
+
+/// Packs a mountinfo `major:minor` pair the way `dev_t` does, so a row's device
+/// is the same number a `stat` of an object on that filesystem reports rather
+/// than a private encoding that only ever compares against itself.
+#[cfg(any(unix, test))]
+const fn makedev(major: u64, minor: u64) -> u64 {
+  ((major & 0xffff_f000) << 32)
+    | ((major & 0x0000_0fff) << 8)
+    | ((minor & 0xffff_ff00) << 12)
+    | (minor & 0x0000_00ff)
+}
+
+/// Parses `/proc/self/mountinfo` content into EVERY mount row strictly under
+/// `root`, in FILE order (PURE — the reader lives in the cfg'd `mounts_under`).
+///
+/// Four fields of every line are read, and all four are already on the line
+/// being scanned: field 1 is the mount ID, field 2 the PARENT mount's ID, field
+/// 3 the `major:minor` of the mounted filesystem, and field 5 the mount point.
+/// All four are kept on the row. Identity is what lets the core see a mount
+/// REPLACED at an unchanged path, which a paths-only read cannot express at all.
+///
+/// A line with fewer than five space-separated fields is skipped (the seed is
+/// trust-reducing only, so omission fails toward closed trust, never toward false
+/// authority). An unparsable identity field is NOT such a line: the location is
+/// the load-bearing half and it parsed, so the row is kept with that identity
+/// `None` — the same honest-unknown the non-Linux tables report.
+///
+/// # Every row, and no claim about which one a lookup REACHES
+///
+/// Several rows can render one mount point: an ordinary stack, a `mount --move`
+/// onto an occupied mount point, two mounts propagated side by side. All of them
+/// come back, each with its own id, and nothing here decides which is visible.
+///
+/// That is the design and not a gap. The kernel exports no visibility — only a
+/// parent link and a rendered label — so every rule for deriving it here was a
+/// MODEL of a structure `/proc` does not publish, and a model is faithful until
+/// the next arrangement. Each refinement (line order, then the parent chain,
+/// then a same-path group, then the whole parent graph) was found wrong on an
+/// arrangement the previous one had not considered, and every wrong answer was a
+/// mount whose departure the core could then never see.
+///
+/// The core does not need the answer. It keys its census by mount ID, so two
+/// rows at one location are simply two rows, and each one's arrival, move and
+/// departure is a transition on its own key. What a visibility resolution bought
+/// — one identity per location, so that a location-keyed set could be diffed —
+/// is exactly what identity-keying makes unnecessary. What it cost was a class
+/// of silent misses whenever the model and the kernel disagreed. A hidden
+/// mount's transition now costs at most one redundant cover of ground that was
+/// already covered, which is the safe direction.
+///
+/// The namespace-generation bracket the read is taken inside ([`mount_sample`])
+/// certifies exactly the facts kept here and nothing else: every topology change
+/// takes `namespace_sem` for write and bumps `ns->event`, so an unchanged count
+/// across the read makes the ID SET coherent. It certifies nothing about the
+/// labels, because `show_mountinfo` renders each row's path by its own
+/// `seq_path_root` call — which is why a location is a cover-location HINT and
+/// the identity is the key.
+///
+/// # Strictly UNDER the root, and nothing else retained
+///
+/// `path.starts_with(root) && path != root`. The root's own row and its
+/// ancestors were retained while the visibility predicates needed to reach above
+/// the root — a shadowing sibling can sit at the root or higher — and with no
+/// predicates there is nothing left to ask them. The retained set is now the
+/// answer set, so a namespace with thousands of rows allocates only the rows
+/// this root actually has.
+///
+/// # Bytes, never a `&str` — one non-UTF-8 mount point must not blind the table
+///
+/// A Linux pathname is an arbitrary byte string with no encoding contract, so
+/// ANY mount in the namespace may carry a mount point that is not valid UTF-8:
+/// a USB stick with a Latin-1 label, a container image built on a
+/// differently-encoded host, a deliberately-named directory. This parser takes
+/// the raw buffer and splits it on its own ASCII delimiters, and the ONLY decode
+/// it performs is `OsStr::from_bytes`, which is total.
+///
+/// The `&str` form this replaces made the failure NAMESPACE-WIDE rather than
+/// per-row: `read_to_string` fails on the whole file, `mounts_under` answers
+/// `None`, every refresh is marked non-authoritative, and the arrival/departure
+/// diff — the primary detector for a mount that departs below the root — never
+/// runs at all. A single unrelated mount point anywhere in the namespace left
+/// every watched root's revealed subtree dark indefinitely, however ordinary the
+/// watched root's own names were.
+#[cfg(any(unix, test))]
+pub(crate) fn parse_mountinfo(content: &[u8], root: &Path) -> Vec<crate::os::MountRow> {
+  let mut rows: Vec<crate::os::MountRow> = Vec::new();
+  // Split on the RAW newline: mountinfo octal-escapes `\n` inside its path
+  // fields (`\012`), so no line boundary can fall inside a mount point.
+  for line in content.split(|byte| *byte == b'\n') {
+    // Fields 1..=5 never carry an unescaped SPACE (mountinfo octal-escapes the
+    // one delimiter byte it uses, along with tab, newline and backslash), so
+    // positional splitting reaches all four of the fields read here. Every other
+    // whitespace byte is ordinary path data — see [`mountinfo_fields`].
+    let mut fields = mountinfo_fields(line);
+    let Some(id_field) = fields.next() else {
       continue;
     };
+    let Some(parent_field) = fields.next() else {
+      continue;
+    };
+    let Some(dev_field) = fields.next() else {
+      continue;
+    };
+    // Field 4 is the mounted subtree's own root inside its filesystem, which is
+    // not one of the facts a row records.
+    if fields.next().is_none() {
+      continue;
+    }
+    let Some(field) = fields.next() else {
+      continue;
+    };
+    let mnt_id = parse_mountinfo_u64(id_field);
+    let parent_id = parse_mountinfo_u64(parent_field);
+    let dev = dev_field
+      .iter()
+      .position(|byte| *byte == b':')
+      .and_then(|at| {
+        Some(makedev(
+          parse_mountinfo_u64(&dev_field[..at])?,
+          parse_mountinfo_u64(&dev_field[at + 1..])?,
+        ))
+      });
     let bytes = unescape_mountinfo(field);
     // A mount point is raw path bytes — only unix carries non-UTF-8 verbatim.
     // The non-unix arm serves solely the cross-platform parser tests (the `test`
@@ -411,20 +584,399 @@ pub(crate) fn parse_mountinfo(content: &str, root: &Path) -> Vec<PathBuf> {
     };
     #[cfg(not(unix))]
     let path = PathBuf::from(String::from_utf8_lossy(&bytes).into_owned());
-    if path.starts_with(root) && path.as_path() != root {
-      mounts.push(path);
+    // STRICTLY under the root. `Path::starts_with` compares COMPONENTS, so
+    // `/rooted` is not under `/root`, and the root's own row is excluded because
+    // a mount AT the root is not a boundary inside it.
+    if !path.starts_with(root) || path.as_path() == root {
+      continue;
     }
+    rows.push(crate::os::MountRow {
+      location: path,
+      mnt_id,
+      parent_id,
+      dev,
+    });
   }
-  mounts
+  rows
 }
 
-/// The mount points strictly under `root`, read from `/proc/self/mountinfo`.
-/// `None` means the table could not be read — the caller must then treat
-/// device boundaries as UNKNOWN rather than absent.
+/// The mount rows strictly under `root`, read from `/proc/self/mountinfo`.
+/// `None` means the table could not be READ — the caller must then treat device
+/// boundaries as UNKNOWN rather than absent.
+///
+/// Read as BYTES. `read_to_string` made one non-UTF-8 mount point ANYWHERE in
+/// the namespace answer `None` here, which marks every refresh non-authoritative
+/// and silently retires the mount arrival/departure diff for every watched root
+/// on the host — see [`parse_mountinfo`]. `None` is reserved for a read that
+/// genuinely failed, and for nothing else: the parse decides nothing and refuses
+/// nothing, so no arrangement of mounts can make a readable table answer `None`
+/// here. A refusal a STABLE topology reproduces is not an honest degrade but a
+/// permanent one, and this read has no way left to make one.
+///
+/// This is the SEED reader — the spawn barriers, whose table is trust-reducing
+/// only. The REFRESH goes through [`mount_sample`], which additionally proves the
+/// mount namespace held still across the table read and the root's own stat.
 #[cfg(all(target_os = "linux", not(miri)))]
-pub(crate) fn mounts_under(root: &Path) -> Option<Vec<PathBuf>> {
-  let content = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+pub(crate) fn mounts_under(root: &Path) -> Option<Vec<crate::os::MountRow>> {
+  mounts_from_file(Path::new("/proc/self/mountinfo"), root)
+}
+
+/// Reads one mountinfo-format file as BYTES and parses the rows strictly under
+/// `root`. `None` means the READ failed; the parse itself always answers a table.
+///
+/// Split out of [`mounts_under`] because the defect this closes lived in the
+/// READ and not in the parse: `read_to_string` turned one non-UTF-8 mount point
+/// anywhere in the namespace into `None` here, and `None` here is what marks a
+/// refresh non-authoritative and retires issue #74's whole arrival/departure
+/// diff. With the `/proc` path factored out, that decision is drivable over a
+/// file a cell writes.
+#[cfg(any(all(target_os = "linux", not(miri)), test))]
+pub(crate) fn mounts_from_file(path: &Path, root: &Path) -> Option<Vec<crate::os::MountRow>> {
+  let content = std::fs::read(path).ok()?;
   Some(parse_mountinfo(&content, root))
+}
+
+/// How many times [`mount_sample`] re-takes the pair before conceding that it
+/// cannot get a coherent one.
+///
+/// The bound exists because the retry is UNBOUNDED work otherwise: a namespace
+/// churning continuously — a container host starting and stopping units, an
+/// automounter expiring a tree — can invalidate every attempt in a row, and the
+/// refresh runs on the blocking pool where spinning starves every other scope the
+/// driver owns. Three is chosen against the failure it answers: an incoherent
+/// attempt means one mount transition landed inside a window that is a few
+/// hundred microseconds wide, so two independent recurrences are already a
+/// namespace in constant motion rather than a race lost to bad luck — and the
+/// answer for that is the honest non-authoritative degrade the next tick retries,
+/// not a fourth read.
+#[cfg(any(all(target_os = "linux", not(miri)), test))]
+const MAX_MOUNT_SAMPLE_ATTEMPTS: usize = 3;
+
+/// ONE attempt at a coherent mount sample: the table, the caller's own sample of
+/// the root, and whether the mount namespace provably held still across BOTH.
+#[cfg(any(all(target_os = "linux", not(miri)), test))]
+struct MountSample<S> {
+  /// The rows strictly under the root, or `None` for a read that failed.
+  rows: Option<Vec<crate::os::MountRow>>,
+  /// Whatever the caller sampled about the root itself, taken INSIDE the window
+  /// `stable` speaks for.
+  root: S,
+  /// The mount-namespace transition count read INSIDE this window (see
+  /// [`NamespaceWatch`]), or `None` where no fd could answer it.
+  namespace: Option<u64>,
+  /// Whether the mount namespace's generation was unchanged from before the table
+  /// read to after the root sample. A table that could not be opened at all is
+  /// trivially stable — there is nothing for a namespace change to have torn.
+  stable: bool,
+}
+
+/// The process-wide mount-namespace TRANSITION counter, and the one piece of
+/// state a refresh keeps between its runs.
+///
+/// # Why an id comparison cannot answer this and a counter can
+///
+/// `mount_sample` already proves the namespace held still across ONE window, and
+/// that is what makes the table and the root's stat a coherent pair. It says
+/// nothing about the GAP between two refreshes — and a mount id observed at
+/// either end of that gap is the same value whether nothing happened or an
+/// unmount and a remount handed the new mount the id the old one freed. The
+/// refresh sees values; the hole is a transition.
+///
+/// One `/proc/self/mountinfo` fd, held open across the gap and polled once per
+/// window, closes it: `mounts_poll` raises `POLLERR | POLLPRI` exactly when
+/// `ns->event` has moved since the fd's own last answer and updates its baseline
+/// as it answers, so repeated polls on ONE fd partition time into "nothing moved
+/// since I last looked" intervals. Counting the intervals that did move yields a
+/// generation that DIFFERS across any gap containing a mount transition —
+/// including A → B → A, which is the whole point.
+///
+/// # Why it is a counter rather than the poll's own boolean
+///
+/// The poll consumes the edge. With several scopes refreshing against one
+/// namespace, whichever polls first would see the transition and the rest would
+/// see a clean fd — so the answer must be a value every reader can compare
+/// against the one IT last adopted, not an edge only one of them receives.
+///
+/// # The two failure directions
+///
+/// An fd that cannot be opened, or a poll that errors, answers "moved": this may
+/// only certify continuity it actually proved, and over-reporting a transition
+/// costs a whole-root generation while under-reporting one costs the cover
+/// entirely. A `/proc` with no `poll` handler is the direction that cannot be
+/// detected — it reads clean forever, exactly as it does for
+/// [`namespace_unchanged`] — and leaves this host where it was before the check
+/// existed.
+#[cfg(all(target_os = "linux", not(miri)))]
+#[derive(Debug, Default)]
+pub(crate) struct NamespaceWatch {
+  state: std::sync::Mutex<NamespaceWatchState>,
+}
+
+#[cfg(all(target_os = "linux", not(miri)))]
+#[derive(Debug, Default)]
+struct NamespaceWatchState {
+  /// The `/proc/self/mountinfo` fd held ACROSS refreshes — never re-opened while
+  /// it answers, because a fresh fd's baseline is its own open and would report
+  /// the gap it was opened inside as quiet.
+  file: Option<std::fs::File>,
+  /// How many windows this watch has observed a transition in.
+  generation: u64,
+}
+
+#[cfg(all(target_os = "linux", not(miri)))]
+impl NamespaceWatch {
+  /// Reads the generation for the window this call sits inside, advancing it
+  /// when the namespace moved since the previous call (or when nothing could
+  /// prove it did not).
+  ///
+  /// Called INSIDE [`mount_sample`]'s attempt and BEFORE that attempt's own
+  /// stability poll, so the interval this generation closes ends inside a window
+  /// the attempt proves quiet: a transition between two refreshes' root stats
+  /// therefore falls strictly between two of these calls and cannot hide in the
+  /// slack at either end.
+  fn observe(&self) -> Option<u64> {
+    let mut state = self
+      .state
+      .lock()
+      .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match state.file.as_ref() {
+      // Held across the gap: the poll answers for everything since the previous
+      // one, which is exactly the interval an id comparison is blind to.
+      Some(file) => {
+        if !namespace_unchanged(file) {
+          state.generation = state.generation.wrapping_add(1);
+        }
+      }
+      // No fd spanned the gap, so nothing proves it was quiet. Opening one now
+      // starts a fresh baseline, and the transition count moves with it.
+      None => {
+        state.file = std::fs::File::open("/proc/self/mountinfo").ok();
+        state.generation = state.generation.wrapping_add(1);
+      }
+    }
+    state.file.is_some().then_some(state.generation)
+  }
+}
+
+/// PURE: the retry policy over [`MountSample`] attempts — takes the pair until
+/// one is stable or the bound is spent, and answers the LAST attempt's root
+/// sample either way.
+///
+/// # Why an unstable attempt is rejected rather than used
+///
+/// The table and the root's stat are two different samples, and the refresh marks
+/// them authoritative as ONE. A mount transition between them is not a stale
+/// reading of one fact, it is two facts about two different worlds presented as a
+/// snapshot: the parser can hand back a chain with a member omitted (which costs
+/// that one location its identity) or — worse, because it is silent — a complete
+/// table from BEFORE a transition beside a root frame from AFTER it. Mount ids are
+/// allocated lowest-free and freed on umount, so an id in the older table can be
+/// the very id the newer root stat reports, and every predicate the core writes
+/// against "a row's id versus the root's" then reads a coincidence as evidence.
+///
+/// Rejecting costs a cover that would have been emitted a tick later anyway; a
+/// wrong baseline costs the cover entirely.
+///
+/// # The last sample's ROOT still travels
+///
+/// Only the TABLE is discarded. The root's liveness and frame come from a single
+/// `statx` of a single object, which is atomic on its own terms and is what the
+/// death gate decides on — and death is terminal regardless of how the table read
+/// went. Withholding it would let a churning namespace keep a vanished root alive
+/// indefinitely.
+#[cfg(any(all(target_os = "linux", not(miri)), test))]
+fn coherent_mount_sample<S>(
+  attempts: usize,
+  mut take: impl FnMut() -> MountSample<S>,
+) -> crate::os::MountReading<S> {
+  let mut sample = take();
+  let mut spent = 1;
+  // Only INSTABILITY is retried, and it is now the only thing that CAN be: the
+  // parse always answers a table, so an arrangement its mount graph could not
+  // decide inside a stable window — the namespace demonstrably did not move — is a
+  // genuine side-by-side arrangement no re-read would resolve, and it degrades that
+  // one location rather than the sample.
+  while !sample.stable && spent < attempts {
+    sample = take();
+    spent += 1;
+  }
+  crate::os::MountReading {
+    rows: if sample.stable { sample.rows } else { None },
+    root: sample.root,
+    // The LAST attempt's generation travels whether or not that attempt was
+    // stable: the count only ever moves forward, so a caller comparing it against
+    // an earlier one still reads every transition between them. What an unstable
+    // window withholds is `stable`, which is what gates pairing two separate root
+    // reads into one token.
+    namespace: sample.namespace,
+    stable: sample.stable,
+  }
+}
+
+/// The refresh's mount sample: the rows strictly under `root` AND the caller's
+/// own sample of the root, taken inside ONE proven-still mount namespace
+/// generation.
+///
+/// `sample_root` runs once per attempt, between the table read and the stability
+/// check, so what comes back is the root reading that belongs to the accepted
+/// table. `None` rows mean non-authoritative — unreadable, or a namespace that
+/// would not hold still for [`MAX_MOUNT_SAMPLE_ATTEMPTS`] tries.
+///
+/// # How the namespace generation is read
+///
+/// `/proc/self/mountinfo` is a `seq_file` whose `open` snapshots the mount
+/// namespace's event counter and whose `poll` reports `POLLERR | POLLPRI` exactly
+/// when that counter has moved since (`mounts_poll`, `fs/namespace.c`; the
+/// counter is bumped under the namespace write lock by every mount, unmount and
+/// move). So an fd held open across the read AND the root stat, polled once at the
+/// end with a zero timeout, answers precisely the question this needs — did
+/// anything change under us — without a second table read to compare against, and
+/// without the A→B→A blindness a byte comparison of two reads would have.
+///
+/// A poll that FAILS is read as "changed": the check may only ever certify
+/// stability it actually proved.
+///
+/// # The GAP between two of these is a separate question
+///
+/// The per-attempt fd is opened here and dropped here, so it speaks for this
+/// window and no other. What happened between one refresh's window and the next
+/// is what [`NamespaceWatch`] answers, out of an fd that outlives both — and it
+/// is polled INSIDE this window, before the stability check, so the interval it
+/// closes ends somewhere this attempt proves quiet.
+#[cfg(all(target_os = "linux", not(miri)))]
+pub(crate) fn mount_sample<S>(
+  root: &Path,
+  namespace: &NamespaceWatch,
+  mut sample_root: impl FnMut() -> S,
+) -> crate::os::MountReading<S> {
+  coherent_mount_sample(MAX_MOUNT_SAMPLE_ATTEMPTS, || {
+    // Re-OPENED per attempt, never rewound: `mounts_poll` updates its own
+    // baseline as it answers, so a second poll on the same fd would compare
+    // against the first poll's moment rather than against this attempt's read.
+    // No fd to poll, so nothing here PROVED the window quiet — and `stable` is
+    // still `true`, which is a claim about two consumers rather than one. For the
+    // TABLE it is trivially right: there is no table, so there is nothing a
+    // namespace change could have torn. For the incarnation TOKEN the second
+    // consumer added later, it is right for a different reason, and the reason is
+    // worth stating because the field's own doc argues only the first: a refresh's
+    // frame verdict ORs two INDEPENDENT point comparisons — the legacy id against
+    // the one this scope holds, and the token against the last one it proved — so a
+    // window that mis-paired them (a transition between the two `statx` calls) can
+    // only ever ADD a frame move, never hide one. What stays undetectable is a
+    // transition that REVERTS inside the window, and that is undetectable across
+    // two windows too (the same-object self-bind `RefusedWalk` exists for), so this
+    // arm opens no hole the proven path does not already carry.
+    let Ok(file) = std::fs::File::open("/proc/self/mountinfo") else {
+      return MountSample {
+        rows: None,
+        root: sample_root(),
+        namespace: namespace.observe(),
+        stable: true,
+      };
+    };
+    let content = {
+      use std::io::Read as _;
+      let mut buffer = Vec::new();
+      (&file).read_to_end(&mut buffer).ok().map(|_| buffer)
+    };
+    let rows = content.map(|content| parse_mountinfo(&content, root));
+    // INSIDE the window: the stability check below speaks for everything between
+    // the open above and this call's return.
+    let sampled = sample_root();
+    let observed = namespace.observe();
+    MountSample {
+      rows,
+      root: sampled,
+      namespace: observed,
+      stable: namespace_unchanged(&file),
+    }
+  })
+}
+
+/// The root's UNIQUE mount id — `statx(STATX_MNT_ID_UNIQUE)`, Linux 6.8 — or
+/// `None` on every kernel below it.
+///
+/// A second `statx` rather than a wider mask on the existing one, and that is
+/// forced: the kernel returns the unique id in the SAME `stx_mnt_id` field as the
+/// legacy one and answers whichever the request asked for, so a single call can
+/// carry one or the other and never both. The legacy id is the value every
+/// `mountinfo` row is compared against and cannot be given up; the unique id is
+/// the only value a recycled mount cannot forge. The pair is made coherent by the
+/// window they are both read inside — see [`crate::os::MountReading::stable`].
+///
+/// `STATX_MNT_ID_UNIQUE` is not in `rustix`'s `StatxFlags`, so the bit is named
+/// here. An older kernel simply leaves it out of `stx_mask`, which is the `None`
+/// this returns; there is no probe and no error path, because a mask miss is the
+/// answer rather than a failure.
+/// `STATX_MNT_ID_UNIQUE` (`include/uapi/linux/stat.h`, Linux 6.8), which
+/// `rustix`'s `StatxFlags` does not name.
+///
+/// `rustix::fs::statx` intersects the requested mask with `StatxFlags::all()`
+/// before the syscall, so this bit reaches the kernel only because that flag set
+/// carries bitflags' externally-defined-flags escape hatch. That link is what
+/// `a_unique_mount_id_is_read_where_the_kernel_has_one` proves on every host,
+/// kernel version or not.
+#[cfg(any(all(target_os = "linux", not(miri)), test))]
+pub(crate) const STATX_MNT_ID_UNIQUE: u32 = 0x0000_4000;
+
+#[cfg(all(target_os = "linux", not(miri)))]
+pub(crate) fn root_mnt_unique_id(root: &Path) -> Option<u64> {
+  use rustix::fs::{AtFlags, StatxFlags, statx};
+  const MNT_ID_UNIQUE: u32 = STATX_MNT_ID_UNIQUE;
+  let want = StatxFlags::from_bits_retain(MNT_ID_UNIQUE);
+  let stx = loop {
+    match statx(rustix::fs::CWD, root, AtFlags::SYMLINK_NOFOLLOW, want) {
+      Ok(stx) => break stx,
+      // Retried in place for the reason `stat_sample` retries: a signal cutting
+      // the call short is not an answer about the mount.
+      Err(rustix::io::Errno::INTR) => continue,
+      Err(_) => return None,
+    }
+  };
+  (stx.stx_mask & MNT_ID_UNIQUE != 0).then_some(stx.stx_mnt_id)
+}
+
+/// Whether the mount namespace's event counter is unchanged since `file` — an
+/// open `/proc/self/mountinfo` — was opened. `false` for a poll that could not
+/// answer.
+///
+/// # Its two failure directions are not symmetric, and both are named
+///
+/// A poll that ERRORS answers `false`: this may only certify stability it
+/// actually proved, and an unprovable window is one the caller re-takes and then
+/// degrades honestly.
+///
+/// A `/proc` whose mountinfo carries no `poll` handler is the other direction and
+/// cannot be told apart from a quiet namespace: `poll(2)` on a file with no
+/// handler answers the default readable/writable mask, so this reads TRUE
+/// forever and the pair is accepted exactly as it was before the check existed.
+/// That is the pre-existing behaviour rather than a new hole, and there is no
+/// cheaper probe for it — proving the mechanism works needs a real mount
+/// transition inside the window.
+///
+/// What is NOT acceptable is the inverse mistake, and it is the one to watch: a
+/// kernel (or a wrong flag, or a second poll on the same fd) that reported
+/// `POLLERR | POLLPRI` on every call would make every refresh non-authoritative
+/// on every host, retiring the entire mount detector in silence.
+/// `a_freshly_opened_mountinfo_fd_polls_clean` is the standing cell for that,
+/// and it runs on every Linux gate.
+#[cfg(all(target_os = "linux", not(miri)))]
+fn namespace_unchanged(file: &std::fs::File) -> bool {
+  use rustix::event::{PollFd, PollFlags, Timespec, poll};
+  // `POLLERR` is reported whether or not it is requested; `POLLPRI` must be asked
+  // for, and `mounts_poll` raises the two together. Zero timeout: the file is
+  // always readable, so this is a state query and never a wait.
+  let mut fds = [PollFd::new(file, PollFlags::PRI)];
+  match poll(
+    &mut fds,
+    Some(&Timespec {
+      tv_sec: 0,
+      tv_nsec: 0,
+    }),
+  ) {
+    Ok(_) => !fds[0].revents().intersects(PollFlags::ERR | PollFlags::PRI),
+    Err(_) => false,
+  }
 }
 
 /// The `(dev, ino)` an arm confirms the opened object still has before
@@ -594,6 +1146,7 @@ impl Source {
       root_dev: stat.st_dev,
       root_mnt_id,
       mounts,
+      declined: Vec::new(),
       identity,
       ancestors,
       backend: super::BackendKind::Inotify,
@@ -1015,45 +1568,231 @@ fn ancestor_identities(
   Ok(chain)
 }
 
-/// The MOUNT id of the pinned root, read fd-relative via
-/// `statx(root_fd, "", AT_EMPTY_PATH, STATX_MNT_ID)` — the descent boundary both
+/// The MOUNT id of the pinned root — `statx(root_fd, "", AT_EMPTY_PATH,
+/// STATX_MNT_ID)` where the kernel answers that, and the fd's own
+/// `/proc/self/fdinfo` line where it does not — the descent boundary both
 /// backends carry on [`RootMeta`](super::RootMeta) so the core (inotify) and the
 /// seed walk (fanotify) can fence a submount by mount id rather than device. A
 /// `mount --bind` of a same-superblock directory shares the root's device, so the
 /// device alone cannot mark the boundary; the mount id differs across any mount.
 ///
-/// # `Ok(None)` is the pre-5.8 belt; `Err` is a syscall failure — never conflated
+/// Which of the two reads answers is decided ONCE per process
+/// ([`mount_id_through_tier`]): a 5.8+ kernel settles on `statx` and never opens
+/// `/proc`, and a 4.11–5.7 kernel settles on fdinfo and never pays the mask probe
+/// again.
 ///
-/// A SUCCESSFUL `statx` whose `stx_mask` lacks the `STATX_MNT_ID` bit returns
-/// `Ok(None)` — the legitimate device-belt degrade below Linux 5.8 (RHEL 8's 4.18,
-/// Ubuntu 20.04's 5.4), where the core's `crosses_mount_boundary` falls back to the
-/// device check (the settled single-device policy). A `statx` SYSCALL FAILURE returns
-/// `Err(errno)` and is NEVER laundered into that `None`: the spawn-time frame capture
-/// (`RootMeta.root_mnt_id`, both backends) turns it into a spawn failure, and the live
-/// reseed/subtree walks turn it into a walk failure — so a `None` mount frame ALWAYS
-/// means `statx` succeeded without the mount-id bit and NEVER means `statx` failed.
-/// The spawn barrier already gated the 4.11 `statx` floor ([`require_statx`], fail
-/// closed), so an `Err` here is not expected — but it fails closed rather than
-/// silently disabling the fence. inotify's 4.11 floor is below 5.8, so `Ok(None)` is a
-/// real path there; fanotify's 5.17 floor always reports the id, but `Ok(None)` is
-/// still handled rather than asserted.
+/// # `Ok(None)` is the below-3.15 belt; `Err` is a read that FAILED — never conflated
+///
+/// `Ok(None)` means the HOST answers no mount id ANYWHERE it could be asked: the
+/// `statx` mask left the `STATX_MNT_ID` bit unset (below 5.8) AND the fd's fdinfo
+/// carried no parsable `mnt_id:` line. The kernel has printed that line for every
+/// open fd, `O_PATH` included, since Linux 3.15 — below the 4.11 `statx` floor the
+/// spawn barrier already enforces ([`require_statx`]) — so on every SUPPORTED host
+/// this `None` is unreachable, and the kernel cell
+/// `every_supported_kernel_records_a_mount_id_in_fdinfo` fails loudly on any host
+/// that stops printing it rather than letting the scope quietly degrade. The belt
+/// survives only as the honest answer for a host below both floors.
+///
+/// That matters above the seams: a boundary observed with no id is recorded
+/// `Standing::Unknown` (the core's ledger) and fails the WHOLE scope closed (a
+/// per-refresh root cover) while it is held. Before the fdinfo tier that was the
+/// standing state of every 4.11–5.7 host; now it has no trigger on an ordinary
+/// mount.
+///
+/// A read that FAILED returns `Err(errno)` and is NEVER laundered into that
+/// `None` — neither the `statx` (the historical rule) nor the fdinfo read (a
+/// closed fd's `ENOENT`, a hardened `/proc`'s `EACCES`). The spawn-time frame
+/// capture (`RootMeta.root_mnt_id`, both backends) turns an `Err` into a spawn
+/// failure and the live reseed/subtree walks turn it into a walk failure, so a
+/// `None` mount frame ALWAYS means the host answered no id and NEVER means a read
+/// failed.
+///
+/// # `EINTR` is retried, never surfaced
+///
+/// Every caller treats an `Err` as a hard refusal — a spawn failure, an incomplete
+/// walk, or a refused arm — which is exactly right for a real failure and exactly
+/// wrong for an interruption. `EINTR` says nothing about the object: the syscall
+/// was interrupted before it answered, and the honest response is to ask again, as
+/// the driver's own `stat_sample` does. Retrying here rather than at each caller
+/// keeps the four call sites from each having to remember, and keeps `Err` meaning
+/// "this read genuinely failed". The fdinfo leg inherits the same discipline from
+/// `std::fs::read`, whose open and read loops both retry `EINTR`.
 #[cfg(all(target_os = "linux", not(miri)))]
 pub(crate) fn root_mount_id(root_fd: BorrowedFd<'_>) -> Result<Option<u64>, rustix::io::Errno> {
-  use rustix::fs::{AtFlags, StatxFlags, statx};
-  let stx = statx(root_fd, c"", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)?;
-  Ok(mnt_id_from_mask(stx.stx_mask, stx.stx_mnt_id))
+  mount_id_through_tier(
+    &MOUNT_ID_TIER,
+    || {
+      use rustix::fs::{AtFlags, StatxFlags, statx};
+      let stx = loop {
+        match statx(root_fd, c"", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID) {
+          Ok(stx) => break stx,
+          Err(rustix::io::Errno::INTR) => continue,
+          Err(err) => return Err(err),
+        }
+      };
+      Ok(mnt_id_from_mask(stx.stx_mask, stx.stx_mnt_id))
+    },
+    || fdinfo_mount_id(root_fd),
+  )
 }
 
 /// The mount id a SUCCESSFUL `statx` reported, or `None` when its `stx_mask` left the
-/// `STATX_MNT_ID` bit unset (PURE — the below-5.8 belt decision, split out so it is
+/// `STATX_MNT_ID` bit unset (PURE — the below-5.8 mask decision, split out so it is
 /// row-testable without a live fd). This distinguishes only mask-present from
 /// mask-absent; a `statx` syscall failure never reaches here (the caller propagates it
-/// as `Err`), so a `None` from this function is ALWAYS the legitimate mask-absent belt,
-/// never a swallowed error.
+/// as `Err`), so a `None` from this function is ALWAYS the legitimate mask-absent
+/// miss — the signal that hands the read to the fdinfo tier — never a swallowed error.
 #[cfg(all(target_os = "linux", not(miri)))]
-fn mnt_id_from_mask(stx_mask: u32, stx_mnt_id: u64) -> Option<u64> {
+pub(crate) fn mnt_id_from_mask(stx_mask: u32, stx_mnt_id: u64) -> Option<u64> {
   use rustix::fs::StatxFlags;
   (stx_mask & StatxFlags::MNT_ID.bits() != 0).then_some(stx_mnt_id)
+}
+
+/// Nothing has answered a mount id yet in this process.
+const MOUNT_ID_TIER_UNKNOWN: u8 = 0;
+/// `statx(STATX_MNT_ID)` answers on this kernel (5.8+): no read opens `/proc`.
+const MOUNT_ID_TIER_STATX: u8 = 1;
+/// `statx` does NOT answer on this kernel (4.11–5.7): every read goes straight to
+/// `/proc/self/fdinfo`, and none pays the mask probe again.
+const MOUNT_ID_TIER_FDINFO: u8 = 2;
+
+/// Which read answers a mount id on THIS kernel, settled once and never revised.
+///
+/// The mask miss is a property of the KERNEL, not of the call — `STATX_MNT_ID`
+/// either exists or it does not — so paying the probe on every read after the
+/// first is pure waste, and a kernel cannot lose the bit at runtime, so there is
+/// no downgrade path to represent. `Relaxed` throughout: the cell publishes no
+/// other memory, and a racing pair of first reads both observe the same kernel
+/// and so agree on what they write.
+static MOUNT_ID_TIER: std::sync::atomic::AtomicU8 =
+  std::sync::atomic::AtomicU8::new(MOUNT_ID_TIER_UNKNOWN);
+
+/// Whether a caller must still ASK `statx` for the mount id, or may go straight
+/// to fdinfo because a previous read already learned this kernel has no bit to
+/// ask for. PURE over the tier cell.
+fn statx_answers_mount_id_in(tier: &std::sync::atomic::AtomicU8) -> bool {
+  tier.load(std::sync::atomic::Ordering::Relaxed) != MOUNT_ID_TIER_FDINFO
+}
+
+/// Records what the FIRST answering read learned (PURE over the tier cell). Only
+/// that first read writes: later ones observe the same kernel and would write the
+/// same value, and a `compare_exchange` from `Unknown` says "settled once" in the
+/// code rather than only in the comment.
+fn settle_mount_id_tier_in(tier: &std::sync::atomic::AtomicU8, answered_by_statx: bool) {
+  use std::sync::atomic::Ordering;
+  let settled = if answered_by_statx {
+    MOUNT_ID_TIER_STATX
+  } else {
+    MOUNT_ID_TIER_FDINFO
+  };
+  let _ = tier.compare_exchange(
+    MOUNT_ID_TIER_UNKNOWN,
+    settled,
+    Ordering::Relaxed,
+    Ordering::Relaxed,
+  );
+}
+
+/// [`statx_answers_mount_id_in`] against THIS process's tier — what the driver's
+/// `stat_sample` asks before it decides which shape of sample to take.
+#[cfg(all(target_os = "linux", not(miri)))]
+pub(crate) fn statx_answers_mount_id() -> bool {
+  statx_answers_mount_id_in(&MOUNT_ID_TIER)
+}
+
+/// [`settle_mount_id_tier_in`] against THIS process's tier — what the driver's
+/// `stat_sample` records after its own `statx` has (or has not) answered, so the
+/// two read sites share ONE memo and either can settle it for both.
+#[cfg(all(target_os = "linux", not(miri)))]
+pub(crate) fn settle_mount_id_tier(answered_by_statx: bool) {
+  settle_mount_id_tier_in(&MOUNT_ID_TIER, answered_by_statx);
+}
+
+/// One mount-id read resolved through the tier — PURE over both reads AND over
+/// the tier cell, the same closure discipline the inotify arm's `frame_check`
+/// uses and for the same reason: the legs a healthy 5.8+ host can never take are
+/// the ones that most need a cell.
+///
+/// `read_mask` performs the `statx` and answers `Ok(Some(id))` when the mask
+/// carried the bit, `Ok(None)` when it did not. It is called AT MOST ONCE, and
+/// NOT AT ALL once the tier has settled on fdinfo. `read_fdinfo` reads and parses
+/// the fd's `/proc/self/fdinfo` line and is called only when the mask did not
+/// answer.
+///
+/// A `statx` that FAILED settles NOTHING: it says nothing about whether this
+/// kernel has the bit, so pinning a tier on it would let one `EACCES` send every
+/// later read down the wrong leg for the life of the process. It propagates as
+/// `Err`, and the next read probes the mask again.
+fn mount_id_through_tier<E>(
+  tier: &std::sync::atomic::AtomicU8,
+  read_mask: impl FnOnce() -> Result<Option<u64>, E>,
+  read_fdinfo: impl FnOnce() -> Result<Option<u64>, E>,
+) -> Result<Option<u64>, E> {
+  if statx_answers_mount_id_in(tier) {
+    match read_mask() {
+      Ok(Some(id)) => {
+        settle_mount_id_tier_in(tier, true);
+        return Ok(Some(id));
+      }
+      Ok(None) => settle_mount_id_tier_in(tier, false),
+      Err(err) => return Err(err),
+    }
+  }
+  read_fdinfo()
+}
+
+/// The mount id `/proc/self/fdinfo/<fd>` records for an open descriptor — the
+/// tier below `statx(STATX_MNT_ID)`, and the SAME legacy id that call reports
+/// (both read `real_mount(path->mnt)->mnt_id`), so the two join one census key
+/// space and a host may answer through either without splitting it.
+///
+/// The kernel has printed the line for every open fd since Linux 3.15, `O_PATH`
+/// included, which is below the 4.11 `statx` floor the spawn barrier enforces.
+///
+/// `Ok(None)` is a fdinfo with no parsable `mnt_id:` line — the honest answer for
+/// a host below 3.15 and unreachable above it. A read that FAILED (a closed fd's
+/// `ENOENT`, a hardened `/proc`'s `EACCES`) is `Err`, never laundered into that
+/// `None`, exactly as a failed `statx` is not.
+#[cfg(all(target_os = "linux", not(miri)))]
+pub(crate) fn fdinfo_mount_id(fd: BorrowedFd<'_>) -> Result<Option<u64>, rustix::io::Errno> {
+  use std::os::fd::AsRawFd;
+  // Small, and read whole: a partial read would truncate the value itself, which
+  // the parser refuses rather than mis-reading (see `mnt_id_from_fdinfo`).
+  match std::fs::read(format!("/proc/self/fdinfo/{}", fd.as_raw_fd())) {
+    Ok(text) => Ok(mnt_id_from_fdinfo(&text)),
+    Err(err) => Err(rustix::io::Errno::from_io_error(&err).unwrap_or(rustix::io::Errno::IO)),
+  }
+}
+
+/// The mount id one `/proc/self/fdinfo/<fd>` body records (PURE — row-testable
+/// without an fd, and the whole of the fdinfo tier's parsing).
+///
+/// The kernel writes `mnt_id:\t<decimal>\n` among the fd's other lines
+/// (`pos:`, `flags:`, `ino:`, and whatever a later kernel adds). This takes the
+/// FIRST line whose prefix is exactly `mnt_id:` — so 6.8's `mnt_id_unique:` line,
+/// which carries a DIFFERENT id in a different key space, is never mistaken for
+/// it — trims the ASCII whitespace the kernel puts after the colon, and requires
+/// what is left to be a non-empty run of ASCII digits.
+///
+/// `None` where the body has no such line, or its value is not a decimal.
+///
+/// # A line the read cut short is `None`, never a smaller mount id
+///
+/// A body whose LAST line has no terminating `\n` was truncated, and
+/// `mnt_id:\t5` out of `mnt_id:\t551\n` parses perfectly well into the id of a
+/// DIFFERENT mount — a fence that would then let a descent cross a boundary while
+/// believing it had proved it did not. Only a newline-terminated line is read, so
+/// a short read declines instead of answering wrongly.
+pub(crate) fn mnt_id_from_fdinfo(text: &[u8]) -> Option<u64> {
+  let line = text
+    .split_inclusive(|byte| *byte == b'\n')
+    .filter(|line| line.ends_with(b"\n"))
+    .find(|line| line.starts_with(b"mnt_id:"))?;
+  let digits = line["mnt_id:".len()..].trim_ascii();
+  if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+    return None;
+  }
+  core::str::from_utf8(digits).ok()?.parse().ok()
 }
 
 /// A live Linux source, one variant per backend. Dropping it tears the reader
@@ -1093,6 +1832,40 @@ impl SourceHandle {
     match self {
       Self::Inotify(_) => None,
       Self::Fanotify(handle) => Some(handle.backend_stats()),
+    }
+  }
+
+  /// Hands the source one ADMISSION RESEED, answering whether it was accepted.
+  ///
+  /// Only fanotify can take one. inotify DESCENDS: it holds no admission map at
+  /// all, its watches are per directory, and a mount that departs below the root
+  /// is covered by a `Rescan` whose re-arm crawl re-enumerates the revealed
+  /// ground and arms it — so there is nothing here for a reseed to add, and the
+  /// honest answer is the refusal.
+  pub(crate) fn request_admits(&self, requests: Vec<super::AdmitRequest>) -> bool {
+    match self {
+      Self::Inotify(_) => false,
+      Self::Fanotify(handle) => handle.request_admits(requests),
+    }
+  }
+
+  /// Publishes the core's frame epoch to the source. Inert on inotify: it keeps no
+  /// admission map, so it runs no whole-root generation that would need stamping.
+  pub(crate) fn publish_frame(&self, epoch: u64) {
+    match self {
+      Self::Inotify(_) => {}
+      Self::Fanotify(handle) => handle.publish_frame(epoch),
+    }
+  }
+
+  /// Hands the source one WHOLE-ROOT RECOVERY, answering whether it was
+  /// accepted. Refused by inotify for the same reason a located admission is:
+  /// there is no admission map to reseed, and the root cover the recovery stands
+  /// for is the whole of what a descending scope owes.
+  pub(crate) fn request_root_recovery(&self, request: super::RecoveryRequest) -> bool {
+    match self {
+      Self::Inotify(_) => false,
+      Self::Fanotify(handle) => handle.request_root_recovery(request),
     }
   }
 
@@ -1166,6 +1939,11 @@ mod inotify_source {
     /// installs — the enumerate→arm rename guard. `None` leaves the arm
     /// unverified (identity was unavailable at enumerate time).
     pub(crate) expected: Option<ExpectedObject>,
+    /// The scope's descent frame. The arm re-reads the opened anchor's
+    /// `(dev, mnt_id)` and REFUSES rather than installing across it — the
+    /// prevention half of the mount design, and the guard that still runs when
+    /// [`expected`](Self::expected) is `None`.
+    pub(crate) frame: crate::os::ScopeFrame,
   }
 
   /// An arm's reply: the outcome plus, on success, the target's transient
@@ -1238,12 +2016,13 @@ mod inotify_source {
         source: err.into(),
       })?;
       let root_dev = stat.st_dev;
-      // The root's mount id from the same PIN — the core's descent boundary. inotify
-      // runs below 5.8, so a SUCCESSFUL read may be `None` (statx reports no mount id
-      // there) and the core falls back to the device check; a statx SYSCALL failure,
-      // by contrast, is a spawn failure — never a silent `None` that would disable the
-      // fence (the barrier already required statx to work). Read once here, carried on
-      // `RootMeta` like `root_dev`.
+      // The root's mount id from the same PIN — the core's descent boundary. A
+      // SUCCESSFUL read is `None` only where neither the statx mask nor the pin's
+      // own fdinfo answers, which no supported kernel reaches; the core would then
+      // fall back to the device check. A read that FAILS, by contrast, is a spawn
+      // failure — never a silent `None` that would disable the fence (the barrier
+      // already required statx to work). Read once here, carried on `RootMeta` like
+      // `root_dev`.
       let root_mnt_id = root_mount_id(root_fd).map_err(|err| SourceError::RootUnavailable {
         root: canonical.clone(),
         source: err.into(),
@@ -1323,6 +2102,7 @@ mod inotify_source {
         root_dev,
         root_mnt_id,
         mounts,
+        declined: Vec::new(),
         identity,
         ancestors,
         backend: super::super::BackendKind::Inotify,

@@ -28,8 +28,8 @@ use crate::{
   core::{ExpectedObject, MountRefresh, ProbeOutcome, RawDirEntry, RawEnumerate, RootLiveness},
   driver::ControlRequest,
   os::{
-    BackendKind, RawOsEvent, RootIdentity, RootMeta, SourceConfig, SourceError, SourceEvent,
-    SourceMessage, SpawnFailed,
+    BackendKind, MountRow, RawOsEvent, RootIdentity, RootMeta, SourceConfig, SourceError,
+    SourceEvent, SourceMessage, SpawnFailed,
     linux::{RawLinuxEvent, WatchOutcome},
   },
 };
@@ -94,13 +94,28 @@ struct FakeState {
   /// Mount-table refreshes served, plus the configured answer (`None` = an
   /// authoritative empty table).
   refreshes: AtomicUsize,
-  refresh_answer: Mutex<Option<(Vec<PathBuf>, bool)>>,
+  refresh_answer: Mutex<Option<(Vec<MountRow>, bool)>>,
   /// Overrides the root-liveness a refresh reports, so the hermetic suites can
   /// drive the root-death-via-refresh path (`None` = derive from the tree: the
   /// root's live identity, or `Missing` when it is gone).
   root_liveness: Mutex<Option<RootLiveness>>,
-  /// Mount prefixes the next spawn seeds its `RootMeta` with.
-  spawn_mounts: Mutex<Vec<PathBuf>>,
+  /// Mount rows the next spawn seeds its `RootMeta` with.
+  spawn_mounts: Mutex<Vec<MountRow>>,
+  /// Every ADMISSION RESEED handed to a source handle, in order. The fake
+  /// ACCEPTS a request and then does nothing: the walk is a real reader's job,
+  /// so a cell drives the reply itself with
+  /// [`answer_admit`](FakeFs::answer_admit) — which is what lets it observe the
+  /// window where the request is out and the cover is still parked.
+  admit_requests: Mutex<Vec<crate::os::AdmitRequest>>,
+  /// Every WHOLE-ROOT RECOVERY handed to a source handle, in order — the
+  /// root-scope sibling of [`admit_requests`](Self::admit_requests), accepted and
+  /// left outstanding for the same reason, and answered by
+  /// [`answer_root_recovery`](FakeFs::answer_root_recovery).
+  recovery_requests: Mutex<Vec<crate::os::RecoveryRequest>>,
+  /// When set, every `request_admits` REFUSES — the real handle's answer when its
+  /// reader thread has already exited. The driver then resolves the round trip
+  /// `Unreachable` itself rather than waiting on a reply that cannot come.
+  admits_refused: std::sync::atomic::AtomicBool,
   /// Requested-root → final-root remaps, mirroring the backend's own
   /// re-canonicalization (a symlink retargeted between reservation and
   /// spawn): the spawned `RootMeta` carries the FINAL root.
@@ -348,6 +363,9 @@ impl Default for FakeState {
       refresh_answer: Mutex::default(),
       root_liveness: Mutex::default(),
       spawn_mounts: Mutex::default(),
+      admit_requests: Mutex::default(),
+      recovery_requests: Mutex::default(),
+      admits_refused: std::sync::atomic::AtomicBool::new(false),
       spawn_remaps: Mutex::default(),
       replace_at_live: Mutex::default(),
       spawn_order: Mutex::default(),
@@ -464,6 +482,23 @@ impl FakeFs {
         ino,
         dev: self.root_dev,
         mnt_id: Some(mnt_id),
+      },
+    );
+  }
+
+  /// Places a node on a DIFFERENT device carrying the ROOT's own mount id — a
+  /// btrfs SUBVOLUME, the boundary that trips the device belt while the mount
+  /// fence sees nothing. It has no mount-table row and never will, so the core
+  /// records it device-only and exempt, and an arm that lands on it is refused by
+  /// the device half of the scope frame alone.
+  pub(crate) fn put_on_device(&self, path: impl AsRef<Path>, kind: FileKind, ino: u64, dev: u64) {
+    self.state.nodes.lock().unwrap().insert(
+      path.as_ref().to_path_buf(),
+      FakeNode {
+        kind,
+        ino,
+        dev,
+        mnt_id: self.root_mnt_id,
       },
     );
   }
@@ -609,6 +644,148 @@ impl FakeFs {
     }
   }
 
+  /// Injects one SEAM 2 message: the boundaries a live WALK declined, straight
+  /// onto `root`'s queue.
+  ///
+  /// Bypassing [`forward_batch`](crate::os::transport::forward_batch) is the
+  /// point, not a shortcut — it is exactly what the fanotify reader does. A
+  /// boundary observation holds no budget permit and stages no resume position,
+  /// and pricing it as a batch would advance the loss dedup position and mute an
+  /// `Overflow` queued behind it.
+  pub(crate) fn send_walk_boundaries(
+    &self,
+    root: impl AsRef<Path>,
+    declined: Vec<crate::os::DeclinedBoundary>,
+  ) {
+    self.send_boundaries(root, declined, crate::os::WalkReach::Partial);
+  }
+
+  /// Injects one SEAM 2 message flagged WHOLE-ROOT: the complete boundary set a
+  /// post-loss map reseed observed under the scope root, which the core reads as
+  /// a generation and reconciles its device-only records against.
+  ///
+  /// `root_mnt_id` is what the reseed walk read off the root it reopened and
+  /// `epoch` is the core's frame epoch as the source last heard it; the core
+  /// installs no generation whose root, or whose world, is not the one it holds.
+  pub(crate) fn send_whole_root_boundaries(
+    &self,
+    root: impl AsRef<Path>,
+    declined: Vec<crate::os::DeclinedBoundary>,
+    root_mnt_id: Option<u64>,
+    epoch: u64,
+  ) {
+    self.send_boundaries(
+      root,
+      declined,
+      crate::os::WalkReach::WholeRoot { root_mnt_id, epoch },
+    );
+  }
+
+  fn send_boundaries(
+    &self,
+    root: impl AsRef<Path>,
+    declined: Vec<crate::os::DeclinedBoundary>,
+    reach: crate::os::WalkReach,
+  ) {
+    let (sender, transport) = self.source_of(root);
+    let permit = crate::os::transport::BudgetPermit::acquire_boundaries(&transport)
+      .expect("the harness never queues past the boundary budget");
+    assert!(
+      sender
+        .try_send(SourceMessage::Boundaries(
+          crate::os::WalkBoundaries { declined, reach },
+          permit,
+        ))
+        .is_ok(),
+      "the source lane takes the boundary message"
+    );
+  }
+
+  /// Every admission reseed the driver handed to a source handle, in order.
+  pub(crate) fn admit_requests(&self) -> Vec<crate::os::AdmitRequest> {
+    self.state.admit_requests.lock().unwrap().clone()
+  }
+
+  /// Every WHOLE-ROOT RECOVERY the driver handed to a source handle, in order.
+  pub(crate) fn recovery_requests(&self) -> Vec<crate::os::RecoveryRequest> {
+    self.state.recovery_requests.lock().unwrap().clone()
+  }
+
+  /// Makes every subsequent `request_admits` REFUSE — the answer a real handle
+  /// gives once its reader thread is gone.
+  pub(crate) fn refuse_admits(&self) {
+    self
+      .state
+      .admits_refused
+      .store(true, std::sync::atomic::Ordering::SeqCst);
+  }
+
+  /// Answers one outstanding admission round trip on `root`'s ordered queue —
+  /// the reply half a real reader sends once its walk has mutated the map.
+  ///
+  /// Bypassing [`forward_batch`](crate::os::transport::forward_batch) is exactly
+  /// what the reader does: the reply holds no budget permit and stages no resume
+  /// position, and pricing it as a batch would advance the loss dedup position.
+  pub(crate) fn answer_admit(
+    &self,
+    root: impl AsRef<Path>,
+    ticket: crate::os::AdmitTicket,
+    outcome: crate::os::AdmitOutcome,
+  ) {
+    let (sender, _transport) = self.source_of(root);
+    assert!(
+      sender
+        .try_send(SourceMessage::Admitted(crate::os::AdmitReport {
+          ticket,
+          outcome
+        }))
+        .is_ok(),
+      "the source lane takes the admission reply"
+    );
+  }
+
+  /// Answers one outstanding WHOLE-ROOT RECOVERY on `root`'s ordered queue with
+  /// the ONE indivisible message a real reader sends: the reseed's complete
+  /// generation, the ticket cutoff it discharges, and the loss it implies.
+  ///
+  /// It takes a boundary permit exactly as the real
+  /// [`forward_root_recovery`](crate::os::linux) does, because the residency bound
+  /// is the same one — the harness never queues past it.
+  ///
+  /// `request` is the very [`RecoveryRequest`](crate::os::RecoveryRequest) the
+  /// driver handed over ([`recovery_requests`](Self::recovery_requests)), so the
+  /// reply carries the epoch it was ISSUED at — what a real reader echoes — and a
+  /// cell that wants a superseded reply builds one deliberately rather than by
+  /// forgetting a field. `root_mnt_id` is what the reseed walk read off the root
+  /// it reopened.
+  pub(crate) fn answer_root_recovery(
+    &self,
+    root: impl AsRef<Path>,
+    request: crate::os::RecoveryRequest,
+    declined: Vec<crate::os::DeclinedBoundary>,
+    root_mnt_id: Option<u64>,
+  ) {
+    let (sender, transport) = self.source_of(root);
+    // The DEFERRABLE claim, because the real recovery report comes off the control
+    // pass — the harness prices it exactly where production does.
+    let permit = crate::os::transport::BudgetPermit::acquire_deferred_boundaries(&transport)
+      .expect("the harness never queues past the boundary budget");
+    assert!(
+      sender
+        .try_send(SourceMessage::RootRecovered(
+          crate::os::RootRecovery {
+            declined,
+            cutoff: request.ticket,
+            epoch: request.epoch,
+            root_mnt_id,
+          },
+          permit,
+        ))
+        .is_ok(),
+      "the source lane takes the root-recovery message"
+    );
+  }
+
   /// Injects the stream's terminal `Fatal`.
   pub(crate) fn send_fatal(&self, root: impl AsRef<Path>) {
     let (sender, transport) = self.source_of(root);
@@ -621,6 +798,21 @@ impl FakeFs {
   /// false again once the driver processed it (dropping its ack).
   pub(crate) fn overflow_pending(&self, root: impl AsRef<Path>) -> bool {
     self.source_of(root).1.overflow_pending()
+  }
+
+  /// Whether every boundary report queued on `root`'s lane has reached the CORE
+  /// — the staging fence for a cell that posts one and then stages something a
+  /// FASTER path can feed the core with.
+  ///
+  /// It reads the report's own budget permit, which the driver releases in the
+  /// `SourceMessage::Boundaries` arm by a drop that runs AFTER
+  /// `on_walk_boundaries` returns. So a zero here is proof the core has applied
+  /// the report, not merely that the lane was dequeued — and that is the one
+  /// ordering a source post cannot otherwise assume: the loop's select is
+  /// op-first and the source lane is its LAST arm, so a mount refresh completing
+  /// anywhere in the window is ingested ahead of a report already queued.
+  pub(crate) fn boundaries_ingested(&self, root: impl AsRef<Path>) -> bool {
+    self.source_of(root).1.boundaries_in_flight() == 0
   }
 
   /// Drops `root`'s send end, disconnecting the source without a `Fatal`.
@@ -640,9 +832,18 @@ impl FakeFs {
     self.state.refreshes.load(Ordering::SeqCst)
   }
 
-  /// Configures the mount prefixes the next spawn seeds its `RootMeta` with.
-  pub(crate) fn seed_mounts(&self, mounts: Vec<PathBuf>) {
+  /// Configures the mount rows the next spawn seeds its `RootMeta` with.
+  pub(crate) fn seed_mounts(&self, mounts: Vec<MountRow>) {
     *self.state.spawn_mounts.lock().unwrap() = mounts;
+  }
+
+  /// Configures what every subsequent `refresh_mounts` reports as the live mount
+  /// table: the prefixes under the root, and whether the table could be read at
+  /// all. The default (an authoritative empty table) is what an unconfigured fake
+  /// answers. Setting a smaller list is how a cell models a mount DEPARTING —
+  /// including the lazy unmount that reaches the core through no other channel.
+  pub(crate) fn answer_refresh(&self, mounts: Vec<MountRow>, authoritative: bool) {
+    *self.state.refresh_answer.lock().unwrap() = Some((mounts, authoritative));
   }
 
   /// Forces every subsequent refresh to report `liveness` as the root's state,
@@ -1073,8 +1274,10 @@ impl FakeFs {
   }
 
   /// The non-parking core of one arm: record it, then model object
-  /// correctness (identity mismatch and alias) and mint a watch descriptor,
-  /// exactly as [`add_watch`](FsOps::add_watch) does once past the hold.
+  /// correctness (identity mismatch, the scope-frame refusal, and alias) and
+  /// mint a watch descriptor, exactly as [`add_watch`](FsOps::add_watch) does
+  /// once past the hold.
+  #[allow(clippy::too_many_arguments)]
   fn arm_one(
     &self,
     _scope: ScopeId,
@@ -1083,6 +1286,7 @@ impl FakeFs {
     path: &Path,
     _name: &Segment,
     expected: Option<ExpectedObject>,
+    frame: crate::os::ScopeFrame,
   ) -> WatchOutcome {
     self
       .state
@@ -1104,6 +1308,22 @@ impl FakeFs {
       if !matches {
         return WatchOutcome::Failed(tributary_proto::WatchError::Gone);
       }
+    }
+    // The scope-frame refusal, modelled exactly as the real reader models it:
+    // read the LANDING object's `(dev, mnt_id)` — here the node the fake holds,
+    // there an `fstat` + `statx` of the pinned anchor — and refuse a landing
+    // across the frame. Run on EVERY arm, `expected` or not, which is the whole
+    // point: a `Created`-learned directory arms with no identity at all.
+    //
+    // An absent node answers `(None, None)`, so it PASSES rather than being
+    // refused here — the fake models "nothing there", and nothing there is not a
+    // boundary. Cells that want the absent case refused use `watch_failures`.
+    let landing = self.state.nodes.lock().unwrap().get(path).copied();
+    if frame.crossed_by(
+      landing.map(|node| node.dev),
+      landing.and_then(|node| node.mnt_id),
+    ) {
+      return WatchOutcome::Failed(tributary_proto::WatchError::Gone);
     }
     // The arm installs (or aliases) a kernel watch: record it live, so a reorder
     // that installs it AFTER its disarm already ran shows as a residual entry.
@@ -1361,10 +1581,11 @@ impl FakeFs {
           name,
           path,
           expected,
+          frame,
         } => outcomes.push(super::ArmResolution {
           watch,
           attempt,
-          outcome: self.arm_one(scope, watch, parent, path.as_path(), &name, expected),
+          outcome: self.arm_one(scope, watch, parent, path.as_path(), &name, expected, frame),
         }),
         ControlRequest::Disarm { watch } => {
           self.state.disarms.lock().unwrap().push(watch);
@@ -1487,6 +1708,45 @@ pub(crate) struct FakeHandle {
 impl SourceControl for FakeHandle {
   fn resume_token(&self) -> Option<crate::os::ResumeToken> {
     *self.state.resume_token.lock().unwrap()
+  }
+
+  /// Records the whole burst and accepts it — never answers it. A real fanotify
+  /// handle only enqueues the walks for its reader thread too; the answers come
+  /// back on the source's ordered queue, which is exactly where
+  /// [`FakeFs::answer_admit`] puts them. Leaving the round trips OUTSTANDING is the
+  /// point: it is the only state in which a cell can prove the departure's cover
+  /// has not been emitted yet.
+  ///
+  /// The burst is recorded under ONE lock acquisition, mirroring the real handle's
+  /// single mailbox post: a cell reading `admit_requests` can never observe a
+  /// prefix of a burst the core published whole.
+  fn request_admits(&self, requests: Vec<crate::os::AdmitRequest>) -> bool {
+    if self
+      .state
+      .admits_refused
+      .load(std::sync::atomic::Ordering::SeqCst)
+    {
+      return false;
+    }
+    self.state.admit_requests.lock().unwrap().extend(requests);
+    true
+  }
+
+  /// Records the whole-root recovery and accepts it — never answers it, for the
+  /// same reason [`request_admits`](Self::request_admits) does not: the answer comes
+  /// back on the source's ordered queue, which is where
+  /// [`FakeFs::answer_root_recovery`] puts it. The same refusal switch governs
+  /// both, so a cell can drive the unreachable degrade for either.
+  fn request_root_recovery(&self, request: crate::os::RecoveryRequest) -> bool {
+    if self
+      .state
+      .admits_refused
+      .load(std::sync::atomic::Ordering::SeqCst)
+    {
+      return false;
+    }
+    self.state.recovery_requests.lock().unwrap().push(request);
+    true
   }
 
   fn shutdown(mut self) -> crate::os::Quiesce {
@@ -1722,11 +1982,26 @@ impl FsOps for FakeFs {
         .map(|node| RootIdentity::new(node.dev, node.ino.into()))
         .collect()
     };
+    // The FRAME is the root NODE's own mount id, exactly as the real barrier
+    // reads it off the pinned root fd (and as `resolve_root_meta` already read
+    // it) — not the fake's global default. A root placed by `put_on_mount`
+    // therefore carries ITS mount into every arm the scope issues, so the
+    // executor's frame refusal is judged against the same value a real spawn
+    // would have published. A root the test never put keeps the global default,
+    // under the synthetic-identity convention above.
+    let root_mnt_id = self
+      .state
+      .nodes
+      .lock()
+      .unwrap()
+      .get(&root)
+      .map_or(self.root_mnt_id, |node| node.mnt_id);
     let meta = RootMeta {
       root: root.clone(),
       root_dev: self.root_dev,
-      root_mnt_id: self.root_mnt_id,
+      root_mnt_id,
       mounts: self.state.spawn_mounts.lock().unwrap().clone(),
+      declined: Vec::new(),
       identity,
       ancestors,
       backend: *self.state.spawn_backend.lock().unwrap(),
@@ -1749,6 +2024,11 @@ impl FsOps for FakeFs {
         kind: node.kind,
         file_id: NonZeroU64::new(node.ino),
         dev: node.dev,
+        // The fake answers the mount id for the same reason the real executor's
+        // ONE `statx` does: a probe answer is a boundary observation (SEAM 4),
+        // and an answer with no id mints a permanently-EXEMPT record for a
+        // boundary it had no way to classify.
+        mnt_id: node.mnt_id,
       },
       None => ProbeOutcome::Missing,
     }
@@ -1793,6 +2073,7 @@ impl FsOps for FakeFs {
       authoritative,
       root: root_liveness,
       root_mnt_id,
+      root_incarnation: None,
     }
   }
 
@@ -1809,6 +2090,7 @@ impl FsOps for FakeFs {
     self.state.scope_generation.lock().unwrap().remove(&scope);
   }
 
+  #[allow(clippy::too_many_arguments)]
   fn add_watch(
     &self,
     scope: ScopeId,
@@ -1817,9 +2099,10 @@ impl FsOps for FakeFs {
     path: &Path,
     name: &Segment,
     expected: Option<ExpectedObject>,
+    frame: crate::os::ScopeFrame,
   ) -> WatchOutcome {
     self.park_on(&self.state.arm_hold);
-    self.arm_one(scope, watch, parent, path, name, expected)
+    self.arm_one(scope, watch, parent, path, name, expected, frame)
   }
 
   // The blocking batch entry: the fake answers its own arms, so it needs no
@@ -1874,6 +2157,7 @@ impl FsOps for FakeFs {
   // (not `arm_hold`) so a test can freeze concurrent discovery batches while
   // this pre-arm still commits. The generation fence does not apply — this
   // arms the explicit new-stream port, which no other batch can reach.
+  #[allow(clippy::too_many_arguments)]
   fn preflight_arm(
     &self,
     _port: &crate::os::ScopePort,
@@ -1882,12 +2166,13 @@ impl FsOps for FakeFs {
     path: &Path,
     name: &Segment,
     expected: Option<ExpectedObject>,
+    frame: crate::os::ScopeFrame,
   ) -> WatchOutcome {
     // Entry counts BEFORE the hold parks: reaching here proves the witnessed
     // window is open (see `prearm_entries`).
     self.state.prearm_entries.fetch_add(1, Ordering::SeqCst);
     self.park_on(&self.state.prearm_hold);
-    let outcome = self.arm_one(scope, watch, watch, path, name, expected);
+    let outcome = self.arm_one(scope, watch, watch, path, name, expected, frame);
     // The arm→re-stat race, modeled deterministically: the swap lands after
     // the kernel arm bound its object, before the bracket's probe.
     if let Some((path, node)) = self.state.prearm_swap.lock().unwrap().take() {
@@ -1940,6 +2225,7 @@ impl FsOps for FakeFs {
       root_dev,
       root_mnt_id,
       mounts: self.state.spawn_mounts.lock().unwrap().clone(),
+      declined: Vec::new(),
       identity,
       ancestors,
       backend: *self.state.spawn_backend.lock().unwrap(),

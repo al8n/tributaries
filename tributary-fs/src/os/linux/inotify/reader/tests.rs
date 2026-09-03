@@ -76,6 +76,24 @@ mod barrier {
       sent.borrow_mut().push(match msg {
         SourceMessage::Batch(payload) => Sent::Batch(payload.events.len()),
         SourceMessage::Overflow(_) => Sent::Overflow,
+        // inotify DESCENDS: the core's own enumerate fence is where its
+        // boundaries are observed, so its reader walks nothing and declines
+        // nothing. Seam 2 is the kernel-recursive profile's answer only.
+        SourceMessage::Boundaries(declined, _) => {
+          unreachable!("an inotify reader walks no tree: {declined:?}")
+        }
+        // And it keeps no admission map: a departed mount below the root is
+        // covered by a `Rescan` whose re-arm crawl re-enumerates the revealed
+        // ground and arms it, so there is no round trip for this reader to
+        // answer.
+        SourceMessage::Admitted(report) => {
+          unreachable!("an inotify reader admits no reseed: {report:?}")
+        }
+        // Nor a whole-root recovery: that message reseeds an ADMISSION MAP, and
+        // this reader keeps none.
+        SourceMessage::RootRecovered(recovery, _) => {
+          unreachable!("an inotify reader recovers no map: {recovery:?}")
+        }
         SourceMessage::Fatal(_) => unreachable!("no fatal on this path"),
       });
       true
@@ -104,6 +122,24 @@ mod barrier {
       sent.borrow_mut().push(match msg {
         SourceMessage::Batch(payload) => Sent::Batch(payload.events.len()),
         SourceMessage::Overflow(_) => Sent::Overflow,
+        // inotify DESCENDS: the core's own enumerate fence is where its
+        // boundaries are observed, so its reader walks nothing and declines
+        // nothing. Seam 2 is the kernel-recursive profile's answer only.
+        SourceMessage::Boundaries(declined, _) => {
+          unreachable!("an inotify reader walks no tree: {declined:?}")
+        }
+        // And it keeps no admission map: a departed mount below the root is
+        // covered by a `Rescan` whose re-arm crawl re-enumerates the revealed
+        // ground and arms it, so there is no round trip for this reader to
+        // answer.
+        SourceMessage::Admitted(report) => {
+          unreachable!("an inotify reader admits no reseed: {report:?}")
+        }
+        // Nor a whole-root recovery: that message reseeds an ADMISSION MAP, and
+        // this reader keeps none.
+        SourceMessage::RootRecovered(recovery, _) => {
+          unreachable!("an inotify reader recovers no map: {recovery:?}")
+        }
         SourceMessage::Fatal(_) => unreachable!("no fatal on this path"),
       });
       true
@@ -405,6 +441,7 @@ mod liveness {
         parent: None,
         name: OsString::from("/tributary-fs-nonexistent-arm-target"),
         expected: None,
+        frame: crate::os::ScopeFrame::default(),
       })],
       reply: BatchReply::new(1, move |outcome| {
         let _ = reply_tx.send(outcome);
@@ -465,6 +502,7 @@ mod liveness {
           parent: None,
           name: OsString::from("/tributary-fs-nonexistent-arm-target"),
           expected: None,
+          frame: crate::os::ScopeFrame::default(),
         })
       })
       .collect();
@@ -540,6 +578,7 @@ mod rebind {
       parent: None,
       name: OsString::from(path.as_os_str()),
       expected: None,
+      frame: crate::os::ScopeFrame::default(),
     }
   }
 
@@ -768,6 +807,7 @@ mod allocation {
       parent: None,
       name: OsString::from(path.as_os_str()),
       expected: None,
+      frame: crate::os::ScopeFrame::default(),
     }
   }
 
@@ -864,6 +904,7 @@ mod allocation {
         parent: None,
         name: OsString::from("/tributary-fs-nonexistent-arm-target"),
         expected: None,
+        frame: crate::os::ScopeFrame::default(),
       }),
       ControlOp::Arm(request(watch(2), &dir)),
     ];
@@ -1023,6 +1064,7 @@ mod rebuild {
       parent: None,
       name: OsString::from(path.as_os_str()),
       expected: None,
+      frame: crate::os::ScopeFrame::default(),
     })
   }
 
@@ -1051,6 +1093,24 @@ mod rebuild {
       sent.push(match msg {
         SourceMessage::Batch(payload) => Sent::Batch(payload.events.len()),
         SourceMessage::Overflow(_) => Sent::Overflow,
+        // inotify DESCENDS: the core's own enumerate fence is where its
+        // boundaries are observed, so its reader walks nothing and declines
+        // nothing. Seam 2 is the kernel-recursive profile's answer only.
+        SourceMessage::Boundaries(declined, _) => {
+          unreachable!("an inotify reader walks no tree: {declined:?}")
+        }
+        // And it keeps no admission map: a departed mount below the root is
+        // covered by a `Rescan` whose re-arm crawl re-enumerates the revealed
+        // ground and arms it, so there is no round trip for this reader to
+        // answer.
+        SourceMessage::Admitted(report) => {
+          unreachable!("an inotify reader admits no reseed: {report:?}")
+        }
+        // Nor a whole-root recovery: that message reseeds an ADMISSION MAP, and
+        // this reader keeps none.
+        SourceMessage::RootRecovered(recovery, _) => {
+          unreachable!("an inotify reader recovers no map: {recovery:?}")
+        }
         SourceMessage::Fatal(_) => unreachable!("no fatal on this path"),
       });
     }
@@ -1357,6 +1417,7 @@ mod batch_preemption {
       parent: None,
       name: OsString::from("/tributary-fs-nonexistent-arm-target"),
       expected: None,
+      frame: crate::os::ScopeFrame::default(),
     })
   }
 
@@ -1497,6 +1558,7 @@ mod queue_cut {
         parent: None,
         name: OsString::from(path.as_os_str()),
         expected: None,
+        frame: crate::os::ScopeFrame::default(),
       })],
       reply: BatchReply::new(1, move |outcome| {
         let _ = reply_tx.send(outcome.replies);
@@ -1519,6 +1581,23 @@ mod queue_cut {
       sent.push(match msg {
         SourceMessage::Batch(payload) => Sent::Batch(payload.events.len()),
         SourceMessage::Overflow(_) => Sent::Overflow,
+        // inotify DESCENDS: its boundaries are observed by the core's enumerate
+        // fence, so its reader walks nothing and declines nothing.
+        SourceMessage::Boundaries(declined, _) => {
+          unreachable!("an inotify reader walks no tree: {declined:?}")
+        }
+        // And it keeps no admission map: a departed mount below the root is
+        // covered by a `Rescan` whose re-arm crawl re-enumerates the revealed
+        // ground and arms it, so there is no round trip for this reader to
+        // answer.
+        SourceMessage::Admitted(report) => {
+          unreachable!("an inotify reader admits no reseed: {report:?}")
+        }
+        // Nor a whole-root recovery: that message reseeds an ADMISSION MAP, and
+        // this reader keeps none.
+        SourceMessage::RootRecovered(recovery, _) => {
+          unreachable!("an inotify reader recovers no map: {recovery:?}")
+        }
         SourceMessage::Fatal(err) => panic!("no fatal on this path: {err:?}"),
       });
     }
@@ -2298,6 +2377,23 @@ mod queue_cut {
               .collect(),
           ),
           SourceMessage::Overflow(_) => Forwarded::Overflow,
+          // inotify DESCENDS: its boundaries are observed by the core's
+          // enumerate fence, so its reader walks nothing and declines nothing.
+          SourceMessage::Boundaries(declined, _) => {
+            unreachable!("an inotify reader walks no tree: {declined:?}")
+          }
+          // And it keeps no admission map: a departed mount below the root is
+          // covered by a `Rescan` whose re-arm crawl re-enumerates the revealed
+          // ground and arms it, so there is no round trip for this reader to
+          // answer.
+          SourceMessage::Admitted(report) => {
+            unreachable!("an inotify reader admits no reseed: {report:?}")
+          }
+          // Nor a whole-root recovery: that message reseeds an ADMISSION MAP,
+          // and this reader keeps none.
+          SourceMessage::RootRecovered(recovery, _) => {
+            unreachable!("an inotify reader recovers no map: {recovery:?}")
+          }
           SourceMessage::Fatal(err) => panic!("no fatal on this path: {err:?}"),
         });
       }
@@ -2458,6 +2554,7 @@ mod queue_cut {
           parent: None,
           name: OsString::from(scope.dir.as_os_str()),
           expected: None,
+          frame: crate::os::ScopeFrame::default(),
         },
       );
       let WatchOutcome::Installed(fresh) = readd.outcome else {
@@ -2535,5 +2632,156 @@ mod queue_cut {
         );
       }
     }
+  }
+}
+
+/// The arm's SCOPE-FRAME fence, and the one distinction it used to collapse: an
+/// UNKNOWN mount id is not a FAILED READ.
+///
+/// The fence is the arm's only defence against a same-device bind. A directory
+/// the Monitor learned from a `Created` record is armed with no enumerate in
+/// between and with no `expected` at all (inotify's `Created` compiles to a bare
+/// record), so `object_matches` passes it straight through and the mount id is
+/// the only thing left that can tell a bind from an in-root directory. When the
+/// check read a failed `statx` as `None`, the frame's own inert-`None` leg passed
+/// the arm and the watch installed ACROSS the scope frame — a fence that fails
+/// open is not a fence.
+///
+/// Both directions are pinned here, because fixing one by breaking the other is
+/// the obvious wrong turn: `Ok(None)` is the legitimate pre-5.8 degrade and a
+/// frame with no id of its own is the whole off-Linux fake-executor harness, and
+/// refusing either would refuse every arm on those hosts.
+mod arm_frame_fence {
+  use rustix::io::Errno;
+
+  use super::super::{FrameCheck, frame_check};
+  use crate::os::ScopeFrame;
+
+  /// A real `Stat` (there is no honest way to fabricate one) with `st_dev`
+  /// overwritten, so a cell can land an arm on whatever device it needs without
+  /// a second filesystem.
+  fn landed(dev: u64) -> rustix::fs::Stat {
+    let fd = rustix::fs::open(
+      std::env::temp_dir(),
+      rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
+      rustix::fs::Mode::empty(),
+    )
+    .expect("the temp dir opens");
+    let mut stat = rustix::fs::fstat(&fd).expect("fstat of a just-opened dir");
+    stat.st_dev = dev;
+    stat
+  }
+
+  /// The FRAME the scope carries: root on device 1, mount id 42.
+  const FRAMED: ScopeFrame = ScopeFrame {
+    root_dev: Some(1),
+    root_mnt_id: Some(42),
+  };
+
+  /// A same-device BIND — the case the mount id alone can see. This is the arm
+  /// the fence exists for.
+  #[test]
+  fn a_failed_mount_id_read_refuses_the_arm_it_cannot_judge() {
+    let stat = landed(1);
+    for errno in [Errno::IO, Errno::ACCESS, Errno::PERM, Errno::NOMEM] {
+      assert_eq!(
+        frame_check(Some(&stat), FRAMED, || Err(errno)),
+        FrameCheck::Unreadable,
+        "a `statx` that FAILED ({errno:?}) is not an answer: the arm is refused, \
+         never passed on the frame's inert-None leg"
+      );
+    }
+  }
+
+  /// The same shape at the other read: a failed `fstat` leaves the fence with no
+  /// device half at all.
+  #[test]
+  fn a_failed_fstat_refuses_the_arm_and_pays_no_statx() {
+    let read = std::cell::Cell::new(0u32);
+    assert_eq!(
+      frame_check(None, FRAMED, || {
+        read.set(read.get() + 1);
+        Ok(Some(42))
+      }),
+      FrameCheck::Unreadable,
+      "no device reading, no verdict"
+    );
+    assert_eq!(
+      read.get(),
+      0,
+      "and the mount-id read is not paid for on a landing that could not be stat'd"
+    );
+  }
+
+  /// The LEGITIMATE degrade, which must keep passing: the kernel answered, and
+  /// its answer is that it carries no mount id (`Ok(None)` — below 5.8, or the
+  /// `STATX_MNT_ID` mask bit unset). The device belt alone governs.
+  #[test]
+  fn a_mask_absent_mount_id_still_passes_to_the_device_belt() {
+    assert_eq!(
+      frame_check(Some(&landed(1)), FRAMED, || Ok(None)),
+      FrameCheck::Inside,
+      "`Ok(None)` is the host answering no mount ids — an in-root, same-device \
+       arm installs exactly as it did before 5.8"
+    );
+    assert_eq!(
+      frame_check(Some(&landed(9)), FRAMED, || Ok(None)),
+      FrameCheck::Crossed,
+      "and the belt still fences a foreign device with no mount id in sight"
+    );
+  }
+
+  /// A scope whose own frame carries no id — every off-Linux fake, and every
+  /// pre-5.8 Linux root — passes, and pays no read at all. This is the leg whose
+  /// inversion previously lit up the whole driver harness.
+  #[test]
+  fn a_frameless_scope_passes_without_reading_a_mount_id() {
+    let read = std::cell::Cell::new(0u32);
+    let frameless = ScopeFrame {
+      root_dev: Some(1),
+      root_mnt_id: None,
+    };
+    assert_eq!(
+      frame_check(Some(&landed(1)), frameless, || {
+        read.set(read.get() + 1);
+        Err(Errno::IO)
+      }),
+      FrameCheck::Inside,
+      "with no frame id to compare against the mount half is inert, so the arm \
+       installs"
+    );
+    assert_eq!(
+      read.get(),
+      0,
+      "and the read is never issued — a scope with no frame cannot be refused by \
+       a syscall failing"
+    );
+    assert_eq!(
+      frame_check(Some(&landed(9)), frameless, || Ok(None)),
+      FrameCheck::Crossed,
+      "the device belt is the whole fence there, and it still fences"
+    );
+    assert_eq!(
+      frame_check(Some(&landed(1)), ScopeFrame::default(), || Ok(None)),
+      FrameCheck::Inside,
+      "a scope with NEITHER half known refuses nothing — the fake executor's own \
+       frame"
+    );
+  }
+
+  /// The verdicts a successful read produces, so the refusals above are read as
+  /// the new leg rather than as the check answering `Crossed` for everything.
+  #[test]
+  fn a_read_mount_id_decides_the_arm_on_its_own_terms() {
+    assert_eq!(
+      frame_check(Some(&landed(1)), FRAMED, || Ok(Some(42))),
+      FrameCheck::Inside,
+      "same device, same mount: an ordinary in-root arm"
+    );
+    assert_eq!(
+      frame_check(Some(&landed(1)), FRAMED, || Ok(Some(77))),
+      FrameCheck::Crossed,
+      "same device, DIFFERENT mount: the bind the device belt cannot see"
+    );
   }
 }

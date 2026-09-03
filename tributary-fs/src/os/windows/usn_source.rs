@@ -561,6 +561,7 @@ fn start(
     root_dev: identity.volume_serial,
     root_mnt_id: None,
     mounts: Vec::new(),
+    declined: Vec::new(),
     identity: super::super::RootIdentity::new(identity.volume_serial, identity.file_id),
     ancestors,
     backend: super::super::BackendKind::UsnJournal,

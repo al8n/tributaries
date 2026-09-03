@@ -8,11 +8,23 @@ use super::{
     decode::{IN_CREATE, IN_IGNORED, IN_ISDIR, IN_Q_OVERFLOW, InotifyMask, RawInotifyEvent},
     table::WdTable,
   },
-  locality_refusal, parse_mountinfo,
+  locality_refusal, mounts_from_file, parse_mountinfo,
 };
 
 fn watch(n: u64) -> WatchId {
   WatchId::new(core::num::NonZeroU64::new(n).unwrap())
+}
+
+/// One expected parse result, spelled the way mountinfo spells it: the mount
+/// point, the mount id (field 1), the PARENT mount's id (field 2), and the
+/// `major:minor` (field 3).
+fn row(location: &str, mnt_id: u64, parent_id: u64, major: u64, minor: u64) -> crate::os::MountRow {
+  crate::os::MountRow {
+    location: std::path::PathBuf::from(location),
+    mnt_id: Some(mnt_id),
+    parent_id: Some(parent_id),
+    dev: Some(super::makedev(major, minor)),
+  }
 }
 
 fn event(wd: i32, mask: u32, name: Option<&[u8]>) -> RawInotifyEvent {
@@ -97,25 +109,907 @@ fn draining_wd_attributes_nothing_until_ignored() {
   assert!(!table.contains(3));
 }
 
+/// Only rows STRICTLY under the root come back: the root's own row, its
+/// ancestors and every mount outside its cone are all filtered out.
+///
+/// The ancestors were RETAINED while the parse resolved visibility — a shadowing
+/// sibling can sit at the root or above it — and with no resolution left there is
+/// nothing to ask them. Retaining them now would only allocate a mount point per
+/// ancestor, per refresh, per watched root, for rows no consumer can use: a
+/// boundary AT or ABOVE the root is not a boundary inside it.
+///
+/// MUTATION WITNESS (cone restored): retain `root.starts_with(&path)` as well and
+/// this FAILS at `nothing at or above the root is a row` — the rootfs and `/mnt/a`
+/// itself both back in the answer.
 #[test]
 fn mountinfo_extracts_mounts_strictly_under_root() {
   let content = "\
+25 25 0:35 / / rw,relatime shared:4 - ext4 /dev/root rw
 36 25 0:32 / /mnt/a rw,relatime shared:1 - tmpfs tmpfs rw
-37 25 0:33 / /mnt/a/inner rw,relatime shared:2 - ext4 /dev/loop0 rw
+37 36 0:33 / /mnt/a/inner rw,relatime shared:2 - ext4 /dev/loop0 rw
 38 25 0:34 / /mnt/b rw,relatime shared:3 - tmpfs tmpfs rw
-39 25 0:35 / / rw,relatime shared:4 - ext4 /dev/root rw
 malformed line
 40 25 0:36 /
 ";
-  let mounts = parse_mountinfo(content, Path::new("/mnt/a"));
-  assert_eq!(mounts, vec![std::path::PathBuf::from("/mnt/a/inner")]);
+  let mounts = parse_mountinfo(content.as_bytes(), Path::new("/mnt/a"));
+  assert_eq!(
+    mounts,
+    vec![row("/mnt/a/inner", 37, 36, 0, 33)],
+    "nothing at or above the root is a row, a mount outside its cone never \
+     enters, and a line short of five fields is skipped"
+  );
+}
+
+/// The parse keeps the three IDENTITY fields it used to discard, and all three
+/// are on every line it was already scanning: field 1 is the mount id, field 2
+/// the id of the mount this one hangs off, and field 3 the `major:minor`. Without
+/// them the table is paths-only and a mount REPLACED at an unchanged path is
+/// invisible to every reader of it.
+///
+/// The parent travels as IDENTITY, not as hierarchy — nothing here resolves it to
+/// another row — and it is what narrows the window a lowest-free mount id leaves
+/// open: a recycled id re-attached under a DIFFERENT mount is a different
+/// vfsmount, which the core reads as a replacement rather than as continuity.
+///
+/// The device is packed the way `dev_t` packs it, so the number a row carries is
+/// the number a `stat` on that filesystem reports rather than a private encoding
+/// that only ever compares against itself.
+///
+/// MUTATION WITNESS (parent dropped): write `parent_id: None` in the pushed row
+/// and this FAILS at `each row carries its own ids and device` — the half that
+/// tells a recycled id from a continuous one, silently absent.
+#[test]
+fn mountinfo_carries_the_identity_of_every_row() {
+  let content = "\
+36 25 0:32 / /mnt rw,relatime shared:1 - tmpfs tmpfs rw
+41 36 259:3 / /mnt/nvme rw,relatime shared:9 - ext4 /dev/nvme0n1p3 rw
+42 36 0:57 /sub /mnt/bind rw,relatime shared:7 - btrfs /dev/sda1 rw
+";
+  let mounts = parse_mountinfo(content.as_bytes(), Path::new("/mnt"));
+  assert_eq!(
+    mounts,
+    vec![
+      row("/mnt/nvme", 41, 36, 259, 3),
+      row("/mnt/bind", 42, 36, 0, 57)
+    ],
+    "each row carries its own ids and device, not just its location"
+  );
+  assert_eq!(
+    mounts[0].dev,
+    Some(0x0001_0303),
+    "major:minor is packed the way dev_t packs it, so the value is comparable \
+     with a stat-read device"
+  );
+}
+
+/// **Several rows can render ONE mount point, and every one of them comes back**
+/// — with its own id, at that same location, in file order.
+///
+/// Two shapes, both ordinary and both stable. A plain STACK is a chain: each
+/// member is mounted on the one below it, so each names the one below as its
+/// parent. The second shape is not a chain at all — mount `A` at `/root/x/y`,
+/// mount `C` over `/root/x`, then mount `B` at the `y` that `C` now shows there:
+/// `A` hangs off the root mount and `B` off `C`, so neither is the other's
+/// parent, yet both render `/root/x/y`.
+///
+/// Naming ONE of them was the whole of the old design, and every rule for it (line
+/// order, the parent chain, a same-path group, the full parent graph) was found
+/// wrong on a shape the previous rule had not considered, because the kernel
+/// exports no visibility to be faithful to. Returning all of them retires the
+/// question: the core keys its census by mount id, so two rows at one location
+/// are two keys, and each one's own arrival, move and departure is a transition
+/// on its own key. A hidden member's transition costs one redundant cover of
+/// ground that was covered anyway — the safe direction, and the only cost.
+///
+/// MUTATION WITNESS (grouping restored): collapse rows by location, keeping the
+/// last at each — and this FAILS at `every member of the stack is a row` with a
+/// single-element `left`, which is one mount whose departure would never be
+/// derived.
+#[test]
+fn mountinfo_returns_every_row_at_one_location() {
+  // 44 is mounted OVER 40 at `/mnt/stack`, so 44's parent is 40 — not the `/mnt`
+  // that carries the mount point's directory entry.
+  let stack = "\
+36 25 0:32 / /mnt rw,relatime shared:1 - tmpfs tmpfs rw
+40 36 0:44 / /mnt/stack rw,relatime shared:5 - tmpfs lower rw
+44 40 0:48 / /mnt/stack rw,relatime shared:6 - tmpfs upper rw
+";
+  let mounts = parse_mountinfo(stack.as_bytes(), Path::new("/mnt"));
+  assert_eq!(
+    mounts,
+    vec![
+      row("/mnt/stack", 40, 36, 0, 44),
+      row("/mnt/stack", 44, 40, 0, 48),
+    ],
+    "every member of the stack is a row, with its own id and the location they \
+     share"
+  );
+  assert_ne!(
+    mounts[0].mnt_id, mounts[1].mnt_id,
+    "and the two are told apart by the only thing that tells them apart"
+  );
+
+  // The rootfs (self-parented, as the initial namespace spells it) carries the
+  // plain directory `/root`; `A` and the overmount `C` both hang off it, and `B`
+  // hangs off `C`. Creation order lists `A` first, exactly as it happened.
+  let unrelated = "\
+1 1 0:1 / / rw,relatime shared:1 - ext4 /dev/root rw
+40 1 0:44 / /root/x/y rw,relatime shared:5 - tmpfs first rw
+41 1 0:45 / /root/x rw,relatime shared:6 - tmpfs overmount rw
+42 41 0:46 / /root/x/y rw,relatime shared:7 - tmpfs revealed rw
+43 1 0:47 / /root/other rw,relatime shared:8 - tmpfs elsewhere rw
+";
+  assert_eq!(
+    parse_mountinfo(unrelated.as_bytes(), Path::new("/root")),
+    vec![
+      row("/root/x/y", 40, 1, 0, 44),
+      row("/root/x", 41, 1, 0, 45),
+      row("/root/x/y", 42, 41, 0, 46),
+      row("/root/other", 43, 1, 0, 47),
+    ],
+    "two rows at one mount point that are not a stack at all are still simply \
+     two rows, and the unrelated mount beside them is untouched"
+  );
+}
+
+/// **Issue #74's transition, at a stacked mount point.** The line order of
+/// `/proc/self/mountinfo` is mount CREATION order, and `mount --move`
+/// re-parents a mount without minting a new one — so a mount moved onto an
+/// occupied mount point keeps its OLDER id and is listed BEFORE the mount it now
+/// hides.
+///
+/// A parse that answered one row per location had to decide which of the two, and
+/// deciding by line order recorded the HIDDEN mount: lazily unmounting the other
+/// then left the selected row byte-identical across both reads, the core saw no
+/// transition, fired no cover, and the revealed subtree stayed dark for the life
+/// of the scope. With both rows returned there is nothing to decide — the
+/// departed mount's id is simply absent from the second read, whichever of the
+/// two it was.
+///
+/// MUTATION WITNESS (grouping restored): collapse by location keeping the last row
+/// at each and this FAILS at `the departure is a TRANSITION the two reads carry`,
+/// `left != right` with both sides `[MountRow { .., mnt_id: Some(55), .. }]` —
+/// two reads straddling an unmount that cannot be told apart.
+#[test]
+fn a_stacked_mounts_departure_is_a_transition_between_two_reads() {
+  // 55 was mounted at `/mnt/vol`; 20 — older, created elsewhere long before — was
+  // then `mount --move`d onto the same mount point, so 20's parent is 55.
+  // Creation order lists 20 first.
+  let stacked = "\
+20 55 0:48 / /mnt/vol rw,relatime shared:7 - tmpfs moved rw
+36 25 0:32 / /mnt rw,relatime shared:1 - tmpfs tmpfs rw
+55 36 0:44 / /mnt/vol rw,relatime shared:3 - tmpfs hidden rw
+";
+  let before = parse_mountinfo(stacked.as_bytes(), Path::new("/mnt"));
+
+  // `umount -l /mnt/vol` detaches the moved mount; the mount it hid is revealed.
+  let unstacked = "\
+36 25 0:32 / /mnt rw,relatime shared:1 - tmpfs tmpfs rw
+55 36 0:44 / /mnt/vol rw,relatime shared:3 - tmpfs hidden rw
+";
+  let after = parse_mountinfo(unstacked.as_bytes(), Path::new("/mnt"));
+
+  // Asserted FIRST: it is what the defect costs, so it is what a parse that
+  // collapses the location has to trip on.
+  assert_ne!(
+    before, after,
+    "the departure is a TRANSITION the two reads carry — the only thing that \
+     makes the core cover the ground it revealed"
+  );
+  assert_eq!(
+    before,
+    vec![
+      row("/mnt/vol", 20, 55, 0, 48),
+      row("/mnt/vol", 55, 36, 0, 44),
+    ],
+    "both members come back in FILE order, however creation order arranged them"
+  );
+  assert_eq!(
+    after,
+    vec![row("/mnt/vol", 55, 36, 0, 44)],
+    "and the survivor is byte-identical, so the diff names exactly the mount \
+     that left"
+  );
+}
+
+/// A torn read can list one mount id TWICE — the kernel drops the namespace lock
+/// between the `read(2)` calls that generate the file, so a mount can be rendered
+/// once, moved, and rendered again. The parse returns both rows: it validates no
+/// uniqueness and drops nothing, because a row it dropped is a location it would
+/// never answer for.
+///
+/// Deduplication belongs to the census, which is where the key exists: `census_of`
+/// keeps the FIRST row of a repeated key, so one mount enters one census once
+/// however many times a torn table named it. Doing it here instead would mean
+/// choosing between two locations for one id, which is the same guess the whole
+/// visibility resolution was.
+#[test]
+fn mountinfo_returns_both_rows_of_a_torn_read_with_a_duplicate_id() {
+  let torn = "\
+36 25 0:32 / /mnt rw,relatime shared:1 - tmpfs tmpfs rw
+44 36 0:48 / /mnt/before rw,relatime shared:5 - tmpfs twice rw
+44 36 0:48 / /mnt/after rw,relatime shared:5 - tmpfs twice rw
+";
+  assert_eq!(
+    parse_mountinfo(torn.as_bytes(), Path::new("/mnt")),
+    vec![
+      row("/mnt/before", 44, 36, 0, 48),
+      row("/mnt/after", 44, 36, 0, 48),
+    ],
+    "both rows come back verbatim — the parse refuses nothing and resolves \
+     nothing, and the census keys and dedupes them"
+  );
+}
+
+/// A line short of five fields is skipped, but a line whose LOCATION parses and
+/// whose identity does not is kept with that identity unknown. The location is
+/// the load-bearing half — losing it under-covers a real mount — while an
+/// unknown id is exactly the honest `None` every non-Linux table reports, and an
+/// unknown half never reads as a difference anywhere it is compared.
+///
+/// Each of the four fields degrades on its own: an unparsable mount id leaves the
+/// row keyed by its location, an unparsable PARENT leaves the replacement test
+/// deciding on the device alone, and either half of `major:minor` takes only the
+/// device with it.
+#[test]
+fn mountinfo_keeps_a_row_whose_identity_will_not_parse() {
+  let content = "\
+zz 25 0:32 / /mnt/bad-id rw,relatime shared:1 - tmpfs tmpfs rw
+37 25 nope / /mnt/bad-dev rw,relatime shared:2 - tmpfs tmpfs rw
+38 25 0:x / /mnt/bad-minor rw,relatime shared:3 - tmpfs tmpfs rw
+39 -1 0:37 / /mnt/bad-parent rw,relatime shared:4 - tmpfs tmpfs rw
+";
+  let mounts = parse_mountinfo(content.as_bytes(), Path::new("/mnt"));
+  assert_eq!(
+    mounts,
+    vec![
+      crate::os::MountRow {
+        location: std::path::PathBuf::from("/mnt/bad-id"),
+        mnt_id: None,
+        parent_id: Some(25),
+        dev: Some(super::makedev(0, 32)),
+      },
+      crate::os::MountRow {
+        location: std::path::PathBuf::from("/mnt/bad-dev"),
+        mnt_id: Some(37),
+        parent_id: Some(25),
+        dev: None,
+      },
+      crate::os::MountRow {
+        location: std::path::PathBuf::from("/mnt/bad-minor"),
+        mnt_id: Some(38),
+        parent_id: Some(25),
+        dev: None,
+      },
+      crate::os::MountRow {
+        location: std::path::PathBuf::from("/mnt/bad-parent"),
+        mnt_id: Some(39),
+        parent_id: None,
+        dev: Some(super::makedev(0, 37)),
+      },
+    ],
+    "an unparsable identity field is UNKNOWN, never a dropped row"
+  );
 }
 
 #[test]
 fn mountinfo_unescapes_octal_fields() {
   let content = "36 25 0:32 / /mnt/with\\040space rw shared:1 - tmpfs tmpfs rw\n";
+  let mounts = parse_mountinfo(content.as_bytes(), Path::new("/mnt"));
+  assert_eq!(mounts, vec![row("/mnt/with space", 36, 25, 0, 32)]);
+}
+
+/// **R8 F2.** mountinfo escapes exactly FOUR bytes inside a path field — space,
+/// tab, newline and backslash, as `\040`, `\011`, `\012`, `\134` — and separates
+/// its fields with the literal space. Every other ASCII whitespace byte is legal
+/// pathname data the kernel emits RAW: vertical tab `0x0b`, form feed `0x0c` and
+/// carriage return `0x0d` all name perfectly ordinary directories.
+///
+/// Splitting fields on `u8::is_ascii_whitespace` truncates such a mount point and
+/// records the row at a PHANTOM location. Because a successful read is
+/// authoritative, that phantom is admitted like any other row: a mount that appears
+/// and then departs silently is covered at a path that never existed, while the
+/// real revealed subtree is never mapped at all.
+///
+/// All three raw bytes are in the fixture, though that predicate only eats two of
+/// them: Rust's `u8::is_ascii_whitespace` is tab, newline, form feed, carriage
+/// return and space, so `0x0b` survived it by accident. Accident is not a rule, and
+/// the delimiter rule this pins — the literal `0x20`, nothing else — is what makes
+/// all three ordinary path data rather than two of them lucky.
+///
+/// The escaped space rides alongside deliberately. The two encodings must stay
+/// DISTINCT — `\040` is four bytes that become one space INSIDE a field, a raw
+/// `0x0d` is one byte that was never an escape — and a rule that confuses them
+/// either splits a path in half or glues two fields together.
+///
+/// MUTATION WITNESS (delimiter): restore `.split(u8::is_ascii_whitespace)` and this
+/// FAILS at `every raw whitespace byte is path data` with `left: [MountRow {
+/// location: "/mnt/we\u{b}i", mnt_id: Some(36), dev: Some(32) }, ...]` — the mount
+/// point truncated at the form feed, two components short of where the mount is.
+/// MUTATION WITNESS (empty-run filter): drop `.filter(|field| !field.is_empty())`
+/// and this FAILS at the same site with `left: [MountRow { location:
+/// "/mnt/we\u{b}i\u{c}r\rd", .. }, MountRow { location: "/mnt/with space", .. }]`
+/// — the DOUBLED-space row gone entirely, the empty run having shifted every
+/// positional index past it. That is what the filter is for, and why scoping it to
+/// the delimiter had to keep it.
+#[test]
+fn mountinfo_keeps_the_raw_whitespace_bytes_of_a_mount_point() {
+  // `\x0b`, `\x0c` and `\x0d` are ASCII whitespace that mountinfo does NOT escape;
+  // the last line separates two fields with a doubled space.
+  let content = "\
+36 25 0:32 / /mnt/we\x0bi\x0cr\x0dd rw,relatime shared:1 - tmpfs tmpfs rw
+37 25 0:33 / /mnt/with\\040space rw,relatime shared:2 - tmpfs tmpfs rw
+38  25 0:34 / /mnt/doubled rw,relatime shared:3 - tmpfs tmpfs rw
+";
+  let mounts = parse_mountinfo(content.as_bytes(), Path::new("/mnt"));
+  assert_eq!(
+    mounts,
+    vec![
+      row("/mnt/we\u{0b}i\u{0c}r\u{0d}d", 36, 25, 0, 32),
+      row("/mnt/with space", 37, 25, 0, 33),
+      row("/mnt/doubled", 38, 25, 0, 34),
+    ],
+    "every raw whitespace byte is path data, an octal triple is the only escape, \
+     and a doubled DELIMITER still shifts nothing"
+  );
+  let full = std::path::PathBuf::from("/mnt/we\u{0b}i\u{0c}r\u{0d}d");
+  assert!(
+    !mounts.iter().any(|mount| {
+      mount.location != full
+        && full
+          .as_os_str()
+          .as_encoded_bytes()
+          .starts_with(mount.location.as_os_str().as_encoded_bytes())
+    }),
+    "no row lands at a TRUNCATION of the mount point, wherever a split would have \
+     cut it — the phantom is a path no mount ever had, and covering it leaves the \
+     real one unmapped"
+  );
+}
+
+/// **R7 F2.** A Linux pathname is arbitrary bytes, so ANY mount in the namespace
+/// may sit at a mount point that is not valid UTF-8 — and the parser must read it
+/// as itself rather than failing the whole table.
+///
+/// The `&str` form this replaced made the failure NAMESPACE-WIDE: one such mount
+/// point anywhere, and the read of `/proc/self/mountinfo` failed outright, every
+/// refresh was marked non-authoritative, and issue #74's arrival/departure diff —
+/// the primary detector for a mount that departs below the root — never ran on
+/// any watched root on the host, however ordinary that root's own names were.
+///
+/// The staging line is what ties this cell to that failure: the buffer really is
+/// undecodable, so a parser that decodes before it splits cannot pass.
+///
+/// MUTATION WITNESS (representability): reject a line whose mount point is not
+/// UTF-8 (`std::str::from_utf8(&bytes).ok()?`) and this FAILS at `a non-UTF-8
+/// mount point is a row like any other` with the middle row missing — the row
+/// whose departure nothing would then derive.
+/// MUTATION WITNESS (totality): fail the whole parse on such a line instead
+/// (return an empty vec) and it FAILS at the same site with an EMPTY left — one
+/// unrelated mount point blinding every row in the table, which is the shape of
+/// the finding itself.
+#[test]
+fn mountinfo_parses_a_non_utf8_mount_point_and_keeps_the_rows_around_it() {
+  // `\xff` is not a valid UTF-8 lead byte anywhere, so no decode of this buffer
+  // succeeds — and the ordinary rows on either side are what prove the failure is
+  // per-row rather than whole-file.
+  let mut content: Vec<u8> = Vec::new();
+  content.extend_from_slice(b"36 25 0:32 / /mnt/before rw shared:1 - tmpfs tmpfs rw\n");
+  content.extend_from_slice(b"37 25 0:33 / /mnt/od\xffd rw shared:2 - ext4 /dev/loop0 rw\n");
+  content.extend_from_slice(b"38 25 0:34 / /mnt/after rw shared:3 - tmpfs tmpfs rw\n");
+  assert!(
+    std::str::from_utf8(&content).is_err(),
+    "staging: this is exactly the buffer a `read_to_string` of the live table \
+     would refuse"
+  );
+
+  let mounts = parse_mountinfo(&content, Path::new("/mnt"));
+  assert_eq!(
+    mounts,
+    vec![
+      row("/mnt/before", 36, 25, 0, 32),
+      crate::os::MountRow {
+        location: odd_mount_point(),
+        mnt_id: Some(37),
+        parent_id: Some(25),
+        dev: Some(super::makedev(0, 33)),
+      },
+      row("/mnt/after", 38, 25, 0, 34),
+    ],
+    "a non-UTF-8 mount point is a row like any other, and it does not take the \
+     rows around it down with it"
+  );
+}
+
+/// The bytes `/mnt/od\xffd` names, spelled the way each host can spell it: unix
+/// carries a pathname verbatim, and the cross-platform half of the parser's gate
+/// (which only ever sees UTF-8 fixtures in production) does the lossy decode the
+/// parser itself does there.
+fn odd_mount_point() -> std::path::PathBuf {
+  #[cfg(unix)]
+  {
+    use std::os::unix::ffi::OsStrExt;
+    std::path::PathBuf::from(std::ffi::OsStr::from_bytes(b"/mnt/od\xffd"))
+  }
+  #[cfg(not(unix))]
+  {
+    std::path::PathBuf::from(String::from_utf8_lossy(b"/mnt/od\xffd").into_owned())
+  }
+}
+
+/// **R7 F2**, the half the parser alone cannot answer: the READ must stay
+/// AUTHORITATIVE over such a table.
+///
+/// `None` out of this function is not a smaller answer — it is what marks the
+/// refresh non-authoritative, and a non-authoritative refresh runs no mount diff
+/// at all, so a lazily-unmounted subtree stays dark indefinitely. The defect was
+/// in the read (`read_to_string`), not in the parse, so this drives the read over
+/// a file whose bytes no decode accepts.
+///
+/// MUTATION WITNESS: restore `std::fs::read_to_string(path).ok()?` (parsing
+/// `content.as_bytes()`) and this FAILS at `the read stays AUTHORITATIVE` with
+/// `left: None, right: Some(..)` — one undecodable mount point silently retiring
+/// the whole detector.
+#[test]
+fn a_mountinfo_file_with_a_non_utf8_mount_point_still_reads_authoritative() {
+  let path = std::env::temp_dir().join(format!(
+    "tributary-fs-mountinfo-{}-{:?}.txt",
+    std::process::id(),
+    std::thread::current().id()
+  ));
+  let mut content: Vec<u8> = Vec::new();
+  content.extend_from_slice(b"36 25 0:32 / /mnt rw shared:1 - tmpfs tmpfs rw\n");
+  // Parented on `/mnt`'s own mount, as the kernel records a mount INSIDE it.
+  content.extend_from_slice(b"37 36 0:33 / /mnt/od\xffd rw shared:2 - ext4 /dev/loop0 rw\n");
+  std::fs::write(&path, &content).expect("the fixture table writes");
+
+  let read = mounts_from_file(&path, Path::new("/mnt"));
+  let _ = std::fs::remove_file(&path);
+
+  assert_eq!(
+    read,
+    Some(vec![crate::os::MountRow {
+      location: odd_mount_point(),
+      mnt_id: Some(37),
+      parent_id: Some(36),
+      dev: Some(super::makedev(0, 33)),
+    }]),
+    "the read stays AUTHORITATIVE over a table no decode accepts: `None` here is \
+     what silences the mount diff on every watched root"
+  );
+}
+
+/// A missing file answers `None` — the honest unreadable-table signal the
+/// authority rule is built on, kept distinct from "the bytes were surprising",
+/// and the ONLY thing that produces it. The parse decides nothing and refuses
+/// nothing, so no arrangement of mounts and no malformed line can make a readable
+/// table answer `None` here.
+#[test]
+fn an_unreadable_mountinfo_file_answers_none() {
+  let missing = std::env::temp_dir().join(format!(
+    "tributary-fs-mountinfo-absent-{}-{:?}",
+    std::process::id(),
+    std::thread::current().id()
+  ));
+  assert!(
+    mounts_from_file(&missing, Path::new("/mnt")).is_none(),
+    "a table that could not be READ is the unknown the caller closes trust for"
+  );
+}
+
+/// Parsing a table must stay near-linear in its rows, because a watched root of
+/// `/` sees the whole namespace and Linux permits `fs.mount-max` — 100 000 by
+/// default — mounts in one.
+///
+/// Nothing bounds a single mount point's stack below that limit either: every
+/// `mount --bind X /r/vol` adds one more row at the SAME location. Two shapes
+/// this parse has already worn were quadratic in exactly that case — asking, per
+/// member, whether any OTHER member named it as a parent — and a full stack then
+/// cost 10^10 comparisons, per refresh, per watched root, on the blocking pool.
+/// A driver stalled there is how the queue loss the whole mount design exists to
+/// avoid actually happens. One pass per line, one row pushed per line, is what
+/// this pins.
+///
+/// # The cost verdict is a RATIO, and it is calibrated by the run itself
+///
+/// An absolute wall clock cannot state this property, and an early version of
+/// this cell tried. It has to sit above the linear form on the slowest
+/// instrumented build and below the quadratic form on the fastest native one, and
+/// those two bounds are nearly an order of magnitude apart here: the linear parse
+/// of a full stack took 0.26 s natively and 3.4 s under TSan (both measured),
+/// against 41 s for a quadratic form. A ceiling with real margin over TSan has
+/// almost none left under the defect, and the same ceiling was a hard RED under
+/// miri.
+///
+/// So the cell measures the SAME work at two sizes an octave apart and asks how
+/// the cost grew. A linear parse grows with the input — about 8x. A quadratic one
+/// grows with its square — about 64x. The threshold sits between them, and
+/// because both halves are measured on the machine running them, no interpreter,
+/// sanitizer, container or loaded runner moves the verdict: it divides out.
+///
+/// Under miri the sizes drop to a token stack — one 32-bit address space is
+/// shared by the whole shard — and the RATIO is skipped there, because at sixteen
+/// rows the fixed costs are the measurement. What is asserted unconditionally at
+/// both sizes is that every member came back.
+#[test]
+fn a_full_namespace_stack_is_parsed_in_linear_time() {
+  // The kernel's own default `fs.mount-max`, and an octave below it. Miri gets a
+  // token stack: the interpreted cost of the real one would fall on the shard
+  // that shares a single 32-bit address space.
+  let (small, big): (u64, u64) = if cfg!(miri) {
+    (4, 16)
+  } else {
+    (12_500, 100_000)
+  };
+
+  // One mount point's whole stack as mountinfo spells it, plus the elapsed of the
+  // PARSE alone — the fixture is built outside the measurement.
+  fn parse(members: u64, base: u64) -> (std::time::Duration, Vec<crate::os::MountRow>) {
+    let mut table = String::from("36 25 0:32 / /mnt rw,relatime shared:1 - tmpfs tmpfs rw\n");
+    for member in 0..members {
+      // Each mount sits on the one below it, so the group is one chain; the
+      // bottom row hangs off `/mnt`'s own mount, exactly as the kernel records it.
+      let id = base + member;
+      let parent = if member == 0 { 36 } else { id - 1 };
+      table.push_str(&format!(
+        "{id} {parent} 0:{} / /mnt/vol rw,relatime shared:9 - tmpfs stacked rw\n",
+        40 + member
+      ));
+    }
+    let started = std::time::Instant::now();
+    let mounts = parse_mountinfo(table.as_bytes(), Path::new("/mnt"));
+    (started.elapsed(), mounts)
+  }
+
+  let whole_stack = |base: u64, members: u64| -> Vec<crate::os::MountRow> {
+    (0..members)
+      .map(|member| {
+        row(
+          "/mnt/vol",
+          base + member,
+          if member == 0 { 36 } else { base + member - 1 },
+          0,
+          40 + member,
+        )
+      })
+      .collect()
+  };
+
+  let (small_elapsed, small_mounts) = parse(small, 1_100_000);
+  let (big_elapsed, big_mounts) = parse(big, 2_200_000);
+  assert_eq!(
+    small_mounts,
+    whole_stack(1_100_000, small),
+    "every member of the stack is a row of its own, in file order"
+  );
+  assert_eq!(
+    big_mounts,
+    whole_stack(2_200_000, big),
+    "and that holds at the namespace's own limit, however deep the stack is"
+  );
+
+  // 8x the input. Linear grows about 8x with it; quadratic grows about 64x. The
+  // threshold is the geometric middle, and every machine-speed factor divides out
+  // — which is what an absolute ceiling could not do here.
+  let grew = big_elapsed.as_secs_f64() / small_elapsed.as_secs_f64().max(f64::MIN_POSITIVE);
+  assert!(
+    cfg!(miri) || grew < 24.0,
+    "the cost of parsing a stack grows with the stack, not with its square — \
+     this refresh runs on the blocking pool, and a driver stalled there is the \
+     queue loss the mount design exists to avoid ({small} rows took \
+     {small_elapsed:?}, {big} rows took {big_elapsed:?}, a factor of {grew:.1})"
+  );
+}
+
+/// **R9 F1, the coherence half.** The refresh marks the mount TABLE and the
+/// root's own stat authoritative as ONE snapshot, and they are two samples: the
+/// kernel generates `/proc/self/mountinfo` across many `read(2)` calls and drops
+/// the namespace lock between them, and the root's `statx` is a separate syscall
+/// after all of them. A mount transition anywhere in that window makes the pair
+/// describe two different worlds.
+///
+/// What that costs is not abstract, because mount ids are allocated LOWEST-FREE
+/// and freed on umount: an id the older table half still lists can be the very id
+/// the newer root stat reports. Every predicate the core writes against "a row's
+/// id versus the root's" then reads a coincidence as evidence — the exemption a
+/// btrfs subvolume gets, and the confirmation that moves a record out of it.
+///
+/// So an attempt the namespace moved under is REJECTED, and the retry is bounded:
+/// a namespace in constant motion must degrade to the honest non-authoritative
+/// answer rather than spin the blocking pool. This drives that policy directly;
+/// the live half — the `mountinfo` fd whose `poll` reports the generation — is
+/// `a_freshly_opened_mountinfo_fd_polls_clean` below.
+///
+/// MUTATION WITNESS (accept the unstable pair): answer `(sample.rows, sample.root)`
+/// unconditionally in `coherent_mount_sample` and this FAILS at `a namespace that
+/// never held still answers NO table` with `left: Some([MountRow { location:
+/// "/mnt/c", mnt_id: Some(3), parent_id: None, dev: Some(3) }]), right: None`.
+/// MUTATION WITNESS (drop the retry): take exactly one sample (`let sample =
+/// take();` with the loop deleted) and this FAILS at `staging: the unstable
+/// attempt is re-taken` with `left: 1, right: 2` — one lost race permanently
+/// costing a refresh its table.
+/// MUTATION WITNESS (retry a table-less read too): loop while `!sample.stable ||
+/// sample.rows.is_none()` and this FAILS at `a STABLE read is not re-taken` with
+/// `left: 3, right: 1` — three reads of `/proc` per refresh, forever, for a
+/// `/proc` that no re-read would open either.
+#[test]
+fn a_mount_sample_the_namespace_moved_under_is_not_a_table() {
+  fn attempt(rows: Option<&str>, stable: bool, root: u64) -> super::MountSample<u64> {
+    super::MountSample {
+      rows: rows.map(|at| {
+        vec![crate::os::MountRow {
+          location: std::path::PathBuf::from(at),
+          mnt_id: Some(root),
+          parent_id: None,
+          dev: Some(root),
+        }]
+      }),
+      root,
+      stable,
+      namespace: None,
+    }
+  }
+
+  // Unstable, then stable: the second attempt is the answer, and its ROOT sample
+  // travels with it.
+  let taken = std::cell::Cell::new(0u64);
+  let crate::os::MountReading { rows, root, .. } =
+    super::coherent_mount_sample(super::MAX_MOUNT_SAMPLE_ATTEMPTS, || {
+      taken.set(taken.get() + 1);
+      match taken.get() {
+        1 => attempt(Some("/mnt/a"), false, 1),
+        n => attempt(Some("/mnt/b"), true, n),
+      }
+    });
+  assert_eq!(taken.get(), 2, "staging: the unstable attempt is re-taken");
+  assert_eq!(
+    rows.as_deref(),
+    Some(
+      [crate::os::MountRow {
+        location: std::path::PathBuf::from("/mnt/b"),
+        mnt_id: Some(2),
+        parent_id: None,
+        dev: Some(2),
+      }]
+      .as_slice()
+    ),
+    "the table that comes back is the one the namespace held still for"
+  );
+  assert_eq!(
+    root, 2,
+    "and the root sample is the ACCEPTED attempt's, never an earlier world's"
+  );
+
+  // Never stable: the bound is spent, the table is refused, and the root sample
+  // still travels — the death gate reads it and death is terminal whatever the
+  // table did.
+  let taken = std::cell::Cell::new(0u64);
+  let crate::os::MountReading { rows, root, .. } =
+    super::coherent_mount_sample(super::MAX_MOUNT_SAMPLE_ATTEMPTS, || {
+      taken.set(taken.get() + 1);
+      attempt(Some("/mnt/c"), false, taken.get())
+    });
+  assert_eq!(
+    taken.get() as usize,
+    super::MAX_MOUNT_SAMPLE_ATTEMPTS,
+    "staging: the retry is BOUNDED — a churning namespace cannot spin the \
+     blocking pool"
+  );
+  assert_eq!(
+    rows, None,
+    "a namespace that never held still answers NO table: non-authoritative \
+     installs no frame and diffs nothing, which is the degrade that cannot lose \
+     a cover"
+  );
+  assert_eq!(
+    root,
+    super::MAX_MOUNT_SAMPLE_ATTEMPTS as u64,
+    "the LAST attempt's root sample still travels: liveness is terminal \
+     regardless of what the table did"
+  );
+
+  // Stable and unreadable: not a tear, so re-reading it would only pay for the
+  // same answer twice more. (This is the ONLY way rows come back `None` — the
+  // parse always answers a table, whatever the bytes hold.)
+  let taken = std::cell::Cell::new(0u64);
+  let crate::os::MountReading { rows, .. } =
+    super::coherent_mount_sample(super::MAX_MOUNT_SAMPLE_ATTEMPTS, || {
+      taken.set(taken.get() + 1);
+      attempt(None, true, taken.get())
+    });
+  assert_eq!(taken.get(), 1, "a STABLE read is not re-taken");
+  assert_eq!(rows, None, "and an unreadable one is still no table");
+}
+
+/// The live half of the coherence check, and the FALSE GREEN it exists to rule
+/// out: if `poll` raised `POLLERR | POLLPRI` on every call — because the fd was
+/// polled twice, because the flag were requested wrongly, because a `/proc`
+/// implementation answered differently — then every refresh on every Linux host
+/// would answer non-authoritative, the mount diff would never run again, and
+/// nothing else in the suite would notice. A freshly opened `mountinfo` fd polled
+/// once must read CLEAN.
+///
+/// The positive direction only. Driving the negative needs a real mount
+/// transition inside the window, which needs privileges the unit suite does not
+/// have; the policy above is where the rejection itself is pinned.
+#[cfg(all(target_os = "linux", not(miri)))]
+#[test]
+fn a_freshly_opened_mountinfo_fd_polls_clean() {
+  let file = std::fs::File::open("/proc/self/mountinfo").expect("the live table opens");
+  assert!(
+    super::namespace_unchanged(&file),
+    "an fd opened and polled with nothing in between reports an UNCHANGED mount \
+     namespace — a check that always answered `changed` would silently retire \
+     the whole mount detector on every host"
+  );
+
+  // And the seam the refresh actually calls hands back the caller's own sample.
+  let namespace = super::NamespaceWatch::default();
+  let reading = super::mount_sample(Path::new("/"), &namespace, || 7u8);
+  let sampled = reading.root;
+  assert_eq!(
+    sampled, 7,
+    "the root sample is the caller's, passed through"
+  );
+  assert!(
+    reading.stable,
+    "a quiet namespace answers a STABLE window — an always-unstable one would \
+     withhold the incarnation token on every refresh of every host"
+  );
+  assert!(
+    reading.namespace.is_some(),
+    "and a token comes back: `None` here means the fallback the pre-6.8 hosts \
+     depend on is silently absent"
+  );
+}
+
+/// The token's EXACT form, and the false green that would hide its absence:
+/// `statx(STATX_MNT_ID_UNIQUE)` must actually be requested and actually be read
+/// back on a kernel that has it (Linux 6.8).
+///
+/// The bit is not in `rustix`'s `StatxFlags`, so it is named by value and passed
+/// through `from_bits_retain` — and `rustix::fs::statx` masks the request with
+/// `StatxFlags::all()` before the syscall. That intersection keeps the bit only
+/// because the flag set carries bitflags' externally-defined-flags escape hatch
+/// (`const _ = !0`). If that ever changes, or the constant is wrong, or the mask
+/// bit is read from the wrong word, this reads `None` on every host — and NOTHING
+/// else fails: the incarnation token silently degrades to the namespace fallback,
+/// which is coarser and still correct, so every cell about the token keeps
+/// passing while the exact leg it is supposed to prefer is dead.
+///
+/// So the presence assertion is gated on the running kernel rather than skipped:
+/// below 6.8 there is genuinely no unique id to read and the cell says so loudly
+/// (the container this repo verifies in runs 6.4, which is exactly why the gate is
+/// a version check and not a `#[cfg]`), and at 6.8 or above a `None` is a defect.
+///
+/// MUTATION WITNESS (the mask drops the bit): narrow the intersection to
+/// `StatxFlags::ALL` — the real `STATX_ALL`, which predates 6.8 and does not carry
+/// this flag — and this FAILS at `the unique-id bit survives the mask` with `left:
+/// 0, right: 16384`. This leg runs on EVERY Linux host, kernel version or not, and
+/// it is the one that catches a `rustix` whose flag set stops covering unknown
+/// bits.
+/// MUTATION WITNESS (bit not requested): pass `StatxFlags::empty()` as the mask in
+/// `root_mnt_unique_id` and this FAILS on any 6.8+ host at `a 6.8+ kernel answers
+/// a unique mount id`. It CANNOT fail below 6.8 — there is no unique id to miss —
+/// which is why the skip line is printed rather than the cell silently reading
+/// green: the verify container runs 6.4, so this leg is proved on CI and on any
+/// modern host, not here.
+#[cfg(all(target_os = "linux", not(miri)))]
+#[test]
+fn a_unique_mount_id_is_read_where_the_kernel_has_one() {
+  fn kernel_at_least(major: u32, minor: u32) -> bool {
+    let Ok(release) = std::fs::read_to_string("/proc/sys/kernel/osrelease") else {
+      return false;
+    };
+    let mut parts = release.trim().split(['.', '-']);
+    let read = |p: Option<&str>| p.and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+    let (found_major, found_minor) = (read(parts.next()), read(parts.next()));
+    (found_major, found_minor) >= (major, minor)
+  }
+
+  // The one link this host can prove whatever its kernel: `rustix::fs::statx`
+  // intersects the requested mask with `StatxFlags::all()`, so a flag set without
+  // the externally-defined-flags escape hatch would drop this bit on the floor and
+  // the request would silently ask for nothing on EVERY host.
+  use rustix::fs::StatxFlags;
+  assert_eq!(
+    (StatxFlags::from_bits_retain(super::STATX_MNT_ID_UNIQUE) & StatxFlags::all()).bits()
+      & super::STATX_MNT_ID_UNIQUE,
+    super::STATX_MNT_ID_UNIQUE,
+    "the unique-id bit survives the mask rustix applies before the syscall — \
+     without it the request reaches the kernel asking for nothing and the token \
+     degrades to the namespace fallback in silence"
+  );
+
+  let first = super::root_mnt_unique_id(Path::new("/"));
+  let second = super::root_mnt_unique_id(Path::new("/"));
+  assert_eq!(
+    first, second,
+    "one mount answers ONE unique id: a token that varied per call would move the \
+     frame on every refresh"
+  );
+  if kernel_at_least(6, 8) {
+    assert!(
+      first.is_some(),
+      "a 6.8+ kernel answers a unique mount id, and the request has to reach it: \
+       a `None` here is the exact leg silently falling back to the coarser \
+       namespace token on every host"
+    );
+  } else {
+    println!(
+      "TRIBUTARY-SKIP a_unique_mount_id_is_read_where_the_kernel_has_one: kernel \
+       below 6.8 has no STATX_MNT_ID_UNIQUE — the namespace fallback is what runs \
+       here, and it has its own cell"
+    );
+    assert!(
+      first.is_none(),
+      "and a kernel WITHOUT the field must not appear to answer one: a value read \
+       out of an unset mask bit is a token invented from uninitialised meaning"
+    );
+  }
+}
+
+/// The FALSE GREEN of the incarnation token's pre-6.8 fallback, and the mirror of
+/// the cell above: [`NamespaceWatch`] must not count a transition where none
+/// happened.
+///
+/// Its generation drives the core's frame epoch, and a frame that moved is a
+/// coverage set owed a fresh whole-root generation and every outstanding round
+/// trip refused. A watch that bumped on every call would therefore buy a
+/// whole-root reseed per refresh, for every fanotify scope holding an exempt
+/// record, on every host — and it would do it while every cell about the token
+/// still passed, because "the frame moved" is exactly what those cells stage.
+///
+/// The negative direction (a real mount transition BETWEEN two observations moving
+/// the count) needs privileges the unit suite does not have; the core-side cells
+/// pin what a moved token means, and this pins that a quiet namespace does not
+/// produce one.
+///
+/// MUTATION WITNESS: bump unconditionally in `NamespaceWatch::observe` (drop the
+/// `if !namespace_unchanged(file)` guard) and this FAILS at `a quiet namespace
+/// counts NO transition` with `left: 2, right: 1`.
+#[cfg(all(target_os = "linux", not(miri)))]
+#[test]
+fn a_quiet_namespace_holds_its_transition_count_still() {
+  let watch = super::NamespaceWatch::default();
+  let first = watch.observe().expect("the live mountinfo opens");
+  let second = watch.observe().expect("and stays open");
+  assert_eq!(
+    second, first,
+    "a quiet namespace counts NO transition: this number is what the core reads \
+     as a frame move, so a count that advanced on its own would put every scope \
+     in a permanent whole-root reseed"
+  );
+  assert_eq!(
+    watch.observe().expect("still open"),
+    first,
+    "and it stays still across repeated observations — the fd is HELD, so each \
+     poll answers for the gap since the last one rather than for its own open"
+  );
+}
+
+/// The octal unescape reads three digits into ONE byte, and the arithmetic that
+/// does it must not overflow. `(octal[0] - b'0') * 64` in `u8` PANICS in a debug
+/// build for any leading digit above 3 — unreachable while the kernel is the only
+/// writer (it emits `\040`, `\011`, `\012`, `\134`), and reachable the moment the
+/// parser reads whatever bytes `/proc` handed back rather than a decoded string.
+///
+/// A triple that does not fit a byte is left VERBATIM rather than truncated into
+/// a different byte: inventing a byte would move the mount point.
+///
+/// MUTATION WITNESS: compute the value in `u8` again and this cell PANICS at
+/// `attempt to multiply with overflow` inside `unescape_mountinfo` rather than
+/// asserting — the debug-build crash the widening exists to prevent.
+#[test]
+fn mountinfo_unescape_survives_an_out_of_range_octal_triple() {
+  let content = b"36 25 0:32 / /mnt/hi\\777there rw shared:1 - tmpfs tmpfs rw\n";
   let mounts = parse_mountinfo(content, Path::new("/mnt"));
-  assert_eq!(mounts, vec![std::path::PathBuf::from("/mnt/with space")]);
+  assert_eq!(
+    mounts,
+    vec![row("/mnt/hi\\777there", 36, 25, 0, 32)],
+    "an out-of-range triple is not an escape the kernel wrote, so it stays as \
+     the four bytes it is"
+  );
 }
 
 /// The exclusion predicate both Linux backends' fences read.
@@ -249,6 +1143,224 @@ fn the_remote_list_only_names_the_refusal_it_never_grants_one() {
     };
     assert_eq!(source.kind(), std::io::ErrorKind::Unsupported);
   }
+}
+
+/// The fdinfo mount-id parser over the bodies the kernel does (and does not)
+/// write. PURE, so it runs on every host the suite builds on, not just Linux.
+///
+/// The load-bearing legs are the two that DECLINE: a value that is not a decimal,
+/// and a body whose last line the read cut short. A truncated `mnt_id:\t551\n`
+/// read back as `mnt_id:\t5` parses perfectly well into the id of a DIFFERENT
+/// mount, and a fence handed that id would believe it had proved a descent stayed
+/// inside the scope when it had proved nothing — strictly worse than declining,
+/// which only costs a fail-closed cover.
+///
+/// MUTATION WITNESS (a truncated tail is answered): drop the
+/// `.filter(|line| line.ends_with(b"\n"))` and this FAILS at `a body cut short
+/// mid-value answers nothing` with `left: Some(5), right: None` — the wrong mount,
+/// reported as fact.
+/// MUTATION WITNESS (a non-decimal value is answered): drop the
+/// `digits.iter().all(u8::is_ascii_digit)` guard and this FAILS at `a signed
+/// decimal is not what the kernel writes` with `left: Some(551), right: None` —
+/// `u64::from_str` takes a leading `+`, so `parse` alone does not decide what a
+/// mount id looks like and the guard is not redundant with it.
+#[test]
+fn the_fdinfo_mount_id_parser_answers_only_a_whole_decimal_line() {
+  use super::mnt_id_from_fdinfo as parse;
+
+  assert_eq!(
+    parse(b"pos:\t0\nflags:\t012000000\nmnt_id:\t551\nino:\t2\n"),
+    Some(551),
+    "the line the kernel actually writes, among the lines it writes around it"
+  );
+  assert_eq!(
+    parse(b"mnt_id:\t551\n"),
+    Some(551),
+    "the line alone still answers"
+  );
+  assert_eq!(
+    parse(b"mnt_id: 551\n"),
+    Some(551),
+    "a space rather than the kernel's tab is still whitespace after the colon"
+  );
+  assert_eq!(
+    parse(b"mnt_id:\t551\r\n"),
+    Some(551),
+    "a trailing carriage return is trimmed with the rest of the whitespace: \
+     refusing a whole decimal over one byte of line ending would fail a scope \
+     closed for nothing"
+  );
+
+  assert_eq!(
+    parse(b"pos:\t0\nflags:\t012000000\nino:\t2\n"),
+    None,
+    "a body with no mnt_id line at all answers nothing"
+  );
+  assert_eq!(parse(b""), None, "an empty body answers nothing");
+  assert_eq!(
+    parse(b"mnt_id: abc\n"),
+    None,
+    "a value that is not a decimal answers nothing, never a partial parse"
+  );
+  assert_eq!(
+    parse(b"mnt_id:\t\n"),
+    None,
+    "an empty value answers nothing"
+  );
+  assert_eq!(
+    parse(b"mnt_id:\t+551\n"),
+    None,
+    "a signed decimal is not what the kernel writes: `u64::from_str` would take \
+     `+551`, so the digits-only guard is what refuses it"
+  );
+  assert_eq!(
+    parse(b"mnt_id:\t551 552\n"),
+    None,
+    "a value with a trailing field is not a mount id"
+  );
+  assert_eq!(
+    parse(b"pos:\t0\nmnt_id:\t5"),
+    None,
+    "a body cut short mid-value answers nothing — `5` out of `551` is a DIFFERENT \
+     mount, and answering it would fence a descent on the wrong boundary"
+  );
+
+  assert_eq!(
+    parse(b"mnt_id_unique:\t34\nmnt_id:\t551\n"),
+    Some(551),
+    "6.8's unique id lives in another key space and never stands in for the \
+     legacy one the census is keyed by"
+  );
+  assert_eq!(
+    parse(b"mnt_id: abc\nmnt_id:\t551\n"),
+    None,
+    "the FIRST mnt_id line decides: a body whose own first answer is unreadable \
+     is not searched for a second opinion"
+  );
+}
+
+/// The tier memo, PURE over its cell and over both reads (the closure discipline
+/// the inotify arm's `frame_check` uses). Each leg drives its own `AtomicU8`, so
+/// nothing here touches the process-wide `MOUNT_ID_TIER` and no cell has to be
+/// serialised against another.
+///
+/// The claim: the tier is settled by the FIRST read that ANSWERS, a `statx` that
+/// FAILED settles nothing, and once settled on fdinfo no later read pays the mask
+/// probe again.
+///
+/// MUTATION WITNESS (a failure settles the tier): move the `Err` arm of
+/// `mount_id_through_tier` to `settle_mount_id_tier_in(tier, false)` before
+/// returning and this FAILS at `a failed statx settles nothing` — one `EACCES`
+/// would otherwise send every later read in the process down the fdinfo leg for
+/// good.
+/// MUTATION WITNESS (the memo is not consulted): replace
+/// `statx_answers_mount_id_in(tier)` with `true` and this FAILS at `a settled
+/// fdinfo tier does not probe the mask again` with the mask probe counted twice.
+/// MUTATION WITNESS (the memo is not written on a miss): drop the `Ok(None) =>`
+/// arm's settle and this FAILS one assertion earlier, at `one miss settles the
+/// fdinfo tier`.
+#[test]
+fn the_mount_id_tier_is_settled_by_the_first_read_that_answers() {
+  use std::sync::atomic::AtomicU8;
+
+  use super::{mount_id_through_tier, statx_answers_mount_id_in};
+
+  // A mask that ANSWERS settles the statx tier, and no later read opens fdinfo.
+  let statx_host = AtomicU8::new(0);
+  let mut fdinfo_reads = 0_u32;
+  for _ in 0..3 {
+    assert_eq!(
+      mount_id_through_tier::<()>(
+        &statx_host,
+        || Ok(Some(7)),
+        || {
+          fdinfo_reads += 1;
+          Ok(Some(9))
+        }
+      ),
+      Ok(Some(7)),
+      "the mask answers, so the mask's id is the answer"
+    );
+  }
+  assert_eq!(
+    fdinfo_reads, 0,
+    "a host whose statx answers never opens /proc — the whole point of settling \
+     on the statx tier"
+  );
+  assert!(
+    statx_answers_mount_id_in(&statx_host),
+    "the statx tier keeps asking statx"
+  );
+
+  // A mask that MISSES settles the fdinfo tier, and the mask is never probed
+  // again.
+  let fdinfo_host = AtomicU8::new(0);
+  let mut mask_probes = 0_u32;
+  let probe = |host: &AtomicU8, probes: &mut u32| {
+    mount_id_through_tier::<()>(
+      host,
+      || {
+        *probes += 1;
+        Ok(None)
+      },
+      || Ok(Some(551)),
+    )
+  };
+  assert_eq!(
+    probe(&fdinfo_host, &mut mask_probes),
+    Ok(Some(551)),
+    "the mask misses, so fdinfo answers"
+  );
+  assert_eq!(mask_probes, 1, "the FIRST read pays one mask probe");
+  assert!(
+    !statx_answers_mount_id_in(&fdinfo_host),
+    "one miss settles the fdinfo tier"
+  );
+  for _ in 0..3 {
+    assert_eq!(
+      probe(&fdinfo_host, &mut mask_probes),
+      Ok(Some(551)),
+      "later reads still answer, straight from fdinfo"
+    );
+  }
+  assert_eq!(
+    mask_probes, 1,
+    "a settled fdinfo tier does not probe the mask again — the memo exists so a \
+     4.11–5.7 host pays the miss once, not once per sample"
+  );
+
+  // A read that FAILED says nothing about the kernel, so it settles nothing.
+  let failing_host = AtomicU8::new(0);
+  assert_eq!(
+    mount_id_through_tier(&failing_host, || Err("EACCES"), || Ok(Some(551))),
+    Err("EACCES"),
+    "a failed read propagates, never laundered into the fdinfo leg's answer"
+  );
+  assert!(
+    statx_answers_mount_id_in(&failing_host),
+    "a failed statx settles nothing: the next read probes the mask again, \
+     because one denied call is not evidence the kernel lacks the bit"
+  );
+  // And the very next read, succeeding, settles it as if the failure never was.
+  assert_eq!(
+    mount_id_through_tier::<()>(&failing_host, || Ok(Some(7)), || Ok(Some(551))),
+    Ok(Some(7)),
+    "the retry reaches the mask"
+  );
+  assert!(
+    statx_answers_mount_id_in(&failing_host),
+    "and settles the statx tier"
+  );
+
+  // fdinfo answering NOTHING is the belt below both floors: still `Ok(None)`,
+  // never an error, and the tier stays where the miss put it.
+  let no_oracle = AtomicU8::new(0);
+  assert_eq!(
+    mount_id_through_tier::<()>(&no_oracle, || Ok(None), || Ok(None)),
+    Ok(None),
+    "a host below BOTH floors answers no id anywhere, and that is the only \
+     surviving source of a `None` frame"
+  );
 }
 
 /// The spawn dispatcher's root pin and the object-grounded identity reads it
@@ -886,6 +1998,7 @@ mod control_port {
         parent: None,
         name: OsString::from("/r"),
         expected: None,
+        frame: crate::os::ScopeFrame::default(),
       }),
       ControlOp::Disarm(watch(2)),
       ControlOp::Arm(AnchorRequest {
@@ -893,6 +2006,7 @@ mod control_port {
         parent: None,
         name: OsString::from("/r/child"),
         expected: None,
+        frame: crate::os::ScopeFrame::default(),
       }),
     ];
 

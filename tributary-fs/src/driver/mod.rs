@@ -23,9 +23,10 @@
 //! once up front and refuses a kernel below the floor (see `os::linux`), so this
 //! executor's live-path sample ([`stat_sample`]) is always a `statx` and never
 //! needs a sub-`statx` fallback. A `statx` mask miss (no `STATX_MNT_ID` below 5.8)
-//! still drops just the mount frame (absent, never mixed in from a second lookup)
-//! and the core fences that object on the device belt — so the rule holds either
-//! way: one object, one sample.
+//! costs the frame nothing: the sample is re-taken through an `O_PATH` pin
+//! ([`stat_sample_pinned`]) whose `/proc/self/fdinfo` line answers the id, and
+//! whose `statx` answers the identity — so all four facts still come from ONE
+//! object, and the rule holds either way: one object, one sample.
 
 use std::{
   collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
@@ -53,8 +54,8 @@ use crate::{
   },
   error::WatchRootError,
   os::{
-    Backend, BackendKind, EventReceiver, RootIdentity, RootMeta, ScopePort, SourceConfig,
-    SourceError, SourceHandle, SourceMessage, SpawnFailed, linux::WatchOutcome,
+    Backend, BackendKind, EventReceiver, RootIdentity, RootMeta, ScopeFrame, ScopePort,
+    SourceConfig, SourceError, SourceHandle, SourceMessage, SpawnFailed, linux::WatchOutcome,
   },
   watcher::{CoverOutcome, SkipReason, SyncTicket},
 };
@@ -4442,7 +4443,9 @@ pub(crate) enum ControlRequest {
   /// Install a per-directory watch for `watch` (arming `parent`'s child
   /// `name`, addressed by absolute `path`). `expected` is the `(dev, ino)` the
   /// opened object must still have before the watch installs (the enumerate→arm
-  /// rename guard); `None` leaves the arm unverified.
+  /// rename guard); `None` leaves the arm unverified. `frame` is the scope's
+  /// descent frame, which the executor refuses a crossing landing against —
+  /// unlike `expected`, it is checked on EVERY arm.
   Arm {
     watch: WatchId,
     /// The arm ATTEMPT this request executes, echoed back in its
@@ -4459,6 +4462,7 @@ pub(crate) enum ControlRequest {
     name: Segment,
     path: Arc<PathBuf>,
     expected: Option<ExpectedObject>,
+    frame: ScopeFrame,
   },
   /// Remove `watch`'s per-directory watch (fire-and-forget; no reply).
   Disarm { watch: WatchId },
@@ -4753,7 +4757,15 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
 
   /// Installs a per-directory kernel watch for `watch` at `path` (blocking).
   /// Reached only under a descending profile. `expected` is the object the arm
-  /// must confirm the open lands on (the enumerate→arm rename guard).
+  /// must confirm the open lands on (the enumerate→arm rename guard); `frame` is
+  /// the scope's descent frame, and an arm whose landing sits ACROSS it is
+  /// refused before anything installs ([`ScopeFrame::crossed_by`]).
+  ///
+  /// The two guards are independent and both are needed. `expected` asks "is
+  /// this the object the enumerate saw" and is `None` for the arms that never
+  /// met an enumerate — precisely the ones a mount can appear under. `frame`
+  /// asks "is this object inside the scope at all", and is asked every time.
+  #[allow(clippy::too_many_arguments)]
   fn add_watch(
     &self,
     scope: ScopeId,
@@ -4762,6 +4774,7 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
     path: &Path,
     name: &Segment,
     expected: Option<ExpectedObject>,
+    frame: ScopeFrame,
   ) -> WatchOutcome;
 
   /// Removes a per-directory kernel watch (blocking, fire-and-forget).
@@ -4802,10 +4815,11 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
           name,
           path,
           expected,
+          frame,
         } => outcomes.push(ArmResolution {
           watch,
           attempt,
-          outcome: self.add_watch(scope, watch, parent, &path, &name, expected),
+          outcome: self.add_watch(scope, watch, parent, &path, &name, expected, frame),
         }),
         ControlRequest::Disarm { watch } => self.remove_watch(scope, watch),
       }
@@ -4855,6 +4869,7 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
   /// commit-or-unwind is decided by the returned outcome. The default routes
   /// through [`add_watch`](Self::add_watch) — the right shape for executors
   /// (fakes) that answer arms themselves and carry `Inert` ports.
+  #[allow(clippy::too_many_arguments)]
   fn preflight_arm(
     &self,
     port: &ScopePort,
@@ -4863,9 +4878,10 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
     path: &Path,
     name: &Segment,
     expected: Option<ExpectedObject>,
+    frame: ScopeFrame,
   ) -> WatchOutcome {
     let _ = port;
-    self.add_watch(scope, watch, watch, path, name, expected)
+    self.add_watch(scope, watch, watch, path, name, expected, frame)
   }
 
   /// Takes `watch`'s transient directory anchor, TRANSFERRING ownership to the
@@ -4955,6 +4971,61 @@ pub(crate) trait SourceControl: Send + 'static {
     None
   }
 
+  /// Hands this source ONE BURST of admission reseeds — admit the ground every
+  /// mount a single departure verdict condemned revealed — answering whether the
+  /// burst was accepted for execution.
+  ///
+  /// `false` is the honest refusal, not an error: a backend with no admission map
+  /// (the default, and every backend but fanotify) admits nothing and has nothing
+  /// to reseed, and a fanotify reader whose thread has already exited will never
+  /// run them. Either way the driver resolves EVERY round trip in the burst
+  /// [`Unreachable`](crate::os::AdmitOutcome::Unreachable) itself, so the covers
+  /// the core parked on them are released rather than stranded.
+  ///
+  /// The burst travels whole because it must arrive whole: a source that could see
+  /// a PREFIX of one would snapshot that prefix into a whole-root recovery and buy
+  /// a second recovery for the rest — and the second report has no boundary permit
+  /// to claim at the supported budget of one, so it kills a healthy source.
+  ///
+  /// A source that accepts one answers each request on its own ordered queue with
+  /// [`SourceMessage::Admitted`](crate::os::SourceMessage), never here: the walks
+  /// run on the reader thread, and the replies must stay ordered against the events
+  /// around them.
+  fn request_admits(&self, requests: Vec<crate::os::AdmitRequest>) -> bool {
+    let _ = requests;
+    false
+  }
+
+  /// Publishes the core's current frame epoch for this scope — the count of worlds
+  /// the core has adopted, which the source stamps onto any whole-root generation
+  /// it produces WITHOUT being asked.
+  ///
+  /// Inert by default, and for every backend but fanotify: nothing else produces
+  /// an unsolicited whole-root generation, so nothing else has a stamp to carry.
+  /// It opens no round trip and answers nothing, so there is no outcome to report.
+  fn publish_frame(&self, epoch: u64) {
+    let _ = epoch;
+  }
+
+  /// Hands this source ONE WHOLE-ROOT RECOVERY — reseed the whole admission map
+  /// from the root — answering whether it was accepted for execution.
+  ///
+  /// The root-scope sibling of [`request_admits`](Self::request_admits), refused by
+  /// default for the same reason: a backend with no admission map has no map to
+  /// reseed. The driver then resolves the recovery inline
+  /// ([`on_recovery_unreachable`](crate::core::DriverCore::on_recovery_unreachable)),
+  /// which emits the root cover the recovery was standing for — the whole
+  /// obligation on a backend that is never blind to revealed ground.
+  ///
+  /// A source that accepts one answers it on its own ordered queue with
+  /// [`SourceMessage::RootRecovered`](crate::os::SourceMessage), never here, and
+  /// that ONE message carries the reseed's generation, the cutoff and the loss
+  /// together.
+  fn request_root_recovery(&self, request: crate::os::RecoveryRequest) -> bool {
+    let _ = request;
+    false
+  }
+
   /// Where a successor stream could resume this one's journal from, when the
   /// backend keeps one and its ids are still valid. A root replacement takes
   /// this from the RETIRING stream and hands it to the replacement's spawn,
@@ -4979,6 +5050,24 @@ impl SourceControl for SourceHandle {
   #[cfg(all(target_os = "linux", not(miri)))]
   fn backend_stats(&self) -> Option<crate::os::BackendStatsHandle> {
     SourceHandle::backend_stats(self)
+  }
+
+  // Linux is the only platform with a source that admits by MEMBERSHIP, so it is
+  // the only one that can be blind to ground a departed mount revealed; every
+  // other keeps the default refusal, and its departures cover immediately.
+  #[cfg(all(target_os = "linux", not(miri)))]
+  fn request_admits(&self, requests: Vec<crate::os::AdmitRequest>) -> bool {
+    SourceHandle::request_admits(self, requests)
+  }
+
+  #[cfg(all(target_os = "linux", not(miri)))]
+  fn request_root_recovery(&self, request: crate::os::RecoveryRequest) -> bool {
+    SourceHandle::request_root_recovery(self, request)
+  }
+
+  #[cfg(all(target_os = "linux", not(miri)))]
+  fn publish_frame(&self, epoch: u64) {
+    SourceHandle::publish_frame(self, epoch);
   }
 
   // Every source but the Linux ones mints a resume point (inotify and
@@ -5051,21 +5140,27 @@ struct StatSample {
   kind: tributary_proto::FileKind,
   dev: u64,
   ino: u64,
-  /// The mount frame, `Some` only when the sample reported the mount id, `None`
-  /// on a `statx` mask miss (`STATX_MNT_ID` is 5.8; below it the bit stays unset)
-  /// — the core then fences on the device belt.
+  /// The mount frame — `Some` on every supported kernel, from the `statx` mask
+  /// (5.8+) or from the pinned fd's `/proc/self/fdinfo` line (3.15+, so below the
+  /// 4.11 `statx` floor). `None` only where NEITHER answers, which no supported
+  /// host reaches; the core then fences on the device belt and fails the scope
+  /// closed while it holds the boundary.
   frame: Option<u64>,
 }
 
-/// ONE sample of the object at `path` (symlink not followed): the sole path-syscall
-/// behind every fact a caller reads about that object.
+/// ONE sample of the object at `path` (symlink not followed): every fact a caller
+/// reads about that object, always from ONE object.
 ///
-/// `statx(AT_FDCWD, path, AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS | STATX_MNT_ID)` —
-/// kind, device, inode, AND mount frame all from THAT one result. The Linux backends
-/// require `statx` (Linux 4.11+, gated once at spawn — see `os::linux`), so there is
-/// no sub-`statx` fallback: the sample is always this single syscall. A mask miss
-/// (`STATX_MNT_ID` is 5.8) declines only the frame (`None`), and the core then fences
-/// that object on the device belt.
+/// On a kernel that answers a mount id through `statx` — 5.8 and up, which the
+/// process settles once (`os::linux`'s tier memo) — that is a single
+/// `statx(AT_FDCWD, path, AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS | STATX_MNT_ID)`:
+/// kind, device, inode AND mount frame all from THAT one result, and no other
+/// syscall at all.
+///
+/// On a 4.11–5.7 kernel the mask carries no mount id, so the sample is taken
+/// through a PINNED fd instead ([`stat_sample_pinned`]) — the frame comes from
+/// `/proc/self/fdinfo`, and the identity is re-read from that same fd rather than
+/// paired with the earlier path lookup's. See that function for why.
 ///
 /// The path is resolved the same way `symlink_metadata` was, so an anchor
 /// (`/proc/self/fd/N`) enumerate reads every fact THROUGH the pinned fd too.
@@ -5081,25 +5176,94 @@ struct StatSample {
 /// never is.
 #[cfg(all(target_os = "linux", not(miri)))]
 fn stat_sample(path: &Path) -> Result<StatSample, rustix::io::Errno> {
-  use rustix::fs::{AtFlags, StatxFlags, makedev, statx};
+  use rustix::fs::{AtFlags, StatxFlags, statx};
+  if crate::os::linux::statx_answers_mount_id() {
+    let stx = loop {
+      match statx(
+        rustix::fs::CWD,
+        path,
+        AtFlags::SYMLINK_NOFOLLOW,
+        StatxFlags::BASIC_STATS.union(StatxFlags::MNT_ID),
+      ) {
+        Ok(stx) => break stx,
+        Err(rustix::io::Errno::INTR) => continue,
+        Err(err) => return Err(err),
+      }
+    };
+    let frame = crate::os::linux::mnt_id_from_mask(stx.stx_mask, stx.stx_mnt_id);
+    crate::os::linux::settle_mount_id_tier(frame.is_some());
+    if frame.is_some() {
+      return Ok(sample_of(&stx, frame));
+    }
+    // The mask missed, so this kernel has no `STATX_MNT_ID` and every later
+    // sample skips straight past the branch above. This one falls through and
+    // re-takes the object through a pin; the result just read is DISCARDED rather
+    // than half-kept, because keeping it is the mispairing the pinned read exists
+    // to avoid.
+  }
+  stat_sample_pinned(path)
+}
+
+/// [`stat_sample`] on a kernel whose `statx` answers no mount id: `open(path,
+/// O_PATH | O_NOFOLLOW | O_CLOEXEC)`, then `statx` and `/proc/self/fdinfo` through
+/// THAT one fd.
+///
+/// # Why the identity is re-read rather than carried over
+///
+/// The frame has to come from an fd, because the fdinfo line is addressed by
+/// descriptor and nothing else. The one-sample rule (see the module doc) then
+/// forbids pairing that fd's frame with the identity a SEPARATE path lookup
+/// returned: a rename or bind toggling `path` between the two would hand one
+/// object's `(kind, dev, ino)` to another object's mount id, and the arm
+/// downstream verifies `(dev, ino)` only — so a raced foreign bind could be
+/// classified descendable and armed, the precise failure the rule exists to
+/// prevent. Taking all four facts through the pinned fd keeps them one object's,
+/// at the cost of two extra syscalls on a kernel below 5.8 and none at all above
+/// it.
+///
+/// `O_PATH` asks no permission on the object itself and opens anything — a
+/// symlink (with `O_NOFOLLOW`), a socket, a device — so this reaches exactly what
+/// `AT_SYMLINK_NOFOLLOW` reached. A FAILED open yields the errno the `statx` would
+/// have yielded for the same path, so `NOENT` keeps its raced-away meaning and no
+/// failure is laundered into a `None` frame.
+#[cfg(all(target_os = "linux", not(miri)))]
+fn stat_sample_pinned(path: &Path) -> Result<StatSample, rustix::io::Errno> {
+  use std::os::fd::AsFd;
+
+  use rustix::fs::{AtFlags, Mode, OFlags, StatxFlags, open, statx};
+  let flags = OFlags::PATH.union(OFlags::NOFOLLOW).union(OFlags::CLOEXEC);
+  let fd = loop {
+    match open(path, flags, Mode::empty()) {
+      Ok(fd) => break fd,
+      Err(rustix::io::Errno::INTR) => continue,
+      Err(err) => return Err(err),
+    }
+  };
   let stx = loop {
     match statx(
-      rustix::fs::CWD,
-      path,
-      AtFlags::SYMLINK_NOFOLLOW,
-      StatxFlags::BASIC_STATS.union(StatxFlags::MNT_ID),
+      fd.as_fd(),
+      c"",
+      AtFlags::EMPTY_PATH,
+      StatxFlags::BASIC_STATS,
     ) {
       Ok(stx) => break stx,
       Err(rustix::io::Errno::INTR) => continue,
       Err(err) => return Err(err),
     }
   };
-  Ok(StatSample {
+  let frame = crate::os::linux::fdinfo_mount_id(fd.as_fd())?;
+  Ok(sample_of(&stx, frame))
+}
+
+/// One `statx` result and the frame decided for it, lowered to a [`StatSample`].
+#[cfg(all(target_os = "linux", not(miri)))]
+fn sample_of(stx: &rustix::fs::Statx, frame: Option<u64>) -> StatSample {
+  StatSample {
     kind: kind_of_mode(u32::from(stx.stx_mode)),
-    dev: makedev(stx.stx_dev_major, stx.stx_dev_minor),
+    dev: rustix::fs::makedev(stx.stx_dev_major, stx.stx_dev_minor),
     ino: stx.stx_ino,
-    frame: (stx.stx_mask & StatxFlags::MNT_ID.bits() != 0).then_some(stx.stx_mnt_id),
-  })
+    frame,
+  }
 }
 
 /// The proto file kind of a raw `st_mode`/`stx_mode` (symlinks are never followed).
@@ -5212,6 +5376,12 @@ pub(crate) struct RealFs {
   /// those apart.
   #[cfg(all(target_os = "linux", not(miri)))]
   anchors: std::sync::Arc<std::sync::Mutex<AnchorTable>>,
+  /// The mount-namespace transition counter every refresh reads its incarnation
+  /// token from ([`crate::os::NamespaceWatch`]). Shared across clones because the
+  /// namespace is one object: the counter is only meaningful when every refresh
+  /// polls the SAME held fd, and a per-clone watch would restart its baseline and
+  /// report each gap it did not span as quiet.
+  namespace: std::sync::Arc<crate::os::NamespaceWatch>,
 }
 
 impl RealFs {
@@ -5248,6 +5418,7 @@ impl RealFs {
   /// through `/proc/self/fd`, but the fallback is not — and it is the common case
   /// once the cold enumerate has consumed the parent anchor).
   #[cfg(all(target_os = "linux", not(miri)))]
+  #[allow(clippy::too_many_arguments)]
   fn build_arm_request(
     &self,
     watch: WatchId,
@@ -5255,6 +5426,7 @@ impl RealFs {
     path: &Path,
     name: &Segment,
     expected: Option<ExpectedObject>,
+    frame: ScopeFrame,
   ) -> crate::os::linux::AnchorRequest {
     let expected = expected.map(|e| crate::os::linux::ExpectedObject {
       dev: e.dev,
@@ -5276,12 +5448,14 @@ impl RealFs {
         parent: Some(fd),
         name: std::ffi::OsString::from(name.as_str()),
         expected,
+        frame,
       },
       None => crate::os::linux::AnchorRequest {
         watch,
         parent: None,
         name: path.as_os_str().to_os_string(),
         expected,
+        frame,
       },
     }
   }
@@ -5355,9 +5529,10 @@ impl RealFs {
           name,
           path,
           expected,
+          frame,
         } => {
           ops.push(ControlOp::Arm(
-            self.build_arm_request(watch, parent, &path, &name, expected),
+            self.build_arm_request(watch, parent, &path, &name, expected, frame),
           ));
           plan.push(Publication::Arm(watch, attempt));
         }
@@ -5651,24 +5826,7 @@ impl FsOps for RealFs {
   }
 
   fn probe(&self, path: &Path) -> ProbeOutcome {
-    match std::fs::symlink_metadata(path) {
-      Ok(meta) => {
-        let file_type = meta.file_type();
-        let kind = if file_type.is_dir() {
-          tributary_proto::FileKind::Dir
-        } else if file_type.is_file() {
-          tributary_proto::FileKind::File
-        } else if file_type.is_symlink() {
-          tributary_proto::FileKind::Symlink
-        } else {
-          tributary_proto::FileKind::Other
-        };
-        let (file_id, dev) = inode_of(&meta);
-        ProbeOutcome::Present { kind, file_id, dev }
-      }
-      Err(err) if err.kind() == std::io::ErrorKind::NotFound => ProbeOutcome::Missing,
-      Err(_) => ProbeOutcome::Failed,
-    }
+    probe_path(path)
   }
 
   fn write_cookie(
@@ -5809,10 +5967,6 @@ impl FsOps for RealFs {
   }
 
   fn refresh_mounts(&self, root: &Path) -> MountRefresh {
-    let (mounts, authoritative) = match crate::os::mounts_under(root) {
-      Some(mounts) => (mounts, true),
-      None => (Vec::new(), false),
-    };
     // ONE sample proves liveness AND reads the mount frame: `root_liveness_and_frame`
     // is a single `statx` (symlink not followed, so a root retargeted to a symlink is
     // a replacement, not a follow), yielding the `(dev, ino)` the death gate decides
@@ -5823,14 +5977,57 @@ impl FsOps for RealFs {
     // identity verdict with a different object's frame (a replace/remount between two
     // separate lookups would). A `Missing` root is DeleteSelf, any other stat failure
     // is Unreadable (MoveSelf) — the exact `RootChanged`-probe mapping; the mount id
-    // is inotify's best-effort belt (`None` below 5.8), taken from the same result's
-    // mask.
-    let (root_liveness, root_mnt_id) = root_liveness_and_frame(root);
+    // is inotify's descent boundary, taken from the SAME sample (`None` only where
+    // the host answers no id at all).
+    //
+    // The stat is taken INSIDE [`crate::os::mount_sample`] rather than beside it,
+    // and that is the second half of the same discipline. One atomic stat of the
+    // root proves the root's own facts belong together; it proves NOTHING about
+    // the table, which is a separate sample the kernel generates across many
+    // reads with the namespace lock dropped between them. Marking the pair
+    // authoritative required the pair to be coherent, and nothing established
+    // that: a torn table can present rows from before a transition beside a frame
+    // from after it, and because mount ids are recycled lowest-free, a row in the
+    // older half can carry the very id the newer root stat reports. `mount_sample`
+    // holds the namespace generation across BOTH halves and answers no table at
+    // all when it moved.
+    //
+    // The UNIQUE mount id rides the same window as a second `statx` (the kernel
+    // answers one id per call — see [`crate::os::root_mnt_unique_id`]), and the
+    // window is what pairs them: `stable` means the namespace demonstrably did not
+    // move between the two reads, so the legacy id the mount table is compared
+    // against and the unique id the incarnation token is built from describe the
+    // same mount. An unstable window yields NO token at all rather than a
+    // mismatched one, and the scope keeps the last token it proved.
+    let reading = crate::os::mount_sample(root, &self.namespace, || {
+      (
+        root_liveness_and_frame(root),
+        crate::os::root_mnt_unique_id(root),
+      )
+    });
+    let ((root_liveness, root_mnt_id), root_unique) = reading.root;
+    let (mounts, authoritative) = match reading.rows {
+      Some(mounts) => (mounts, true),
+      None => (Vec::new(), false),
+    };
+    // The unique id FIRST: it is exact in both directions and costs an unrelated
+    // namespace nothing, while the transition count is the pre-6.8 fallback that
+    // reads any mount anywhere as a possible move. A host answers one or the
+    // other for its whole life, never both.
+    let root_incarnation = reading
+      .stable
+      .then(|| {
+        root_unique
+          .map(crate::os::RootIncarnation::Unique)
+          .or(reading.namespace.map(crate::os::RootIncarnation::Namespace))
+      })
+      .flatten();
     MountRefresh {
       mounts,
       authoritative,
       root: root_liveness,
       root_mnt_id,
+      root_incarnation,
     }
   }
   #[cfg(all(target_os = "linux", not(miri)))]
@@ -5868,6 +6065,7 @@ impl FsOps for RealFs {
     path: &Path,
     name: &Segment,
     expected: Option<ExpectedObject>,
+    frame: ScopeFrame,
   ) -> WatchOutcome {
     // A direct single arm runs against the CURRENT transport (the caller is
     // synchronous, not a leftover batch), so it adopts the attached
@@ -5886,6 +6084,7 @@ impl FsOps for RealFs {
           name: name.clone(),
           path: Arc::new(path.to_path_buf()),
           expected,
+          frame,
         }],
       )
       .resolutions
@@ -5904,6 +6103,7 @@ impl FsOps for RealFs {
     _path: &Path,
     _name: &Segment,
     _expected: Option<ExpectedObject>,
+    _frame: ScopeFrame,
   ) -> WatchOutcome {
     WatchOutcome::Failed(WatchError::Io)
   }
@@ -5972,6 +6172,7 @@ impl FsOps for RealFs {
     path: &Path,
     name: &Segment,
     expected: Option<ExpectedObject>,
+    frame: ScopeFrame,
   ) -> WatchOutcome {
     use crate::os::linux::ControlOp;
 
@@ -5979,7 +6180,7 @@ impl FsOps for RealFs {
       return WatchOutcome::Failed(WatchError::Gone);
     };
     let ops = vec![ControlOp::Arm(
-      self.build_arm_request(watch, watch, path, name, expected),
+      self.build_arm_request(watch, watch, path, name, expected, frame),
     )];
     // A pre-arm needs no `answered`: a reader that never served it answers its one
     // arm `Failed(Io)`, and the commit is decided by that outcome alone — it
@@ -6054,9 +6255,10 @@ impl FsOps for RealFs {
 /// `(kind, dev, ino)` with another object's mount frame — the arm downstream
 /// verifies `(dev, ino)` only, so a raced foreign bind that split the sample
 /// could otherwise be classified descendable and armed. A `statx` mask miss (no
-/// `STATX_MNT_ID` below 5.8) drops just the frame (`None`) and descent runs on the
-/// device belt. Off Linux, one `symlink_metadata` (no mount-id notion; the core
-/// fences on device alone) — still a single object's facts.
+/// `STATX_MNT_ID` below 5.8) still answers a frame: the sample is re-taken whole
+/// through an `O_PATH` pin whose fdinfo carries the id. Off Linux, one
+/// `symlink_metadata` (no mount-id notion; the core fences on device alone) —
+/// still a single object's facts.
 #[cfg(all(target_os = "linux", not(miri)))]
 fn dir_entry_stat(entry_path: &Path) -> Option<(tributary_proto::FileKind, u64, u64, Option<u64>)> {
   let sample = stat_sample(entry_path).ok()?;
@@ -6072,6 +6274,56 @@ fn dir_entry_stat(entry_path: &Path) -> Option<(tributary_proto::FileKind, u64, 
     ino_of(&meta),
     None,
   ))
+}
+
+/// One executed probe: a single no-follow stat of `path`, lowered to
+/// [`ProbeOutcome`].
+///
+/// On Linux it is the SAME [`stat_sample`] a directory listing takes, for the
+/// same reason [`dir_entry_stat`] takes it: the answer carries a MOUNT id beside
+/// the device, and a probe answer is a boundary observation the core records
+/// (SEAM 4). Without the id every such record is born device-only and therefore
+/// permanently exempt from condemnation, which loses the departure of a genuine
+/// mount the probe was the first thing to see. Taking both facts from one
+/// `statx` also means a bind toggling between two syscalls can never pair one
+/// object's device with another's mount id.
+///
+/// Off Linux there is no mount-id notion, so the id is `None` — the honest
+/// degrade, and one the core pays for: a boundary recorded with no id enters the
+/// ledger `Standing::Unknown`, which joins no census and fails the whole scope
+/// closed (a per-refresh root cover) while it is held. On Linux that cannot happen
+/// on a supported kernel — the id comes from the `statx` mask on 5.8+ and from the
+/// pinned fd's `/proc/self/fdinfo` line below it — so this degrade is the fake and
+/// non-Linux executors' alone.
+#[cfg(all(target_os = "linux", not(miri)))]
+fn probe_path(path: &Path) -> ProbeOutcome {
+  match stat_sample(path) {
+    Ok(sample) => ProbeOutcome::Present {
+      kind: sample.kind,
+      file_id: std::num::NonZeroU64::new(sample.ino),
+      dev: sample.dev,
+      mnt_id: sample.frame,
+    },
+    Err(rustix::io::Errno::NOENT) => ProbeOutcome::Missing,
+    Err(_) => ProbeOutcome::Failed,
+  }
+}
+
+#[cfg(not(all(target_os = "linux", not(miri))))]
+fn probe_path(path: &Path) -> ProbeOutcome {
+  match std::fs::symlink_metadata(path) {
+    Ok(meta) => {
+      let (file_id, dev) = inode_of(&meta);
+      ProbeOutcome::Present {
+        kind: kind_of(&meta.file_type()),
+        file_id,
+        dev,
+        mnt_id: None,
+      }
+    }
+    Err(err) if err.kind() == std::io::ErrorKind::NotFound => ProbeOutcome::Missing,
+    Err(_) => ProbeOutcome::Failed,
+  }
 }
 
 /// The most entries ONE directory read may retain before it declares itself
@@ -6190,6 +6442,9 @@ fn list_dir(path: &Path) -> RawEnumerate {
   RawEnumerate::Listed { entries, complete }
 }
 
+// Feeds the metadata-based probe alone; the Linux path reads both facts from its
+// one `statx` result ([`stat_sample`]) and never calls this.
+#[cfg(not(all(target_os = "linux", not(miri))))]
 fn inode_of(meta: &std::fs::Metadata) -> (Option<std::num::NonZeroU64>, u64) {
   #[cfg(unix)]
   {
@@ -7660,6 +7915,11 @@ pub(crate) async fn run<R, F>(
                   dev: spawned.meta.identity.dev(),
                   ino,
                 });
+              // The REPLACEMENT world's frame, read off its own barrier: the core
+              // still holds the outgoing root's, and the two roots need not share
+              // a mount at all. Taken before the escrow is parked, which consumes
+              // the spawn.
+              let frame = spawned.meta.frame();
               match &mut streams.replace_states.get_mut(&scope).expect("just checked").mode {
                 // The slot is borrowed BEFORE the escrow is consumed, so the
                 // lookup and its `expect` are still on the guarded side.
@@ -7676,7 +7936,7 @@ pub(crate) async fn run<R, F>(
               let tx = op_tx.clone();
               R::spawn_blocking_detach(move || {
                 let outcome =
-                  ops_for_arm.preflight_arm(&port, scope, watch, &path, &name, expected);
+                  ops_for_arm.preflight_arm(&port, scope, watch, &path, &name, expected, frame);
                 let _ = tx.try_send(OpResult::RebindArmed { scope, outcome });
               });
               continue;
@@ -8008,13 +8268,13 @@ pub(crate) async fn run<R, F>(
           // and the seed's own read is fresher than the spawn-time frames.
           let still_widen = core.root_path(scope).is_some_and(|old| {
             widen_predicate(&old, &meta.root)
-              && !meta.mounts.iter().any(|m| old.starts_with(m))
+              && !meta.mounts.iter().any(|row| old.starts_with(&row.location))
           }) && core.root_frame(scope).is_some_and(|(dev, mnt)| {
               meta.root_dev == dev
                 && match (meta.root_mnt_id, mnt) {
                   (Some(new_mnt), Some(old_mnt)) => new_mnt == old_mnt,
                   // Either frame unknown: the device belt governs alone — the
-                  // codebase's existing pre-5.8 degrade, inherited unchanged.
+                  // codebase's existing no-oracle degrade, inherited unchanged.
                   _ => true,
                 }
             });
@@ -8070,6 +8330,11 @@ pub(crate) async fn run<R, F>(
               dev: meta.identity.dev(),
               ino,
             });
+          // The WIDENED root's own frame, never the scope's. The commit has not
+          // landed, so the core still holds the OLD root's frame — and the old
+          // root is a DESCENDANT of this arm's target, so judging the wider root
+          // against it would refuse every widen that crosses a mount upward.
+          let frame = meta.frame();
           streams.replace_states.get_mut(&scope).expect("just checked").mode = ReplaceMode::SameFd {
             phase: SameFdPhase::Arming { reserved, meta },
           };
@@ -8077,7 +8342,7 @@ pub(crate) async fn run<R, F>(
           let tx = op_tx.clone();
           R::spawn_blocking_detach(move || {
             let mut outcome =
-              ops_for_arm.preflight_arm(&port, scope, reserved, &path, &name, expected);
+              ops_for_arm.preflight_arm(&port, scope, reserved, &path, &name, expected, frame);
             // The stale-Installed bracket: the arm's own open-then-verify ran
             // at ARM time, and the commit must never accept that outcome
             // alone — re-stat the path NOW, so an object swapped in right
@@ -8094,7 +8359,7 @@ pub(crate) async fn run<R, F>(
             {
               let matches = matches!(
                 ops_for_arm.probe(&path),
-                ProbeOutcome::Present { kind, file_id: Some(id), dev }
+                ProbeOutcome::Present { kind, file_id: Some(id), dev, .. }
                   if kind.is_dir() && dev == want.dev && id == want.ino
               );
               if !matches {
@@ -10720,6 +10985,31 @@ fn apply_source_message(
       payload.acknowledge_resume();
       core.on_batch(scope, payload, now());
     }
+    // SEAM 2: boundaries a live WALK declined, on the same ordered lane as the
+    // events they fence. No resume position to publish — a boundary observation is
+    // not a batch — so it goes straight to the core. Its permit is the transport's
+    // independent boundary slot, and it is released HERE, by the drop at the end
+    // of this arm: the core copies what it needs into the coverage set
+    // synchronously and parks nothing, so residency really does end at ingest.
+    SourceMessage::Boundaries(boundaries, permit) => {
+      core.on_walk_boundaries(scope, boundaries, now());
+      drop(permit);
+    }
+    // The reply half of an admission round trip, on the same ordered lane as the
+    // map mutation that produced it — which is the whole reason
+    // admission-before-cover holds: the core releases the parked cover from here,
+    // and everything the walk admitted is already behind this message.
+    SourceMessage::Admitted(report) => core.on_admitted(scope, report, now()),
+    // ONE whole-root recovery, indivisible: the reseed's complete generation, the
+    // tickets it discharges, and the loss it implies. It rides the same ordered
+    // lane as everything the reseed admitted, so by the time the core acts on it
+    // the map already holds the ground the cover sends the consumer to re-read.
+    // Its permit is released HERE, by this arm's drop, exactly as a boundary
+    // report's is: the core copies what it needs synchronously and parks nothing.
+    SourceMessage::RootRecovered(recovery, permit) => {
+      core.on_root_recovered(scope, recovery, now());
+      drop(permit);
+    }
     // The queue is the source's ONE ordered lane, so everything the
     // signal postdates was already handled above it — no drain, no
     // barrier, nothing to reason about. Dropping the ack BEFORE
@@ -11827,6 +12117,7 @@ fn execute_effects<R, F>(
         name,
         path,
         expected,
+        frame,
       } => {
         // Droppable at close, unlike spawns and teardowns: a result that
         // never lands leaves the Monitor node Arming, and the node dies with
@@ -11844,6 +12135,7 @@ fn execute_effects<R, F>(
             name,
             path,
             expected,
+            frame,
           });
       }
       Effect::RemoveWatch { scope, watch } => {
@@ -11890,6 +12182,59 @@ fn execute_effects<R, F>(
           let refresh = ops.refresh_mounts(&root);
           let _ = tx.try_send(OpResult::MountsRefreshed { scope, refresh });
         });
+      }
+      Effect::AdmitBoundaries { scope, requests } => {
+        // Handed to the scope's LIVE handle and to nothing else, and handed over
+        // WHOLE. Not a blocking-pool job: the walks must run on the thread that
+        // owns the admission map, so this only enqueues the burst there (and wakes
+        // the reader once, which a quiet tree would otherwise leave blocked in
+        // `poll` with the covers parked behind it).
+        //
+        // A scope with no handle — never spawned, or torn down earlier in THIS very
+        // drain — and a reader whose thread has already exited both answer `false`,
+        // and every round trip in the burst resolves inline. Re-entering the core
+        // inside the drain is the established shape here (`Effect::Emit` calls
+        // `on_delivery` the same way): whatever effects the resolutions push are
+        // drained by this same loop.
+        let tickets: Vec<crate::os::AdmitTicket> =
+          requests.iter().map(|request| request.ticket).collect();
+        let delivered = handles
+          .get(&scope)
+          .is_some_and(|handle| handle.request_admits(requests));
+        if !delivered {
+          for ticket in tickets {
+            core.on_admitted(
+              scope,
+              crate::os::AdmitReport {
+                ticket,
+                outcome: crate::os::AdmitOutcome::Unreachable,
+              },
+              now(),
+            );
+          }
+        }
+      }
+      // A bare publication: the core's frame epoch for this scope, which the
+      // source stamps onto the whole-root generation its own post-loss reseed
+      // produces. It opens no round trip, so there is nothing to resolve when the
+      // scope has no handle — a source that is not there produces no generation.
+      Effect::PublishFrame { scope, epoch } => {
+        if let Some(handle) = handles.get(&scope) {
+          handle.publish_frame(epoch);
+        }
+      }
+      // The root-scope form of the above, routed identically: to the scope's live
+      // handle, on the reader's own thread, with the same inline resolution when
+      // there is no handle to take it. A source that has no admission map (every
+      // backend but fanotify) answers `false` here and the recovery degrades to
+      // the bare root cover, which is exactly what such a backend owed anyway.
+      Effect::RecoverRoot { scope, request } => {
+        let delivered = handles
+          .get(&scope)
+          .is_some_and(|handle| handle.request_root_recovery(request));
+        if !delivered {
+          core.on_recovery_unreachable(scope, now());
+        }
       }
       Effect::Emit {
         scope,

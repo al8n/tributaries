@@ -1439,7 +1439,17 @@ async fn sync_barrier_resolves_over_the_custom_binding() {
   let mut rescanned = false;
   while let Some(event) = w.next().now_or_never().flatten() {
     if event.kind().is_rescan() {
+      // A `Rescan` is deliberately NOT classified against the reserved namespace
+      // (`Driver::reserved_endpoints`): it names no object, so it has no endpoint
+      // to reserve, and masking one would hide a coverage loss behind the very
+      // namespace whose events it may have eaten. A LOCATED one can therefore
+      // legitimately name the cookie directory — the lower watcher arms that
+      // directory like any other and covers it when a crawl finds it already
+      // holding the cookie — and asserting the artifact rule over it reads a
+      // coverage statement as a delivery. The artifact rule below is about
+      // DELIVERED CHANGES, which is the only thing the masking seam governs.
       rescanned = true;
+      continue;
     }
     if let Some(Comp::Seg(leaf)) = event.key().last() {
       assert!(

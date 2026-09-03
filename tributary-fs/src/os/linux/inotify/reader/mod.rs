@@ -58,6 +58,7 @@ use super::{
   super::{
     super::{SourceError, transport},
     AnchorRequest, ArmReply, BatchReply, ExpectedObject, WatchOutcome, attribute_events,
+    root_mount_id,
     wake::WakeState,
   },
   decode::{self, WATCH_MASK},
@@ -1064,19 +1065,70 @@ fn arm(instance: &mut Instance, request: AnchorRequest) -> ArmReply {
     }
   };
 
+  // ONE `fstat` of the pinned `O_PATH` fd, read by both landing guards below —
+  // they ask different questions of the same object and must never answer them
+  // off two different reads. `None` is a `fstat` that FAILED (an interruption is
+  // retried, so it is never the reason); each guard says below what it makes of
+  // that, and both refuse — one for want of proof, the other for want of a
+  // reading.
+  let landed = fstat_anchor(&anchor).ok();
+
   // Object-correctness: an absolute-path open (the common case, once the cold
   // enumerate consumed the parent anchor) can land on a DIFFERENT object if a
-  // rename slipped in after the enumerate. `fstat` the opened `O_PATH` fd and
-  // require the `(dev, ino)` the enumerate read — a mismatch means the name now
-  // points at another object, so the arm is refused as `Gone` and the Monitor's
-  // tested drop+rescan heals. An anchor-chain open is already object-pinned
-  // through `/proc/self/fd`, but confirming it too costs one `fstat` and closes
-  // the window uniformly.
-  if !object_matches(&anchor, request.expected) {
+  // rename slipped in after the enumerate. Require the `(dev, ino)` the
+  // enumerate read — a mismatch means the name now points at another object, so
+  // the arm is refused as `Gone` and the Monitor's tested drop+rescan heals. An
+  // anchor-chain open is already object-pinned through `/proc/self/fd`, but
+  // confirming it too costs nothing more and closes the window uniformly.
+  if !object_matches(landed.as_ref(), request.expected) {
     return ArmReply {
       outcome: WatchOutcome::Failed(WatchError::Gone),
       anchor: None,
     };
+  }
+
+  // PREVENTION: the scope's mount boundary, enforced on the arm the enumerate
+  // fence never judged. `crosses_mount_boundary` declines a boundary-crossing
+  // dir ENTRY, but a directory the Monitor learned from a `Created` record is
+  // armed with no enumerate in between and with no `expected` at all (inotify's
+  // `Created` compiles to a bare record with no identity), so the guard above
+  // passes it straight through and the watch installs on the far side of a
+  // mount. Refused BEFORE the add: nothing installs, the anchor is dropped, and
+  // there is no verify-then-install window for a mount to slip into.
+  //
+  // The refusal is not itself a RECORDER. A failed arm reaches the Monitor's
+  // `Err` arm, which emits a located `Rescan`, records a level-persistent slot
+  // deficit and drops the node; it queues no enumerate and calls no re-arm. For
+  // a MOUNT-BACKED crossing the recorder is the mount refresh's ARRIVAL side,
+  // whose cover re-arms a crawl that re-runs the enumerate decline, and the
+  // reconcile then heals the deficit. For a DEVICE-ONLY crossing (a btrfs
+  // subvolume — no mountinfo row, so no arrival ever) there is no recorder and
+  // no crawl: the slot stays a deficit, re-signalled ahead of every sync cookie
+  // — signalled, not silent — and that is the accepted terminal for that case.
+  //
+  // No livelock: this check and the enumerate fence resolve the same path to the
+  // same object, so a refuse → rescan → re-arm → refuse cycle would need a fresh
+  // mount transition per iteration.
+  //
+  // A frame that could not be READ refuses too, and separately — see
+  // [`FrameCheck`]. A fence that fails open is not a fence: a same-device bind
+  // reached by an arm with no `expected` has only the mount id to distinguish it,
+  // so a failed `statx` there would install the watch ACROSS the scope frame,
+  // which is the exact state this check exists to prevent.
+  match crosses_scope_frame(&anchor, landed.as_ref(), request.frame) {
+    FrameCheck::Inside => {}
+    FrameCheck::Crossed => {
+      return ArmReply {
+        outcome: WatchOutcome::Failed(WatchError::Gone),
+        anchor: None,
+      };
+    }
+    FrameCheck::Unreadable => {
+      return ArmReply {
+        outcome: WatchOutcome::Failed(WatchError::Io),
+        anchor: None,
+      };
+    }
   }
 
   let proc_path = format!("/proc/self/fd/{}", anchor.as_raw_fd());
@@ -1209,17 +1261,141 @@ fn erase_dead_on_invalid(fd: &OwnedFd, table: &mut WdTable, wd: i32) {
 
 /// Whether the opened anchor is the object the enumerate saw. An `expected` of
 /// `None` is unverified (identity was unavailable at enumerate time) and passes.
-/// An `fstat` failure is treated as a mismatch: the object the arm would install
-/// on cannot be confirmed, so refusing (→ `Gone` → rescan) is the honest choice.
-/// `fstat` on an `O_PATH` fd reads the pinned object's `(dev, ino)` — exactly the
-/// object the watch would attach to.
-fn object_matches(anchor: &OwnedFd, expected: Option<ExpectedObject>) -> bool {
+///
+/// `landed` is the caller's one `fstat` of the pinned `O_PATH` fd, which reads
+/// the `(dev, ino)` of exactly the object the watch would attach to. A `None`
+/// there is a FAILED `fstat`, and it is treated as a mismatch: the object the
+/// arm would install on cannot be confirmed, so refusing (→ `Gone` → rescan) is
+/// the honest choice. [`crosses_scope_frame`] refuses on the same `None` — a
+/// guard with no reading is not a guard — and differs only in reaching that
+/// answer for every arm rather than only one holding an `expected`.
+fn object_matches(landed: Option<&rustix::fs::Stat>, expected: Option<ExpectedObject>) -> bool {
   let Some(expected) = expected else {
     return true;
   };
-  match rustix::fs::fstat(anchor) {
-    Ok(stat) => stat.st_dev == expected.dev && stat.st_ino == expected.ino.get(),
-    Err(_) => false,
+  match landed {
+    Some(stat) => stat.st_dev == expected.dev && stat.st_ino == expected.ino.get(),
+    None => false,
+  }
+}
+
+/// What [`crosses_scope_frame`] found — three answers, because "the frame could
+/// not be read" is not "the frame was not crossed".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameCheck {
+  /// The landing object is on the scope's own frame. The arm may install.
+  Inside,
+  /// The landing object is across the frame — a foreign device, or a differing
+  /// mount id. The arm is refused as `Gone`.
+  Crossed,
+  /// A read the verdict DEPENDS ON failed, so there is no verdict. The arm is
+  /// refused as `Io`.
+  Unreadable,
+}
+
+/// Whether the opened anchor sits ACROSS the scope's descent frame — the arm's
+/// half of the mount boundary, asked of the object the watch would attach to.
+///
+/// Read from the ANCHOR rather than from the path: the `O_PATH` fd is pinned to
+/// the object the add will install on (the add goes through
+/// `/proc/self/fd/{anchor}`), so nothing can be swapped in between this answer
+/// and the install.
+///
+/// The device half is the caller's single `fstat` — the identical read
+/// [`object_matches`] compares `expected.dev` against, so the two guards cannot
+/// disagree about what a device is. The mount half is [`root_mount_id`], the
+/// masked `statx(STATX_MNT_ID)` read that is only paid for when the frame
+/// carries a mount id to compare it with.
+///
+/// # An UNKNOWN passes; a FAILURE refuses. They are not the same thing
+///
+/// This is the distinction the check originally collapsed, and collapsing it
+/// made the fence fail OPEN:
+///
+/// - **`Ok(None)`** — the kernel answers no mount ids (below 5.8, or the
+///   `STATX_MNT_ID` mask bit unset), and a `None` on the frame side means the
+///   same about the scope's own root. Nothing is wrong; the id simply does not
+///   exist on this host, so the mount half goes inert and the DEVICE belt alone
+///   governs, exactly as `crosses_mount_boundary`'s own `None` legs do. This must
+///   keep passing or every arm on a pre-5.8 kernel — and every arm in the
+///   off-Linux fake-executor harness, whose frame answers no ids at all — is
+///   refused.
+/// - **`Err(..)`** — this read FAILED. It says nothing about the object, and a
+///   fence that treats "I could not look" as "nothing there" is not a fence. A
+///   same-device bind reached by an arm with NO `expected` (inotify's `Created`
+///   carries no identity, so [`object_matches`] passes it straight through) is
+///   distinguished by the mount id and by nothing else, so a failed `statx`
+///   there installed the watch across the frame — the precise state this check
+///   exists to prevent. An interruption is not a failure and is retried inside
+///   [`root_mount_id`]; what survives that is a real error and refuses.
+///
+/// A failed `fstat` (`landed: None`) refuses for the same reason, and the fence
+/// has no device half without it. That aligns this guard with
+/// [`object_matches`], which already fails closed on the same `None` — but only
+/// when it holds an `expected` to compare against, which is exactly the case
+/// this one is not for.
+///
+/// The cost of refusing is bounded and signalled: a refused arm emits a located
+/// `Rescan`, books a level-persistent slot deficit re-signalled ahead of every
+/// sync cookie, and is retried by the Monitor's own heal — never a silent
+/// blind spot, whereas a watch installed across the frame is silent by
+/// construction.
+fn crosses_scope_frame(
+  anchor: &OwnedFd,
+  landed: Option<&rustix::fs::Stat>,
+  frame: crate::os::ScopeFrame,
+) -> FrameCheck {
+  frame_check(landed, frame, || root_mount_id(anchor.as_fd()))
+}
+
+/// [`crosses_scope_frame`]'s decision, PURE over the mount-id read — the same
+/// closure discipline the fanotify reader's walk drivers use, and for the same
+/// reason: the `Err` leg is the whole point of this guard and no fd on a healthy
+/// host can be made to produce one, so a cell could not otherwise reach it at
+/// all.
+///
+/// `read_mnt_id` is called AT MOST ONCE, and only when the frame carries an id to
+/// compare against — which is itself part of the contract: a scope with no frame
+/// id pays no syscall and therefore cannot be refused by one failing.
+fn frame_check(
+  landed: Option<&rustix::fs::Stat>,
+  frame: crate::os::ScopeFrame,
+  read_mnt_id: impl FnOnce() -> Result<Option<u64>, Errno>,
+) -> FrameCheck {
+  let Some(landed) = landed else {
+    return FrameCheck::Unreadable;
+  };
+  let mnt_id = match frame.root_mnt_id {
+    // No frame id to compare against: the mount half is inert whatever the
+    // anchor would answer, so the read is not paid for and cannot fail.
+    None => None,
+    // `Ok(None)` is the host answering no mount id — the legacy degrade, which
+    // passes to the device belt. `Err` is a read that failed, which is not an
+    // answer at all.
+    Some(_) => match read_mnt_id() {
+      Ok(mnt_id) => mnt_id,
+      Err(_) => return FrameCheck::Unreadable,
+    },
+  };
+  if frame.crossed_by(Some(landed.st_dev), mnt_id) {
+    FrameCheck::Crossed
+  } else {
+    FrameCheck::Inside
+  }
+}
+
+/// The arm's one `fstat` of the pinned anchor, retrying an INTERRUPTED call.
+///
+/// Both landing guards refuse when this fails, so an `EINTR` that reached them
+/// would drop a watch and book a slot deficit over a signal — the same
+/// interruption-is-not-a-failure discipline [`root_mount_id`] and the driver's
+/// `stat_sample` follow.
+fn fstat_anchor(anchor: &OwnedFd) -> Result<rustix::fs::Stat, Errno> {
+  loop {
+    match rustix::fs::fstat(anchor) {
+      Err(Errno::INTR) => continue,
+      other => return other,
+    }
   }
 }
 

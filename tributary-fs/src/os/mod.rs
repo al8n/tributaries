@@ -2,8 +2,8 @@
 //!
 //! Every platform module exposes the same surface: [`Source::spawn`] starts the
 //! native watch and hands back a [`SourceHandle`] plus the ONE ordered queue
-//! it reports on. `Batch`, `Overflow`, and `Fatal` all ride that single
-//! unbounded FIFO, so per-source ordering between data and the loss/death
+//! it reports on. `Batch`, `Boundaries`, `Overflow`, and `Fatal` all ride that
+//! single unbounded FIFO, so per-source ordering between data and the loss/death
 //! signals covering it holds by construction, and a signal send can never
 //! fail for capacity — a loss can never be recorded without a message left to
 //! observe it, and no signal can overtake the batches it postdates. Memory is
@@ -33,8 +33,11 @@ mod macos;
 #[cfg(all(target_os = "macos", not(miri)))]
 pub(crate) use macos::{Source, SourceHandle, mounts_under};
 
+// Linux's own table reader stays inside `linux::` (its spawn barriers seed from
+// it); the seam here is [`mount_sample`], which is what the refresh reads and the
+// only one of the two that proves the table and the root's stat belong together.
 #[cfg(all(target_os = "linux", not(miri)))]
-pub(crate) use linux::{Source, SourceHandle, mounts_under};
+pub(crate) use linux::{Source, SourceHandle};
 
 #[cfg(all(target_os = "windows", not(miri)))]
 pub(crate) use windows::{Source, SourceHandle, mounts_under};
@@ -49,6 +52,125 @@ mod unsupported;
   miri
 ))]
 pub(crate) use unsupported::{Source, SourceHandle, mounts_under};
+
+/// WHICH INCARNATION of a mount the root was living on when a refresh read it —
+/// a token compared for equality and never for order, and the one fact a
+/// recycled mount id cannot carry.
+///
+/// Mount ids are allocated lowest-free and freed on umount, so an A → B → A
+/// sequence between two refreshes puts the root back on the id the previous
+/// refresh recorded. Nothing in an id COMPARISON can see that: the refresh
+/// observes a value, not a transition, and both values are `A`. A scope that
+/// reads the match as proof of continuity then admits a walk that ran against an
+/// incarnation which has since died — its generation retires boundaries the live
+/// root never presented, and its reseeded map describes the dead one.
+///
+/// Both forms answer the same question and neither is ordered against the other,
+/// which is why they are variants rather than a bare `u64`: a host answers one
+/// KIND for its whole life, and comparing across kinds (which cannot happen)
+/// reads as "changed", the conservative direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RootIncarnation {
+  /// `statx(STATX_MNT_ID_UNIQUE)` (Linux 6.8): a 64-bit id the kernel never
+  /// recycles, so equality is proof of the same mount object and inequality is
+  /// proof of a different one. Exact in both directions, and the only form that
+  /// costs an unrelated namespace nothing.
+  Unique(u64),
+  /// A count of the mount-namespace TRANSITIONS this process has observed
+  /// (`ns->event`, read through a held `/proc/self/mountinfo` fd — see
+  /// `linux::NamespaceWatch`), for the 4.11–6.7 hosts that have no unique id.
+  ///
+  /// Equality proves the root's mount is the same object, because it proves
+  /// nothing in the namespace moved at all. Inequality proves only that
+  /// SOMETHING moved — one honest degrade in one direction: a mount elsewhere on
+  /// the host reads as a frame move for every scope, which costs a whole-root
+  /// generation per refresh for a scope holding exempt records on a churning
+  /// pre-6.8 host, exactly the bound a fail-closed scope already pays. The
+  /// alternative is to keep reading a recycled id as evidence.
+  Namespace(u64),
+}
+
+/// The mount-namespace transition counter a refresh reads its
+/// [`RootIncarnation::Namespace`] token from — a real one on Linux, an inert
+/// placeholder everywhere else.
+#[cfg(not(all(target_os = "linux", not(miri))))]
+#[derive(Debug, Default)]
+pub(crate) struct NamespaceWatch;
+
+#[cfg(all(target_os = "linux", not(miri)))]
+pub(crate) use linux::NamespaceWatch;
+
+/// One refresh's coherent reading: the table under `root`, the caller's own
+/// sample of the root, and the evidence about the WINDOW the two were taken in.
+#[cfg_attr(
+  not(any(
+    all(
+      any(target_os = "macos", target_os = "linux", target_os = "windows"),
+      not(miri)
+    ),
+    test
+  )),
+  allow(dead_code)
+)]
+pub(crate) struct MountReading<S> {
+  /// The rows strictly under the root, or `None` for a read that failed (or a
+  /// window that never held still).
+  pub(crate) rows: Option<Vec<MountRow>>,
+  /// Whatever the caller sampled about the root itself, taken INSIDE the window.
+  pub(crate) root: S,
+  /// The mount-namespace generation observed inside the window, or `None` where
+  /// the host answers none.
+  pub(crate) namespace: Option<u64>,
+  /// Whether the mount namespace provably held still across the whole window.
+  ///
+  /// It is what licenses a caller to pair two SEPARATE reads of the root as one
+  /// incarnation token: the legacy mount id and the unique one come from two
+  /// `statx` calls, and a transition between them would pair the old mount's
+  /// legacy id with the new mount's unique id — a mismatched token that reads as
+  /// continuity on the very next refresh.
+  pub(crate) stable: bool,
+}
+
+/// The refresh's mount sample: the table under `root` AND the caller's own sample
+/// of the root, taken so that the two describe ONE moment.
+///
+/// Linux has to prove that: its table is a `seq_file` generated across many
+/// `read(2)` calls with the namespace lock dropped between them, so the rows and
+/// a separately-stat'd root frame can straddle a mount transition, and mount ids
+/// are recycled lowest-free — which makes "this row's id equals the root's" a
+/// coincidence a torn pair can manufacture. Its version holds an fd across both
+/// halves and rejects the pair when the namespace generation moved.
+///
+/// Everywhere else the table is a single call that returns a whole answer
+/// (`getfsstat` on macOS, nothing at all on Windows and the unsupported stub), so
+/// there is no window to straddle, the pair is just the two reads, and the
+/// namespace token those hosts have no notion of is `None`.
+#[cfg(not(all(target_os = "linux", not(miri))))]
+pub(crate) fn mount_sample<S>(
+  root: &std::path::Path,
+  _namespace: &NamespaceWatch,
+  mut sample_root: impl FnMut() -> S,
+) -> MountReading<S> {
+  MountReading {
+    rows: mounts_under(root),
+    root: sample_root(),
+    namespace: None,
+    stable: true,
+  }
+}
+
+#[cfg(all(target_os = "linux", not(miri)))]
+pub(crate) use linux::mount_sample;
+
+/// The root's UNIQUE mount id where the host has one. Only Linux 6.8+ does; every
+/// other host answers `None` and falls back to the namespace token.
+#[cfg(not(all(target_os = "linux", not(miri))))]
+pub(crate) fn root_mnt_unique_id(_root: &std::path::Path) -> Option<u64> {
+  None
+}
+
+#[cfg(all(target_os = "linux", not(miri)))]
+pub(crate) use linux::root_mnt_unique_id;
 
 pub(crate) use fsevent::{FsEventFlags, RawOsEvent};
 
@@ -609,6 +731,537 @@ impl RootIdentity {
   }
 }
 
+/// One row of a live mount table, at a location strictly under a watched root:
+/// WHERE the mount lands plus whatever IDENTITY the host can answer for it.
+///
+/// Linux reads all three identity fields off `/proc/self/mountinfo`, which
+/// carries them on every row it already parses — field 1 is the mount id,
+/// field 2 the parent mount's id, field 3 the `major:minor` of the mounted
+/// filesystem. That is what makes the table an OBSERVER rather than a list of
+/// paths: a mount replaced by a different mount at the SAME location is a
+/// change in `(mnt_id, parent_id, dev)` and in nothing else, so a paths-only
+/// read cannot see it at all.
+///
+/// Several rows can share one LOCATION — a stack, a `mount --move` onto an
+/// occupied mount point, two mounts propagated side by side — and on Linux
+/// every one of them is a row here, each with its own id. Nothing in this type
+/// or in its producer says which of them a path lookup reaches; the core keys
+/// its census by identity, so it does not need to be told.
+///
+/// Every other host answers `None` for all three. macOS' `getfsstat` reports no
+/// mount id, Windows reads no table, and the fakes have no namespace — so they
+/// say so rather than inventing a value, and the consumers degrade honestly
+/// (the core's census key falls back to the rendered location for a row with no
+/// id, and an unknown half never reads as a difference).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MountRow {
+  /// The mount point — where the kernel rendered this mount's path.
+  ///
+  /// A best-effort LABEL, not a key: `show_mountinfo` renders each row's path
+  /// by its own `seq_path_root` call, so a rename can land between two rows of
+  /// one read. The core carries it as a cover-location hint and keys on the
+  /// identity below.
+  pub(crate) location: PathBuf,
+  /// The mount's own id, unique among LIVE mounts. `None` where the host
+  /// answers none, or where the field would not parse.
+  ///
+  /// This is the LEGACY (non-unique) id, allocated lowest-free, so an unmount
+  /// and a mount between two reads hand the new mount the just-freed id almost
+  /// deterministically. `parent_id` narrows that window — the recycled id has
+  /// to have been re-attached under the SAME mount as well — without closing
+  /// it; `STATX_MNT_ID_UNIQUE` (Linux 6.8) is the upgrade where a future reader
+  /// can require a genuinely unique one.
+  pub(crate) mnt_id: Option<u64>,
+  /// The id of the mount this one is attached to. `None` where the host answers
+  /// none, or where the field would not parse.
+  ///
+  /// Held as IDENTITY, never as hierarchy. It is COMPARED — two reads that
+  /// agree on a mount id but not on its parent are looking at two different
+  /// vfsmounts, one of which inherited the other's recycled id — and it is
+  /// never WALKED: nothing resolves it to another row, climbs a chain of them,
+  /// or derives from the graph these links describe which mount a lookup
+  /// reaches.
+  pub(crate) parent_id: Option<u64>,
+  /// The device of the filesystem mounted here, packed the way `dev_t` packs
+  /// `major:minor`. `None` where the host answers none.
+  pub(crate) dev: Option<u64>,
+}
+
+/// One boundary an os-layer WALK declined to descend — SEAM 2 of the mount
+/// design, carried out of the walk instead of discarded at it.
+///
+/// Deliberately NOT a [`MountRow`], though the two carry the same three facts.
+/// A row is a mountinfo line: proof that a vfsmount is (or was) at that
+/// location, and therefore something a CENSUS can key and derive transitions
+/// for. A decline is only "the walk's fence said stop here" — which a btrfs
+/// subvolume trips on the device belt while carrying the walk root's own mount
+/// id, with no row, ever. Keeping the two types apart is what stops a future
+/// reader from feeding a decline into the census and re-opening the cover storm
+/// that "condemn on a transition, never on an absence" exists to prevent (see the
+/// core's `CensusRow` and `LedgerEntry`).
+///
+/// The fields mirror what the fence actually reads at the moment it declines,
+/// and no more:
+///
+/// - `dev` is always known: the walk `fstat`s every child it pins, and the
+///   device belt is decided on that stat.
+/// - `mnt_id` is ALSO read for every decline, both fences alike, from the fd the
+///   walk pinned — so a `None` here means the HOST answers no mount id ANYWHERE
+///   it could be asked (neither the `statx` mask nor the fd's `/proc/self/fdinfo`
+///   line), never that this observer did not ask. That distinction is
+///   load-bearing. An id-less observation is one the core can only record
+///   `Standing::Unknown`, which joins no census and fails the whole scope closed
+///   while it is held, so producing one from an observation that COULD have
+///   answered the id — as the device belt once did, being checked before the
+///   `statx` — buys a whole-root cover per refresh in place of a precise
+///   departure. Since the fdinfo tier (`os::linux`'s `root_mount_id`) that `None`
+///   needs a kernel below BOTH floors, 3.15 fdinfo and 4.11 `statx`, so no
+///   supported host reaches it and the type carries the case only because the
+///   core must not assume it away. A read that FAILS yields an incomplete walk
+///   instead; it never reaches this type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeclinedBoundary {
+  /// The absolute path of the declined child.
+  pub(crate) location: PathBuf,
+  /// The declined child's device, from the `fstat` of the pinned fd.
+  pub(crate) dev: u64,
+  /// The declined child's mount id, read from the pinned fd for EVERY decline;
+  /// `None` only where the host answers no mount ids (see the type doc).
+  pub(crate) mnt_id: Option<u64>,
+}
+
+/// What ONE walk (or one buffer's worth of walks) observed about boundaries —
+/// SEAM 2's payload on the source's ordered queue.
+///
+/// A bare `Vec<DeclinedBoundary>` could only ever ADD, and that was the whole of
+/// the growth problem: the core's DEVICE-ONLY partition — records the provenance
+/// partition exempts from every condemnation mechanism — had exactly one removal
+/// path, a compiled `Removed`/`MovedFrom` in the event stream, and a loss window
+/// that swallowed those left the record standing for the scope's life. Saying
+/// whether a report is COMPLETE turns the same message into a generation the core
+/// can reconcile against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WalkBoundaries {
+  /// The boundaries the walk(s) declined to descend.
+  pub(crate) declined: Vec<DeclinedBoundary>,
+  /// How much of the root [`declined`](Self::declined) speaks for — and, for the
+  /// complete form, the frame it was taken in.
+  pub(crate) reach: WalkReach,
+}
+
+/// How much of the scope root ONE boundary report speaks for.
+///
+/// The two arms are read oppositely, and the difference is the whole reason the
+/// distinction is on the wire: a COMPLETE report is a generation the core
+/// reconciles against — what it did not decline is not there any more — while a
+/// partial one may only ever ADD.
+///
+/// # Why only the complete arm carries a frame
+///
+/// Because only the complete arm RETIRES, and a retirement is the one operation
+/// whose licence depends on which root the walk ran under. "Everything still
+/// standing under the root" is a claim about a particular root mount; taken under
+/// one and applied under another it deletes records for boundaries the walk never
+/// looked at, and the device-only partition it deletes from has no other observer
+/// that could put them back.
+///
+/// The additive arm needs no frame because forgoing it is the DANGEROUS direction
+/// there: a decline dropped is a boundary recorded nowhere, whose later departure
+/// is then derived by nothing, while a decline applied under a moved frame costs
+/// at worst one false condemnation that converges through the admission round
+/// trip's own re-reading. Safe-to-drop and unsafe-to-drop are opposite here, so
+/// the stamp belongs on exactly one of them.
+#[cfg_attr(not(any(all(target_os = "linux", not(miri)), test)), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WalkReach {
+  /// ONE SUBTREE: a moved-in subtree walk, an admission reseed. It proves nothing
+  /// about the rest of the root, so the core only ever adds from it.
+  Partial,
+  /// THE WHOLE ROOT, from a walk that RAN TO COMPLETION — the post-loss map
+  /// reseed (its budget-truncated and failed forms return no seed at all, so they
+  /// never reach here). The core reads it as a generation: a device-only record
+  /// under the root that this walk did not decline is not there any more, and this
+  /// is the only observation on a kernel-recursive profile that can say so — the
+  /// mount table cannot, by the partition's own construction.
+  ///
+  /// # Two stamps, because a mount id is not a generation
+  ///
+  /// This arm once carried the walked root id alone, and that was sufficient only
+  /// against a root that moved and STAYED moved. Linux allocates mount ids
+  /// lowest-free, so a root that goes A → B → A is back on the id the core still
+  /// holds while the walk that produced this generation ran against the FIRST A —
+  /// a mount that has since died. The id comparison passes, the generation retires
+  /// device-only records the current incarnation never showed the walk, and the
+  /// mount table cannot restore that partition, so every later departure under it
+  /// becomes underivable. That is the whole of the loss the id leg cannot see.
+  ///
+  /// So the report carries the core's own [`epoch`](Self::WholeRoot::epoch)
+  /// beside it, exactly as [`RootRecovery`] does. The two legs cover each other:
+  /// the epoch counts WORLDS core-side and is never recycled, so no reading of an
+  /// id can forge it, while the walked id speaks for the SOURCE and catches a root
+  /// that moved before the core ever ran the refresh that would bump an epoch.
+  WholeRoot {
+    /// The ROOT MOUNT ID this walk fenced its descent against, read from the fd it
+    /// reopened — the root the generation actually describes.
+    ///
+    /// The core installs nothing from a generation whose root is not the one it
+    /// holds. This is the leg that speaks for the SOURCE: it is read live, off the
+    /// fd the reseed reopened, and no value the core supplied can make it agree.
+    ///
+    /// `None` PASSES, as every unknown frame leg does — a host that answers no
+    /// mount id ANYWHERE reads `None` for every one, and the epoch beside it
+    /// carries the check there, exactly as it does for
+    /// [`RootRecovery::root_mnt_id`].
+    root_mnt_id: Option<u64>,
+    /// The core's own [frame epoch](crate::os::AdmitRequest::epoch) as the SOURCE
+    /// last heard it, sampled BEFORE the reseed walk began.
+    ///
+    /// Core-owned, monotone and never recycled — which is the whole point: it is a
+    /// count of the worlds the core has adopted, not an identifier the kernel
+    /// re-issues. The core publishes it down the same control mailbox that carries
+    /// admissions and recoveries (`Control::Frame`), the reader keeps the newest
+    /// value it has ever been told, and a walk stamps the value it held when it
+    /// STARTED — so a generation whose walk began before a frame move carries the
+    /// pre-move count and is refused, however the ids happen to compare.
+    ///
+    /// Sampling before rather than after is the safe direction and not an
+    /// accident: a stamp taken after the walk would claim a world the walk never
+    /// saw the whole of. A stale sample only costs one refused generation, which
+    /// the next one replaces.
+    epoch: u64,
+  },
+}
+
+impl WalkReach {
+  /// The stamps a COMPLETE generation was taken under — `(walked root id, the
+  /// core's frame epoch the source last heard)` — or `None` for a partial report,
+  /// which retires nothing and is therefore judged against no frame.
+  pub(crate) const fn whole_root_stamp(self) -> Option<(Option<u64>, u64)> {
+    match self {
+      Self::Partial => None,
+      Self::WholeRoot { root_mnt_id, epoch } => Some((root_mnt_id, epoch)),
+    }
+  }
+}
+
+/// A scope's DESCENT FRAME — the root's device and mount id — carried on every
+/// arm so the executor can refuse one that lands ACROSS it.
+///
+/// The core already fences enumerate descent on exactly these two facts
+/// (`crosses_mount_boundary`), but an arm is a second way into the same ground
+/// and the fence never sees it: a directory the Monitor learns about from a
+/// `Created` record is armed with no enumerate in between, and inotify's
+/// `Created` carries no identity at all, so the arm's own object guard
+/// ([`ExpectedObject`](linux::ExpectedObject), `None` there) passes and the
+/// watch installs on the far side of a mount. Refusing at the arm is what makes
+/// the boundary ONE boundary rather than one the crawl honours and the live
+/// stream walks straight through.
+///
+/// Travelling on the REQUEST rather than being held by the executor is
+/// deliberate. A widen re-roots the scope onto an ancestor whose frame is its
+/// own, and a replace swaps the world outright; an executor-held frame would
+/// have to be invalidated at both, whereas a frame minted beside the arm is the
+/// frame of the world that asked for it. It also reaches the fakes, which is
+/// where the refusal is testable at all.
+///
+/// # `None` PASSES — the same honest degrade the fence itself makes
+///
+/// Either half unknown leaves that half inert, exactly as
+/// `crosses_mount_boundary`'s own `None` legs do: a host that answers no mount id
+/// ANYWHERE reads `None` for every one, and an off-Linux fake answers no frame at
+/// all. A check that read unknown as "different" would refuse every arm on those
+/// hosts.
+///
+/// An UNKNOWN is not a FAILED READ, and only the first one reaches here. A
+/// `statx`/`fstat` that fails answers nothing about the object, so the executor
+/// refuses the arm outright rather than handing this table a `None` that would
+/// pass — see the inotify reader's `FrameCheck`. Everything that arrives as
+/// `None` here is a value the host genuinely cannot supply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct ScopeFrame {
+  /// The scope root's device, or `None` where the host answers none.
+  pub(crate) root_dev: Option<u64>,
+  /// The scope root's mount id, or `None` where the host answers none — off
+  /// Linux, or a kernel below every id oracle.
+  pub(crate) root_mnt_id: Option<u64>,
+}
+
+impl ScopeFrame {
+  /// Whether an object that stat'd to `(dev, mnt_id)` sits ACROSS this frame —
+  /// the SAME truth table `crosses_mount_boundary` fences enumerate descent on,
+  /// so a refused arm and a declined dir entry agree about what a boundary is.
+  ///
+  /// Two independent fences, either one a boundary: the DEVICE belt (a different
+  /// superblock is always a boundary) and the MOUNT frame (a `mount --bind` of a
+  /// same-superblock directory shares the root's device, so only a differing
+  /// mount id marks it). Reading the mount id alone would let a subvolume arm
+  /// install; reading the device alone would let a bind arm install. Both, or
+  /// the two seams disagree about what they are fencing.
+  ///
+  /// Every unknown leg PASSES (see the type doc).
+  pub(crate) fn crossed_by(self, dev: Option<u64>, mnt_id: Option<u64>) -> bool {
+    let device_boundary = matches!(
+      (self.root_dev, dev),
+      (Some(root_dev), Some(landed)) if landed != root_dev
+    );
+    let mount_boundary = matches!(
+      (self.root_mnt_id, mnt_id),
+      (Some(root_mnt), Some(landed)) if landed != root_mnt
+    );
+    device_boundary || mount_boundary
+  }
+}
+
+/// Correlates one ADMISSION RESEED round trip — the core's request that a
+/// kernel-recursive source admit the ground a departed mount revealed, and the
+/// [`AdmitReport`] the source answers with.
+///
+/// Minted by the core, echoed back untouched. It is what lets the core hold the
+/// departure's cover PARKED across the round trip and still know, on a reply,
+/// which parked cover the answer belongs to — an ordinary path comparison could
+/// not, since a second mount may already have arrived and departed at the same
+/// location by then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct AdmitTicket(u64);
+
+impl AdmitTicket {
+  /// The ticket for round trip `seq`. Only the core mints these, off its own
+  /// monotone counter.
+  pub(crate) const fn new(seq: u64) -> Self {
+    Self(seq)
+  }
+}
+
+/// One admission reseed: admit the ground the mount that departed at `location`
+/// REVEALED, before the cover for it is emitted.
+///
+/// # Why the request exists at all
+///
+/// fanotify admits by directory-handle MEMBERSHIP, and the seed walk declines to
+/// descend a mount (`crate::os::linux::fanotify::map`) — so a mount that departs
+/// reveals a subtree whose handles were never seeded, and the reader drops every
+/// later event on it as provably-outside-root. A located `Rescan` alone would
+/// have the consumer re-read ground the source is still blind to, and there is no
+/// crawl to fix it: `Monitor::start_rearm` refuses outright on a non-descending
+/// scope. So the ground must be walked INTO the map, and the cover must wait for
+/// that walk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AdmitRequest {
+  /// The round trip this request opens.
+  pub(crate) ticket: AdmitTicket,
+  /// The departed boundary's location: the walk's root, and the parked cover's
+  /// target.
+  pub(crate) location: PathBuf,
+  /// The scope's descent frame AT PARK TIME. The walk re-opens `location`, reads
+  /// the frame of the object it actually pinned, and REFUSES the reseed when that
+  /// sits across the root's frame ([`ScopeFrame::crossed_by`]) — a location still
+  /// covered, or re-covered by a remount between the refresh's read and the walk,
+  /// would otherwise be walked against the BIND's frame and seed an alias subtree
+  /// into the admission map, the exact breach the walk's own mount fence exists to
+  /// prevent.
+  ///
+  /// **This value is NOT what the fence is taken against.** The walk re-reads the
+  /// ROOT's frame from an fd it holds open beside the location's, because a mount
+  /// id is unique among LIVE mounts and means nothing against a reading from
+  /// another moment: ids are allocated lowest-free, so a root that re-mounted and
+  /// a bind that took the id it gave up would compare EQUAL across the park/walk
+  /// interval and the descent would cross the mount. What this value does is
+  /// detect exactly that — a live root frame that differs from it means the core
+  /// issued the request for a world it has since left, and the request is refused
+  /// rather than executed against a frame the core no longer holds.
+  pub(crate) frame: ScopeFrame,
+  /// The scope's frame EPOCH at park time — the counter the core bumps wherever it
+  /// installs a descent frame, so "the frame moved" is a statement no mount-id
+  /// comparison across time can fake.
+  ///
+  /// The executor never reads it. It exists because this request may be COLLAPSED
+  /// into a whole-root recovery rather than walked (the mailbox's backlog cap, and
+  /// the reader's own blind/superseded rung), and the reply that discharges it must
+  /// be stamped with the epoch of the newest obligation it folds — which is this
+  /// one whenever this request's ticket becomes the cutoff. See
+  /// [`RootRecovery::epoch`].
+  pub(crate) epoch: u64,
+}
+
+/// One WHOLE-ROOT recovery request: the cutoff it will discharge, and the scope
+/// frame epoch it was issued at.
+///
+/// The two travel together because the reply must carry both back — the ticket so
+/// the core knows which parked round trips are discharged, the epoch so it can
+/// tell whether the generation it is about to install was walked in the world the
+/// core still holds ([`RootRecovery::epoch`]).
+///
+/// Folding two of these keeps the one with the HIGHER ticket, epoch and all: a
+/// recovery discharges a contiguous prefix of the scope's tickets, so the maximum
+/// is the whole obligation, and the newest request's epoch is the tightest
+/// statement available about the world the walk it authorizes will run in.
+#[cfg_attr(not(any(all(target_os = "linux", not(miri)), test)), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RecoveryRequest {
+  /// Every parked admission ticket at or below this one is discharged by the
+  /// recovery this opens.
+  pub(crate) ticket: AdmitTicket,
+  /// The issuing scope's [frame epoch](AdmitRequest::epoch) when this was sent.
+  pub(crate) epoch: u64,
+}
+
+/// What one [`AdmitRequest`] resolved to.
+///
+/// Every variant RETIRES the parked cover — the round trip has exactly one
+/// answer and the core must never be left holding a cover no reply will
+/// release. They differ in what the core still owes.
+///
+/// # There is no "the loss barrier already covered it" variant
+///
+/// There was one, and it was half of a silent-blindness hole. The reader's
+/// ladder answered `Covered` once it had reseeded the whole map and raised an
+/// `Overflow`, and the core then RETIRED the parked record and emitted nothing —
+/// three separate queue messages (the whole-root generation, the loss, the
+/// reply) any one of which could be dropped independently. Losing the generation
+/// left the still-live boundaries the reseed re-declined unrecorded while the
+/// reply had already discarded the records the verdict took, so no later
+/// departure there was derivable at all.
+///
+/// The whole-root recovery is now ONE message
+/// ([`RootRecovery`]) carrying all three facts, and it is
+/// non-droppable by construction: a report that cannot claim its permit kills
+/// the source instead. So the ladder answers no ticket individually — the
+/// recovery's own cutoff retires every ticket at or below it.
+//
+// Only the fanotify reader mints the two walk verdicts (it is the one backend
+// with an admission map); `Unreachable` is the driver's, on every platform. The
+// core matches all three everywhere, so cfg-gating the variants would fracture
+// that one body.
+#[cfg_attr(not(any(all(target_os = "linux", not(miri)), test)), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdmitOutcome {
+  /// The revealed ground is in the admission map (or there was nothing to admit
+  /// — the location vanished after the unmount, or the caller excludes it). The
+  /// core emits the parked cover NOW: admission completed first, so a mutation
+  /// landing between the consumer's covering re-read and the next event admits
+  /// rather than dropping on an unknown handle.
+  Admitted,
+  /// The location is STILL covered: either the refresh raced a mount the walk
+  /// then found live, or a remount re-covered it between the two, or what the
+  /// departed mount REVEALED is itself a boundary. No walk ran and nothing was
+  /// admitted. The core lapses to the REPLACED handling — cover, and re-record the
+  /// boundary in place — because a boundary that is still there must stay recorded
+  /// or its eventual departure is underivable.
+  ///
+  /// # It carries WHAT the walk found, and the whole convergence rests on that
+  ///
+  /// The refusal fires on [`ScopeFrame::crossed_by`], which is two independent
+  /// fences: a different device OR a different mount id. So "still covered" does
+  /// not mean "the same thing is still there" — a btrfs subvolume answers it
+  /// exactly as a live mount does, on the device leg alone, while carrying the
+  /// ROOT's own mount id and having no mountinfo row ever.
+  ///
+  /// That is the shape a real mount OVER a subvolume leaves behind when it
+  /// departs, and re-recording the departed mount's own row-confirmed record for
+  /// it never converges: every later authoritative refresh finds that row absent,
+  /// condemns it again, parks another admission, and gets the same answer — one
+  /// cover and one round trip per tick, forever. The identity read off the fd the
+  /// walk actually pinned is what lets the core re-record the boundary that is
+  /// THERE instead of the one that left.
+  StillCovered {
+    /// The device of the object standing at the location, from the walk's own
+    /// `fstat` of the fd it opened — `None` only where no walk could read one.
+    dev: Option<u64>,
+    /// That object's mount id, read from the same fd (`statx(STATX_MNT_ID)`, or
+    /// the fd's `/proc/self/fdinfo` line below 5.8), or `None` where the host
+    /// answers none.
+    mnt_id: Option<u64>,
+  },
+  /// The request could not be handed to a source at all — no live stream for the
+  /// scope, or a reader thread that has already exited. Nothing was admitted and
+  /// nothing will be. The core emits the parked cover on the refresh's verdict
+  /// alone, exactly as a backend with no admission map does.
+  Unreachable,
+}
+
+/// ONE whole-root recovery, whole: the generation a complete reseed walk
+/// produced, the loss it implies, and the ticket cutoff it discharges — all
+/// three in a single message that cannot be split.
+///
+/// # Why the three facts may not travel separately
+///
+/// They were three messages, and each was independently droppable. The
+/// sequence that made that fatal: a mass unmount collapses into a whole-map
+/// reseed; the reseed's `Boundaries` report cannot claim a permit and is dropped
+/// for an `Overflow`; the replies still answer every parked ticket, so the core
+/// discards every record its departure verdict took. The boundaries the reseed
+/// re-declined — the mounts that were STILL THERE — are now recorded nowhere,
+/// so their later departure is derived by nothing, their revealed ground is
+/// never admitted, and every event under it is rejected as outside the map with
+/// no loss signal at all. A positional cover cannot substitute for evidence a
+/// LATER departure needs.
+///
+/// So the recovery is atomic. Either the whole message lands — declines
+/// recorded, tickets retired, root covered, in that order, on the source's one
+/// ordered queue — or the source dies with a terminal `Fatal`. A dead source is
+/// loud; a blind one is not.
+///
+/// It is also what bounds the reply traffic. The previous shape emitted one
+/// reply per collapsed ticket and the core retired each by searching its parked
+/// vector, which is quadratic in the size of the very burst the collapse exists
+/// to absorb. A cutoff retires the whole run in one linear pass.
+#[cfg_attr(not(any(all(target_os = "linux", not(miri)), test)), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RootRecovery {
+  /// Every boundary the completed whole-root walk declined — the same COMPLETE
+  /// generation a [`WalkBoundaries`] with [`WalkReach::WholeRoot`] carries, and read
+  /// the same way: what it did not decline is not a boundary any more, and what
+  /// it did decline is re-recorded even if a departure verdict had just taken it.
+  pub(crate) declined: Vec<DeclinedBoundary>,
+  /// Every parked admission ticket AT OR BELOW this one is discharged by this
+  /// recovery. Tickets are minted from one monotone counter and delivered in
+  /// order, so a cutoff names a contiguous prefix of the scope's outstanding
+  /// round trips — and a ticket the core parked after the recovery was requested
+  /// sits above it and is answered on its own terms.
+  pub(crate) cutoff: AdmitTicket,
+  /// The [frame epoch](AdmitRequest::epoch) of the NEWEST request this recovery
+  /// folded — the one whose ticket is [`cutoff`](Self::cutoff), echoed back
+  /// untouched.
+  ///
+  /// The core applies nothing from a recovery whose epoch is not its current one.
+  /// Every request folded here was posted BEFORE the walk began (a ticket minted
+  /// during it lands in the follow-up instead), so an epoch that still matches
+  /// means no frame moved between the newest request and now — and therefore none
+  /// between the request and the walk, nor between the walk and this ingest.
+  ///
+  /// It is the leg [`root_mnt_id`](Self::root_mnt_id) cannot cover: mount ids are
+  /// allocated lowest-free, so a root that re-mounted twice can be back on the id
+  /// the core still holds while the walk ran against a mount that has since died.
+  /// The epoch counts WORLDS, not ids, and counts them core-side, so no reading of
+  /// an id from another moment can make it agree.
+  pub(crate) epoch: u64,
+  /// The ROOT MOUNT ID the reseed walk actually fenced its descent against, read
+  /// from the fd it reopened — not a value the core supplied.
+  ///
+  /// This is the other half of the applicability check, and the half that speaks
+  /// for the SOURCE: a walk is on the core's frame only if the root it walked is
+  /// the root the core holds. A core that has not yet run the refresh which would
+  /// adopt a re-mounted root is one whose coverage set is relative to a frame this
+  /// generation is not.
+  ///
+  /// `None` PASSES, exactly as every unknown leg of [`ScopeFrame::crossed_by`]
+  /// does: a host that answers no mount id ANYWHERE reads `None` for every one,
+  /// and a check that read unknown as "different" would reject every recovery such
+  /// a host could ever produce — leaving the epoch to carry the check alone, which
+  /// is what it is for.
+  pub(crate) root_mnt_id: Option<u64>,
+}
+
+/// One [`AdmitRequest`]'s answer, on its way back to the core over the source's
+/// single ordered queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AdmitReport {
+  /// The round trip being answered.
+  pub(crate) ticket: AdmitTicket,
+  /// What it resolved to.
+  pub(crate) outcome: AdmitOutcome,
+}
+
 /// What a source's spawn learned about its root — finalized strictly BEFORE
 /// the stream can enqueue its first event, so nothing here can postdate a
 /// message the source delivers, and no fallible metadata path exists after
@@ -626,17 +1279,40 @@ pub(crate) struct RootMeta {
   pub(crate) root: PathBuf,
   /// The device the root lives on.
   pub(crate) root_dev: u64,
-  /// The root's MOUNT id (from `statx(STATX_MNT_ID)` on the pinned root), or
-  /// `None` when the source could not read one (below Linux 5.8 where the field
-  /// is absent, or a non-Linux backend — FSEvents has no mount id). The core
+  /// The root's MOUNT id, read from the pinned root (`statx(STATX_MNT_ID)`, or
+  /// that fd's `/proc/self/fdinfo` line below 5.8), or `None` when the source
+  /// could not read one (a non-Linux backend — FSEvents has no mount id — or a
+  /// kernel below every id oracle). The core
   /// fences descent across a differing mount id: a `mount --bind` of a
   /// same-device directory shares [`root_dev`](Self::root_dev), so the device
   /// alone cannot mark it a boundary. `None` degrades to the device check.
   pub(crate) root_mnt_id: Option<u64>,
-  /// The trust-reducing mount seed: mount points observed strictly under the
+  /// The trust-reducing mount seed: the table rows observed strictly under the
   /// root before the stream started (empty when the table could not be read —
   /// either way, event-side trust stays closed until the post-live refresh).
-  pub(crate) mounts: Vec<PathBuf>,
+  ///
+  /// The SAME read a refresh runs, so the core's coverage set diffs the two
+  /// cleanly and a seeded row carries the identity a later refresh compares
+  /// against.
+  pub(crate) mounts: Vec<MountRow>,
+  /// SEAM 2, spawn half: the boundaries this source's own SEED WALK declined to
+  /// descend. Empty on every backend whose spawn walks nothing (the descending
+  /// primitives seed no map, so they decline nothing at spawn — their boundaries
+  /// are observed by the core's enumerate fence instead).
+  ///
+  /// It rides the meta rather than the queue on purpose. `RootMeta` is the
+  /// PRE-LIVE channel — everything on it was learned before the stream could
+  /// enqueue its first event — and a seed walk's declines are exactly that kind
+  /// of fact. Surfacing them here also means the core records them in the same
+  /// step that seeds the coverage baseline from [`mounts`](Self::mounts), so a
+  /// scope is never live with a half-built set, and the core never has to
+  /// re-derive or guess what the walk declined.
+  ///
+  /// The walks that run LATER — the post-loss reseed, the moved-in subtree walk
+  /// and the admission reseed — cannot use this channel (they run on the reader
+  /// thread, long past spawn), so they surface their declines through the
+  /// source's one ordered queue instead (`SourceMessage::Boundaries`).
+  pub(crate) declined: Vec<DeclinedBoundary>,
   /// The root object's identity — what root disjointness is decided on
   /// (spelling-aliased paths share it; distinct objects never do).
   pub(crate) identity: RootIdentity,
@@ -647,6 +1323,19 @@ pub(crate) struct RootMeta {
   /// The primitive backing this source — the core confirms its per-scope
   /// lowering profile against it.
   pub(crate) backend: BackendKind,
+}
+
+impl RootMeta {
+  /// This world's descent frame, for an arm issued BEFORE the meta is committed
+  /// into a scope — the widen pre-arm, whose target is the meta's own (wider)
+  /// root and whose frame is therefore the meta's, never the scope's still-old
+  /// one. Committed scopes read the frame off their state instead.
+  pub(crate) const fn frame(&self) -> ScopeFrame {
+    ScopeFrame {
+      root_dev: Some(self.root_dev),
+      root_mnt_id: self.root_mnt_id,
+    }
+  }
 }
 
 /// Everything a platform source needs to start watching.

@@ -400,6 +400,7 @@ impl Source {
       // the reparse refusal at descent, and event-side trust stays closed
       // until the driver's post-live refresh regardless.
       mounts: Vec::new(),
+      declined: Vec::new(),
       identity: super::super::RootIdentity::new(identity.volume_serial, identity.file_id),
       ancestors,
       backend: super::super::BackendKind::Rdcw,

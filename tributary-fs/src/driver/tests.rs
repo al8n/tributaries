@@ -32,10 +32,27 @@ fn config() -> DriverConfig {
     exclusions: Vec::new(),
     profile: BackendKind::FsEvents,
     backend: Backend::Auto,
-    // Inert for the FSEvents/inotify driver suites (only fanotify arms the
-    // tick, and the fake spawns never resolve fanotify); a fanotify-specific
-    // driver test overrides it.
-    root_liveness_interval: Duration::from_secs(30),
+    // DISABLED here (`ZERO`), not merely dormant. Since #74 the tick arms for
+    // BOTH Linux profiles (`DriverCore::liveness_ticked`), so every descending
+    // rig below would inherit a LIVE cadence from this shared config — and a
+    // production-sized interval buys the shared suite nothing, because no cell
+    // here runs for 30 s, so the tick never fires natively at all.
+    //
+    // Under an INTERPRETER it does fire, and there it starves the loop. A driver
+    // iteration costs on the order of a second under Miri (measured: 182
+    // iterations in 272 s), while N ticking scopes demand N mount refreshes per
+    // interval — so past a couple of dozen live scopes the demand exceeds the
+    // service rate, each refresh completion lands on `op_rx`, and `op_rx` is the
+    // FIRST `select_biased!` arm: once it stops emptying, the command mailbox
+    // behind it is never polled again and the run makes no further progress.
+    // That is what took `retention`'s
+    // `held_root_arms_cannot_burst_past_the_teardown_backlog_bound` (64 live
+    // scopes) from a pass to a permanent stall at 48 of them, on every Miri
+    // shard.
+    //
+    // A cell that is ABOUT the cadence sets its own interval — see
+    // `descending::tick`.
+    root_liveness_interval: Duration::ZERO,
     // Inert for the fake spawns (no fanotify admission map); a real fanotify
     // spawn threads this into its SourceConfig.
     max_map_directories: None,
@@ -206,6 +223,19 @@ fn loc(parts: &[&str]) -> Location {
 /// emitted at the settle edge, so it postdates the root's read AND every
 /// descendant arm by construction, whereas a `Created` for one entry proved only
 /// that one read had reached the consumer.
+/// A mount-table row with no identity — the fake reads no namespace, so its
+/// rows answer `None` for the mount id, its parent and the device exactly as
+/// macOS' `getfsstat` and a pre-5.8 Linux kernel do. The driver suites here care only
+/// WHERE a mount is; identity is exercised in the core's own cells.
+fn bare_mount(location: &str) -> crate::os::MountRow {
+  crate::os::MountRow {
+    location: PathBuf::from(location),
+    mnt_id: None,
+    parent_id: None,
+    dev: None,
+  }
+}
+
 async fn fence_birth_crawl(rig: &Rig, scope: ScopeId, root: &str) {
   let (s, r, change) = next_rooted(rig).await;
   assert_eq!((s, r.as_path()), (scope, std::path::Path::new(root)));
@@ -322,11 +352,24 @@ const INTERPRETED_DEADLINE: Duration = Duration::from_secs(900);
 /// keep coming" — where the budget EXPIRING is the observation the cell is
 /// making. Widening one would change what its cell proves, not how long it waits
 /// to prove it.
+///
+/// # An INSTRUMENTED build is native, and needed the same widening
+///
+/// `cfg!(miri)` is two-valued and this axis is not. A sanitizer build runs native
+/// code — so it took the `native` arm — while ASan and TSan slow the runtime
+/// several fold and the real clock keeps its pace, which is the same ratio the
+/// interpreted arm exists for. That is what took the tsan lane red on a POSITIVE
+/// wait (`the driver dies rather than replying: Elapsed`) with nothing wrong but
+/// the budget. [`timing_scale`] is the knob that DOES express it — the workspace
+/// sets it per instrument, 6 for ASan/LSan/MSan and 12 for TSan, 1 unset — and
+/// scaling by it here changes nothing on an ordinary native run while giving the
+/// instrumented one exactly the proportional room the blanket argument above
+/// already licenses.
 fn interpreted_secs(native: u64) -> Duration {
   if cfg!(miri) {
     INTERPRETED_DEADLINE
   } else {
-    Duration::from_secs(native)
+    Duration::from_secs(native) * timing_scale()
   }
 }
 
@@ -794,7 +837,24 @@ async fn refresh_finding_root_gone_dies_end_to_end() {
 
   // The loss itself yields the standing Rescan; the refresh-detected death then
   // ends the scope with its terminal Rescan and reclaims the entry.
-  settle(|| registry.dead() == [scope]).await;
+  //
+  // BOTH observables are waited on, and on an explicit budget. Each is published
+  // OFF the runtime — the reclamation and the teardown both land on the driver's
+  // teardown reaper, an ordinary OS thread the paused clock does not govern — so
+  // what the wait actually spends is [`SETTLE_ROUND_SLICE`] of real time per
+  // round, and the shared 200-round default is not enough of it on a loaded host.
+  // Observed: one failure in four consecutive runs of this suite while a Miri
+  // shard and a container suite shared the machine, reported at the reclamation
+  // assertion below. Every condition here is eventually-true, so a wider budget
+  // can only prevent a spurious failure, never mask a real one — and waiting on
+  // the shutdown too stops the second assertion from reading an observable the
+  // first one's wait never covered.
+  assert!(
+    settle_within(1000, || registry.dead() == [scope]
+      && rig.fs.shutdowns() == 1)
+    .await,
+    "the refresh-detected death reclaimed the registry entry and tore the stream down"
+  );
   assert_eq!(
     registry.dead(),
     [scope],
@@ -1208,7 +1268,7 @@ async fn spawn_seals_root_meta_before_the_stream_goes_live() {
 async fn spawn_seed_carries_a_preexisting_submount() {
   let fs = FakeFs::new(1);
   fs.put("/r", FileKind::Dir, 1);
-  fs.seed_mounts(vec![PathBuf::from("/r/vol")]);
+  fs.seed_mounts(vec![bare_mount("/r/vol")]);
   let (cmd_tx, cmd_rx) = async_channel::bounded(16);
   let (cleanup, cookie_wake) = cookie_ingress();
   let (ev_tx, ev_rx) = async_channel::bounded(64);
@@ -2064,6 +2124,529 @@ mod descending {
     }
   }
 
+  /// The refresh cadence the ticking rigs run at, NATIVELY. The production
+  /// default is 30 s and nothing about the tick depends on the interval, so a
+  /// cell about WHAT the refresh derives shortens it rather than sleeping through
+  /// it. Still far longer than the crawl it must not race: the birth window
+  /// closes in a handful of milliseconds here.
+  const NATIVE_TICK: Duration = Duration::from_millis(250);
+
+  /// The same cadence, in the wall clock an INTERPRETER needs for it — the
+  /// missing half of the argument [`config`] makes when it disables the tick
+  /// outright for every cell that is not about it.
+  ///
+  /// That argument is about a RATE, not about a count of scopes: a driver
+  /// iteration costs on the order of a second under Miri, and each tick hands the
+  /// loop two units of work (arm the read, then consume its completion off
+  /// `op_rx`). At 250 ms the demand outruns the service rate several times over,
+  /// `op_rx` — the FIRST `select_biased!` arm — stops emptying, and the source
+  /// lane and command mailbox behind it are never polled again. One live scope is
+  /// enough; what varies is only how many cells have already run in the shard,
+  /// which is why these cells pass alone and hang in the suite.
+  ///
+  /// 20 s leaves the loop room for a dozen-odd iterations per interval on a fast
+  /// host and several on an ordinary one. Like [`INTERPRETED_DEADLINE`] it is one
+  /// flat value rather than a tuned multiple: a cadence only has to be slower
+  /// than the loop, and overshooting costs a passing run real seconds it can
+  /// afford.
+  const INTERPRETED_TICK: Duration = Duration::from_secs(20);
+
+  /// The cadence these rigs run at, on whatever is executing them.
+  ///
+  /// The interpreted value is a cliff rather than a scale ([`INTERPRETED_TICK`]),
+  /// but the axis underneath it is a RATE — the tick's demand against the driver
+  /// loop's service rate — and `cfg!(miri)` is not the only thing that moves it.
+  /// A SANITIZER build is native, so it takes the native arm, while ASan/TSan slow
+  /// the loop several fold against a real clock that does not stretch: exactly the
+  /// ratio that starved `op_rx` under the interpreter. So the native cadence rides
+  /// [`timing_scale`], the same knob the workspace already sets per instrument (1
+  /// unset, so an ordinary run is unchanged). Lengthening a cadence can only give
+  /// the loop more room — these cells assert WHAT the refresh derives, never how
+  /// quickly — so the widening is safe in the same blanket way
+  /// [`interpreted_secs`]'s is.
+  fn tick() -> Duration {
+    if cfg!(miri) {
+      INTERPRETED_TICK
+    } else {
+      NATIVE_TICK * timing_scale()
+    }
+  }
+
+  /// A descending rig whose periodic mount refresh runs at a cadence a real-time
+  /// cell can wait out ([`tick`]).
+  fn inotify_rig_ticking(fs: FakeFs) -> Rig {
+    fs.put("/r", FileKind::Dir, 1);
+    fs.spawn_backend(BackendKind::Inotify);
+    let (cmd_tx, cmd_rx) = async_channel::bounded(16);
+    let (cleanup, cookie_wake) = cookie_ingress();
+    let (ev_tx, ev_rx) = async_channel::bounded(64);
+    tokio::spawn(run::<TokioRuntime, FakeFs>(
+      DriverConfig {
+        root_liveness_interval: tick(),
+        ..inotify_config()
+      },
+      fs.clone(),
+      cmd_rx,
+      cookie_wake,
+      ev_tx,
+      NullRegistry,
+    ));
+    Rig {
+      fs,
+      commands: cmd_tx,
+      cleanup,
+      events: ev_rx,
+    }
+  }
+
+  /// #74, end to end on the real loop. A LAZY unmount below the watched root
+  /// reaches this driver through no channel at all — the control experiment
+  /// measured an inotify watch on a subdirectory surviving unmount and remount
+  /// with no delivery, no `Rescan` and nothing else for 120 s — so the only thing
+  /// that can notice is the periodic refresh the descending profile now arms, and
+  /// the only honest thing it can say is a COVER: the mount table cannot tell a
+  /// vanished bind from a vanished volume, and re-enumeration answers both.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_silently_departed_mount_covers_its_subtree_end_to_end() {
+    let fs = FakeFs::new(1);
+    // The live table at birth: one mount under the root, with a tree on it. The
+    // spawn barrier reads it AND the birth refresh confirms it, which is what a
+    // mount that was already there looks like — so the row is recorded with no
+    // arrival cover, and the only cover this cell can observe is the departure.
+    fs.seed_mounts(vec![bare_mount("/r/vol")]);
+    fs.answer_refresh(vec![bare_mount("/r/vol")], true);
+    let rig = inotify_rig_ticking(fs);
+    rig.fs.put("/r/vol", FileKind::Dir, 20);
+    rig.fs.put("/r/vol/inner.txt", FileKind::File, 21);
+    let scope = watch(&rig, "/r").await;
+    fence_birth_crawl(&rig, scope, "/r").await;
+
+    // `umount -l /r/vol`: the row leaves the table and the kernel says nothing.
+    rig.fs.answer_refresh(Vec::new(), true);
+
+    let (s, change) = next_event(&rig).await;
+    assert_eq!(s, scope);
+    assert!(
+      change.kind().is_rescan(),
+      "a departure nothing signalled is covered, never delivered: {change:?}"
+    );
+    assert_eq!(
+      change.location(),
+      &loc(&["vol"]),
+      "and the cover is LOCATED at the departed mount: {change:?}"
+    );
+  }
+
+  /// The same departure, reached through the operating point that used to
+  /// swallow it: refresh latency at or past the interval, so the tick fires ON
+  /// TOP of the read in flight. That needs no adversary — a busy blocking pool
+  /// or a short interval produces it — and the interval is a public knob with no
+  /// floor above zero.
+  ///
+  /// A tick that CONDEMNED the read it raced (marking it stale) would discard
+  /// this completion, and the read it re-arms would be condemned by the next
+  /// tick in turn: the mount-table install, the frame adoption and the departure
+  /// diff all sit BEHIND `on_mounts_refreshed`'s stale gate, so nothing past it
+  /// would ever publish again. Only the root-death check survives, being in
+  /// front of the gate — which is exactly why the below-root silence would stay
+  /// silent forever.
+  ///
+  /// Staged with the refresh gate: one read is held on the pool across several
+  /// ticks, and a SUPERSEDING gate is installed before it is released, so the
+  /// next read parks too and the latency stays above the interval. A condemned
+  /// completion therefore cannot heal itself by re-reading quickly inside the
+  /// cell — the cover either comes from the tick-raced read or it does not come.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_tick_raced_refresh_still_covers_the_departure_end_to_end() {
+    let fs = FakeFs::new(1);
+    // Seeded AND answered, so the mount is recorded at the barrier and merely
+    // confirmed by the first read: no arrival cover can stand in for the
+    // departure this cell is about.
+    fs.seed_mounts(vec![bare_mount("/r/vol")]);
+    fs.answer_refresh(vec![bare_mount("/r/vol")], true);
+    let rig = inotify_rig_ticking(fs);
+    rig.fs.put("/r/vol", FileKind::Dir, 20);
+    rig.fs.put("/r/vol/inner.txt", FileKind::File, 21);
+    let scope = watch(&rig, "/r").await;
+    fence_birth_crawl(&rig, scope, "/r").await;
+
+    // Every refresh from here parks on the pool.
+    let held = rig.fs.hold_refreshes();
+    // The budget has to outlast ONE cadence, and the cadence is 20 s under an
+    // interpreter (see [`INTERPRETED_TICK`]). A round is ~12 ms of real time at
+    // minimum, so the shared 200-round default cannot reach the first tick there
+    // — and an expired staging budget is this cell's own failure, not a weaker
+    // path through it.
+    assert!(
+      settle_within(3000, || held.captured() >= 1).await,
+      "staging: a tick armed a refresh and it parked on the gate"
+    );
+    // Hold it across several ticks. This runtime is NOT paused and the driver's
+    // deadline runs on the same real clock, so the ticks are the loop's own.
+    // Only the LOWER bound is load-bearing: more ticks can only strengthen the
+    // staging, never weaken it.
+    // Four cadences of real time. `tick()` already carries `timing_scale`, so this
+    // must NOT multiply by it again: doing so is quadratic in the knob and would
+    // spend minutes of an instrumented lane's budget waiting out a staging step.
+    tokio::time::sleep(tick() * 4).await;
+    assert_eq!(
+      held.captured(),
+      1,
+      "staging: those ticks coalesced onto the held read rather than stacking refreshes"
+    );
+
+    // `umount -l /r/vol`, seen by the read that is already parked (the gate is
+    // entered before the answer is read).
+    rig.fs.answer_refresh(Vec::new(), true);
+    let next = rig.fs.hold_refreshes();
+    held.release();
+
+    let (s, change) = next_event(&rig).await;
+    assert_eq!(s, scope);
+    assert!(
+      change.kind().is_rescan(),
+      "the tick-raced read still covers what it found gone: {change:?}"
+    );
+    assert_eq!(
+      change.location(),
+      &loc(&["vol"]),
+      "and the cover is LOCATED at the departed mount: {change:?}"
+    );
+    next.release();
+  }
+
+  /// A KERNEL-RECURSIVE rig at the same cadence, for the profile seam 2 exists
+  /// for: one mark covers the whole root, the Monitor never descends, and the
+  /// source's own walk is the only thing that ever fences a directory.
+  fn fanotify_rig_ticking(fs: FakeFs) -> Rig {
+    fs.put("/r", FileKind::Dir, 1);
+    fs.spawn_backend(BackendKind::Fanotify);
+    let (cmd_tx, cmd_rx) = async_channel::bounded(16);
+    let (cleanup, cookie_wake) = cookie_ingress();
+    let (ev_tx, ev_rx) = async_channel::bounded(64);
+    tokio::spawn(run::<TokioRuntime, FakeFs>(
+      DriverConfig {
+        root_liveness_interval: tick(),
+        profile: BackendKind::Fanotify,
+        ..config()
+      },
+      fs.clone(),
+      cmd_rx,
+      cookie_wake,
+      ev_tx,
+      NullRegistry,
+    ));
+    Rig {
+      fs,
+      commands: cmd_tx,
+      cleanup,
+      events: ev_rx,
+    }
+  }
+
+  /// SEAM 2 on the WIRE, end to end on the real loop: a boundary a live WALK
+  /// declined rides the source's own ordered lane as its own message, lands in
+  /// the coverage set, and its later departure is covered from there.
+  ///
+  /// This is the path the fanotify reader's post-loss reseed and moved-in subtree
+  /// walk take — they run on the reader thread, long past the spawn result the
+  /// seed walk's declines ride — and it is the path the admission reseed will
+  /// take too. Nothing in the core re-derives the triple: what the walk read is
+  /// what the set holds.
+  ///
+  /// The mount table answers EMPTY for this cell's whole life, which is what
+  /// makes the verdict readable. A table that ever listed `/r/bound` would fire
+  /// an ARRIVAL cover at the very location the departure assertion reads, and the
+  /// cell would pass on the wrong signal. With no row ever, an arrival is
+  /// impossible by construction and the only thing that can cover `/r/bound` is
+  /// the departure of what the walk declined.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_live_walks_declined_boundary_rides_the_lane_and_departs_from_the_set() {
+    // The root sits on mount 42; the walk's decline names mount 77 — a
+    // `mount --bind` of a same-superblock directory, which the device belt cannot
+    // see. Both halves known and unequal, so the seam decides `Mount(77)` and the
+    // first census that does not key 77 derives its departure (and no census ever
+    // will key it).
+    let fs = FakeFs::with_root_mnt_id(1, 42);
+    fs.answer_refresh(Vec::new(), true);
+    let rig = fanotify_rig_ticking(fs);
+    let scope = watch(&rig, "/r").await;
+
+    rig.fs.send_walk_boundaries(
+      "/r",
+      vec![crate::os::DeclinedBoundary {
+        location: PathBuf::from("/r/bound"),
+        dev: 1,
+        mnt_id: Some(77),
+      }],
+    );
+
+    // The departure the next tick derives does NOT cover yet. This profile's
+    // source admits by directory-handle membership and its walk stopped AT the
+    // bind, so the ground the departure just revealed has no handles at all —
+    // covering now would send the consumer to re-read a subtree the reader still
+    // drops every event on. The cover parks on an admission round trip instead.
+    assert!(
+      settle(|| !rig.fs.admit_requests().is_empty()).await,
+      "the departure asked the source to admit the revealed ground"
+    );
+    let requested = rig.fs.admit_requests();
+    assert_eq!(
+      requested.len(),
+      1,
+      "one round trip per departure: {requested:?}"
+    );
+    assert_eq!(requested[0].location, PathBuf::from("/r/bound"));
+    assert!(
+      tokio::time::timeout(Duration::from_millis(200), rig.events.recv())
+        .await
+        .is_err(),
+      "and NOTHING reaches the consumer while it is outstanding — this is \
+       admission-before-cover, on the real loop"
+    );
+
+    // The reader walked the revealed ground into its map and answered.
+    rig
+      .fs
+      .answer_admit("/r", requested[0].ticket, crate::os::AdmitOutcome::Admitted);
+    let (s, change) = next_event(&rig).await;
+    assert_eq!(s, scope);
+    assert!(
+      change.kind().is_rescan(),
+      "a departure nothing signalled is covered, never delivered: {change:?}"
+    );
+    assert_eq!(
+      change.location(),
+      &loc(&["bound"]),
+      "and the cover is LOCATED at the boundary the WALK declined — the core \
+       never saw that path any other way: {change:?}"
+    );
+  }
+
+  /// **THE FAIL-CLOSED RULE ON THE WIRE**, and its routing: a scope holding an
+  /// AMBIGUOUS record asks its source for a WHOLE-ROOT RECOVERY on every
+  /// authoritative refresh, and the root cover reaches the consumer only behind
+  /// that recovery's reply.
+  ///
+  /// The fake's root carries NO mount id — the pre-5.8 Linux shape, and the only
+  /// one that can produce an ambiguous record at all — so the walk's id-less
+  /// decline is indistinguishable from a genuine vfsmount that has departed. No
+  /// per-record evidence exists to say which, so the whole root is covered.
+  ///
+  /// **The routing is half the assertion.** A bare `Scope::Root` cover emitted
+  /// from the refresh would send the consumer to re-read a tree whose FID map the
+  /// source has never seeded, and every mutation until some later reseed would
+  /// drop on an unknown handle with no loss signal — the same failure the located
+  /// admission round trip exists to prevent, at root scale. So nothing reaches
+  /// the consumer until the recovery answers.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn an_ambiguous_record_recovers_the_whole_root_through_the_source() {
+    let fs = FakeFs::new(1);
+    fs.answer_refresh(Vec::new(), true);
+    let rig = fanotify_rig_ticking(fs);
+    let scope = watch(&rig, "/r").await;
+
+    // A walk decline carrying a device and NO mount id, against a scope with no
+    // frame of its own: ambiguous on both sides of the comparison.
+    rig.fs.send_walk_boundaries(
+      "/r",
+      vec![crate::os::DeclinedBoundary {
+        location: PathBuf::from("/r/bound"),
+        dev: 99,
+        mnt_id: None,
+      }],
+    );
+
+    assert!(
+      settle(|| !rig.fs.recovery_requests().is_empty()).await,
+      "the ambiguity made the scope fail closed, and the whole root is recovered \
+       through the source"
+    );
+    assert!(
+      rig.fs.admit_requests().is_empty(),
+      "and nothing LOCATED was asked for: {:?}",
+      rig.fs.admit_requests()
+    );
+    assert!(
+      tokio::time::timeout(Duration::from_millis(200), rig.events.recv())
+        .await
+        .is_err(),
+      "NOTHING reaches the consumer while the recovery is outstanding — a bare \
+       root cover here would point at ground the FID map does not hold"
+    );
+
+    // The reader reseeded the whole map and answered with the one indivisible
+    // message: the complete generation (the boundary is still there), and the
+    // cutoff.
+    let asked = rig.fs.recovery_requests()[0];
+    rig.fs.answer_root_recovery(
+      "/r",
+      asked,
+      vec![crate::os::DeclinedBoundary {
+        location: PathBuf::from("/r/bound"),
+        dev: 99,
+        mnt_id: None,
+      }],
+      // The reseed reopened the root this scope still holds, and this fake host
+      // reports no mount id for it — the honest unknown, which the frame check
+      // passes exactly as every other unknown leg does.
+      None,
+    );
+    let (s, change) = next_event(&rig).await;
+    assert_eq!(s, scope);
+    assert!(
+      change.kind().is_rescan(),
+      "the fail-closed answer is a cover, never a delivery: {change:?}"
+    );
+    assert_eq!(
+      change.location(),
+      &loc(&[]),
+      "and it covers the WHOLE root: {change:?}"
+    );
+  }
+
+  /// The same departure with no source to ask: `request_admits` refuses (a real
+  /// handle answers that once its reader thread is gone), so the driver resolves
+  /// the round trip itself and the cover goes out on the refresh's verdict alone.
+  ///
+  /// The alternative is the one unacceptable outcome — a cover held forever
+  /// behind a reply that cannot come — so this is the leg that keeps the parked
+  /// state from being a liveness hazard.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn an_admission_no_source_can_take_still_covers_the_departure() {
+    let fs = FakeFs::with_root_mnt_id(1, 42);
+    fs.answer_refresh(Vec::new(), true);
+    fs.refuse_admits();
+    let rig = fanotify_rig_ticking(fs);
+    let scope = watch(&rig, "/r").await;
+
+    rig.fs.send_walk_boundaries(
+      "/r",
+      vec![crate::os::DeclinedBoundary {
+        location: PathBuf::from("/r/bound"),
+        dev: 1,
+        mnt_id: Some(77),
+      }],
+    );
+
+    let (s, change) = next_event(&rig).await;
+    assert_eq!(s, scope);
+    assert!(change.kind().is_rescan());
+    assert_eq!(
+      change.location(),
+      &loc(&["bound"]),
+      "the cover is not stranded by a source that cannot admit: {change:?}"
+    );
+    assert!(
+      rig.fs.admit_requests().is_empty(),
+      "and the refused request was never even recorded as accepted"
+    );
+  }
+
+  /// A WHOLE-ROOT walk report is a GENERATION, and it retires the ledger entries
+  /// that walk did not decline — end to end on the real loop, through the
+  /// source's own ordered lane.
+  ///
+  /// The retirement itself emits nothing (the callers of a complete generation
+  /// each carry a root-wide cover of their own behind the report), so the cell
+  /// reads it through the ONE thing an entry's presence does change: a later
+  /// table row at the same location is an ARRIVAL either way, but an entry that
+  /// SURVIVED is still held beside it and one that was retired is not.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_whole_root_walk_report_retires_a_stale_device_only_record() {
+    // Root on mount 42. The decline below names the SAME mount id on a different
+    // device — a btrfs subvolume, which has no mountinfo row ever and is exempt
+    // from every condemnation mechanism.
+    let fs = FakeFs::with_root_mnt_id(1, 42);
+    fs.answer_refresh(Vec::new(), true);
+    let rig = fanotify_rig_ticking(fs);
+    let scope = watch(&rig, "/r").await;
+
+    rig.fs.send_walk_boundaries(
+      "/r",
+      vec![crate::os::DeclinedBoundary {
+        location: PathBuf::from("/r/sub"),
+        dev: 9,
+        mnt_id: Some(42),
+      }],
+    );
+    assert!(
+      tokio::time::timeout(Duration::from_millis(200), rig.events.recv())
+        .await
+        .is_err(),
+      "staging: an exempt record is not a departure on any tick"
+    );
+
+    // The post-loss reseed re-walks the whole root and declines NOTHING: the
+    // subvolume was deleted while a loss window ate its removal record.
+    // Taken on the root the core holds — mount 42, the id the fake reports — so
+    // the generation is the scope's own to install.
+    rig
+      .fs
+      .send_whole_root_boundaries("/r", Vec::new(), Some(42), 1);
+    // FENCED, because nothing else orders this post against the one below it. A
+    // report waits on the source lane, the select's LAST arm, while a tick's
+    // mount refresh completes on `op_rx`, its FIRST — so a read that lands
+    // anywhere in this window reaches the core AHEAD of the generation, and the
+    // row below then CONFIRMS the record instead of arriving at it. Confirming
+    // makes it row-confirmed — mount-backed, the partition a generation retires
+    // nothing from — so the arrival never comes and this cell waits out its whole
+    // budget, which is exactly how it failed on a CI runner and never here.
+    //
+    // What that interleaving costs in PRODUCTION is one extra located cover, not
+    // this silence, and the difference is the row's identity. A real mountinfo row
+    // at that location carries the departed/arrived mount's OWN id, which differs
+    // from the record's, so `identity_changed` fires and the confirmation is a
+    // covered REPLACEMENT; and even a silent confirmation only survives until the
+    // next authoritative refresh that does not list the row, which condemns the
+    // now-mount-backed record, covers it once, and drops it. Over-signal, and it
+    // converges in one refresh.
+    //
+    // The silent leg needs a row whose KNOWN identity halves both agree with the
+    // record's — here, the root's own mount id beside the subvolume's device — and
+    // an authoritative table cannot carry the first. Within one proven-still
+    // namespace generation every listed mount is a distinct live `struct mount`,
+    // legacy mount ids are unique among live mounts, and the root's own mount is
+    // live at the `statx` that reports `root_mnt_id`; `crate::os::mount_sample`
+    // rejects the pair outright when the namespace moved between the two, which is
+    // what makes that an enforced invariant rather than an assumption. (Round 8
+    // asserted it instead, and the assertion was wrong for the code as it then
+    // stood: the table and the root stat were unsynchronized samples, and mount
+    // ids are allocated lowest-free.) So the fixture's identity is a CELL
+    // construction, and this fence is what keeps it from reading as a verdict.
+    assert!(
+      settle(|| rig.fs.boundaries_ingested("/r")).await,
+      "staging: the generation reached the core before any row could confirm the \
+       record"
+    );
+
+    // A row now appears at the same location with the identity the record held.
+    // With the record retired this is an ARRIVAL and covers; with the record
+    // still standing it is a silent confirmation.
+    rig.fs.answer_refresh(
+      vec![crate::os::MountRow {
+        location: PathBuf::from("/r/sub"),
+        mnt_id: Some(42),
+        parent_id: None,
+        dev: Some(9),
+      }],
+      true,
+    );
+
+    let (s, change) = next_event(&rig).await;
+    assert_eq!(s, scope);
+    assert!(
+      change.kind().is_rescan(),
+      "an arrival shadows ground the consumer may have read: {change:?}"
+    );
+    assert_eq!(
+      change.location(),
+      &loc(&["sub"]),
+      "and the generation really did retire the stale record — the row had \
+       nothing to confirm: {change:?}"
+    );
+  }
+
   fn attributed(anchors: &[tributary_proto::WatchId], mask: u32, name: &[u8]) -> RawLinuxEvent {
     RawLinuxEvent::Inotify {
       anchors: anchors.to_vec(),
@@ -2168,6 +2751,216 @@ mod descending {
         .iter()
         .any(|(_, p)| p == std::path::Path::new("/r/bound")),
       "the bind-mount directory is lowered but never armed: {arms:?}"
+    );
+  }
+
+  /// PREVENTION, end to end: a directory the Monitor learns from a `Created`
+  /// record — the arm the enumerate fence NEVER judges — is refused when it lands
+  /// across the scope's mount frame.
+  ///
+  /// This is the hole the decline alone cannot close. No enumerate runs between
+  /// the record and the arm, and inotify's `Created` compiles to a bare record
+  /// with no identity, so the executor's own object guard is `None` and passes
+  /// whatever it opens. Without the frame refusal the watch installs on the far
+  /// side of the bind and the live stream walks straight through a boundary the
+  /// crawl honours.
+  ///
+  /// Refusal is observable three ways: the arm is ATTEMPTED (this is not the
+  /// exclusion fence quietly dropping the record), no watch installs, and the
+  /// slot's cold enumerate — which only a successful arm queues — never runs.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_created_directory_across_a_mount_boundary_is_refused_not_armed() {
+    const IN_ISDIR: u32 = 0x4000_0000;
+    let rig = inotify_rig_mnt(42);
+    let _scope = watch(&rig, "/r").await;
+    settle(|| !rig.fs.enumerates().is_empty()).await;
+    let root_watch = rig
+      .fs
+      .enumerates()
+      .first()
+      .map(|(watch, _)| *watch)
+      .expect("the root enumerated");
+
+    // The bind lands, and the create announces it. Same device as the root, a
+    // different mount (77) — the boundary only the mount fence sees.
+    rig.fs.put_on_mount("/r/bound", FileKind::Dir, 30, 77);
+    rig.fs.put("/r/bound/hidden.txt", FileKind::File, 31);
+    rig.fs.send_inotify_batch(
+      "/r",
+      vec![attributed(&[root_watch], IN_CREATE | IN_ISDIR, b"bound")],
+    );
+
+    let armed = settle(|| {
+      rig
+        .fs
+        .arms()
+        .iter()
+        .any(|(_, p)| p == Path::new("/r/bound"))
+    })
+    .await;
+    assert!(
+      armed,
+      "the arm is issued — and then refused, not suppressed"
+    );
+    // Give a successful install every chance to publish its watch and queue its
+    // read before the negative is read.
+    for _ in 0..30 {
+      tokio::task::yield_now().await;
+      tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let enumerates = rig.fs.enumerates();
+    assert!(
+      !enumerates.iter().any(|(_, p)| p == Path::new("/r/bound")),
+      "a refused arm queues no cold read, so the subtree beyond the boundary is \
+       never walked: {enumerates:?}"
+    );
+    let armed_watches: Vec<WatchId> = rig
+      .fs
+      .arms()
+      .iter()
+      .filter(|(_, p)| p == Path::new("/r/bound"))
+      .map(|(watch, _)| *watch)
+      .collect();
+    let live = rig.fs.live_watches();
+    assert!(
+      armed_watches.iter().all(|watch| !live.contains(watch)),
+      "and nothing installed: {armed_watches:?} vs {live:?}"
+    );
+  }
+
+  /// The same refusal, driven by the DEVICE half of the frame: a btrfs
+  /// subvolume, which carries the ROOT's own mount id and would install happily
+  /// under a mnt-id-only check.
+  ///
+  /// The design names that alternative and declines it, and this cell is why —
+  /// the refusal and the enumerate decline must agree about what a boundary is,
+  /// and `crosses_mount_boundary` fires on `device_boundary || mount_boundary`.
+  ///
+  /// The terminal here is different from the bind's and it is ACCEPTED: a
+  /// subvolume has no mountinfo row, so no refresh arrival ever covers it and no
+  /// crawl re-runs the decline. The slot becomes a persistent deficit — signalled
+  /// on every sync cookie, never silent.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_created_directory_across_the_device_belt_is_refused_not_armed() {
+    const IN_ISDIR: u32 = 0x4000_0000;
+    let rig = inotify_rig_mnt(42);
+    let scope = watch(&rig, "/r").await;
+    settle(|| !rig.fs.enumerates().is_empty()).await;
+    let root_watch = rig
+      .fs
+      .enumerates()
+      .first()
+      .map(|(watch, _)| *watch)
+      .expect("the root enumerated");
+
+    // The subvolume: a foreign DEVICE (99) on the root's OWN mount (42).
+    rig.fs.put_on_device("/r/subvol", FileKind::Dir, 30, 99);
+    rig.fs.send_inotify_batch(
+      "/r",
+      vec![attributed(&[root_watch], IN_CREATE | IN_ISDIR, b"subvol")],
+    );
+
+    let armed = settle(|| {
+      rig
+        .fs
+        .arms()
+        .iter()
+        .any(|(_, p)| p == Path::new("/r/subvol"))
+    })
+    .await;
+    assert!(armed, "the arm is issued");
+    for _ in 0..30 {
+      tokio::task::yield_now().await;
+      tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let enumerates = rig.fs.enumerates();
+    assert!(
+      !enumerates.iter().any(|(_, p)| p == Path::new("/r/subvol")),
+      "the device belt refuses it exactly as the mount fence refuses a bind — a \
+       mnt-id-only check would have walked straight in: {enumerates:?}"
+    );
+    let armed_watches: Vec<WatchId> = rig
+      .fs
+      .arms()
+      .iter()
+      .filter(|(_, p)| p == Path::new("/r/subvol"))
+      .map(|(watch, _)| *watch)
+      .collect();
+    let live = rig.fs.live_watches();
+    assert!(
+      armed_watches.iter().all(|watch| !live.contains(watch)),
+      "nothing installed: {armed_watches:?} vs {live:?}"
+    );
+    // The refusal reaches the consumer as coverage, which is what makes the
+    // deficit terminal acceptable rather than a silent hole.
+    let mut covered = false;
+    for _ in 0..8 {
+      let Ok(Ok((s, _root, change))) =
+        tokio::time::timeout(Duration::from_millis(500), rig.events.recv()).await
+      else {
+        break;
+      };
+      if s == scope && change.kind().is_rescan() && change.location() == &loc(&["subvol"]) {
+        covered = true;
+        break;
+      }
+    }
+    assert!(covered, "the refused slot stands its located Rescan");
+  }
+
+  /// The UNKNOWN-FRAME legs, stated as their own cell because the whole fake
+  /// harness rests on them.
+  ///
+  /// Below Linux 5.8 there is no `STATX_MNT_ID`, so a scope's frame and every
+  /// object's mount id read `None` — and an off-Linux fake answers no frame at
+  /// all. The refusal's truth table PASSES every unknown leg, exactly as
+  /// `crosses_mount_boundary`'s own `None` legs do. Invert them and this cell
+  /// fails alongside most of the suite: an arm with nothing to compare against is
+  /// not a crossing, and treating it as one refuses every watch on those hosts.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn an_unknown_scope_frame_refuses_no_arm() {
+    const IN_ISDIR: u32 = 0x4000_0000;
+    // `inotify_rig` reports NO root mount id — the pre-5.8 / off-Linux shape.
+    let rig = inotify_rig();
+    let _scope = watch(&rig, "/r").await;
+    settle(|| !rig.fs.enumerates().is_empty()).await;
+    let root_watch = rig
+      .fs
+      .enumerates()
+      .first()
+      .map(|(watch, _)| *watch)
+      .expect("the root enumerated");
+
+    rig.fs.put("/r/newdir", FileKind::Dir, 30);
+    rig.fs.send_inotify_batch(
+      "/r",
+      vec![attributed(&[root_watch], IN_CREATE | IN_ISDIR, b"newdir")],
+    );
+
+    let read = settle(|| {
+      rig
+        .fs
+        .enumerates()
+        .iter()
+        .any(|(_, p)| p == Path::new("/r/newdir"))
+    })
+    .await;
+    assert!(
+      read,
+      "an unknown frame fences nothing: the created directory arms and \
+       cold-reads exactly as it always did"
+    );
+    let armed_watches: Vec<WatchId> = rig
+      .fs
+      .arms()
+      .iter()
+      .filter(|(_, p)| p == Path::new("/r/newdir"))
+      .map(|(watch, _)| *watch)
+      .collect();
+    let live = rig.fs.live_watches();
+    assert!(
+      armed_watches.iter().any(|watch| live.contains(watch)),
+      "and its watch is installed: {armed_watches:?} vs {live:?}"
     );
   }
 
@@ -2368,14 +3161,29 @@ mod descending {
     );
 
     hold.release();
-    settle(|| enumerates_at(&rig, "/r/a") == 3).await;
-    let listings: Vec<Option<u64>> = rig
-      .fs
-      .enumerate_anchors()
-      .into_iter()
-      .filter(|(w, _)| *w == child)
-      .map(|(_, anchor)| anchor)
-      .collect();
+    // Waited on the observable the assertions below actually read, and the
+    // verdict asserted. The two are not interchangeable: the fake records an
+    // execution in `enumerates` and its dispatch-time anchor in
+    // `enumerate_anchors` under two separate locks, back to back, so a settle on
+    // the enumerate COUNT can be satisfied while the third anchor has not landed
+    // yet — and with the verdict discarded, that window and an expired budget
+    // both degraded into the length mismatch below, reported as a staging
+    // failure of something that had merely not happened yet.
+    let anchors_for_child = || -> Vec<Option<u64>> {
+      rig
+        .fs
+        .enumerate_anchors()
+        .into_iter()
+        .filter(|(w, _)| *w == child)
+        .map(|(_, anchor)| anchor)
+        .collect()
+    };
+    assert!(
+      settle(|| anchors_for_child().len() == 3).await,
+      "staging: the birth read plus one per loss ({:?})",
+      anchors_for_child()
+    );
+    let listings = anchors_for_child();
     assert_eq!(
       listings.len(),
       3,
@@ -2484,6 +3292,7 @@ mod descending {
             name: Segment::new("r"),
             path: Arc::new(PathBuf::from(path)),
             expected: None,
+            frame: crate::os::ScopeFrame::default(),
           }],
         )
         .resolutions
@@ -8553,7 +9362,7 @@ mod descending {
       rig.fs.put("/r/sub", FileKind::Dir, 11);
       let scope = watch(&rig, "/r/sub").await;
       // The widen target's meta resolves with a mount seeded at the old root.
-      rig.fs.seed_mounts(vec![PathBuf::from("/r/sub")]);
+      rig.fs.seed_mounts(vec![bare_mount("/r/sub")]);
 
       assert!(replace(&rig, scope, "/r").await.is_ok());
       settle(|| rig.fs.shutdowns() == 1).await;
@@ -8842,6 +9651,7 @@ mod descending {
             root_dev: 1,
             root_mnt_id: None,
             mounts: Vec::new(),
+            declined: Vec::new(),
             identity: crate::os::RootIdentity::new(1, 1),
             ancestors: Vec::new(),
             backend: BackendKind::Inotify,
@@ -8870,6 +9680,7 @@ mod descending {
           root_dev: 1,
           root_mnt_id: None,
           mounts: Vec::new(),
+          declined: Vec::new(),
           identity: crate::os::RootIdentity::new(1, 9),
           ancestors: Vec::new(),
           backend: BackendKind::Inotify,
@@ -9328,6 +10139,7 @@ mod descending {
             root_dev: 1,
             root_mnt_id: None,
             mounts: Vec::new(),
+            declined: Vec::new(),
             identity: crate::os::RootIdentity::new(1, 1),
             ancestors: Vec::new(),
             backend: BackendKind::Inotify,
@@ -9392,6 +10204,7 @@ mod descending {
             root_dev: 1,
             root_mnt_id: None,
             mounts: Vec::new(),
+            declined: Vec::new(),
             identity: crate::os::RootIdentity::new(1, 9),
             ancestors: Vec::new(),
             backend: BackendKind::Inotify,
@@ -9491,6 +10304,7 @@ mod descending {
             root_dev: 1,
             root_mnt_id: None,
             mounts: Vec::new(),
+            declined: Vec::new(),
             identity: crate::os::RootIdentity::new(1, ino),
             ancestors: Vec::new(),
             backend: BackendKind::Inotify,
@@ -9690,6 +10504,7 @@ mod descending {
           root_dev: 1,
           root_mnt_id: None,
           mounts: Vec::new(),
+          declined: Vec::new(),
           identity: crate::os::RootIdentity::new(1, 9),
           ancestors: Vec::new(),
           backend: BackendKind::Inotify,
@@ -12871,7 +13686,16 @@ mod sync_cookie {
       2,
       "still exactly two dispatches: the failed attempt and the driver's own retry"
     );
-    settle(|| rig.fs.files_under("/r").is_empty()).await;
+    // Both halves waited on, and the STAGING half's verdict asserted. The unlink
+    // landing in the fake and the driver dropping its ledger record are two
+    // observables with a real window between them, so a settle on the file alone
+    // left the count assertion below to fail as though the record had leaked when
+    // it had merely not been dropped yet.
+    assert!(
+      settle(|| rig.fs.files_under("/r").is_empty()).await,
+      "staging: the driver's own retry confirmed the unlink"
+    );
+    settle_cookie_count(&rig, 0).await;
     assert_eq!(
       cookie_count(&rig).await,
       0,
@@ -18493,6 +19317,7 @@ mod control_batch_publication_order {
       name: Segment::new("churn"),
       path: Arc::new(path.to_path_buf()),
       expected: None,
+      frame: crate::os::ScopeFrame::default(),
     }
   }
 
@@ -20514,5 +21339,96 @@ mod abnormal_exit {
       settle(|| rig.fs.shutdowns() == 1).await,
       "and it completes once the wedge clears"
     );
+  }
+}
+
+/// The mask-miss leg of [`stat_sample`]: on a kernel whose `statx` answers no
+/// mount id, the sample is taken through an `O_PATH` pin instead, and it must
+/// answer the SAME object and the SAME mount id the single-`statx` leg answers
+/// where the bit exists.
+///
+/// Real syscalls on a real tree, so this runs on the ubuntu runners and in the
+/// container `unit` suite. It drives [`stat_sample_pinned`] DIRECTLY rather than
+/// forcing the process tier: the tier is a process-wide memo and the lib binary
+/// runs its cells in parallel, so a cell that flipped it would decide which leg
+/// every sibling's sample took.
+#[cfg(all(target_os = "linux", not(miri)))]
+mod mount_frame_sampling {
+  use super::*;
+
+  /// A unique real directory for one cell.
+  fn scratch(tag: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let dir = std::env::temp_dir()
+      .canonicalize()
+      .expect("canonicalize temp dir")
+      .join(format!(
+        "tributary-fs-frame-{}-{}-{}",
+        tag,
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed),
+      ));
+    std::fs::create_dir_all(&dir).expect("create scratch dir");
+    dir
+  }
+
+  /// The pinned sample answers a mount id on EVERY supported kernel, for every
+  /// object kind the enumerate can hand it — a directory, a regular file, and a
+  /// symlink, which `O_PATH | O_NOFOLLOW` must open AS the link rather than
+  /// following it, exactly as the `AT_SYMLINK_NOFOLLOW` leg does.
+  ///
+  /// MUTATION WITNESS (the pin follows the link): drop `OFlags::NOFOLLOW` from
+  /// `stat_sample_pinned` and this FAILS at `the pinned sample reaches the same
+  /// object` for the symlink, reporting the target file's kind and inode.
+  /// MUTATION WITNESS (the frame is dropped on the pinned leg): return `None` for
+  /// `frame` there and this FAILS at `every supported kernel answers a mount id
+  /// through fdinfo`.
+  #[test]
+  fn a_pinned_sample_answers_the_same_object_and_a_mount_id() {
+    let dir = scratch("pinned");
+    let file = dir.join("f");
+    std::fs::write(&file, b"x").expect("write the scratch file");
+    let link = dir.join("l");
+    std::os::unix::fs::symlink("f", &link).expect("create the scratch symlink");
+
+    for path in [dir.as_path(), file.as_path(), link.as_path()] {
+      let direct = stat_sample(path).expect("sample the path");
+      let pinned = stat_sample_pinned(path).expect("sample the path through a pin");
+      assert_eq!(
+        (pinned.kind, pinned.dev, pinned.ino),
+        (direct.kind, direct.dev, direct.ino),
+        "the pinned sample reaches the same object as the path sample: {}",
+        path.display()
+      );
+      assert!(
+        pinned.frame.is_some(),
+        "every supported kernel answers a mount id through fdinfo (3.15, below \
+         the 4.11 statx floor), so the pinned leg never degrades to a frameless \
+         sample: {}",
+        path.display()
+      );
+      if direct.frame.is_some() {
+        assert_eq!(
+          pinned.frame,
+          direct.frame,
+          "where this host ALSO has `STATX_MNT_ID`, the two tiers must report one \
+           id — they key the same census: {}",
+          path.display()
+        );
+      }
+    }
+
+    // A path that is not there fails the same way through either leg, so the
+    // enumerate's raced-away `Missing` keeps its meaning on the fdinfo tier.
+    let gone = dir.join("gone");
+    assert_eq!(
+      stat_sample_pinned(&gone).map(|sample| sample.ino),
+      Err(rustix::io::Errno::NOENT),
+      "the pin's own open carries the errno the statx would have, so NOENT is \
+       still a raced-away entry and never a laundered frameless sample"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
   }
 }

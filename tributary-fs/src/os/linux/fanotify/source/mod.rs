@@ -2,6 +2,9 @@
 //! barrier. A `FAN_MARK_FILESYSTEM` mark is kernel-recursive — one mark covers
 //! the whole root, so unlike inotify there is NO per-directory arming; the map
 //! is seeded once at spawn and self-maintains from create events thereafter.
+//! Three later walks extend or rebuild it — the post-loss whole-map reseed, the
+//! moved-in subtree walk, and the ADMISSION RESEED that maps the ground a
+//! departed mount revealed ([`revealed_walk`]).
 //!
 //! The mount seed is trivial: an sb mark never crosses a mount boundary (the
 //! kernel scopes it to the superblock the marked path lives on), so a mount
@@ -41,13 +44,29 @@
 //! > and the pinned ancestors + probe all descend from it); (b) VERIFIED AGAINST A
 //! > REQUEST-FIXED EXPECTED FID before it mutates the map (the live-reseed root
 //! > against the spawn anchor [`ReseedContext::root_fid`]; a pending move-in subtree
-//! > against the moved dir's learned FID); or (c) INDUCTIVELY VERIFIED VIA ITS
+//! > against the moved dir's learned FID); (c) INDUCTIVELY VERIFIED VIA ITS
 //! > PARENT CHAIN (a per-child walk open is a single-component `openat` NOFOLLOW
 //! > from an already-verified parent fd, fenced to the root MOUNT by its mount id
 //! > — device as a belt — verified parent + single-component NOFOLLOW open + mount
 //! > fence = verified child; a bind of a same-device directory the device belt
 //! > alone would admit is caught by the mount-id fence, and a bind onto an ancestor
-//! > by the walk's per-run visited-handle cycle guard).
+//! > by the walk's per-run visited-handle cycle guard); or (d) VERIFIED AGAINST THE
+//! > LIVE MAP (the ADMISSION RESEED's revealed location — see [`revealed_walk`]).
+//!
+//! Case (d) is the one whose expected identity is not fixed by the request, and it
+//! is worth stating why it is not case (b) with a gap. The revealed location's
+//! PARENT is opened by path (no-symlink), its handle is encoded from that fd, and
+//! the location itself is then opened as a single-component `openat` NOFOLLOW
+//! under it — so the parent/child link the inventory records is the KERNEL's
+//! answer about the fd pair, true whatever object the parent path resolved to.
+//! The reader then refuses to seed any of it unless that parent handle is ALREADY
+//! an admitted directory whose ancestry reaches the map's root anchor. A
+//! same-superblock directory swapped in at the parent path therefore seeds
+//! NOTHING (its handle is not in the map), and a parent that IS in the map makes
+//! `path(parent)/name` the location's true current path. On top of that the
+//! location's own frame is read from the fd just pinned and refused if it sits
+//! across the scope's — which is what keeps a still-covered location from being
+//! walked against the BIND's frame and admitting an alias subtree.
 //!
 //! The per-child case (c) records the CURRENT object at `(parent, name)`: if a
 //! same-name replacement lands between the `readdir` listing and the child open,
@@ -68,7 +87,7 @@ use std::{
     unix::fs::MetadataExt,
   },
   path::Path,
-  sync::{Arc, mpsc},
+  sync::Arc,
   thread::JoinHandle,
 };
 
@@ -272,19 +291,30 @@ impl Source {
         source,
       }),
     })?;
-    map.seed(seed);
+    map.seed(seed.entries);
+    // SEAM 2, spawn driver. The seed walk's declines are carried out on the meta
+    // (see `RootMeta::declined`) rather than dropped here: they are the ONLY
+    // record of where this scope's coverage ends, because a kernel-recursive mark
+    // runs no enumerate whose fence could learn it again later.
+    let declined = seed.declined;
 
     let stats = Arc::new(super::super::super::BackendStatsShared::default());
     let (queue_tx, queue_rx) = async_channel::unbounded();
+    // The wake is built BEFORE the transport because the transport holds it: a
+    // boundary slot returned by the driver has to wake a reader that stopped short
+    // for want of one, and nothing else on this source's queue would.
+    let wake = WakeState::new()?;
     let shared = Arc::new(ReaderShared {
       queue: queue_tx,
-      transport: transport::TransportState::new(config.channel_capacity.get()),
+      transport: transport::TransportState::with_boundary_credit(
+        config.channel_capacity.get(),
+        Some(Arc::clone(&wake) as Arc<dyn transport::BoundaryCredit>),
+      ),
       buffer_bytes: config.os_buffer_bytes.get() as usize,
       stats: Arc::clone(&stats),
     });
 
-    let wake = WakeState::new()?;
-    let (control_tx, control_rx) = mpsc::channel();
+    let (control_tx, control_rx) = reader::control_mailbox();
     let thread = reader::start(
       fd,
       Arc::clone(&wake),
@@ -374,6 +404,7 @@ impl Source {
       root_dev,
       root_mnt_id,
       mounts,
+      declined,
       identity,
       ancestors,
       backend: super::super::super::BackendKind::Fanotify,
@@ -500,7 +531,7 @@ impl ReseedContext {
   /// path-authority is lost, and the mount/liveness refresh — which re-resolves the
   /// root BY PATH — will reject it and kill the scope regardless; a fatal now is
   /// that same death, sooner and without the map ever rebinding to the replacement.
-  pub(crate) fn walk(&self) -> io::Result<Vec<SeedEntry>> {
+  pub(crate) fn walk(&self) -> io::Result<WalkSeed> {
     seed_walk(
       &self.root,
       self.fsid,
@@ -508,6 +539,7 @@ impl ReseedContext {
       &self.root_fid,
       &self.exclusions,
       self.max_directories,
+      MAX_WALK_DECLINES,
     )
     .map_err(WalkError::into_io)
   }
@@ -523,7 +555,7 @@ impl ReseedContext {
   /// viable → fall back / typed error) from a vanished root (root-unavailable). Only
   /// the pre-live spawn calls this; the live reseed re-opens the path via the
   /// `io::Error`-folding [`walk`](Self::walk).
-  fn seed_at_fd(&self, root_fd: BorrowedFd<'_>) -> Result<Vec<SeedEntry>, WalkError> {
+  fn seed_at_fd(&self, root_fd: BorrowedFd<'_>) -> Result<WalkSeed, WalkError> {
     let root_fd = root_fd.try_clone_to_owned().map_err(WalkError::RootGone)?;
     // The spawn passes the CAPTURED `root_mnt_id` (unlike the reseed/subtree walks,
     // which re-read it from the fd they reopened): it was read from THIS very pin at
@@ -533,11 +565,14 @@ impl ReseedContext {
     seed_from_fd(
       root_fd,
       &self.root,
-      self.fsid,
-      self.root_dev,
-      self.root_mnt_id,
-      &self.exclusions,
-      self.max_directories,
+      &WalkFrame {
+        fsid: self.fsid,
+        root_dev: self.root_dev,
+        fence_mnt_id: self.root_mnt_id,
+        exclusions: &self.exclusions,
+        budget: self.max_directories,
+        decline_budget: MAX_WALK_DECLINES,
+      },
     )
   }
 
@@ -558,22 +593,75 @@ impl ReseedContext {
   /// blind → fatal). Bounded by the moved subtree's directory count — the honest
   /// cost of admitting a foreign populated directory.
   ///
-  /// `budget` is the directory ceiling for THIS walk — the room the map still has
+  /// `budget` is the MAP ceiling for THIS walk — the room the map still has
   /// (`cap - len`), NOT the full cap: an additive move-in into a near-cap map must
   /// fence on what is actually left, else it could allocate a whole extra `cap` of
   /// descendants before the reader's additive over-cap check fired. `None` =
   /// uncapped. The reader computes it from the map after the moved-in top is
   /// learned; the spawn/reseed walks pass the full cap instead, since they seed a
   /// FRESH (empty) map.
+  ///
+  /// `max_declines` is the WALK-OUTPUT ceiling, and it is the SECOND parameter
+  /// precisely because the two may never be one number — see [`fence_declines`].
+  /// The spawn, reseed and admission drivers each start a fresh decline vector, so
+  /// they pass the whole of [`MAX_WALK_DECLINES`]; the move-in driver appends into
+  /// a vector shared by every walk in the buffer, so the reader passes what is
+  /// LEFT of that same allowance. Neither figure is ever subtracted from the
+  /// other: a decline seeds no map node and a map node reports no decline.
   pub(crate) fn walk_subtree(
     &self,
     subtree: &Path,
     subtree_fid: &Fid,
     budget: Option<usize>,
-  ) -> io::Result<Vec<SeedEntry>> {
+    max_declines: usize,
+  ) -> io::Result<WalkSeed> {
     subtree_walk(
       subtree,
       subtree_fid,
+      self.fsid,
+      self.root_dev,
+      &self.exclusions,
+      budget,
+      max_declines,
+    )
+    .map_err(WalkError::into_io)
+  }
+
+  /// Walks the ground a departed mount REVEALED at `location` into the map — the
+  /// ADMISSION RESEED, and the fourth of this context's walk drivers.
+  ///
+  /// The precondition is the whole point, and it is checked from the pinned fd
+  /// rather than from any path-derived fact: the location's parent is opened
+  /// no-symlink, `location` itself is opened RELATIVE to that parent by its single
+  /// name component (so the parent/child relation is the kernel's answer, not a
+  /// second path resolution's), and the frame of THAT object is read from THAT fd.
+  /// A location still covered — by a mount the refresh raced, or by a remount that
+  /// re-covered it since — sits across `frame` and is REFUSED
+  /// ([`AdmitWalk::StillCovered`]); walking it would fence the descent on the
+  /// BIND's own frame and seed an out-of-root alias subtree into the admission map,
+  /// which is precisely the breach [`descend`]'s mount fence exists to prevent.
+  ///
+  /// The frame `location` is fenced against is read at EXECUTION time from a
+  /// freshly opened `root`, held open across both mount-id reads; `frame` is the
+  /// core's captured value, and a live frame that differs from it refuses the
+  /// request outright ([`AdmitWalk::Stale`]). A mount id is only meaningful
+  /// against another read of the same instant — see [`revealed_walk`].
+  ///
+  /// `budget` is the room the map has LEFT (`cap - len`), never the full cap: this
+  /// is an additive walk into a live map, exactly like
+  /// [`walk_subtree`](Self::walk_subtree), so a near-cap map must fence on what
+  /// remains or a populated revealed subtree could allocate a whole extra cap
+  /// before the reader's additive over-cap check fired.
+  pub(crate) fn walk_revealed(
+    &self,
+    location: &Path,
+    frame: crate::os::ScopeFrame,
+    budget: Option<usize>,
+  ) -> io::Result<AdmitWalk> {
+    revealed_walk(
+      location,
+      &self.root,
+      frame,
       self.fsid,
       self.root_dev,
       &self.exclusions,
@@ -682,6 +770,127 @@ impl WalkError {
   }
 }
 
+/// What ONE descent produced: the directories it admitted, and the boundaries it
+/// DECLINED.
+///
+/// The declines are SEAM 2 of the mount design. The walk already computes the
+/// exact `(location, dev, mnt_id)` triple at the moment its fence stops it — the
+/// same two-fence truth table [`ScopeFrame::crossed_by`](crate::os::ScopeFrame)
+/// uses, mount id primary with the device belt kept — and every walk driver used
+/// to discard it. Carrying it out in the SAME value as the entries is what lets
+/// the core record where its coverage actually ends without re-deriving
+/// anything: on a kernel-recursive mark the core runs no enumerate of its own to
+/// learn it from, so a decline the walk drops is a boundary nothing in the
+/// system ever sees.
+///
+/// A decline is NOT an error and never abandons a descent — the walk goes on to
+/// the next sibling exactly as it always did — so the entries this carries are
+/// unchanged by the seam.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct WalkSeed {
+  /// The admitted directories, parent-linked — what seeds (or extends) the map.
+  pub(crate) entries: Vec<SeedEntry>,
+  /// The boundaries the descent's mount fence / device belt declined.
+  pub(crate) declined: Vec<crate::os::DeclinedBoundary>,
+  /// The MOUNT ID this descent was fenced against, read from the fd the walk
+  /// pinned — the walk root's own frame, whatever that root was: the watched root
+  /// for the spawn and reseed walks, the moved-in directory for a subtree walk,
+  /// the revealed location for an admission walk.
+  ///
+  /// It travels out for the same reason the declines do: it is a fact only the
+  /// walk holds. The WHOLE-ROOT reseed's value is the one the core reads — it is
+  /// the root this generation actually describes, and a core that has since
+  /// adopted a different one must not install it
+  /// ([`RootRecovery::root_mnt_id`](crate::os::RootRecovery)). `None` where the
+  /// host reports no mount ids, exactly as everywhere else.
+  pub(crate) fence_mnt_id: Option<u64>,
+}
+
+/// The MAP budget's fence (design §4.9), applied BEFORE an entry is pushed so an
+/// oversized tree never materializes the inventory at all.
+///
+/// `budget` is `max_map_directories`, and it bounds exactly what its name says:
+/// the directories this walk would ADMIT into the admission map. Nothing else may
+/// be charged against it. It is a public option whose documented meaning is the
+/// map's size, so spending it on the walk's report made a legal configuration
+/// illegal — `max_map_directories = 1` rejecting a root that holds one boundary,
+/// and, more generally, any tree with `entries <= cap` that had ever declined
+/// anything failing at spawn and killing a live scope on recovery. The walk's
+/// OUTPUT is bounded separately, by [`fence_declines`].
+///
+/// An over-budget abort is [`WalkError::Incomplete`], which the spawn folds to
+/// `NotViable` (fall back / typed error) and the reseed, move-in and admission
+/// walks fold to their loss-then-fatal ladder — the existing outcomes, not a new
+/// one.
+fn fence_entries(budget: Option<usize>, seed: &WalkSeed) -> Result<(), WalkError> {
+  if budget.is_some_and(|budget| seed.entries.len() >= budget) {
+    return Err(WalkError::Incomplete(io::Error::other(
+      "the fanotify seed walk exceeded the directory budget; the tree is too large to map",
+    )));
+  }
+  Ok(())
+}
+
+/// The WALK-OUTPUT budget's fence, applied BEFORE a decline is pushed — the other
+/// half of the split [`fence_entries`] documents.
+///
+/// A decline never becomes a map node, so it cannot be charged to
+/// `max_map_directories`; but it does cost a `PathBuf` in a vector the walk hands
+/// out, and bounding the entries alone left that vector free to grow without
+/// limit. A FLAT tree of boundary directories — the btrfs-subvolume layout this
+/// design exists to support, or a container host's mount farm — produces nothing
+/// BUT declines: every child is opened, stat'd, declined and skipped without ever
+/// reaching an entry fence, so the entry budget fences a vector that never grows
+/// while the one that does grows unbounded.
+///
+/// `max_declines` is the caller's SHARE of [`MAX_WALK_DECLINES`], and on three of
+/// the four production walk drivers that share is the whole of it: the spawn, the
+/// reseed and the admission walk each fill a decline vector of their own. The
+/// MOVE-IN driver is the one exception — every walk in a buffer appends into one
+/// shared accumulator, so the reader passes what is LEFT of the allowance and the
+/// buffer total stays under the one ceiling. What no caller may ever pass is a
+/// figure derived from the MAP's remaining room: that spends `max_map_directories`
+/// on a vector the map does not account for, which is the coupling this split
+/// exists to forbid. Only the cells that prove this fence exists pass a small one.
+///
+/// Over-budget is the same
+/// [`WalkError::Incomplete`] the entry fence raises, so it degrades through the
+/// walk-completeness ladder already in place (spawn → `NotViable` → inotify under
+/// `Auto`; reseed/move-in/admission → retry → blind → fatal, whose loss barrier
+/// covers the whole root) rather than inventing a truncation protocol whose
+/// partial report would silently license
+/// `retire_unwalked_boundaries` to retire records it never observed.
+fn fence_declines(max_declines: usize, seed: &WalkSeed) -> Result<(), WalkError> {
+  if seed.declined.len() >= max_declines {
+    return Err(WalkError::Incomplete(io::Error::other(
+      "the fanotify seed walk exceeded the boundary-report budget; the tree has too many mount \
+       boundaries to report",
+    )));
+  }
+  Ok(())
+}
+
+/// The most boundaries ONE REPORT may carry — the walk-output bound
+/// [`fence_declines`] enforces, and deliberately NOT the public
+/// `max_map_directories`.
+///
+/// Sized so it binds only pathology while staying far above any real layout: a
+/// btrfs/snapper/docker root holds tens of subvolumes and a container host's mount
+/// farm hundreds, against a ceiling of 65536 `DeclinedBoundary` values (a
+/// `PathBuf` plus two integers each — single-digit megabytes at the very top). A
+/// root that exceeds it is one where the walk's report, not the map, is the thing
+/// that would exhaust memory, and the completeness ladder is the honest terminal
+/// there.
+///
+/// "One report", not "one walk", is the unit that matters: three of the four walk
+/// drivers fill a decline vector of their own and so spend the whole allowance,
+/// while the MOVE-IN driver appends into one vector shared by every walk in the
+/// buffer. That accumulator is bounded HERE — the reader hands each move-in walk
+/// what is left of this allowance — and never by deducting declines from the map's
+/// remaining capacity, which would spend a public option on a vector it does not
+/// account for. Visible to the reader for exactly that reason.
+pub(super) const MAX_WALK_DECLINES: usize = 65_536;
+
 /// Opens the walk-root path `root` as a pinned directory fd for the descent —
 /// the ONLY entry point that starts from a path rather than an inherited parent
 /// fd, so it carries the whole no-escape burden. Uses `openat2` with
@@ -741,7 +950,8 @@ fn seed_walk(
   expected: &Fid,
   exclusions: &[std::path::PathBuf],
   max_directories: Option<usize>,
-) -> Result<Vec<SeedEntry>, WalkError> {
+  max_declines: usize,
+) -> Result<WalkSeed, WalkError> {
   // Pin the root as an fd (no-symlink resolution) BEFORE anything else: its
   // handle and its children both come from this fd, never a re-resolved name. A
   // failure to open it is a race reported as root-unavailable (the probe already
@@ -774,11 +984,14 @@ fn seed_walk(
   seed_from_fd(
     root_fd,
     root,
-    fsid,
-    root_dev,
-    fence_mnt_id,
-    exclusions,
-    max_directories,
+    &WalkFrame {
+      fsid,
+      root_dev,
+      fence_mnt_id,
+      exclusions,
+      budget: max_directories,
+      decline_budget: max_declines,
+    },
   )
 }
 
@@ -825,7 +1038,13 @@ fn seed_walk(
 ///   root anchor is load-bearing, but the probe already proved the root openable
 ///   and exportable, so its absence is a race reported as root-unavailable.
 ///
-/// The directory cap (`max_directories`, design §4.9) fences the ANCHOR here,
+/// Everything the descent is bounded and encoded against arrives as one
+/// [`WalkFrame`] — the superblock id, the mount fence and device belt, the
+/// exclusions and the two budgets — because that is precisely what this function
+/// forwards to [`descend`] unchanged, and both of its callers were already
+/// carrying the same six values positionally.
+///
+/// The directory cap ([`WalkFrame::budget`], design §4.9) fences the ANCHOR here,
 /// before it is pushed, then [`descend`] fences every child: the map may never
 /// exceed the cap, and the anchor is its first node, so a `Some(0)` cap is
 /// `Incomplete` (no map may exist) exactly as an over-cap descent is. This keeps
@@ -840,17 +1059,13 @@ fn seed_walk(
 fn seed_from_fd(
   root_fd: OwnedFd,
   root: &Path,
-  fsid: [u8; 8],
-  root_dev: u64,
-  fence_mnt_id: Option<u64>,
-  exclusions: &[std::path::PathBuf],
-  max_directories: Option<usize>,
-) -> Result<Vec<SeedEntry>, WalkError> {
+  frame: &WalkFrame<'_>,
+) -> Result<WalkSeed, WalkError> {
   // The root anchor is load-bearing: without its handle the map has no base to
   // resolve any path against, so its absence is a spawn/reseed failure, never an
   // empty success. Encoded from the pinned fd, so it names exactly the object we
   // pinned.
-  let Some(root_fid) = handle_fid_at(root_fd.as_fd(), fsid) else {
+  let Some(root_fid) = handle_fid_at(root_fd.as_fd(), frame.fsid) else {
     return Err(WalkError::RootGone(io::Error::new(
       io::ErrorKind::Unsupported,
       "the watched root does not export a file handle",
@@ -864,25 +1079,17 @@ fn seed_from_fd(
   // terminal fatal), exactly as an oversized descent does. Without this fence a
   // zero cap would seed a live one-node map whose first admitted event trips the
   // `over_capacity` fatal instead of the documented seed-time selection.
-  if max_directories == Some(0) {
+  if frame.budget == Some(0) {
     return Err(WalkError::Incomplete(io::Error::other(
       "the fanotify seed walk exceeded the directory budget; the tree is too large to map",
     )));
   }
-  let mut seed = vec![SeedEntry::root(root_fid.clone(), root)];
-  descend(
-    root_fd,
-    root_fid,
-    root,
-    &WalkFrame {
-      fsid,
-      root_dev,
-      fence_mnt_id,
-      exclusions,
-      budget: max_directories,
-    },
-    &mut seed,
-  )?;
+  let mut seed = WalkSeed {
+    entries: vec![SeedEntry::root(root_fid.clone(), root)],
+    declined: Vec::new(),
+    fence_mnt_id: frame.fence_mnt_id,
+  };
+  descend(root_fd, root_fid, root, frame, &mut seed)?;
   Ok(seed)
 }
 
@@ -921,7 +1128,8 @@ fn subtree_walk(
   root_dev: u64,
   exclusions: &[std::path::PathBuf],
   budget: Option<usize>,
-) -> Result<Vec<SeedEntry>, WalkError> {
+  max_declines: usize,
+) -> Result<WalkSeed, WalkError> {
   // The moved directory is still in-map and pending its walk, so pinning it must
   // succeed: any failure (a vanish/shape-change included) is a coverage hole, not
   // a race — Incomplete, escalated through the reader's retry-then-fatal. Pinned
@@ -949,7 +1157,10 @@ fn subtree_walk(
   // belt degrade.
   let fence_mnt_id =
     root_mount_id(subtree_fd.as_fd()).map_err(|err| WalkError::Incomplete(err.into()))?;
-  let mut seed = Vec::new();
+  let mut seed = WalkSeed {
+    fence_mnt_id,
+    ..WalkSeed::default()
+  };
   descend(
     subtree_fd,
     subtree_fid.clone(),
@@ -960,10 +1171,301 @@ fn subtree_walk(
       fence_mnt_id,
       exclusions,
       budget,
+      decline_budget: max_declines,
     },
     &mut seed,
   )?;
   Ok(seed)
+}
+
+/// What ONE admission-reseed walk answered — the walk half of an
+/// [`AdmitRequest`](crate::os::AdmitRequest).
+///
+/// Four arms: the three things a departed boundary's location can turn out to be
+/// — only the first of which admits anything — plus the refusal that fires before
+/// any of them is asked, when the request's own frame no longer describes the
+/// root.
+#[derive(Debug)]
+pub(crate) enum AdmitWalk {
+  /// The location resolved to a plain in-root directory on the scope's own
+  /// frame, and this is the ground it revealed: `seed`'s entries are the
+  /// location itself plus every directory under it, and `parent` is the FID of
+  /// the directory it hangs beneath — which the caller must find ADMITTED before
+  /// seeding, or the whole inventory would enter linked under a node the map
+  /// cannot reach.
+  Revealed {
+    /// The revealed location's parent directory, encoded from the fd the child
+    /// was opened relative to.
+    parent: Fid,
+    /// The revealed location and its descendants, plus whatever boundaries the
+    /// descent itself declined.
+    seed: WalkSeed,
+  },
+  /// The location is STILL a boundary: it sits across the scope's frame, so
+  /// either the refresh raced a live mount, a remount re-covered the location
+  /// since, or what the departed mount revealed is itself a boundary. NOTHING was
+  /// walked — walking it would fence the descent on that object's frame and seed
+  /// an alias subtree.
+  ///
+  /// The identity travels because the two fences are independent and the core has
+  /// to tell them apart: a btrfs subvolume trips the DEVICE belt while carrying
+  /// the root's own mount id, and re-recording a departed mount's row-confirmed
+  /// record over one of those never converges (see
+  /// [`AdmitOutcome::StillCovered`](crate::os::AdmitOutcome::StillCovered)). Both
+  /// halves are read off the fd this walk pinned, never re-resolved.
+  StillCovered {
+    /// The device of the object at the location, from this walk's `fstat`.
+    dev: Option<u64>,
+    /// That object's mount id, or `None` where the host answers none.
+    mnt_id: Option<u64>,
+  },
+  /// Nothing is owed: the location no longer resolves to a plain directory (the
+  /// mountpoint was removed after the unmount, or its name now holds a
+  /// symlink/file), or the caller EXCLUDES it, so no part of it may enter the map
+  /// at all.
+  ///
+  /// A FILE-target bind — the `resolv.conf` class, ubiquitous in containers —
+  /// lands here rather than in [`StillCovered`](Self::StillCovered) even when it
+  /// is genuinely still mounted, because the `O_DIRECTORY` open refuses it before
+  /// the frame is ever read. That is the right answer anyway: the map holds only
+  /// DIRECTORIES, so a file has no ground to admit, and the record the core then
+  /// drops is re-recorded (with a cover) as an arrival by the very next
+  /// authoritative refresh that still lists its row.
+  Nothing,
+  /// The request was issued against a frame that is no longer the root's, so it
+  /// is not EXECUTED at all: nothing opened past the check, nothing walked,
+  /// nothing seeded.
+  ///
+  /// # The interval this closes, and why the captured frame could not
+  ///
+  /// The core captures `(root_dev, root_mnt_id)` when it PARKS the departure and
+  /// the walk runs arbitrarily later, on this thread. Legacy mount ids are
+  /// allocated lowest-free and freed on umount, so across that interval a
+  /// departure can free the child's id while a same-object remount of the ROOT
+  /// takes it, and a same-device bind at the departed location can take the id
+  /// the root just gave up. The captured frame then reads `(D, R)` against a
+  /// bind that reads `(D, R)`, [`ScopeFrame::crossed_by`](crate::os::ScopeFrame)
+  /// sees no boundary, and the descent seeds the BIND's subtree into the
+  /// admission map — every mutation on the alias's real path outside the root
+  /// then resolves and delivers as in-root. That is the exact breach
+  /// [`descend`]'s mount fence exists to prevent, reached through the one walk
+  /// driver that fenced on a value it did not read itself.
+  ///
+  /// [`seed_walk`] and [`subtree_walk`] have always read their fence from the fd
+  /// they just opened. This is that same discipline applied here, and the refusal
+  /// is what it costs: a frame the request no longer shares with the live root is
+  /// not a frame this walk may substitute for, because the core's whole coverage
+  /// set is relative to it.
+  Stale,
+}
+
+/// The ADMISSION-RESEED walk: maps the ground a departed mount revealed at
+/// `location`, having first PROVED from a pinned fd that the location is no
+/// longer covered.
+///
+/// # The frame check, and why it is not a `stat` of the path
+///
+/// `location`'s PARENT is opened no-symlink ([`open_walk_dir`]), and `location`
+/// itself is then opened RELATIVE to it by its single trailing name component
+/// with `O_NOFOLLOW | O_DIRECTORY` — the same one-component-under-a-held-fd step
+/// [`descend`] makes for every child, which cannot escape the parent and cannot
+/// follow a symlink. So the object whose `(dev, mnt_id)` is read is the object
+/// that actually hangs under that parent under that name, and the parent FID the
+/// caller links the inventory beneath is encoded from the very fd the child was
+/// opened through. A path-resolved `stat` could answer about a different object
+/// than the walk then descends; this cannot.
+///
+/// The child's frame comes from that fd exactly as [`seed_walk`]'s and
+/// [`subtree_walk`]'s do (`fstat` for the device belt, `root_mount_id` for the
+/// mount fence). What it is compared AGAINST is read here too, and that is the
+/// half this walk used to take on trust.
+///
+/// # The comparison is between two fds held OPEN AT THE SAME TIME
+///
+/// `root` is opened as well, and both `statx` reads happen while both fds are
+/// held. That is the whole soundness argument, and nothing weaker gives it: a
+/// mount id is unique among LIVE mounts and an open fd pins its vfsmount (so its
+/// id cannot be freed, and therefore cannot be re-allocated, while the fd is
+/// open) — so two ids read from two simultaneously-held fds are equal if and only
+/// if they name the SAME live mount. Reading the child now and comparing against
+/// a root id captured at some earlier moment proves nothing of the kind: ids are
+/// allocated lowest-free, so a root that re-mounted and a bind that took the id
+/// the root gave up compare EQUAL and the descent walks straight across the mount
+/// (see [`AdmitWalk::Stale`]).
+///
+/// The request's own captured frame is still consulted — but as a STALENESS test,
+/// not as the fence: a live root frame that differs from it means the core issued
+/// this request for a world it has since left, so the request is refused
+/// ([`AdmitWalk::Stale`]) rather than executed against a frame the core does not
+/// hold any more. Where they agree, fencing against either is the same comparison.
+///
+/// The reopened root is deliberately NOT handle-checked against the map anchor
+/// the way [`seed_walk`]'s is. A frame is a property of the MOUNT, so a
+/// same-superblock object swapped in at the root path answers the same frame and
+/// the fence is unaffected — and an inventory linked under a parent the map
+/// cannot resolve is dropped by the caller before it can seed anything.
+///
+/// Both unknown legs of [`crossed_by`](crate::os::ScopeFrame::crossed_by) still
+/// PASS, exactly as everywhere else that reads this frame: a kernel with no
+/// `STATX_MNT_ID` must not refuse every reseed. On the 5.17 fanotify floor both
+/// halves are always known.
+///
+/// # Fence and completeness
+///
+/// The descent fences on the REVEALED location's own mount id (read from the fd
+/// just checked), never on a captured value — the same discipline
+/// [`subtree_walk`] follows. Having passed the frame check, that id IS the
+/// scope's when both are known, so a submount nested under the revealed ground is
+/// declined and surfaces as a boundary like any other.
+///
+/// Failure classification is [`subtree_walk`]'s, not [`seed_walk`]'s: a
+/// vanish/shape-change at the TOP is benign here (the mountpoint may well have
+/// been removed after the unmount) and answers [`AdmitWalk::Nothing`], while every
+/// other failure — permission, I/O, an unexportable handle, a `statx` that failed
+/// as a syscall — is [`WalkError::Incomplete`], folding into the reader's
+/// retry-once-then-loss-barrier ladder. A half-mapped revealed subtree is never
+/// left standing.
+fn revealed_walk(
+  location: &Path,
+  root: &Path,
+  frame: crate::os::ScopeFrame,
+  fsid: [u8; 8],
+  root_dev: u64,
+  exclusions: &[std::path::PathBuf],
+  budget: Option<usize>,
+) -> Result<AdmitWalk, WalkError> {
+  // Excluded ground never enters the map — the option's whole enforcement on a
+  // kernel-recursive mark — so an excluded location is owed no admission at all.
+  // Checked before any open: the caller asked not to be told about this subtree,
+  // and a walk of it is exactly the "told about it" the fence refuses.
+  if super::super::excluded(exclusions, location) {
+    return Ok(AdmitWalk::Nothing);
+  }
+  // Strictly under the root, so both halves exist; a location that cannot be
+  // split into parent + single name is not addressable as a child and owes
+  // nothing.
+  let (Some(parent_path), Some(name)) = (location.parent(), location.file_name()) else {
+    return Ok(AdmitWalk::Nothing);
+  };
+  let parent_fd = match open_walk_dir(parent_path) {
+    Ok(fd) => fd,
+    // The parent vanished or changed shape: whatever was revealed went with it,
+    // and the delete that took it is its own event. Any other failure leaves the
+    // revealed subtree unmapped, which is a coverage hole.
+    Err(err) => {
+      return match classify_walk_skip(err) {
+        WalkSkip::VanishedRace => Ok(AdmitWalk::Nothing),
+        WalkSkip::Incomplete => Err(WalkError::Incomplete(err.into())),
+      };
+    }
+  };
+  let child_fd = match openat(parent_fd.as_fd(), name, WALK_DIR_FLAGS, Mode::empty()) {
+    Ok(fd) => fd,
+    Err(err) => {
+      return match classify_walk_skip(err) {
+        WalkSkip::VanishedRace => Ok(AdmitWalk::Nothing),
+        WalkSkip::Incomplete => Err(WalkError::Incomplete(err.into())),
+      };
+    }
+  };
+  // The ROOT, pinned BEFORE either mount id is read and held across both — the
+  // simultaneity the comparison below rests on. A root that cannot be opened
+  // leaves the walk with nothing to fence against, which is a coverage hole and
+  // never a benign vanish: it folds into the reader's retry-then-loss-barrier
+  // ladder like any other incomplete walk.
+  let root_fd = open_walk_dir(root).map_err(|err| WalkError::Incomplete(err.into()))?;
+  let stat = fstat(&child_fd).map_err(|err| WalkError::Incomplete(err.into()))?;
+  if stat.st_mode & S_IFMT != S_IFDIR {
+    // Structurally impossible after `O_DIRECTORY`, but the map must never admit a
+    // non-directory handle.
+    return Ok(AdmitWalk::Nothing);
+  }
+  // A statx SYSCALL failure is Incomplete, never a silent degrade to the device
+  // belt: the frame check is this walk's precondition, and answering it from half
+  // the evidence is exactly the alias admission it exists to refuse. BOTH reads
+  // are taken here, with both fds still open.
+  let child_mnt_id =
+    root_mount_id(child_fd.as_fd()).map_err(|err| WalkError::Incomplete(err.into()))?;
+  let root_stat = fstat(&root_fd).map_err(|err| WalkError::Incomplete(err.into()))?;
+  let live = crate::os::ScopeFrame {
+    root_dev: Some(root_stat.st_dev),
+    root_mnt_id: root_mount_id(root_fd.as_fd()).map_err(|err| WalkError::Incomplete(err.into()))?,
+  };
+  drop(root_fd);
+  if live != frame {
+    // The core issued this request for a frame the root no longer has. Refuse it
+    // whole rather than substituting the live one: the coverage set the departure
+    // verdict came out of is relative to the frame the request carries, so a
+    // superseded request is answered by the whole-root recovery the reader
+    // escalates to, not by a located walk nobody asked for.
+    return Ok(AdmitWalk::Stale);
+  }
+  if live.crossed_by(Some(stat.st_dev), child_mnt_id) {
+    // The identity is the one just read off THIS fd, so the core learns which of
+    // the two fences fired: a live mount (its own id) or the device-only boundary
+    // a departed mount uncovered (the root's id, another device).
+    return Ok(AdmitWalk::StillCovered {
+      dev: Some(stat.st_dev),
+      mnt_id: child_mnt_id,
+    });
+  }
+  // The parent's handle from the PINNED parent fd, so the inventory links under
+  // the object the child is actually opened beneath.
+  //
+  // Read AFTER the frame check, not before it: a location that is still covered
+  // admits nothing, so demanding a handle from its parent first would turn a
+  // definite `StillCovered` into an `Incomplete` — the loss ladder — for every
+  // covered location whose parent sits on a filesystem that exports none
+  // (overlayfs, the root of most containers). Nothing between the two opens and
+  // this call can move the object: the parent fd has been held throughout.
+  let Some(parent_fid) = handle_fid_at(parent_fd.as_fd(), fsid) else {
+    return Err(WalkError::Incomplete(io::Error::new(
+      io::ErrorKind::Unsupported,
+      "the revealed location's parent does not export a file handle",
+    )));
+  };
+  // The cap fences the revealed location itself, not just its descendants: a map
+  // with no room left cannot take even the one node, so it folds to the additive
+  // over-cap terminal here rather than pushing an entry `descend` would then
+  // never have counted.
+  if budget == Some(0) {
+    return Err(WalkError::Incomplete(io::Error::other(
+      "the fanotify admission reseed exceeded the directory budget; the map has no room left",
+    )));
+  }
+  let Some(child_fid) = handle_fid_at(child_fd.as_fd(), fsid) else {
+    return Err(WalkError::Incomplete(io::Error::new(
+      io::ErrorKind::Unsupported,
+      "the revealed location does not export a file handle",
+    )));
+  };
+  let mut seed = WalkSeed {
+    entries: vec![SeedEntry::child(
+      child_fid.clone(),
+      parent_fid.clone(),
+      name.to_os_string(),
+    )],
+    declined: Vec::new(),
+    fence_mnt_id: child_mnt_id,
+  };
+  descend(
+    child_fd,
+    child_fid,
+    location,
+    &WalkFrame {
+      fsid,
+      root_dev,
+      fence_mnt_id: child_mnt_id,
+      exclusions,
+      budget,
+      decline_budget: MAX_WALK_DECLINES,
+    },
+    &mut seed,
+  )?;
+  Ok(AdmitWalk::Revealed {
+    parent: parent_fid,
+    seed,
+  })
 }
 
 /// One open directory in the descent: the pinned fd (the descent reads its
@@ -1003,8 +1505,13 @@ struct WalkFrame<'a> {
   fence_mnt_id: Option<u64>,
   /// The caller's exclusion fence, applied before a child is opened.
   exclusions: &'a [std::path::PathBuf],
-  /// The ceiling on entries this descent may push; `None` is uncapped.
+  /// The ceiling on ENTRIES this descent may push — `max_map_directories`, the
+  /// public admission-map option; `None` is uncapped.
   budget: Option<usize>,
+  /// The ceiling on DECLINES this descent may report — the walk-output bound,
+  /// never the map option. Always [`MAX_WALK_DECLINES`] outside the cells that
+  /// prove the fence exists.
+  decline_budget: usize,
 }
 
 /// The shared iterative descent: reads `root_fd` (an already-pinned, already-FID'd
@@ -1059,24 +1566,38 @@ struct WalkFrame<'a> {
 /// skipped, anything else on an existing in-root directory aborts as
 /// [`WalkError::Incomplete`].
 ///
-/// # Directory budget
+/// # Two budgets, and why they are two
 ///
-/// `budget` is the ceiling on entries THIS descent may push (design §4.9): the
-/// walk aborts with a cap [`WalkError::Incomplete`] the moment `seed` would exceed
-/// it — fenced BEFORE the oversized inventory is built, so a huge tree never
-/// materializes a multi-gigabyte `Vec`. The spawn/reseed pass the FULL cap (they
-/// seed a fresh empty map), while the moved-in subtree walk passes the REMAINING
-/// room (`cap - map.len()`, an additive walk into a near-cap map): threading the
-/// room left keeps a populated move-in from allocating a whole extra cap before the
-/// reader's additive check. `None` = uncapped. The spawn folds an over-budget abort
-/// to `NotViable` (fall back / typed error) and the reseed/move-in to the terminal
-/// `Fatal`, matching the walk-completeness taxonomy.
+/// `budget` is the MAP budget (design §4.9, `max_map_directories`) and bounds only
+/// what this descent would ADMIT: the walk aborts with a cap
+/// [`WalkError::Incomplete`] the moment its next ENTRY push would exceed it,
+/// fenced BEFORE the oversized inventory is built so a huge tree never
+/// materializes a multi-gigabyte `Vec`. `decline_budget` is the WALK-OUTPUT bound
+/// (the caller's share of [`MAX_WALK_DECLINES`]) and bounds the declines the same
+/// way.
+///
+/// Charging both to one number was wrong in both directions. Bounding the ENTRIES
+/// alone left a flat tree of boundary directories — the btrfs-subvolume and
+/// container-mount-farm shapes — free to build an unbounded decline list under a
+/// budget that was never reached. Bounding them TOGETHER spent a public option on
+/// a vector that never becomes a map node, so `max_map_directories = 1` rejected a
+/// root holding one boundary and any tree that fit before but had declined
+/// anything failed at spawn — and failed twice during recovery, killing a live
+/// scope. Two fences, one per vector, is what makes each number mean what it says.
+///
+/// The spawn/reseed pass the FULL map cap (they seed a fresh empty map), while the
+/// moved-in subtree walk passes the REMAINING room (`cap - map.len()`, an additive
+/// walk into a near-cap map): threading the room left keeps a populated move-in
+/// from allocating a whole extra cap before the reader's additive check. `None` =
+/// uncapped. Either fence's abort folds the same way — the spawn to `NotViable`
+/// (fall back / typed error) and the reseed/move-in to the terminal `Fatal`,
+/// matching the walk-completeness taxonomy.
 fn descend(
   root_fd: OwnedFd,
   root_fid: Fid,
   root_path: &Path,
   frame: &WalkFrame<'_>,
-  seed: &mut Vec<SeedEntry>,
+  seed: &mut WalkSeed,
 ) -> Result<(), WalkError> {
   let &WalkFrame {
     fsid,
@@ -1084,6 +1605,7 @@ fn descend(
     fence_mnt_id,
     exclusions,
     budget,
+    decline_budget,
   } = frame;
   let root_reader = Dir::new(root_fd).map_err(|err| WalkError::Incomplete(err.into()))?;
   // The handles walked THIS run — the cycle/diamond guard. Seeded with the root so
@@ -1180,10 +1702,66 @@ fn descend(
     // `st_dev`/`st_mode` are `u64`/`u32` on every Linux target (the 32-bit
     // `Stat` declares them so explicitly, the 64-bit `c_ulong`/`c_uint` aliases
     // resolve to the same), so the comparisons need no conversion.
+    // The child's MOUNT id, read from the very fd the walk pinned — ONE `statx`,
+    // taken BEFORE either fence so that BOTH of them record the identity they saw
+    // rather than only the one whose own comparison needs it.
+    //
+    // This read used to sit BELOW the device belt, so a foreign-device decline was
+    // recorded with `mnt_id: None` — and an id-less observation is one the core's
+    // ledger can only hold as `Standing::Unknown`, which joins no census and is
+    // cleared only by a row standing at its location. That recorded an ambiguity
+    // from an observation that COULD tell a real vfsmount from a same-mount
+    // subvolume, and the failure was reachable: a genuine mount that arrives after
+    // the spawn census, is first observed by a LIVE walk, and departs before any
+    // mountinfo refresh lists it has its departure derived by nothing precise at
+    // all — no located cover, no admission request, and a revealed subtree the
+    // walk never seeded into the FID map. Fanotify goes silently blind there until
+    // some
+    // unrelated whole-map reseed. The rule this now encodes, once, for every fence
+    // in this walk: NEVER mint an exempt record from an observation that could not
+    // have distinguished the two.
+    //
+    // The cost is one `statx` per foreign-device DECLINE, which is rare — every
+    // child that passes the belt already paid this exact syscall.
+    //
+    // A SUCCESSFUL mask-absent read (`Ok(None)` — below 5.8, or `stx_mask` unset)
+    // means the host answers no mount ids at all: the mount fence declines, the
+    // device belt alone governs, and a record born `None` there says "nothing here
+    // can answer mount ids", never "this observer did not ask" — the provenance
+    // upgrade from a later mount-table row is what rescues a genuine mount on those
+    // kernels. A statx SYSCALL FAILURE, by contrast, is classified like the `fstat`
+    // above ([`classify_walk_skip`]): a vanish/shape-change race is skipped, anything
+    // else is `Incomplete`. So a failed read yields an INCOMPLETE WALK — never an
+    // exempt record, and never a belt-only admission of a child whose mount could
+    // not be read.
+    let child_mnt_id = match root_mount_id(child_fd.as_fd()) {
+      Ok(child_mnt_id) => child_mnt_id,
+      Err(err) => match classify_walk_skip(err) {
+        WalkSkip::VanishedRace => continue,
+        WalkSkip::Incomplete => return Err(WalkError::Incomplete(err.into())),
+      },
+    };
     if stat.st_dev != root_dev {
       // A mount boundary (the cheap belt): a different device is always a different
       // superblock, not descended. `O_DIRECTORY` already guaranteed it is a
       // directory, so this is purely the device fence.
+      //
+      // SEAM 2, carrying the id read above. Whether that makes the record
+      // CONDEMNABLE is the core's question — the partition compares against the
+      // SCOPE's frame — but the record now carries the fact that question needs: a
+      // foreign-device vfsmount enters MOUNT-BACKED on any kernel that answers ids,
+      // and a btrfs subvolume (the root's own mount id on a different device) enters
+      // device-only and stays exempt, correctly, forever.
+      // The WALK-OUTPUT budget, fenced BEFORE this push exactly as the MAP budget
+      // is before an entry's: a decline costs a `PathBuf` like an entry does, and
+      // a tree that is all boundaries builds its whole report here. The two
+      // budgets are separate on purpose — see [`fence_declines`].
+      fence_declines(decline_budget, seed)?;
+      seed.declined.push(crate::os::DeclinedBoundary {
+        location: child_path,
+        dev: stat.st_dev,
+        mnt_id: child_mnt_id,
+      });
       continue;
     }
     // The PRIMARY mount fence: a child on a different MOUNT is a submount the mark
@@ -1194,24 +1772,30 @@ fn descend(
     // then delivering as in-root). `fence_mnt_id` is the walk root's OWN frame (the
     // caller read it from the pinned/reopened root fd), so this compares each child
     // against the mount the root lives on RIGHT NOW — a re-mounted root fences its
-    // children on the new frame, not a stale one. When either mount id is a SUCCESSFUL
-    // mask-absent read (`fence_mnt_id`/the child's is `Ok(None)` — below 5.8, or
-    // `stx_mask` unset) the fence declines and the device belt alone governs, never
-    // skipping a genuine in-root directory on a mask miss. A statx SYSCALL failure on
-    // the child, by contrast, is classified like the `fstat` above
-    // ([`classify_walk_skip`]) — a vanish/shape-change race is skipped, anything else
-    // is `Incomplete` — never laundered into a belt-only admission of a child whose
-    // mount could not be read.
-    let child_mnt_id = match root_mount_id(child_fd.as_fd()) {
-      Ok(child_mnt_id) => child_mnt_id,
-      Err(err) => match classify_walk_skip(err) {
-        WalkSkip::VanishedRace => continue,
-        WalkSkip::Incomplete => return Err(WalkError::Incomplete(err.into())),
-      },
-    };
+    // children on the new frame, not a stale one. When either mount id is a
+    // SUCCESSFUL mask-absent read (`fence_mnt_id`'s or the child's is `Ok(None)`) the
+    // fence declines and the device belt alone governs, never skipping a genuine
+    // in-root directory on a mask miss.
     if let (Some(root_mnt), Some(child_mnt)) = (fence_mnt_id, child_mnt_id)
       && root_mnt != child_mnt
     {
+      // SEAM 2, the same-superblock half. This is the `mount --bind` of a
+      // same-superblock directory: it shares the walk root's device, so the belt
+      // cannot see it, and on a kernel-recursive mark nothing else ever will.
+      //
+      // Whether it is CONDEMNABLE is the core's question, not this one: the
+      // partition compares against the SCOPE's frame, while `fence_mnt_id` is this
+      // walk root's. The two coincide for the spawn and reseed walks (their root is
+      // the scope root); a moved-in subtree walk fences on the moved directory's
+      // frame, and if that ever differs the record simply stays exempt until a row
+      // confirms it — the conservative direction.
+      // The same fence as the device belt's, for the same reason.
+      fence_declines(decline_budget, seed)?;
+      seed.declined.push(crate::os::DeclinedBoundary {
+        location: child_path,
+        dev: stat.st_dev,
+        mnt_id: Some(child_mnt),
+      });
       continue;
     }
     if stat.st_mode & S_IFMT != S_IFDIR {
@@ -1250,12 +1834,8 @@ fn descend(
     // move-in escalates to fatal). `budget` is the full cap for a fresh spawn/reseed
     // seed and the room actually left (`cap - map.len()`) for an additive move-in
     // subtree, so this fence trips at the map's true ceiling in both cases.
-    if budget.is_some_and(|budget| seed.len() >= budget) {
-      return Err(WalkError::Incomplete(io::Error::other(
-        "the fanotify seed walk exceeded the directory budget; the tree is too large to map",
-      )));
-    }
-    seed.push(SeedEntry::child(
+    fence_entries(budget, seed)?;
+    seed.entries.push(SeedEntry::child(
       fid.clone(),
       level.fid.clone(),
       os_name(name),
@@ -1337,7 +1917,7 @@ fn os_name(name: &std::ffi::CStr) -> std::ffi::OsString {
 /// A live fanotify source. Dropping it tears the reader down; prefer
 /// [`shutdown`](Self::shutdown) at an orderly exit.
 pub(crate) struct SourceHandle {
-  control: mpsc::Sender<Control>,
+  control: reader::ControlPost,
   wake: Arc<WakeState>,
   thread: Option<JoinHandle<()>>,
   /// The live stats the reader writes; the driver clones this into the registry
@@ -1349,6 +1929,73 @@ impl SourceHandle {
   /// The clonable handle to this source's live stats.
   pub(crate) fn backend_stats(&self) -> Arc<super::super::super::BackendStatsShared> {
     Arc::clone(&self.stats)
+  }
+
+  /// Hands the reader ONE BURST of admission reseeds — every cover a single
+  /// departure verdict parked — and wakes it once, answering whether the burst was
+  /// accepted for execution.
+  ///
+  /// `false` means the reader thread is already gone (its inbox dropped), so
+  /// nothing will ever run these walks or answer their tickets — the caller must
+  /// resolve every one of the round trips itself rather than wait for replies that
+  /// cannot come. All or none: an inbox that is gone takes none of them.
+  ///
+  /// # A burst, not a request at a time
+  ///
+  /// The plural is the contract. One mount-table refresh can condemn many
+  /// boundaries at once and the core parks a cover on each, so a burst is what
+  /// this seam actually carries; handed over one request at a time, the reader can
+  /// wake on a PREFIX of it and snapshot only that prefix into a whole-root
+  /// recovery, leaving the remainder to arrive during that recovery's walk and buy
+  /// a second whole-root walk and a second report. At the supported boundary
+  /// budget of one, the second report cannot claim a permit and kills a healthy
+  /// source. [`ControlPost::send_all`](super::reader::ControlPost::send_all) posts
+  /// the whole burst under one mailbox lock, so no prefix of it is ever visible.
+  ///
+  /// The wake is unconditional and deliberately so: the reader spends nearly all
+  /// its life blocked in `poll` over the fanotify fd and this eventfd, and a quiet
+  /// tree produces no fanotify event to wake it — so an unwoken request would sit
+  /// in the mailbox, and the cover parked on it in the core, for as long as the
+  /// tree stayed quiet. It is the same wake `teardown` issues, for the same
+  /// reason. ONE wake for the whole burst: the reader's pass drains what it finds.
+  pub(crate) fn request_admits(&self, requests: Vec<crate::os::AdmitRequest>) -> bool {
+    if !self.control.send_all(requests) {
+      return false;
+    }
+    self.wake.wake();
+    true
+  }
+
+  /// Publishes the core's current frame epoch for this scope — the count of worlds
+  /// the core has adopted — so the reader's own autonomous whole-root reseed can
+  /// stamp its generation with a core-owned, non-recyclable value.
+  ///
+  /// No wake and no return value to act on: the message opens no round trip and
+  /// asks for no work, so a reader that never wakes for it simply reads the newer
+  /// value at its next buffer. A mailbox whose inbox is gone drops it, which is
+  /// correct — a reader that no longer exists produces no generation to stamp.
+  pub(crate) fn publish_frame(&self, epoch: u64) {
+    let _ = self.control.send(Control::Frame(epoch));
+  }
+
+  /// Hands the reader ONE WHOLE-ROOT RECOVERY — reseed the entire map from the
+  /// root — and wakes it, answering whether the request was accepted.
+  ///
+  /// The root-scope sibling of [`request_admits`](Self::request_admits), with the
+  /// same `false`-means-the-reader-is-gone contract and the same unconditional
+  /// wake (a quiet tree produces no event to carry it).
+  ///
+  /// The reader answers ONE [`RootRecovery`](crate::os::RootRecovery) whose cutoff
+  /// is this request's ticket, discharging every round trip at or below it in one
+  /// message rather than one reply each — and echoing back the frame epoch the
+  /// request carries, which is what lets the core tell a reply from the world it
+  /// asked in from one it has since left.
+  pub(crate) fn request_root_recovery(&self, request: crate::os::RecoveryRequest) -> bool {
+    if !self.control.send(Control::Recover(request)) {
+      return false;
+    }
+    self.wake.wake();
+    true
   }
 
   /// Stops the reader and closes the instance. The reader exits at its next
@@ -1369,6 +2016,13 @@ impl SourceHandle {
     let Some(thread) = self.thread.take() else {
       return;
     };
+    // OUT OF BAND, and BEFORE the terminal message. The reader's shutdown checks
+    // read this flag without touching the mailbox at all, so a teardown preempts
+    // between two retries of a walk ladder that has not looked at control since
+    // the pass began. The message still follows (it is the correctness floor,
+    // synchronized through the mailbox lock), and the unconditional wake still
+    // follows that.
+    self.wake.request_shutdown();
     let _ = self.control.send(Control::Shutdown);
     self.wake.wake();
     // A join hands back the reader's panic payload exactly as `catch_unwind` does,

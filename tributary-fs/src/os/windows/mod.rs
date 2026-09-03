@@ -35,7 +35,7 @@ pub(crate) use source::{Source, SourceHandle};
 /// semantic), and junction containment is enforced by the reparse refusal at
 /// descent rather than by a seed.
 #[cfg(all(target_os = "windows", not(miri)))]
-pub(crate) fn mounts_under(root: &std::path::Path) -> Option<Vec<std::path::PathBuf>> {
+pub(crate) fn mounts_under(root: &std::path::Path) -> Option<Vec<crate::os::MountRow>> {
   let _ = root;
   None
 }
