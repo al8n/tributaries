@@ -21341,3 +21341,94 @@ mod abnormal_exit {
     );
   }
 }
+
+/// The mask-miss leg of [`stat_sample`]: on a kernel whose `statx` answers no
+/// mount id, the sample is taken through an `O_PATH` pin instead, and it must
+/// answer the SAME object and the SAME mount id the single-`statx` leg answers
+/// where the bit exists.
+///
+/// Real syscalls on a real tree, so this runs on the ubuntu runners and in the
+/// container `unit` suite. It drives [`stat_sample_pinned`] DIRECTLY rather than
+/// forcing the process tier: the tier is a process-wide memo and the lib binary
+/// runs its cells in parallel, so a cell that flipped it would decide which leg
+/// every sibling's sample took.
+#[cfg(all(target_os = "linux", not(miri)))]
+mod mount_frame_sampling {
+  use super::*;
+
+  /// A unique real directory for one cell.
+  fn scratch(tag: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let dir = std::env::temp_dir()
+      .canonicalize()
+      .expect("canonicalize temp dir")
+      .join(format!(
+        "tributary-fs-frame-{}-{}-{}",
+        tag,
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed),
+      ));
+    std::fs::create_dir_all(&dir).expect("create scratch dir");
+    dir
+  }
+
+  /// The pinned sample answers a mount id on EVERY supported kernel, for every
+  /// object kind the enumerate can hand it — a directory, a regular file, and a
+  /// symlink, which `O_PATH | O_NOFOLLOW` must open AS the link rather than
+  /// following it, exactly as the `AT_SYMLINK_NOFOLLOW` leg does.
+  ///
+  /// MUTATION WITNESS (the pin follows the link): drop `OFlags::NOFOLLOW` from
+  /// `stat_sample_pinned` and this FAILS at `the pinned sample reaches the same
+  /// object` for the symlink, reporting the target file's kind and inode.
+  /// MUTATION WITNESS (the frame is dropped on the pinned leg): return `None` for
+  /// `frame` there and this FAILS at `every supported kernel answers a mount id
+  /// through fdinfo`.
+  #[test]
+  fn a_pinned_sample_answers_the_same_object_and_a_mount_id() {
+    let dir = scratch("pinned");
+    let file = dir.join("f");
+    std::fs::write(&file, b"x").expect("write the scratch file");
+    let link = dir.join("l");
+    std::os::unix::fs::symlink("f", &link).expect("create the scratch symlink");
+
+    for path in [dir.as_path(), file.as_path(), link.as_path()] {
+      let direct = stat_sample(path).expect("sample the path");
+      let pinned = stat_sample_pinned(path).expect("sample the path through a pin");
+      assert_eq!(
+        (pinned.kind, pinned.dev, pinned.ino),
+        (direct.kind, direct.dev, direct.ino),
+        "the pinned sample reaches the same object as the path sample: {}",
+        path.display()
+      );
+      assert!(
+        pinned.frame.is_some(),
+        "every supported kernel answers a mount id through fdinfo (3.15, below \
+         the 4.11 statx floor), so the pinned leg never degrades to a frameless \
+         sample: {}",
+        path.display()
+      );
+      if direct.frame.is_some() {
+        assert_eq!(
+          pinned.frame,
+          direct.frame,
+          "where this host ALSO has `STATX_MNT_ID`, the two tiers must report one \
+           id — they key the same census: {}",
+          path.display()
+        );
+      }
+    }
+
+    // A path that is not there fails the same way through either leg, so the
+    // enumerate's raced-away `Missing` keeps its meaning on the fdinfo tier.
+    let gone = dir.join("gone");
+    assert_eq!(
+      stat_sample_pinned(&gone).map(|sample| sample.ino),
+      Err(rustix::io::Errno::NOENT),
+      "the pin's own open carries the errno the statx would have, so NOENT is \
+       still a raced-away entry and never a laundered frameless sample"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+}

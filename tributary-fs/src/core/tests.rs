@@ -1907,12 +1907,18 @@ fn a_replaced_mount_covers_and_re_records_the_new_identity() {
 /// census, not the consumer's work.
 ///
 /// MUTATION WITNESS (per-location grouping restored in `parse_mountinfo`): answer
-/// each location with its LAST row and this FAILS at `the departure of one member
-/// is covered` with `left: 0` — the selected row byte-identical across an unmount
-/// the core then cannot see, which is the silent loss itself.
-/// MUTATION WITNESS (dedup dropped): remove `dedup_locations(&mut covered)` and
-/// this FAILS at `two members arriving at ONE location is ONE cover` with `left:
-/// 2` — one re-read of the same ground per member of the stack.
+/// each location with its LAST row and this FAILS at `and BOTH members are in the
+/// census, each keyed by its own id` with a single-row `left` — the stack reduced
+/// to one census key, so the hidden member's `umount -l` is a row that was never
+/// there to depart, which is the silent loss itself.
+/// NOT A WITNESS (dedup dropped): removing `dedup_locations(&mut covered)` — either
+/// call site, or both — does not fail this cell, and no cell in the suite catches
+/// it. The one-cover-per-place OUTCOME is held downstream by the Monitor's own
+/// `Rescan` coalescing (`emit_rescan`'s `would_coalesce` folds a second identical
+/// still-queued `Rescan` into the first), so what the dedup here buys is COST: it
+/// keeps one refresh from driving `on_overflow` — with its pending-source dirtying
+/// and its re-arm — once per member of a stack. That is not a fact this cell, which
+/// counts emitted covers, can witness.
 #[test]
 fn a_stack_at_one_location_is_covered_once_per_transition() {
   // 55 is mounted at `/r/vol`; 20 — older, created elsewhere — is then

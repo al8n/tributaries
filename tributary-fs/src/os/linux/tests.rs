@@ -1145,6 +1145,224 @@ fn the_remote_list_only_names_the_refusal_it_never_grants_one() {
   }
 }
 
+/// The fdinfo mount-id parser over the bodies the kernel does (and does not)
+/// write. PURE, so it runs on every host the suite builds on, not just Linux.
+///
+/// The load-bearing legs are the two that DECLINE: a value that is not a decimal,
+/// and a body whose last line the read cut short. A truncated `mnt_id:\t551\n`
+/// read back as `mnt_id:\t5` parses perfectly well into the id of a DIFFERENT
+/// mount, and a fence handed that id would believe it had proved a descent stayed
+/// inside the scope when it had proved nothing — strictly worse than declining,
+/// which only costs a fail-closed cover.
+///
+/// MUTATION WITNESS (a truncated tail is answered): drop the
+/// `.filter(|line| line.ends_with(b"\n"))` and this FAILS at `a body cut short
+/// mid-value answers nothing` with `left: Some(5), right: None` — the wrong mount,
+/// reported as fact.
+/// MUTATION WITNESS (a non-decimal value is answered): drop the
+/// `digits.iter().all(u8::is_ascii_digit)` guard and this FAILS at `a signed
+/// decimal is not what the kernel writes` with `left: Some(551), right: None` —
+/// `u64::from_str` takes a leading `+`, so `parse` alone does not decide what a
+/// mount id looks like and the guard is not redundant with it.
+#[test]
+fn the_fdinfo_mount_id_parser_answers_only_a_whole_decimal_line() {
+  use super::mnt_id_from_fdinfo as parse;
+
+  assert_eq!(
+    parse(b"pos:\t0\nflags:\t012000000\nmnt_id:\t551\nino:\t2\n"),
+    Some(551),
+    "the line the kernel actually writes, among the lines it writes around it"
+  );
+  assert_eq!(
+    parse(b"mnt_id:\t551\n"),
+    Some(551),
+    "the line alone still answers"
+  );
+  assert_eq!(
+    parse(b"mnt_id: 551\n"),
+    Some(551),
+    "a space rather than the kernel's tab is still whitespace after the colon"
+  );
+  assert_eq!(
+    parse(b"mnt_id:\t551\r\n"),
+    Some(551),
+    "a trailing carriage return is trimmed with the rest of the whitespace: \
+     refusing a whole decimal over one byte of line ending would fail a scope \
+     closed for nothing"
+  );
+
+  assert_eq!(
+    parse(b"pos:\t0\nflags:\t012000000\nino:\t2\n"),
+    None,
+    "a body with no mnt_id line at all answers nothing"
+  );
+  assert_eq!(parse(b""), None, "an empty body answers nothing");
+  assert_eq!(
+    parse(b"mnt_id: abc\n"),
+    None,
+    "a value that is not a decimal answers nothing, never a partial parse"
+  );
+  assert_eq!(
+    parse(b"mnt_id:\t\n"),
+    None,
+    "an empty value answers nothing"
+  );
+  assert_eq!(
+    parse(b"mnt_id:\t+551\n"),
+    None,
+    "a signed decimal is not what the kernel writes: `u64::from_str` would take \
+     `+551`, so the digits-only guard is what refuses it"
+  );
+  assert_eq!(
+    parse(b"mnt_id:\t551 552\n"),
+    None,
+    "a value with a trailing field is not a mount id"
+  );
+  assert_eq!(
+    parse(b"pos:\t0\nmnt_id:\t5"),
+    None,
+    "a body cut short mid-value answers nothing — `5` out of `551` is a DIFFERENT \
+     mount, and answering it would fence a descent on the wrong boundary"
+  );
+
+  assert_eq!(
+    parse(b"mnt_id_unique:\t34\nmnt_id:\t551\n"),
+    Some(551),
+    "6.8's unique id lives in another key space and never stands in for the \
+     legacy one the census is keyed by"
+  );
+  assert_eq!(
+    parse(b"mnt_id: abc\nmnt_id:\t551\n"),
+    None,
+    "the FIRST mnt_id line decides: a body whose own first answer is unreadable \
+     is not searched for a second opinion"
+  );
+}
+
+/// The tier memo, PURE over its cell and over both reads (the closure discipline
+/// the inotify arm's `frame_check` uses). Each leg drives its own `AtomicU8`, so
+/// nothing here touches the process-wide `MOUNT_ID_TIER` and no cell has to be
+/// serialised against another.
+///
+/// The claim: the tier is settled by the FIRST read that ANSWERS, a `statx` that
+/// FAILED settles nothing, and once settled on fdinfo no later read pays the mask
+/// probe again.
+///
+/// MUTATION WITNESS (a failure settles the tier): move the `Err` arm of
+/// `mount_id_through_tier` to `settle_mount_id_tier_in(tier, false)` before
+/// returning and this FAILS at `a failed statx settles nothing` — one `EACCES`
+/// would otherwise send every later read in the process down the fdinfo leg for
+/// good.
+/// MUTATION WITNESS (the memo is not consulted): replace
+/// `statx_answers_mount_id_in(tier)` with `true` and this FAILS at `a settled
+/// fdinfo tier does not probe the mask again` with the mask probe counted twice.
+/// MUTATION WITNESS (the memo is not written on a miss): drop the `Ok(None) =>`
+/// arm's settle and this FAILS one assertion earlier, at `one miss settles the
+/// fdinfo tier`.
+#[test]
+fn the_mount_id_tier_is_settled_by_the_first_read_that_answers() {
+  use std::sync::atomic::AtomicU8;
+
+  use super::{mount_id_through_tier, statx_answers_mount_id_in};
+
+  // A mask that ANSWERS settles the statx tier, and no later read opens fdinfo.
+  let statx_host = AtomicU8::new(0);
+  let mut fdinfo_reads = 0_u32;
+  for _ in 0..3 {
+    assert_eq!(
+      mount_id_through_tier::<()>(
+        &statx_host,
+        || Ok(Some(7)),
+        || {
+          fdinfo_reads += 1;
+          Ok(Some(9))
+        }
+      ),
+      Ok(Some(7)),
+      "the mask answers, so the mask's id is the answer"
+    );
+  }
+  assert_eq!(
+    fdinfo_reads, 0,
+    "a host whose statx answers never opens /proc — the whole point of settling \
+     on the statx tier"
+  );
+  assert!(
+    statx_answers_mount_id_in(&statx_host),
+    "the statx tier keeps asking statx"
+  );
+
+  // A mask that MISSES settles the fdinfo tier, and the mask is never probed
+  // again.
+  let fdinfo_host = AtomicU8::new(0);
+  let mut mask_probes = 0_u32;
+  let probe = |host: &AtomicU8, probes: &mut u32| {
+    mount_id_through_tier::<()>(
+      host,
+      || {
+        *probes += 1;
+        Ok(None)
+      },
+      || Ok(Some(551)),
+    )
+  };
+  assert_eq!(
+    probe(&fdinfo_host, &mut mask_probes),
+    Ok(Some(551)),
+    "the mask misses, so fdinfo answers"
+  );
+  assert_eq!(mask_probes, 1, "the FIRST read pays one mask probe");
+  assert!(
+    !statx_answers_mount_id_in(&fdinfo_host),
+    "one miss settles the fdinfo tier"
+  );
+  for _ in 0..3 {
+    assert_eq!(
+      probe(&fdinfo_host, &mut mask_probes),
+      Ok(Some(551)),
+      "later reads still answer, straight from fdinfo"
+    );
+  }
+  assert_eq!(
+    mask_probes, 1,
+    "a settled fdinfo tier does not probe the mask again — the memo exists so a \
+     4.11–5.7 host pays the miss once, not once per sample"
+  );
+
+  // A read that FAILED says nothing about the kernel, so it settles nothing.
+  let failing_host = AtomicU8::new(0);
+  assert_eq!(
+    mount_id_through_tier(&failing_host, || Err("EACCES"), || Ok(Some(551))),
+    Err("EACCES"),
+    "a failed read propagates, never laundered into the fdinfo leg's answer"
+  );
+  assert!(
+    statx_answers_mount_id_in(&failing_host),
+    "a failed statx settles nothing: the next read probes the mask again, \
+     because one denied call is not evidence the kernel lacks the bit"
+  );
+  // And the very next read, succeeding, settles it as if the failure never was.
+  assert_eq!(
+    mount_id_through_tier::<()>(&failing_host, || Ok(Some(7)), || Ok(Some(551))),
+    Ok(Some(7)),
+    "the retry reaches the mask"
+  );
+  assert!(
+    statx_answers_mount_id_in(&failing_host),
+    "and settles the statx tier"
+  );
+
+  // fdinfo answering NOTHING is the belt below both floors: still `Ok(None)`,
+  // never an error, and the tier stays where the miss put it.
+  let no_oracle = AtomicU8::new(0);
+  assert_eq!(
+    mount_id_through_tier::<()>(&no_oracle, || Ok(None), || Ok(None)),
+    Ok(None),
+    "a host below BOTH floors answers no id anywhere, and that is the only \
+     surviving source of a `None` frame"
+  );
+}
+
 /// The spawn dispatcher's root pin and the object-grounded identity reads it
 /// hands to both backends. These exercise real syscalls, so they run only on a
 /// Linux host (the container `unit` suite); the pure decode/parse cells above

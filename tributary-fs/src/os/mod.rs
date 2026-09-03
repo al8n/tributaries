@@ -806,16 +806,19 @@ pub(crate) struct MountRow {
 /// - `dev` is always known: the walk `fstat`s every child it pins, and the
 ///   device belt is decided on that stat.
 /// - `mnt_id` is ALSO read for every decline, both fences alike, from the fd the
-///   walk pinned — so a `None` here means the HOST answers no mount ids
-///   (`statx` succeeded with the `STATX_MNT_ID` bit unset: below 5.8, or the mask
-///   missing), never that this observer did not ask. That distinction is
+///   walk pinned — so a `None` here means the HOST answers no mount id ANYWHERE
+///   it could be asked (neither the `statx` mask nor the fd's `/proc/self/fdinfo`
+///   line), never that this observer did not ask. That distinction is
 ///   load-bearing. An id-less observation is one the core can only record
 ///   `Standing::Unknown`, which joins no census and fails the whole scope closed
 ///   while it is held, so producing one from an observation that COULD have
 ///   answered the id — as the device belt once did, being checked before the
 ///   `statx` — buys a whole-root cover per refresh in place of a precise
-///   departure. A `statx` that FAILS yields an incomplete walk instead; it never
-///   reaches this type.
+///   departure. Since the fdinfo tier (`os::linux`'s `root_mount_id`) that `None`
+///   needs a kernel below BOTH floors, 3.15 fdinfo and 4.11 `statx`, so no
+///   supported host reaches it and the type carries the case only because the
+///   core must not assume it away. A read that FAILS yields an incomplete walk
+///   instead; it never reaches this type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DeclinedBoundary {
   /// The absolute path of the declined child.
@@ -905,9 +908,10 @@ pub(crate) enum WalkReach {
     /// holds. This is the leg that speaks for the SOURCE: it is read live, off the
     /// fd the reseed reopened, and no value the core supplied can make it agree.
     ///
-    /// `None` PASSES, as every unknown frame leg does — below Linux 5.8 nothing in
-    /// the system reports a mount id, and the epoch beside it carries the check
-    /// there, exactly as it does for [`RootRecovery::root_mnt_id`].
+    /// `None` PASSES, as every unknown frame leg does — a host that answers no
+    /// mount id ANYWHERE reads `None` for every one, and the epoch beside it
+    /// carries the check there, exactly as it does for
+    /// [`RootRecovery::root_mnt_id`].
     root_mnt_id: Option<u64>,
     /// The core's own [frame epoch](crate::os::AdmitRequest::epoch) as the SOURCE
     /// last heard it, sampled BEFORE the reseed walk began.
@@ -963,10 +967,10 @@ impl WalkReach {
 /// # `None` PASSES — the same honest degrade the fence itself makes
 ///
 /// Either half unknown leaves that half inert, exactly as
-/// `crosses_mount_boundary`'s own `None` legs do: below Linux 5.8 there is no
-/// `STATX_MNT_ID` and every mount id in the system reads `None`, and an
-/// off-Linux fake answers no frame at all. A check that read unknown as
-/// "different" would refuse every arm on those hosts.
+/// `crosses_mount_boundary`'s own `None` legs do: a host that answers no mount id
+/// ANYWHERE reads `None` for every one, and an off-Linux fake answers no frame at
+/// all. A check that read unknown as "different" would refuse every arm on those
+/// hosts.
 ///
 /// An UNKNOWN is not a FAILED READ, and only the first one reaches here. A
 /// `statx`/`fstat` that fails answers nothing about the object, so the executor
@@ -977,7 +981,8 @@ impl WalkReach {
 pub(crate) struct ScopeFrame {
   /// The scope root's device, or `None` where the host answers none.
   pub(crate) root_dev: Option<u64>,
-  /// The scope root's mount id, or `None` below Linux 5.8 / off Linux.
+  /// The scope root's mount id, or `None` where the host answers none — off
+  /// Linux, or a kernel below every id oracle.
   pub(crate) root_mnt_id: Option<u64>,
 }
 
@@ -1162,8 +1167,9 @@ pub(crate) enum AdmitOutcome {
     /// The device of the object standing at the location, from the walk's own
     /// `fstat` of the fd it opened — `None` only where no walk could read one.
     dev: Option<u64>,
-    /// That object's mount id, from `statx(STATX_MNT_ID)` on the same fd, or
-    /// `None` below Linux 5.8 / off Linux.
+    /// That object's mount id, read from the same fd (`statx(STATX_MNT_ID)`, or
+    /// the fd's `/proc/self/fdinfo` line below 5.8), or `None` where the host
+    /// answers none.
     mnt_id: Option<u64>,
   },
   /// The request could not be handed to a source at all — no live stream for the
@@ -1239,10 +1245,10 @@ pub(crate) struct RootRecovery {
   /// generation is not.
   ///
   /// `None` PASSES, exactly as every unknown leg of [`ScopeFrame::crossed_by`]
-  /// does: below Linux 5.8 nothing in the system reports a mount id, and a check
-  /// that read unknown as "different" would reject every recovery such a host could
-  /// ever produce — leaving the epoch to carry the check alone, which is what it is
-  /// for.
+  /// does: a host that answers no mount id ANYWHERE reads `None` for every one,
+  /// and a check that read unknown as "different" would reject every recovery such
+  /// a host could ever produce — leaving the epoch to carry the check alone, which
+  /// is what it is for.
   pub(crate) root_mnt_id: Option<u64>,
 }
 
@@ -1273,9 +1279,10 @@ pub(crate) struct RootMeta {
   pub(crate) root: PathBuf,
   /// The device the root lives on.
   pub(crate) root_dev: u64,
-  /// The root's MOUNT id (from `statx(STATX_MNT_ID)` on the pinned root), or
-  /// `None` when the source could not read one (below Linux 5.8 where the field
-  /// is absent, or a non-Linux backend — FSEvents has no mount id). The core
+  /// The root's MOUNT id, read from the pinned root (`statx(STATX_MNT_ID)`, or
+  /// that fd's `/proc/self/fdinfo` line below 5.8), or `None` when the source
+  /// could not read one (a non-Linux backend — FSEvents has no mount id — or a
+  /// kernel below every id oracle). The core
   /// fences descent across a differing mount id: a `mount --bind` of a
   /// same-device directory shares [`root_dev`](Self::root_dev), so the device
   /// alone cannot mark it a boundary. `None` degrades to the device check.

@@ -277,9 +277,8 @@
 //! - [`Standing::SameMount`] — the ROOT's own mount id: a subvolume. No row will
 //!   ever list it, so it joins nothing and is condemned by nothing; the event
 //!   stream and the generations retire it.
-//! - [`Standing::Unknown`] — one id unanswerable, which is EVERY seam observation
-//!   on Linux 4.11–5.7 until stage 3 reads ids from `fdinfo`, genuine vfsmounts
-//!   included. Nothing can tell those two apart, so the scope pays for the
+//! - [`Standing::Unknown`] — one id unanswerable. Nothing can tell a genuine
+//!   vfsmount from a same-mount subvolume there, so the scope pays for the
 //!   ambiguity at the coarsest granularity there is:
 //!
 //! > **While a scope holds ANY `Unknown` entry, every AUTHORITATIVE refresh
@@ -292,21 +291,24 @@
 //! from every census, re-declined by every crawl. No predicate over a per-entry
 //! observation can separate them. The scope-wide rule does not try.
 //!
-//! **The cost is real and accepted.** On a 4.11–5.7 kernel whose root holds btrfs
-//! subvolumes, every seam entry is `Unknown` and only a census row standing at
-//! its location clears one — and no row ever stands at a subvolume — so the scope
-//! covers its whole root on every authoritative refresh, for as long as it holds
-//! one. That is correctness bought
-//! at a permanent per-refresh root cover, and it is the deliberate trade; see
+//! **The cost is real and accepted, and on Linux nothing now pays it.** Where a
+//! host answers no id, every seam entry is `Unknown` and only a census row
+//! standing at its location clears one — and no row ever stands at a subvolume —
+//! so the scope covers its whole root on every authoritative refresh for as long
+//! as it holds one. That is correctness bought at a permanent per-refresh root
+//! cover, and it is the deliberate trade; see
 //! [`root_liveness_interval`](crate::WatcherOptions::root_liveness_interval).
 //!
-//! **Who actually pays is narrow.** On Linux ≥ 5.8 the `Unknown` population is
-//! provably EMPTY: `root_mnt_id` is read at spawn or the source does not start,
-//! and every seam that records a boundary reads the id from the fd it already
-//! pinned (a `statx` that FAILS never mints an entry at all). So every entry is
-//! decided `Mount` or `SameMount`, and `fails_closed` answers `false` for the life
-//! of the scope. The fanotify backend requires `FAN_REPORT_TARGET_FID` (5.17), so
-//! it can never run on a host that pays this at all.
+//! **Who actually pays is nobody, on any supported Linux kernel.** The
+//! `Unknown` population is provably EMPTY: `root_mnt_id` is read at spawn or the
+//! source does not start, and every seam that records a boundary reads the id
+//! from the fd it already pinned — through `statx(STATX_MNT_ID)` on 5.8+ and
+//! through that fd's `/proc/self/fdinfo` line, which the kernel has printed since
+//! 3.15, below the 4.11 `statx` floor, on everything older (`os::linux`'s
+//! `root_mount_id`). A read that FAILS never mints an entry at all. So every entry
+//! is decided `Mount` or `SameMount`, and `fails_closed` answers `false` for the
+//! life of the scope. What remains of this rule is the non-Linux fake executor and
+//! a kernel below both oracles, which the Linux backends refuse to start on.
 //!
 //! A refusal at [`MAX_BOUNDARIES`] needs no announcement of its own for the same
 //! reason: the bound only refuses when the ledger is full of entries that may yet
@@ -501,9 +503,10 @@ pub(crate) enum ProbeOutcome {
     /// The device the object lives on; identity is minted only on the
     /// root's own device.
     dev: u64,
-    /// The object's MOUNT id, or `None` where the host answers none (below
-    /// Linux 5.8, the `STATX_MNT_ID` mask bit unset, or a non-Linux/fake
-    /// executor).
+    /// The object's MOUNT id, or `None` where the host answers none — a
+    /// non-Linux or fake executor, or a Linux kernel below BOTH id oracles (5.8's
+    /// `STATX_MNT_ID` and 3.15's `/proc/self/fdinfo`), which is below the 4.11
+    /// `statx` floor the Linux backends refuse to start under.
     ///
     /// Carried for exactly one reason, and it is a correctness one rather than
     /// a convenience: [`record_probe_boundary`] records what a probe answer
@@ -564,9 +567,9 @@ pub(crate) struct MountRefresh {
   /// would read as a boundary and lower non-descendable until the next re-watch.
   /// [`on_mounts_refreshed`](DriverCore::on_mounts_refreshed) adopts a `Some`
   /// value once the root is confirmed alive-and-present AND the refresh is not stale
-  /// (a stale snapshot's frame is as suspect as its mount table). `None` (below Linux
-  /// 5.8, the mask bit unset, or a non-Linux/fake source that reports no frame)
-  /// leaves the captured value intact — a transient read miss never drops a known
+  /// (a stale snapshot's frame is as suspect as its mount table). `None` (a
+  /// non-Linux/fake source, or a kernel below every id oracle, that reports no
+  /// frame) leaves the captured value intact — a transient read miss never drops a known
   /// frame.
   pub(crate) root_mnt_id: Option<u64>,
   /// WHICH INCARNATION of a mount the root was on when this refresh read it, where
@@ -703,11 +706,14 @@ enum Standing {
   /// census and is condemned by none; it leaves only by the event stream or by a
   /// complete generation.
   SameMount,
-  /// One of the two ids was unanswerable — the whole of Linux 4.11–5.7, where
-  /// `statx(STATX_MNT_ID)` does not exist, and any host whose frame could not be
-  /// read. Nothing here can tell a genuine vfsmount from a same-mount subvolume,
-  /// so the scope FAILS CLOSED while one is held
-  /// ([`ScopeState::fails_closed`]) rather than guessing in either direction.
+  /// One of the two ids was unanswerable: a host that answers no mount id
+  /// ANYWHERE it could be asked. On Linux that needs a kernel below BOTH oracles
+  /// — 5.8's `statx(STATX_MNT_ID)` and 3.15's `/proc/self/fdinfo` line — which is
+  /// below the 4.11 `statx` floor the backends refuse to start on, so no supported
+  /// host mints one; off Linux the executor answers no ids at all. Nothing here
+  /// can tell a genuine vfsmount from a same-mount subvolume, so the scope FAILS
+  /// CLOSED while one is held ([`ScopeState::fails_closed`]) rather than guessing
+  /// in either direction.
   Unknown,
 }
 
@@ -2303,8 +2309,8 @@ struct ScopeState {
   /// scope's coverage when the frame changed). Only ever the last AUTHORITATIVE frame
   /// — a stale refresh publishes nothing here (see the module doc's mount-refresh
   /// publication invariant). `None` when neither the barrier nor a refresh could read
-  /// it (below Linux 5.8, or a non-Linux/fake source), and then the device check
-  /// governs alone — the honest degrade.
+  /// it (a non-Linux/fake source, or a kernel below every id oracle), and then the
+  /// device check governs alone — the honest degrade.
   root_mnt_id: Option<u64>,
   /// The last PROVEN incarnation token for the mount
   /// [`root_mnt_id`](Self::root_mnt_id) names — what makes a frame move
@@ -2824,21 +2830,23 @@ impl ScopeState {
   ///
   /// # The cost, stated plainly
   ///
-  /// On a 4.11–5.7 kernel with btrfs subvolumes under the root this is a
-  /// PERMANENT per-refresh whole-root cover: every seam entry there is `Unknown`,
-  /// and only a census row at the location or a retirement pass clears one. That
-  /// is accepted — correctness over cost — and documented on
+  /// On a host that answers no mount id, a root with btrfs subvolumes under it is
+  /// a PERMANENT per-refresh whole-root cover: every seam entry there is
+  /// `Unknown`, and only a census row at the location or a retirement pass clears
+  /// one. That is accepted — correctness over cost — and documented on
   /// [`root_liveness_interval`](crate::WatcherOptions::root_liveness_interval),
   /// which is the knob that prices it.
   ///
   /// # Who never pays
   ///
-  /// On Linux ≥ 5.8 this is `false` for the life of every scope: `root_mnt_id` is
-  /// read at spawn (a failure there is a spawn failure, not a `None`), and every
-  /// seam that records reads the boundary's own id from the fd it pinned — a
-  /// `statx` that fails yields an incomplete walk or a `Failed` probe and records
-  /// nothing. So every entry is decided `Mount` or `SameMount`, and the `Unknown`
-  /// population is empty.
+  /// On every SUPPORTED Linux kernel this is `false` for the life of every scope:
+  /// `root_mnt_id` is read at spawn (a failure there is a spawn failure, not a
+  /// `None`), and every seam that records reads the boundary's own id from the fd
+  /// it pinned — through `statx(STATX_MNT_ID)` on 5.8+ and through that fd's
+  /// `/proc/self/fdinfo` line below it, which the kernel has printed since 3.15,
+  /// below the 4.11 `statx` floor. A read that fails yields an incomplete walk or
+  /// a `Failed` probe and records nothing. So every entry is decided `Mount` or
+  /// `SameMount`, and the `Unknown` population is empty.
   fn fails_closed(&self) -> bool {
     self
       .ledger
@@ -4583,7 +4591,7 @@ impl DriverCore {
   /// fence catches a `mount --bind` of a same-DEVICE directory the device check
   /// alone would descend across (the same breach the fanotify walk closes with the
   /// same fence); the device belt still governs when either mount id is unknown
-  /// (the honest below-5.8 degrade).
+  /// (the honest degrade of a host that answers none).
   ///
   /// An entry the caller EXCLUDED is dropped from the listing outright — the cold
   /// half of the common-layer fence (see [`exclusions`](Self::exclusions)). An
@@ -5733,9 +5741,9 @@ impl DriverCore {
       return;
     };
     // An unknown id on EITHER side passes, exactly as every unknown leg of
-    // `ScopeFrame::crossed_by` does: below Linux 5.8 nothing reports a mount id,
-    // and reading unknown as "different" would reject every recovery such a host
-    // can produce. The epoch carries the check there.
+    // `ScopeFrame::crossed_by` does: a host that answers no mount id anywhere
+    // reports none for every one, and reading unknown as "different" would reject
+    // every recovery such a host can produce. The epoch carries the check there.
     let walked_elsewhere = match (recovery.root_mnt_id, state.root_mnt_id) {
       (Some(walked), Some(current)) if walked != current => Some(walked),
       _ => None,
@@ -6349,12 +6357,13 @@ impl DriverCore {
           // else UNDER the row, the row's own departure cover re-reveals it and
           // the crawl re-declines it.
           //
-          // Matching only an id-less row would leave the floor kernel — 4.11-5.7,
-          // where `/proc/self/mountinfo` has always carried mount ids and
-          // `statx(STATX_MNT_ID)` does not exist — with every seam entry
-          // `Unknown`, every census row `Id`-keyed, and nothing that could ever
-          // clear one: a whole-root cover per refresh for the life of the scope,
-          // on a kernel range that pays none today.
+          // Matching only an id-less row would leave a host whose seams answer no
+          // id — `/proc/self/mountinfo` has always carried them, so its census
+          // rows stay `Id`-keyed — with every seam entry `Unknown`, every census
+          // row `Id`-keyed, and nothing that could ever clear one: a whole-root
+          // cover per refresh for the life of the scope. Since the fdinfo tier no
+          // supported Linux kernel is in that state, but the rule must not depend
+          // on which oracle answered.
           Standing::Unknown => !located.contains(entry.location.as_path()),
           // A `SameMount` entry joins nothing, ever. No mountinfo read will list
           // a subvolume, so its absence from a census is evidence of nothing and
@@ -8518,19 +8527,20 @@ fn mint(
 ///   of a same-superblock directory shares the root's device, so only a differing
 ///   mount id marks it a boundary.
 ///
-/// When either mount id is unknown (the executor could not read one — below Linux
-/// 5.8, the `stx_mask` bit unset, or a non-Linux/fake source), the device belt
+/// When either mount id is unknown (the executor answers none — a non-Linux/fake
+/// source, or a kernel below every id oracle), the device belt
 /// alone governs — the honest degrade to the settled single-device policy, never
 /// over-fencing a genuine in-root directory on a mount-id read miss. An unknown
 /// ROOT device (`None`, an off-unix fake) leaves the belt inert; with no mount id
 /// either, nothing crosses — the fake tree is one scope.
 ///
-/// A `None` mount id reaching this belt is ALWAYS a legitimate mask-absent read (a
-/// SUCCESSFUL statx below 5.8, or a fake), NEVER a swallowed statx failure: on Linux
-/// the spawn barrier fails closed on any statx error (`os::linux::require_statx`) and
-/// the mount-id captures turn a statx syscall failure into a spawn/walk failure, so a
-/// statx-denied environment never goes live to feed a `None` frame here. The belt is
-/// thus only ever the honest pre-5.8 degrade, not a silently disabled fence.
+/// A `None` mount id reaching this belt is ALWAYS a host that answered none where
+/// it COULD be asked (both the `statx` mask and `/proc/self/fdinfo` declining, or a
+/// fake), NEVER a swallowed read failure: on Linux the spawn barrier fails closed on
+/// any statx error (`os::linux::require_statx`) and the mount-id captures turn a
+/// failed read into a spawn/walk failure, so a statx-denied environment never goes
+/// live to feed a `None` frame here. The belt is thus only ever the honest degrade
+/// of a host below every oracle, not a silently disabled fence.
 fn crosses_mount_boundary(state: &ScopeState, entry: &RawDirEntry) -> bool {
   let device_boundary = matches!(state.root_dev, Some(root_dev) if entry.dev != root_dev);
   let mount_boundary = matches!(
@@ -8653,12 +8663,12 @@ fn record_boundary(state: &mut ScopeState, location: &Path, mnt_id: Option<u64>)
   // OCCUPIED, on either of the two facts a census can offer: a row STANDING at
   // this location, or a row already keyed by this observation's own id.
   //
-  // The location leg is not a convenience. On Linux 4.11-5.7 every census row is
-  // `Id`-keyed (mountinfo has always carried mount ids) and every seam answers
-  // none (`statx(STATX_MNT_ID)` does not exist), so the id leg never fires there
-  // — and without the location leg every enumerate that re-declines a mount the
-  // census already lists would push an `Unknown` entry and fail the whole scope
-  // closed until the next refresh's join dropped it again. One whole-root cover
+  // The location leg is not a convenience. On a host whose census rows are
+  // `Id`-keyed (mountinfo has always carried mount ids) while its seams answer
+  // none, the id leg never fires — and without the location leg every enumerate
+  // that re-declines a mount the census already lists would push an `Unknown`
+  // entry and fail the whole scope closed until the next refresh's join dropped it
+  // again. One whole-root cover
   // per refresh, for as long as anything under the root is being listed. It is
   // the same rule the join applies, one step earlier, and it is what keeps the
   // ledger to what the census cannot speak for.
@@ -9534,12 +9544,13 @@ pub(crate) struct RawDirEntry {
   pub(crate) dev: u64,
   /// The entry's inode number (0 = unknown).
   pub(crate) ino: u64,
-  /// The entry's MOUNT id (from `statx(STATX_MNT_ID)`), or `None` when the
-  /// executor could not read it (a pre-5.8 kernel, the mask bit unset, or a
-  /// non-Linux/fake executor). The core fences descent on a differing mount id —
-  /// a `mount --bind` of a same-device directory shares [`dev`](Self::dev), so
-  /// the device alone cannot mark it a boundary. `None` falls back to the device
-  /// check (the honest below-5.8 degrade).
+  /// The entry's MOUNT id (from `statx(STATX_MNT_ID)`, or the object's own
+  /// `/proc/self/fdinfo` line below 5.8), or `None` when the executor could not
+  /// read it (a non-Linux/fake executor, or a kernel below every id oracle). The
+  /// core fences descent on a differing mount id — a `mount --bind` of a
+  /// same-device directory shares [`dev`](Self::dev), so the device alone cannot
+  /// mark it a boundary. `None` falls back to the device check (the honest degrade
+  /// of a host that answers none).
   pub(crate) mnt_id: Option<u64>,
 }
 

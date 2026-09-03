@@ -578,26 +578,29 @@ impl WatcherOptions {
   /// no class that waits several ticks. What varies is the SCOPE of the cover a
   /// tick emits.
   ///
-  /// On Linux 4.11–5.7 there is no `statx(STATX_MNT_ID)`, so a boundary the
-  /// watcher's own descent found cannot be told apart from a filesystem-internal
-  /// one — a btrfs subvolume, which no mount table lists and which never departs.
-  /// Nothing observable distinguishes "that mount departed" from "that subvolume
-  /// is exactly where it always was", and no amount of re-observation ever will.
-  /// The watcher therefore FAILS CLOSED: while it holds any such boundary, every
-  /// tick that manages to read the mount table emits ONE
+  /// A boundary the watcher's own descent found is told apart from a
+  /// filesystem-internal one — a btrfs subvolume, which no mount table lists and
+  /// which never departs — by its MOUNT id, and by nothing else. On a host that
+  /// answers no id, nothing observable distinguishes "that mount departed" from
+  /// "that subvolume is exactly where it always was", and no amount of
+  /// re-observation ever will. The watcher therefore FAILS CLOSED: while it holds
+  /// any such boundary, every tick that manages to read the mount table emits ONE
   /// [`Rescan`](crate::EventKind::Rescan) covering the whole watched root, rather
   /// than guessing at a located one.
   ///
-  /// **That cost is permanent for as long as the boundary is held.** A root with
-  /// btrfs subvolumes under it on such a kernel is re-read by the consumer once
-  /// per interval, for the life of the watch. Raising the interval is the knob
-  /// that prices it; [`Duration::ZERO`] disables the tick entirely, at the cost
-  /// below.
+  /// **That cost is permanent for as long as the boundary is held** — the whole
+  /// root re-read by the consumer once per interval, for the life of the watch.
+  /// Raising the interval is the knob that prices it; [`Duration::ZERO`] disables
+  /// the tick entirely, at the cost below.
   ///
-  /// On Linux 5.8 and later the class is EMPTY — every boundary the watcher
-  /// records carries a mount id, and so does the root — and the covers are
-  /// located at the mount that actually departed. The fanotify backend needs 5.17
-  /// regardless, so it never pays this at all.
+  /// On every SUPPORTED Linux kernel the class is EMPTY — every boundary the
+  /// watcher records carries a mount id, and so does the root — and the covers are
+  /// located at the mount that actually departed. `statx(STATX_MNT_ID)` answers
+  /// from 5.8; below it the id comes from the pinned fd's own `/proc/self/fdinfo`
+  /// line, which the kernel has printed since 3.15, itself below the 4.11 `statx`
+  /// floor the backends refuse to start under. The whole-root class survives only
+  /// as what a host below BOTH oracles would get. The fanotify backend needs 5.17
+  /// regardless, so it never came near it at all.
   ///
   /// Only the Linux backends consult it — inotify and fanotify. FSEvents signals
   /// both cases in band (`RootChanged` for the root, an `UNMOUNT` flag word for a

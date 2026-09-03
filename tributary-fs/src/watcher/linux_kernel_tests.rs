@@ -181,6 +181,66 @@ fn fdinfo_line_matching_is_device_and_inode_exact() {
   );
 }
 
+/// Every supported kernel RECORDS a mount id in `/proc/self/fdinfo/<fd>`, and it is
+/// the SAME id `statx(STATX_MNT_ID)` reports.
+///
+/// This is the whole load-bearing claim of the fdinfo tier, asserted against the
+/// running kernel rather than reasoned about. The tier exists because
+/// `STATX_MNT_ID` is 5.8 while `mnt_id:` has been printed for every open fd —
+/// `O_PATH` included — since 3.15, below the 4.11 `statx` floor the spawn barrier
+/// enforces. If that stops being true, a boundary is recorded with no id, which
+/// makes the core hold a `Standing::Unknown` entry and cover the WHOLE watched
+/// root on every authoritative refresh, silently and forever. This cell turns
+/// that silent degrade into a red test on every Linux host the suite runs on: no
+/// root, no loopback mount, no kernel-version gate — a scratch directory and one
+/// `O_PATH` open.
+///
+/// The equality leg only asserts where the host HAS the `statx` bit, because
+/// below 5.8 there is no second reading to compare against — but that is exactly
+/// the host on which it matters that the two ids are interchangeable, since the
+/// census keys ids from `mountinfo` (the legacy id) and the seams read them
+/// through whichever tier answered.
+#[test]
+fn every_supported_kernel_records_a_mount_id_in_fdinfo() {
+  use std::os::fd::AsRawFd as _;
+
+  use rustix::fs::{AtFlags, Mode, OFlags, StatxFlags, open, statx};
+
+  let dir = scratch_root("fdinfo-mnt-id");
+  let flags = OFlags::PATH
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::DIRECTORY)
+    .union(OFlags::CLOEXEC);
+  let fd = open(&dir, flags, Mode::empty()).expect("O_PATH the scratch directory");
+
+  let text = std::fs::read(format!("/proc/self/fdinfo/{}", fd.as_raw_fd()))
+    .expect("read the fd's own fdinfo");
+  let parsed = crate::os::linux::mnt_id_from_fdinfo(&text);
+  assert!(
+    parsed.is_some(),
+    "this kernel prints no parsable `mnt_id:` line for an O_PATH fd, so the tier \
+     below `statx(STATX_MNT_ID)` has no oracle and every boundary observed \
+     without the statx bit would be recorded id-less — a permanent whole-root \
+     cover per refresh. fdinfo was:\n{}",
+    String::from_utf8_lossy(&text)
+  );
+
+  let stx = statx(&fd, c"", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)
+    .expect("statx the SAME fd the fdinfo line describes");
+  if let Some(masked) = crate::os::linux::mnt_id_from_mask(stx.stx_mask, stx.stx_mnt_id) {
+    assert_eq!(
+      parsed,
+      Some(masked),
+      "fdinfo and `statx(STATX_MNT_ID)` must report the SAME id for one fd — they \
+       are one key space, and a census keyed by one while a seam reads the other \
+       would condemn every boundary on its first transition"
+    );
+  }
+
+  drop(fd);
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Waits (bounded) until `done()` holds, polling the kernel-visible state; `false` on lapse.
 async fn converge(mut done: impl FnMut() -> bool) -> bool {
   tokio::time::timeout(DEADLINE, async {

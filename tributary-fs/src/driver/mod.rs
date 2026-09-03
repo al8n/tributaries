@@ -23,9 +23,10 @@
 //! once up front and refuses a kernel below the floor (see `os::linux`), so this
 //! executor's live-path sample ([`stat_sample`]) is always a `statx` and never
 //! needs a sub-`statx` fallback. A `statx` mask miss (no `STATX_MNT_ID` below 5.8)
-//! still drops just the mount frame (absent, never mixed in from a second lookup)
-//! and the core fences that object on the device belt — so the rule holds either
-//! way: one object, one sample.
+//! costs the frame nothing: the sample is re-taken through an `O_PATH` pin
+//! ([`stat_sample_pinned`]) whose `/proc/self/fdinfo` line answers the id, and
+//! whose `statx` answers the identity — so all four facts still come from ONE
+//! object, and the rule holds either way: one object, one sample.
 
 use std::{
   collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
@@ -5139,21 +5140,27 @@ struct StatSample {
   kind: tributary_proto::FileKind,
   dev: u64,
   ino: u64,
-  /// The mount frame, `Some` only when the sample reported the mount id, `None`
-  /// on a `statx` mask miss (`STATX_MNT_ID` is 5.8; below it the bit stays unset)
-  /// — the core then fences on the device belt.
+  /// The mount frame — `Some` on every supported kernel, from the `statx` mask
+  /// (5.8+) or from the pinned fd's `/proc/self/fdinfo` line (3.15+, so below the
+  /// 4.11 `statx` floor). `None` only where NEITHER answers, which no supported
+  /// host reaches; the core then fences on the device belt and fails the scope
+  /// closed while it holds the boundary.
   frame: Option<u64>,
 }
 
-/// ONE sample of the object at `path` (symlink not followed): the sole path-syscall
-/// behind every fact a caller reads about that object.
+/// ONE sample of the object at `path` (symlink not followed): every fact a caller
+/// reads about that object, always from ONE object.
 ///
-/// `statx(AT_FDCWD, path, AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS | STATX_MNT_ID)` —
-/// kind, device, inode, AND mount frame all from THAT one result. The Linux backends
-/// require `statx` (Linux 4.11+, gated once at spawn — see `os::linux`), so there is
-/// no sub-`statx` fallback: the sample is always this single syscall. A mask miss
-/// (`STATX_MNT_ID` is 5.8) declines only the frame (`None`), and the core then fences
-/// that object on the device belt.
+/// On a kernel that answers a mount id through `statx` — 5.8 and up, which the
+/// process settles once (`os::linux`'s tier memo) — that is a single
+/// `statx(AT_FDCWD, path, AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS | STATX_MNT_ID)`:
+/// kind, device, inode AND mount frame all from THAT one result, and no other
+/// syscall at all.
+///
+/// On a 4.11–5.7 kernel the mask carries no mount id, so the sample is taken
+/// through a PINNED fd instead ([`stat_sample_pinned`]) — the frame comes from
+/// `/proc/self/fdinfo`, and the identity is re-read from that same fd rather than
+/// paired with the earlier path lookup's. See that function for why.
 ///
 /// The path is resolved the same way `symlink_metadata` was, so an anchor
 /// (`/proc/self/fd/N`) enumerate reads every fact THROUGH the pinned fd too.
@@ -5169,25 +5176,94 @@ struct StatSample {
 /// never is.
 #[cfg(all(target_os = "linux", not(miri)))]
 fn stat_sample(path: &Path) -> Result<StatSample, rustix::io::Errno> {
-  use rustix::fs::{AtFlags, StatxFlags, makedev, statx};
+  use rustix::fs::{AtFlags, StatxFlags, statx};
+  if crate::os::linux::statx_answers_mount_id() {
+    let stx = loop {
+      match statx(
+        rustix::fs::CWD,
+        path,
+        AtFlags::SYMLINK_NOFOLLOW,
+        StatxFlags::BASIC_STATS.union(StatxFlags::MNT_ID),
+      ) {
+        Ok(stx) => break stx,
+        Err(rustix::io::Errno::INTR) => continue,
+        Err(err) => return Err(err),
+      }
+    };
+    let frame = crate::os::linux::mnt_id_from_mask(stx.stx_mask, stx.stx_mnt_id);
+    crate::os::linux::settle_mount_id_tier(frame.is_some());
+    if frame.is_some() {
+      return Ok(sample_of(&stx, frame));
+    }
+    // The mask missed, so this kernel has no `STATX_MNT_ID` and every later
+    // sample skips straight past the branch above. This one falls through and
+    // re-takes the object through a pin; the result just read is DISCARDED rather
+    // than half-kept, because keeping it is the mispairing the pinned read exists
+    // to avoid.
+  }
+  stat_sample_pinned(path)
+}
+
+/// [`stat_sample`] on a kernel whose `statx` answers no mount id: `open(path,
+/// O_PATH | O_NOFOLLOW | O_CLOEXEC)`, then `statx` and `/proc/self/fdinfo` through
+/// THAT one fd.
+///
+/// # Why the identity is re-read rather than carried over
+///
+/// The frame has to come from an fd, because the fdinfo line is addressed by
+/// descriptor and nothing else. The one-sample rule (see the module doc) then
+/// forbids pairing that fd's frame with the identity a SEPARATE path lookup
+/// returned: a rename or bind toggling `path` between the two would hand one
+/// object's `(kind, dev, ino)` to another object's mount id, and the arm
+/// downstream verifies `(dev, ino)` only — so a raced foreign bind could be
+/// classified descendable and armed, the precise failure the rule exists to
+/// prevent. Taking all four facts through the pinned fd keeps them one object's,
+/// at the cost of two extra syscalls on a kernel below 5.8 and none at all above
+/// it.
+///
+/// `O_PATH` asks no permission on the object itself and opens anything — a
+/// symlink (with `O_NOFOLLOW`), a socket, a device — so this reaches exactly what
+/// `AT_SYMLINK_NOFOLLOW` reached. A FAILED open yields the errno the `statx` would
+/// have yielded for the same path, so `NOENT` keeps its raced-away meaning and no
+/// failure is laundered into a `None` frame.
+#[cfg(all(target_os = "linux", not(miri)))]
+fn stat_sample_pinned(path: &Path) -> Result<StatSample, rustix::io::Errno> {
+  use std::os::fd::AsFd;
+
+  use rustix::fs::{AtFlags, Mode, OFlags, StatxFlags, open, statx};
+  let flags = OFlags::PATH.union(OFlags::NOFOLLOW).union(OFlags::CLOEXEC);
+  let fd = loop {
+    match open(path, flags, Mode::empty()) {
+      Ok(fd) => break fd,
+      Err(rustix::io::Errno::INTR) => continue,
+      Err(err) => return Err(err),
+    }
+  };
   let stx = loop {
     match statx(
-      rustix::fs::CWD,
-      path,
-      AtFlags::SYMLINK_NOFOLLOW,
-      StatxFlags::BASIC_STATS.union(StatxFlags::MNT_ID),
+      fd.as_fd(),
+      c"",
+      AtFlags::EMPTY_PATH,
+      StatxFlags::BASIC_STATS,
     ) {
       Ok(stx) => break stx,
       Err(rustix::io::Errno::INTR) => continue,
       Err(err) => return Err(err),
     }
   };
-  Ok(StatSample {
+  let frame = crate::os::linux::fdinfo_mount_id(fd.as_fd())?;
+  Ok(sample_of(&stx, frame))
+}
+
+/// One `statx` result and the frame decided for it, lowered to a [`StatSample`].
+#[cfg(all(target_os = "linux", not(miri)))]
+fn sample_of(stx: &rustix::fs::Statx, frame: Option<u64>) -> StatSample {
+  StatSample {
     kind: kind_of_mode(u32::from(stx.stx_mode)),
-    dev: makedev(stx.stx_dev_major, stx.stx_dev_minor),
+    dev: rustix::fs::makedev(stx.stx_dev_major, stx.stx_dev_minor),
     ino: stx.stx_ino,
-    frame: (stx.stx_mask & StatxFlags::MNT_ID.bits() != 0).then_some(stx.stx_mnt_id),
-  })
+    frame,
+  }
 }
 
 /// The proto file kind of a raw `st_mode`/`stx_mode` (symlinks are never followed).
@@ -5901,8 +5977,8 @@ impl FsOps for RealFs {
     // identity verdict with a different object's frame (a replace/remount between two
     // separate lookups would). A `Missing` root is DeleteSelf, any other stat failure
     // is Unreadable (MoveSelf) — the exact `RootChanged`-probe mapping; the mount id
-    // is inotify's best-effort belt (`None` below 5.8), taken from the same result's
-    // mask.
+    // is inotify's descent boundary, taken from the SAME sample (`None` only where
+    // the host answers no id at all).
     //
     // The stat is taken INSIDE [`crate::os::mount_sample`] rather than beside it,
     // and that is the second half of the same discipline. One atomic stat of the
@@ -6179,9 +6255,10 @@ impl FsOps for RealFs {
 /// `(kind, dev, ino)` with another object's mount frame — the arm downstream
 /// verifies `(dev, ino)` only, so a raced foreign bind that split the sample
 /// could otherwise be classified descendable and armed. A `statx` mask miss (no
-/// `STATX_MNT_ID` below 5.8) drops just the frame (`None`) and descent runs on the
-/// device belt. Off Linux, one `symlink_metadata` (no mount-id notion; the core
-/// fences on device alone) — still a single object's facts.
+/// `STATX_MNT_ID` below 5.8) still answers a frame: the sample is re-taken whole
+/// through an `O_PATH` pin whose fdinfo carries the id. Off Linux, one
+/// `symlink_metadata` (no mount-id notion; the core fences on device alone) —
+/// still a single object's facts.
 #[cfg(all(target_os = "linux", not(miri)))]
 fn dir_entry_stat(entry_path: &Path) -> Option<(tributary_proto::FileKind, u64, u64, Option<u64>)> {
   let sample = stat_sample(entry_path).ok()?;
@@ -6212,8 +6289,12 @@ fn dir_entry_stat(entry_path: &Path) -> Option<(tributary_proto::FileKind, u64, 
 /// object's device with another's mount id.
 ///
 /// Off Linux there is no mount-id notion, so the id is `None` — the honest
-/// degrade the provenance partition already handles through the row-confirmed
-/// upgrade.
+/// degrade, and one the core pays for: a boundary recorded with no id enters the
+/// ledger `Standing::Unknown`, which joins no census and fails the whole scope
+/// closed (a per-refresh root cover) while it is held. On Linux that cannot happen
+/// on a supported kernel — the id comes from the `statx` mask on 5.8+ and from the
+/// pinned fd's `/proc/self/fdinfo` line below it — so this degrade is the fake and
+/// non-Linux executors' alone.
 #[cfg(all(target_os = "linux", not(miri)))]
 fn probe_path(path: &Path) -> ProbeOutcome {
   match stat_sample(path) {
@@ -8193,7 +8274,7 @@ pub(crate) async fn run<R, F>(
                 && match (meta.root_mnt_id, mnt) {
                   (Some(new_mnt), Some(old_mnt)) => new_mnt == old_mnt,
                   // Either frame unknown: the device belt governs alone — the
-                  // codebase's existing pre-5.8 degrade, inherited unchanged.
+                  // codebase's existing no-oracle degrade, inherited unchanged.
                   _ => true,
                 }
             });

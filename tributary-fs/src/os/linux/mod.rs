@@ -55,15 +55,20 @@
 //!   all, so a 4.11–5.5 kernel still pins, starts the reader, AND reads the ancestor
 //!   chain without ever hitting an unhandled
 //!   `ENOSYS`. `statx`'s mount id (`STATX_MNT_ID`, 5.8) is a masked read
-//!   ([`root_mount_id`] here, and the driver's `stat_sample`) that yields `Ok(None)`
-//!   — the device-belt fence — on a 4.11–5.7 kernel rather than failing. The scope
-//!   fence rests on one invariant: **a `None` mount frame means `statx` SUCCEEDED
-//!   without the `STATX_MNT_ID` bit (a pre-5.8 belt), and NEVER that `statx`
-//!   failed.** A `statx` failure is always a spawn failure ([`require_statx`] fails
-//!   closed on EVERY error, and the mount-id capture turns `Err` into a spawn
-//!   refusal) or a walk failure — so the belt is never reached by silently
-//!   swallowing a denied `statx`, which would disable the fence. `inotify_init` and
-//!   `eventfd` are far below the floor.
+//!   ([`root_mount_id`] here, and the driver's `stat_sample`) whose MISS on a
+//!   4.11–5.7 kernel hands the read to `/proc/self/fdinfo`, which has printed the
+//!   same legacy `mnt_id:` for every open fd — `O_PATH` included — since 3.15,
+//!   below this floor. A mount id is therefore ANSWERED on every supported host,
+//!   and the once-permanent 4.11–5.7 device-belt degrade has no trigger left on an
+//!   ordinary mount; which of the two reads answers is settled ONCE per process
+//!   (see [`root_mount_id`]). The scope fence rests on one invariant: **a `None`
+//!   mount frame means the host answered no mount id ANYWHERE it could be asked —
+//!   neither the `statx` mask nor fdinfo — and NEVER that a read failed.** A
+//!   failed read is always a spawn failure ([`require_statx`] fails closed on
+//!   EVERY error, and the mount-id capture turns `Err` into a spawn refusal) or a
+//!   walk failure — so the belt is never reached by silently swallowing a denied
+//!   `statx` or an unreadable `/proc`, which would disable the fence.
+//!   `inotify_init` and `eventfd` are far below the floor.
 //! - **fanotify: 5.17+** (the `FAN_REPORT_TARGET_FID` / `FAN_RENAME` composite,
 //!   design §4), well above the `statx` floor, so the up-front gate never trips on
 //!   it. Every fanotify-only call — including the seed walk's `openat2` roots in
@@ -1563,28 +1568,44 @@ fn ancestor_identities(
   Ok(chain)
 }
 
-/// The MOUNT id of the pinned root, read fd-relative via
-/// `statx(root_fd, "", AT_EMPTY_PATH, STATX_MNT_ID)` — the descent boundary both
+/// The MOUNT id of the pinned root — `statx(root_fd, "", AT_EMPTY_PATH,
+/// STATX_MNT_ID)` where the kernel answers that, and the fd's own
+/// `/proc/self/fdinfo` line where it does not — the descent boundary both
 /// backends carry on [`RootMeta`](super::RootMeta) so the core (inotify) and the
 /// seed walk (fanotify) can fence a submount by mount id rather than device. A
 /// `mount --bind` of a same-superblock directory shares the root's device, so the
 /// device alone cannot mark the boundary; the mount id differs across any mount.
 ///
-/// # `Ok(None)` is the pre-5.8 belt; `Err` is a syscall failure — never conflated
+/// Which of the two reads answers is decided ONCE per process
+/// ([`mount_id_through_tier`]): a 5.8+ kernel settles on `statx` and never opens
+/// `/proc`, and a 4.11–5.7 kernel settles on fdinfo and never pays the mask probe
+/// again.
 ///
-/// A SUCCESSFUL `statx` whose `stx_mask` lacks the `STATX_MNT_ID` bit returns
-/// `Ok(None)` — the legitimate device-belt degrade below Linux 5.8 (RHEL 8's 4.18,
-/// Ubuntu 20.04's 5.4), where the core's `crosses_mount_boundary` falls back to the
-/// device check (the settled single-device policy). A `statx` SYSCALL FAILURE returns
-/// `Err(errno)` and is NEVER laundered into that `None`: the spawn-time frame capture
-/// (`RootMeta.root_mnt_id`, both backends) turns it into a spawn failure, and the live
-/// reseed/subtree walks turn it into a walk failure — so a `None` mount frame ALWAYS
-/// means `statx` succeeded without the mount-id bit and NEVER means `statx` failed.
-/// The spawn barrier already gated the 4.11 `statx` floor ([`require_statx`], fail
-/// closed), so an `Err` here is not expected — but it fails closed rather than
-/// silently disabling the fence. inotify's 4.11 floor is below 5.8, so `Ok(None)` is a
-/// real path there; fanotify's 5.17 floor always reports the id, but `Ok(None)` is
-/// still handled rather than asserted.
+/// # `Ok(None)` is the below-3.15 belt; `Err` is a read that FAILED — never conflated
+///
+/// `Ok(None)` means the HOST answers no mount id ANYWHERE it could be asked: the
+/// `statx` mask left the `STATX_MNT_ID` bit unset (below 5.8) AND the fd's fdinfo
+/// carried no parsable `mnt_id:` line. The kernel has printed that line for every
+/// open fd, `O_PATH` included, since Linux 3.15 — below the 4.11 `statx` floor the
+/// spawn barrier already enforces ([`require_statx`]) — so on every SUPPORTED host
+/// this `None` is unreachable, and the kernel cell
+/// `every_supported_kernel_records_a_mount_id_in_fdinfo` fails loudly on any host
+/// that stops printing it rather than letting the scope quietly degrade. The belt
+/// survives only as the honest answer for a host below both floors.
+///
+/// That matters above the seams: a boundary observed with no id is recorded
+/// `Standing::Unknown` (the core's ledger) and fails the WHOLE scope closed (a
+/// per-refresh root cover) while it is held. Before the fdinfo tier that was the
+/// standing state of every 4.11–5.7 host; now it has no trigger on an ordinary
+/// mount.
+///
+/// A read that FAILED returns `Err(errno)` and is NEVER laundered into that
+/// `None` — neither the `statx` (the historical rule) nor the fdinfo read (a
+/// closed fd's `ENOENT`, a hardened `/proc`'s `EACCES`). The spawn-time frame
+/// capture (`RootMeta.root_mnt_id`, both backends) turns an `Err` into a spawn
+/// failure and the live reseed/subtree walks turn it into a walk failure, so a
+/// `None` mount frame ALWAYS means the host answered no id and NEVER means a read
+/// failed.
 ///
 /// # `EINTR` is retried, never surfaced
 ///
@@ -1594,30 +1615,184 @@ fn ancestor_identities(
 /// was interrupted before it answered, and the honest response is to ask again, as
 /// the driver's own `stat_sample` does. Retrying here rather than at each caller
 /// keeps the four call sites from each having to remember, and keeps `Err` meaning
-/// "this read genuinely failed".
+/// "this read genuinely failed". The fdinfo leg inherits the same discipline from
+/// `std::fs::read`, whose open and read loops both retry `EINTR`.
 #[cfg(all(target_os = "linux", not(miri)))]
 pub(crate) fn root_mount_id(root_fd: BorrowedFd<'_>) -> Result<Option<u64>, rustix::io::Errno> {
-  use rustix::fs::{AtFlags, StatxFlags, statx};
-  let stx = loop {
-    match statx(root_fd, c"", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID) {
-      Ok(stx) => break stx,
-      Err(rustix::io::Errno::INTR) => continue,
-      Err(err) => return Err(err),
-    }
-  };
-  Ok(mnt_id_from_mask(stx.stx_mask, stx.stx_mnt_id))
+  mount_id_through_tier(
+    &MOUNT_ID_TIER,
+    || {
+      use rustix::fs::{AtFlags, StatxFlags, statx};
+      let stx = loop {
+        match statx(root_fd, c"", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID) {
+          Ok(stx) => break stx,
+          Err(rustix::io::Errno::INTR) => continue,
+          Err(err) => return Err(err),
+        }
+      };
+      Ok(mnt_id_from_mask(stx.stx_mask, stx.stx_mnt_id))
+    },
+    || fdinfo_mount_id(root_fd),
+  )
 }
 
 /// The mount id a SUCCESSFUL `statx` reported, or `None` when its `stx_mask` left the
-/// `STATX_MNT_ID` bit unset (PURE — the below-5.8 belt decision, split out so it is
+/// `STATX_MNT_ID` bit unset (PURE — the below-5.8 mask decision, split out so it is
 /// row-testable without a live fd). This distinguishes only mask-present from
 /// mask-absent; a `statx` syscall failure never reaches here (the caller propagates it
-/// as `Err`), so a `None` from this function is ALWAYS the legitimate mask-absent belt,
-/// never a swallowed error.
+/// as `Err`), so a `None` from this function is ALWAYS the legitimate mask-absent
+/// miss — the signal that hands the read to the fdinfo tier — never a swallowed error.
 #[cfg(all(target_os = "linux", not(miri)))]
-fn mnt_id_from_mask(stx_mask: u32, stx_mnt_id: u64) -> Option<u64> {
+pub(crate) fn mnt_id_from_mask(stx_mask: u32, stx_mnt_id: u64) -> Option<u64> {
   use rustix::fs::StatxFlags;
   (stx_mask & StatxFlags::MNT_ID.bits() != 0).then_some(stx_mnt_id)
+}
+
+/// Nothing has answered a mount id yet in this process.
+const MOUNT_ID_TIER_UNKNOWN: u8 = 0;
+/// `statx(STATX_MNT_ID)` answers on this kernel (5.8+): no read opens `/proc`.
+const MOUNT_ID_TIER_STATX: u8 = 1;
+/// `statx` does NOT answer on this kernel (4.11–5.7): every read goes straight to
+/// `/proc/self/fdinfo`, and none pays the mask probe again.
+const MOUNT_ID_TIER_FDINFO: u8 = 2;
+
+/// Which read answers a mount id on THIS kernel, settled once and never revised.
+///
+/// The mask miss is a property of the KERNEL, not of the call — `STATX_MNT_ID`
+/// either exists or it does not — so paying the probe on every read after the
+/// first is pure waste, and a kernel cannot lose the bit at runtime, so there is
+/// no downgrade path to represent. `Relaxed` throughout: the cell publishes no
+/// other memory, and a racing pair of first reads both observe the same kernel
+/// and so agree on what they write.
+static MOUNT_ID_TIER: std::sync::atomic::AtomicU8 =
+  std::sync::atomic::AtomicU8::new(MOUNT_ID_TIER_UNKNOWN);
+
+/// Whether a caller must still ASK `statx` for the mount id, or may go straight
+/// to fdinfo because a previous read already learned this kernel has no bit to
+/// ask for. PURE over the tier cell.
+fn statx_answers_mount_id_in(tier: &std::sync::atomic::AtomicU8) -> bool {
+  tier.load(std::sync::atomic::Ordering::Relaxed) != MOUNT_ID_TIER_FDINFO
+}
+
+/// Records what the FIRST answering read learned (PURE over the tier cell). Only
+/// that first read writes: later ones observe the same kernel and would write the
+/// same value, and a `compare_exchange` from `Unknown` says "settled once" in the
+/// code rather than only in the comment.
+fn settle_mount_id_tier_in(tier: &std::sync::atomic::AtomicU8, answered_by_statx: bool) {
+  use std::sync::atomic::Ordering;
+  let settled = if answered_by_statx {
+    MOUNT_ID_TIER_STATX
+  } else {
+    MOUNT_ID_TIER_FDINFO
+  };
+  let _ = tier.compare_exchange(
+    MOUNT_ID_TIER_UNKNOWN,
+    settled,
+    Ordering::Relaxed,
+    Ordering::Relaxed,
+  );
+}
+
+/// [`statx_answers_mount_id_in`] against THIS process's tier — what the driver's
+/// `stat_sample` asks before it decides which shape of sample to take.
+#[cfg(all(target_os = "linux", not(miri)))]
+pub(crate) fn statx_answers_mount_id() -> bool {
+  statx_answers_mount_id_in(&MOUNT_ID_TIER)
+}
+
+/// [`settle_mount_id_tier_in`] against THIS process's tier — what the driver's
+/// `stat_sample` records after its own `statx` has (or has not) answered, so the
+/// two read sites share ONE memo and either can settle it for both.
+#[cfg(all(target_os = "linux", not(miri)))]
+pub(crate) fn settle_mount_id_tier(answered_by_statx: bool) {
+  settle_mount_id_tier_in(&MOUNT_ID_TIER, answered_by_statx);
+}
+
+/// One mount-id read resolved through the tier — PURE over both reads AND over
+/// the tier cell, the same closure discipline the inotify arm's `frame_check`
+/// uses and for the same reason: the legs a healthy 5.8+ host can never take are
+/// the ones that most need a cell.
+///
+/// `read_mask` performs the `statx` and answers `Ok(Some(id))` when the mask
+/// carried the bit, `Ok(None)` when it did not. It is called AT MOST ONCE, and
+/// NOT AT ALL once the tier has settled on fdinfo. `read_fdinfo` reads and parses
+/// the fd's `/proc/self/fdinfo` line and is called only when the mask did not
+/// answer.
+///
+/// A `statx` that FAILED settles NOTHING: it says nothing about whether this
+/// kernel has the bit, so pinning a tier on it would let one `EACCES` send every
+/// later read down the wrong leg for the life of the process. It propagates as
+/// `Err`, and the next read probes the mask again.
+fn mount_id_through_tier<E>(
+  tier: &std::sync::atomic::AtomicU8,
+  read_mask: impl FnOnce() -> Result<Option<u64>, E>,
+  read_fdinfo: impl FnOnce() -> Result<Option<u64>, E>,
+) -> Result<Option<u64>, E> {
+  if statx_answers_mount_id_in(tier) {
+    match read_mask() {
+      Ok(Some(id)) => {
+        settle_mount_id_tier_in(tier, true);
+        return Ok(Some(id));
+      }
+      Ok(None) => settle_mount_id_tier_in(tier, false),
+      Err(err) => return Err(err),
+    }
+  }
+  read_fdinfo()
+}
+
+/// The mount id `/proc/self/fdinfo/<fd>` records for an open descriptor — the
+/// tier below `statx(STATX_MNT_ID)`, and the SAME legacy id that call reports
+/// (both read `real_mount(path->mnt)->mnt_id`), so the two join one census key
+/// space and a host may answer through either without splitting it.
+///
+/// The kernel has printed the line for every open fd since Linux 3.15, `O_PATH`
+/// included, which is below the 4.11 `statx` floor the spawn barrier enforces.
+///
+/// `Ok(None)` is a fdinfo with no parsable `mnt_id:` line — the honest answer for
+/// a host below 3.15 and unreachable above it. A read that FAILED (a closed fd's
+/// `ENOENT`, a hardened `/proc`'s `EACCES`) is `Err`, never laundered into that
+/// `None`, exactly as a failed `statx` is not.
+#[cfg(all(target_os = "linux", not(miri)))]
+pub(crate) fn fdinfo_mount_id(fd: BorrowedFd<'_>) -> Result<Option<u64>, rustix::io::Errno> {
+  use std::os::fd::AsRawFd;
+  // Small, and read whole: a partial read would truncate the value itself, which
+  // the parser refuses rather than mis-reading (see `mnt_id_from_fdinfo`).
+  match std::fs::read(format!("/proc/self/fdinfo/{}", fd.as_raw_fd())) {
+    Ok(text) => Ok(mnt_id_from_fdinfo(&text)),
+    Err(err) => Err(rustix::io::Errno::from_io_error(&err).unwrap_or(rustix::io::Errno::IO)),
+  }
+}
+
+/// The mount id one `/proc/self/fdinfo/<fd>` body records (PURE — row-testable
+/// without an fd, and the whole of the fdinfo tier's parsing).
+///
+/// The kernel writes `mnt_id:\t<decimal>\n` among the fd's other lines
+/// (`pos:`, `flags:`, `ino:`, and whatever a later kernel adds). This takes the
+/// FIRST line whose prefix is exactly `mnt_id:` — so 6.8's `mnt_id_unique:` line,
+/// which carries a DIFFERENT id in a different key space, is never mistaken for
+/// it — trims the ASCII whitespace the kernel puts after the colon, and requires
+/// what is left to be a non-empty run of ASCII digits.
+///
+/// `None` where the body has no such line, or its value is not a decimal.
+///
+/// # A line the read cut short is `None`, never a smaller mount id
+///
+/// A body whose LAST line has no terminating `\n` was truncated, and
+/// `mnt_id:\t5` out of `mnt_id:\t551\n` parses perfectly well into the id of a
+/// DIFFERENT mount — a fence that would then let a descent cross a boundary while
+/// believing it had proved it did not. Only a newline-terminated line is read, so
+/// a short read declines instead of answering wrongly.
+pub(crate) fn mnt_id_from_fdinfo(text: &[u8]) -> Option<u64> {
+  let line = text
+    .split_inclusive(|byte| *byte == b'\n')
+    .filter(|line| line.ends_with(b"\n"))
+    .find(|line| line.starts_with(b"mnt_id:"))?;
+  let digits = line["mnt_id:".len()..].trim_ascii();
+  if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+    return None;
+  }
+  core::str::from_utf8(digits).ok()?.parse().ok()
 }
 
 /// A live Linux source, one variant per backend. Dropping it tears the reader
@@ -1841,12 +2016,13 @@ mod inotify_source {
         source: err.into(),
       })?;
       let root_dev = stat.st_dev;
-      // The root's mount id from the same PIN — the core's descent boundary. inotify
-      // runs below 5.8, so a SUCCESSFUL read may be `None` (statx reports no mount id
-      // there) and the core falls back to the device check; a statx SYSCALL failure,
-      // by contrast, is a spawn failure — never a silent `None` that would disable the
-      // fence (the barrier already required statx to work). Read once here, carried on
-      // `RootMeta` like `root_dev`.
+      // The root's mount id from the same PIN — the core's descent boundary. A
+      // SUCCESSFUL read is `None` only where neither the statx mask nor the pin's
+      // own fdinfo answers, which no supported kernel reaches; the core would then
+      // fall back to the device check. A read that FAILS, by contrast, is a spawn
+      // failure — never a silent `None` that would disable the fence (the barrier
+      // already required statx to work). Read once here, carried on `RootMeta` like
+      // `root_dev`.
       let root_mnt_id = root_mount_id(root_fd).map_err(|err| SourceError::RootUnavailable {
         root: canonical.clone(),
         source: err.into(),
