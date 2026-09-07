@@ -65,8 +65,8 @@ serde = { version = "1", optional = true, features = ["derive"] }
 # gate and builds for `wasm32-unknown-unknown` unchanged.
 rand_chacha = "0.9"
 thiserror = "2"
-tributary-fs = { version = "0.1", path = "../tributary-fs", optional = true }
-tributary-proto = { version = "0.1", path = "../tributary-proto" }
+tributary-fs = { version = "0.2", path = "../tributary-fs", optional = true }
+tributary-proto = { version = "0.2", path = "../tributary-proto" }
 
 # The ONE place an OS entropy source is consulted: the 32-byte seed for the cookie-nonce
 # generator above, taken once when a driver is assembled and never again. Gated off
@@ -95,7 +95,7 @@ agnostic-lite = { version = "0.7", features = ["time"] }
 proptest = "1"
 serde_json = "1"
 tempfile = "3"
-tributary-fs = { version = "0.1", path = "../tributary-fs", features = [
+tributary-fs = { version = "0.2", path = "../tributary-fs", features = [
   "tokio",
   "_integration",
 ] }

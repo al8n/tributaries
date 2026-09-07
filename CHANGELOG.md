@@ -4,6 +4,35 @@ All notable changes to this workspace are documented here. The format is based o
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the crates adhere to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0]
+
+### Added
+
+- **`tributaries`**, **`tributary-fs`**, **`tributary-proto`** — optional **`serde`**
+  and **`clap`** faces on the option households, both off by default and neither
+  changing anything when off. `serde` gives every household one document keyed by its
+  own field names, defaulted from the type's `Default` (a missing key is that
+  default), with no `deny_unknown_fields` so a document written for a later version
+  still loads; `Duration` knobs are humantime text (`"250ms"`, `"2s"`) and the
+  non-zero capacities refuse a `0`. `clap` gives each household a `clap::Args` group
+  whose flagless command line is that same `Default`. Faced: `WatcherOptions` and
+  `Backend` (`tributary-fs`), `TributariesOptions`, `DebounceConfig`, `Debounce`,
+  `Interest` and `WatchOptions` (`tributaries`), and the core `Interest`
+  (`tributary-proto`).
+
+  - `Backend` spells itself exactly as `Backend::as_str` does on both faces —
+    `usn-journal`, not a second spelling.
+  - `WatchOptions`'s `Filter` is on neither face: a caller's closure is not something
+    a document can name, so it is skipped and comes back `Filter::all`. Neither face
+    constrains the component parameter `C`.
+  - `Debounce` has no `clap` face — `Debounce::Custom` carries a whole
+    `DebounceConfig`, which one flag cannot name — but `TributariesOptions`'s
+    watcher-global debounce does: its flattened flags stay off until one is given.
+  - One flag is not its field's name: `WatcherOptions::event_capacity` is
+    `--watcher-event-capacity`, so the three households can be flattened onto ONE
+    `clap::Command` beside `TributariesOptions`'s `--event-capacity`. The `serde` key
+    is unchanged.
+
 ## [0.1.0]
 
 ### Added
