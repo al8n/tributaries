@@ -54,13 +54,21 @@ tributary-proto = { version = "0.2", path = "../tributary-proto" }
 # `string` lets a flag default be an OWNED string, which is how the `--<duration>`
 # defaults are rendered from the `DEFAULT_*` constants themselves rather than
 # retyped as literals that could drift from them.
-clap = { version = "4", optional = true, features = ["derive", "string"] }
+# Floors, not decoration: the `minimal-versions` job resolves every DIRECT
+# requirement to its lowest match and builds there. `serde` must be at least the
+# generation its own derive emits against (`serde_derive` is transitive, so it is
+# NOT minimized and arrives newest — 1.0.0 against derive 1.0.229 is the failure
+# this pins out). `clap` 4.2 is where `Option<T>` in `#[command(flatten)]` landed,
+# which the opt-in debounce group rests on.
+clap = { version = "4.2", optional = true, features = ["derive", "string"] }
 humantime = { version = "2", optional = true }
 humantime-serde = { version = "1", optional = true }
-serde = { version = "1", optional = true, features = ["derive"] }
+serde = { version = "1.0.229", optional = true, features = ["derive"] }
 
 [dev-dependencies]
-serde_json = "1"
+# The floor the `json!` macro is usable from a 2018+ edition caller at
+# (1.0.10 still fails to resolve `json_internal!`).
+serde_json = "1.0.25"
 tokio = { version = "1.30", features = [
   "macros",
   "rt",

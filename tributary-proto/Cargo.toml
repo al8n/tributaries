@@ -23,16 +23,24 @@ serde = ["dep:serde"]
 clap = ["dep:clap", "std"]
 
 [dependencies]
-clap = { version = "4", optional = true, default-features = false, features = [
+# Floors, not decoration: the `minimal-versions` job resolves every DIRECT
+# requirement to its lowest match and builds there. `serde` must be at least the
+# generation its own derive emits against (`serde_derive` is transitive, so it is
+# NOT minimized and arrives newest — 1.0.0 against derive 1.0.229 is the failure
+# this pins out). `clap` 4.2 is where `Option<T>` in `#[command(flatten)]` landed,
+# which the opt-in debounce group rests on.
+clap = { version = "4.2", optional = true, default-features = false, features = [
   "std",
   "derive",
 ] }
-serde = { version = "1", optional = true, default-features = false, features = [
+serde = { version = "1.0.229", optional = true, default-features = false, features = [
   "derive",
 ] }
 
 [dev-dependencies]
-serde_json = "1"
+# The floor the `json!` macro is usable from a 2018+ edition caller at
+# (1.0.10 still fails to resolve `json_internal!`).
+serde_json = "1.0.25"
 
 [lints]
 workspace = true

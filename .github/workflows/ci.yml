@@ -999,8 +999,15 @@ jobs:
           # then prove nothing.
           target_dir=$(cargo metadata --no-deps --format-version 1 \
             | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
+          # ONE invocation for the whole workspace, not one per crate. The members
+          # require each other by VERSION as well as by path, so a per-crate
+          # `cargo package` resolves that requirement against crates.io alone and
+          # fails on every pre-publish bump ("failed to select a version for the
+          # requirement tributary-proto = ..."). Packaged together, cargo resolves
+          # each member against the archives it is building beside it. The proof
+          # below is unchanged: it still opens every produced archive.
+          cargo package --workspace --no-verify --allow-dirty
           for crate in tributary-proto tributary-fs tributaries; do
-            cargo package -p "$crate" --no-verify --allow-dirty
             archive=$(ls -1 "$target_dir"/package/"$crate"-*.crate)
             for license in LICENSE-APACHE LICENSE-MIT; do
               if ! tar tzf "$archive" | grep -qE "^$crate-[^/]+/$license\$"; then
