@@ -38,12 +38,107 @@ mod tests;
 /// [`admits`](Self::admits) always admits it (and fan-out bypasses the gate for it
 /// entirely, design §5/§7/§8). Even a [`none`](Self::none) subscription still receives
 /// its `Rescan`s.
+///
+/// # Configuration faces
+///
+/// With the `serde` feature the mask is the **list of the kinds it admits** — a set,
+/// spelled as the set it is, rather than four booleans a reader has to add up:
+///
+/// ```json
+/// ["created", "modified", "removed", "moved"]
+/// ```
+///
+/// A present list is exhaustive: what it does not name is gated away, so `[]` is
+/// [`none`](Self::none) (Rescan-only) and the full list is [`all`](Self::all). An
+/// ABSENT list is not the empty one — where an `Interest` is a field of a larger
+/// household ([`WatchOptions`](crate::WatchOptions)) the household's own
+/// `#[serde(default)]` supplies [`all`](Self::all), the deliver-everything default.
+/// A name outside the vocabulary is an error rather than a silent no-op: a
+/// misspelled kind would otherwise quietly stop being delivered.
+///
+/// With the `clap` feature it is a `clap::Args` group of one `--<kind>` flag per
+/// bit. Every bit defaults to `true`, so the flagless command line is
+/// [`all`](Self::all) and NARROWING is what a flag does — which is why each takes an
+/// explicit value:
+///
+/// ```text
+/// $ app --moved=false --removed=false
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "clap", derive(clap::Args))]
 pub struct Interest {
+  #[cfg_attr(feature = "clap", arg(long, action = clap::ArgAction::Set, num_args = 0..=1, require_equals = true, default_missing_value = "true", default_value_t = true))]
   created: bool,
+  #[cfg_attr(feature = "clap", arg(long, action = clap::ArgAction::Set, num_args = 0..=1, require_equals = true, default_missing_value = "true", default_value_t = true))]
   modified: bool,
+  #[cfg_attr(feature = "clap", arg(long, action = clap::ArgAction::Set, num_args = 0..=1, require_equals = true, default_missing_value = "true", default_value_t = true))]
   removed: bool,
+  #[cfg_attr(feature = "clap", arg(long, action = clap::ArgAction::Set, num_args = 0..=1, require_equals = true, default_missing_value = "true", default_value_t = true))]
   moved: bool,
+}
+
+/// The kind names the `serde` face spells an [`Interest`] with, in emission order —
+/// the field order, which is also the order [`EventKind`] declares them in.
+#[cfg(feature = "serde")]
+const KIND_NAMES: [&str; 4] = ["created", "modified", "removed", "moved"];
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for Interest {
+  /// The list of admitted kind names (see the type docs) — a set as a set.
+  fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+  where
+    S: serde::Serializer,
+  {
+    use serde::ser::SerializeSeq as _;
+
+    let bits = [self.created, self.modified, self.removed, self.moved];
+    let mut seq = serializer.serialize_seq(Some(bits.iter().filter(|bit| **bit).count()))?;
+    for (name, admitted) in KIND_NAMES.iter().zip(bits) {
+      if admitted {
+        seq.serialize_element(name)?;
+      }
+    }
+    seq.end()
+  }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for Interest {
+  /// A list of kind names, exhaustively: every kind it does not name is gated away.
+  /// A name outside the vocabulary is refused rather than ignored.
+  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+  where
+    D: serde::Deserializer<'de>,
+  {
+    struct KindList;
+
+    impl<'de> serde::de::Visitor<'de> for KindList {
+      type Value = Interest;
+
+      fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("a list of delivery-kind names")
+      }
+
+      fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+      where
+        A: serde::de::SeqAccess<'de>,
+      {
+        let mut interest = Interest::none();
+        while let Some(name) = seq.next_element::<std::borrow::Cow<'_, str>>()? {
+          match name.as_ref() {
+            "created" => interest.set_created(),
+            "modified" => interest.set_modified(),
+            "removed" => interest.set_removed(),
+            "moved" => interest.set_moved(),
+            other => return Err(serde::de::Error::unknown_variant(other, &KIND_NAMES)),
+          };
+        }
+        Ok(interest)
+      }
+    }
+
+    deserializer.deserialize_seq(KindList)
+  }
 }
 
 impl Interest {

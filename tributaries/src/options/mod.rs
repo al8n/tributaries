@@ -32,11 +32,94 @@ mod tests;
 /// ([`WatchOptions::with_debounce`], resolved through [`Debounce`]). Absent both —
 /// no global config and no [`Debounce::Custom`] override anywhere — events pass
 /// through untouched, and the coalescer is never even instantiated.
+///
+/// # Configuration faces
+///
+/// With the `serde` feature the policy is one object keyed by the field names, every
+/// key optional and defaulted from [`new`](Self::new), unknown keys ignored. The two
+/// windows are humantime text:
+///
+/// ```json
+/// { "quiet_window": "100ms", "max_hold": "2s", "max_buffered": 4096 }
+/// ```
+///
+/// With the `clap` feature it is a `clap::Args` group of one `--<field>` flag per
+/// knob, defaulted the same way:
+///
+/// ```text
+/// $ app --quiet-window 100ms --max-hold 2s --max-buffered 4096
+/// ```
+///
+/// Both doors honor the same clamp the builders do: a
+/// [`max_buffered`](Self::max_buffered) of `0` becomes `1`, never a buffer no entry
+/// can be admitted to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[cfg_attr(feature = "clap", derive(clap::Args))]
 pub struct DebounceConfig {
+  #[cfg_attr(feature = "serde", serde(with = "humantime_serde"))]
+  #[cfg_attr(
+    feature = "clap",
+    arg(
+      long,
+      value_parser = humantime::parse_duration,
+      default_value = clap_duration_default(DebounceConfig::DEFAULT_QUIET_WINDOW),
+    )
+  )]
   quiet_window: Duration,
+  #[cfg_attr(feature = "serde", serde(with = "humantime_serde"))]
+  #[cfg_attr(
+    feature = "clap",
+    arg(
+      long,
+      value_parser = humantime::parse_duration,
+      default_value = clap_duration_default(DebounceConfig::DEFAULT_MAX_HOLD),
+    )
+  )]
   max_hold: Duration,
+  #[cfg_attr(feature = "serde", serde(deserialize_with = "de_max_buffered"))]
+  #[cfg_attr(
+    feature = "clap",
+    arg(
+      long,
+      value_parser = clamped_max_buffered,
+      default_value_t = DebounceConfig::DEFAULT_MAX_BUFFERED,
+    )
+  )]
   max_buffered: usize,
+}
+
+/// A flag default rendered from the constant it mirrors, so the flag and the
+/// constructor can never drift.
+#[cfg(feature = "clap")]
+fn clap_duration_default(duration: Duration) -> clap::builder::OsStr {
+  clap::builder::Str::from(humantime::format_duration(duration).to_string()).into()
+}
+
+/// The one clamp behind both faces of [`DebounceConfig::max_buffered`]: `0` is a cap
+/// no entry can be admitted under, and the builders already read it as `1`. A loaded
+/// or parsed value must mean what the same number means through
+/// [`with_max_buffered`](DebounceConfig::with_max_buffered), so the clamp lives here
+/// rather than in one door of three.
+#[cfg(any(feature = "serde", feature = "clap"))]
+const fn clamp_max_buffered(max_buffered: usize) -> usize {
+  if max_buffered == 0 { 1 } else { max_buffered }
+}
+
+#[cfg(feature = "serde")]
+fn de_max_buffered<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+  D: serde::Deserializer<'de>,
+{
+  use serde::Deserialize as _;
+
+  usize::deserialize(deserializer).map(clamp_max_buffered)
+}
+
+#[cfg(feature = "clap")]
+fn clamped_max_buffered(text: &str) -> Result<usize, core::num::ParseIntError> {
+  text.parse().map(clamp_max_buffered)
 }
 
 impl DebounceConfig {
@@ -157,7 +240,25 @@ impl Default for DebounceConfig {
 /// switch settling off for one subscription while the global coalescer stays on, and
 /// [`Custom`](Self::Custom) can switch it on (with its own windows) while the global
 /// default is off — neither expressible with a bare `Option<DebounceConfig>`.
+///
+/// # Configuration faces
+///
+/// With the `serde` feature the two postures that carry nothing are their own
+/// lowercase names and the one that carries a policy is that name against it:
+///
+/// ```json
+/// "inherit"
+/// "off"
+/// { "custom": { "quiet_window": "100ms" } }
+/// ```
+///
+/// There is no `clap` face: a posture carrying a whole [`DebounceConfig`] is not a
+/// value a single flag can name. A command line that wants one flattens
+/// [`DebounceConfig`]'s own flags and hands the result to
+/// [`WatchOptions::with_debounce`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 #[non_exhaustive]
 pub enum Debounce {
   /// Follow the watcher-global policy ([`TributariesOptions::debounce`]) — the default.
@@ -213,10 +314,39 @@ impl Debounce {
 /// (`Tributaries::new(watcher, options)` under the `fs` feature), and a pre-built
 /// custom source ([`Tributaries::with_source`](crate::Tributaries::with_source)) was
 /// configured by its builder.
+///
+/// # Configuration faces
+///
+/// With the `serde` feature the household is one object keyed by the field names,
+/// every key optional and defaulted from [`new`](Self::new), unknown keys ignored.
+/// `debounce` is the opt-in it is: absent (or `null`) leaves the coalescer off, and a
+/// [`DebounceConfig`] object turns it on.
+///
+/// ```json
+/// {
+///   "event_capacity": 4096,
+///   "debounce": { "quiet_window": "100ms" }
+/// }
+/// ```
+///
+/// With the `clap` feature it is a `clap::Args` group carrying the two capacity
+/// flags plus [`DebounceConfig`]'s own flags, flattened. The coalescer stays off
+/// until one of THOSE flags is given, so it is opt-in on the command line exactly as
+/// it is in a document:
+///
+/// ```text
+/// $ app --event-capacity 4096 --quiet-window 100ms
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[cfg_attr(feature = "clap", derive(clap::Args))]
 pub struct TributariesOptions {
+  #[cfg_attr(feature = "clap", arg(long, default_value_t = TributariesOptions::DEFAULT_EVENT_CAPACITY))]
   event_capacity: NonZeroUsize,
+  #[cfg_attr(feature = "clap", arg(long, default_value_t = TributariesOptions::DEFAULT_COMMAND_CAPACITY))]
   command_capacity: NonZeroUsize,
+  #[cfg_attr(feature = "clap", command(flatten))]
   debounce: Option<DebounceConfig>,
 }
 
@@ -362,9 +492,40 @@ impl Default for TributariesOptions {
 /// handle is observed by every holder. So a cloned `WatchOptions` (and every watch
 /// committed from either copy) shares one live-swappable filter; pass a fresh
 /// [`Filter`] via [`with_filter`](Self::with_filter) for an independent one.
+///
+/// # Configuration faces
+///
+/// With the `serde` feature the subscription is one object keyed by the field names,
+/// every key optional and defaulted from [`new`](Self::new) — so the empty document
+/// is the deliver-everything default and a key is a narrowing:
+///
+/// ```json
+/// { "interest": ["created", "modified"], "debounce": "off" }
+/// ```
+///
+/// The [`Filter`] is on neither face and never round-trips: it is a caller's own
+/// closure, which no document can name. It is skipped on the way out and comes back
+/// [`Filter::all`] — a loaded `WatchOptions` admits everything its [`Interest`]
+/// admits, and a caller that wants a predicate installs it afterwards with
+/// [`with_filter`](Self::with_filter). Neither face constrains `C`.
+///
+/// With the `clap` feature it is a `clap::Args` group of [`Interest`]'s own flags.
+/// The [`Debounce`] posture is skipped there: [`Debounce::Custom`] carries a whole
+/// [`DebounceConfig`], which one flag cannot name (see [`Debounce`]).
+///
+/// ```text
+/// $ app --moved=false --removed=false
+/// ```
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default, bound = ""))]
+#[cfg_attr(feature = "clap", derive(clap::Args))]
 pub struct WatchOptions<C> {
+  #[cfg_attr(feature = "clap", command(flatten))]
   interest: Interest,
+  #[cfg_attr(feature = "serde", serde(skip))]
+  #[cfg_attr(feature = "clap", arg(skip))]
   filter: Filter<C>,
+  #[cfg_attr(feature = "clap", arg(skip))]
   debounce: Debounce,
 }
 

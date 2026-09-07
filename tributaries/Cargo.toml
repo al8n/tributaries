@@ -24,6 +24,19 @@ fs = ["dep:tributary-fs"]
 # runtime.
 tokio = ["agnostic-lite/tokio", "tributary-fs?/tokio"]
 smol = ["agnostic-lite/smol", "tributary-fs?/smol"]
+# Optional `serde` face on the option households (`TributariesOptions`,
+# `DebounceConfig`, `Debounce`, `Interest`, `WatchOptions`), forwarded to the
+# inner crates so a `fs` consumer's `WatcherOptions` and `Backend` carry it too
+# (the weak `?` dependency: nothing to forward when the fs binding is off).
+# `Duration` knobs read and write as humantime text ("50ms", "2s").
+serde = [
+  "dep:serde",
+  "dep:humantime-serde",
+  "tributary-proto/serde",
+  "tributary-fs?/serde",
+]
+# Optional `clap` face on the same households, forwarded the same way.
+clap = ["dep:clap", "dep:humantime", "tributary-proto/clap", "tributary-fs?/clap"]
 
 [dependencies]
 agnostic-lite = { version = "0.7", features = ["time"] }
@@ -35,6 +48,15 @@ futures-util = { version = "0.3", default-features = false, features = [
   "async-await-macro",
 ] }
 iradix = "0.3"
+# The `Duration` knobs' text form, shared by both faces: `humantime-serde` is the
+# serde adapter, `humantime` the `value_parser` the clap flags take. `string` lets
+# a flag default be an OWNED string, which is how the `--<duration>` defaults are
+# rendered from the `DEFAULT_*` constants themselves rather than retyped as
+# literals that could drift from them.
+clap = { version = "4", optional = true, features = ["derive", "string"] }
+humantime = { version = "2", optional = true }
+humantime-serde = { version = "1", optional = true }
+serde = { version = "1", optional = true, features = ["derive"] }
 # The barrier's integrity rests on a cookie name a co-user cannot predict (see
 # `SyncToken`). ChaCha20 is a cryptographic stream cipher, so a driver that seeds one
 # from the OS at construction mints every later nonce as arithmetic, and publishing those
@@ -71,6 +93,7 @@ getrandom = "0.3"
 # are being built.
 agnostic-lite = { version = "0.7", features = ["time"] }
 proptest = "1"
+serde_json = "1"
 tempfile = "3"
 tributary-fs = { version = "0.1", path = "../tributary-fs", features = [
   "tokio",
