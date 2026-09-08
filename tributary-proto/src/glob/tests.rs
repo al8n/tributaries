@@ -119,6 +119,69 @@ fn a_clone_shares_the_compiled_set() {
   assert_eq!(clone.patterns(), set.patterns());
 }
 
+/// The union automaton has a size limit the individual patterns do not, so a
+/// large or pathological — but perfectly VALID — pattern set can be refused;
+/// [`Globs::new`] answers that with a matcher per pattern rather than a panic on
+/// a caller's configuration value.
+///
+/// The refusal itself takes a pattern set no cell can build in reasonable time,
+/// so the fallback arm is constructed directly and asked the very fixtures the
+/// union cells above are asked: same patterns, same paths, same answers — the
+/// only difference the two arms are allowed is speed.
+#[test]
+fn the_per_pattern_fallback_answers_what_the_union_answers() {
+  let patterns = [
+    "**/*.mp4",
+    "**/Caches",
+    "*.mp4",
+    "**/node_modules",
+    "**/.git",
+    "**/*.{mp4,mov}",
+  ];
+  let union = globs(&patterns);
+  let each = Globs::each(patterns.iter().copied().map(glob));
+
+  assert!(!each.is_empty());
+  assert_eq!(each.patterns(), union.patterns());
+  assert_eq!(std::format!("{each:?}"), std::format!("{union:?}"));
+
+  for path in [
+    "",
+    "a.mp4",
+    "a/b.mp4",
+    "a/B.MP4",
+    "a/b/c/d.mp4",
+    "deep/caches",
+    "deep/CACHES",
+    "node_modules",
+    "a/node_modules",
+    "node_modules_old",
+    ".git",
+    "a/b/.git",
+    "a/b.mov",
+    "notes.txt",
+    "a/b/notes.txt",
+    "mp4",
+  ] {
+    assert_eq!(each.is_match(path), union.is_match(path), "{path}");
+  }
+
+  // The agreed answers are the RIGHT ones, not merely equal to each other.
+  assert!(each.is_match("a/B.MP4"), "case-insensitive");
+  assert!(each.is_match("node_modules"), "`**/` spans zero depth");
+  assert!(!each.is_match("node_modules_old"), "a whole component");
+  assert!(!each.is_match("notes.txt"), "no pattern names it");
+  assert!(!each.is_match(""), "the root is never matched");
+
+  // Cheap to clone on this arm too — the matchers sit behind the same `Arc`.
+  let clone = each.clone();
+  assert!(clone.is_match("a/node_modules"));
+  assert_eq!(clone.patterns(), each.patterns());
+
+  // And the empty set is the empty set on either arm.
+  assert!(Globs::each(Vec::new()).is_empty());
+}
+
 /// The `serde` face: a plain string, in both directions, compiled on the way in.
 #[cfg(feature = "serde")]
 mod serde_face {

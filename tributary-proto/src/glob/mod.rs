@@ -192,19 +192,58 @@ pub struct Globs {
 
 struct Compiled {
   patterns: Vec<Glob>,
-  set: globset::GlobSet,
+  matcher: Matcher,
+}
+
+/// How a non-empty [`Globs`] answers — the union automaton when the matcher
+/// could build one, the per-pattern matchers when it could not (see
+/// [`Globs::new`]). The two are answer-identical; only the cost differs.
+enum Matcher {
+  /// Every pattern in ONE automaton: a single pass over the path, whatever the
+  /// pattern count. The ordinary arm.
+  Set(globset::GlobSet),
+  /// One matcher per pattern, asked in turn until one answers. The fallback
+  /// arm.
+  Each(Vec<globset::GlobMatcher>),
+}
+
+impl Matcher {
+  fn is_match(&self, path: &str) -> bool {
+    match self {
+      Self::Set(set) => set.is_match(path),
+      Self::Each(matchers) => matchers.iter().any(|matcher| matcher.is_match(path)),
+    }
+  }
+}
+
+/// Compiles each pattern on its own, for [`Matcher::Each`].
+fn each_matcher(patterns: &[Glob]) -> Vec<globset::GlobMatcher> {
+  patterns
+    .iter()
+    .map(|glob| glob.inner.compile_matcher())
+    .collect()
 }
 
 impl Globs {
   /// Compiles `patterns` into one matcher.
   ///
-  /// Infallible: every [`Glob`] compiled at ITS construction, and a set is the
-  /// union of compiled patterns.
+  /// Infallible **by construction**, in two steps: every [`Glob`] compiled at
+  /// ITS own construction, so no pattern here can be malformed; and the union
+  /// of those patterns is attempted but never *required*.
   ///
-  /// # Panics
+  /// # Why the union can be refused
   ///
-  /// Only if the matcher refuses a union of patterns it individually accepted —
-  /// a matcher-internal limit no caller can name from this API.
+  /// A set is compiled into ONE automaton, and that automaton has a size limit
+  /// the individual patterns do not: a large or pathological pattern set — each
+  /// pattern of it perfectly valid — can exceed it. That is a caller's
+  /// configuration value, and a configuration value must never panic the
+  /// process. So a refused union falls back to a matcher per pattern, asked in
+  /// turn.
+  ///
+  /// The fallback answers **identically**: a path matches the set exactly when
+  /// some pattern matches it, which is what both arms compute. Only the cost
+  /// differs — one pass over the path becomes one pass per pattern — and only
+  /// for the pattern sets that could not be unioned in the first place.
   pub fn new(patterns: impl IntoIterator<Item = Glob>) -> Self {
     let patterns: Vec<Glob> = patterns.into_iter().collect();
     if patterns.is_empty() {
@@ -214,11 +253,28 @@ impl Globs {
     for glob in &patterns {
       builder.add(glob.inner.clone());
     }
-    let set = builder
-      .build()
-      .expect("every pattern compiled at its own construction");
+    let matcher = match builder.build() {
+      Ok(set) => Matcher::Set(set),
+      Err(_) => Matcher::Each(each_matcher(&patterns)),
+    };
     Self {
-      inner: Some(Arc::new(Compiled { patterns, set })),
+      inner: Some(Arc::new(Compiled { patterns, matcher })),
+    }
+  }
+
+  /// The same set on the [`Matcher::Each`] arm, whatever the union would have
+  /// done — so the fallback can be asked the very fixtures the union is asked,
+  /// rather than only the pattern sets big enough to refuse a union (which no
+  /// cell can build in reasonable time).
+  #[cfg(test)]
+  fn each(patterns: impl IntoIterator<Item = Glob>) -> Self {
+    let patterns: Vec<Glob> = patterns.into_iter().collect();
+    if patterns.is_empty() {
+      return Self { inner: None };
+    }
+    let matcher = Matcher::Each(each_matcher(&patterns));
+    Self {
+      inner: Some(Arc::new(Compiled { patterns, matcher })),
     }
   }
 
@@ -234,7 +290,7 @@ impl Globs {
     self
       .inner
       .as_ref()
-      .is_some_and(|compiled| compiled.set.is_match(path))
+      .is_some_and(|compiled| compiled.matcher.is_match(path))
   }
 
   /// The patterns this set was built from, in the order they were given.
