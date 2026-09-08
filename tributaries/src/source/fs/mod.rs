@@ -929,6 +929,18 @@ fn watch_error_from_fs(err: WatchRootError) -> WatchError {
     // failed-widen unwind reads that difference to decide whether to RETIRE established roots.
     // The sync seam already draws the same line (`SyncRootError::CleanupBacklog` → `Busy`).
     WatchRootError::CleanupBacklog => FaultKind::Capacity,
+    // A CALLER-CONFIGURATION refusal, and deliberately the unclassified kind. The watcher
+    // refused the per-root household before any coverage existed — a seat carrying more glob
+    // patterns than it bounds — so nothing was watched, nothing was lost, and the fix is the
+    // caller's own words rather than anything about the source. None of the classified kinds
+    // says that: `Capacity` is the one kind the umbrella RETRIES, and re-offering a household
+    // the watcher will refuse identically forever would spin; `Unsupported` is read as a verdict
+    // on the platform, which a caller answers by abandoning watching altogether. `Other` keeps
+    // the concrete `WatchRootError::InvalidOptions` (with the typed `OptionsError` behind it)
+    // recoverable through `WatchError::as_fs`, which is exactly where the seat and its ceiling
+    // are named. The arm is explicit so the classification is a decision, not the catch-all's
+    // leftovers.
+    WatchRootError::InvalidOptions(_) => FaultKind::Other,
     WatchRootError::Closed => return WatchError::Closed,
     _ => FaultKind::Other,
   };

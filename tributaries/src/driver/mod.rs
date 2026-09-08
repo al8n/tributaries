@@ -55,7 +55,7 @@ use crate::{
   event::Event,
   filter::{Filter, FilterInput},
   interest::Interest,
-  options::{Debounce, DebounceConfig, RootGlobs, TributariesOptions, WatchOptions},
+  options::{Debounce, DebounceConfig, OptionsError, RootGlobs, TributariesOptions, WatchOptions},
   route::{ReservedEndpoints, RoutableEvent},
   source::{Armed, LocalSource, Source, SourceEvent, SyncOutcome, SyncToken},
   subscription::Subscription,
@@ -407,6 +407,11 @@ impl<C, V, R, H> Clone for Tributaries<C, V, R, H> {
   }
 }
 
+/// What the shared construction body hands back: the caller's handle and the owner
+/// the driver future runs — or the typed refusal it took on the household before it
+/// allocated either.
+type Assembled<C, V, R, S, H> = Result<(Tributaries<C, V, R, H>, Owner<C, V, R, S>), OptionsError>;
+
 impl<C, V, R, H> Tributaries<C, V, R, H>
 where
   C: Ord + Clone + Send + Sync + 'static,
@@ -433,13 +438,22 @@ where
   /// [`parts`](Self::parts) and spawn the returned driver future yourself; for a
   /// thread-local source that cannot promise `Send` futures (a [`LocalSource`]
   /// implementor), use [`parts_local`](Self::parts_local).
-  pub fn with_source<S>(source: S, options: impl Into<TributariesOptions>) -> Self
+  ///
+  /// # Errors
+  ///
+  /// [`OptionsError`] when a capacity in `options` is above its documented ceiling
+  /// — refused before any channel is allocated and before the owner task is
+  /// spawned, so nothing was started to unwind.
+  pub fn with_source<S>(
+    source: S,
+    options: impl Into<TributariesOptions>,
+  ) -> Result<Self, OptionsError>
   where
     S: Source<C, Handle = H> + Send + 'static,
   {
-    let (this, driver) = Self::parts(source, options);
+    let (this, driver) = Self::parts(source, options)?;
     R::spawn_detach(driver);
-    this
+    Ok(this)
   }
 
   /// Builds a watcher over any [`Source`] WITHOUT spawning: returns the handle and the
@@ -481,15 +495,20 @@ where
   /// The returned future is `Send` (pinned by the crate's compile-time owner proofs),
   /// so it is spawnable on both work-stealing and local executors. For a source that
   /// cannot promise `Send` futures at all, use [`parts_local`](Self::parts_local).
+  ///
+  /// # Errors
+  ///
+  /// [`OptionsError`] when a capacity in `options` is above its documented ceiling
+  /// — refused before any channel is allocated.
   pub fn parts<S>(
     source: S,
     options: impl Into<TributariesOptions>,
-  ) -> (Self, impl Future<Output = ()> + Send + 'static)
+  ) -> Result<(Self, impl Future<Output = ()> + Send + 'static), OptionsError>
   where
     S: Source<C, Handle = H> + Send + 'static,
   {
-    let (this, owner) = Self::assemble(source, options.into());
-    (this, run(owner))
+    let (this, owner) = Self::assemble(source, options.into())?;
+    Ok((this, run(owner)))
   }
 
   /// Builds a watcher over a **thread-local** [`LocalSource`] WITHOUT spawning — the
@@ -521,15 +540,20 @@ where
   /// Every [`Source`] is a [`LocalSource`] through the crate's blanket impl, so a `Send`
   /// source constructs here too — but then [`parts`](Self::parts) is strictly more
   /// capable (its driver future can ALSO be polled locally).
+  ///
+  /// # Errors
+  ///
+  /// [`OptionsError`] when a capacity in `options` is above its documented ceiling
+  /// — refused before any channel is allocated.
   pub fn parts_local<S>(
     source: S,
     options: impl Into<TributariesOptions>,
-  ) -> (Self, impl Future<Output = ()> + 'static)
+  ) -> Result<(Self, impl Future<Output = ()> + 'static), OptionsError>
   where
     S: LocalSource<C, Handle = H> + 'static,
   {
-    let (this, owner) = Self::assemble(source, options.into());
-    (this, run(owner))
+    let (this, owner) = Self::assemble(source, options.into())?;
+    Ok((this, run(owner)))
   }
 
   /// The shared construction body of [`parts`](Self::parts) and
@@ -537,10 +561,17 @@ where
   /// constructor wraps [`run`]`(owner)` in its own opaque return type itself, so its
   /// `Send` promise (or [`parts_local`](Self::parts_local)'s deliberate lack of one) is
   /// proven directly against the owner future's hidden type.
-  fn assemble<S>(source: S, options: TributariesOptions) -> (Self, Owner<C, V, R, S>)
+  ///
+  /// The capacities are checked HERE, at the one choke point every constructor
+  /// funnels through, and before the first `bounded` call: each channel is
+  /// allocated eagerly with one slot per item, so an out-of-range capacity would
+  /// otherwise be an allocation-size panic inside the channel instead of a verdict
+  /// the caller can read.
+  fn assemble<S>(source: S, options: TributariesOptions) -> Assembled<C, V, R, S, H>
   where
     S: LocalSource<C, Handle = H>,
   {
+    options.validate()?;
     let (event_capacity, command_capacity, debounce) = options.into_parts();
     let subsumer = Subsumer::new();
     let view = subsumer.view();
@@ -615,7 +646,7 @@ where
       observed_handles: ObservedHandles::new(),
       _rt: PhantomData::<R>,
     };
-    (
+    Ok((
       Self {
         commands: command_tx,
         sync_commands: sync_command_tx,
@@ -626,7 +657,7 @@ where
         _rt: PhantomData,
       },
       owner,
-    )
+    ))
   }
 }
 
@@ -1000,10 +1031,17 @@ impl<R: RuntimeLite> Tributaries<OsString, (), R, RootHandle> {
   ///
   /// # Errors
   ///
-  /// [`BuildError::Source`] when the underlying `tributary-fs` watcher cannot be built.
+  /// [`BuildError::InvalidOptions`] when a capacity in `options` is above its
+  /// documented ceiling; [`BuildError::Source`] when the underlying `tributary-fs`
+  /// watcher cannot be built. Both households are refused before anything is
+  /// started — the fs watcher checks its own knobs before it spawns, and this one
+  /// is checked before that watcher exists.
   pub fn new(watcher: WatcherOptions, options: TributariesOptions) -> Result<Self, BuildError> {
+    // Ahead of the source, not after it: building one starts a native watcher, and a
+    // household the umbrella will refuse anyway should cost nothing to be told about.
+    options.validate()?;
     let source = FsSource::<R>::new(watcher)?;
-    Ok(Self::with_source(source, options))
+    Ok(Self::with_source(source, options)?)
   }
 }
 
@@ -8372,7 +8410,8 @@ fn assert_rc_local_source_constructs<R: RuntimeLite>() {
       state: Rc::new(Cell::new(0)),
     },
     TributariesOptions::new(),
-  );
+  )
+  .expect("the default capacities are in range");
 }
 
 /// A [`Tributaries`] driven by the tokio runtime, over the local filesystem.

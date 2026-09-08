@@ -1,6 +1,7 @@
+use core::num::NonZeroUsize;
 use std::ffi::OsString;
 
-use super::{Debounce, DebounceConfig, RootGlobs, WatchOptions};
+use super::{Debounce, DebounceConfig, RootGlobs, TributariesOptions, WatchOptions};
 use crate::{
   event::EventKind,
   filter::{Filter, FilterInput},
@@ -47,6 +48,59 @@ fn debounce_as_custom_projects_only_the_custom_payload() {
   assert_eq!(Debounce::Custom(config).as_custom(), Some(&config));
   assert_eq!(Debounce::Inherit.as_custom(), None);
   assert_eq!(Debounce::Off.as_custom(), None);
+}
+
+/// Both capacities are bounded, and the CEILINGS THEMSELVES are inside the bound: a
+/// household set to either maximum validates, while a capacity no allocator could serve
+/// is a typed refusal rather than an allocation-size panic inside the channel.
+#[test]
+fn the_capacities_are_bounded_and_their_maxima_are_in_range() {
+  let at_ceiling = TributariesOptions::new()
+    .with_event_capacity(TributariesOptions::MAX_EVENT_CAPACITY)
+    .with_command_capacity(TributariesOptions::MAX_COMMAND_CAPACITY);
+  assert!(
+    at_ceiling.validate().is_ok(),
+    "a documented maximum is a value the household can hold, not one it stops short of"
+  );
+  assert!(TributariesOptions::new().validate().is_ok());
+
+  let err = TributariesOptions::new()
+    .with_event_capacity(NonZeroUsize::MAX)
+    .validate()
+    .expect_err("an event channel nothing could allocate is refused");
+  assert!(err.is_event_capacity_too_large(), "got {err:?}");
+  assert!(!err.is_command_capacity_too_large());
+
+  let err = TributariesOptions::new()
+    .with_command_capacity(NonZeroUsize::MAX)
+    .validate()
+    .expect_err("a mailbox nothing could allocate is refused");
+  assert!(err.is_command_capacity_too_large(), "got {err:?}");
+
+  // One past each ceiling: the bound is the documented value itself.
+  for (options, over) in [
+    (
+      TributariesOptions::new().with_event_capacity(
+        TributariesOptions::MAX_EVENT_CAPACITY
+          .checked_add(1)
+          .expect("one past the ceiling is representable"),
+      ),
+      "event",
+    ),
+    (
+      TributariesOptions::new().with_command_capacity(
+        TributariesOptions::MAX_COMMAND_CAPACITY
+          .checked_add(1)
+          .expect("one past the ceiling is representable"),
+      ),
+      "command",
+    ),
+  ] {
+    assert!(
+      options.validate().is_err(),
+      "{over} capacity, one past its ceiling"
+    );
+  }
 }
 
 #[test]
@@ -207,7 +261,7 @@ mod serde_face {
   use core::{num::NonZeroUsize, time::Duration};
 
   use super::{
-    super::{Debounce, DebounceConfig, TributariesOptions, WatchOptions},
+    super::{Debounce, DebounceConfig, RootGlobs, TributariesOptions, WatchOptions},
     glob, texts,
   };
   use crate::{
@@ -286,6 +340,70 @@ mod serde_face {
         "{document}"
       );
     }
+  }
+
+  /// A capacity past its ceiling is refused where the DOCUMENT is read, with the same
+  /// verdict `validate` gives the builders — the channel is allocated eagerly, so a
+  /// number a document can write but no allocator can serve must die at the key.
+  #[test]
+  fn an_out_of_range_capacity_is_a_document_error() {
+    for document in [
+      std::format!(r#"{{"event_capacity": {}}}"#, usize::MAX),
+      std::format!(r#"{{"command_capacity": {}}}"#, usize::MAX),
+    ] {
+      assert!(
+        serde_json::from_str::<TributariesOptions>(&document).is_err(),
+        "{document}"
+      );
+    }
+
+    // The ceilings themselves load.
+    let document = std::format!(
+      r#"{{"event_capacity": {}, "command_capacity": {}}}"#,
+      TributariesOptions::MAX_EVENT_CAPACITY,
+      TributariesOptions::MAX_COMMAND_CAPACITY
+    );
+    let parsed: TributariesOptions = serde_json::from_str(&document).unwrap();
+    assert_eq!(
+      parsed.event_capacity(),
+      TributariesOptions::MAX_EVENT_CAPACITY
+    );
+    assert_eq!(
+      parsed.command_capacity(),
+      TributariesOptions::MAX_COMMAND_CAPACITY
+    );
+  }
+
+  /// The per-root words a custom source is armed with carry the same document shape the
+  /// subscription's own seats do: two lists of plain strings, an ABSENT `include` being
+  /// the absent seat rather than an empty one.
+  #[test]
+  fn the_root_words_round_trip_as_lists_of_plain_strings() {
+    let words = RootGlobs::new()
+      .with_prune([glob("**/node_modules"), glob("**/.git")])
+      .with_include([glob("*.mp4")]);
+    let json = serde_json::to_string(&words).unwrap();
+    assert_eq!(
+      json,
+      r#"{"prune":["**/node_modules","**/.git"],"include":["*.mp4"]}"#
+    );
+    assert_eq!(serde_json::from_str::<RootGlobs>(&json).unwrap(), words);
+
+    let bare: RootGlobs = serde_json::from_str("{}").unwrap();
+    assert!(
+      bare.is_unengaged(),
+      "an empty document is the unengaged household"
+    );
+    let empty: RootGlobs = serde_json::from_str(r#"{"include": []}"#).unwrap();
+    assert_eq!(
+      empty.include().map(texts),
+      Some(std::vec![]),
+      "an EMPTY include is a seat admitting no file, not the absent seat"
+    );
+    assert!(
+      serde_json::from_str::<RootGlobs>(r#"{"prune": ["[unclosed"]}"#).is_err(),
+      "an uncompilable pattern is a document error"
+    );
   }
 
   /// The same clamp the builders apply: `0` buffered entries is a buffer nothing can
@@ -461,17 +579,22 @@ mod clap_face {
   use core::{num::NonZeroUsize, time::Duration};
 
   use super::{
-    super::{DebounceConfig, TributariesOptions, WatchOptions},
-    texts,
+    super::{DebounceConfig, RootGlobs, TributariesOptions, WatchOptions},
+    glob, texts,
   };
   use crate::{
     event::EventKind,
     filter::{Filter, FilterInput},
     interest::Interest,
   };
-  use clap::Parser as _;
+  use clap::{CommandFactory as _, FromArgMatches as _, Parser as _};
   use std::ffi::OsString;
   use tributary_proto::Location;
+
+  /// One non-zero capacity — a cell only has to be able to name one.
+  fn nonzero(capacity: usize) -> NonZeroUsize {
+    NonZeroUsize::new(capacity).expect("a non-zero capacity")
+  }
 
   #[derive(clap::Parser)]
   struct DebounceCli {
@@ -491,8 +614,20 @@ mod clap_face {
     options: WatchOptions<OsString>,
   }
 
+  #[derive(clap::Parser)]
+  struct GlobsCli {
+    #[command(flatten)]
+    globs: RootGlobs,
+  }
+
   fn args<'a>(rest: &'a [&'a str]) -> impl Iterator<Item = &'a str> {
     std::iter::once("app").chain(rest.iter().copied())
+  }
+
+  /// The `ArgMatches` an UPDATE reads: one household's own group, augmented the way
+  /// clap augments a command for update, parsed from `rest`.
+  fn update_matches<A: clap::Args>(rest: &[&str]) -> clap::ArgMatches {
+    A::augment_args_for_update(clap::Command::new("app")).get_matches_from(args(rest))
   }
 
   #[test]
@@ -596,6 +731,202 @@ mod clap_face {
         "{flags:?}"
       );
     }
+  }
+
+  /// A capacity past its ceiling is refused at the FLAG, where the number is written,
+  /// rather than at the channel it could never open.
+  #[test]
+  fn an_out_of_range_capacity_flag_is_refused() {
+    for flags in [
+      ["--event-capacity", "18446744073709551615"],
+      ["--command-capacity", "18446744073709551615"],
+    ] {
+      let err = WatcherCli::try_parse_from(args(&flags))
+        .err()
+        .unwrap_or_else(|| std::panic!("{flags:?} is above its ceiling"));
+      assert_eq!(
+        err.kind(),
+        clap::error::ErrorKind::ValueValidation,
+        "{flags:?}"
+      );
+    }
+
+    // The ceilings themselves parse.
+    let options = WatcherCli::parse_from(args(&[
+      "--event-capacity",
+      &TributariesOptions::MAX_EVENT_CAPACITY.to_string(),
+      "--command-capacity",
+      &TributariesOptions::MAX_COMMAND_CAPACITY.to_string(),
+    ]))
+    .options;
+    assert_eq!(
+      options.event_capacity(),
+      TributariesOptions::MAX_EVENT_CAPACITY
+    );
+    assert_eq!(
+      options.command_capacity(),
+      TributariesOptions::MAX_COMMAND_CAPACITY
+    );
+  }
+
+  /// The per-root words a custom source is armed with flatten onto a command of their
+  /// own, with the very flags a subscription spells them with.
+  #[test]
+  fn the_root_words_flatten_onto_a_command() {
+    GlobsCli::command().debug_assert();
+
+    let globs = GlobsCli::parse_from(args(&[
+      "--prune",
+      "**/node_modules",
+      "--prune",
+      "**/.git",
+      "--include",
+      "*.mp4",
+    ]))
+    .globs;
+    assert_eq!(texts(globs.prune()), ["**/node_modules", "**/.git"]);
+    assert_eq!(globs.include().map(texts), Some(std::vec!["*.mp4"]));
+
+    let bare = GlobsCli::parse_from(args(&[])).globs;
+    assert!(
+      bare.is_unengaged(),
+      "no flag at all is the unengaged household — an absent include is no seat"
+    );
+
+    let err = GlobsCli::try_parse_from(args(&["--prune", "[unclosed"]))
+      .err()
+      .expect("an uncompilable pattern is refused at the flag");
+    assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+  }
+
+  /// An UPDATE applies what the COMMAND LINE carried and nothing else — the rule every
+  /// household on this face follows.
+  ///
+  /// A derived update cannot tell a flag's DEFAULT from a value someone gave, so it
+  /// writes every default over the household it was handed: one `--event-capacity` would
+  /// reset the command mailbox, switch settling on, and re-open an interest a caller had
+  /// deliberately narrowed. Each household is pinned here on its own.
+  #[test]
+  fn an_update_changes_only_what_the_command_line_carried() {
+    // The watcher household: one capacity moves, and nothing else does — the mailbox
+    // keeps its configured value and the coalescer stays off.
+    let mut options = TributariesOptions::new().with_command_capacity(nonzero(8));
+    options
+      .update_from_arg_matches(&update_matches::<TributariesOptions>(&[
+        "--event-capacity",
+        "4096",
+      ]))
+      .expect("the update applies");
+    assert_eq!(options.event_capacity(), nonzero(4096));
+    assert_eq!(
+      options.command_capacity(),
+      nonzero(8),
+      "an unrelated capacity flag does not reapply the mailbox default"
+    );
+    assert_eq!(
+      options.debounce_config(),
+      None,
+      "nor does it switch settling on with a household nobody asked for"
+    );
+
+    // A configured policy survives an unrelated update, and is updated KNOB BY KNOB
+    // when the command line names one.
+    let mut options = TributariesOptions::new().debounce(
+      DebounceConfig::new()
+        .with_max_buffered(7)
+        .with_max_hold(Duration::from_secs(9)),
+    );
+    options
+      .update_from_arg_matches(&update_matches::<TributariesOptions>(&[
+        "--event-capacity",
+        "4096",
+      ]))
+      .expect("the update applies");
+    assert_eq!(
+      options.debounce_config(),
+      Some(
+        DebounceConfig::new()
+          .with_max_buffered(7)
+          .with_max_hold(Duration::from_secs(9))
+      ),
+      "an unrelated flag leaves the settle policy exactly as it stood"
+    );
+    options
+      .update_from_arg_matches(&update_matches::<TributariesOptions>(&[
+        "--quiet-window",
+        "250ms",
+      ]))
+      .expect("the update applies");
+    assert_eq!(
+      options.debounce_config(),
+      Some(
+        DebounceConfig::new()
+          .with_max_buffered(7)
+          .with_max_hold(Duration::from_secs(9))
+          .with_quiet_window(Duration::from_millis(250))
+      ),
+      "the named knob moves; the other two keep their configured values"
+    );
+
+    // The policy household on its own.
+    let mut config = DebounceConfig::new().with_max_buffered(7);
+    config
+      .update_from_arg_matches(&update_matches::<DebounceConfig>(&[
+        "--quiet-window",
+        "250ms",
+      ]))
+      .expect("the update applies");
+    assert_eq!(
+      config,
+      DebounceConfig::new()
+        .with_max_buffered(7)
+        .with_quiet_window(Duration::from_millis(250))
+    );
+
+    // The subscription household: the interest gate is the field a derived update would
+    // silently BROADEN, since no interest flag given is what spells the deliver-everything
+    // default. An unrelated `--prune` must leave even the empty gate empty.
+    let mut watch: WatchOptions<OsString> = WatchOptions::new()
+      .with_interest(Interest::none())
+      .with_include([glob("*.mp4")])
+      .with_debounce(crate::options::Debounce::Off);
+    watch
+      .update_from_arg_matches(&update_matches::<WatchOptions<OsString>>(&[
+        "--prune",
+        "**/node_modules",
+      ]))
+      .expect("the update applies");
+    assert_eq!(texts(watch.prune()), ["**/node_modules"]);
+    assert!(
+      watch.interest().is_none(),
+      "an unrelated seat does not re-open a gate the caller closed"
+    );
+    assert_eq!(
+      watch.include().map(texts),
+      Some(std::vec!["*.mp4"]),
+      "the seat nobody named keeps its patterns"
+    );
+    assert!(
+      watch.debounce().is_off(),
+      "a posture on no face is not something an update writes over"
+    );
+
+    // And a named interest flag narrows exactly its own bit.
+    watch
+      .update_from_arg_matches(&update_matches::<WatchOptions<OsString>>(&[
+        "--created=true",
+      ]))
+      .expect("the update applies");
+    assert_eq!(watch.interest(), Interest::none().with_created());
+
+    // The per-root words on their own: neither flag carries a default, so the seat the
+    // command line did not name is left as it stood.
+    let mut globs = RootGlobs::new().with_include([glob("*.mp4")]);
+    globs
+      .update_from_arg_matches(&update_matches::<RootGlobs>(&["--prune", "**/.git"]))
+      .expect("the update applies");
+    assert_eq!(texts(globs.prune()), ["**/.git"]);
+    assert_eq!(globs.include().map(texts), Some(std::vec!["*.mp4"]));
   }
 
   /// `--prune` and `--include` repeat, once per pattern; an `--include` given no times

@@ -3,7 +3,7 @@ use std::{
   ffi::OsString,
   io,
   marker::PhantomData,
-  num::NonZeroU64,
+  num::{NonZeroU64, NonZeroUsize},
   path::{Path, PathBuf},
   time::Duration,
 };
@@ -6132,7 +6132,8 @@ async fn watch_admission_backpressures_when_the_mailbox_is_full() {
       gate: gate_rx,
     },
     TributariesOptions::new().with_command_capacity(std::num::NonZeroUsize::new(1).unwrap()),
-  );
+  )
+  .expect("the default capacities are in range");
 
   // Watch 1 is consumed by the owner, which parks inside the gated arm. Watch 2 then
   // fills the capacity-1 mailbox. Watch 3's submission must AWAIT admission.
@@ -6202,7 +6203,8 @@ async fn parts_future_drives_the_watcher_when_caller_spawned() {
   }
 
   let (w, driver): (super::Tributaries<OsString, (), TokioRuntime, u32>, _) =
-    super::Tributaries::parts(AliveSource(FakeSource::new()), TributariesOptions::new());
+    super::Tributaries::parts(AliveSource(FakeSource::new()), TributariesOptions::new())
+      .expect("the default capacities are in range");
   let driver = tokio::spawn(driver);
 
   let sub = w
@@ -6220,13 +6222,51 @@ async fn parts_future_drives_the_watcher_when_caller_spawned() {
     .expect("driver task");
 }
 
+/// A capacity no channel could ever be allocated at is REFUSED at construction, on
+/// every path and before anything is allocated or spawned.
+///
+/// The channels are opened eagerly with one slot per item, so `usize::MAX` is not a
+/// generous buffer but an allocation-size overflow — a panic raised deep inside the
+/// channel, where no caller can read it. The verdict belongs at the door instead, and
+/// the door is every constructor: the spawning one, the caller-spawned one, and the
+/// thread-local one all funnel through the same check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_out_of_range_capacity_is_refused_at_every_construction_path() {
+  type Watcher = super::Tributaries<OsString, (), TokioRuntime, u32>;
+
+  let event = TributariesOptions::new().with_event_capacity(NonZeroUsize::MAX);
+  let command = TributariesOptions::new().with_command_capacity(NonZeroUsize::MAX);
+
+  let Err(err) = Watcher::parts(FakeSource::new(), event.clone()) else {
+    panic!("the caller-spawned path refuses an unallocatable event channel")
+  };
+  assert!(err.is_event_capacity_too_large(), "got {err:?}");
+
+  let Err(err) = Watcher::with_source(FakeSource::new(), event) else {
+    panic!("the spawning path refuses it too")
+  };
+  assert!(err.is_event_capacity_too_large(), "got {err:?}");
+
+  let Err(err) = Watcher::parts_local(FakeSource::new(), command) else {
+    panic!("the thread-local path refuses an unallocatable mailbox")
+  };
+  assert!(err.is_command_capacity_too_large(), "got {err:?}");
+
+  // And the ordinary household still builds, through the same check.
+  let (w, driver) = Watcher::parts(FakeSource::new(), TributariesOptions::new())
+    .expect("the default capacities are in range");
+  drop(driver);
+  drop(w);
+}
+
 /// `parts()` caveat two, pinned: DROPPING the un-spawned driver future is hard
 /// teardown — the owner's drop publishes an empty read plane and closes every channel,
 /// so calls surface Closed/Stopped rather than hanging.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropping_the_parts_future_is_hard_teardown() {
   let (mut w, driver): (super::Tributaries<OsString, (), TokioRuntime, u32>, _) =
-    super::Tributaries::parts(FakeSource::new(), TributariesOptions::new());
+    super::Tributaries::parts(FakeSource::new(), TributariesOptions::new())
+      .expect("the default capacities are in range");
   drop(driver);
 
   let err = w
@@ -6307,7 +6347,8 @@ async fn dropping_the_parts_future_mid_arm_drops_the_source_for_reclamation() {
         dropped: std::sync::Arc::clone(&dropped),
       },
       TributariesOptions::new(),
-    );
+    )
+    .expect("the default capacities are in range");
   let driver = tokio::spawn(driver);
 
   // Submit a watch and wait until the owner is provably INSIDE the gated arm.
@@ -6408,7 +6449,8 @@ async fn dropping_the_parts_future_mid_grow_drops_the_source_for_reclamation() {
         dropped: std::sync::Arc::clone(&dropped),
       },
       TributariesOptions::new(),
-    );
+    )
+    .expect("the default capacities are in range");
   let driver = tokio::spawn(driver);
 
   // Build the covered-outside state through the real loop: /a/b, widen /a, unwatch the widening
@@ -6520,7 +6562,8 @@ async fn parts_local_drives_a_thread_local_source_end_to_end() {
     events: event_rx,
   };
   let (mut w, driver): (super::Tributaries<OsString, (), TokioRuntime, u32>, _) =
-    super::Tributaries::parts_local(source, TributariesOptions::new());
+    super::Tributaries::parts_local(source, TributariesOptions::new())
+      .expect("the default capacities are in range");
 
   let local = tokio::task::LocalSet::new();
   local
@@ -9050,7 +9093,8 @@ async fn teardown_publishes_empty_read_plane_so_view_stops_advertising_dead_subs
     drain: drain_rx,
   };
   let mut w: super::Tributaries<OsString, (), TokioRuntime, u32> =
-    super::Tributaries::with_source(source, TributariesOptions::new());
+    super::Tributaries::with_source(source, TributariesOptions::new())
+      .expect("the default capacities are in range");
 
   // A view clone taken WHILE watching — the pre-taken handle the regression is about.
   let view = w.view();
@@ -17174,7 +17218,8 @@ async fn unpolled_grant_across_source_drain_teardown_is_poisoned() {
     drain: drain_rx,
   };
   let w: super::Tributaries<OsString, (), TokioRuntime, u32> =
-    super::Tributaries::with_source(source, TributariesOptions::new());
+    super::Tributaries::with_source(source, TributariesOptions::new())
+      .expect("the default capacities are in range");
 
   // A hand-built Watch whose reply receiver is HELD UNPOLLED: the owner commits the sub and sends
   // the grant into the slot, where it sits (unclaimed, no Cleanup fired).
@@ -17417,7 +17462,8 @@ async fn parked_rescan_delivers_under_sustained_command_load() {
   let mut w: super::Tributaries<OsString, (), TokioRuntime, u32> = super::Tributaries::with_source(
     source,
     TributariesOptions::new().with_event_capacity(std::num::NonZeroUsize::new(1).expect("nonzero")),
-  );
+  )
+  .expect("the default capacities are in range");
 
   // Two claimed narrow watches, then the widen: two re-point Rescans — one fills bounded(1), the
   // other parks as overflow debt for a CLAIMED subscription.
@@ -17620,7 +17666,8 @@ async fn raw_source_event_delivers_under_sustained_command_load() {
     grows: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
   };
   let mut w: super::Tributaries<OsString, (), TokioRuntime, u32> =
-    super::Tributaries::with_source(source, TributariesOptions::new());
+    super::Tributaries::with_source(source, TributariesOptions::new())
+      .expect("the default capacities are in range");
   let sub = w
     .watch(key("/a"), (), WatchOptions::new())
     .await
@@ -17664,7 +17711,8 @@ async fn valve_pumped_rescan_still_degrades_the_retained_cover() {
     grows: grows.clone(),
   };
   let mut w: super::Tributaries<OsString, (), TokioRuntime, u32> =
-    super::Tributaries::with_source(source, TributariesOptions::new());
+    super::Tributaries::with_source(source, TributariesOptions::new())
+      .expect("the default capacities are in range");
 
   // Narrow the wide /a root to {/a/b}: widen /a over /a/b (handle 2), then prune the widener.
   let s_b = w
@@ -17766,7 +17814,8 @@ async fn due_debounced_event_drains_under_sustained_command_load() {
     .with_quiet_window(Duration::from_millis(20))
     .with_max_hold(Duration::from_millis(100));
   let mut w: super::Tributaries<OsString, (), TokioRuntime, u32> =
-    super::Tributaries::with_source(source, TributariesOptions::new().debounce(cfg));
+    super::Tributaries::with_source(source, TributariesOptions::new().debounce(cfg))
+      .expect("the default capacities are in range");
   let sub = w
     .watch(key("/a"), (), WatchOptions::new())
     .await
@@ -17807,7 +17856,8 @@ async fn close_is_not_starved_by_a_prefilled_command_backlog_and_flood() {
     // The mailbox is BOUNDED; size it to this test's full 500-deep
     // prefill so the close-vs-deepest-possible-backlog shape is preserved.
     TributariesOptions::new().with_command_capacity(std::num::NonZeroUsize::new(500).unwrap()),
-  );
+  )
+  .expect("the default capacities are in range");
 
   // A live claimed subscription, so the owner is genuinely running with real state (the finding's
   // "owner/source kept alive while shutdown is requested").
@@ -19064,7 +19114,8 @@ async fn a_sync_admitted_through_the_dedicated_mailbox_still_resolves() {
     observe: true,
   };
   let w: super::Tributaries<OsString, (), TokioRuntime, u32> =
-    super::Tributaries::with_source(source, TributariesOptions::new());
+    super::Tributaries::with_source(source, TributariesOptions::new())
+      .expect("the default capacities are in range");
   let sub = w
     .watch(key("/a"), (), WatchOptions::new())
     .await
@@ -19093,7 +19144,8 @@ async fn a_sync_times_out_when_never_observed() {
     observe: false,
   };
   let w: super::Tributaries<OsString, (), TokioRuntime, u32> =
-    super::Tributaries::with_source(source, TributariesOptions::new());
+    super::Tributaries::with_source(source, TributariesOptions::new())
+      .expect("the default capacities are in range");
   let sub = w
     .watch(key("/a"), (), WatchOptions::new())
     .await
@@ -19169,7 +19221,8 @@ async fn a_command_flood_does_not_starve_the_sync_mailbox() {
     // A deep BOUNDED mailbox, so the prefill below is a genuinely deep backlog the flood can hold
     // saturated — the shape a starved sync arm would never get out from under.
     TributariesOptions::new().with_command_capacity(std::num::NonZeroUsize::new(500).unwrap()),
-  );
+  )
+  .expect("the default capacities are in range");
   let sub = w
     .watch(key("/a"), (), WatchOptions::new())
     .await
@@ -19294,7 +19347,8 @@ async fn a_timed_out_sync_frees_the_owner_when_the_caller_drops() {
     begin_gate: begin_rx,
   };
   let w: super::Tributaries<OsString, (), TokioRuntime, u32> =
-    super::Tributaries::with_source(source, TributariesOptions::new());
+    super::Tributaries::with_source(source, TributariesOptions::new())
+      .expect("the default capacities are in range");
   let sub = w
     .watch(key("/a"), (), WatchOptions::new())
     .await
@@ -19349,7 +19403,8 @@ async fn a_close_during_a_held_sync_tears_down_promptly() {
     begin_gate: begin_rx,
   };
   let w: super::Tributaries<OsString, (), TokioRuntime, u32> =
-    super::Tributaries::with_source(source, TributariesOptions::new());
+    super::Tributaries::with_source(source, TributariesOptions::new())
+      .expect("the default capacities are in range");
   let sub = w
     .watch(key("/a"), (), WatchOptions::new())
     .await
@@ -19471,7 +19526,8 @@ async fn assert_a_held_retarget_does_not_wedge_close(
     replace_calls: 0,
   };
   let w: super::Tributaries<OsString, (), TokioRuntime, u32> =
-    super::Tributaries::with_source(source, TributariesOptions::new());
+    super::Tributaries::with_source(source, TributariesOptions::new())
+      .expect("the default capacities are in range");
   // The SOLE root the widen below subsumes — which is what sends it down the in-place retarget path
   // (`unwatch.as_slice()` matching `[only]`) rather than release-and-rearm.
   w.watch(key("/a/b"), (), WatchOptions::new())
@@ -21223,7 +21279,8 @@ mod reserved_namespace {
       super::super::Tributaries::with_source(
         source,
         TributariesOptions::new().debounce(settle_in_20ms_hold_100ms()),
-      );
+      )
+      .expect("the default capacities are in range");
     let sub = w
       .watch(key("/a"), (), WatchOptions::new())
       .await
@@ -21388,7 +21445,8 @@ mod reserved_namespace {
           stop: worker_stop,
         };
         let mut w: super::super::Tributaries<OsString, (), TokioRuntime, u32> =
-          super::super::Tributaries::with_source(source, TributariesOptions::new());
+          super::super::Tributaries::with_source(source, TributariesOptions::new())
+            .expect("the default capacities are in range");
         let sub = w
           .watch(key("/a"), (), WatchOptions::new())
           .await
@@ -21586,7 +21644,8 @@ mod ownership {
         entered: std::sync::Arc::clone(&entered),
       },
       TributariesOptions::new(),
-    );
+    )
+    .expect("the default capacities are in range");
 
     let watching = {
       let w = w.clone();
@@ -22323,7 +22382,8 @@ mod ownership {
         joined: std::sync::Arc::clone(&joined),
       },
       TributariesOptions::new(),
-    );
+    )
+    .expect("the default capacities are in range");
     w.watch(key("/a"), (), WatchOptions::new())
       .await
       .expect("watch /a");

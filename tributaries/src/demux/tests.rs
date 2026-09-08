@@ -136,7 +136,8 @@ fn rig(capacity: usize) -> (Tributaries<OsString, (), TokioRuntime, u32>, Feed) 
   };
   let options = TributariesOptions::new()
     .with_event_capacity(NonZeroUsize::new(capacity).expect("nonzero capacity"));
-  let watcher = Tributaries::with_source(source, options);
+  let watcher =
+    Tributaries::with_source(source, options).expect("the default capacities are in range");
   (
     watcher,
     Feed {

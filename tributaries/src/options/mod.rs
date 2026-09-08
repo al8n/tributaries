@@ -13,6 +13,94 @@ use crate::{filter::Filter, interest::Interest};
 #[cfg(test)]
 mod tests;
 
+/// Why a [`TributariesOptions`] value cannot be honored.
+///
+/// The two channel capacities are the umbrella's only unbounded quantities, and
+/// both are spent EAGERLY: assembling a [`Tributaries`](crate::Tributaries)
+/// allocates each channel up front, one slot per item, so a capacity near
+/// [`usize::MAX`] is not a large buffer but an allocation-size overflow — a panic
+/// deep inside the channel rather than a verdict a caller can read. Every face
+/// turns such a value into one of these instead
+/// ([`TributariesOptions::validate`]), and construction refuses on it before a
+/// single channel exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum OptionsError {
+  /// The owner→consumer event-channel capacity exceeds
+  /// [`TributariesOptions::MAX_EVENT_CAPACITY`].
+  #[error(
+    "an event capacity of {supplied} exceeds the {} ceiling",
+    TributariesOptions::MAX_EVENT_CAPACITY
+  )]
+  EventCapacityTooLarge {
+    /// The capacity the options carried.
+    supplied: NonZeroUsize,
+  },
+  /// The caller→owner command-mailbox capacity exceeds
+  /// [`TributariesOptions::MAX_COMMAND_CAPACITY`].
+  #[error(
+    "a command capacity of {supplied} exceeds the {} ceiling",
+    TributariesOptions::MAX_COMMAND_CAPACITY
+  )]
+  CommandCapacityTooLarge {
+    /// The capacity the options carried.
+    supplied: NonZeroUsize,
+  },
+}
+
+impl OptionsError {
+  /// Whether this is [`EventCapacityTooLarge`](Self::EventCapacityTooLarge).
+  #[inline]
+  pub const fn is_event_capacity_too_large(&self) -> bool {
+    matches!(self, Self::EventCapacityTooLarge { .. })
+  }
+
+  /// Whether this is [`CommandCapacityTooLarge`](Self::CommandCapacityTooLarge).
+  #[inline]
+  pub const fn is_command_capacity_too_large(&self) -> bool {
+    matches!(self, Self::CommandCapacityTooLarge { .. })
+  }
+}
+
+/// The ONE range rule behind every face of
+/// [`TributariesOptions::event_capacity`]: a builder is checked by
+/// [`validate`](TributariesOptions::validate) at construction, a document by its
+/// deserializer, a flag by its parser — and all three ask this, so no door can
+/// admit what another refuses.
+const fn check_event_capacity(capacity: NonZeroUsize) -> Result<NonZeroUsize, OptionsError> {
+  if capacity.get() > TributariesOptions::MAX_EVENT_CAPACITY.get() {
+    return Err(OptionsError::EventCapacityTooLarge { supplied: capacity });
+  }
+  Ok(capacity)
+}
+
+/// The same one rule for [`TributariesOptions::command_capacity`].
+const fn check_command_capacity(capacity: NonZeroUsize) -> Result<NonZeroUsize, OptionsError> {
+  if capacity.get() > TributariesOptions::MAX_COMMAND_CAPACITY.get() {
+    return Err(OptionsError::CommandCapacityTooLarge { supplied: capacity });
+  }
+  Ok(capacity)
+}
+
+/// The value an argument carried, but ONLY when the COMMAND LINE is where it came
+/// from — the one question `ArgMatches::get_one` cannot answer, because a
+/// DEFAULTED argument reads there exactly like a given one.
+///
+/// It is what every hand-written `update_from_arg_matches` in this crate stands
+/// on. An update must change only what the command line actually said; a derived
+/// one asks `contains_id`, which a default satisfies, so it writes every default
+/// over whatever the caller had already configured.
+#[cfg(feature = "clap")]
+pub(crate) fn command_line_value<T>(matches: &clap::ArgMatches, id: &str) -> Option<T>
+where
+  T: Clone + Send + Sync + 'static,
+{
+  if matches.value_source(id) != Some(clap::parser::ValueSource::CommandLine) {
+    return None;
+  }
+  matches.get_one::<T>(id).cloned()
+}
+
 /// Settle/debounce policy for the opt-in coalescer (design §6).
 ///
 /// Two windows govern how long a per-`(subscription, path)` burst is held before its
@@ -57,41 +145,120 @@ mod tests;
 /// Both doors honor the same clamp the builders do: a
 /// [`max_buffered`](Self::max_buffered) of `0` becomes `1`, never a buffer no entry
 /// can be admitted to.
+///
+/// An UPDATE (`clap::FromArgMatches::update_from_arg_matches`) changes only the
+/// knobs the command line actually carried: updating `--quiet-window` alone leaves
+/// the hold ceiling and the buffered cap exactly as they stood.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(default))]
-#[cfg_attr(feature = "clap", derive(clap::Args))]
 pub struct DebounceConfig {
   #[cfg_attr(feature = "serde", serde(with = "humantime_serde"))]
-  #[cfg_attr(
-    feature = "clap",
-    arg(
-      long,
-      value_parser = humantime::parse_duration,
-      default_value = clap_duration_default(DebounceConfig::DEFAULT_QUIET_WINDOW),
-    )
-  )]
   quiet_window: Duration,
   #[cfg_attr(feature = "serde", serde(with = "humantime_serde"))]
-  #[cfg_attr(
-    feature = "clap",
-    arg(
-      long,
-      value_parser = humantime::parse_duration,
-      default_value = clap_duration_default(DebounceConfig::DEFAULT_MAX_HOLD),
-    )
-  )]
   max_hold: Duration,
   #[cfg_attr(feature = "serde", serde(deserialize_with = "de_max_buffered"))]
-  #[cfg_attr(
-    feature = "clap",
-    arg(
-      long,
-      value_parser = clamped_max_buffered,
-      default_value_t = DebounceConfig::DEFAULT_MAX_BUFFERED,
-    )
+  max_buffered: usize,
+}
+
+/// The `clap` face of [`DebounceConfig`]: the same three flags the household
+/// derived before, kept in a proxy so the UPDATE can be written by hand (see
+/// [`command_line_value`]). The group id is pinned to the household's own name so
+/// the flattened `Option<DebounceConfig>` group a command already carries keeps
+/// its identity.
+#[cfg(feature = "clap")]
+#[derive(Debug, Clone, clap::Args)]
+#[group(id = "DebounceConfig")]
+struct DebounceConfigArgs {
+  #[arg(
+    long,
+    value_parser = humantime::parse_duration,
+    default_value = clap_duration_default(DebounceConfig::DEFAULT_QUIET_WINDOW),
+  )]
+  quiet_window: Duration,
+  #[arg(
+    long,
+    value_parser = humantime::parse_duration,
+    default_value = clap_duration_default(DebounceConfig::DEFAULT_MAX_HOLD),
+  )]
+  max_hold: Duration,
+  #[arg(
+    long,
+    value_parser = clamped_max_buffered,
+    default_value_t = DebounceConfig::DEFAULT_MAX_BUFFERED,
   )]
   max_buffered: usize,
+}
+
+#[cfg(feature = "clap")]
+impl DebounceConfigArgs {
+  /// The flag names, in field order — the ONE list, so a knob added to the policy
+  /// cannot be forgotten by the update rule or by the opt-in check below.
+  const FLAGS: [&'static str; 3] = ["quiet_window", "max_hold", "max_buffered"];
+
+  /// Whether the parse actually SAW one of the debounce flags on the command line
+  /// — what makes the coalescer opt-in on an UPDATE exactly as it is on a parse:
+  /// an unrelated flag must not switch settling on with a household of defaults.
+  fn given_on_command_line(matches: &clap::ArgMatches) -> bool {
+    Self::FLAGS
+      .iter()
+      .any(|flag| matches.value_source(flag) == Some(clap::parser::ValueSource::CommandLine))
+  }
+}
+
+#[cfg(feature = "clap")]
+impl From<DebounceConfigArgs> for DebounceConfig {
+  fn from(args: DebounceConfigArgs) -> Self {
+    let DebounceConfigArgs {
+      quiet_window,
+      max_hold,
+      max_buffered,
+    } = args;
+    Self {
+      quiet_window,
+      max_hold,
+      max_buffered,
+    }
+  }
+}
+
+#[cfg(feature = "clap")]
+impl clap::FromArgMatches for DebounceConfig {
+  fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+    DebounceConfigArgs::from_arg_matches(matches).map(Into::into)
+  }
+
+  /// Applies only what the COMMAND LINE said, leaving every other knob as it
+  /// stood. A derived update writes each flag's DEFAULT over the existing value
+  /// (every knob here has one), so `--quiet-window` alone would silently reset a
+  /// configured hold ceiling and buffered cap.
+  fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+    if let Some(quiet_window) = command_line_value(matches, "quiet_window") {
+      self.quiet_window = quiet_window;
+    }
+    if let Some(max_hold) = command_line_value(matches, "max_hold") {
+      self.max_hold = max_hold;
+    }
+    if let Some(max_buffered) = command_line_value(matches, "max_buffered") {
+      self.max_buffered = max_buffered;
+    }
+    Ok(())
+  }
+}
+
+#[cfg(feature = "clap")]
+impl clap::Args for DebounceConfig {
+  fn group_id() -> Option<clap::Id> {
+    DebounceConfigArgs::group_id()
+  }
+
+  fn augment_args(cmd: clap::Command) -> clap::Command {
+    DebounceConfigArgs::augment_args(cmd)
+  }
+
+  fn augment_args_for_update(cmd: clap::Command) -> clap::Command {
+    DebounceConfigArgs::augment_args_for_update(cmd)
+  }
 }
 
 /// A flag default rendered from the constant it mirrors, so the flag and the
@@ -319,6 +486,16 @@ impl Debounce {
 /// custom source ([`Tributaries::with_source`](crate::Tributaries::with_source)) was
 /// configured by its builder.
 ///
+/// # Both capacities are BOUNDED
+///
+/// Each channel is allocated eagerly, one slot per item, so the capacities are
+/// checked against [`MAX_EVENT_CAPACITY`](Self::MAX_EVENT_CAPACITY) /
+/// [`MAX_COMMAND_CAPACITY`](Self::MAX_COMMAND_CAPACITY) on every face — a
+/// document by its deserializer, a flag by its parser, a builder by
+/// [`validate`](Self::validate), which every constructor runs before it allocates
+/// anything. An out-of-range value is a typed [`OptionsError`] at the door rather
+/// than an allocation-size panic inside the channel.
+///
 /// # Configuration faces
 ///
 /// With the `serde` feature the household is one object keyed by the field names,
@@ -341,17 +518,148 @@ impl Debounce {
 /// ```text
 /// $ app --event-capacity 4096 --quiet-window 100ms
 /// ```
+///
+/// An UPDATE (`clap::FromArgMatches::update_from_arg_matches`) changes only what
+/// the command line actually carried: updating `--event-capacity` alone leaves the
+/// command mailbox and the debounce posture exactly as they stood, and an
+/// unrelated flag never switches settling on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(default))]
-#[cfg_attr(feature = "clap", derive(clap::Args))]
 pub struct TributariesOptions {
-  #[cfg_attr(feature = "clap", arg(long, default_value_t = TributariesOptions::DEFAULT_EVENT_CAPACITY))]
+  #[cfg_attr(feature = "serde", serde(deserialize_with = "de_event_capacity"))]
   event_capacity: NonZeroUsize,
-  #[cfg_attr(feature = "clap", arg(long, default_value_t = TributariesOptions::DEFAULT_COMMAND_CAPACITY))]
+  #[cfg_attr(feature = "serde", serde(deserialize_with = "de_command_capacity"))]
   command_capacity: NonZeroUsize,
-  #[cfg_attr(feature = "clap", command(flatten))]
   debounce: Option<DebounceConfig>,
+}
+
+/// The `clap` face of [`TributariesOptions`]: the two capacity flags plus
+/// [`DebounceConfig`]'s own group, flattened as the opt-in it is. It is a proxy
+/// for the same reason [`DebounceConfigArgs`] is — the UPDATE is written by hand
+/// so a defaulted flag cannot overwrite a configured knob — and its group id is
+/// pinned to the household's name.
+#[cfg(feature = "clap")]
+#[derive(Debug, Clone, clap::Args)]
+#[group(id = "TributariesOptions")]
+struct TributariesOptionsArgs {
+  #[arg(
+    long,
+    value_parser = parse_event_capacity,
+    default_value_t = TributariesOptions::DEFAULT_EVENT_CAPACITY,
+  )]
+  event_capacity: NonZeroUsize,
+  #[arg(
+    long,
+    value_parser = parse_command_capacity,
+    default_value_t = TributariesOptions::DEFAULT_COMMAND_CAPACITY,
+  )]
+  command_capacity: NonZeroUsize,
+  #[command(flatten)]
+  debounce: Option<DebounceConfig>,
+}
+
+/// The `--event-capacity` parser: the flag refuses out of range what
+/// [`TributariesOptions::validate`] refuses at construction, so a command line
+/// hears the ceiling where the value is written rather than at the channel.
+#[cfg(feature = "clap")]
+fn parse_event_capacity(
+  text: &str,
+) -> Result<NonZeroUsize, Box<dyn core::error::Error + Send + Sync>> {
+  Ok(check_event_capacity(text.parse()?)?)
+}
+
+/// The same, for `--command-capacity`.
+#[cfg(feature = "clap")]
+fn parse_command_capacity(
+  text: &str,
+) -> Result<NonZeroUsize, Box<dyn core::error::Error + Send + Sync>> {
+  Ok(check_command_capacity(text.parse()?)?)
+}
+
+/// The `event_capacity` key: a document is refused where the key is READ, with
+/// the same verdict the builders get from [`TributariesOptions::validate`].
+#[cfg(feature = "serde")]
+fn de_event_capacity<'de, D>(deserializer: D) -> Result<NonZeroUsize, D::Error>
+where
+  D: serde::Deserializer<'de>,
+{
+  use serde::{Deserialize as _, de::Error as _};
+
+  check_event_capacity(NonZeroUsize::deserialize(deserializer)?).map_err(D::Error::custom)
+}
+
+/// The same, for the `command_capacity` key.
+#[cfg(feature = "serde")]
+fn de_command_capacity<'de, D>(deserializer: D) -> Result<NonZeroUsize, D::Error>
+where
+  D: serde::Deserializer<'de>,
+{
+  use serde::{Deserialize as _, de::Error as _};
+
+  check_command_capacity(NonZeroUsize::deserialize(deserializer)?).map_err(D::Error::custom)
+}
+
+#[cfg(feature = "clap")]
+impl clap::FromArgMatches for TributariesOptions {
+  fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+    let TributariesOptionsArgs {
+      event_capacity,
+      command_capacity,
+      debounce,
+    } = TributariesOptionsArgs::from_arg_matches(matches)?;
+    Ok(Self {
+      event_capacity,
+      command_capacity,
+      debounce,
+    })
+  }
+
+  /// Applies only what the COMMAND LINE said, leaving every other knob of the
+  /// existing household exactly as it stood.
+  ///
+  /// Both capacities carry a flag default, so a derived update would write those
+  /// defaults over a configured household whenever ANY flag of the group was
+  /// given: `--event-capacity` alone would silently reset the command mailbox.
+  ///
+  /// The flattened debounce group needs the rule twice over. A derived update
+  /// builds the absent policy from the matches whenever the field is [`None`] —
+  /// which, every knob being defaulted, means an unrelated flag switches settling
+  /// ON with a household nobody asked for. Here the group is instantiated only
+  /// when one of ITS flags came from the command line, which is the same opt-in
+  /// rule a parse follows; an already-configured policy is updated in place, knob
+  /// by knob.
+  fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+    if let Some(event_capacity) = command_line_value(matches, "event_capacity") {
+      self.event_capacity = event_capacity;
+    }
+    if let Some(command_capacity) = command_line_value(matches, "command_capacity") {
+      self.command_capacity = command_capacity;
+    }
+    match &mut self.debounce {
+      Some(config) => config.update_from_arg_matches(matches)?,
+      None if DebounceConfigArgs::given_on_command_line(matches) => {
+        self.debounce = Some(DebounceConfig::from_arg_matches(matches)?);
+      }
+      None => {}
+    }
+    Ok(())
+  }
+}
+
+#[cfg(feature = "clap")]
+impl clap::Args for TributariesOptions {
+  fn group_id() -> Option<clap::Id> {
+    TributariesOptionsArgs::group_id()
+  }
+
+  fn augment_args(cmd: clap::Command) -> clap::Command {
+    TributariesOptionsArgs::augment_args(cmd)
+  }
+
+  fn augment_args_for_update(cmd: clap::Command) -> clap::Command {
+    TributariesOptionsArgs::augment_args_for_update(cmd)
+  }
 }
 
 impl TributariesOptions {
@@ -373,6 +681,29 @@ impl TributariesOptions {
   /// beyond what an orderly consumer keeps outstanding.
   pub const DEFAULT_COMMAND_CAPACITY: NonZeroUsize = NonZeroUsize::new(64).unwrap();
 
+  /// The largest owner→consumer event-channel capacity (2^20 events), matching
+  /// the fs watcher's own ceiling on the channel one level down.
+  ///
+  /// The channel is allocated EAGERLY at construction, one slot per event: 2^20
+  /// slots is already a hundreds-of-megabytes buffer, and a capacity near
+  /// [`usize::MAX`] is not a large buffer at all but an allocation-size overflow —
+  /// a panic inside the channel on 64-bit, and an immediate one on the 32-bit
+  /// targets. Past this ceiling a value stops naming a buffering trade and starts
+  /// naming a crash, so it is refused instead.
+  pub const MAX_EVENT_CAPACITY: NonZeroUsize = NonZeroUsize::new(1 << 20).unwrap();
+
+  /// The largest caller→owner command-mailbox capacity (2^16 commands).
+  ///
+  /// Tighter than [`MAX_EVENT_CAPACITY`](Self::MAX_EVENT_CAPACITY) for the reason
+  /// [`DEFAULT_COMMAND_CAPACITY`](Self::DEFAULT_COMMAND_CAPACITY) is tighter than
+  /// the default event capacity: every queued command owns its key, value and
+  /// filter, and the bound is what caps what abandoned requests can retain. The
+  /// mailbox is also allocated TWICE — `watch`/`unwatch` and `sync` admit through
+  /// channels of the same size — so the ceiling is paid twice over, and 2^16
+  /// outstanding control operations is already orders of magnitude past anything
+  /// an orderly consumer keeps in flight.
+  pub const MAX_COMMAND_CAPACITY: NonZeroUsize = NonZeroUsize::new(1 << 16).unwrap();
+
   /// The default options: default capacities, no debounce.
   #[inline]
   pub const fn new() -> Self {
@@ -381,6 +712,28 @@ impl TributariesOptions {
       command_capacity: Self::DEFAULT_COMMAND_CAPACITY,
       debounce: Self::DEFAULT_DEBOUNCE,
     }
+  }
+
+  /// Checks both capacities against their documented ceilings.
+  ///
+  /// Every [`Tributaries`](crate::Tributaries) constructor runs this BEFORE it
+  /// allocates a channel, so a caller normally never calls it; it is public so a
+  /// configuration layer can refuse a bad setting where the setting is read, with
+  /// the same verdict construction would give. The [`DebounceConfig`] carries no
+  /// unbounded quantity of its own — its buffered cap is clamped, never refused —
+  /// so nothing else here has a range to check.
+  ///
+  /// # Errors
+  ///
+  /// The first capacity found above its ceiling, as an [`OptionsError`].
+  pub const fn validate(&self) -> Result<(), OptionsError> {
+    if let Err(err) = check_event_capacity(self.event_capacity) {
+      return Err(err);
+    }
+    if let Err(err) = check_command_capacity(self.command_capacity) {
+      return Err(err);
+    }
+    Ok(())
   }
 
   /// The capacity of the owner→consumer event channel (design backpressure doc): the
@@ -565,9 +918,45 @@ impl Default for TributariesOptions {
 ///
 /// The default ([`new`](Self::new)) is both seats unengaged, which is exactly
 /// the behaviour every source had before the seats existed.
+///
+/// # Configuration faces
+///
+/// The words a custom source is armed with are configurable in their own right,
+/// on the same two faces and with the same spellings [`WatchOptions`] gives them
+/// — so a consumer that builds its own [`Source`](crate::Source) arms it from a
+/// document or a command line without re-deriving the vocabulary.
+///
+/// With the `serde` feature the seats are one object of two optional keys, each a
+/// list of plain pattern strings, and an invalid pattern is a document error
+/// rather than a value that matches nothing later. An absent `include` is the
+/// ABSENT seat ([`None`], deliver every file), which an empty list is not:
+///
+/// ```json
+/// { "prune": ["**/node_modules"], "include": ["**/*.{mp4,mov}"] }
+/// ```
+///
+/// With the `clap` feature it is a `clap::Args` group whose `--prune` and
+/// `--include` repeat, once per pattern; `--include` given no times at all is
+/// again the absent seat.
+///
+/// ```text
+/// $ app --prune '**/node_modules' --prune '**/.git' --include '**/*.mp4'
+/// ```
+///
+/// Those are the SAME flag names [`WatchOptions`] carries, deliberately — one
+/// vocabulary, one spelling — so a single command flattens one household or the
+/// other, never both (clap refuses a duplicate argument id, and a command that
+/// tried would fail its own `debug_assert`). An UPDATE changes only the seat the
+/// command line named: neither flag carries a default, so a seat nobody gave is
+/// left exactly as it stood.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[cfg_attr(feature = "clap", derive(clap::Args))]
 pub struct RootGlobs {
+  #[cfg_attr(feature = "clap", arg(long))]
   prune: Vec<Glob>,
+  #[cfg_attr(feature = "clap", arg(long))]
   include: Option<Vec<Glob>>,
 }
 
@@ -732,6 +1121,14 @@ impl RootGlobs {
 /// ```text
 /// $ app --moved=false --removed=false --prune '**/node_modules' --include '**/*.mp4'
 /// ```
+///
+/// An UPDATE (`clap::FromArgMatches::update_from_arg_matches`) changes only what
+/// the command line actually carried. Each of the three fields the face carries
+/// gets that from a rule of its own: the [`Interest`] gate consults the value
+/// SOURCE of its flags (see [`Interest`]'s own face), and the two glob seats carry
+/// no flag default at all, so a seat nobody named keeps the patterns it had. The
+/// [`Filter`] and the [`Debounce`] posture are on no face, and an update leaves
+/// them untouched.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(default, bound = ""))]
 #[cfg_attr(feature = "clap", derive(clap::Args))]

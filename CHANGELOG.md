@@ -221,7 +221,44 @@ All notable changes to this workspace are documented here. The format is based o
   worst case a number (256 passes per prefix) rather than whatever a document happened
   to list.
 
+- **`tributaries`** — `TributariesOptions::MAX_EVENT_CAPACITY` (2^20) and
+  `MAX_COMMAND_CAPACITY` (2^16), checked by the new `TributariesOptions::validate` and
+  reported as the new `OptionsError` (`EventCapacityTooLarge` /
+  `CommandCapacityTooLarge`, also carried by `BuildError::InvalidOptions`). Both
+  channels are allocated eagerly with one slot per item, so a capacity a document or a
+  flag could name but no allocator could serve was an allocation-size panic inside the
+  channel; every face now refuses it where the value is written, and every constructor
+  refuses it before the first channel exists.
+
+- **`tributaries`** — `RootGlobs` carries both configuration faces: serde (two optional
+  lists of plain pattern strings, an absent `include` being the absent seat) and a
+  `clap::Args` group with the repeatable `--prune` / `--include` a subscription already
+  spells its seats with. A consumer arming its own `Source` configures the words from a
+  document or a command line instead of re-deriving the vocabulary.
+
 ### Changed
+
+- **`tributaries`** — **BREAKING**: `Tributaries::with_source`, `parts` and
+  `parts_local` return `Result<_, OptionsError>`. Construction is where the umbrella's
+  capacities are checked, and the check has to be in front of the channels rather than
+  behind them; `Tributaries::new` (the fs constructor) keeps its signature and answers
+  `BuildError::InvalidOptions`. A household built from the defaults, or from any value
+  either face will admit, is always `Ok`.
+
+- **`tributaries`** — a `clap` UPDATE (`FromArgMatches::update_from_arg_matches`) on
+  `TributariesOptions`, `DebounceConfig`, `Interest` or `WatchOptions` applies only the
+  arguments the COMMAND LINE carried. A derived update cannot tell a flag's default from
+  a value someone gave, so `--event-capacity` alone used to reset the command mailbox,
+  switch the coalescer on with a default policy, and re-open an `Interest` a caller had
+  narrowed. The optional flattened debounce group is instantiated only when one of its
+  own flags was given, which is the rule a parse already followed.
+
+- **`tributaries`** — a per-root household the fs layer refuses
+  (`WatchRootError::InvalidOptions`) reaches a `watch` caller as an explicitly
+  classified `FaultKind::Other`, with the typed refusal recoverable through
+  `WatchError::as_fs`. It is a caller-configuration verdict: not `Capacity`, the one
+  kind the umbrella retries, and not `Unsupported`, which is read as a verdict on the
+  platform.
 
 - **`tributaries`** — **BREAKING for a custom `Source`**: `Source::arm` and
   `LocalSource::arm` take the per-root `&RootGlobs` as a third argument

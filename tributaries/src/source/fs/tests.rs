@@ -73,6 +73,68 @@ fn watch_error_from_fs_classifies_honestly() {
   );
 }
 
+/// A REFUSED per-root household is a caller-configuration verdict, and the seam
+/// classifies it as one deliberately rather than letting it fall through the catch-all.
+///
+/// Nothing was watched and nothing was lost — the layer below refused the words before any
+/// coverage existed — so the two kinds that would mislead are both wrong: `Capacity` is the
+/// one kind the umbrella RETRIES, and a household the watcher refuses identically forever
+/// would spin on it, while `Unsupported` reads as a verdict on the platform, which a caller
+/// answers by abandoning watching altogether. The unclassified kind is the honest one, and
+/// the concrete refusal stays recoverable so the seat and its ceiling can be named.
+#[test]
+fn a_refused_root_household_is_a_configuration_verdict_not_a_retryable_fault() {
+  use tributary_fs::{OptionsError, WatchRootError};
+
+  use crate::error::FaultKind;
+
+  let mapped = super::watch_error_from_fs(WatchRootError::InvalidOptions(
+    OptionsError::TooManyPrunePatterns { supplied: 300 },
+  ));
+  let fault = mapped
+    .fault()
+    .expect("a refused household arrives as a classified arm failure");
+  assert_eq!(fault.kind(), FaultKind::Other);
+  assert!(
+    !fault.kind().is_capacity(),
+    "asking again cannot change a refused household"
+  );
+  assert!(
+    !fault.kind().is_unsupported(),
+    "the platform can watch; these words it cannot"
+  );
+  let concrete = fault
+    .downcast_ref::<WatchRootError>()
+    .expect("the whole fs error is preserved in the box");
+  assert!(
+    concrete.is_invalid_options(),
+    "the typed refusal is what a caller reads to fix its own words"
+  );
+}
+
+/// The pure-fs constructor answers the UMBRELLA's own refusal in its own vocabulary,
+/// and answers it before a native watcher exists: building one starts kernel work, and
+/// a household this constructor will refuse anyway should cost none of it.
+#[cfg(feature = "tokio")]
+#[test]
+fn the_fs_constructor_refuses_an_out_of_range_capacity_before_it_builds_a_watcher() {
+  use core::num::NonZeroUsize;
+
+  use crate::{TributariesOptions, WatcherOptions};
+
+  let Err(err) = crate::TokioTributaries::new(
+    WatcherOptions::new(),
+    TributariesOptions::new().with_event_capacity(NonZeroUsize::MAX),
+  ) else {
+    panic!("a capacity no channel could be allocated at is refused")
+  };
+  assert!(err.is_invalid_options(), "got {err:?}");
+  assert!(
+    err.fault().is_none(),
+    "no source ever saw this household, so it carries no source fault"
+  );
+}
+
 /// The SAME reclassification on the in-place retarget's seam
 /// ([`replace_error_to_watch_error`](super::replace_error_to_watch_error)), which is a separate
 /// mapping over a separate fs error enum. Both are load-bearing and for different reasons: the
@@ -2251,7 +2313,8 @@ mod the_invalid_uid_sentinel {
       trigger,
     };
     let mut w: crate::Tributaries<OsString, (), TokioRuntime, u32> =
-      crate::Tributaries::with_source(source, TributariesOptions::new());
+      crate::Tributaries::with_source(source, TributariesOptions::new())
+        .expect("the default capacities are in range");
     let sub = w
       .watch(key("/r"), (), WatchOptions::new())
       .await

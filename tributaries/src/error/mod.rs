@@ -19,7 +19,7 @@
 
 use core::error::Error;
 
-use crate::options::RootGlobs;
+use crate::options::{OptionsError, RootGlobs};
 
 #[cfg(all(test, not(feature = "fs")))]
 mod tests;
@@ -200,6 +200,14 @@ impl core::fmt::Display for FaultKind {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum BuildError {
+  /// A capacity in the umbrella's own household lies outside its documented range.
+  /// The whole range-checking vocabulary lives with the options
+  /// ([`TributariesOptions::validate`](crate::TributariesOptions::validate)), so the
+  /// verdict a configuration layer computes where the setting is read and the one
+  /// construction computes are the same value — and it is reached before a single
+  /// channel is allocated.
+  #[error(transparent)]
+  InvalidOptions(#[from] OptionsError),
   /// The source could not be built; the classified fault carries the source's concrete
   /// error.
   #[error("the source could not be built")]
@@ -207,17 +215,25 @@ pub enum BuildError {
 }
 
 impl BuildError {
+  /// Whether this is [`InvalidOptions`](Self::InvalidOptions).
+  #[inline]
+  pub const fn is_invalid_options(&self) -> bool {
+    matches!(self, Self::InvalidOptions(_))
+  }
+
   /// Whether this is [`Source`](Self::Source).
   #[inline]
   pub const fn is_source(&self) -> bool {
     matches!(self, Self::Source(_))
   }
 
-  /// The classified fault this error carries.
+  /// The classified fault this error carries, when the failure was the SOURCE's —
+  /// [`None`] for a refused configuration, which no source ever saw.
   #[inline]
   pub const fn fault(&self) -> Option<&SourceFault> {
     match self {
       Self::Source(fault) => Some(fault),
+      Self::InvalidOptions(_) => None,
     }
   }
 
