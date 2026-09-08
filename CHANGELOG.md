@@ -107,12 +107,36 @@ All notable changes to this workspace are documented here. The format is based o
     narrowing this subscription's delivery: `prune` subtracts coverage, so a pruned
     subtree is never entered at all, while `interest`, the `Filter` and the `Debounce`
     posture stay per-subscription gates over a root armed at the source's widest
-    policy. Both faces carry them (serde: lists of plain strings, an invalid pattern
+    policy. They match what the fs household's seats match — `prune` against
+    root-relative DIRECTORY paths, `include` against the object's NAME alone. Both
+    faces carry them (serde: lists of plain strings, an invalid pattern
     being a document error; clap: repeatable `--prune` / `--include`, an absent
     `--include` being the absent seat), and neither constrains `C`.
   - `RootGlobs` — the per-root words a source receives, `WatchOptions::root_globs`
     extracts them, and a root remembers the ones it was ARMED with, so a widen's
     restore re-arms a survivor under its own words rather than the newcomer's.
+  - **One root, one set of words.** Roots are SHARED, so every subscription a root
+    serves carries that root's `RootGlobs`, and the per-subscription `Filter` is what
+    narrows delivery further. A watch whose seats differ from those of the root that
+    would serve it — the root already covering it, or ANY root its wider key would
+    subsume — is REFUSED with the new `WatchError::RootWordsConflict` (carrying the
+    conflicting root's key depth and both word sets, with
+    `WatchError::is_root_words_conflict` beside the other predicates), never silently
+    re-scoped and never merged: no union or intersection of two callers' seats is one
+    either of them asked for. Unengaged words are a value like any other and conflict
+    with engaged ones; equality is `RootGlobs`'s own — the same patterns, as written, in
+    the same order. The verdict is the planner's, taken off the root records BEFORE
+    anything is armed, disarmed, retargeted or re-pointed — the gapless in-place widen
+    included — so a refused watch moves no coverage and owes nobody a `Rescan`.
+  - A cookie directory the root's own `prune` seat covers reaches a `sync` caller as
+    `SyncError::CookieDirUncovered` — the same verdict as one outside the root or under a
+    watcher exclusion, all three being "no event could ever arrive there" — rather than as
+    a write failure it would be pointless to retry.
+  - `Source::replace`'s contract states what the fs binding's `replace_root` does: a
+    retarget swaps the root's key and KEEPS its words, which are root-relative and are
+    therefore re-based onto the new key, so a depth-anchored `prune` pattern names a
+    different directory afterwards (both the over- and the under-coverage case are named).
+    Stating new words is what an `arm` is for.
   - `Event::is_dir()`: the affected object's class where the source proved it, `None`
     where nothing did. A move's two projections carry it (both endpoints are one
     object); a synthesized delivery reports `None`. `SourceEvent` carries it too, stated

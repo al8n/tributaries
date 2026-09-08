@@ -549,6 +549,19 @@ pub trait LocalSource<C> {
   /// no fresh handle is minted: nothing can alias, and the umbrella re-keys its record in
   /// place rather than dropping and re-inserting.
   ///
+  /// **The root's WORDS are kept, and they are RE-BASED.** A retarget swaps the root's key,
+  /// never the [`RootGlobs`] it was armed with: no new words are stated here, and the umbrella
+  /// goes on recording exactly the ones the root already held. Both seats are ROOT-RELATIVE, so
+  /// keeping them re-bases every pattern onto the new key — the same words read against a
+  /// different origin — and a depth-anchored `prune` pattern then names a different place.
+  /// Retargeting `/r` onto `/r/a` makes `prune = ["a/cache"]` name `/r/a/a/cache`, so the
+  /// directory it was written for is armed and delivered again (over-coverage); retargeting `/r`
+  /// onto its parent `/p` makes the same pattern name `/p/a/cache`, a directory nobody asked
+  /// about, while `/p/r/a/cache` is watched again (under-coverage). An `include` pattern matches
+  /// the object's NAME, which no re-rooting moves, and a depth-free `prune` (`**/node_modules`)
+  /// is position-independent; both re-base unchanged. Stating NEW words is what a fresh
+  /// [`arm`](Self::arm) is for — this never does it.
+  ///
   /// **Atomic on failure**: every error MUST leave the old root's coverage exactly as it was,
   /// and BOTH of the umbrella's error paths rest on that. Most errors fall back to
   /// release-and-rearm — including the default's
@@ -877,6 +890,19 @@ pub trait Source<C> {
   /// generation-unique [`Handle`](Self::Handle) contract, and it is sound precisely because
   /// no fresh handle is minted: nothing can alias, and the umbrella re-keys its record in
   /// place rather than dropping and re-inserting.
+  ///
+  /// **The root's WORDS are kept, and they are RE-BASED.** A retarget swaps the root's key,
+  /// never the [`RootGlobs`] it was armed with: no new words are stated here, and the umbrella
+  /// goes on recording exactly the ones the root already held. Both seats are ROOT-RELATIVE, so
+  /// keeping them re-bases every pattern onto the new key — the same words read against a
+  /// different origin — and a depth-anchored `prune` pattern then names a different place.
+  /// Retargeting `/r` onto `/r/a` makes `prune = ["a/cache"]` name `/r/a/a/cache`, so the
+  /// directory it was written for is armed and delivered again (over-coverage); retargeting `/r`
+  /// onto its parent `/p` makes the same pattern name `/p/a/cache`, a directory nobody asked
+  /// about, while `/p/r/a/cache` is watched again (under-coverage). An `include` pattern matches
+  /// the object's NAME, which no re-rooting moves, and a depth-free `prune` (`**/node_modules`)
+  /// is position-independent; both re-base unchanged. Stating NEW words is what a fresh
+  /// [`arm`](Self::arm) is for — this never does it.
   ///
   /// **Atomic on failure**: every error MUST leave the old root's coverage exactly as it was,
   /// and BOTH of the umbrella's error paths rest on that. Most errors fall back to

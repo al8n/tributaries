@@ -482,23 +482,53 @@ impl Default for TributariesOptions {
 /// seats a subscription's [`WatchOptions`] carries, extracted for the seam
 /// ([`Source::arm`](crate::Source::arm)).
 ///
-/// Both are matched against a **root-relative** path: the segments between the
-/// armed root and the object, joined with `/`, never with a leading separator.
-/// The root itself is the empty path and matches neither seat, so a pattern can
-/// never silence the root it is configured on. Patterns are case-insensitive
-/// and a `*` never crosses a `/` (see [`Glob`]).
+/// The seats speak for different things, and each is matched against a
+/// different string. Patterns are case-insensitive and a `*` never crosses a
+/// `/` (see [`Glob`]).
 ///
-/// - [`prune`](Self::prune) subtracts SUBTREES from the watch itself: a
-///   directory whose root-relative path — or any ancestor's, below the root —
+/// - [`prune`](Self::prune) subtracts SUBTREES from the watch itself, and it is
+///   matched against a **root-relative DIRECTORY path**: the segments between
+///   the armed root and a directory, joined with `/`, never with a leading
+///   separator. A directory whose path — or any ancestor's, below the root —
 ///   matches is never enumerated, never armed, never descended, and nothing at
-///   or under it is delivered. Empty (the default) prunes nothing.
-/// - [`include`](Self::include) narrows DELIVERY to files whose last path
-///   segment matches, changing no coverage. [`None`] — the default — delivers
-///   everything; an EMPTY list is not the same thing, but a seat admitting no
-///   file at all. Directories, re-enumeration signals, an object whose class
-///   the source did not prove, and a rename whose SOURCE matched are always
-///   delivered: the seat fails OPEN, because a folder the consumer never hears
-///   about is a hole in its view while an extra event is one it can drop.
+///   or under it is delivered. The root itself is the empty path and matches
+///   nothing, so a pattern can never silence the root it is configured on.
+///   Empty (the default) prunes nothing.
+///
+///   It speaks for DIRECTORIES only: a plain FILE whose own name matches a
+///   prune pattern is not dropped by it — which files arrive is `include`'s
+///   seat — so `**/.*`, written to skip dot-directories, does not silently ban
+///   every dotfile in the tree. Because the separator is literal,
+///   `**/node_modules` matches `node_modules` at any depth while `a/cache`
+///   names one place.
+/// - [`include`](Self::include) narrows DELIVERY, changing no coverage, and it
+///   is matched against the object's **NAME** — the last segment of its path,
+///   alone. So `*.mp4` and `**/*.mp4` are the same seat here, and a pattern
+///   carrying a `/` matches nothing at all: there is no `/` in a name to match
+///   it against. [`None`] — the default — delivers everything; an EMPTY list is
+///   not the same thing, but a seat admitting no file at all. Directories,
+///   re-enumeration signals, an object whose class the source did not prove,
+///   and a rename whose SOURCE matched are always delivered: the seat fails
+///   OPEN, because a folder the consumer never hears about is a hole in its
+///   view while an extra event is one it can drop.
+///
+/// # One root, one set of words
+///
+/// These are the words a ROOT is armed with, and the umbrella folds overlapping
+/// subscriptions onto shared roots — so every subscription a root serves carries
+/// words EQUAL to that root's. A watch whose seats differ from those of the root
+/// that would serve it, or from any root it would subsume, is REFUSED with
+/// [`WatchError::RootWordsConflict`](crate::WatchError::RootWordsConflict) — never
+/// silently re-scoped, and never merged: no union or intersection of two callers'
+/// seats is one either of them asked for. Unengaged words ([`new`](Self::new))
+/// are just another value here; they conflict with engaged ones. Equality is this
+/// type's own [`PartialEq`]: the same patterns, as written, in the same order.
+///
+/// The refusal is decided before anything is armed, disarmed or re-pointed, so a
+/// conflicting watch costs no coverage and owes no
+/// [`Rescan`](crate::EventKind::Rescan). A narrowing that must be this
+/// subscription's own whatever else is watched around it belongs in the
+/// per-subscription [`Filter`](crate::Filter), which gates delivery alone.
 ///
 /// # A source that cannot honour a seat must SAY so
 ///
@@ -536,7 +566,9 @@ impl RootGlobs {
     self.prune.is_empty() && self.include.is_none()
   }
 
-  /// The subtrees this root never descends into. Empty is the default.
+  /// The subtrees this root never descends into. Empty is the default. Matched
+  /// against root-relative DIRECTORY paths; see the type docs for what a match
+  /// subtracts and what it does not.
   #[inline]
   pub fn prune(&self) -> &[Glob] {
     self.prune.as_slice()
@@ -558,7 +590,8 @@ impl RootGlobs {
   }
 
   /// The file patterns delivery is narrowed to, or [`None`] — the default — for
-  /// every file.
+  /// every file. Matched against the object's NAME alone, so a pattern carrying
+  /// a `/` admits nothing.
   #[inline]
   pub fn include(&self) -> Option<&[Glob]> {
     self.include.as_deref()
@@ -617,12 +650,17 @@ impl RootGlobs {
 /// The glob seats are not that. They are handed to [`Source::arm`](crate::Source::arm)
 /// as the words the root itself is armed with, so [`prune`](Self::prune) subtracts
 /// coverage rather than filtering it — which is exactly why it can keep a watcher out
-/// of a `node_modules` tree instead of merely dropping its events. The consequence to
-/// hold: they are per-ROOT, and roots are shared. A root armed for this subscription
-/// carries THESE words, and a later subscription merely *covered* by it — or one whose
-/// wider watch subsumes it — is served by the root its own reconcile armed. A caller
-/// that needs a narrowing which is unconditionally its own, whatever else is watched
-/// around it, wants the [`Filter`].
+/// of a `node_modules` tree instead of merely dropping its events. [`prune`](Self::prune)
+/// is matched against root-relative DIRECTORY paths and [`include`](Self::include) against
+/// the object's NAME alone; see [`RootGlobs`] for both seats in full.
+///
+/// The consequence to hold: they are per-ROOT, and roots are shared — so ALL subscriptions
+/// sharing a root share its words. The per-subscription [`Filter`] narrows delivery further,
+/// on top of them; a watch whose own seats CONFLICT with the words of the root that would
+/// serve it (or of any root it would subsume) is refused with
+/// [`WatchError::RootWordsConflict`](crate::WatchError::RootWordsConflict), never silently
+/// re-scoped. A caller that needs a narrowing which is unconditionally its own, whatever else
+/// is watched around it, wants the [`Filter`].
 ///
 /// # Cloning shares the [`Filter`] slot
 ///
@@ -775,12 +813,14 @@ impl<C> WatchOptions<C> {
 
   /// The subtrees a root armed for this subscription never descends into — the
   /// [`prune`](RootGlobs::prune) half of the per-root words handed to
-  /// [`Source::arm`](crate::Source::arm). Empty (the default) prunes nothing.
+  /// [`Source::arm`](crate::Source::arm), matched against root-relative
+  /// DIRECTORY paths. Empty (the default) prunes nothing.
   ///
   /// Unlike the [`interest`](Self::interest) gate and the
   /// [`filter`](Self::filter), this is NOT a delivery narrowing the umbrella
   /// applies on top of a full watch: it re-scopes the underlying watch itself,
-  /// so a pruned subtree is never even covered. See [`RootGlobs`].
+  /// so a pruned subtree is never even covered — and it is the ROOT's, shared
+  /// with every subscription that root serves. See [`RootGlobs`].
   #[inline]
   pub fn prune(&self) -> &[Glob] {
     self.prune.as_slice()
@@ -803,9 +843,10 @@ impl<C> WatchOptions<C> {
 
   /// The file patterns delivery is narrowed to, or [`None`] — the default — for
   /// every file: the [`include`](RootGlobs::include) half of the per-root words
-  /// handed to [`Source::arm`](crate::Source::arm). An EMPTY list is not the
-  /// same thing but a seat admitting no file at all (see [`RootGlobs`] for what
-  /// the seat always admits regardless).
+  /// handed to [`Source::arm`](crate::Source::arm), matched against the object's
+  /// NAME alone (so a pattern carrying a `/` admits nothing). An EMPTY list is
+  /// not the same thing but a seat admitting no file at all (see [`RootGlobs`]
+  /// for what the seat always admits regardless).
   #[inline]
   pub fn include(&self) -> Option<&[Glob]> {
     self.include.as_deref()

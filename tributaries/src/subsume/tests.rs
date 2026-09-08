@@ -48,7 +48,7 @@ impl Handles {
 /// the planned one itself.
 fn watch(s: &mut S, handles: &mut Handles, path: &str, interest: Interest) -> (u32, Subscription) {
   let k = key(path);
-  let outcome = s.plan_watch(&k, (), interest);
+  let outcome = s.test_plan_watch(&k, (), interest);
   let (fs_root, sub) = match &outcome {
     WatchOutcome::Covered { fs_root, sub, .. } => (*fs_root, *sub),
     WatchOutcome::Widen { sub, .. } | WatchOutcome::Disjoint { sub, .. } => (handles.mint(), *sub),
@@ -56,6 +56,33 @@ fn watch(s: &mut S, handles: &mut Handles, path: &str, interest: Interest) -> (u
   s.commit_watch(&outcome, fs_root, &k, &RootGlobs::new())
     .release();
   (fs_root, sub)
+}
+
+/// [`watch`] under explicit per-root words: the seats the root is ARMED with, and — because a
+/// root carries one set of words for every subscription it serves — the seats every later watch
+/// sharing its coverage must carry too.
+fn watch_with_globs(
+  s: &mut S,
+  handles: &mut Handles,
+  path: &str,
+  globs: &RootGlobs,
+) -> (u32, Subscription) {
+  let k = key(path);
+  let outcome = match s.plan_watch(&k, (), Interest::all(), globs) {
+    Ok(outcome) => outcome,
+    Err(_) => panic!("{path} plans under the very words its root is armed with"),
+  };
+  let (fs_root, sub) = match &outcome {
+    WatchOutcome::Covered { fs_root, sub, .. } => (*fs_root, *sub),
+    WatchOutcome::Widen { sub, .. } | WatchOutcome::Disjoint { sub, .. } => (handles.mint(), *sub),
+  };
+  s.commit_watch(&outcome, fs_root, &k, globs).release();
+  (fs_root, sub)
+}
+
+/// One validated pattern for the per-root-words cells.
+fn glob(pattern: &str) -> tributary_proto::glob::Glob {
+  pattern.parse().expect("a valid pattern compiles")
 }
 
 /// The keys of every live root, as a set.
@@ -89,7 +116,7 @@ fn descendant_is_covered() {
   let (ra, sa) = watch(&mut s, &mut h, "/a", Interest::all());
 
   // `/a/b` is already covered by `/a`: no new root, no new kernel watch.
-  let outcome = s.plan_watch(&key("/a/b"), (), Interest::all());
+  let outcome = s.test_plan_watch(&key("/a/b"), (), Interest::all());
   let sb = match &outcome {
     WatchOutcome::Covered {
       fs_root,
@@ -123,7 +150,7 @@ fn ancestor_widens_and_repoints() {
   let (narrow, s_narrow) = watch(&mut s, &mut h, "/a/b", Interest::all());
 
   // Watching the strict ancestor `/a` subsumes `/a/b`.
-  let outcome = s.plan_watch(&key("/a"), (), Interest::all());
+  let outcome = s.test_plan_watch(&key("/a"), (), Interest::all());
   let s_wide = match &outcome {
     WatchOutcome::Widen {
       repointed,
@@ -153,6 +180,144 @@ fn ancestor_widens_and_repoints() {
   // The wider root's key IS the widening subscription's own registered key — the source of truth
   // the plan never needed to carry a second copy of.
   assert_eq!(s.subscription_key(s_wide), Some(key("/a").as_slice()));
+}
+
+/// One root, one set of words, on the `Covered` path: a newcomer the covering root would serve
+/// arms nothing of its own, so words that differ from that root's are a request the commit could
+/// not carry out — it is REFUSED rather than silently served under the root's words.
+///
+/// And the refusal costs nothing. The planner decides it from the root RECORD, so the engine is
+/// bit-for-bit what it was: the root, its words, its cohort, and — the reading that pins there was
+/// no plan at all — an empty pending ledger, with nothing for the driver to abort.
+#[test]
+fn a_covered_watch_whose_words_differ_is_refused_and_moves_nothing() {
+  let mut s = S::new();
+  let mut h = Handles::default();
+
+  let words = RootGlobs::new().with_prune([glob("**/node_modules")]);
+  let (ra, sa) = watch_with_globs(&mut s, &mut h, "/a", &words);
+
+  // The newcomer asks for the UNENGAGED words — which are not "no request", but a different one.
+  let refused = match s.plan_watch(&key("/a/b"), (), Interest::all(), &RootGlobs::new()) {
+    Ok(outcome) => panic!("expected a refusal, got {outcome:?}"),
+    Err(conflict) => conflict,
+  };
+  assert_eq!(refused.root, ra, "the refusal names the covering root");
+  assert_eq!(
+    refused.root_depth,
+    key("/a").len(),
+    "and names it by the depth of its own key"
+  );
+  assert_eq!(
+    refused.armed, words,
+    "it carries the words that root is ARMED with — the ones a watch here must match"
+  );
+
+  assert_eq!(root_keys(&s), BTreeSet::from([key("/a")]));
+  assert_eq!(s.subscribers(ra), vec![sa], "the cohort is untouched");
+  assert_eq!(
+    s.root_globs(ra),
+    Some(&words),
+    "and the root keeps its own words"
+  );
+  assert_eq!(
+    s.pending_len(),
+    0,
+    "a refused watch mints no reservation for anyone to abort"
+  );
+}
+
+/// The same rule on the `Widen` path, where it matters most: ANY subsumed root whose words differ
+/// refuses the whole widen — the newcomer's root would REPLACE those roots and re-point their
+/// subscribers onto words they never asked for, and coverage lost that way has no `Rescan` that
+/// can un-lose it.
+///
+/// The conflict is deliberately on the SECOND subsumed root, and the second is the UNENGAGED one:
+/// the planner scans every root it would subsume rather than the first, and unengaged words are a
+/// value like any other rather than a wildcard that agrees with everything.
+///
+/// Above all, the plan never gets as far as naming a root to release: the verdict comes off the
+/// records, so both roots are still live, still armed, still carrying their cohorts.
+#[test]
+fn a_widen_refuses_when_any_subsumed_root_disagrees_before_naming_a_teardown() {
+  let mut s = S::new();
+  let mut h = Handles::default();
+
+  let words = RootGlobs::new().with_include([glob("*.mp4")]);
+  let (rb, sb) = watch_with_globs(&mut s, &mut h, "/a/b", &words);
+  let (rc, sc) = watch_with_globs(&mut s, &mut h, "/a/c", &RootGlobs::new());
+
+  let refused = match s.plan_watch(&key("/a"), (), Interest::all(), &words) {
+    Ok(outcome) => panic!("expected a refusal, got {outcome:?}"),
+    Err(conflict) => conflict,
+  };
+  assert_eq!(
+    refused.root, rc,
+    "the refusal names the DISAGREEING root, not merely the first subsumed one"
+  );
+  assert_eq!(refused.root_depth, key("/a/c").len());
+  assert_eq!(
+    refused.armed,
+    RootGlobs::new(),
+    "the unengaged words that root was armed with"
+  );
+
+  assert_eq!(
+    root_keys(&s),
+    BTreeSet::from([key("/a/b"), key("/a/c")]),
+    "neither subsumed root was torn down for a watch that is then refused"
+  );
+  assert_eq!(s.subscribers(rb), vec![sb]);
+  assert_eq!(s.subscribers(rc), vec![sc]);
+  assert_eq!(s.root_globs(rb), Some(&words));
+  assert_eq!(s.root_globs(rc), Some(&RootGlobs::new()));
+  assert_eq!(s.pending_len(), 0);
+}
+
+/// The rule is EQUALITY, not "no words engaged": a watch carrying the same seats as the root it
+/// would share plans exactly as it always did, on both paths — `Covered` under an engaged root,
+/// and `Widen` over one. The newcomer's words are built separately from the root's, so what
+/// passes is the value, not a shared allocation.
+#[test]
+fn equal_words_plan_as_they_always_did_on_both_paths() {
+  let mut s = S::new();
+  let mut h = Handles::default();
+
+  let words = || {
+    RootGlobs::new()
+      .with_prune([glob("**/skip")])
+      .with_include([glob("*.mp4")])
+  };
+  let (rb, sb) = watch_with_globs(&mut s, &mut h, "/a/b", &words());
+
+  // Covered: an equal-worded newcomer joins the root's cohort, arming nothing.
+  let (covered_root, covered_sub) = watch_with_globs(&mut s, &mut h, "/a/b/c", &words());
+  assert_eq!(covered_root, rb, "covered by the /a/b root");
+  assert_eq!(s.subscribers(rb), vec![sb, covered_sub]);
+
+  // Widen: an equal-worded ancestor subsumes it, re-pointing both subscribers.
+  let outcome = match s.plan_watch(&key("/a"), (), Interest::all(), &words()) {
+    Ok(outcome) => outcome,
+    Err(_) => panic!("equal words never conflict"),
+  };
+  let wide = match &outcome {
+    WatchOutcome::Widen {
+      repointed, unwatch, ..
+    } => {
+      assert_eq!(repointed, &vec![sb, covered_sub]);
+      assert_eq!(unwatch, &vec![rb]);
+      h.mint()
+    }
+    other => panic!("expected Widen, got {other:?}"),
+  };
+  s.commit_watch(&outcome, wide, &key("/a"), &words())
+    .release();
+  assert_eq!(root_keys(&s), BTreeSet::from([key("/a")]));
+  assert_eq!(
+    s.root_globs(wide),
+    Some(&words()),
+    "the widened root is armed with the words every subscription it serves carries"
+  );
 }
 
 #[test]
@@ -265,7 +430,7 @@ fn stale_broad_root_does_not_over_report_is_watched() {
 
   let (_narrow, _s_narrow) = watch(&mut s, &mut h, "/a/b", Interest::all());
   // Widen /a: subsumes /a/b onto a wider root /a; the /a watch's own key equals the root.
-  let outcome = s.plan_watch(&key("/a"), (), Interest::all());
+  let outcome = s.test_plan_watch(&key("/a"), (), Interest::all());
   let s_wide = match &outcome {
     WatchOutcome::Widen { sub, .. } => *sub,
     other => panic!("expected Widen, got {other:?}"),
@@ -313,7 +478,7 @@ fn stale_broad_root_does_not_over_report_is_watched() {
 
   // Self-heal: a dedup caller re-installs /a/c. It is Covered under the still-armed /a root
   // (no new arm), and is now truthfully watched.
-  let re = s.plan_watch(&key("/a/c"), (), Interest::all());
+  let re = s.test_plan_watch(&key("/a/c"), (), Interest::all());
   assert!(
     matches!(re, WatchOutcome::Covered { .. }),
     "re-installing /a/c is Covered under the still-armed broad root — no re-arm",
@@ -374,7 +539,7 @@ fn over_broad_drop_reports_survivor_antichain() {
   let (_rb, _s_b) = watch(&mut s, &mut h, "/a/b", Interest::all());
   let (_rc, _s_c) = watch(&mut s, &mut h, "/a/c", Interest::all());
   // Widen /a over both disjoint roots: the wide root /a now serves /a/b, /a/c, and its own /a watch.
-  let outcome = s.plan_watch(&key("/a"), (), Interest::all());
+  let outcome = s.test_plan_watch(&key("/a"), (), Interest::all());
   let s_a = match &outcome {
     WatchOutcome::Widen { sub, .. } => *sub,
     other => panic!("expected Widen, got {other:?}"),
@@ -436,7 +601,7 @@ fn over_broad_antichain_collapses_nested_survivors() {
   // /a/b/c is Covered by the /a/b root (no new root); both ride /a/b.
   let (_rbc, _s_bc) = watch(&mut s, &mut h, "/a/b/c", Interest::all());
   // Widen /a: subsumes the /a/b root with BOTH its subscribers → wide /a serves /a/b, /a/b/c, /a.
-  let outcome = s.plan_watch(&key("/a"), (), Interest::all());
+  let outcome = s.test_plan_watch(&key("/a"), (), Interest::all());
   let s_a = match &outcome {
     WatchOutcome::Widen { sub, .. } => *sub,
     other => panic!("expected Widen, got {other:?}"),
@@ -473,7 +638,7 @@ fn narrowed_cover_non_root_unwatch_reprunes() {
   let (_rb, _s_b) = watch(&mut s, &mut h, "/a/b", Interest::all());
   let (_rc, s_c) = watch(&mut s, &mut h, "/a/c", Interest::all());
   // Widen /a over /a/b and /a/c, then drop /a, leaving the wide root serving only /a/b and /a/c.
-  let outcome = s.plan_watch(&key("/a"), (), Interest::all());
+  let outcome = s.test_plan_watch(&key("/a"), (), Interest::all());
   let s_a = match &outcome {
     WatchOutcome::Widen { sub, .. } => *sub,
     other => panic!("expected Widen, got {other:?}"),
@@ -518,7 +683,7 @@ fn equal_survivor_antichain_reports_no_reprune() {
   let (_rb, _s_b) = watch(&mut s, &mut h, "/a/b", Interest::all());
   let (_rdeep, s_deep) = watch(&mut s, &mut h, "/a/b/deep", Interest::all()); // Covered by /a/b.
   let (_rc, _s_c) = watch(&mut s, &mut h, "/a/c", Interest::all());
-  let outcome = s.plan_watch(&key("/a"), (), Interest::all());
+  let outcome = s.test_plan_watch(&key("/a"), (), Interest::all());
   let s_a = match &outcome {
     WatchOutcome::Widen { sub, .. } => *sub,
     other => panic!("expected Widen, got {other:?}"),
@@ -555,7 +720,7 @@ fn retained_cover_for_tracks_current_membership() {
   let (_rb, _s_b) = watch(&mut s, &mut h, "/a/b", Interest::all());
   let (_rc, _s_c) = watch(&mut s, &mut h, "/a/c", Interest::all());
   // Widen /a over both disjoint roots: the wide root serves /a/b, /a/c, and its own /a watch.
-  let outcome = s.plan_watch(&key("/a"), (), Interest::all());
+  let outcome = s.test_plan_watch(&key("/a"), (), Interest::all());
   let s_a = match &outcome {
     WatchOutcome::Widen { sub, .. } => *sub,
     other => panic!("expected Widen, got {other:?}"),
@@ -596,7 +761,7 @@ fn retained_cover_for_collapses_nested_survivors() {
 
   let (_rb, _s_b) = watch(&mut s, &mut h, "/a/b", Interest::all());
   let (_rbc, _s_bc) = watch(&mut s, &mut h, "/a/b/c", Interest::all()); // Covered by /a/b.
-  let outcome = s.plan_watch(&key("/a"), (), Interest::all());
+  let outcome = s.test_plan_watch(&key("/a"), (), Interest::all());
   let s_a = match &outcome {
     WatchOutcome::Widen { sub, .. } => *sub,
     other => panic!("expected Widen, got {other:?}"),
@@ -623,7 +788,7 @@ fn retained_cover_for_includes_a_newly_covered_subscriber() {
 
   // Make /a over-broad, serving only /a/b: widen /a over /a/b, then drop the /a sub.
   let (_rb, _s_b) = watch(&mut s, &mut h, "/a/b", Interest::all());
-  let outcome = s.plan_watch(&key("/a"), (), Interest::all());
+  let outcome = s.test_plan_watch(&key("/a"), (), Interest::all());
   let s_a = match &outcome {
     WatchOutcome::Widen { sub, .. } => *sub,
     other => panic!("expected Widen, got {other:?}"),
@@ -661,7 +826,7 @@ fn retained_cover_for_joins_the_explicit_newcomer_before_commit() {
 
   // Make /a over-broad, serving only /a/b: widen /a over /a/b, then drop the /a sub.
   let (_rb, _s_b) = watch(&mut s, &mut h, "/a/b", Interest::all());
-  let outcome = s.plan_watch(&key("/a"), (), Interest::all());
+  let outcome = s.test_plan_watch(&key("/a"), (), Interest::all());
   let s_a = match &outcome {
     WatchOutcome::Widen { sub, .. } => *sub,
     other => panic!("expected Widen, got {other:?}"),
@@ -748,7 +913,7 @@ fn plan_watch_flags_covered_outside_the_narrowed_cover() {
   let (ra, _sa) = watch(&mut s, &mut h, "/a", Interest::all());
 
   // Full coverage (None): no Covered newcomer is outside.
-  let outcome = s.plan_watch(&key("/a/x"), (), Interest::all());
+  let outcome = s.test_plan_watch(&key("/a/x"), (), Interest::all());
   match &outcome {
     WatchOutcome::Covered { outside_cover, .. } => assert!(
       !outside_cover,
@@ -762,7 +927,7 @@ fn plan_watch_flags_covered_outside_the_narrowed_cover() {
   s.set_retained_cover(ra, Some(vec![key("/a/b")])).release();
 
   // A newcomer OUTSIDE {/a/b} → flagged.
-  let outcome = s.plan_watch(&key("/a/c"), (), Interest::all());
+  let outcome = s.test_plan_watch(&key("/a/c"), (), Interest::all());
   match &outcome {
     WatchOutcome::Covered {
       fs_root,
@@ -780,7 +945,7 @@ fn plan_watch_flags_covered_outside_the_narrowed_cover() {
   s.abort_watch(&outcome).release();
 
   // A newcomer INSIDE the retained prefix /a/b → not flagged.
-  let outcome = s.plan_watch(&key("/a/b/deep"), (), Interest::all());
+  let outcome = s.test_plan_watch(&key("/a/b/deep"), (), Interest::all());
   match &outcome {
     WatchOutcome::Covered { outside_cover, .. } => assert!(
       !outside_cover,
@@ -791,7 +956,7 @@ fn plan_watch_flags_covered_outside_the_narrowed_cover() {
   s.abort_watch(&outcome).release();
 
   // A newcomer whose key EQUALS a retained prefix → not flagged (an ancestor-or-equal is covered).
-  let outcome = s.plan_watch(&key("/a/b"), (), Interest::all());
+  let outcome = s.test_plan_watch(&key("/a/b"), (), Interest::all());
   match &outcome {
     WatchOutcome::Covered { outside_cover, .. } => assert!(
       !outside_cover,
@@ -974,7 +1139,7 @@ fn cohort_retirement_clones_values_linearly() {
   let k = key("/cohort");
   let mut root_handle = 0u32;
   for i in 0..COHORT {
-    let outcome = s.plan_watch(&k, CountedValue(Arc::clone(&clones)), Interest::all());
+    let outcome = s.test_plan_watch(&k, CountedValue(Arc::clone(&clones)), Interest::all());
     let fs_root = match &outcome {
       WatchOutcome::Covered { fs_root, .. } => *fs_root,
       WatchOutcome::Widen { .. } | WatchOutcome::Disjoint { .. } => {
@@ -1028,7 +1193,7 @@ fn cohort_construction_clones_values_linearly() {
   let mut s: Subsumer<OsString, CountedValue, u32> = Subsumer::new();
   let k = key("/cohort");
   for _ in 0..COHORT {
-    let outcome = s.plan_watch(&k, CountedValue(Arc::clone(&clones)), Interest::all());
+    let outcome = s.test_plan_watch(&k, CountedValue(Arc::clone(&clones)), Interest::all());
     let fs_root = match &outcome {
       WatchOutcome::Covered { fs_root, .. } => *fs_root,
       WatchOutcome::Widen { .. } | WatchOutcome::Disjoint { .. } => 1,
@@ -1068,7 +1233,7 @@ fn per_event_attribution_does_not_scan_the_cohort() {
     let k = key("/cohort");
     let mut subs = Vec::new();
     for i in 0..n {
-      let outcome = s.plan_watch(&k, i as u32, Interest::all());
+      let outcome = s.test_plan_watch(&k, i as u32, Interest::all());
       let (fs_root, sub) = match &outcome {
         WatchOutcome::Covered { fs_root, sub, .. } => (*fs_root, *sub),
         WatchOutcome::Widen { sub, .. } | WatchOutcome::Disjoint { sub, .. } => (1, *sub),

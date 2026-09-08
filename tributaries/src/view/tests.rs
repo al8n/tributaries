@@ -15,7 +15,7 @@ type S = Subsumer<u8, u32, u32>;
 /// engine-minted subscription. Drives the same plan → commit the driver does, so the
 /// commit republishes into the shared slot every [`WatchView`] reads.
 fn install(s: &mut S, handle: u32, key: &[u8], value: u32) -> Subscription {
-  let outcome = s.plan_watch(key, value, Interest::all());
+  let outcome = s.test_plan_watch(key, value, Interest::all());
   let sub = match &outcome {
     WatchOutcome::Covered { sub, .. }
     | WatchOutcome::Widen { sub, .. }

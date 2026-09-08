@@ -30,7 +30,8 @@
 //! A `watch` cannot mutate committed state up front: the real root handle does not
 //! exist until *after* the source is armed, and if that arming fails no state may have
 //! changed. So [`Subsumer::plan_watch`] is a pure read returning a [`WatchOutcome`]
-//! describing the operations the driver must perform, and [`Subsumer::commit_watch`]
+//! describing the operations the driver must perform — or a [`WordsConflict`] refusing the watch
+//! before any of them is issued — and [`Subsumer::commit_watch`]
 //! applies the state transition once the real handle is known. `unwatch` needs no such
 //! split — the handle already exists — so [`Subsumer::plan_unwatch`] mutates
 //! immediately and reports whether the root emptied.
@@ -304,6 +305,10 @@ pub(crate) struct RootRecord<C, H> {
   /// (the widen restore's [`rearm_disarmed_root`](crate::Source::arm)) asks the source
   /// for the coverage it already had, rather than for whatever the reconcile that
   /// happens to be running wants.
+  ///
+  /// And kept so it can be ENFORCED: every subscription this root serves carries words equal to
+  /// these, because a later watch whose own differ is refused against this very field
+  /// ([`plan_watch`](Subsumer::plan_watch)) rather than served under someone else's words.
   pub(crate) globs: RootGlobs,
   /// The source's ACTUAL coverage for this root (set-cover): `None` = **full** coverage (a
   /// fresh/widened root never narrowed, or one grown back to its own key — the cancel-equivalent),
@@ -392,6 +397,46 @@ pub(crate) enum WatchOutcome<H> {
     /// The new subscription.
     sub: Subscription,
   },
+}
+
+/// The refusal [`Subsumer::plan_watch`] answers a watch with when the per-root words it carries
+/// differ from those a live root whose coverage it would share is ARMED with — one root, one set
+/// of words.
+///
+/// Decided by the PLANNER, from the [`globs`](RootRecord::globs) every root record carries, so the
+/// refusal lands before the driver has armed, disarmed or re-pointed anything: a `Covered`
+/// newcomer would have ridden the covering root's words, and a `Widen` would have torn its
+/// subsumed roots down and re-pointed their subscribers onto words those subscribers never asked
+/// for. Neither is silently re-scoped, and no root is released for a watch that is then refused.
+///
+/// It carries the caller's `value` back rather than destroying it inside the planner (see
+/// [`Salvage`]), and the conflicting root's own [`handle`](Self::root) so the driver can hold the
+/// refusal to the same liveness standard as every other classification against a recorded root: a
+/// root the SOURCE has already forgotten owes nobody a refusal, and is retired and re-planned past
+/// instead.
+#[must_use = "this carries the refused watch's caller value — place its release deliberately"]
+pub(crate) struct WordsConflict<V, H> {
+  /// The conflicting root's armed handle — the driver's liveness probe coordinate.
+  pub(crate) root: H,
+  /// How deep the conflicting root's own key is, in key components. Reported rather than the key
+  /// itself: the key is `Vec<C>` of CALLER components, which nothing above this seam can render.
+  pub(crate) root_depth: usize,
+  /// The words that root is armed with.
+  pub(crate) armed: RootGlobs,
+  /// The caller value the refused plan was carrying, handed back unplaced.
+  pub(crate) value: V,
+}
+
+impl<V, H: Copy> WordsConflict<V, H> {
+  /// The refusal `record` earns against a newcomer carrying `value`.
+  fn against<C>(record: &RootRecord<C, H>, value: V) -> Self {
+    Self {
+      root: record.handle,
+      root_depth: record.key.len(),
+      armed: record.globs.clone(),
+      value,
+    }
+  }
 }
 
 /// The result of [`Subsumer::plan_unwatch`].
@@ -891,40 +936,70 @@ where
     self.covers = txn.commit();
   }
 
-  /// Plans a `watch` of `key` carrying `value` with `interest`, returning the
-  /// operations the driver must perform. Reads only; the state transition is applied
-  /// by the paired [`commit_watch`](Self::commit_watch).
+  /// Plans a `watch` of `key` carrying `value` with `interest` under the per-root `globs`,
+  /// returning the operations the driver must perform — or REFUSING the watch outright when
+  /// those words conflict with a live root whose coverage it would share. Reads only; the
+  /// state transition is applied by the paired [`commit_watch`](Self::commit_watch).
   ///
   /// The new subscription's id is minted from the engine's own monotonic counter, so
   /// overlapping subscriptions never collide even when they subsume onto one root.
-  pub(crate) fn plan_watch(&mut self, key: &[C], value: V, interest: Interest) -> WatchOutcome<H> {
-    let sub = self.mint_subscription();
-    self.pending.insert(
-      sub,
-      PendingWatch {
-        key: key.to_vec(),
-        value,
-        interest,
-      },
-    );
-
+  ///
+  /// # One root, one set of words
+  ///
+  /// The glob seats are per-ROOT (they are handed to [`Source::arm`](crate::Source::arm), not
+  /// applied above the seam), and this engine's whole job is to fold overlapping subscriptions
+  /// onto SHARED roots — so a subscription's words and its root's cannot both be honoured unless
+  /// they are the same words. Every subscription a root serves therefore carries [`RootGlobs`]
+  /// EQUAL to the root's, and a newcomer that would break that is refused here rather than
+  /// silently re-scoped:
+  ///
+  /// - on `Covered`, the newcomer arms nothing at all — it would simply ride the covering root's
+  ///   words, receiving neither the coverage its `prune` asked for nor the delivery its `include`
+  ///   did;
+  /// - on `Widen`, the newcomer's root would REPLACE the subsumed ones, re-pointing their
+  ///   subscribers onto words they never asked for — coverage they lose has no `Rescan` that can
+  ///   un-lose it.
+  ///
+  /// The verdict is taken from the [`globs`](RootRecord::globs) each root RECORD carries, ahead
+  /// of the plan itself, so the refusal costs nothing: no root is disarmed, retargeted or
+  /// re-pointed for a watch that is then refused, and no reservation is minted for the driver to
+  /// abort. Unengaged words ([`RootGlobs::new`]) are just another value — they conflict with
+  /// engaged ones exactly as two engaged sets do.
+  pub(crate) fn plan_watch(
+    &mut self,
+    key: &[C],
+    value: V,
+    interest: Interest,
+    globs: &RootGlobs,
+  ) -> Result<WatchOutcome<H>, WordsConflict<V, H>> {
     // Case 1 — Covered: an existing root at or above `key` already watches this
     // subtree. Disjointness guarantees at most one such ancestor, and its presence
     // rules out any strict descendant. The covering root is armed `Interest::all`
     // (design §4), so it carries every kind this newcomer could ask for.
-    if let Some(record) = self.index.get_ancestor(key) {
+    //
+    // Read out of the borrow before anything mints: the classification needs the index, the
+    // reservation needs the whole engine.
+    let covered = match self.index.get_ancestor(key) {
+      // ... but only under the covering root's OWN words: this newcomer arms nothing, so
+      // different words here are a request the commit could not carry out.
+      Some(record) if record.globs != *globs => {
+        return Err(WordsConflict::against(record, value));
+      }
       // Covered-OUTSIDE (the set-cover reconcile): the covering root's source coverage was narrowed (`retained_cover`
       // is `Some`) to prefixes NONE of which is an ancestor-or-equal of this newcomer's key. The
       // source pruned that region, so `commit_watch` — which arms nothing — would leave the newcomer
       // advertised-yet-uncovered until the driver's awaited grow lands (applied before the watch
       // returns). A full-coverage root (`None`) or a newcomer already under a retained prefix is
       // `false`.
-      let outside_cover = record.covered_outside(key);
-      return WatchOutcome::Covered {
-        fs_root: record.handle,
-        sub,
+      Some(record) => Some((record.handle, record.covered_outside(key))),
+      None => None,
+    };
+    if let Some((fs_root, outside_cover)) = covered {
+      return Ok(WatchOutcome::Covered {
+        fs_root,
+        sub: self.reserve(key, value, interest),
         outside_cover,
-      };
+      });
     }
 
     // Case 2 — Widen: `key` is a strict ancestor of one or more existing roots, which
@@ -934,21 +1009,62 @@ where
     let mut unwatch = Vec::new();
     let mut repointed = Vec::new();
     for record in self.index.descendants(key) {
+      // ANY subsumed root whose words differ refuses the whole widen, and it refuses it while
+      // `unwatch` is still a local list of handles nobody has been asked to release.
+      if record.globs != *globs {
+        return Err(WordsConflict::against(record, value));
+      }
       if let Some(cohort) = self.root_subs.get(&record.handle) {
         repointed.extend_from_slice(cohort);
       }
       unwatch.push(record.handle);
     }
     if !unwatch.is_empty() {
-      return WatchOutcome::Widen {
+      return Ok(WatchOutcome::Widen {
         repointed,
         unwatch,
-        sub,
-      };
+        sub: self.reserve(key, value, interest),
+      });
     }
 
-    // Case 3 — Disjoint: neither covered nor covering.
-    WatchOutcome::Disjoint { sub }
+    // Case 3 — Disjoint: neither covered nor covering, so this watch's words are nobody
+    // else's — the fresh root is armed with exactly them.
+    Ok(WatchOutcome::Disjoint {
+      sub: self.reserve(key, value, interest),
+    })
+  }
+
+  /// Mints this plan's subscription and stashes its reservation — the state a plan leaves behind
+  /// for the paired [`commit_watch`](Self::commit_watch) / [`abort_watch`](Self::abort_watch) to
+  /// consume. Called only once the plan is CLASSIFIED, so a refused watch mints nothing and holds
+  /// nothing.
+  fn reserve(&mut self, key: &[C], value: V, interest: Interest) -> Subscription {
+    let sub = self.mint_subscription();
+    self.pending.insert(
+      sub,
+      PendingWatch {
+        key: key.to_vec(),
+        value,
+        interest,
+      },
+    );
+    sub
+  }
+
+  /// [`plan_watch`](Self::plan_watch) under the UNENGAGED words, with the never-taken refusal
+  /// unwrapped — what a cell exercising SUBSUMPTION rather than the words wants (every root a
+  /// cell commits is armed under those same unengaged words, so none of them can conflict).
+  #[cfg(test)]
+  pub(crate) fn test_plan_watch(
+    &mut self,
+    key: &[C],
+    value: V,
+    interest: Interest,
+  ) -> WatchOutcome<H> {
+    match self.plan_watch(key, value, interest, &RootGlobs::new()) {
+      Ok(outcome) => outcome,
+      Err(_) => panic!("the unengaged words conflict with no root armed under them"),
+    }
   }
 
   /// Commits the state transition for `outcome`, binding the real `fs_root` the driver
@@ -1695,8 +1811,9 @@ where
   }
 
   /// The number of not-yet-committed plans still holding a pending reservation — the
-  /// leak the plan→commit-or-abort contract must keep at zero between watches.
-  #[cfg(all(test, feature = "tokio"))]
+  /// leak the plan→commit-or-abort contract must keep at zero between watches, and the
+  /// reading that pins a REFUSED plan as having minted nothing at all.
+  #[cfg(test)]
   pub(crate) fn pending_len(&self) -> usize {
     self.pending.len()
   }

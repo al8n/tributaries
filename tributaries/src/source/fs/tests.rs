@@ -135,6 +135,87 @@ fn replace_error_from_fs_classifies_both_capacity_refusals_as_capacity_refusals(
   );
 }
 
+/// The THIRD seam mapping ([`sync_error_from_fs`](super::sync_error_from_fs)): a refused
+/// sync-cookie write classified into the barrier vocabulary.
+///
+/// The line that carries the weight is "the cookie directory is not covered". There are three ways
+/// to be uncovered — outside the root, under a watcher exclusion, or under this ROOT's own `prune`
+/// seat — and they mean one thing to a caller: a cookie written there produces no event on the
+/// stream the barrier waits on, so the barrier could never be met. The glob-shaped one is the
+/// newest, and reaching the wildcard it read as
+/// [`CookieWrite`](crate::error::SyncError::CookieWrite) — "your filesystem refused this" — which
+/// is neither true (nothing was written) nor actionable (no retry and no permission change would
+/// alter it). It is [`CookieDirUncovered`](crate::error::SyncError::CookieDirUncovered) like its
+/// two twins, and the caller's fix is the same: name a cookie directory the seats leave alone.
+///
+/// The transient refusals and the genuine write failure are asserted beside them, because the
+/// value of the classification is the DISTINCTION: a `Busy` is retried, an uncovered directory is
+/// re-chosen, and a `CookieWrite` carries the concrete `io::Error` for a caller to read.
+#[test]
+fn sync_error_from_fs_classifies_a_refused_cookie_honestly() {
+  use std::path::PathBuf;
+
+  use tributary_fs::SyncRootError;
+
+  use crate::error::{FaultKind, SyncError};
+
+  // The three shapes of "that directory could never report the cookie".
+  let uncovered = [
+    SyncRootError::DirOutsideRoot {
+      dir: PathBuf::from("/elsewhere"),
+      root: PathBuf::from("/root"),
+    },
+    SyncRootError::DirExcluded {
+      dir: PathBuf::from("/root/.cache"),
+      exclusion: PathBuf::from("/root/.cache"),
+    },
+    SyncRootError::DirPruned {
+      dir: PathBuf::from("/root/.cache"),
+      pattern: "**/.cache".parse().expect("a valid pattern compiles"),
+    },
+  ];
+  for err in uncovered {
+    let mapped = super::sync_error_from_fs(err);
+    assert!(
+      mapped.is_cookie_dir_uncovered(),
+      "an uncovered cookie directory is never a write failure: {mapped:?}"
+    );
+  }
+
+  // Transient and retryable — nothing was written.
+  assert!(super::sync_error_from_fs(SyncRootError::WriteInFlight).is_busy());
+  assert!(super::sync_error_from_fs(SyncRootError::CleanupBacklog).is_busy());
+  // The subscription's coverage went away underneath the barrier.
+  assert!(super::sync_error_from_fs(SyncRootError::UnknownRoot).is_retired());
+  assert!(super::sync_error_from_fs(SyncRootError::Retired).is_retired());
+  assert!(super::sync_error_from_fs(SyncRootError::Closed).is_closed());
+
+  // A genuine write failure keeps its honest kind AND the concrete error.
+  let write = super::sync_error_from_fs(SyncRootError::Write {
+    path: PathBuf::from("/root/.cookie"),
+    source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+  });
+  match &write {
+    SyncError::CookieWrite(fault) => {
+      assert_eq!(fault.kind(), FaultKind::PermissionDenied);
+      assert!(
+        fault.downcast_ref::<std::io::Error>().is_some(),
+        "the concrete io error survives in the box"
+      );
+    }
+    other => panic!("expected CookieWrite, got {other:?}"),
+  }
+
+  // The `#[non_exhaustive]` wildcard stays the FAILED-write arm: an unclassified refusal is never
+  // read as a barrier that was met.
+  assert!(
+    super::sync_error_from_fs(SyncRootError::BadCookieName {
+      name: String::from("a/b"),
+    })
+    .is_cookie_write()
+  );
+}
+
 /// The fs-to-neutral EVENT binding ([`SourceEvent::from_fs`](super::SourceEvent::from_fs)),
 /// driven from a real lower-layer [`tributary_fs::Event`] all the way to the delivery a
 /// source-only subscriber receives — the propagation of a rename's SOURCE coordinate across

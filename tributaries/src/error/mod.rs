@@ -19,6 +19,8 @@
 
 use core::error::Error;
 
+use crate::options::RootGlobs;
+
 #[cfg(all(test, not(feature = "fs")))]
 mod tests;
 
@@ -308,6 +310,40 @@ pub enum WatchError {
      retry the watch"
   )]
   CoverageIncomplete,
+  /// This watch asked for per-root glob words that DIFFER from the ones the root whose
+  /// coverage it would share is armed with, so it was refused rather than silently served
+  /// under another subscription's words.
+  ///
+  /// The two glob seats ([`prune`](crate::WatchOptions::prune) /
+  /// [`include`](crate::WatchOptions::include)) are per-ROOT, and roots are SHARED: a watch
+  /// already covered by a live root arms nothing and rides that root's words, and a wider
+  /// watch that subsumes live roots re-points their subscribers onto its own. Either way one
+  /// set of words has to stand for subscriptions that asked for two, and no merge of them is
+  /// honest — a union of `prune` seats subtracts coverage a subscriber never agreed to lose,
+  /// an intersection re-enters a subtree another asked to stay out of. So the newcomer is
+  /// refused instead. Unengaged words ([`RootGlobs::new`]) are just another value here: they
+  /// conflict with engaged ones exactly as two engaged sets do.
+  ///
+  /// Refused by the planner, **before anything is armed, disarmed or re-pointed**: no
+  /// coverage moves, no root is torn down, and nobody is owed a
+  /// [`Rescan`](crate::EventKind::Rescan). Retrying the same words changes nothing while that
+  /// root lives; watch with words EQUAL to the `armed` ones this carries, or
+  /// narrow this subscription alone with the per-subscription [`Filter`](crate::Filter),
+  /// which gates delivery only and is never shared.
+  #[error(
+    "the watch's per-root words conflict with those of the root {root_depth} key component(s) \
+     deep whose coverage it would share"
+  )]
+  RootWordsConflict {
+    /// How deep the conflicting root's own key is, in key components — which names WHICH root
+    /// it is, relative to the watch: at or below the watch's own key depth it is the root
+    /// COVERING the watch, and beyond it, one of the roots the watch would have subsumed.
+    root_depth: usize,
+    /// The words that root is ARMED with — the ones a watch sharing its coverage must carry.
+    armed: RootGlobs,
+    /// The words this watch asked for.
+    requested: RootGlobs,
+  },
   /// This watch asked for a [`Filter`](crate::Filter) of its own, and the watcher's filter
   /// plane is **retired**: it will never enter a caller predicate again, so the subscription
   /// could only be created unfiltered.
@@ -413,6 +449,13 @@ impl WatchError {
     matches!(self, Self::CoverageIncomplete)
   }
 
+  /// Whether this is [`RootWordsConflict`](Self::RootWordsConflict) — the pre-mutation refusal
+  /// of a watch whose per-root words differ from those of the root it would share.
+  #[inline]
+  pub const fn is_root_words_conflict(&self) -> bool {
+    matches!(self, Self::RootWordsConflict { .. })
+  }
+
   /// Whether this is [`FilterRetired`](Self::FilterRetired) — the watcher will never enter a
   /// caller predicate again, so a watch asking for one is refused rather than silently
   /// created unfiltered.
@@ -439,6 +482,7 @@ impl WatchError {
       | Self::RescanBacklog
       | Self::Closed
       | Self::CoverageIncomplete
+      | Self::RootWordsConflict { .. }
       | Self::FilterRetired
       | Self::SourceRetired => None,
     }

@@ -388,6 +388,23 @@ mod serde_face {
     assert_eq!(parsed.include().map(texts), options.include().map(texts));
   }
 
+  /// "One root, one set of words" is a REFUSAL, not a knob: it added nothing a document can
+  /// state. The subscription's face is exactly the four keys it always had — the rule lives in
+  /// the planner and surfaces as `WatchError::RootWordsConflict`, so a document written for the
+  /// previous version still means precisely what it meant.
+  #[test]
+  fn the_per_root_words_rule_added_no_key_to_the_document() {
+    let json = serde_json::to_value(WatchOptions::<OsString>::new()).unwrap();
+    let mut keys: Vec<&str> = json
+      .as_object()
+      .expect("the subscription is one object")
+      .keys()
+      .map(String::as_str)
+      .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["debounce", "include", "interest", "prune"]);
+  }
+
   /// A document naming NEITHER seat leaves both at the default — the absent `include` is
   /// the ABSENT seat (every file), which is what an empty list is not.
   #[test]

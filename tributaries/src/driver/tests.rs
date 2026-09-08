@@ -1846,6 +1846,206 @@ async fn widen_falls_back_to_release_and_rearm_without_replace_support() {
   );
 }
 
+/// One validated pattern for the per-root-words cells.
+fn glob(pattern: &str) -> tributary_proto::glob::Glob {
+  pattern.parse().expect("a valid pattern compiles")
+}
+
+/// The patterns a seat carries, as their source text — what a cell can compare against a literal
+/// list.
+fn texts(patterns: &[tributary_proto::glob::Glob]) -> Vec<&str> {
+  patterns
+    .iter()
+    .map(tributary_proto::glob::Glob::as_str)
+    .collect()
+}
+
+/// The per-watch options carrying just the `prune` seat — the smallest engaged words a cell can
+/// put on a root.
+fn pruning(pattern: &str) -> WatchOptions<OsString> {
+  WatchOptions::new().with_prune([glob(pattern)])
+}
+
+/// ONE ROOT, ONE SET OF WORDS, on the covered path: a newcomer an existing root would serve arms
+/// nothing of its own, so seats that differ from that root's cannot be honoured — the watch is
+/// REFUSED instead of being quietly served under the root's words.
+///
+/// The reading that matters is what the source was asked to do about it: nothing. The refusal is
+/// the planner's, taken off the root record, so the ledger holds exactly the covering root's own
+/// arm and the cohort is untouched — a caller can retry with matching words against state that
+/// never moved.
+#[tokio::test]
+async fn a_covered_watch_whose_words_conflict_is_refused_with_no_source_call() {
+  let mut h = Harness::new();
+
+  let covering = h
+    .watch_with("/a", pruning("**/node_modules"))
+    .await
+    .expect("watch /a under its own words");
+
+  // The newcomer asks for the UNENGAGED words, which are a different request rather than no
+  // request at all.
+  let refused = h
+    .watch_with("/a/b", WatchOptions::new())
+    .await
+    .expect_err("a covered newcomer under different words is refused");
+  assert!(
+    refused.is_root_words_conflict(),
+    "the refusal is the typed one: {refused:?}"
+  );
+  assert!(
+    refused.fault().is_none(),
+    "it is the umbrella's own verdict, not a source fault"
+  );
+  match &refused {
+    WatchError::RootWordsConflict {
+      root_depth,
+      armed,
+      requested,
+    } => {
+      assert_eq!(*root_depth, key("/a").len());
+      assert_eq!(texts(armed.prune()), ["**/node_modules"]);
+      assert!(requested.is_unengaged(), "and what this watch asked for");
+    }
+    other => panic!("expected RootWordsConflict, got {other:?}"),
+  }
+  // The Display NAMES the root it conflicts with — by the depth of that root's own key, the one
+  // coordinate this layer can render for a caller-typed component.
+  assert!(
+    refused
+      .to_string()
+      .contains(&format!("{} key component", key("/a").len())),
+    "the message names the conflicting root: {refused}"
+  );
+
+  assert_eq!(
+    h.owner.source.calls(),
+    vec![Call::Arm(PathBuf::from("/a"))],
+    "the refused watch asked the source for nothing at all"
+  );
+  assert_eq!(
+    h.owner.subsumer.subscribers(1),
+    vec![covering],
+    "and joined nobody's cohort"
+  );
+  assert_eq!(
+    h.owner.subsumer.pending_len(),
+    0,
+    "no reservation was minted for the refusal to abort"
+  );
+}
+
+/// The same rule on the WIDEN path, with several subsumed roots — and the property the whole
+/// placement of this check exists for: the refusal lands BEFORE any disarm. The wider watch would
+/// have released both subsumed roots and re-pointed their subscribers onto its own words; refused
+/// in the planner, it releases nothing, so no coverage gap is opened and nobody is owed a `Rescan`.
+///
+/// The disagreeing root is the SECOND one, so this also pins that the planner reads every root it
+/// would subsume rather than the first.
+#[tokio::test]
+async fn a_widen_whose_words_conflict_is_refused_before_any_disarm() {
+  let mut h = Harness::new();
+
+  let s_b = h
+    .watch_with("/a/b", pruning("**/skip"))
+    .await
+    .expect("watch /a/b");
+  let s_c = h
+    .watch_with("/a/c", WatchOptions::new())
+    .await
+    .expect("watch /a/c");
+
+  let refused = h
+    .watch_with("/a", pruning("**/skip"))
+    .await
+    .expect_err("a widen over a root armed with other words is refused");
+  assert!(
+    refused.is_root_words_conflict(),
+    "the typed refusal: {refused:?}"
+  );
+
+  assert_eq!(
+    h.owner.source.calls(),
+    vec![
+      Call::Arm(PathBuf::from("/a/b")),
+      Call::Arm(PathBuf::from("/a/c")),
+    ],
+    "not one disarm and not one wider arm: the refusal precedes every teardown"
+  );
+  let roots: Vec<PathBuf> = h
+    .owner
+    .subsumer
+    .roots()
+    .map(|(k, _)| PathBuf::from_iter(k))
+    .collect();
+  assert_eq!(
+    roots,
+    vec![PathBuf::from("/a/b"), PathBuf::from("/a/c")],
+    "both subsumed roots are still live"
+  );
+  assert_eq!(h.owner.subsumer.subscribers(1), vec![s_b]);
+  assert_eq!(h.owner.subsumer.subscribers(2), vec![s_c]);
+  assert!(
+    h.drain().is_empty(),
+    "a refused widen owes no subscriber a Rescan"
+  );
+}
+
+/// And on the GAPLESS widen — the sole-subsumed-root path that would retarget the source's own
+/// root in place. `Source::replace` re-keys a watch, it does not re-configure it, so a retarget
+/// under conflicting words would leave the newcomer riding the old root's seats with the handle
+/// preserved and nothing to fall back to. The planner refuses first, so the retarget is never
+/// issued.
+#[tokio::test]
+async fn a_conflicting_in_place_widen_is_refused_before_the_retarget() {
+  let mut h = Harness::new();
+  h.owner.source.supports_replace = true;
+
+  let s_narrow = h
+    .watch_with("/a/b", pruning("**/skip"))
+    .await
+    .expect("watch /a/b");
+
+  let refused = h
+    .watch_with("/a", pruning("**/other"))
+    .await
+    .expect_err("the in-place widen is refused on the words, not attempted and rolled back");
+  assert!(
+    refused.is_root_words_conflict(),
+    "the typed refusal: {refused:?}"
+  );
+  assert_eq!(
+    h.owner.source.calls(),
+    vec![Call::Arm(PathBuf::from("/a/b"))],
+    "no Replace was issued — the root keeps its key and its words"
+  );
+
+  // Equal words on the same shape DO widen in place, which is what makes the refusal above a
+  // verdict on the words rather than on the path.
+  let s_wide = h
+    .watch_with("/a", pruning("**/skip"))
+    .await
+    .expect("an equal-worded widen still retargets in place");
+  assert_eq!(
+    h.owner.source.calls(),
+    vec![
+      Call::Arm(PathBuf::from("/a/b")),
+      Call::Replace(1, PathBuf::from("/a")),
+    ],
+    "the gapless retarget is unaffected by the check that precedes it"
+  );
+  assert_eq!(
+    h.owner.subsumer.subscribers(1),
+    vec![s_narrow, s_wide],
+    "both subscriptions ride the retargeted root"
+  );
+  assert_eq!(
+    h.owner.subsumer.root_globs(1).map(|g| texts(g.prune())),
+    Some(vec!["**/skip"]),
+    "under the words they both carry"
+  );
+}
+
 #[tokio::test]
 async fn widen_disarms_subsumed_before_arming_the_wider_root() {
   let mut h = Harness::new();

@@ -669,7 +669,14 @@ impl<C, V, R, H> Tributaries<C, V, R, H> {
   ///   ([`TributariesOptions::debounce`](crate::TributariesOptions::debounce)):
   ///   [`Debounce::Off`] passes its events through raw even while siblings settle, and
   ///   [`Debounce::Custom`] settles under its own windows even when the global debounce
-  ///   is off.
+  ///   is off;
+  /// - the two glob seats — **[`prune`](WatchOptions::with_prune)** (which subtracts SUBTREES
+  ///   from the watch itself, matched against root-relative directory paths) and
+  ///   **[`include`](WatchOptions::with_include)** (which narrows file delivery, matched against
+  ///   the object's NAME alone) — are not delivery gates of this subscription but the words the
+  ///   ROOT is armed with, and roots are shared. One root carries one set of words: a watch whose
+  ///   seats differ from those of the root that would serve it — or from any root it would subsume
+  ///   — is refused with [`WatchError::RootWordsConflict`], never silently re-scoped.
   ///
   /// # Key canonicalization
   ///
@@ -705,6 +712,9 @@ impl<C, V, R, H> Tributaries<C, V, R, H> {
   /// - [`WatchError::CoverageIncomplete`] when the key is covered by a root whose coverage was
   ///   narrowed and the awaited coverage grow could not be applied — nothing was committed and
   ///   the coverage record did not broaden; retryable;
+  /// - [`WatchError::RootWordsConflict`] when the per-root glob seats differ from those of the
+  ///   root whose coverage this watch would share — refused by the planner, so nothing was
+  ///   armed, disarmed or re-pointed;
   /// - [`WatchError::Closed`] when the owner is gone.
   pub async fn watch(
     &self,
@@ -3996,7 +4006,42 @@ where
     // double-arms — the `Covered` path arms nothing; only the terminal `Disjoint`/`Widen` arms, once,
     // after the loop exits.
     let outcome = loop {
-      let outcome = self.subsumer.plan_watch(key, value.clone(), interest);
+      let outcome = match self
+        .subsumer
+        .plan_watch(key, value.clone(), interest, globs)
+      {
+        Ok(outcome) => outcome,
+        // ONE ROOT, ONE SET OF WORDS: this watch's per-root seats differ from those of a
+        // recorded root whose coverage it would share, so it is refused — but only once that
+        // root is known to be LIVE. A source-forgotten root owes nobody a refusal (nothing it
+        // recorded is being honoured any more), and the planner would go on refusing against it
+        // until the terminal event that retires it is consumed — which the command-biased loop
+        // runs strictly after this reconcile. So retire it here, exactly as the `Covered`
+        // liveness probe below does, and re-plan against the updated watch-set.
+        //
+        // Terminating for the same reason that probe's loop is: each pass force-removes one root
+        // from the finite, pairwise-disjoint index, and nothing adds one before the plan settles.
+        Err(conflict) => {
+          let mut salvage = Salvage::new();
+          salvage.keep_value(conflict.value);
+          self.retire_salvage(salvage);
+          if self.source.root_key(conflict.root).is_none() {
+            self.retire_root_with_terminal_rescan(conflict.root);
+            continue;
+          }
+          // Refused BEFORE mutation, which is the whole point of deciding it in the planner:
+          // nothing was armed, disarmed, retargeted or re-pointed, no reservation was minted to
+          // abort, and no subscriber is owed a `Rescan`.
+          return Err(
+            WatchError::RootWordsConflict {
+              root_depth: conflict.root_depth,
+              armed: conflict.armed,
+              requested: globs.clone(),
+            }
+            .into(),
+          );
+        }
+      };
       if let WatchOutcome::Covered { fs_root, .. } = &outcome {
         let covering = *fs_root;
         if self.source.root_key(covering).is_none() {
@@ -4248,7 +4293,11 @@ where
             // The retarget PRESERVED the handle, so the root keeps the words it was
             // armed with — a source that widens in place re-keys its watch, it does not
             // re-configure it. Record what the source actually holds rather than the
-            // newcomer's seats, which this path never asked it to adopt.
+            // newcomer's seats, which this path never asked it to adopt. The two are EQUAL
+            // here in any case: the planner refused this widen outright had the sole subsumed
+            // root's recorded words differed from the newcomer's, so the retained words are the
+            // requested ones — read off the root rather than assumed, since the record is what
+            // the source was actually asked for.
             let armed_globs = self
               .subsumer
               .root_globs(handle)
