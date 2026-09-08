@@ -180,8 +180,14 @@ pub(crate) enum RootLiveness {
 /// whether the read was authoritative, and what the root itself re-stat'd to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MountRefresh {
-  /// Mount points observed strictly under the root.
-  pub(crate) mounts: Vec<PathBuf>,
+  /// The mount rows observed strictly under the root.
+  ///
+  /// Identity-bearing where the host can answer it
+  /// ([`MountRow`](crate::os::MountRow)), which is what lets two successive
+  /// readings be compared for a mount REPLACED at an unchanged path — a change
+  /// in `(mnt_id, parent_id, dev, mnt_id_unique)` and in nothing else, which a
+  /// paths-only read cannot express at all.
+  pub(crate) mounts: Vec<crate::os::MountRow>,
   /// Whether the live mount table could be read (device trust returns only
   /// with an authoritative read).
   pub(crate) authoritative: bool,
@@ -197,11 +203,26 @@ pub(crate) struct MountRefresh {
   /// would read as a boundary and lower non-descendable until the next re-watch.
   /// [`on_mounts_refreshed`](DriverCore::on_mounts_refreshed) adopts a `Some`
   /// value once the root is confirmed alive-and-present AND the refresh is not stale
-  /// (a stale snapshot's frame is as suspect as its mount table). `None` (below Linux
-  /// 5.8, the mask bit unset, or a non-Linux/fake source that reports no frame)
-  /// leaves the captured value intact — a transient read miss never drops a known
-  /// frame.
+  /// (a stale snapshot's frame is as suspect as its mount table). `None` (a
+  /// non-Linux/fake source, or a kernel below every id oracle, that reports no
+  /// frame) leaves the captured value intact — a transient read miss never drops a
+  /// known frame.
   pub(crate) root_mnt_id: Option<u64>,
+  /// WHICH INCARNATION of a mount the root was on when this refresh read it, where
+  /// the host can answer that at all ([`RootIncarnation`](crate::os::RootIncarnation)).
+  ///
+  /// [`root_mnt_id`](Self::root_mnt_id) is a value observed at one instant, and an
+  /// unmount plus a remount between two refreshes hands the new mount the id the
+  /// old one freed — so an id that MATCHES across the gap is not evidence the root
+  /// stayed put. This is the fact that is, and the scope's frame moves on it.
+  ///
+  /// `None` where nothing could answer: a host with no unique mount id and no
+  /// namespace generation, or a window this refresh could not prove quiet (a
+  /// token built out of two reads that straddle a transition would read as
+  /// continuity on the very next refresh). A `None` compares against nothing and
+  /// leaves the scope's last PROVEN token standing — the frame then moves on the
+  /// mount-id comparison alone, exactly as it did before this existed.
+  pub(crate) root_incarnation: Option<crate::os::RootIncarnation>,
 }
 
 /// Why one mount refresh is being armed.
@@ -1714,9 +1735,18 @@ struct ScopeState {
   /// scope's coverage when the frame changed). Only ever the last AUTHORITATIVE frame
   /// — a stale refresh publishes nothing here (see the module doc's mount-refresh
   /// publication invariant). `None` when neither the barrier nor a refresh could read
-  /// it (below Linux 5.8, or a non-Linux/fake source), and then the device check
-  /// governs alone — the honest degrade.
+  /// it (a non-Linux/fake source, or a kernel below every id oracle), and then the
+  /// device check governs alone — the honest degrade.
   root_mnt_id: Option<u64>,
+  /// The last PROVEN incarnation token for the mount
+  /// [`root_mnt_id`](Self::root_mnt_id) names — what makes a frame move
+  /// observable when the id did not change.
+  ///
+  /// Overwritten only by a refresh that answered one, so an unprovable window
+  /// leaves the last proven token to be compared against, rather than a token
+  /// that would silently agree with whatever comes next. `None` until the first
+  /// refresh that can answer, and forever on a host that answers none.
+  root_incarnation: Option<crate::os::RootIncarnation>,
   /// The root object's identity, captured at the spawn barrier. The mount
   /// refresh re-stats the root and compares against this: a `Missing` or
   /// mismatched read is a root death, lowered through the same self-event path
@@ -2658,6 +2688,7 @@ impl DriverCore {
         root: None,
         root_dev: None,
         root_mnt_id: None,
+        root_incarnation: None,
         identity: None,
         mount_table: Vec::new(),
         learned_mounts: Vec::new(),
@@ -4118,8 +4149,12 @@ impl DriverCore {
         state.root = Some(Arc::clone(&root));
         state.root_dev = Some(meta.root_dev);
         state.root_mnt_id = meta.root_mnt_id;
+        // A token belongs to the mount it was proven against, so a new world
+        // starts with none: comparing this world's first reading against the
+        // previous root's token would read every fresh scope as a frame move.
+        state.root_incarnation = None;
         state.identity = Some(meta.identity);
-        install_mount_table(state, meta.mounts);
+        install_mount_table(state, meta.mounts.into_iter().map(|row| row.location));
         // A brand-new world: nothing learned about the previous one survives, and
         // nothing else may empty this set (see [`ScopeState::learned_mounts`]).
         state.learned_mounts.clear();
@@ -4547,8 +4582,12 @@ impl DriverCore {
     state.root = Some(root);
     state.root_dev = Some(meta.root_dev);
     state.root_mnt_id = meta.root_mnt_id;
+    // A token belongs to the mount it was proven against, so a new world starts
+    // with none: comparing this world's first reading against the previous root's
+    // token would read the swap as a frame move on top of the swap itself.
+    state.root_incarnation = None;
     state.identity = Some(meta.identity);
-    install_mount_table(state, meta.mounts);
+    install_mount_table(state, meta.mounts.into_iter().map(|row| row.location));
     // A brand-new world: nothing learned about the previous one survives, and
     // nothing else may empty this set (see [`ScopeState::learned_mounts`]).
     state.learned_mounts.clear();
@@ -5009,8 +5048,12 @@ impl DriverCore {
     state.root = Some(root);
     state.root_dev = Some(meta.root_dev);
     state.root_mnt_id = meta.root_mnt_id;
+    // A token belongs to the mount it was proven against, so a new world starts
+    // with none: comparing this world's first reading against the previous root's
+    // token would read the swap as a frame move on top of the swap itself.
+    state.root_incarnation = None;
     state.identity = Some(meta.identity);
-    install_mount_table(state, meta.mounts);
+    install_mount_table(state, meta.mounts.into_iter().map(|row| row.location));
     // A brand-new world: nothing learned about the previous one survives, and
     // nothing else may empty this set (see [`ScopeState::learned_mounts`]).
     state.learned_mounts.clear();
@@ -5458,12 +5501,33 @@ impl DriverCore {
     // (`None`) must not drop a known frame to the device belt. Gated behind the stale
     // check above, so `state.root_mnt_id` is only ever the last AUTHORITATIVE frame —
     // the value `crosses_mount_boundary` consumes is never a stale/pre-window one.
+    //
+    // TWO legs, and the second is what makes the first honest. An id comparison
+    // observes a VALUE, and mount ids are allocated lowest-free: a root that went
+    // A -> B -> new-A between two refreshes is back on the id this scope still
+    // holds, so the comparison passes and the coverage this scope re-established
+    // under the FIRST A is never re-checked against the mount actually standing
+    // there. So the frame also moves on the INCARNATION token, which is a
+    // transition the host observed rather than a value this scope re-read (see
+    // [`RootIncarnation`](crate::os::RootIncarnation)).
+    //
+    // The token only ever ADDS a move. A refresh that answers none, or a host that
+    // has none, compares nothing and leaves this exactly the id check it has always
+    // been — which is what keeps every host without a mount namespace (and every
+    // fake) on the behaviour it had.
+    let incarnation_moved = matches!(
+      (state.root_incarnation, refresh.root_incarnation),
+      (Some(held), Some(read)) if held != read
+    );
+    if refresh.root_incarnation.is_some() {
+      state.root_incarnation = refresh.root_incarnation;
+    }
     let frame_changed = if let Some(mnt_id) = refresh.root_mnt_id {
       let changed = state.root_mnt_id != Some(mnt_id);
       state.root_mnt_id = Some(mnt_id);
-      changed
+      changed || incarnation_moved
     } else {
-      false
+      incarnation_moved
     };
 
     // Alive and current: (re)arm the liveness tick — the birth refresh seeds it
@@ -5480,7 +5544,7 @@ impl DriverCore {
       // that arrived after this read was taken, and a probe's foreign device is a
       // path no mountinfo row will ever name. Probe-carried device evidence still
       // decides what it can.
-      install_mount_table(state, refresh.mounts);
+      install_mount_table(state, refresh.mounts.into_iter().map(|row| row.location));
       state.mounts_authoritative = true;
     } else {
       // The live table could not be read, so this refresh installs no table — and a
