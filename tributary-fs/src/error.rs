@@ -300,6 +300,17 @@ pub enum SyncRootError {
   /// seat that speaks for directories alone is the only thing a pattern can
   /// prune; pick a cookie directory no pattern covers, or widen the seat.
   ///
+  /// [`dir`](Self::DirPruned::dir) is the CANONICAL directory the write itself
+  /// resolved — the target's own directory, or its parent when the target is a
+  /// file, with every symlink on the way followed — rather than the spelling the
+  /// caller passed. That is the path the cookie would truly have landed in, and
+  /// judging any other one gets the answer wrong in both directions: a link into a
+  /// pruned subtree passes a lexical test it should fail, and a file
+  /// subscription's own key fails a test it should never have been given (the seat
+  /// speaks for directories, and the file's parent is what the cookie goes in).
+  /// The refusal is taken there, before anything is created — which is also why
+  /// the admission's sequence is spent by it.
+  ///
   /// Unlike the exclusions this is per ROOT, so the same directory may be
   /// perfectly writable for a sync on another root of the same watcher.
   #[error("cookie directory {} is pruned by {pattern}", dir.display())]

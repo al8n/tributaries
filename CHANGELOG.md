@@ -35,7 +35,21 @@ All notable changes to this workspace are documented here. The format is based o
 
   Neither seat reaches the watcher's own sync cookie, so a `sync` barrier resolves
   whatever the patterns say; a cookie directory `prune` would have covered is
-  refused before any write, as the new `SyncRootError::DirPruned`.
+  refused before anything is created, as the new `SyncRootError::DirPruned`. That
+  verdict is taken on the CANONICAL directory the write itself selects — the
+  target's parent when the target is a file, every symlink on the way resolved —
+  so a link into a pruned subtree is refused rather than left waiting on an event
+  the fence would suppress, and a file subscription whose parent is reportable is
+  not refused for its own name.
+
+  `prune` is enforced at each backend's OWN boundary, not only at the common
+  layer's exit. The two kernel-recursive backends that keep an admission map
+  (fanotify, the USN journal) receive the compiled seat and consult it in their
+  seed walk, their reseed walk, every moved-in subtree walk, every live directory
+  learn, and ahead of bounded transport admission — so a pruned subtree is never
+  enumerated, never mapped, and its churn can never consume the directory cap
+  whose exhaustion kills the source. FSEvents and `ReadDirectoryChangesW` keep no
+  such map and need nothing beyond the common-layer fence.
 
   Patterns are `tributary_proto::glob::Glob` (re-exported as `tributary_fs::Glob`),
   matched case-insensitively with `literal_separator` — `*` never crosses a `/`,
@@ -97,6 +111,11 @@ All notable changes to this workspace are documented here. The format is based o
     `--watcher-event-capacity`, so the three households can be flattened onto ONE
     `clap::Command` beside `TributariesOptions`'s `--event-capacity`. The `serde` key
     is unchanged.
+  - `RootOptions`'s clap face reads its interest flags as "narrow to exactly these":
+    a command line giving NONE of them is `RootOptions::new()` — every kind — like
+    every other face of that household, and giving any narrows to those alone. The
+    standalone `tributary_proto::Interest` group keeps its own face, where a flagless
+    parse is the empty mask.
 
 - **`tributaries`** — the two glob seats reach the umbrella, so a subscription carries
   them and every source is armed with them.

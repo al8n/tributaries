@@ -6,6 +6,7 @@ use super::{
 use crate::os::{
   BackendStatsShared, SourceMessage,
   linux::fanotify::{
+    Fence,
     fid::{
       DecodeOutcome, FAN_CREATE, FAN_DELETE, FAN_DELETE_SELF, FAN_EVENT_INFO_TYPE_DFID_NAME,
       FAN_MODIFY, FAN_MOVE_SELF, FAN_ONDIR, FAN_RENAME, FanMask, Fid, RawFanotifyEvent, RenameInfo,
@@ -18,6 +19,33 @@ use crate::os::{
 
 fn fid(tag: u8) -> Fid {
   Fid::new([tag; 8], Box::from(&[tag][..]))
+}
+
+/// The unengaged fence — neither seat — which is what every buffer outside the fence
+/// suites is processed under, so their outcomes are the pre-fence ones verbatim.
+fn unfenced() -> Fence<'static> {
+  Fence::new(Path::new("/root"), &[], no_prune())
+}
+
+/// The empty compiled prune seat, borrowed for a fence's whole lifetime.
+fn no_prune() -> &'static tributary_proto::glob::Globs {
+  static NONE: std::sync::LazyLock<tributary_proto::glob::Globs> =
+    std::sync::LazyLock::new(|| tributary_proto::glob::Globs::new([]));
+  &NONE
+}
+
+/// A fence carrying `exclusions` alone.
+fn excluding(exclusions: &[std::path::PathBuf]) -> Fence<'_> {
+  Fence::new(Path::new("/root"), exclusions, no_prune())
+}
+
+/// The root's compiled prune words, for a fence that carries the OTHER seat alone.
+fn prune_words(patterns: &[&str]) -> tributary_proto::glob::Globs {
+  tributary_proto::glob::Globs::new(
+    patterns
+      .iter()
+      .map(|pattern| tributary_proto::glob::Glob::new(pattern).expect("a valid pattern compiles")),
+  )
 }
 
 /// The exact `Fid` `decode_events` yields from a wire FID (handle = `handle_type`
@@ -102,7 +130,7 @@ fn run_process(
     &BufferContext {
       stats: &stats,
       transport: &transport,
-      exclusions: &[],
+      fence: unfenced(),
     },
     || {
       reseeds.set(reseeds.get() + 1);
@@ -142,7 +170,7 @@ fn run_process_with_exclusions(
     &BufferContext {
       stats: &stats,
       transport: &transport,
-      exclusions,
+      fence: excluding(exclusions),
     },
     || Ok(one_entry_walk()),
     |_, _, _| Ok(Vec::new()),
@@ -184,7 +212,7 @@ fn run_process_with_subtree(
     &BufferContext {
       stats: &stats,
       transport: &transport,
-      exclusions: &[],
+      fence: unfenced(),
     },
     || {
       reseeds.set(reseeds.get() + 1);
@@ -1009,7 +1037,7 @@ fn dfid_name_dot_root_delete_reaches_root_death_at_the_reader() {
     &BufferContext {
       stats: &stats,
       transport: &transport,
-      exclusions: &[],
+      fence: unfenced(),
     },
     || Ok(one_entry_walk()),
     |_, _, _| Ok(Vec::new()),
@@ -1063,6 +1091,12 @@ mod exclusion_fence {
   /// is visible both in `walks` and as growth in the map — the two ways this suite
   /// catches a fence that acts too late.
   fn run(map: &mut FidMap, decoded: DecodeOutcome, exclusions: &[std::path::PathBuf]) -> Fenced {
+    run_fenced(map, decoded, excluding(exclusions))
+  }
+
+  /// The same drive under an arbitrary fence — how the PRUNE half's rows reach the
+  /// identical assertions with the other seat engaged and no exclusion at all.
+  fn run_fenced(map: &mut FidMap, decoded: DecodeOutcome, fence: Fence<'_>) -> Fenced {
     let stats = BackendStatsShared::default();
     let transport = TransportState::new(8);
     let forwarded = std::cell::RefCell::new(Vec::new());
@@ -1074,7 +1108,7 @@ mod exclusion_fence {
       &BufferContext {
         stats: &stats,
         transport: &transport,
-        exclusions,
+        fence,
       },
       || Ok(one_entry_walk()),
       |_, subtree_fid, _| {
@@ -1190,6 +1224,172 @@ mod exclusion_fence {
         .collect::<Vec<_>>(),
       vec![std::path::PathBuf::from("/root/keep")],
       "the excluded create is not reported; the sibling is"
+    );
+  }
+
+  /// The PRUNE half of the same boundary, with NO exclusion in force at all: a live
+  /// `mkdir` of a pruned name never enters the admission map.
+  ///
+  /// The seat promises a pruned subtree is never enumerated and never armed, and on a
+  /// descending backend the core's fence delivers that by never asking for a watch
+  /// below one. A `FAN_MARK_FILESYSTEM` mark has no such lever — it covers the whole
+  /// superblock — so the promise lives or dies here: a pruned directory that gets
+  /// learned admits every event under it forever, and its churn spends map entries and
+  /// transport admission the rest of the tree competes for.
+  ///
+  /// Revert witness: drop the prune half from the admission fence and `cache` is
+  /// learned, from where every create beneath it resolves and grows the map.
+  #[test]
+  fn a_live_create_of_a_pruned_directory_never_enters_the_map() {
+    let mut map = root_only();
+    let before = map.dir_count();
+    let prune = prune_words(&["**/cache"]);
+    let decoded = DecodeOutcome {
+      events: vec![
+        dir_create(fid(1), b"cache", fid(10)),
+        dir_create(fid(1), b"keep", fid(11)),
+      ],
+      lossy: false,
+    };
+    let out = run_fenced(
+      &mut map,
+      decoded,
+      Fence::new(Path::new("/root"), &[], &prune),
+    );
+    assert!(out.alive);
+    assert_eq!(
+      map.dir_count(),
+      before + 1,
+      "only the reported sibling was learned — the pruned directory never entered the map"
+    );
+    assert!(
+      !map.contains(&fid(10)),
+      "the pruned directory is absent, so nothing under it can ever resolve"
+    );
+    assert_eq!(
+      out
+        .forwarded
+        .iter()
+        .filter_map(|e| e.path.clone())
+        .collect::<Vec<_>>(),
+      vec![std::path::PathBuf::from("/root/keep")],
+      "the pruned create is not reported; the sibling is"
+    );
+  }
+
+  /// The seat speaks for DIRECTORIES only, and this is where that stays true on a
+  /// kernel-recursive backend: a plain FILE whose own name matches a prune pattern is
+  /// still reported, because a `**/.*` written to skip dot-directories must not
+  /// silently ban every dotfile in the tree. The class comes off `FAN_ONDIR`, which the
+  /// kernel sets exactly when the object the event is about is a directory — so the
+  /// source and the common layer answer the same question about the same object rather
+  /// than disagreeing at the seam.
+  #[test]
+  fn a_file_named_like_a_pruned_directory_is_still_reported() {
+    let mut map = root_only();
+    let prune = prune_words(&["**/cache"]);
+    let file_create = RawFanotifyEvent {
+      mask: FanMask::new(FAN_CREATE),
+      dir_fid: Some(fid(1)),
+      target_fid: Some(fid(10)),
+      name: Some(b"cache".to_vec()),
+      rename: None,
+    };
+    let out = run_fenced(
+      &mut map,
+      DecodeOutcome {
+        events: vec![file_create],
+        lossy: false,
+      },
+      Fence::new(Path::new("/root"), &[], &prune),
+    );
+    assert!(out.alive);
+    assert_eq!(
+      out
+        .forwarded
+        .iter()
+        .filter_map(|e| e.path.clone())
+        .collect::<Vec<_>>(),
+      vec![std::path::PathBuf::from("/root/cache")],
+      "a non-`ONDIR` object is judged on its ancestors alone, exactly as the core judges it"
+    );
+    assert_eq!(
+      map.dir_count(),
+      1,
+      "a file create learns nothing either way — the map is untouched"
+    );
+  }
+
+  /// The severity, reproduced through the prune seat: sustained create traffic under a
+  /// pruned path must not be able to consume the directory cap and kill the source.
+  ///
+  /// This is the reported hole exactly — a root containing thousands of directories
+  /// under a pruned `node_modules`, with a small map cap. Learning any of them runs the
+  /// map past the cap, and an over-cap map is the terminal `Fatal`: the source dies and
+  /// every subscription on the scope loses coverage, over activity in a subtree the
+  /// caller explicitly pruned.
+  #[test]
+  fn sustained_creates_under_a_pruned_subtree_cannot_consume_the_map_cap() {
+    let mut map = FidMap::with_capacity(Some(2));
+    map.seed([SeedEntry::root(fid(1), Path::new("/root"))]);
+    let prune = prune_words(&["**/node_modules"]);
+    let mut events = vec![dir_create(fid(1), b"node_modules", fid(10))];
+    events.extend((11..=40).map(|tag| dir_create(fid(10), b"d", fid(tag))));
+    let out = run_fenced(
+      &mut map,
+      DecodeOutcome {
+        events,
+        lossy: false,
+      },
+      Fence::new(Path::new("/root"), &[], &prune),
+    );
+    assert!(
+      out.alive,
+      "pruned churn must never reach the cap, let alone the terminal it triggers"
+    );
+    assert!(
+      !out.sent.contains(&Sent::Fatal),
+      "no Fatal: the cap cannot be consumed by a subtree the caller pruned"
+    );
+    assert_eq!(
+      map.dir_count(),
+      1,
+      "the map is exactly the root it started as — 31 pruned creates cost it nothing"
+    );
+  }
+
+  /// A POPULATED directory moved in from outside the root, landing on a pruned name.
+  /// Learning it would also owe a descendant walk, so a late fence pays twice: the map
+  /// grows AND the reader walks a whole foreign subtree for a destination the caller
+  /// asked never to be enumerated.
+  #[test]
+  fn a_populated_move_in_to_a_pruned_destination_is_refused_whole() {
+    let mut map = root_only();
+    let before = map.dir_count();
+    let prune = prune_words(&["**/cache"]);
+    let out = run_fenced(
+      &mut map,
+      DecodeOutcome {
+        events: vec![dir_rename(fid(9), b"X", fid(1), b"cache", fid(5))],
+        lossy: false,
+      },
+      Fence::new(Path::new("/root"), &[], &prune),
+    );
+    assert!(out.alive);
+    assert_eq!(
+      out.walks, 0,
+      "no subtree walk ran: a pruned destination owes no descendants"
+    );
+    assert_eq!(
+      map.dir_count(),
+      before,
+      "neither the moved directory nor any descendant entered the map"
+    );
+    assert!(!map.contains(&fid(5)), "the moved-in top was not learned");
+    assert!(
+      out.forwarded.is_empty(),
+      "neither end is in the reported tree, so nothing may be forwarded: {:?}",
+      out.forwarded
     );
   }
 

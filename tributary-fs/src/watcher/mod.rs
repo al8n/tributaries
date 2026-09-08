@@ -195,9 +195,9 @@ impl SyncAdmission {
 /// [`sync_root`](Watcher::sync_root) to retry under the SAME sequence — the paired
 /// [`SyncTicket`] stays valid. `None` means the sequence is spent or its fate is
 /// ambiguous — the write was admitted then retired
-/// ([`Write`](SyncRootError::Write)), the sync reached a post-birth terminal
-/// ([`Retired`](SyncRootError::Retired)), or the watcher is
-/// [`Closed`](SyncRootError::Closed) — so a retry must re-mint through
+/// ([`Write`](SyncRootError::Write), [`DirPruned`](SyncRootError::DirPruned)), the
+/// sync reached a post-birth terminal ([`Retired`](SyncRootError::Retired)), or the
+/// watcher is [`Closed`](SyncRootError::Closed) — so a retry must re-mint through
 /// [`mint_sync_ticket`](Watcher::mint_sync_ticket).
 #[derive(Debug)]
 pub struct SyncRootDenied {
@@ -219,7 +219,9 @@ impl SyncRootDenied {
   /// so a future refusal is fail-safe — an unnecessary re-mint, never a reused
   /// sequence. Post-birth by construction and therefore deliberately absent from
   /// the returned set: `Write` (admitted, then retired before the reply — the
-  /// sequence is burned), `Retired` (a post-admission terminal), and `Closed`.
+  /// sequence is burned), `DirPruned` (the same shape: the verdict needs the canonical
+  /// directory only the write can resolve, so it too is admitted and then retired),
+  /// `Retired` (a post-admission terminal), and `Closed`.
   pub(crate) fn classify(error: SyncRootError, admission: SyncAdmission) -> Self {
     let admission = if matches!(
       error,
@@ -228,7 +230,6 @@ impl SyncRootDenied {
         | SyncRootError::BadCookieName { .. }
         | SyncRootError::DirOutsideRoot { .. }
         | SyncRootError::DirExcluded { .. }
-        | SyncRootError::DirPruned { .. }
         | SyncRootError::WriteInFlight
         | SyncRootError::NameInUse { .. }
         | SyncRootError::TicketInUse {}
@@ -1541,8 +1542,9 @@ impl<R> Watcher<R> {
   /// under one of the configured exclusions, whose whole purpose is to keep that
   /// subtree's events off the stream the barrier waits on;
   /// [`DirPruned`](SyncRootError::DirPruned) when this ROOT's own
-  /// [`prune`](crate::RootOptions::prune) seat covers `dir`, for the same reason
-  /// and carrying the pattern that did it;
+  /// [`prune`](crate::RootOptions::prune) seat covers the CANONICAL directory the
+  /// write resolves for `dir`, for the same reason and carrying the pattern that did
+  /// it;
   /// [`Write`](SyncRootError::Write) when the
   /// create fails (a read-only tree surfaces as `PermissionDenied`);
   /// [`WriteInFlight`](SyncRootError::WriteInFlight) when a physical write for this
@@ -1554,7 +1556,8 @@ impl<R> Watcher<R> {
   /// cleanup backlog cap is reached; [`Retired`](SyncRootError::Retired) when the
   /// root died while the write was parked; [`Closed`](SyncRootError::Closed) once
   /// the watcher is closed. The admission is returned (retryable) for every refusal
-  /// except [`Write`](SyncRootError::Write), [`Retired`](SyncRootError::Retired),
+  /// except [`Write`](SyncRootError::Write),
+  /// [`DirPruned`](SyncRootError::DirPruned), [`Retired`](SyncRootError::Retired),
   /// and [`Closed`](SyncRootError::Closed), whose sequence is spent — re-mint to
   /// retry those.
   pub async fn sync_root(

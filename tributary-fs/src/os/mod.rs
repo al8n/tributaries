@@ -718,6 +718,32 @@ pub(crate) struct SourceConfig {
   /// every other backend ignores it.
   #[cfg_attr(not(all(target_os = "linux", not(miri))), allow(dead_code))]
   pub(crate) max_map_directories: Option<usize>,
+  /// The ROOT's compiled `prune` seat — the glob-shaped fence the caller armed
+  /// this root with, carried into the source so a KERNEL-RECURSIVE backend can
+  /// enforce it at its OWN boundary rather than only at the common layer's exit.
+  ///
+  /// The seat promises that a pruned subtree is never enumerated and never armed.
+  /// On a descending backend the core's fence delivers that by never asking for a
+  /// watch below a pruned directory. A backend that keeps its own admission MAP
+  /// (fanotify, the USN journal) has no such lever: its mark covers a whole
+  /// superblock or volume, so a pruned subtree the seed walk mapped would go on
+  /// costing map entries and transport admission for churn the caller asked not
+  /// to hear about — the same load-shedding hole the exclusion set closes one
+  /// layer down. So those two consult this set wherever their map can GROW (the
+  /// seed and reseed walks, a moved-in subtree walk, a live learn) and ahead of
+  /// bounded transport admission, exactly as they consult
+  /// [`exclusions`](Self::exclusions).
+  ///
+  /// FSEvents and RDCW ignore it: neither keeps a directory map, so there is
+  /// nothing under a pruned name for them to spend, and the core's own fence is
+  /// the whole enforcement.
+  ///
+  /// Empty — the overwhelmingly common case — short-circuits every test.
+  #[cfg_attr(
+    not(all(any(target_os = "linux", target_os = "windows"), not(miri))),
+    allow(dead_code)
+  )]
+  pub(crate) prune: tributary_proto::glob::Globs,
 }
 
 impl SourceConfig {
@@ -733,6 +759,7 @@ impl SourceConfig {
       os_buffer_bytes: NonZeroU32::new(64 * 1024).expect("64 KiB is nonzero"),
       backend: Backend::Auto,
       max_map_directories: None,
+      prune: tributary_proto::glob::Globs::new([]),
     }
   }
 }

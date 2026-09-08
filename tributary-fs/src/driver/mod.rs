@@ -43,6 +43,7 @@ use agnostic_lite::{RuntimeLite, time::Instant as _};
 use futures_util::{FutureExt, StreamExt, stream::SelectAll};
 use tributary_proto::{
   ArmAttempt, Change, Instant, IoClass, ReqId, ScopeId, Segment, WatchError, WatchId,
+  glob::{Glob, Globs},
 };
 
 use crate::{
@@ -1905,6 +1906,24 @@ pub(crate) struct CookieWriteError {
   /// whoever receives it OWNS it. Boxed so the failure path costs a pointer
   /// rather than a whole cookie record on every `Result` the write returns.
   pub(crate) residue: Option<Box<CookieResidue>>,
+  /// Set when the write refused because the root's `prune` seat covers the
+  /// CANONICAL directory the cookie would have gone in — a typed refusal the
+  /// caller can act on, not an `io::Error` it can only print. Always a clean
+  /// failure: the verdict is reached before anything is created, so it never
+  /// carries a residue. Boxed for the same reason `residue` is.
+  pub(crate) pruned: Option<Box<PrunedCookieDir>>,
+}
+
+/// The prune verdict a cookie write refused on: the canonical directory it
+/// resolved (the one the cookie would truly have landed in, symlinks and the
+/// file-target-goes-beside-it rule already applied) and the pattern that closed
+/// it.
+#[derive(Debug)]
+pub(crate) struct PrunedCookieDir {
+  /// The canonical cookie parent the write resolved.
+  pub(crate) dir: PathBuf,
+  /// The pattern of the root's prune seat that covers it.
+  pub(crate) pattern: Glob,
 }
 
 impl CookieWriteError {
@@ -1917,6 +1936,18 @@ impl CookieWriteError {
     Self {
       source,
       residue: None,
+      pruned: None,
+    }
+  }
+
+  /// The prune refusal: the canonical cookie parent `dir` is covered by
+  /// `pattern`, so the write created nothing and the caller learns which word
+  /// closed the directory it named.
+  pub(crate) fn pruned(dir: PathBuf, pattern: Glob) -> Self {
+    Self {
+      source: std::io::Error::other("the cookie directory is pruned"),
+      residue: None,
+      pruned: Some(Box::new(PrunedCookieDir { dir, pattern })),
     }
   }
 }
@@ -3994,11 +4025,16 @@ where
         let _ = cookie.reply.send(Err(crate::error::SyncRootError::Retired));
         continue;
       };
+      // The root's compiled prune seat travels WITH the write: the verdict has to
+      // be taken against the canonical directory the writer itself selects, which
+      // only the blocking write knows, and the core — the seat's owner — is not
+      // reachable from there.
+      let prune = core.scope_prune(scope);
       let ops = ops.clone();
       let tx = op_tx.clone();
       R::spawn_blocking_detach(move || {
         let ParkedCookie { dir, reply } = cookie;
-        match ops.write_cookie(&root, &dir, &name) {
+        match ops.write_cookie(&root, &dir, &name, &prune) {
           Ok(file) => {
             // Hand the cookie to the registry — the path the write ACTUALLY
             // landed at (which only the write knows: a covered FILE
@@ -4033,8 +4069,26 @@ where
             }
           }
           Err(CookieWriteError {
+            pruned: Some(pruned),
+            ..
+          }) => {
+            // The write resolved the CANONICAL directory it would have created in
+            // — the writer's own selection, symlinks and the file-target rule
+            // already applied — and the root's prune seat covers it: the cookie's
+            // event would be fenced by the very pattern that asked for the
+            // fencing, so the barrier could never resolve. Refused before
+            // anything was created, so the obligation reaches the same
+            // pre-physical terminal a clean failure does, and the caller is told
+            // WHICH word closed the directory rather than being handed a bare
+            // write error.
+            lock_ledger(&guard.ledger).retire(guard.id, Reaped::NeverCreated);
+            let PrunedCookieDir { dir, pattern } = *pruned;
+            let _ = reply.send(Err(crate::error::SyncRootError::DirPruned { dir, pattern }));
+          }
+          Err(CookieWriteError {
             source,
             residue: None,
+            ..
           }) => {
             // Nothing was created, so this incarnation reaches its terminal
             // having produced no file: retire it as never-created, IN THE JOB
@@ -4051,6 +4105,7 @@ where
           Err(CookieWriteError {
             source,
             residue: Some(residue),
+            ..
           }) => {
             // The write FAILED and left something behind: a file it could not
             // identify and could not destroy, or the directory it had already
@@ -4650,11 +4705,22 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
   /// statement about that write and the directory must come back as a residue
   /// (see [`post_mint_failure`]). A `clean` failure is a promise that this write
   /// left the filesystem exactly as it found it.
+  ///
+  /// `prune` is the ROOT's compiled prune seat, and the write is where that seat
+  /// is judged: only here is the CANONICAL cookie parent known — the target's own
+  /// directory, or its parent when the target is a file, with every symlink on the
+  /// way resolved — and a verdict taken on any other spelling would refuse a file
+  /// subscription whose parent is perfectly reportable, or admit a symlink that
+  /// lands inside a pruned subtree. An implementation that finds the seat covers
+  /// that directory must create NOTHING and answer
+  /// [`CookieWriteError::pruned`], which the caller reports as
+  /// [`SyncRootError::DirPruned`](crate::SyncRootError::DirPruned).
   fn write_cookie(
     &self,
     root: &Path,
     dir: &Path,
     name: &str,
+    prune: &Globs,
   ) -> Result<CookieFile, CookieWriteError>;
 
   /// Removes a sync cookie (blocking) through the anchor it was created with,
@@ -5616,6 +5682,119 @@ pub(crate) fn excluded(exclusions: &[PathBuf], path: &Path) -> bool {
   !exclusions.is_empty() && cookie_dir_excluded(exclusions, path).is_some()
 }
 
+/// Walks the DIRECTORY prefixes of `path`'s form relative to `root`, from the
+/// shallowest down, asking `ask` for each, and answers the first `Some` — THE
+/// prune predicate, for every enforcement site on every backend.
+///
+/// The prefixes are what a `prune` seat may speak for, and they are the seat's
+/// whole definition:
+///
+/// - every prefix of length **at least one**. The length floor is what makes the
+///   ROOT unprunable — its root-relative path is empty, so it has no prefix to
+///   match with, and a seat can never silence the very root it was configured on;
+/// - `directory` says whether `path`'s OWN last segment is one of them. Prune
+///   names SUBTREES, so a directory is judged on its own name as well as its
+///   ancestors', while an object proven not to be a directory is judged on its
+///   ancestors ALONE. That is what keeps `**/.*` — a pattern a caller writes to
+///   skip dot-DIRECTORIES — from silently taking every dotfile in the tree with
+///   it, files being the `include` seat's business and not this one's. An entry
+///   still inside an already-pruned prefix is dropped whatever its class, because
+///   the walk covers its ancestors either way.
+///
+/// An ancestor walk bounded by the path's own depth and cached nowhere: a scope's
+/// coverage moves under it (a rename re-parents a whole subtree in O(1)), so a
+/// memo keyed on a path would be a second description of a tree the Monitor
+/// already owns.
+///
+/// It lives here, beside [`excluded`], for the same reason that one does: it is
+/// no longer one layer's helper. The core's own fence, the sync-cookie birth
+/// refusal, the fanotify seed walk and admission fence, and the USN walk and
+/// admission fence all consult THIS function, so "a directory a walk declines",
+/// "a path admission drops", "a directory the core refuses to cover" and "a
+/// directory a cookie may not be written in" are one set by construction rather
+/// than several that agree today.
+///
+/// # The sync cookie is never pruned
+///
+/// A segment naming this driver's own cookie directory
+/// ([`is_sync_cookie_dir_name`]) ends the walk at once, answering `None` for that
+/// directory and everything under it. The cookie is the WATCHER's artifact, not
+/// the tree's: its event is what a sync barrier waits on, and a seat that
+/// suppressed it would leave the caller waiting on an event that can no longer
+/// exist — a hang produced by a pattern that was only ever meant to describe the
+/// caller's own files.
+///
+/// The reserved directory can stand at any depth (a sync is placed under the
+/// SUBSCRIPTION's directory, which need not be the root), so the exemption is
+/// stated over every segment rather than the first one alone. It exempts the
+/// reserved NAME, never the caller's own directories above it: a pattern that
+/// prunes the directory a cookie would be written in is a real refusal, and the
+/// write makes it one before creating anything.
+///
+/// FAILS OPEN — answers `None` — for an unengaged seat, a path outside `root`,
+/// and a segment that is not UTF-8 (a glob is text; an unrepresentable name is
+/// not something a pattern can have meant). The direction is the fence's own: not
+/// suppressing costs a delivery the caller did not want, suppressing on an
+/// unresolved path costs one it may have needed.
+pub(crate) fn prune_prefixes<T>(
+  root: &Path,
+  prune: &Globs,
+  directory: bool,
+  path: &Path,
+  mut ask: impl FnMut(&str) -> Option<T>,
+) -> Option<T> {
+  if prune.is_empty() {
+    return None;
+  }
+  let relative = path.strip_prefix(root).ok()?;
+  let mut walked = String::new();
+  let mut segments = relative.iter().peekable();
+  while let Some(segment) = segments.next() {
+    let segment = segment.to_str()?;
+    if is_sync_cookie_dir_name(segment) {
+      return None;
+    }
+    // The last segment of a proven non-directory is not a prefix the seat may
+    // speak for, and it is the end of the walk either way.
+    if segments.peek().is_none() && !directory {
+      return None;
+    }
+    if !walked.is_empty() {
+      walked.push('/');
+    }
+    walked.push_str(segment);
+    if let Some(hit) = ask(&walked) {
+      return Some(hit);
+    }
+  }
+  None
+}
+
+/// Whether `prune` covers `path` — some directory prefix of it matches
+/// ([`prune_prefixes`]).
+///
+/// The hot form, and the only one a fence asks: it wants a verdict, not a path,
+/// so it asks the compiled union in one pass per prefix and allocates nothing
+/// beyond the prefix buffer itself.
+pub(crate) fn pruned(root: &Path, prune: &Globs, directory: bool, path: &Path) -> bool {
+  prune_prefixes(root, prune, directory, path, |prefix| {
+    prune.is_match(prefix).then_some(())
+  })
+  .is_some()
+}
+
+/// WHICH pattern prunes `dir`, for the one caller that must name it to a person:
+/// the sync-cookie birth refusal, whose whole value is telling the caller which
+/// word closed the directory it asked to write in.
+///
+/// Always asked about a DIRECTORY, because with the seat evaluated on directory
+/// prefixes that is the only thing a pattern can prune.
+pub(crate) fn pruned_dir_by(root: &Path, prune: &Globs, dir: &Path) -> Option<Glob> {
+  prune_prefixes(root, prune, true, dir, |prefix| {
+    prune.matched(prefix).cloned()
+  })
+}
+
 impl FsOps for RealFs {
   type Handle = SourceHandle;
 
@@ -5677,6 +5856,7 @@ impl FsOps for RealFs {
     root: &Path,
     dir: &Path,
     name: &str,
+    prune: &Globs,
   ) -> Result<CookieFile, CookieWriteError> {
     // Resolve the directory the sync named — which is where the private cookie
     // directory goes — then CANONICALIZE it: `canonicalize` follows every symlink
@@ -5699,6 +5879,18 @@ impl FsOps for RealFs {
       return Err(CookieWriteError::clean(std::io::Error::other(
         "the cookie directory resolves outside the watched root",
       )));
+    }
+    // The root's PRUNE seat, judged on the very directory this write is about to
+    // create in and against the canonical root the containment test just used —
+    // so the pattern is matched on the same root-relative spelling the fence will
+    // match the cookie's own event on. A seat that covers it would suppress that
+    // event, leaving the caller's barrier waiting on something that can never
+    // arrive, so the write refuses here and creates nothing. Asking the CALLER's
+    // spelling instead would be two different questions: an intermediate symlink
+    // hides a pruned destination, and a FILE subscription's own path is not the
+    // directory the cookie goes in at all.
+    if let Some(pattern) = pruned_dir_by(&canonical_root, prune, &canonical_dir) {
+      return Err(CookieWriteError::pruned(canonical_dir, pattern));
     }
     // This is the last path this write resolves on the platforms that keep ONE
     // shared directory: it is opened once, and every operation on the cookie — this
@@ -6311,6 +6503,7 @@ fn destroy_unidentified(
         CookieProof::Anchor,
         handle,
       )))),
+      pruned: None,
     },
   }
 }
@@ -6345,6 +6538,7 @@ fn post_mint_failure(dir: &Arc<CookieDir>, name: &str, source: std::io::Error) -
     Some(owed) => CookieWriteError {
       source,
       residue: Some(Box::new(CookieResidue::Dir(owed))),
+      pruned: None,
     },
     None => CookieWriteError::clean(source),
   }
@@ -8033,6 +8227,7 @@ pub(crate) async fn run<R, F>(
               &mut pending_spawns,
               scope,
               meta.root,
+              core.scope_prune(scope),
             );
             continue;
           }
@@ -8501,6 +8696,7 @@ pub(crate) async fn run<R, F>(
                   &mut pending_spawns,
                   scope,
                   root,
+                  core.scope_prune(scope),
                 );
                 slot.insert(ReplaceState {
                   reservation,
@@ -8650,19 +8846,6 @@ pub(crate) async fn run<R, F>(
                   dir,
                   exclusion,
                 }));
-              } else if let Some(pattern) = lexically_normalized(&dir)
-                .and_then(|folded| core.pruned_dir(scope, &folded))
-              {
-                // The same refusal, one seat over: the root's own prune words
-                // cover the directory, so the cookie's event would be fenced by
-                // the pattern that asked for the fencing and the barrier would
-                // wait forever. The verdict is asked of the core, which holds the
-                // compiled seat, on the DIRECTORY path — with prune evaluated on
-                // directory prefixes that is the only shape a pattern can prune —
-                // and it is asked on the lexically folded path, exactly as the
-                // exclusion test above is, so `<root>/./x` and `<root>/x` get one
-                // answer. Refused before birth; the refusal creates nothing.
-                let _ = reply.send(Err(crate::error::SyncRootError::DirPruned { dir, pattern }));
               } else if cookies.has_pending_write(scope) {
                 // Single-flight per scope: refuse a second sync while one for
                 // this scope is anywhere in the pipeline — still PARKED on its
@@ -10640,6 +10823,7 @@ fn dispatch_replace_spawn<R, F>(
   pending_spawns: &mut BTreeSet<ScopeId>,
   scope: ScopeId,
   root: PathBuf,
+  prune: Globs,
 ) where
   R: RuntimeLite,
   F: FsOps,
@@ -10648,6 +10832,11 @@ fn dispatch_replace_spawn<R, F>(
   let mut source_config = SourceConfig::new(vec![root]);
   source_config.since = handles.get(&scope).and_then(SourceControl::resume_token);
   source_config.exclusions = config.exclusions.clone();
+  // The scope's words ride the replacement stream as they rode the first one.
+  // They are ROOT-RELATIVE, so the replacement re-bases them onto its new root —
+  // the same re-basing `Watcher::replace_root` documents for the common layer,
+  // applied by the same set at the source's own boundary.
+  source_config.prune = prune;
   source_config.latency = config.latency;
   source_config.channel_capacity = config.os_batch_capacity;
   source_config.os_buffer_bytes = config.os_buffer_bytes;
@@ -11100,6 +11289,7 @@ where
           pending_spawns,
           scope,
           widened,
+          core.scope_prune(scope),
         );
         replace_states.insert(
           scope,
@@ -11758,6 +11948,10 @@ fn execute_effects<R, F>(
         pending_spawns.insert(scope);
         let mut source_config = SourceConfig::new(vec![root]);
         source_config.exclusions = config.exclusions.clone();
+        // The root's own prune words, so a kernel-recursive backend fences its
+        // admission map on them instead of mapping a subtree the caller asked
+        // never to be enumerated.
+        source_config.prune = core.scope_prune(scope);
         source_config.latency = config.latency;
         source_config.channel_capacity = config.os_batch_capacity;
         source_config.os_buffer_bytes = config.os_buffer_bytes;

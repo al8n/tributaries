@@ -9608,8 +9608,16 @@ mod kernel_recursive_fanotify {
       name: Some(b"r".to_vec()),
       rename: None,
     };
-    let Admission::RootDeath(admitted) = classify(&mut map, &raw, &mut MemoBatch::new(), &[])
-    else {
+    let Admission::RootDeath(admitted) = classify(
+      &mut map,
+      &raw,
+      &mut MemoBatch::new(),
+      crate::os::linux::fanotify::Fence::new(
+        std::path::Path::new("/root"),
+        &[],
+        &tributary_proto::glob::Globs::new([]),
+      ),
+    ) else {
       panic!("the root delete-from-parent must classify as RootDeath, not a firehose drop");
     };
 
@@ -10999,6 +11007,7 @@ mod usn_lowering {
     let mut admission = UsnAdmission::new(map, 64).with_fence(UsnFence::new(
       PathBuf::from("/r"),
       vec![PathBuf::from("/r/cache")],
+      tributary_proto::glob::Globs::new([]),
     ));
     let mut admitted = Vec::new();
     for round in 0..200u128 {
@@ -11623,6 +11632,7 @@ mod usn_lowering {
     let mut adm = UsnAdmission::new(map, 64).with_fence(UsnFence::new(
       PathBuf::from("/r"),
       vec![PathBuf::from("/r/a/cache")],
+      tributary_proto::glob::Globs::new([]),
     ));
     let mut core = DriverCore::new(WINDOW, LIVENESS);
     let scope = live_scope(&mut core);

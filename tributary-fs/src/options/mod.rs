@@ -828,6 +828,19 @@ impl Default for WatcherOptions {
 ///   [`WatcherOptions::exclusions_slice`], and unlike that option it is enforced
 ///   on EVERY backend: no OS API takes a glob, so the enforcement never stands
 ///   down to one.
+///
+///   "Never enumerated, never armed" is a resource promise as much as a delivery
+///   one, and where a backend can spend resources on a subtree the seat is
+///   enforced at ITS boundary too. A descending backend simply never asks for a
+///   watch below a pruned directory. The two kernel-recursive backends that keep
+///   their own admission map — fanotify and the Windows change journal — consult
+///   the seat in their seed and reseed walks, in every moved-in subtree walk,
+///   before every live directory learn, and ahead of bounded transport admission,
+///   so a pruned subtree costs them no map entry and its churn cannot exhaust the
+///   directory cap. FSEvents (whose stream is the OS's own) and
+///   `ReadDirectoryChangesW` (which keeps no map) have nothing under a pruned
+///   name to spend, so for them the common layer's fence is the whole
+///   enforcement.
 /// - [`include`](Self::include) narrows DELIVERY, and it is matched against the
 ///   object's **NAME** — the last segment of its path, alone. So `*.mp4` and
 ///   `**/*.mp4` are the same seat here, and a pattern containing a `/` matches
@@ -846,8 +859,10 @@ impl Default for WatcherOptions {
 /// Neither seat can reach the watcher's own sync cookie: `prune` never covers
 /// the reserved cookie directory and `include` always admits what is inside it,
 /// so a `sync` barrier resolves whatever the patterns say. A cookie directory a
-/// seat WOULD have pruned is refused before any write
-/// ([`SyncRootError::DirPruned`](crate::SyncRootError::DirPruned)).
+/// seat WOULD have pruned is refused before anything is created
+/// ([`SyncRootError::DirPruned`](crate::SyncRootError::DirPruned)) — judged on the
+/// CANONICAL directory the write resolves, so a symlink into a pruned subtree is
+/// refused and a file target whose parent is reportable is not.
 ///
 /// # Configuration faces
 ///
@@ -868,21 +883,161 @@ impl Default for WatcherOptions {
 /// $ app --prune '**/node_modules' --prune '**/.git' --include '**/*.mp4'
 /// ```
 ///
-/// The flattened [`Interest`] flags default to the EMPTY mask on that face,
-/// exactly as they do everywhere `Interest` is flattened: a bare flag sets a
-/// bit, so a flagless command line subscribes to nothing rather than to
-/// [`Interest::all`].
+/// The interest flags are `--created`, `--removed`, `--modified`, `--moved`,
+/// `--attrib` and `--ondir`, and a command line that gives NONE of them parses to
+/// [`new`](Self::new) — every kind, the same household the serde face and
+/// [`Watcher::watch`](crate::Watcher::watch) hand back. Giving any of them narrows
+/// to exactly those:
+///
+/// ```text
+/// $ app --prune '**/node_modules'            # every kind, node_modules pruned
+/// $ app --created --moved                    # creates and moves alone
+/// ```
+///
+/// This is deliberately NOT the standalone [`Interest`] group's own clap face,
+/// where a flagless parse is the EMPTY mask. There, the flags ARE the whole value
+/// and an empty one is a legitimate thing to spell; here they are one field of a
+/// household whose every OTHER face defaults to
+/// [`Interest::all`](tributary_proto::Interest::all), and a flagless
+/// `RootOptions` that silently subscribed to nothing would make the command line
+/// mean something no other face means — creates, modifications, removals and moves
+/// all absent, with only the unmaskable `Rescan`s left. A command line that really
+/// wants the empty mask says so through the [`Interest`] group directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(default))]
-#[cfg_attr(feature = "clap", derive(clap::Args))]
 pub struct RootOptions {
-  #[cfg_attr(feature = "clap", command(flatten))]
   interest: Interest,
-  #[cfg_attr(feature = "clap", arg(long))]
   prune: Vec<Glob>,
-  #[cfg_attr(feature = "clap", arg(long))]
   include: Option<Vec<Glob>>,
+}
+
+/// The `clap` face of [`RootOptions`], and the one place the two households differ.
+///
+/// A derived `clap::Args` reads each boolean as "given or not given", so flattening
+/// the protocol [`Interest`] group straight into [`RootOptions`] made a flagless
+/// parse the EMPTY interest while every other face of the same type defaults to
+/// [`Interest::all`](tributary_proto::Interest::all). The proxy keeps the flags
+/// identical and only reinterprets the flagless case, so the standalone group's own
+/// face is untouched.
+#[cfg(feature = "clap")]
+#[derive(Debug, Clone, clap::Args)]
+struct RootOptionsArgs {
+  #[command(flatten)]
+  interest: RootInterestArgs,
+  #[arg(long)]
+  prune: Vec<Glob>,
+  #[arg(long)]
+  include: Option<Vec<Glob>>,
+}
+
+/// One `--<field>` flag per [`Interest`] bit, read as "narrow to exactly these".
+#[cfg(feature = "clap")]
+#[derive(Debug, Clone, clap::Args)]
+struct RootInterestArgs {
+  #[arg(long)]
+  created: bool,
+  #[arg(long)]
+  removed: bool,
+  #[arg(long)]
+  modified: bool,
+  #[arg(long)]
+  moved: bool,
+  #[arg(long)]
+  attrib: bool,
+  #[arg(long)]
+  ondir: bool,
+}
+
+#[cfg(feature = "clap")]
+impl From<RootInterestArgs> for Interest {
+  /// NO flag given is the DEFAULT household ([`Interest::all`]); any flag given
+  /// narrows to exactly the ones that were.
+  fn from(args: RootInterestArgs) -> Self {
+    let RootInterestArgs {
+      created,
+      removed,
+      modified,
+      moved,
+      attrib,
+      ondir,
+    } = args;
+    if !(created || removed || modified || moved || attrib || ondir) {
+      return RootOptions::DEFAULT_INTEREST;
+    }
+    Interest::new()
+      .maybe_created(created)
+      .maybe_removed(removed)
+      .maybe_modified(modified)
+      .maybe_moved(moved)
+      .maybe_attrib(attrib)
+      .maybe_ondir(ondir)
+  }
+}
+
+#[cfg(feature = "clap")]
+impl From<Interest> for RootInterestArgs {
+  /// The inverse, for `update_from_arg_matches`: the flags an already-built
+  /// household would have been spelled with. The EMPTY interest has no spelling on
+  /// this face — no flag given means "every kind" — so it round-trips back to
+  /// [`Interest::all`], which is the same rule a flagless parse follows.
+  fn from(interest: Interest) -> Self {
+    Self {
+      created: interest.created(),
+      removed: interest.removed(),
+      modified: interest.modified(),
+      moved: interest.moved(),
+      attrib: interest.attrib(),
+      ondir: interest.ondir(),
+    }
+  }
+}
+
+#[cfg(feature = "clap")]
+impl From<RootOptionsArgs> for RootOptions {
+  fn from(args: RootOptionsArgs) -> Self {
+    Self {
+      interest: args.interest.into(),
+      prune: args.prune,
+      include: args.include,
+    }
+  }
+}
+
+#[cfg(feature = "clap")]
+impl From<&RootOptions> for RootOptionsArgs {
+  fn from(options: &RootOptions) -> Self {
+    Self {
+      interest: options.interest.into(),
+      prune: options.prune.clone(),
+      include: options.include.clone(),
+    }
+  }
+}
+
+#[cfg(feature = "clap")]
+impl clap::FromArgMatches for RootOptions {
+  fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+    RootOptionsArgs::from_arg_matches(matches).map(Into::into)
+  }
+
+  fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+    let mut args = RootOptionsArgs::from(&*self);
+    args.update_from_arg_matches(matches)?;
+    *self = args.into();
+    Ok(())
+  }
+}
+
+#[cfg(feature = "clap")]
+impl clap::Args for RootOptions {
+  fn augment_args(cmd: clap::Command) -> clap::Command {
+    RootOptionsArgs::augment_args(cmd)
+  }
+
+  fn augment_args_for_update(cmd: clap::Command) -> clap::Command {
+    RootOptionsArgs::augment_args_for_update(cmd)
+  }
 }
 
 impl RootOptions {

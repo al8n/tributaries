@@ -670,15 +670,58 @@ mod root_options {
       );
     }
 
-    /// The flattened `Interest` flags default to the EMPTY mask, exactly as they
-    /// do everywhere `Interest` is flattened: a bare flag SETS a bit, so a
-    /// flagless command line subscribes to nothing rather than to `Interest::all`.
+    /// A FLAGLESS command line is the default household — the same value
+    /// `RootOptions::new()` and an absent serde document hand back.
+    ///
+    /// The standalone `Interest` group's clap face reads a flagless parse as the
+    /// EMPTY mask, and flattening it here made `--prune '**/x'` alone build a root
+    /// subscribed to nothing: no creates, no modifications, no removals, no moves,
+    /// only the unmaskable `Rescan`s — while every other face of the same household
+    /// meant every kind. The proxy reinterprets only the flagless case.
+    ///
+    /// Revert witness: flatten the protocol `Interest` group back into
+    /// `RootOptions` and the first row parses to `Interest::new()`.
     #[test]
-    fn the_flattened_interest_flags_default_empty() {
-      assert_eq!(parse(&[]).interest(), Interest::new());
+    fn a_flagless_command_line_is_the_default_household() {
+      assert_eq!(parse(&[]), RootOptions::new());
+      assert_eq!(parse(&[]).interest(), RootOptions::DEFAULT_INTEREST);
+      // A seat flag is not an interest flag: the household still defaults.
+      assert_eq!(
+        parse(&["--prune", "**/node_modules"]).interest(),
+        RootOptions::DEFAULT_INTEREST
+      );
+    }
+
+    /// ANY interest flag narrows to exactly the ones given — the opt-in act the
+    /// household's docs promise, with no bit riding along from the default.
+    #[test]
+    fn one_interest_flag_narrows_to_exactly_that_kind() {
+      assert_eq!(
+        parse(&["--created"]).interest(),
+        Interest::new().with_created()
+      );
       assert_eq!(
         parse(&["--created", "--moved"]).interest(),
         Interest::new().with_created().with_moved()
+      );
+      assert_eq!(parse(&["--ondir"]).interest(), Interest::new().with_ondir());
+    }
+
+    /// The standalone `Interest` group keeps ITS face: a flagless parse there is
+    /// still the empty mask, because there the flags are the whole value rather than
+    /// one field of a household with a deliver-everything default.
+    #[test]
+    fn the_standalone_interest_group_still_defaults_empty() {
+      #[derive(Debug, clap::Parser)]
+      struct Bare {
+        #[command(flatten)]
+        interest: Interest,
+      }
+
+      assert_eq!(
+        Bare::parse_from(["app"]).interest,
+        Interest::new(),
+        "flattening `Interest` on its own is untouched by the household's proxy"
       );
     }
 

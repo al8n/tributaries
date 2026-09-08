@@ -85,7 +85,7 @@ use tributary_proto::{
   ArmAttempt, Capabilities, Change, ChangeKind, DirEntry, EnumerateResult, Evidence, FileKind,
   Identity, Instant, IoClass, Location, Monitor, MoveCookie, OsRecord, RecordKind, ReqId, Scope,
   ScopeId, Segment, StatEntry, StatResult, SubtreeScope, WatchError, WatchId,
-  glob::{Glob, Globs},
+  glob::Globs,
   monitor::{CoverageWorkEpoch, RecordOutcome},
 };
 
@@ -1478,7 +1478,7 @@ struct ScopeState {
   /// narrowing which FILES are delivered is [`include`](Self::include)'s seat,
   /// and conflating the two turns a `**/.*` written to skip dot-directories into
   /// a silent ban on every dotfile in the tree. This driver's own sync cookie is
-  /// exempt outright ([`prune_prefixes`](DriverCore::prune_prefixes)).
+  /// exempt outright ([`crate::driver::prune_prefixes`]).
   ///
   /// Unlike the watcher-wide [`exclusions`](DriverCore::exclusions) it NEVER
   /// stands down for a backend that enforces exclusions itself: no OS API takes
@@ -1793,114 +1793,19 @@ impl DriverCore {
     crate::driver::excluded(&self.exclusions, path)
   }
 
-  /// Walks the DIRECTORY prefixes of `path`'s root-relative form from the
-  /// shallowest down, asking `ask` for each, and answers the first `Some`.
-  ///
-  /// The prefixes are what the [`prune`](ScopeState::prune) seat may speak for,
-  /// and they are the seat's whole definition:
-  ///
-  /// - every prefix of length **at least one**. The length floor is what makes
-  ///   the ROOT unprunable — its root-relative path is empty, so it has no prefix
-  ///   to match with, and a seat can never silence the very root it was
-  ///   configured on;
-  /// - `directory` says whether `path`'s OWN last segment is one of them. Prune
-  ///   names SUBTREES, so a directory is judged on its own name as well as its
-  ///   ancestors', while an object proven not to be a directory is judged on its
-  ///   ancestors ALONE. That is what keeps `**/.*` — a pattern a caller writes to
-  ///   skip dot-DIRECTORIES — from silently taking every dotfile in the tree with
-  ///   it, files being [`include`](ScopeState::include)'s business and not this
-  ///   seat's. An entry still inside an already-pruned prefix is dropped whatever
-  ///   its class, because the walk covers its ancestors either way.
-  ///
-  /// An ancestor walk bounded by the path's own depth and cached nowhere: a
-  /// scope's coverage moves under it (a rename re-parents a whole subtree in
-  /// O(1)), so a memo keyed on a path would be a second description of a tree the
-  /// Monitor already owns — the mirror [`path_of`](Self::path_of) exists to have
-  /// deleted.
-  ///
-  /// # The sync cookie is never pruned
-  ///
-  /// A segment naming this driver's own cookie directory
-  /// ([`is_sync_cookie_dir_name`](crate::is_sync_cookie_dir_name)) ends the walk
-  /// at once, answering `None` for that directory and everything under it. The
-  /// cookie is the WATCHER's artifact, not the tree's: its event is what a sync
-  /// barrier waits on, and a seat that suppressed it would leave the caller
-  /// waiting on an event that can no longer exist — a hang produced by a pattern
-  /// that was only ever meant to describe the caller's own files.
-  ///
-  /// The reserved directory can stand at any depth (a sync is placed under the
-  /// SUBSCRIPTION's directory, which need not be the root), so the exemption is
-  /// stated over every segment rather than the first one alone. It exempts the
-  /// reserved NAME, never the caller's own directories above it: a pattern that
-  /// prunes the directory the caller asked to sync IN is a real refusal, and
-  /// `sync_root` makes it one before any write
-  /// ([`pruned_dir`](Self::pruned_dir)) rather than letting the write land and
-  /// the barrier hang.
-  ///
-  /// FAILS OPEN — answers `None` — for a scope with no prune seat, a path outside
-  /// the scope root, a root that is not known yet, and a segment that is not
-  /// UTF-8 (a glob is text; an unrepresentable name is not something a pattern can
-  /// have meant). The direction is the fence's own: not suppressing costs a
-  /// delivery the caller did not want, suppressing on an unresolved path costs one
-  /// it may have needed.
-  fn prune_prefixes<T>(
-    state: &ScopeState,
-    directory: bool,
-    path: &Path,
-    mut ask: impl FnMut(&str) -> Option<T>,
-  ) -> Option<T> {
-    if state.prune.is_empty() {
-      return None;
-    }
-    let root = state.root.as_deref()?;
-    let relative = path.strip_prefix(root).ok()?;
-    let mut walked = String::new();
-    let mut segments = relative.iter().peekable();
-    while let Some(segment) = segments.next() {
-      let segment = segment.to_str()?;
-      if crate::driver::is_sync_cookie_dir_name(segment) {
-        return None;
-      }
-      // The last segment of a proven non-directory is not a prefix the seat may
-      // speak for, and it is the end of the walk either way.
-      if segments.peek().is_none() && !directory {
-        return None;
-      }
-      if !walked.is_empty() {
-        walked.push('/');
-      }
-      walked.push_str(segment);
-      if let Some(hit) = ask(&walked) {
-        return Some(hit);
-      }
-    }
-    None
-  }
-
   /// Whether the [`prune`](ScopeState::prune) seat covers `path` — some directory
-  /// prefix of it matches ([`prune_prefixes`](Self::prune_prefixes)).
+  /// prefix of it matches.
   ///
-  /// The hot form, and the only one the fence asks: it wants a verdict, not a
-  /// path, so it asks the compiled union in one pass per prefix and allocates
-  /// nothing beyond the prefix buffer itself.
+  /// The seat's whole definition, the cookie-directory exemption included, lives
+  /// in the ONE shared predicate ([`crate::driver::pruned`]), so the core's fence
+  /// and the kernel-recursive sources that enforce the seat at their own boundary
+  /// cannot drift apart. Here it is only bound to a scope: an unbound root (one
+  /// not resolved yet) fails OPEN, exactly as a path outside the root does.
   fn is_pruned(state: &ScopeState, directory: bool, path: &Path) -> bool {
-    Self::prune_prefixes(state, directory, path, |prefix| {
-      state.prune.is_match(prefix).then_some(())
-    })
-    .is_some()
-  }
-
-  /// WHICH pattern prunes `path`, for the one caller that must name it to a
-  /// person: the sync-cookie birth refusal, whose whole value is telling the
-  /// caller which word closed the directory it asked to write in.
-  ///
-  /// Always asked about a DIRECTORY, because with the seat evaluated on directory
-  /// prefixes that is the only thing a pattern can prune.
-  pub(crate) fn pruned_dir(&self, scope: ScopeId, dir: &Path) -> Option<Glob> {
-    let state = self.scopes.get(&scope)?;
-    Self::prune_prefixes(state, true, dir, |prefix| {
-      state.prune.matched(prefix).cloned()
-    })
+    state
+      .root
+      .as_deref()
+      .is_some_and(|root| crate::driver::pruned(root, &state.prune, directory, path))
   }
 
   /// Whether `path` lies inside EITHER half of the common-layer fence — the ONE
@@ -3576,6 +3481,25 @@ impl DriverCore {
   /// widen predicate (old ⊂ new) compares against.
   pub(crate) fn root_path(&self, scope: ScopeId) -> Option<Arc<PathBuf>> {
     self.scopes.get(&scope).and_then(|state| state.root.clone())
+  }
+
+  /// A live scope's compiled `prune` seat.
+  ///
+  /// The seat is the SCOPE's, so the core owns it — but two things outside the
+  /// core have to enforce it and cannot reach the core to ask: the blocking
+  /// cookie write (which alone knows the canonical directory it is about to
+  /// create in) and the kernel-recursive sources (which enforce the seat at their
+  /// own admission boundary, so a pruned subtree is never walked, never mapped
+  /// and never granted transport). Both are handed this clone — cheap, the
+  /// compiled set is shared — rather than a second compilation of the same words.
+  ///
+  /// An unknown scope answers the unengaged seat: it fences nothing, which is the
+  /// fail-open direction every prune site takes.
+  pub(crate) fn scope_prune(&self, scope: ScopeId) -> Globs {
+    self
+      .scopes
+      .get(&scope)
+      .map_or_else(|| Globs::new([]), |state| state.prune.clone())
   }
 
   /// A live scope's mount frame `(root_dev, root_mnt_id)` — the same-frame

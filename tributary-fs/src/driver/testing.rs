@@ -1951,6 +1951,7 @@ impl FsOps for FakeFs {
     root: &Path,
     dir: &Path,
     name: &str,
+    prune: &tributary_proto::glob::Globs,
   ) -> Result<CookieFile, CookieWriteError> {
     // The dispatch is counted BEFORE the hold: a cell that must race a scope
     // retirement (or an abandoned reply) against a write in flight needs to know
@@ -2004,6 +2005,13 @@ impl FsOps for FakeFs {
           "the cookie directory resolves outside the watched root",
         )));
       }
+      // The root's prune seat, judged on the CANONICAL directory this write
+      // would create in — the production refusal, mirrored, so a cell can prove
+      // the verdict is taken on the path the writer selects rather than on the
+      // spelling the caller passed.
+      if let Some(pattern) = crate::driver::pruned_dir_by(root, prune, &canonical_dir) {
+        return Err(CookieWriteError::pruned(canonical_dir, pattern));
+      }
       let path = canonical_dir.join(name);
       // O_NOFOLLOW on the real create, mirrored: a symlink swapped in where the
       // cookie is to land is refused rather than followed to a target that could
@@ -2047,6 +2055,7 @@ impl FsOps for FakeFs {
       return Err(CookieWriteError {
         source: std::io::Error::new(kind, "cookie write left an unresolved file"),
         residue: Some(Box::new(CookieResidue::File(file))),
+        pruned: None,
       });
     }
     Ok(file)

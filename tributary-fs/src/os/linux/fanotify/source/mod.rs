@@ -87,6 +87,8 @@ use super::{
   map::{FidMap, SeedEntry},
   reader::{self, Control, ReaderShared},
 };
+use tributary_proto::glob::Globs;
+
 use crate::os::MAX_EXCLUSIONS;
 
 /// The `st_mode` type-bits mask (`S_IFMT`) and the directory type (`S_IFDIR`):
@@ -255,6 +257,7 @@ impl Source {
       root_fid,
       max_directories: config.max_map_directories,
       exclusions: Arc::from(config.exclusions.clone()),
+      prune: config.prune.clone(),
     };
     let mut map = FidMap::with_capacity(config.max_map_directories);
     // The SPAWN seed roots at the pin (a dup of it, consumed by the descent), so
@@ -476,6 +479,15 @@ pub(crate) struct ReseedContext {
   /// honors an option the kernel itself has no notion of. Shared rather than
   /// cloned because the reader keeps this context for the source's whole life.
   exclusions: Arc<[std::path::PathBuf]>,
+  /// The ROOT's compiled prune seat — the second half of the same boundary. Every
+  /// walk this context drives refuses to map a directory the seat covers, and the
+  /// reader hands it to the admission fence alongside the exclusions, so a pruned
+  /// subtree is never seeded, never learned and never descended. Without it the
+  /// promise the seat is documented on ("never enumerated, never armed") would hold
+  /// only on the descending backends: this mark covers a whole superblock, so a
+  /// pruned subtree the walk mapped would go on spending map entries and transport
+  /// admission for churn the caller asked not to hear about.
+  prune: Globs,
 }
 
 impl ReseedContext {
@@ -506,7 +518,7 @@ impl ReseedContext {
       self.fsid,
       self.root_dev,
       &self.root_fid,
-      &self.exclusions,
+      self.fence(),
       self.max_directories,
     )
     .map_err(WalkError::into_io)
@@ -536,7 +548,7 @@ impl ReseedContext {
       self.fsid,
       self.root_dev,
       self.root_mnt_id,
-      &self.exclusions,
+      self.fence(),
       self.max_directories,
     )
   }
@@ -576,20 +588,20 @@ impl ReseedContext {
       subtree_fid,
       self.fsid,
       self.root_dev,
-      &self.exclusions,
+      self.fence(),
       budget,
     )
     .map_err(WalkError::into_io)
   }
 
-  /// The caller's exclusion directories — what every walk this context drives refuses
-  /// to map, and what the reader hands the admission classifier so the SAME set fences
-  /// the two boundary shapes no walk can reach: an event about the excluded directory
+  /// The reported tree's boundary — what every walk this context drives refuses to
+  /// map, and what the reader hands the admission classifier so the SAME two seats
+  /// fence the boundary shapes no walk can reach: an event about the fenced directory
   /// itself (its parent is mapped, so it would resolve) and a rename with an end inside
-  /// it. One list, one rule, applied both where the map is built and where it is
+  /// it. One boundary, one rule, applied both where the map is built and where it is
   /// maintained.
-  pub(crate) fn exclusions(&self) -> &[std::path::PathBuf] {
-    &self.exclusions
+  pub(crate) fn fence(&self) -> super::Fence<'_> {
+    super::Fence::new(&self.root, &self.exclusions, &self.prune)
   }
 }
 
@@ -609,6 +621,7 @@ impl ReseedContext {
       root_fid: Fid::new([0u8; 8], Box::from(&[0u8][..])),
       max_directories: None,
       exclusions: Arc::from(Vec::new()),
+      prune: Globs::new([]),
     }
   }
 }
@@ -739,7 +752,7 @@ fn seed_walk(
   fsid: [u8; 8],
   root_dev: u64,
   expected: &Fid,
-  exclusions: &[std::path::PathBuf],
+  fence: super::Fence<'_>,
   max_directories: Option<usize>,
 ) -> Result<Vec<SeedEntry>, WalkError> {
   // Pin the root as an fd (no-symlink resolution) BEFORE anything else: its
@@ -777,7 +790,7 @@ fn seed_walk(
     fsid,
     root_dev,
     fence_mnt_id,
-    exclusions,
+    fence,
     max_directories,
   )
 }
@@ -843,7 +856,7 @@ fn seed_from_fd(
   fsid: [u8; 8],
   root_dev: u64,
   fence_mnt_id: Option<u64>,
-  exclusions: &[std::path::PathBuf],
+  fence: super::Fence<'_>,
   max_directories: Option<usize>,
 ) -> Result<Vec<SeedEntry>, WalkError> {
   // The root anchor is load-bearing: without its handle the map has no base to
@@ -878,7 +891,7 @@ fn seed_from_fd(
       fsid,
       root_dev,
       fence_mnt_id,
-      exclusions,
+      fence,
       budget: max_directories,
     },
     &mut seed,
@@ -919,7 +932,7 @@ fn subtree_walk(
   subtree_fid: &Fid,
   fsid: [u8; 8],
   root_dev: u64,
-  exclusions: &[std::path::PathBuf],
+  fence: super::Fence<'_>,
   budget: Option<usize>,
 ) -> Result<Vec<SeedEntry>, WalkError> {
   // The moved directory is still in-map and pending its walk, so pinning it must
@@ -958,7 +971,7 @@ fn subtree_walk(
       fsid,
       root_dev,
       fence_mnt_id,
-      exclusions,
+      fence,
       budget,
     },
     &mut seed,
@@ -1001,8 +1014,9 @@ struct WalkFrame<'a> {
   /// The walk root's OWN mount id, or `None` when the kernel did not report one —
   /// in which case the device belt alone governs.
   fence_mnt_id: Option<u64>,
-  /// The caller's exclusion fence, applied before a child is opened.
-  exclusions: &'a [std::path::PathBuf],
+  /// The reported tree's boundary — the caller's exclusions and the root's prune
+  /// seat — applied before a child is opened.
+  fence: super::Fence<'a>,
   /// The ceiling on entries this descent may push; `None` is uncapped.
   budget: Option<usize>,
 }
@@ -1082,7 +1096,7 @@ fn descend(
     fsid,
     root_dev,
     fence_mnt_id,
-    exclusions,
+    fence,
     budget,
   } = frame;
   let root_reader = Dir::new(root_fd).map_err(|err| WalkError::Incomplete(err.into()))?;
@@ -1121,18 +1135,6 @@ fn descend(
     if name == c"." || name == c".." {
       continue;
     }
-    // The EXCLUSION fence. An exclusion is the caller's instruction not to report a
-    // subtree, and on a kernel-recursive mark the only way to honor it is to keep
-    // the subtree OUT OF THE ADMISSION MAP: the mark covers the whole superblock, so
-    // an excluded directory that is mapped admits every event under it forever.
-    // Skipped here means never seeded and never descended, so no event under it can
-    // resolve — and nothing below it can ever be learned live either, because a
-    // later create's parent FID is not in the map. That is the load-shedding the
-    // option promises, not just a filter at the exit.
-    let child_path = level.path.join(os_name(name));
-    if super::super::excluded(exclusions, &child_path) {
-      continue;
-    }
     // `d_type` is ADVISORY: a filesystem may report `DT_UNKNOWN`, and a stale
     // cache can name a swapped object's OLD type — never trusted for admission.
     // A definitively-non-directory, non-unknown entry is skipped without an open
@@ -1142,6 +1144,23 @@ fn descend(
     // type.
     let advisory = entry.file_type();
     if advisory != rustix::fs::FileType::Directory && advisory != rustix::fs::FileType::Unknown {
+      continue;
+    }
+    // THE fence — both seats. An exclusion and a prune pattern are each the caller's
+    // instruction not to report a subtree, and on a kernel-recursive mark the only way
+    // to honor either is to keep the subtree OUT OF THE ADMISSION MAP: the mark covers
+    // the whole superblock, so a fenced directory that is mapped admits every event
+    // under it forever. Skipped here means never seeded and never descended, so no
+    // event under it can resolve — and nothing below it can ever be learned live
+    // either, because a later create's parent FID is not in the map. That is the
+    // load-shedding both options promise, not just a filter at the exit.
+    //
+    // Asked AFTER the advisory type filter, so the prune half — which speaks for
+    // directories only — is only ever put to a candidate directory, and a file's name
+    // never pays the join. What survives both is confirmed a directory by the pinning
+    // open's own `fstat` below.
+    let child_path = level.path.join(os_name(name));
+    if fence.fences(true, &child_path) {
       continue;
     }
 

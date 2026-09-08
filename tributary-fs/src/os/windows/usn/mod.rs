@@ -1436,26 +1436,52 @@ fn learn_refusal_below_a_resolved_parent(outcome: LearnOutcome) -> Option<UsnAdm
 pub(crate) struct UsnFence {
   root: std::path::PathBuf,
   exclusions: Vec<std::path::PathBuf>,
+  prune: tributary_proto::glob::Globs,
 }
 
 impl UsnFence {
-  /// The fence for a root watched with `exclusions` (empty = unfenced).
-  pub(crate) fn new(root: std::path::PathBuf, exclusions: Vec<std::path::PathBuf>) -> Self {
-    Self { root, exclusions }
+  /// The fence for a root watched with `exclusions` and `prune` (both empty =
+  /// unfenced).
+  pub(crate) fn new(
+    root: std::path::PathBuf,
+    exclusions: Vec<std::path::PathBuf>,
+    prune: tributary_proto::glob::Globs,
+  ) -> Self {
+    Self {
+      root,
+      exclusions,
+      prune,
+    }
   }
 
-  /// A fence that excludes nothing.
+  /// A fence that shuts out nothing.
   pub(crate) fn unfenced() -> Self {
     Self {
       root: std::path::PathBuf::new(),
       exclusions: Vec::new(),
+      prune: tributary_proto::glob::Globs::new([]),
     }
   }
 
-  /// Whether an ABSOLUTE path lies at or under an exclusion — the walk's
+  /// Whether the fence speaks for nothing — neither seat engaged.
+  fn unengaged(&self) -> bool {
+    self.exclusions.is_empty() && self.prune.is_empty()
+  }
+
+  /// Whether an ABSOLUTE path lies outside the reported tree — at or under an
+  /// exclusion, or under (or at, for a directory) a pruned name. The walk's
   /// per-child decision, made before the child is learned, opened or descended.
-  pub(crate) fn excludes_path(&self, path: &std::path::Path) -> bool {
+  ///
+  /// `directory` is the PRUNE half's own question and the exclusion half ignores
+  /// it: an exclusion is a literal subtree, so it covers a file inside it exactly
+  /// as it covers the directory holding it, while prune speaks for directories
+  /// only — a plain file whose own name matches a pattern stays reported, and only
+  /// an already-pruned directory above it takes it out. Callers pass the class the
+  /// record proved (`FILE_ATTRIBUTE_DIRECTORY`) or the class the site guarantees (a
+  /// walk child is a directory by construction).
+  pub(crate) fn fences_path(&self, directory: bool, path: &std::path::Path) -> bool {
     crate::driver::excluded(&self.exclusions, path)
+      || crate::driver::pruned(&self.root, &self.prune, directory, path)
   }
 
   /// The absolute path of `name` inside the root-relative directory `dir`.
@@ -1478,8 +1504,8 @@ impl UsnFence {
 
   /// Whether one resolved endpoint — a directory plus a name in it — is outside
   /// the reported tree.
-  fn excludes_end(&self, dir: &[String], name: &UsnName) -> bool {
-    !self.exclusions.is_empty() && self.excludes_path(&self.joined(dir, name))
+  fn excludes_end(&self, dir: &[String], name: &UsnName, directory: bool) -> bool {
+    !self.unengaged() && self.fences_path(directory, &self.joined(dir, name))
   }
 
   /// Whether the link one record was written under is outside the reported tree.
@@ -1492,7 +1518,10 @@ impl UsnFence {
     let Some(dir) = map.resolve_dir(record.parent) else {
       return false;
     };
-    self.excludes_end(&dir, &record.name)
+    // The record's own class decides the prune half's question: a USN record
+    // carries `FILE_ATTRIBUTE_DIRECTORY`, so a file whose name happens to match a
+    // pattern stays reported exactly as it does at the common layer.
+    self.excludes_end(&dir, &record.name, record.is_dir())
   }
 
   /// Whether `event` reports NOTHING inside the reported tree — the fence's
@@ -1512,7 +1541,7 @@ impl UsnFence {
   /// nulled out there, which routes it into the same arms an OUT-OF-ROOT
   /// endpoint already takes.
   fn excludes_event(&self, map: &FrnMap, event: &UsnEvent) -> bool {
-    if self.exclusions.is_empty() {
+    if self.unengaged() {
       return false;
     }
     match event {
@@ -1561,8 +1590,21 @@ impl UsnFence {
     new_dir: &[String],
     new_name: &UsnName,
   ) -> bool {
-    if self.exclusions.is_empty() {
+    if self.unengaged() {
       return false;
+    }
+    // The PRUNE half cannot be answered the exclusion half's way. A prune pattern
+    // is a glob over the ROOT-RELATIVE path, so which descendants of a subtree it
+    // covers is a function of the whole path — there is no finite set of "relevant
+    // patterns" to run the containment against, and a rename rewrites that path by
+    // definition. So an engaged prune seat answers `true` for every mapped-directory
+    // re-parent: the subtree is relearned and re-walked through the fence, the only
+    // way to get a map that agrees with the seat at the destination. The cost is one
+    // bounded subtree walk per directory rename on a pruned root, and it buys the
+    // invariant the seat is documented on — a pruned subtree is never mapped, and a
+    // revealed one is never left blind.
+    if !self.prune.is_empty() {
+      return true;
     }
     let endpoints = [
       self.joined(old_dir, old_name),
@@ -2237,11 +2279,11 @@ impl UsnAdmission {
     let old_parent = self
       .map
       .resolve_dir(old.parent)
-      .filter(|dir| !self.fence.excludes_end(dir, &old.name));
+      .filter(|dir| !self.fence.excludes_end(dir, &old.name, old.is_dir()));
     let new_parent = self
       .map
       .resolve_dir(new.parent)
-      .filter(|dir| !self.fence.excludes_end(dir, &new.name));
+      .filter(|dir| !self.fence.excludes_end(dir, &new.name, new.is_dir()));
     let is_dir = new.is_dir();
 
     let resolve_end = |parent: Option<Vec<String>>, name: &UsnName| {
@@ -5857,7 +5899,29 @@ mod exclusion_fence {
     UsnFence::new(
       PathBuf::from("/r"),
       exclusions.iter().map(PathBuf::from).collect(),
+      tributary_proto::glob::Globs::new([]),
     )
+  }
+
+  /// The OTHER seat alone: the root's own prune words, no exclusion at all — so a
+  /// cell proves the words carry the fence rather than riding an exclusion.
+  fn pruning_fence(patterns: &[&str]) -> UsnFence {
+    UsnFence::new(
+      PathBuf::from("/r"),
+      Vec::new(),
+      tributary_proto::glob::Globs::new(patterns.iter().map(|pattern| {
+        tributary_proto::glob::Glob::new(pattern).expect("a valid pattern compiles")
+      })),
+    )
+  }
+
+  /// [`admission`]'s twin over the prune seat: `/r` with `keep` mapped, a directory
+  /// cap of `cap`, and the root's words in force. `cache` is deliberately NOT mapped —
+  /// the seed walk declines a pruned directory exactly as it declines an excluded one.
+  fn pruned_admission(cap: Option<usize>, patterns: &[&str]) -> UsnAdmission {
+    let mut map = FrnMap::new(ROOT, cap);
+    map.seed([(10, ROOT, "keep".into())]);
+    UsnAdmission::new(map, 64).with_fence(pruning_fence(patterns))
   }
 
   /// `/r` with `keep` mapped under it, a directory cap of `cap`, and the
@@ -5946,6 +6010,124 @@ mod exclusion_fence {
       "a reported create still admits: {out:?}"
     );
     assert_eq!(adm.map_mut().directories(), 2);
+  }
+
+  /// THE budget property again, through the PRUNE seat and with no exclusion in
+  /// force at all — the root's own words are a fence in their own right.
+  ///
+  /// A glob can be handed to no volume API, so the journal source has exactly one
+  /// place to honor a prune pattern: ahead of the map's growth. Without it a root
+  /// containing thousands of directories under a pruned `node_modules` walks and
+  /// maps every one of them, and the cap the rest of the tree competes for is
+  /// spent on a subtree the caller asked never to be enumerated.
+  #[test]
+  fn pruned_churn_consumes_no_admission_map_budget() {
+    let mut adm = pruned_admission(Some(2), &["**/node_modules"]);
+    let mut out = Vec::new();
+    for round in 0..200u128 {
+      let frn = 1000 + round;
+      adm.admit(
+        record(frn, ROOT, reason::FILE_CREATE, DIR, "node_modules"),
+        &mut out,
+      );
+      adm.admit(
+        record(
+          frn,
+          ROOT,
+          reason::FILE_CREATE | reason::FILE_DELETE,
+          DIR,
+          "node_modules",
+        ),
+        &mut out,
+      );
+    }
+    assert!(
+      !out.iter().any(UsnAdmitted::ends_the_batchs_trust),
+      "four hundred pruned records never end the source: {out:?}"
+    );
+    assert!(
+      out.is_empty(),
+      "and nothing from inside the pruned subtree is delivered: {out:?}"
+    );
+    assert_eq!(
+      adm.map_mut().directories(),
+      1,
+      "the map still holds only the reported directory"
+    );
+
+    // The rest of the tree still has its whole budget: one more reported
+    // directory fits under the cap of two.
+    adm.admit(record(30, ROOT, reason::FILE_CREATE, DIR, "also"), &mut out);
+    assert!(
+      matches!(&out[..], [UsnAdmitted::Single { target: UsnTarget::Resolved(c), .. }]
+        if c == &["also".to_owned()]),
+      "a reported create still admits: {out:?}"
+    );
+    assert_eq!(adm.map_mut().directories(), 2);
+  }
+
+  /// The seat speaks for DIRECTORIES only, and the record's own
+  /// `FILE_ATTRIBUTE_DIRECTORY` is what says which it is: a plain FILE named like a
+  /// pruned directory still delivers, so a `**/.*` written to skip dot-directories
+  /// does not silently ban every dotfile in the tree. The DIRECTORY of that name is
+  /// fenced in the same breath, so this is the boundary and not a mute button.
+  #[test]
+  fn a_file_named_like_a_pruned_directory_still_delivers() {
+    let mut adm = pruned_admission(None, &["**/cache"]);
+    let mut out = Vec::new();
+    adm.admit(
+      record(50, ROOT, reason::DATA_OVERWRITE, FILE, "cache"),
+      &mut out,
+    );
+    assert!(
+      matches!(&out[..], [UsnAdmitted::Single { target: UsnTarget::Resolved(c), .. }]
+        if c == &["cache".to_owned()]),
+      "a proven non-directory is judged on its ancestors alone: {out:?}"
+    );
+    out.clear();
+    adm.admit(
+      record(51, ROOT, reason::FILE_CREATE, DIR, "cache"),
+      &mut out,
+    );
+    assert!(
+      out.is_empty(),
+      "the DIRECTORY of that name is fenced: {out:?}"
+    );
+    assert_eq!(
+      adm.map_mut().directories(),
+      1,
+      "and it never entered the map"
+    );
+  }
+
+  /// A directory moved IN onto a pruned path must not be learned and must not
+  /// demand a walk — the twin of the exclusion row, through the other seat.
+  #[test]
+  fn a_move_in_onto_a_pruned_path_neither_learns_nor_walks() {
+    let mut adm = pruned_admission(None, &["**/cache"]);
+    let mut out = Vec::new();
+    adm.admit(
+      record(70, 999, reason::RENAME_OLD_NAME, DIR, "elsewhere"),
+      &mut out,
+    );
+    adm.admit(
+      record(
+        70,
+        ROOT,
+        reason::RENAME_OLD_NAME | reason::RENAME_NEW_NAME,
+        DIR,
+        "cache",
+      ),
+      &mut out,
+    );
+    assert!(
+      out.is_empty(),
+      "neither end is in the reported tree, so nothing is reported: {out:?}"
+    );
+    assert_eq!(adm.map_mut().directories(), 1, "and nothing was learned");
+    // And the arrival really is unmapped: a create under it resolves nothing.
+    adm.admit(record(80, 70, reason::FILE_CREATE, FILE, "child"), &mut out);
+    assert!(out.is_empty(), "{out:?}");
   }
 
   /// A file's churn inside an excluded subtree delivers nothing either — and the
@@ -6296,9 +6478,44 @@ mod exclusion_fence {
     );
   }
 
+  /// The COLD half's decision through the PRUNE seat: the walk learns a directory
+  /// child only when the fence declines its joined path, so a preexisting pruned
+  /// subtree can never exhaust the directory cap. The `**/` pattern spans any depth,
+  /// which is what makes one word cover every `node_modules` in the tree.
+  #[test]
+  fn the_seed_walks_decision_declines_a_pruned_subtree_before_the_cap() {
+    let fence = pruning_fence(&["**/node_modules"]);
+    let mut map = FrnMap::new(ROOT, Some(2));
+    let mut declined = 0usize;
+    let mut listing: Vec<(u128, u128, String, PathBuf)> =
+      vec![(10, ROOT, "keep".into(), PathBuf::from("/r/keep"))];
+    for n in 0..200u128 {
+      listing.push((
+        1000 + n,
+        ROOT,
+        format!("d{n}"),
+        PathBuf::from("/r/a/node_modules").join(format!("d{n}")),
+      ));
+    }
+    listing.push((11, ROOT, "also".into(), PathBuf::from("/r/also")));
+    for (frn, parent, name, path) in listing {
+      if fence.fences_path(true, &path) {
+        declined += 1;
+        continue;
+      }
+      assert_eq!(
+        map.learn(frn, parent, name),
+        super::map::LearnOutcome::Learned,
+        "the reported tree fits its cap"
+      );
+    }
+    assert_eq!(declined, 200);
+    assert_eq!(map.directories(), 2);
+  }
+
   /// The COLD half's decision, at the one place it is decidable off a real
   /// volume: the seed and reseed walks learn a directory child only when
-  /// [`UsnFence::excludes_path`] declines to fence its joined path, so a
+  /// [`UsnFence::fences_path`] declines to fence its joined path, so a
   /// preexisting excluded subtree can never exhaust the directory cap.
   ///
   /// This drives the predicate the walk calls over the shape a listing produces;
@@ -6324,7 +6541,7 @@ mod exclusion_fence {
     }
     listing.push((11, ROOT, "also".into(), PathBuf::from("/r/also")));
     for (frn, parent, name, path) in listing {
-      if fence.excludes_path(&path) {
+      if fence.fences_path(true, &path) {
         declined += 1;
         continue;
       }
