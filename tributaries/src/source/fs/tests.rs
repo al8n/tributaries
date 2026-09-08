@@ -452,6 +452,17 @@ mod integration {
   /// proves the root's ordered queue has already passed the window they would have
   /// occupied. The grace drain after it is belt-and-suspenders for a backend that
   /// batches on its own timer.
+  ///
+  /// `keep` pre-exists the arm, so its coverage must settle before any of the three
+  /// writes: on a descending backend `arm` resolves once the ROOT's own native stream is
+  /// live, never once the cold crawl has armed a subtree that already existed beneath it,
+  /// so a write issued right after `arm` can land in a window with no kernel record and no
+  /// listing to report it either. The settle probe is a DIRECTORY create rather than a
+  /// file, because `include` narrows FILE delivery to `**/*.mp4` — a plain-named probe
+  /// file is exactly what the seat is meant to silence and would never come back to end
+  /// the retry loop, while a directory change is not subject to `include` at all. `skip`
+  /// needs no such handshake: it is pruned, so nothing under it is ever observed, settled
+  /// or not — that silence is the cell's own point.
   #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
   async fn fs_source_arm_forwards_the_root_globs_to_the_watcher() {
     let (_dir, root) = scratch();
@@ -467,6 +478,29 @@ mod integration {
       .arm(&root_key, &globs)
       .await
       .expect("arm the tempdir under both seats");
+
+    let settled = tokio::time::timeout(DEADLINE, async {
+      let mut attempt = 0u32;
+      loop {
+        let probe = root.join("keep").join(format!("settle-{attempt}"));
+        attempt += 1;
+        std::fs::create_dir(&probe).expect("create the settle probe dir");
+        let seen = wait_for(&mut source, Duration::from_millis(250), |event| {
+          !event.is_rescan()
+            && event.handle() == armed.handle()
+            && key_to_path(event.key()) == probe
+        })
+        .await;
+        if seen.is_some() {
+          return;
+        }
+      }
+    })
+    .await;
+    assert!(
+      settled.is_ok(),
+      "coverage under `keep` never settled: no directory change there came back"
+    );
 
     let silent_kind = root.join("keep").join("notes.txt");
     let pruned = root.join("skip").join("clip.mp4");
