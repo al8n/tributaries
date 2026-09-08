@@ -21,7 +21,8 @@ use windows_sys::{
   Wdk::{
     Foundation::OBJECT_ATTRIBUTES,
     Storage::FileSystem::{
-      FILE_CREATE, FILE_DIRECTORY_FILE, FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+      FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_SYNCHRONOUS_IO_NONALERT,
+      NtCreateFile,
     },
   },
   Win32::{
@@ -700,11 +701,16 @@ pub(crate) fn final_path_of(handle: BorrowedHandle<'_>) -> io::Result<std::path:
 /// questions, and only the second one keeps a permitted create off
 /// `ACCESS_DENIED`.
 ///
-/// The handle this returns performs exactly ONE operation for its whole life:
-/// the delete disposition [`delete_by_handle`] sets at retirement.
-/// `driver::CookieDir` holds it for nothing else — no attribute read, no
-/// enumeration, no identity read, and no reparse verdict, since the mint takes
-/// its answer from this create's own `NTSTATUS` instead. So:
+/// The handle this returns performs exactly one ACCESS-CHECKED operation for its
+/// whole life: the delete disposition [`delete_by_handle`] sets at retirement.
+/// It also serves as the `RootDirectory` the marker's own create is anchored at
+/// ([`create_file_at`]) and answers its own name ([`final_path_of`]), and neither
+/// of those adds a bit here: that anchoring is the same one THIS create already
+/// rests on one level up, where the parent handle [`open_cookie_parent`] returns
+/// asks for zero access at all. `driver::CookieDir` holds it for nothing
+/// else — no attribute read, no enumeration, no identity read, and no reparse
+/// verdict, since the mint takes its answer from this create's own `NTSTATUS`
+/// instead. So:
 ///
 /// * `DELETE` is what that disposition requires. `NtSetInformationFile`
 ///   documents it for both classes [`delete_by_handle`] can set —
@@ -740,6 +746,55 @@ pub(crate) fn create_directory_at(
   parent: BorrowedHandle<'_>,
   leaf: &str,
 ) -> io::Result<OwnedHandle> {
+  create_at(
+    parent,
+    leaf,
+    FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+    "cookie directory",
+  )
+}
+
+/// CREATES the FILE named `leaf` directly inside the directory `parent` refers
+/// to, and answers the handle THAT CREATE produced — [`create_directory_at`]'s
+/// twin, for the sync cookie itself.
+///
+/// It exists for the same reason that one does, one level down. The cookie used
+/// to be created through `self.path.join(name)`, a path resolved afresh from the
+/// cookie directory's own recorded name: the retained directory handle shares
+/// deletion, so a peer may rename the freshly minted directory aside and stand a
+/// junction at its old leaf, and the create then follows that junction and puts
+/// the marker outside the directory the write judged — while the reply still
+/// names an in-root path and the barrier waits for an event that will never come.
+/// Anchoring the create at the directory's own HANDLE resolves no component at
+/// all, so there is nothing left to interpose on.
+///
+/// The options differ from the directory's in exactly one bit —
+/// `FILE_NON_DIRECTORY_FILE` where that one has `FILE_DIRECTORY_FILE` — and the
+/// access mask is the same `DELETE | SYNCHRONIZE`, derived the same way: a cookie
+/// is an EMPTY file whose existence is the whole message, so the only operations
+/// its handle ever performs are the identity read that promotes it, and the
+/// delete disposition that destroys it. `FILE_OPEN_REPARSE_POINT` is absent for
+/// the reason [`create_directory_at`] states: `FILE_CREATE` fails on a
+/// pre-existing leaf of ANY kind, a reparse point included, so the no-follow
+/// guarantee is total without it.
+pub(crate) fn create_file_at(parent: BorrowedHandle<'_>, leaf: &str) -> io::Result<OwnedHandle> {
+  create_at(
+    parent,
+    leaf,
+    FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+    "sync cookie",
+  )
+}
+
+/// The body both anchored creates share: one `NtCreateFile` against `parent`'s
+/// handle and a leaf NAME, never a path. `create_options` is the only thing that
+/// differs between them, and `what` names the object in the refusals.
+fn create_at(
+  parent: BorrowedHandle<'_>,
+  leaf: &str,
+  create_options: u32,
+  what: &str,
+) -> io::Result<OwnedHandle> {
   use crate::os::windows::security::{self, NtCreate};
 
   let name: Vec<u16> = leaf.encode_utf16().collect();
@@ -749,7 +804,7 @@ pub(crate) fn create_directory_at(
   let bytes = u16::try_from(size_of_val(name.as_slice())).map_err(|_| {
     io::Error::new(
       io::ErrorKind::InvalidInput,
-      "a cookie directory name longer than a UNICODE_STRING can measure",
+      format!("a {what} name longer than a UNICODE_STRING can measure"),
     )
   })?;
   let unicode = UNICODE_STRING {
@@ -795,7 +850,7 @@ pub(crate) fn create_directory_at(
       FILE_ATTRIBUTE_NORMAL,
       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
       FILE_CREATE,
-      FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+      create_options,
       std::ptr::null(),
       0,
     )
@@ -816,11 +871,11 @@ pub(crate) fn create_directory_at(
     // here and the name is left exactly as it was found.
     NtCreate::Collided => Err(io::Error::new(
       io::ErrorKind::AlreadyExists,
-      "the cookie directory's name was already bound",
+      format!("the {what}'s name was already bound"),
     )),
     NtCreate::Denied => Err(io::Error::new(
       io::ErrorKind::PermissionDenied,
-      "creating a cookie directory was denied",
+      format!("creating a {what} was denied"),
     )),
     NtCreate::Failed => {
       // SAFETY: `RtlNtStatusToDosError` reads no memory beyond its argument and
@@ -831,7 +886,7 @@ pub(crate) fn create_directory_at(
         // No Win32 code for this status. Reporting it as error 0 would render
         // the failure as "the operation completed successfully".
         io::Error::other(format!(
-          "creating a cookie directory failed with NTSTATUS {:#010x}",
+          "creating a {what} failed with NTSTATUS {:#010x}",
           status as u32
         ))
       } else {

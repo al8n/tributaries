@@ -12,7 +12,7 @@ use crate::os::linux::fanotify::{Fence, fid::Fid};
 
 /// The empty compiled prune seat, borrowed for a fence's whole lifetime.
 fn no_prune() -> &'static Globs {
-  static NONE: std::sync::LazyLock<Globs> = std::sync::LazyLock::new(|| Globs::new([]));
+  static NONE: std::sync::LazyLock<Globs> = std::sync::LazyLock::new(Globs::default);
   &NONE
 }
 
@@ -34,6 +34,7 @@ fn prune_words(patterns: &[&str]) -> Globs {
       .iter()
       .map(|pattern| Glob::new(pattern).expect("a valid pattern compiles")),
   )
+  .expect("a bounded set compiles")
 }
 
 /// Opens `path` as a pinned directory `OwnedFd` the same no-symlink way the walk

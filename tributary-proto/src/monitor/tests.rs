@@ -282,6 +282,61 @@ fn enumerate_emits_created_and_descends_into_dirs() {
   assert_eq!(child.target(), &WatchTarget::child(d, seg("sub")));
 }
 
+/// A cold listing's `Created` carries the class the LISTING PROVED, three-valued:
+/// a directory is `Some(true)`, a known non-directory is `Some(false)`, and an
+/// entry the read could not classify is [`None`] — unproven, not proven-not.
+///
+/// The middle case is what this cell is for. An `Unknown` entry is retained as an
+/// unsettled occupant and stat'd, and it may well answer DIRECTORY; stamping
+/// `Some(false)` on its `Created` hands every downstream delivery seat a proof
+/// the listing never made, and a seat that drops proven files would then drop a
+/// real directory's only announcement — after which coverage installs beneath it
+/// and its children arrive with no parent creation and no `Rescan` behind them.
+///
+/// The `ondir` gate reads the same derivation, so the two can never disagree
+/// about what an entry is.
+///
+/// Revert witness: stamp `Some(entry.is_dir())` again and the mystery entry is
+/// announced as a proven non-directory.
+#[test]
+fn a_cold_listing_reports_an_unclassified_entry_as_unproven() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+  let d = discovered_child_dir(&mut m, root, "d");
+  let read = armed_read(&mut m, d);
+
+  m.on_enumerate(
+    read,
+    EnumerateResult::Ok(vec![
+      DirEntry::new(seg("a.txt"), FileKind::File),
+      DirEntry::new(seg("sub"), FileKind::Dir),
+      DirEntry::new(seg("mystery"), FileKind::Unknown),
+      DirEntry::new(seg("link"), FileKind::Symlink),
+    ]),
+  );
+
+  let events = drain_events(&mut m);
+  let class = |name: &str| {
+    events
+      .iter()
+      .find(|e| e.location() == &loc(&["d", name]))
+      .unwrap_or_else(|| panic!("{name} is announced: {events:?}"))
+      .is_dir()
+  };
+  assert_eq!(class("sub"), Some(true), "a listed directory is proven one");
+  assert_eq!(class("a.txt"), Some(false), "and a listed file proven not");
+  assert_eq!(
+    class("link"),
+    Some(false),
+    "every other KNOWN kind is a proven non-directory too"
+  );
+  assert_eq!(
+    class("mystery"),
+    None,
+    "and the one the read could not classify is unproven, not proven-not"
+  );
+}
+
 #[test]
 fn enumerate_partial_forces_rescan() {
   let mut m = per_dir();

@@ -22,7 +22,7 @@ fn fid(tag: u8) -> Fid {
 /// The UNENGAGED fence — neither seat — which is what every row test outside the
 /// fence suite classifies under, so their actions are the pre-fence ones verbatim.
 fn unfenced() -> Fence<'static> {
-  static NONE: std::sync::LazyLock<Globs> = std::sync::LazyLock::new(|| Globs::new([]));
+  static NONE: std::sync::LazyLock<Globs> = std::sync::LazyLock::new(Globs::default);
   Fence::new(Path::new("/root"), &[], &NONE)
 }
 
@@ -2412,7 +2412,7 @@ mod exclusion_fence {
     event: &RawFanotifyEvent,
     exclusions: &[PathBuf],
   ) -> Admission {
-    let prune = Globs::new([]);
+    let prune = Globs::default();
     classify(
       map,
       event,
@@ -2429,7 +2429,8 @@ mod exclusion_fence {
       patterns
         .iter()
         .map(|pattern| Glob::new(pattern).expect("a valid pattern compiles")),
-    );
+    )
+    .expect("a bounded set compiles");
     classify(
       map,
       event,

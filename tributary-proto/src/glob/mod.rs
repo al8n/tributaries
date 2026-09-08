@@ -33,9 +33,9 @@
 //! a command line, and [`Glob::new`] is the one door it comes through. Two
 //! ceilings are enforced there, before the matcher ever sees the text —
 //! [`MAX_GLOB_LEN`] and [`MAX_GLOB_NESTING`] — so no pattern any face accepts can
-//! exhaust the stack or the automaton budget. A SET of already-valid patterns is
-//! bounded in turn by the seat that carries it (see [`Globs::new`], and
-//! `tributary_fs::RootOptions::MAX_SEAT_PATTERNS` for the seat that does it).
+//! exhaust the stack or the automaton budget. A SET is bounded by the third,
+//! [`MAX_SEAT_PATTERNS`], enforced by [`Globs::new`] itself — the one door a
+//! compiled set comes through, whichever crate holds the seat that carries it.
 //!
 //! # Unicode: one canonical form on both sides
 //!
@@ -88,6 +88,30 @@ pub const MAX_GLOB_LEN: usize = 1024;
 /// Eight is far above anything the vocabulary needs — `**/*.{mp4,mov,{a,b}}` is
 /// three — and far below anything a parser has to think about.
 pub const MAX_GLOB_NESTING: usize = 8;
+
+/// The most patterns ONE compiled set ([`Globs`]) may carry.
+///
+/// Each pattern is bounded on its own ([`MAX_GLOB_LEN`], [`MAX_GLOB_NESTING`]);
+/// this is the bound on the SET, and it exists because a set has a cost no single
+/// pattern has. A set compiles into one union automaton — a single pass per
+/// candidate however many patterns it holds — but that union has a size limit of
+/// the matcher's own, and a set that exceeds it degrades to asking each pattern in
+/// turn (see [`Globs::new`]). A prune fence asks a set once per DIRECTORY PREFIX
+/// of every event, so on the degraded arm the per-event work is
+/// `patterns × depth` automaton passes.
+///
+/// 256 is what makes that worst case a number rather than a document's whim: at
+/// the ceiling, a ten-deep path costs at most 2560 passes on a set the matcher
+/// refused to union, and the ordinary set — which unions, and which real
+/// configurations stay two orders of magnitude below — costs ten. A seat that
+/// wants more ground than 256 words describe wants a broader word, not a longer
+/// list.
+///
+/// It lives HERE, beside the matcher, rather than on any one configuration
+/// household: [`Globs::new`] is the only door a compiled set comes through, and a
+/// bound stated at a household above it is a bound a direct caller — or another
+/// crate's own seat — can walk around.
+pub const MAX_SEAT_PATTERNS: usize = 256;
 
 /// `text` in NFC, borrowed when it is already there.
 ///
@@ -166,11 +190,43 @@ impl core::fmt::Display for GlobError {
 
 impl core::error::Error for GlobError {}
 
+/// Why a set of valid patterns is not a valid [`Globs`]: there are too many of
+/// them.
+///
+/// The only way a set of already-compiled [`Glob`]s can be refused, so the value
+/// carries the one fact a caller can act on — how many patterns were supplied,
+/// against the [`MAX_SEAT_PATTERNS`] ceiling the message names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GlobsError {
+  supplied: usize,
+}
+
+impl GlobsError {
+  /// How many patterns the refused set carried.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn supplied(&self) -> usize {
+    self.supplied
+  }
+}
+
+impl core::fmt::Display for GlobsError {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    write!(
+      f,
+      "{} patterns exceed the per-set limit of {MAX_SEAT_PATTERNS}",
+      self.supplied
+    )
+  }
+}
+
+impl core::error::Error for GlobsError {}
+
 /// ONE validated glob pattern, compiled once at construction.
 ///
-/// Construction is the only fallible step: a `Glob` that exists has compiled
-/// AND has proven it can be matched with, so every set built from `Glob`s
-/// ([`Globs::new`]) is infallible and no later step can fail on it.
+/// Construction is the only fallible step for the PATTERN: a `Glob` that exists
+/// has compiled AND has proven it can be matched with, so a set built from
+/// `Glob`s ([`Globs::new`]) can only ever be refused for carrying too many of
+/// them, and no later step can fail on it.
 ///
 /// [`Display`](core::fmt::Display) and [`as_str`](Self::as_str) both give back
 /// the SOURCE text, unchanged — a pattern round-trips through any format that
@@ -389,8 +445,8 @@ impl<'de> serde::Deserialize<'de> for Glob {
 /// The compiled SET a seat matches with: many [`Glob`]s, one matcher.
 ///
 /// Cheap to clone (the compiled set sits behind an [`Arc`]), so a driver can
-/// hand one to every scope that needs it. Built infallibly from already-valid
-/// patterns ([`Globs::new`]).
+/// hand one to every scope that needs it. Built from already-valid patterns,
+/// bounded in number ([`Globs::new`]).
 ///
 /// Matching input is a root-relative path whose segments are joined with `/`,
 /// never with a leading separator; the root itself is the empty string and never
@@ -432,11 +488,13 @@ enum Matcher {
 }
 
 impl Globs {
-  /// Compiles `patterns` into one matcher.
+  /// Compiles `patterns` into one matcher, refusing more than
+  /// [`MAX_SEAT_PATTERNS`] of them.
   ///
-  /// Infallible **by construction**, in two steps: every [`Glob`] compiled at
-  /// ITS own construction, so no pattern here can be malformed; and the union
-  /// of those patterns is attempted but never *required*.
+  /// The COUNT is the only thing that can be refused here: every [`Glob`]
+  /// compiled at its own construction, so no pattern reaching this door can be
+  /// malformed, and the union of those patterns is attempted but never
+  /// *required*.
   ///
   /// # Why the union can be refused
   ///
@@ -462,17 +520,46 @@ impl Globs {
   /// The fallback costs one automaton pass PER PATTERN, and a prune fence asks a
   /// set once per directory prefix of every event — so the whole worst case is
   /// `patterns × prefix depth` passes per event, on the pattern sets large enough
-  /// to have refused a union in the first place. That is a real cost and it is
-  /// bounded where the patterns are ADMITTED rather than here: a seat carries at
-  /// most `tributary_fs::RootOptions::MAX_SEAT_PATTERNS` (256) of them, refused
-  /// with a typed configuration error, so the worst case is 256 passes per
-  /// prefix and not "as many as a document happened to list". Bounding it here
-  /// instead would mean refusing a `Globs` — an infallible constructor whose
-  /// whole promise is that a set of valid patterns always builds.
-  pub fn new(patterns: impl IntoIterator<Item = Glob>) -> Self {
-    let patterns: Vec<Glob> = patterns.into_iter().collect();
+  /// to have refused a union in the first place. That is a real cost, and THIS
+  /// constructor is where it is bounded: the count is checked before anything is
+  /// collected or compiled, so the worst case is 256 passes per prefix and not
+  /// "as many as a document happened to list".
+  ///
+  /// It is bounded here rather than at the configuration households above
+  /// because those are not the only door: a direct caller, or another crate's own
+  /// seat, reaches the matcher without passing any of them. A household still
+  /// refuses an over-full seat at ITS own boundary, where it can name the field
+  /// that carried it — this is the floor beneath every such refusal, not a
+  /// substitute for one.
+  ///
+  /// # Errors
+  ///
+  /// [`GlobsError`] when `patterns` yields more than [`MAX_SEAT_PATTERNS`]
+  /// patterns.
+  pub fn new(patterns: impl IntoIterator<Item = Glob>) -> Result<Self, GlobsError> {
+    // Bounded COLLECTION rather than a length test afterwards: an iterator a
+    // caller controls is read one item past the ceiling and no further, so a
+    // refusal costs an allocation the size of the ceiling rather than however
+    // many patterns that iterator was willing to yield. The one extra item is
+    // what makes the refusal exact — a set that fills the ceiling is legal, and
+    // only a set that goes on past it is not.
+    let mut source = patterns.into_iter();
+    let mut patterns: Vec<Glob> = Vec::new();
+    for glob in source.by_ref().take(MAX_SEAT_PATTERNS + 1) {
+      patterns.push(glob);
+    }
+    if patterns.len() > MAX_SEAT_PATTERNS {
+      // The count REACHED, not the count the iterator holds: reading the rest to
+      // report an exact total is the unbounded work this refusal exists to
+      // decline. `size_hint`'s lower bound adds what the source will admit to
+      // without being drained, so a `Vec` or a slice still names its true size.
+      let supplied = MAX_SEAT_PATTERNS
+        .saturating_add(1)
+        .saturating_add(source.size_hint().0);
+      return Err(GlobsError { supplied });
+    }
     if patterns.is_empty() {
-      return Self { inner: None };
+      return Ok(Self { inner: None });
     }
     let mut builder = globset::GlobSetBuilder::new();
     for glob in &patterns {
@@ -482,9 +569,9 @@ impl Globs {
       Ok(set) => Matcher::Set(set),
       Err(_) => Matcher::Each,
     };
-    Self {
+    Ok(Self {
       inner: Some(Arc::new(CompiledSet { patterns, matcher })),
-    }
+    })
   }
 
   /// The same set on the [`Matcher::Each`] arm, whatever the union would have
@@ -570,9 +657,20 @@ impl core::fmt::Debug for Globs {
   }
 }
 
-impl FromIterator<Glob> for Globs {
+/// `Globs` deliberately has NO [`FromIterator`] impl: `collect` cannot fail, and
+/// a set built by silently truncating — or by panicking — past
+/// [`MAX_SEAT_PATTERNS`] is exactly the unbounded seat this bound exists to
+/// refuse. The fallible spelling is this one.
+impl TryFrom<Vec<Glob>> for Globs {
+  type Error = GlobsError;
+
+  /// Compiles `patterns` — see [`Globs::new`].
+  ///
+  /// # Errors
+  ///
+  /// [`GlobsError`] when there are more than [`MAX_SEAT_PATTERNS`] of them.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  fn from_iter<T: IntoIterator<Item = Glob>>(patterns: T) -> Self {
+  fn try_from(patterns: Vec<Glob>) -> Result<Self, Self::Error> {
     Self::new(patterns)
   }
 }

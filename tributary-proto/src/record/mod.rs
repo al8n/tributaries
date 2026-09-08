@@ -70,6 +70,28 @@ impl FileKind {
   pub const fn is_unknown(&self) -> bool {
     matches!(self, Self::Unknown)
   }
+
+  /// The three-valued directory class this kind PROVES, in the shape
+  /// [`Change::is_dir`](crate::Change::is_dir) reports it:
+  /// [`Dir`](Self::Dir) is `Some(true)`, [`Unknown`](Self::Unknown) is [`None`],
+  /// and every other kind — all of them known non-directories — is `Some(false)`.
+  ///
+  /// The middle case is the whole point, and folding it into `Some(false)` is a
+  /// LIE about an object whose class nobody read: an `Unknown` entry may well
+  /// stat as a directory later, and a downstream seat that filters proven files
+  /// would have dropped its creation on that false proof — after which coverage
+  /// is installed, children arrive, and the parent's own creation was never
+  /// reported. Every consumer of the class already reads `None` as "unproven"
+  /// and fails open on it; this is the one derivation that hands them that
+  /// answer.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn proven_dir(&self) -> Option<bool> {
+    match self {
+      Self::Dir => Some(true),
+      Self::Unknown => None,
+      Self::File | Self::Symlink | Self::Other => Some(false),
+    }
+  }
 }
 
 impl core::fmt::Display for FileKind {

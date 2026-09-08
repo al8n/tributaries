@@ -5,7 +5,7 @@ fn glob(pattern: &str) -> Glob {
 }
 
 fn globs(patterns: &[&str]) -> Globs {
-  Globs::new(patterns.iter().copied().map(glob))
+  Globs::new(patterns.iter().copied().map(glob)).expect("a bounded set compiles")
 }
 
 /// A valid pattern compiles through every constructor, and each keeps the
@@ -85,7 +85,7 @@ fn the_empty_path_never_matches() {
 /// nothing.
 #[test]
 fn an_empty_set_matches_nothing() {
-  let empty = Globs::new(Vec::new());
+  let empty = Globs::new(Vec::new()).expect("an empty set compiles");
   assert!(empty.is_empty());
   assert!(empty.patterns().is_empty());
   assert!(!empty.is_match("anything/at/all"));
@@ -105,8 +105,10 @@ fn a_set_reports_the_patterns_it_was_built_from() {
     std::format!("{set:?}"),
     r#"[Glob("**/node_modules"), Glob("**/.git")]"#
   );
-  let collected: Globs = set.patterns().iter().cloned().collect();
-  assert_eq!(collected.patterns(), set.patterns());
+  // `TryFrom` rather than `collect`: the set's own bound has no infallible
+  // spelling, by design.
+  let rebuilt = Globs::try_from(set.patterns().to_vec()).expect("a bounded set rebuilds");
+  assert_eq!(rebuilt.patterns(), set.patterns());
 }
 
 /// The compiled set is shared, not copied: a clone answers identically without
@@ -180,6 +182,47 @@ fn the_per_pattern_fallback_answers_what_the_union_answers() {
 
   // And the empty set is the empty set on either arm.
   assert!(Globs::each(Vec::new()).is_empty());
+}
+
+/// A SET is bounded too, and the bound lives HERE rather than at a
+/// configuration household above: a direct caller reaches the matcher without
+/// passing any household, and an unbounded set buys `patterns × prefix depth`
+/// automaton passes per event on the arm that could not union.
+///
+/// The refusal names how many were supplied, so a person reading it can act on
+/// it — and the ceiling itself is legal, only the step past it is not.
+#[test]
+fn a_set_past_the_pattern_ceiling_is_a_typed_refusal() {
+  let many = |count: usize| {
+    (0..count)
+      .map(|n| glob(&std::format!("**/w{n}")))
+      .collect::<std::vec::Vec<_>>()
+  };
+
+  let full = Globs::new(many(MAX_SEAT_PATTERNS)).expect("the ceiling itself is honoured");
+  assert_eq!(full.patterns().len(), MAX_SEAT_PATTERNS);
+  assert!(full.is_match("a/w0"));
+
+  let err = Globs::new(many(MAX_SEAT_PATTERNS + 1)).expect_err("one past it is refused");
+  assert_eq!(err.supplied(), MAX_SEAT_PATTERNS + 1);
+  let rendered = err.to_string();
+  assert!(
+    rendered.contains(&std::format!("{}", MAX_SEAT_PATTERNS + 1))
+      && rendered.contains(&std::format!("{MAX_SEAT_PATTERNS}")),
+    "{rendered}"
+  );
+
+  // The `TryFrom` spelling is the same door, and there is no `collect` that
+  // could have walked around it.
+  assert_eq!(
+    Globs::try_from(many(MAX_SEAT_PATTERNS + 1)).unwrap_err(),
+    err
+  );
+
+  // A source that knows its own length reports the TRUE total rather than the
+  // ceiling it stopped reading at.
+  let far_past = Globs::new(many(MAX_SEAT_PATTERNS * 2)).expect_err("well past it is refused too");
+  assert_eq!(far_past.supplied(), MAX_SEAT_PATTERNS * 2);
 }
 
 /// An over-long pattern is a typed refusal, and it is refused BEFORE the

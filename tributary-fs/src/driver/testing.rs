@@ -1738,6 +1738,7 @@ impl FsOps for FakeFs {
       },
       receiver,
       meta,
+      root_pin: None,
     })
   }
 
@@ -1946,13 +1947,27 @@ impl FsOps for FakeFs {
     })
   }
 
-  fn write_cookie(
+  /// No descriptors exist in a modelled tree, so this fake pins nothing and the
+  /// [`LiveRoot`] the driver records for it carries no object. What the real
+  /// implementation would refuse for, the fake never reaches: its whole world is
+  /// the path map below.
+  fn pin_root(
     &self,
     root: &Path,
+    identity: crate::os::RootIdentity,
+  ) -> Option<std::sync::Arc<crate::driver::RootPin>> {
+    let _ = (root, identity);
+    None
+  }
+
+  fn write_cookie(
+    &self,
+    root: &crate::driver::LiveRoot,
     dir: &Path,
     name: &str,
     prune: &tributary_proto::glob::Globs,
   ) -> Result<CookieFile, CookieWriteError> {
+    let root = root.path();
     // The dispatch is counted BEFORE the hold: a cell that must race a scope
     // retirement (or an abandoned reply) against a write in flight needs to know
     // the write is parked in the pool, not still queued behind its settle fence.

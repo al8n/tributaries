@@ -9748,6 +9748,7 @@ mod descending {
           ancestors: Vec::new(),
           backend: BackendKind::Inotify,
         },
+        root_pin: None,
         replay: WatchOutcome::Installed(1),
         remaining: rx.len(),
       };
@@ -11424,6 +11425,66 @@ mod replace {
 /// cancellation) each leave zero cookies on disk and zero records behind.
 mod sync_cookie {
   use super::*;
+
+  /// The rule the Windows marker create is re-read against, asked of names alone
+  /// so every host can run it.
+  ///
+  /// That platform has no descriptor-relative create for the LEAF, so the marker
+  /// is created against the cookie directory's own handle and then the two names
+  /// — the directory's, read off the handle every verdict was taken on, and the
+  /// marker's, read off the handle the create returned — are compared. Directly
+  /// under, and under the name this process asked for: a marker one level deeper,
+  /// or one that answers to a different leaf, is as unreachable to the barrier as
+  /// one outside the tree entirely.
+  ///
+  /// The comparison is exact rather than a prefix test, which is the whole point:
+  /// a junction interposed at the directory's old leaf redirects the create to a
+  /// path that is still perfectly BENEATH something, and only "this exact parent"
+  /// says no to it.
+  #[test]
+  fn a_marker_is_accepted_only_directly_inside_the_judged_directory() {
+    use crate::driver::marker_stands_in;
+
+    let dir = Path::new(r"\\?\C:\r\.tributaries-sync-cookies-7");
+    let name = ".tributaries-sync-1";
+
+    assert!(
+      marker_stands_in(dir, &dir.join(name), name),
+      "the marker the create asked for, where the create was anchored"
+    );
+    assert!(
+      !marker_stands_in(dir, &dir.join("deep").join(name), name),
+      "one level deeper is not directly inside it"
+    );
+    assert!(
+      !marker_stands_in(
+        dir,
+        Path::new(r"\\?\C:\elsewhere").join(name).as_path(),
+        name
+      ),
+      "and a redirected create lands under a parent that is not this one"
+    );
+    assert!(
+      !marker_stands_in(dir, &dir.join("other"), name),
+      "the leaf must be the name the create bound, not merely some name here"
+    );
+    assert!(
+      !marker_stands_in(dir, dir, name),
+      "the directory itself is not a marker standing in it"
+    );
+    // A sibling whose name merely EXTENDS the judged directory's is a different
+    // directory, which a prefix test would have accepted.
+    assert!(
+      !marker_stands_in(
+        dir,
+        Path::new(r"\\?\C:\r\.tributaries-sync-cookies-77")
+          .join(name)
+          .as_path(),
+        name
+      ),
+      "and containment is the parent's identity, never a name prefix"
+    );
+  }
 
   /// The exported cookie-directory classifier recognizes exactly the names this crate
   /// mints for that directory — the bare stem, and the stem qualified by any uid
@@ -15733,7 +15794,8 @@ mod sync_cookie {
       std::fs::create_dir_all(&parent).expect("create the scratch parent");
       // The scratch directory IS the walk's root, so the pin is a zero-component
       // descent onto it — the same object a real write would end up holding.
-      let pinned = CookieParent::open(&parent, &parent).expect("the scratch parent pins");
+      let root = crate::driver::RootPin::for_tests(&parent).expect("the scratch root pins");
+      let pinned = CookieParent::open(&root, &parent, &parent).expect("the scratch parent pins");
       let dir = Arc::new(CookieDir::open_or_create(&pinned).expect("a cookie directory is minted"));
       (parent, dir)
     }
@@ -17295,7 +17357,8 @@ mod sync_cookie {
     /// descent onto it and the directory is created relative to what that
     /// descent holds.
     fn cookie_dir_in(parent: &std::path::Path) -> CookieDir {
-      let pinned = CookieParent::open(parent, parent).expect("the scratch parent pins");
+      let root = crate::driver::RootPin::for_tests(parent).expect("the scratch root pins");
+      let pinned = CookieParent::open(&root, parent, parent).expect("the scratch parent pins");
       CookieDir::open_or_create(&pinned).expect("the cookie directory opens")
     }
 
@@ -17326,7 +17389,9 @@ mod sync_cookie {
       std::fs::create_dir_all(&judged).expect("the judged directory");
       std::fs::create_dir_all(&decoy).expect("a directory of the same shape elsewhere");
 
-      let parent = CookieParent::open(&root, &judged).expect("the walk reaches the judged object");
+      let pin = crate::driver::RootPin::for_tests(&root).expect("the scratch root pins");
+      let parent =
+        CookieParent::open(&pin, &root, &judged).expect("the walk reaches the judged object");
       assert_eq!(
         parent.path(),
         judged.as_path(),
@@ -17365,6 +17430,78 @@ mod sync_cookie {
       );
     }
 
+    /// A cookie descends from the ROOT OBJECT the scope is attached to, never from
+    /// the pathname that named it when the scope went live.
+    ///
+    /// The escape this closes: the registry held only the root's canonical path,
+    /// and the write re-resolved it. Rename the root aside and stand a fresh tree
+    /// at its name — between the sync's admission and the write, a window the
+    /// blocking pool makes wide — and BOTH canonicalizations now resolve inside
+    /// the replacement. Containment passes, the generation check passes (nothing
+    /// replaced the SCOPE), the write returns `Ok` with an in-root path, and the
+    /// marker sits in a tree whose events this stream will never carry: a barrier
+    /// that resolved nowhere and a caller parked until it times out.
+    ///
+    /// The pin makes the answer object-shaped instead. The descent starts at the
+    /// descriptor the spawn opened, so the write either lands in the original
+    /// object or refuses outright; the one outcome it may not have is the
+    /// replacement.
+    ///
+    /// Real syscalls, because what is being tested is which OBJECT a name reaches
+    /// after a rename — a question no modelled tree can be asked.
+    ///
+    /// Revert witness: descend from `canonicalize(root)` again and the cookie
+    /// appears under the replacement.
+    #[test]
+    fn a_cookie_never_descends_into_a_replacement_of_the_watched_root() {
+      let base = scratch("root-replaced");
+      let root = base.join("root");
+      std::fs::create_dir_all(root.join("sub")).expect("the watched tree");
+
+      // The scope goes live HERE: the canonical root and the object behind it are
+      // recorded together, exactly as a spawn records them.
+      let live = crate::driver::LiveRoot::for_tests(&root);
+
+      // …and a peer then swaps the whole tree out from under the name, leaving a
+      // replacement of the same shape standing at it.
+      std::fs::rename(&root, base.join("moved")).expect("the real tree moves aside");
+      std::fs::create_dir_all(root.join("sub")).expect("a replacement of the same shape");
+      assert_eq!(
+        std::fs::canonicalize(root.join("sub")).expect("the spelling still resolves"),
+        base.join("root").join("sub"),
+        "staging: every path the old write would have resolved is inside the \
+         replacement"
+      );
+
+      let written = RealFs::new().write_cookie(
+        &live,
+        &root.join("sub"),
+        ".tributaries-sync-replaced",
+        &tributary_proto::glob::Globs::default(),
+      );
+
+      let landed = |dir: &std::path::Path| {
+        std::fs::read_dir(dir)
+          .expect("the directory is readable")
+          .filter_map(Result::ok)
+          .any(|entry| crate::driver::is_sync_cookie_dir_name(&entry.file_name().to_string_lossy()))
+      };
+      assert!(
+        !landed(&root.join("sub")),
+        "nothing of this write reached the replacement, whether it succeeded or \
+         refused: {written:?}"
+      );
+      if written.is_ok() {
+        assert!(
+          landed(&base.join("moved").join("sub")),
+          "and a write that DID succeed went into the object the scope is \
+           attached to"
+        );
+      }
+
+      let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// The replacement's contents, so the survivor is proven by what it HOLDS and
     /// not merely by something existing at the name.
     const STRANGER: &[u8] = b"a file the watcher never created";
@@ -17383,10 +17520,10 @@ mod sync_cookie {
       let fs = RealFs::new();
       let cookie = fs
         .write_cookie(
-          &root,
+          &crate::driver::LiveRoot::for_tests(&root),
           &root,
           ".tributaries-sync-displaced",
-          &tributary_proto::glob::Globs::new([]),
+          &tributary_proto::glob::Globs::default(),
         )
         .expect("a cookie is created in a writable scratch root");
 
@@ -17425,10 +17562,10 @@ mod sync_cookie {
       let fs = RealFs::new();
       let cookie = fs
         .write_cookie(
-          &root,
+          &crate::driver::LiveRoot::for_tests(&root),
           &root,
           ".tributaries-sync-plain",
-          &tributary_proto::glob::Globs::new([]),
+          &tributary_proto::glob::Globs::default(),
         )
         .expect("a cookie is created in a writable scratch root");
       assert_eq!(
@@ -17476,10 +17613,10 @@ mod sync_cookie {
       let fs = RealFs::new();
       let cookie = fs
         .write_cookie(
-          &root,
+          &crate::driver::LiveRoot::for_tests(&root),
           &root,
           ".tributaries-sync-gone",
-          &tributary_proto::glob::Globs::new([]),
+          &tributary_proto::glob::Globs::default(),
         )
         .expect("a cookie is created in a writable scratch root");
       std::fs::remove_file(cookie.path()).expect("someone else reaps it first");
@@ -17552,10 +17689,10 @@ mod sync_cookie {
       // pinned by the `CookieFile` this cell holds for the whole cycle below.
       let cookie = fs
         .write_cookie(
-          &root,
+          &crate::driver::LiveRoot::for_tests(&root),
           &root,
           ".tributaries-sync-reuse",
-          &tributary_proto::glob::Globs::new([]),
+          &tributary_proto::glob::Globs::default(),
         )
         .expect("a cookie is created in a writable scratch root");
       std::fs::remove_file(cookie.path()).expect("the stranger deletes the cookie");
@@ -17679,10 +17816,10 @@ mod sync_cookie {
       let fs = RealFs::new();
       let cookie = fs
         .write_cookie(
-          &root,
+          &crate::driver::LiveRoot::for_tests(&root),
           &dir,
           ".tributaries-sync-unprovable",
-          &tributary_proto::glob::Globs::new([]),
+          &tributary_proto::glob::Globs::default(),
         )
         .expect("a cookie is created in a writable scratch root");
 
@@ -17732,10 +17869,10 @@ mod sync_cookie {
       let fs = RealFs::new();
       let cookie = fs
         .write_cookie(
-          &root,
+          &crate::driver::LiveRoot::for_tests(&root),
           &root,
           ".tributaries-sync-fifo",
-          &tributary_proto::glob::Globs::new([]),
+          &tributary_proto::glob::Globs::default(),
         )
         .expect("a cookie is created in a writable scratch root");
       std::fs::remove_file(cookie.path()).expect("the cookie's name is freed");
@@ -17909,10 +18046,10 @@ mod sync_cookie {
       let fs = RealFs::new();
       let cookie = fs
         .write_cookie(
-          &root,
+          &crate::driver::LiveRoot::for_tests(&root),
           &root,
           ".tributaries-sync-reap-pin",
-          &tributary_proto::glob::Globs::new([]),
+          &tributary_proto::glob::Globs::default(),
         )
         .expect("a cookie is created in a writable scratch root");
       assert!(
@@ -17960,10 +18097,10 @@ mod sync_cookie {
       let fs = RealFs::new();
       let cookie = fs
         .write_cookie(
-          &root,
+          &crate::driver::LiveRoot::for_tests(&root),
           &dir,
           ".tributaries-sync-reap-pin-kept",
-          &tributary_proto::glob::Globs::new([]),
+          &tributary_proto::glob::Globs::default(),
         )
         .expect("a cookie is created in a writable scratch root");
 
@@ -18125,10 +18262,10 @@ mod sync_cookie {
       // exactly the ones the next write will resolve.
       let cookie = fs
         .write_cookie(
-          &root,
+          &crate::driver::LiveRoot::for_tests(&root),
           &root,
           ".tributaries-sync-dir-mode",
-          &tributary_proto::glob::Globs::new([]),
+          &tributary_proto::glob::Globs::default(),
         )
         .expect("a cookie is created in a writable scratch root");
       let cookie_dir = cookie
@@ -18141,10 +18278,10 @@ mod sync_cookie {
       std::fs::set_permissions(&cookie_dir, std::fs::Permissions::from_mode(0o777))
         .expect("the scratch tree accepts the widened mode");
       let widened = fs.write_cookie(
-        &root,
+        &crate::driver::LiveRoot::for_tests(&root),
         &root,
         ".tributaries-sync-dir-mode-2",
-        &tributary_proto::glob::Globs::new([]),
+        &tributary_proto::glob::Globs::default(),
       );
 
       // SAFETY: `geteuid` reads no memory, takes no arguments, and cannot fail.
@@ -18161,10 +18298,10 @@ mod sync_cookie {
         let given = unsafe { libc::chown(path.as_ptr(), 1, u32::MAX) };
         assert_eq!(given, 0, "root may give the cookie directory away");
         fs.write_cookie(
-          &root,
+          &crate::driver::LiveRoot::for_tests(&root),
           &root,
           ".tributaries-sync-dir-owner",
-          &tributary_proto::glob::Globs::new([]),
+          &tributary_proto::glob::Globs::default(),
         )
       });
       let _ = std::fs::set_permissions(&cookie_dir, std::fs::Permissions::from_mode(0o700));
@@ -18219,7 +18356,8 @@ mod sync_cookie {
     /// anchored at and the verdicts are taken on. `parent` stands as its own
     /// root here, which is what a cell reaching straight for the mint wants.
     fn pinned(parent: &Path) -> CookieParent {
-      CookieParent::open(parent, parent).expect("the scratch parent pins")
+      let root = crate::driver::RootPin::for_tests(parent).expect("the scratch root pins");
+      CookieParent::open(&root, parent, parent).expect("the scratch parent pins")
     }
 
     /// A cookie directory minted inside `parent`, through that pin.
@@ -18269,10 +18407,10 @@ mod sync_cookie {
       let fs = RealFs::new();
       let cookie = fs
         .write_cookie(
-          &root,
+          &crate::driver::LiveRoot::for_tests(&root),
           &root,
           ".tributaries-sync-dispose",
-          &tributary_proto::glob::Globs::new([]),
+          &tributary_proto::glob::Globs::default(),
         )
         .expect("a cookie is created in a writable scratch root");
       let cookie_dir = cookie_dir_of(&cookie);
@@ -18332,10 +18470,10 @@ mod sync_cookie {
       let fs = RealFs::new();
       let cookie = fs
         .write_cookie(
-          &root,
+          &crate::driver::LiveRoot::for_tests(&root),
           &root,
           ".tributaries-sync-renamed",
-          &tributary_proto::glob::Globs::new([]),
+          &tributary_proto::glob::Globs::default(),
         )
         .expect("a cookie is created in a writable scratch root");
       let cookie_dir = cookie_dir_of(&cookie);
@@ -18480,10 +18618,10 @@ mod sync_cookie {
       let fs = RealFs::new();
       let cookie = fs
         .write_cookie(
-          &root,
+          &crate::driver::LiveRoot::for_tests(&root),
           &root,
           ".tributaries-sync-dispose-refused",
-          &tributary_proto::glob::Globs::new([]),
+          &tributary_proto::glob::Globs::default(),
         )
         .expect("a cookie is created in a writable scratch root");
       let cookie_dir = cookie_dir_of(&cookie);
@@ -18672,10 +18810,10 @@ mod sync_cookie {
       // And the production path, with the same junk standing.
       let fs = RealFs::new();
       let written = fs.write_cookie(
-        &root,
+        &crate::driver::LiveRoot::for_tests(&root),
         &root,
         ".tributaries-sync-junk",
-        &tributary_proto::glob::Globs::new([]),
+        &tributary_proto::glob::Globs::default(),
       );
       let landed = written.as_ref().ok().map(cookie_dir_of);
       let removal = written.as_ref().ok().map(|cookie| fs.remove_cookie(cookie));
@@ -18767,10 +18905,10 @@ mod sync_cookie {
       let fs = RealFs::new();
       let cookie = fs
         .write_cookie(
-          &root,
+          &crate::driver::LiveRoot::for_tests(&root),
           &root,
           ".tributaries-sync-residue",
-          &tributary_proto::glob::Globs::new([]),
+          &tributary_proto::glob::Globs::default(),
         )
         .expect("a stale cookie directory beside it blocks nothing");
       let landed = cookie_dir_of(&cookie);

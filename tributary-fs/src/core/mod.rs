@@ -2024,7 +2024,7 @@ impl DriverCore {
     profile: BackendKind,
   ) -> Result<ScopeId, WatchRootError> {
     let interest = options.interest();
-    let (prune, include) = options.compile();
+    let (prune, include) = options.compile()?;
     self.scope_seq += 1;
     let scope = ScopeId::new(NonZeroU64::new(self.scope_seq).expect("sequence starts at one"));
     let Some(watch) = self
@@ -3528,7 +3528,7 @@ impl DriverCore {
     self
       .scopes
       .get(&scope)
-      .map_or_else(|| Globs::new([]), |state| state.prune.clone())
+      .map_or_else(Globs::default, |state| state.prune.clone())
   }
 
   /// A live scope's mount frame `(root_dev, root_mnt_id)` — the same-frame
@@ -4611,7 +4611,17 @@ impl DriverCore {
         {
           Self::accept(&mut self.monitor, state, &mut kept, repair, now);
         }
-        if let Some(repair) = revealed {
+        // The destination cover goes through the FENCE like anything else bound
+        // for the Monitor. It is born after the record's own verdict was taken,
+        // and it names a path that verdict never judged: a directory rename into
+        // pruned ground keeps both halves (neither is a PROVEN directory, so
+        // neither is judged on its own last segment) and then reveals a
+        // destination the seat does cover. Accepting it unjudged emitted a
+        // `Rescan` naming exactly the subtree the caller pruned — an instruction
+        // to enumerate ground whose every later change stays silent.
+        if let Some(repair) = revealed
+          && let Some(repair) = self.fenced_repair(state, exclusions, scope, repair)
+        {
           Self::accept(&mut self.monitor, state, &mut kept, repair, now);
         }
       }
@@ -4684,7 +4694,10 @@ impl DriverCore {
         None
       };
       kept.push(planned);
-      kept.extend(revealed);
+      // Fenced for the reason the batch-time twin is: this cover is born after
+      // its record's verdict and names ground that verdict never judged, so it
+      // is the one input that could carry a `Rescan` into a pruned subtree.
+      kept.extend(revealed.and_then(|repair| self.fenced_repair(state, exclusions, scope, repair)));
     }
     resolved.planned = kept;
     if before > 0 && resolved.planned.is_empty() {
@@ -4831,9 +4844,39 @@ impl DriverCore {
   /// reason the fence judges it as one — a backend that reported no class has not
   /// reported a file.
   ///
-  /// Needs no fencing of its own: it is anchored at the destination of a record
-  /// the fence just KEPT, and a kept record's endpoint is by construction not
-  /// pruned.
+  /// Fenced by its caller before acceptance, and the reason is the very case this
+  /// cover exists for: a kept record's endpoint is NOT by construction unpruned.
+  /// The record fence judges a leaf only when the backend PROVED it a directory,
+  /// and the profiles that owe this cover are exactly the ones whose records
+  /// often prove nothing — so a directory rename into pruned ground keeps both
+  /// halves and reveals a destination the seat covers. See
+  /// [`fenced_repair`](Self::fenced_repair).
+  /// One LATE-born repair, run through the same fence every planned input goes
+  /// through: `None` where the fence drops it, and the widened signal where the
+  /// fence re-aims it above a pruned leaf.
+  ///
+  /// It exists as its own step because a repair is born on the far side of its
+  /// record's verdict — after the feed at batch time, after the resolution at
+  /// probe time — and so is the one input the record-by-record pass structurally
+  /// cannot have judged. Widening rather than dropping is what keeps the
+  /// recovery instruction alive: a `Rescan` one level above the pruned leaf still
+  /// covers what was revealed while naming only ground the caller hears about,
+  /// which is the same trade [`fenced`](Self::fenced) already makes for every
+  /// other located over-signal.
+  fn fenced_repair(
+    &self,
+    state: &ScopeState,
+    exclusions: bool,
+    scope: ScopeId,
+    repair: Planned,
+  ) -> Option<Planned> {
+    match self.fenced(state, exclusions, scope, &repair) {
+      Fenced::Stands => Some(repair),
+      Fenced::Dropped => None,
+      Fenced::Widened(widened) => Some(widened),
+    }
+  }
+
   fn revealed(planned: &Planned) -> Option<Planned> {
     match planned {
       Planned::Rec(rec)
@@ -5789,15 +5832,18 @@ impl DriverCore {
   ///   ([`Change::is_dir`] `!= Some(false)`). Directories always pass, so a moved
   ///   or removed folder is never silent, and an unproven class fails OPEN — a
   ///   backend that reported no class has not reported a file;
-  /// - **(d)** this driver's OWN sync cookie: a change some location segment of
-  ///   which is a cookie directory's name
-  ///   ([`is_sync_cookie_dir_name`](crate::is_sync_cookie_dir_name)). The marker
-  ///   is a file, and it is the file a `sync` barrier waits on — a caller's
-  ///   pattern about the caller's own media has no business deciding whether the
-  ///   watcher can observe its own artifact, and a seat that dropped it would
-  ///   turn every restricted-include sync into a timeout. Read over every segment
-  ///   because a sync is placed under the SUBSCRIPTION's directory, which need
-  ///   not be the root. The layer that owns the namespace keeps these off the
+  /// - **(d)** this driver's OWN sync cookie: a change whose location IS the
+  ///   reserved cookie directory or its DIRECT marker child
+  ///   ([`prune_prefixes`](crate::driver::prune_prefixes) exempts exactly the
+  ///   same two). The marker is a file, and it is the file a `sync` barrier waits
+  ///   on — a caller's pattern about the caller's own media has no business
+  ///   deciding whether the watcher can observe its own artifact, and a seat that
+  ///   dropped it would turn every restricted-include sync into a timeout. Read
+  ///   over every segment because a sync is placed under the SUBSCRIPTION's
+  ///   directory, which need not be the root, and read POSITIONALLY because a
+  ///   deeper descendant of a cookie-named directory is nothing this driver ever
+  ///   wrote: a stray file under one is the caller's own ground and is filtered
+  ///   like any other. The layer that owns the namespace keeps these off the
   ///   consumer's stream regardless, so admitting here widens the barrier's view
   ///   and not the caller's;
   /// - **(e)** a last location segment that matches;
@@ -5816,12 +5862,10 @@ impl DriverCore {
     if change.kind().is_rescan() || change.is_dir() != Some(false) {
       return true;
     }
-    if change
-      .location()
-      .segments()
-      .iter()
-      .any(|segment| crate::driver::is_sync_cookie_dir_name(segment.as_str()))
-    {
+    let segments = change.location().segments();
+    if segments.iter().enumerate().any(|(index, segment)| {
+      crate::driver::is_sync_cookie_artifact_segment(segment.as_str(), index, segments.len())
+    }) {
       return true;
     }
     let matches = |location: &Location| {

@@ -30,7 +30,7 @@ fn unfenced() -> Fence<'static> {
 /// The empty compiled prune seat, borrowed for a fence's whole lifetime.
 fn no_prune() -> &'static tributary_proto::glob::Globs {
   static NONE: std::sync::LazyLock<tributary_proto::glob::Globs> =
-    std::sync::LazyLock::new(|| tributary_proto::glob::Globs::new([]));
+    std::sync::LazyLock::new(tributary_proto::glob::Globs::default);
   &NONE
 }
 
@@ -46,6 +46,7 @@ fn prune_words(patterns: &[&str]) -> tributary_proto::glob::Globs {
       .iter()
       .map(|pattern| tributary_proto::glob::Glob::new(pattern).expect("a valid pattern compiles")),
   )
+  .expect("a bounded set compiles")
 }
 
 /// The exact `Fid` `decode_events` yields from a wire FID (handle = `handle_type`

@@ -621,7 +621,7 @@ impl ReseedContext {
       root_fid: Fid::new([0u8; 8], Box::from(&[0u8][..])),
       max_directories: None,
       exclusions: Arc::from(Vec::new()),
-      prune: Globs::new([]),
+      prune: Globs::default(),
     }
   }
 }

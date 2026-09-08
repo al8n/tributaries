@@ -694,6 +694,67 @@ mod root_options {
       assert_eq!(parsed.include().map(patterns), Some(std::vec!["**/*.mkv"]));
     }
 
+    /// A seat past the ceiling is a DOCUMENT error, refused mid-list rather than
+    /// collected whole and measured afterwards.
+    ///
+    /// The bound is a resource bound, so a face that reads an untrusted length to
+    /// the end before judging it has already paid what the bound exists to
+    /// refuse: every pattern in the list compiles an automaton on the way in. The
+    /// element that would take the seat past the ceiling is where the read stops.
+    ///
+    /// Revert witness: derive the two fields plainly and a 257-entry document
+    /// parses into a household `validate` then has to catch — after compiling
+    /// every one of them.
+    #[test]
+    fn a_document_past_the_pattern_ceiling_is_refused() {
+      let cap = RootOptions::MAX_SEAT_PATTERNS;
+      let list = |count: usize| {
+        (0..count)
+          .map(|n| std::format!("\"**/w{n}\""))
+          .collect::<std::vec::Vec<_>>()
+          .join(",")
+      };
+
+      let full: RootOptions =
+        serde_json::from_str(&std::format!(r#"{{"prune": [{}]}}"#, list(cap)))
+          .expect("the ceiling itself is honoured");
+      assert_eq!(full.prune().len(), cap);
+
+      let err =
+        serde_json::from_str::<RootOptions>(&std::format!(r#"{{"prune": [{}]}}"#, list(cap + 1)))
+          .expect_err("one past it is a document error");
+      assert!(
+        err.to_string().contains(&std::format!("{cap}")),
+        "the refusal names the ceiling: {err}"
+      );
+
+      let err =
+        serde_json::from_str::<RootOptions>(&std::format!(r#"{{"include": [{}]}}"#, list(cap + 1)))
+          .expect_err("the include seat carries the same ceiling");
+      assert!(err.to_string().contains(&std::format!("{cap}")), "{err}");
+
+      // The seat's other two shapes are untouched: absent is the absent seat,
+      // and an explicit empty list is the engaged one that admits nothing.
+      assert_eq!(
+        serde_json::from_str::<RootOptions>(r#"{}"#)
+          .expect("an empty document parses")
+          .include(),
+        None
+      );
+      assert_eq!(
+        serde_json::from_str::<RootOptions>(r#"{"include": []}"#)
+          .expect("an empty seat parses")
+          .include(),
+        Some(&[][..])
+      );
+      assert_eq!(
+        serde_json::from_str::<RootOptions>(r#"{"include": null}"#)
+          .expect("an explicit null parses")
+          .include(),
+        None
+      );
+    }
+
     /// A document naming ONE key leaves every other knob at the value `new()`
     /// gives it — the struct-level `#[serde(default)]`.
     #[test]
@@ -837,6 +898,81 @@ mod root_options {
         err.render().to_string().contains("invalid glob"),
         "the type's own message reaches the command line: {}",
         err.render()
+      );
+    }
+
+    /// The household composes as an OPTIONAL flatten, which is the one shape that
+    /// needs a real arg group underneath it.
+    ///
+    /// clap decides `Some` from `None` by asking whether this household's
+    /// `ArgGroup` was matched, and it asks for the group's id while BUILDING the
+    /// command — panicking outright when there is none. Forwarding the proxy's own
+    /// derived group would not do either: clap's derive leaves that group empty for
+    /// any struct containing a nested flatten, and an empty group is never present,
+    /// so every flag would parse and then be discarded.
+    ///
+    /// Both halves are asserted: the household is `None` when the caller spelled
+    /// nothing of it, and `Some` — carrying the value — after ANY of its arguments,
+    /// the nested interest flags included.
+    ///
+    /// Revert witness: drop `group_id` and this cell panics before it parses a
+    /// single argument.
+    #[test]
+    fn an_optional_flatten_is_present_exactly_when_a_flag_was_given() {
+      #[derive(Debug, clap::Parser)]
+      struct Optional {
+        #[arg(long)]
+        unrelated: bool,
+        #[command(flatten)]
+        root: Option<RootOptions>,
+      }
+
+      let parse = |args: &[&str]| {
+        Optional::parse_from(std::iter::once("app").chain(args.iter().copied())).root
+      };
+
+      assert_eq!(parse(&[]), None, "nothing of the household was spelled");
+      assert_eq!(
+        parse(&["--unrelated"]),
+        None,
+        "and another argument entirely does not conjure one"
+      );
+
+      // A direct argument.
+      let pruned = parse(&["--prune", "**/node_modules"]).expect("a seat flag makes it present");
+      assert_eq!(patterns(pruned.prune()), ["**/node_modules"]);
+      assert_eq!(
+        pruned.interest(),
+        RootOptions::DEFAULT_INTEREST,
+        "and the rest of the household is still its own default"
+      );
+
+      let included = parse(&["--include", "**/*.mp4"]).expect("the other seat too");
+      assert_eq!(
+        included.include().map(patterns),
+        Some(std::vec!["**/*.mp4"])
+      );
+
+      // A NESTED argument — the half a forwarded derived group would have lost.
+      for flag in [
+        "--created",
+        "--removed",
+        "--modified",
+        "--moved",
+        "--attrib",
+        "--ondir",
+      ] {
+        let narrowed =
+          parse(&[flag]).unwrap_or_else(|| panic!("{flag} is a member of the household's group"));
+        assert_ne!(
+          narrowed.interest(),
+          RootOptions::DEFAULT_INTEREST,
+          "{flag} both makes the household present and narrows it"
+        );
+      }
+      assert_eq!(
+        parse(&["--created", "--moved"]).map(|root| root.interest()),
+        Some(Interest::new().with_created().with_moved())
       );
     }
 

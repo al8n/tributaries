@@ -4012,14 +4012,22 @@ impl Monitor {
           // boundary directory is announced as the directory it is and installed
           // as a leaf (`listed_occupant`). Reporting it as a non-directory would
           // hand every downstream file filter licence to drop a real directory.
-          if self.ondir_allows(scope, Some(entry.is_dir())) {
+          //
+          // Three-valued, from the kind the listing actually carried: an entry
+          // the read could not classify is UNPROVEN, not proven-not-a-directory.
+          // It is retained here as an unsettled occupant and may yet stat as a
+          // directory, so stamping `Some(false)` on it would hand a delivery seat
+          // a proof it does not have — and the directory's own `Created`, dropped
+          // on that proof, is never re-offered once coverage installs beneath it.
+          let class = entry.kind().proven_dir();
+          if self.ondir_allows(scope, class) {
             let location = self.child_location(dir, entry.name());
             self.emit(
               scope,
               location,
               ChangeKind::Created,
               Evidence::of(RecordKind::Created),
-              Some(entry.is_dir()),
+              class,
             );
           }
           // A cold enumerate is discovery, not a replace, so an already-watched slot

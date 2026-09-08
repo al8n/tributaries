@@ -1047,11 +1047,15 @@ impl Default for WatcherOptions {
 /// nesting) and one seat by [`MAX_SEAT_PATTERNS`](Self::MAX_SEAT_PATTERNS), which
 /// [`validate`](Self::validate) checks and
 /// [`watch_with`](crate::Watcher::watch_with) refuses on before any coverage
-/// exists.
+/// exists. The `serde` face refuses an over-full seat mid-document, so a list
+/// past the ceiling never even compiles; and beneath every one of those the
+/// matcher's own constructor carries the same bound, so a seat this household
+/// never saw is bounded too.
 ///
 /// With the `serde` feature the household is one object keyed by the field
 /// names, every key optional and defaulted from [`new`](Self::new); the two glob
-/// seats are lists of plain strings, and an invalid pattern is a document error.
+/// seats are lists of plain strings, and an invalid pattern — or a list longer
+/// than the ceiling — is a document error.
 ///
 /// ```json
 /// { "prune": ["**/node_modules", "**/.git"], "include": ["**/*.{mp4,mov}"] }
@@ -1095,8 +1099,114 @@ impl Default for WatcherOptions {
 #[cfg_attr(feature = "serde", serde(default))]
 pub struct RootOptions {
   interest: Interest,
+  #[cfg_attr(feature = "serde", serde(deserialize_with = "deserialize_seat"))]
   prune: Vec<Glob>,
+  #[cfg_attr(
+    feature = "serde",
+    serde(deserialize_with = "deserialize_optional_seat")
+  )]
   include: Option<Vec<Glob>>,
+}
+
+/// Reads ONE glob seat, refusing the element past
+/// [`RootOptions::MAX_SEAT_PATTERNS`] rather than the list after it.
+///
+/// The refusal has to happen mid-sequence to mean anything: a document is an
+/// untrusted length, and collecting it whole so the count can be checked
+/// afterwards has already compiled — and kept — every automaton the bound exists
+/// to refuse. So the element that would take the seat past the ceiling is where
+/// this stops, with at most the ceiling's worth of patterns ever built.
+#[cfg(feature = "serde")]
+fn deserialize_seat<'de, D>(deserializer: D) -> Result<Vec<Glob>, D::Error>
+where
+  D: serde::Deserializer<'de>,
+{
+  struct Seat;
+
+  impl<'de> serde::de::Visitor<'de> for Seat {
+    type Value = Vec<Glob>;
+
+    fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+      write!(
+        f,
+        "at most {} glob patterns",
+        RootOptions::MAX_SEAT_PATTERNS
+      )
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+      A: serde::de::SeqAccess<'de>,
+    {
+      use serde::de::Error as _;
+
+      // The hint is a document's own claim, so it steers the allocation and
+      // never the bound: capped at the ceiling, it cannot be used to ask for a
+      // reservation nothing will fill.
+      let hint = seq
+        .size_hint()
+        .unwrap_or(0)
+        .min(RootOptions::MAX_SEAT_PATTERNS);
+      let mut patterns = Vec::with_capacity(hint);
+      while let Some(glob) = seq.next_element::<Glob>()? {
+        if patterns.len() == RootOptions::MAX_SEAT_PATTERNS {
+          return Err(A::Error::custom(std::format!(
+            "more glob patterns than the per-seat limit of {}",
+            RootOptions::MAX_SEAT_PATTERNS
+          )));
+        }
+        patterns.push(glob);
+      }
+      Ok(patterns)
+    }
+  }
+
+  deserializer.deserialize_seq(Seat)
+}
+
+/// The [`include`](RootOptions::include) seat: the same bound, through the
+/// [`None`] this one field can also be.
+#[cfg(feature = "serde")]
+fn deserialize_optional_seat<'de, D>(deserializer: D) -> Result<Option<Vec<Glob>>, D::Error>
+where
+  D: serde::Deserializer<'de>,
+{
+  struct Engaged;
+
+  impl<'de> serde::de::Visitor<'de> for Engaged {
+    type Value = Option<Vec<Glob>>;
+
+    fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+      write!(
+        f,
+        "null, or at most {} glob patterns",
+        RootOptions::MAX_SEAT_PATTERNS
+      )
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E>
+    where
+      E: serde::de::Error,
+    {
+      Ok(None)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+      E: serde::de::Error,
+    {
+      Ok(None)
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+      D: serde::Deserializer<'de>,
+    {
+      deserialize_seat(deserializer).map(Some)
+    }
+  }
+
+  deserializer.deserialize_option(Engaged)
 }
 
 /// The `clap` face of [`RootOptions`], and the one place the two households differ.
@@ -1261,14 +1371,65 @@ impl clap::FromArgMatches for RootOptions {
   }
 }
 
+/// The stable [`clap::ArgGroup`] id this household answers to, and the arguments
+/// it holds — every one of them, direct and nested alike.
+///
+/// It exists because an OPTIONAL flatten (`#[command(flatten)] root:
+/// Option<RootOptions>`) is decided entirely by this group: clap asks
+/// [`clap::Args::group_id`] when it builds the command — panicking outright if
+/// there is none — and then reads `ArgMatches::contains_id` on that group to
+/// decide `Some` from `None`. A group is marked present only by an EXPLICIT
+/// value source, so membership is exactly "the caller spelled one of these",
+/// which is what the optional flatten means.
+///
+/// Forwarding the proxy's own derived group would not do, and the reason is a
+/// documented limitation rather than an oversight: clap's derive leaves the
+/// generated group EMPTY for any struct that itself contains a `#[command(flatten)]`
+/// — nested arg groups are not validated yet — and [`RootOptionsArgs`] flattens
+/// the interest flags. An empty group is never present, so every flag would be
+/// parsed and then silently discarded.
+///
+/// So the members are named here, and named EXHAUSTIVELY: the six interest flags
+/// come from [`RootInterestArgs::FLAGS`] — the one list a new flag must be added
+/// to — and the two seats are spelled beside them. A flag missing from this group
+/// is a flag whose presence cannot turn an optional household `Some`.
+#[cfg(feature = "clap")]
+impl RootOptions {
+  /// The group's id, stable across releases: a downstream `ArgGroup` that names
+  /// this household refers to it by this string.
+  const GROUP_ID: &'static str = "RootOptions";
+
+  /// The arguments the group holds — the two seats, plus every interest flag.
+  fn group_members() -> impl Iterator<Item = clap::Id> {
+    ["prune", "include"]
+      .into_iter()
+      .chain(RootInterestArgs::FLAGS)
+      .map(clap::Id::from)
+  }
+
+  /// [`augment_args`](clap::Args::augment_args) and its update twin differ only
+  /// in which proxy augmentation they run, so the group is added in one place.
+  fn with_group(cmd: clap::Command) -> clap::Command {
+    cmd.group(
+      clap::ArgGroup::new(Self::GROUP_ID)
+        .multiple(true)
+        .args(Self::group_members()),
+    )
+  }
+}
+
 #[cfg(feature = "clap")]
 impl clap::Args for RootOptions {
+  fn group_id() -> Option<clap::Id> {
+    Some(clap::Id::from(Self::GROUP_ID))
+  }
+
   fn augment_args(cmd: clap::Command) -> clap::Command {
-    RootOptionsArgs::augment_args(cmd)
+    Self::with_group(RootOptionsArgs::augment_args(cmd))
   }
 
   fn augment_args_for_update(cmd: clap::Command) -> clap::Command {
-    RootOptionsArgs::augment_args_for_update(cmd)
+    Self::with_group(RootOptionsArgs::augment_args_for_update(cmd))
   }
 }
 
@@ -1279,26 +1440,15 @@ impl RootOptions {
   /// existed.
   pub const DEFAULT_INTEREST: Interest = Interest::all();
 
-  /// The most patterns EITHER glob seat may carry.
+  /// The most patterns EITHER glob seat may carry — the VOCABULARY's own bound,
+  /// [`tributary_proto::glob::MAX_SEAT_PATTERNS`], named here because this is the
+  /// household a caller configures the seats through.
   ///
-  /// Each pattern is bounded on its own
-  /// ([`MAX_GLOB_LEN`](tributary_proto::glob::MAX_GLOB_LEN),
-  /// [`MAX_GLOB_NESTING`](tributary_proto::glob::MAX_GLOB_NESTING)); this is the
-  /// bound on the SET, and it exists because a set has a cost no single pattern
-  /// has. The seats compile into one union automaton, which is a single pass per
-  /// candidate however many patterns it holds — but that union has a size limit
-  /// of the matcher's own, and a set that exceeds it degrades to asking each
-  /// pattern in turn ([`Globs::new`](tributary_proto::glob::Globs::new)). The
-  /// fence asks a prune seat once per DIRECTORY PREFIX of every event, so on the
-  /// degraded arm the per-event work is `patterns × depth` automaton passes.
-  ///
-  /// 256 is what makes that worst case a number rather than a document's whim: at
-  /// the ceiling, a ten-deep path costs at most 2560 passes on a set the matcher
-  /// refused to union, and the ordinary set — which unions, and which real
-  /// configurations stay two orders of magnitude below — costs ten. A seat that
-  /// wants more ground than 256 words describe wants a broader word, not a longer
-  /// list.
-  pub const MAX_SEAT_PATTERNS: usize = 256;
+  /// It is not restated here, and deliberately: the matcher's own constructor
+  /// enforces it, so a direct caller and another crate's seat are bounded by the
+  /// same number this household refuses on. See the constant's own documentation
+  /// for what the number buys.
+  pub const MAX_SEAT_PATTERNS: usize = tributary_proto::glob::MAX_SEAT_PATTERNS;
 
   /// The default options: deliver every kind, prune nothing, include
   /// everything.
@@ -1426,14 +1576,32 @@ impl RootOptions {
   /// The compiled seats this household names, in the shape the driver stores
   /// them on a scope: the pruned subtrees and, when the seat is engaged, the
   /// included files.
-  pub(crate) fn compile(&self) -> (Globs, Option<Globs>) {
-    (
-      Globs::new(self.prune.iter().cloned()),
-      self
-        .include
-        .as_ref()
-        .map(|include| Globs::new(include.iter().cloned())),
-    )
+  ///
+  /// Fallible for the one reason [`Globs::new`](tributary_proto::glob::Globs::new)
+  /// is — a seat past [`MAX_SEAT_PATTERNS`](Self::MAX_SEAT_PATTERNS) — and it
+  /// says which SEAT carried it, which the matcher's own refusal cannot know.
+  /// [`validate`](Self::validate) answers the same question one step earlier, at
+  /// the door, so a household that passed it compiles; this arm is the floor
+  /// beneath that, not a second gate a caller has to remember.
+  ///
+  /// # Errors
+  ///
+  /// [`OptionsError::TooManyPrunePatterns`] /
+  /// [`OptionsError::TooManyIncludePatterns`].
+  pub(crate) fn compile(&self) -> Result<(Globs, Option<Globs>), OptionsError> {
+    let prune =
+      Globs::new(self.prune.iter().cloned()).map_err(|err| OptionsError::TooManyPrunePatterns {
+        supplied: err.supplied(),
+      })?;
+    let include = match &self.include {
+      None => None,
+      Some(include) => Some(Globs::new(include.iter().cloned()).map_err(|err| {
+        OptionsError::TooManyIncludePatterns {
+          supplied: err.supplied(),
+        }
+      })?),
+    };
+    Ok((prune, include))
   }
 }
 

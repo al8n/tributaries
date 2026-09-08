@@ -1459,7 +1459,7 @@ impl UsnFence {
     Self {
       root: std::path::PathBuf::new(),
       exclusions: Vec::new(),
-      prune: tributary_proto::glob::Globs::new([]),
+      prune: tributary_proto::glob::Globs::default(),
     }
   }
 
@@ -5899,7 +5899,7 @@ mod exclusion_fence {
     UsnFence::new(
       PathBuf::from("/r"),
       exclusions.iter().map(PathBuf::from).collect(),
-      tributary_proto::glob::Globs::new([]),
+      tributary_proto::glob::Globs::default(),
     )
   }
 
@@ -5911,7 +5911,8 @@ mod exclusion_fence {
       Vec::new(),
       tributary_proto::glob::Globs::new(patterns.iter().map(|pattern| {
         tributary_proto::glob::Glob::new(pattern).expect("a valid pattern compiles")
-      })),
+      }))
+      .expect("a bounded set compiles"),
     )
   }
 

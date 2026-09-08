@@ -759,7 +759,7 @@ impl SourceConfig {
       os_buffer_bytes: NonZeroU32::new(64 * 1024).expect("64 KiB is nonzero"),
       backend: Backend::Auto,
       max_map_directories: None,
-      prune: tributary_proto::glob::Globs::new([]),
+      prune: tributary_proto::glob::Globs::default(),
     }
   }
 }

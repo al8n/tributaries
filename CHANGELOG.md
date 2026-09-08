@@ -200,6 +200,62 @@ All notable changes to this workspace are documented here. The format is based o
     on that object and creates relative to it. A symlink swapped into an intermediate
     directory after the verdict can no longer redirect the create into pruned ground or
     out of the watched root.
+  - **The sync cookie descends from the live ROOT OBJECT, and its marker is bound to the
+    judged directory.** Each live scope now retains, from its spawn, the root itself —
+    an `O_DIRECTORY|O_NOFOLLOW` descriptor on Unix, a zero-access directory handle on
+    Windows — beside the canonical path and the generation, and every cookie write
+    descends from it after re-checking its identity against the one the scope was armed
+    on. A root renamed aside with a fresh tree stood at its name used to leave both
+    canonical paths resolving inside the REPLACEMENT while the stream stayed attached to
+    the original: containment passed, the write reported success, and the marker landed
+    where no event of that scope could come from. The descriptor lives and dies with the
+    scope's registry entry, so a replace or a retirement swaps it with the root it
+    belongs to. On Windows the marker itself is now created with `NtCreateFile` anchored
+    at the cookie directory's own handle — no component of its path is resolved, so a
+    peer that renames the freshly minted directory aside and stands a junction at its old
+    leaf has nothing to redirect — and the create's result is re-read off both handles
+    and required to stand directly inside the directory the write judged before any
+    success is reported.
+  - **Every late repair goes through the prune fence.** The destination cover a
+    geometry-less profile owes on a kept directory rename is born AFTER that record's
+    verdict and names ground the verdict never judged, so it is now fenced like any other
+    planned input — widened to the nearest unpruned parent, or dropped. An RDCW basic
+    record proves no class, so `/r/src -> /r/cache` under `prune = ["cache"]` kept both
+    halves and then aimed a `Rescan` at `cache`: an instruction to enumerate a subtree
+    whose every later change stays silent.
+  - **The cookie exemption is exactly two paths.** `prune` and `include` exempt the
+    reserved cookie directory and its DIRECT marker child, and nothing deeper — the only
+    two things this driver ever writes there. A whole-subtree exemption handed anything
+    under a reserved name a free pass through both seats, so a peer's stray file (or a
+    foreign platform's like-named user directory) was armed, mapped and delivered
+    through ground the caller had closed.
+  - **A cold listing's unclassified entry is announced as UNPROVEN.** The class stamped
+    on such an entry's `Created` — and read by the `ondir` gate — is three-valued from
+    `FileKind` (`proven_dir`): a directory is `Some(true)`, an unclassifiable entry is
+    `None`, and every known non-directory is `Some(false)`. It used to collapse to
+    `Some(false)`, which let a delivery seat drop a real directory's only announcement on
+    a proof the listing never made — after which coverage installs and its children
+    arrive with no parent creation and no `Rescan` behind them.
+
+- **`tributary-proto`** — `glob::MAX_SEAT_PATTERNS` (256), `glob::GlobsError`, and a
+  fallible `Globs::new`. The bound on a pattern SET now lives beside the matcher rather
+  than on one configuration household above it: `Globs::new` is the only door a compiled
+  set comes through, so a direct caller — or another crate's own seat — is bounded by the
+  same number `RootOptions` refuses on, and the count is checked by bounded collection
+  before anything is compiled or cloned. `RootOptions::MAX_SEAT_PATTERNS` is now that
+  constant, and `RootOptions`' serde face refuses an over-full seat MID-DOCUMENT rather
+  than after compiling every pattern in it. `Globs` has no `FromIterator` impl any more —
+  `collect` cannot fail, and a set built by truncating past the bound is the unbounded
+  seat the bound exists to refuse; `TryFrom<Vec<Glob>>` is the fallible spelling.
+  `FileKind::proven_dir` states the three-valued directory class a kind proves.
+
+- **`tributary-fs`** — `RootOptions` answers a stable `clap::ArgGroup` (`group_id`,
+  explicitly populated with every direct and nested argument id), so
+  `#[command(flatten)] root: Option<RootOptions>` builds and parses: it is `Some` after
+  any of the household's flags — the nested interest flags included — and `None`
+  otherwise. Without it clap panicked while BUILDING the command, and forwarding the
+  proxy's own derived group would not have helped, that group being left empty by the
+  derive for any struct containing a nested flatten.
 
 - **`tributary-proto`** — `glob::MAX_GLOB_LEN` (1024 bytes) and `glob::MAX_GLOB_NESTING`
   (8) bound what `Glob::new` will compile, as typed `GlobError`s, before the matcher is
