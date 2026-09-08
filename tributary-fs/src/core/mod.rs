@@ -53,6 +53,16 @@
 //! while probe-read device evidence (`dev == root_dev`) still decides independently
 //! throughout.
 //!
+//! The veto itself is TWO components, and the split is what lets the table half be
+//! replaced rather than unioned. [`ScopeState::mount_table`] holds one authoritative
+//! snapshot's rows and the next one replaces it whole ([`install_mount_table`]): the
+//! reads are serialized and a stale one publishes nothing, so a location an
+//! authoritative read does not list is a mount the host says is gone. Everything a
+//! snapshot cannot speak for — an in-band `Mount` word for a mount that arrived after
+//! the read in flight was taken, or a probe's foreign device at a path arbitrarily deep
+//! inside a volume — lives in [`ScopeState::learned_mounts`], which no read may empty
+//! and which only the in-band unmount word (or a world swap) retires.
+//!
 //! # Root-death signals per backend
 //!
 //! Every backend's root death — unmount, delete, or replace — must reach a
@@ -1396,15 +1406,51 @@ struct ScopeState {
   /// unmount signal, so the refresh cadence is their root-liveness check).
   /// `None` for a scope whose barrier read no identity (off-unix fakes).
   identity: Option<RootIdentity>,
-  /// Foreign-device prefixes under the root: seeded from the live mount
-  /// table at spawn, then maintained by Mount/Unmount events and probed
-  /// devices. Tiny in practice, so a linear scan beats indexing.
-  mounts: Vec<PathBuf>,
-  /// Whether `mounts` is backed by an authoritative read of the live mount
-  /// table (the spawn seed, or a post-loss refresh). Without it, a path not
-  /// covered by a known mount prefix proves nothing (the table is blind), so
-  /// event-side device trust is refused. Revoked by every loss signal — a
-  /// dropped window may have carried a mount transition.
+  /// The AUTHORITATIVE mount table's locations under the root, as of the last
+  /// read that could take one — the REPLACEABLE half of the device-trust veto.
+  ///
+  /// Every row here came from one snapshot, and the next authoritative snapshot
+  /// replaces the whole vector rather than unioning onto it
+  /// ([`install_mount_table`]). It used to union, on the argument that absence
+  /// from a table must never GRANT trust — but the two components below were
+  /// conflated then, and the union was what actually leaked: every mountpoint a
+  /// host ever presented stayed here for the life of the scope, so a long-lived
+  /// scope on a container host retained one `PathBuf` per HISTORICAL mount and
+  /// paid a linear scan against that history on every refresh. Unbounded
+  /// residency is not a safe direction, it is a leak wearing one.
+  ///
+  /// Replacement is sound because the reads are SERIALIZED — [`arm_refresh`] lets
+  /// at most one be outstanding, so snapshot N+1 is read after N landed — and a
+  /// stale one publishes no table at all. A row absent from an authoritative read
+  /// is therefore a mount the host says is gone, which is exactly the fact that
+  /// makes the path root-device again. What replacement must NOT touch is a
+  /// prefix learned somewhere OTHER than a table snapshot, and that is why those
+  /// live in [`learned_mounts`](Self::learned_mounts) instead.
+  ///
+  /// Tiny in practice, so a linear scan beats indexing.
+  mount_table: Vec<PathBuf>,
+  /// Foreign-device prefixes this scope learned from something OTHER than a mount
+  /// table read — the INDEPENDENT half of the veto, and the one no snapshot may
+  /// remove.
+  ///
+  /// Two writers: [`apply_mount_add`] (an in-band `Mount` flag word) and
+  /// [`learn_device`] (a probe that read a foreign device at a path). Neither is a
+  /// mount-table row: the first can describe a mount that arrived AFTER the
+  /// snapshot in flight was read, and the second is a path that may sit
+  /// arbitrarily deep inside one. A table install that dropped either would
+  /// re-trust a subtree this scope has direct evidence is foreign.
+  ///
+  /// So the lifecycle is evidence-backed in both directions, and only in both
+  /// directions: an entry enters on an observation and leaves ONLY on the in-band
+  /// unmount word that proves its mount is gone (`deferred_unmounts`, applied at
+  /// [`settle`](DriverCore::settle)) or on a world swap, which retires the whole
+  /// world the prefix described. A cadence never removes one.
+  learned_mounts: Vec<PathBuf>,
+  /// Whether [`mount_table`](Self::mount_table) is backed by an authoritative
+  /// read of the live mount table (the spawn seed, or a post-loss refresh).
+  /// Without it, a path not covered by a known mount prefix proves nothing (the
+  /// table is blind), so event-side device trust is refused. Revoked by every
+  /// loss signal — a dropped window may have carried a mount transition.
   mounts_authoritative: bool,
   /// An [`Effect::RefreshMounts`] is outstanding; repeated loss signals
   /// coalesce onto it instead of stacking effects.
@@ -1958,7 +2004,8 @@ impl DriverCore {
         root_dev: None,
         root_mnt_id: None,
         identity: None,
-        mounts: Vec::new(),
+        mount_table: Vec::new(),
+        learned_mounts: Vec::new(),
         mounts_authoritative: false,
         refresh_pending: false,
         refresh_stale: false,
@@ -2970,7 +3017,10 @@ impl DriverCore {
         state.root_dev = Some(meta.root_dev);
         state.root_mnt_id = meta.root_mnt_id;
         state.identity = Some(meta.identity);
-        state.mounts = meta.mounts;
+        install_mount_table(state, meta.mounts);
+        // A brand-new world: nothing learned about the previous one survives, and
+        // nothing else may empty this set (see [`ScopeState::learned_mounts`]).
+        state.learned_mounts.clear();
         // Born closed: the seed was read before the stream started, so a
         // mount appearing in that gap is in neither the seed nor the event
         // stream — the seed can only REDUCE trust. Authority arrives with
@@ -3330,7 +3380,10 @@ impl DriverCore {
     state.root_dev = Some(meta.root_dev);
     state.root_mnt_id = meta.root_mnt_id;
     state.identity = Some(meta.identity);
-    state.mounts = meta.mounts;
+    install_mount_table(state, meta.mounts);
+    // A brand-new world: nothing learned about the previous one survives, and
+    // nothing else may empty this set (see [`ScopeState::learned_mounts`]).
+    state.learned_mounts.clear();
     // The old world's authority cannot vouch for the new root's mounts:
     // trust fails closed until the refresh this commit arms completes. A
     // refresh already in flight was addressed to the REPLACED root — mark it
@@ -3651,7 +3704,10 @@ impl DriverCore {
     state.root_dev = Some(meta.root_dev);
     state.root_mnt_id = meta.root_mnt_id;
     state.identity = Some(meta.identity);
-    state.mounts = meta.mounts;
+    install_mount_table(state, meta.mounts);
+    // A brand-new world: nothing learned about the previous one survives, and
+    // nothing else may empty this set (see [`ScopeState::learned_mounts`]).
+    state.learned_mounts.clear();
     state.refresh_world_stale = state.refresh_pending;
     // The witnessed window is CONSUMED by the commit (INV-ROOT): it was clean
     // through the taint gate above, the splice landed, and from here the
@@ -3879,15 +3935,15 @@ impl DriverCore {
     Self::arm_liveness(state, interval, now);
 
     if refresh.authoritative {
-      // UNION, never replacement: an existing entry is either a still-real mount (a
-      // later unmount event removes it) or a probed foreign-device prefix the
-      // snapshot cannot know about — keeping both only ever reduces trust, the safe
-      // direction. Probe-carried device evidence still decides what it can.
-      for mount in refresh.mounts {
-        if !state.mounts.iter().any(|m| m == &mount) {
-          state.mounts.push(mount);
-        }
-      }
+      // REPLACEMENT, never union: the reads are serialized and this one is not
+      // stale, so a location it does not list is a mount the host says is gone —
+      // and unioning retained one `PathBuf` per HISTORICAL mountpoint for the life
+      // of the scope. What a snapshot may not reach lives in
+      // [`ScopeState::learned_mounts`]: an in-band mount word can describe a mount
+      // that arrived after this read was taken, and a probe's foreign device is a
+      // path no mountinfo row will ever name. Probe-carried device evidence still
+      // decides what it can.
+      install_mount_table(state, refresh.mounts);
       state.mounts_authoritative = true;
     } else {
       // The live table could not be read, so this refresh installs no table — and a
@@ -3895,9 +3951,9 @@ impl DriverCore {
       // would keep proving paths root-device by their ABSENCE from a table we just
       // failed to re-read across the very mount change this refresh was meant to
       // reconcile. Close it: absence from an unreadable table is not evidence of
-      // in-root-device. The trust-REDUCING learned prefixes in `state.mounts` are
-      // kept (they only ever veto trust, never grant it) for the next authoritative
-      // refresh to union onto.
+      // in-root-device. Both veto components are kept as they stand (they only ever
+      // reduce trust, never grant it) for the next authoritative read to replace
+      // the table half of.
       state.mounts_authoritative = false;
     }
 
@@ -4756,7 +4812,10 @@ impl DriverCore {
       Self::feed(monitor, planned, now);
     }
     for path in deferred {
-      state.mounts.retain(|m| m != &path);
+      // The LEARNED half only: this word is the one piece of evidence that retires
+      // a prefix no snapshot may remove. A table row that named the same mount is
+      // dropped by the next authoritative read instead.
+      state.learned_mounts.retain(|m| m != &path);
     }
   }
 
@@ -5802,7 +5861,9 @@ fn device_trusted(state: &ScopeState, path: &Path, dev: Option<u64>) -> bool {
     (Some(_), None) => return false,
     (None, _) => {}
   }
-  state.mounts_authoritative && !state.mounts.iter().any(|m| path.starts_with(m))
+  state.mounts_authoritative
+    && !state.mount_table.iter().any(|m| path.starts_with(m))
+    && !state.learned_mounts.iter().any(|m| path.starts_with(m))
 }
 
 /// Applies one MOUNT event's trust-reducing prefix add. Runs in `compile`'s
@@ -5814,20 +5875,44 @@ fn apply_mount_add(state: &mut ScopeState, ev: &RawOsEvent) {
   if !matches!(lower(state, &ev.path), Lowered::Target(_)) {
     return;
   }
-  if !state.mounts.iter().any(|m| m == &ev.path) {
-    state.mounts.push(ev.path.clone());
+  // Into the LEARNED half, and deduped only against that half. A word describes a
+  // mount that may have arrived after the snapshot currently in flight was read,
+  // so pairing it with a table row would let that install drop it; kept
+  // independent, it is removed by exactly one thing — the unmount word for the
+  // same path, deferred to settlement — which is what bounds this set to the
+  // mounts that are actually live.
+  if !state.learned_mounts.iter().any(|m| m == &ev.path) {
+    state.learned_mounts.push(ev.path.clone());
   }
 }
 
 /// Records a probed foreign-device path as a mount prefix, so later
 /// event-side identities under it degrade to `None` instead of colliding.
+///
+/// Into the LEARNED half: this is a path the probe read a device at, not a
+/// mountpoint, so no table row need ever name it and an install that replaced it
+/// away would re-trust a subtree a stat proved foreign. Deduped against BOTH
+/// halves — a path already covered by a live table row or an existing learned
+/// prefix adds no veto — which is also what bounds the set: the first prefix
+/// learned under a volume absorbs every deeper path on it.
 fn learn_device(state: &mut ScopeState, path: &Path, dev: u64) {
   if let Some(root_dev) = state.root_dev
     && dev != root_dev
-    && !state.mounts.iter().any(|m| path.starts_with(m))
+    && !state.mount_table.iter().any(|m| path.starts_with(m))
+    && !state.learned_mounts.iter().any(|m| path.starts_with(m))
   {
-    state.mounts.push(path.to_path_buf());
+    state.learned_mounts.push(path.to_path_buf());
   }
+}
+
+/// Installs one authoritative mount table's locations, REPLACING the last one.
+///
+/// The single write path for [`mount_table`](ScopeState::mount_table) — the spawn
+/// barrier's seed, both world swaps' and the authoritative refresh's — so the
+/// replacement discipline is stated once and cannot drift between the four.
+fn install_mount_table(state: &mut ScopeState, rows: impl IntoIterator<Item = PathBuf>) {
+  state.mount_table.clear();
+  state.mount_table.extend(rows);
 }
 
 /// Lowers an absolute event path to its place under the scope root.

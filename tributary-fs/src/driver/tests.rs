@@ -1204,11 +1204,18 @@ async fn spawn_seals_root_meta_before_the_stream_goes_live() {
 /// for its whole prefix from the first event on — even if the volume vanishes
 /// immediately after (its unmount travels in-band and is applied late, per
 /// the monotone rule); nothing can event before the seed exists.
+///
+/// The live table answers the same row the seed carried, because the mount IS
+/// still there: an authoritative read REPLACES the table
+/// (`install_mount_table`), so a fake whose
+/// birth refresh answered the default empty table would be staging a departure
+/// rather than the pre-existing submount this cell is about.
 #[tokio::test(start_paused = true)]
 async fn spawn_seed_carries_a_preexisting_submount() {
   let fs = FakeFs::new(1);
   fs.put("/r", FileKind::Dir, 1);
   fs.seed_mounts(vec![PathBuf::from("/r/vol")]);
+  fs.answer_refresh(vec![PathBuf::from("/r/vol")], true);
   let (cmd_tx, cmd_rx) = async_channel::bounded(16);
   let (cleanup, cookie_wake) = cookie_ingress();
   let (ev_tx, ev_rx) = async_channel::bounded(64);
