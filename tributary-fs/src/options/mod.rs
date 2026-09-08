@@ -86,6 +86,26 @@ pub enum OptionsError {
     /// The interval the options carried.
     supplied: Duration,
   },
+  /// The per-root [`prune`](RootOptions::prune) seat carries more patterns than
+  /// [`RootOptions::MAX_SEAT_PATTERNS`].
+  #[error(
+    "{supplied} prune patterns exceed the per-seat limit of {}",
+    RootOptions::MAX_SEAT_PATTERNS
+  )]
+  TooManyPrunePatterns {
+    /// How many patterns the seat carried.
+    supplied: usize,
+  },
+  /// The per-root [`include`](RootOptions::include) seat carries more patterns
+  /// than [`RootOptions::MAX_SEAT_PATTERNS`].
+  #[error(
+    "{supplied} include patterns exceed the per-seat limit of {}",
+    RootOptions::MAX_SEAT_PATTERNS
+  )]
+  TooManyIncludePatterns {
+    /// How many patterns the seat carried.
+    supplied: usize,
+  },
 }
 
 impl OptionsError {
@@ -93,6 +113,18 @@ impl OptionsError {
   #[inline]
   pub const fn is_too_many_exclusions(&self) -> bool {
     matches!(self, Self::TooManyExclusions { .. })
+  }
+
+  /// Whether this is [`TooManyPrunePatterns`](Self::TooManyPrunePatterns).
+  #[inline]
+  pub const fn is_too_many_prune_patterns(&self) -> bool {
+    matches!(self, Self::TooManyPrunePatterns { .. })
+  }
+
+  /// Whether this is [`TooManyIncludePatterns`](Self::TooManyIncludePatterns).
+  #[inline]
+  pub const fn is_too_many_include_patterns(&self) -> bool {
+    matches!(self, Self::TooManyIncludePatterns { .. })
   }
 }
 
@@ -866,6 +898,13 @@ impl Default for WatcherOptions {
 ///
 /// # Configuration faces
 ///
+/// Both seats are BOUNDED, on every face: one pattern is bounded by
+/// [`Glob::new`](tributary_proto::glob::Glob::new) (length and alternation
+/// nesting) and one seat by [`MAX_SEAT_PATTERNS`](Self::MAX_SEAT_PATTERNS), which
+/// [`validate`](Self::validate) checks and
+/// [`watch_with`](crate::Watcher::watch_with) refuses on before any coverage
+/// exists.
+///
 /// With the `serde` feature the household is one object keyed by the field
 /// names, every key optional and defaulted from [`new`](Self::new); the two glob
 /// seats are lists of plain strings, and an invalid pattern is a document error.
@@ -903,6 +942,10 @@ impl Default for WatcherOptions {
 /// mean something no other face means — creates, modifications, removals and moves
 /// all absent, with only the unmaskable `Rescan`s left. A command line that really
 /// wants the empty mask says so through the [`Interest`] group directly.
+///
+/// An UPDATE (`clap::FromArgMatches::update_from_arg_matches`) changes only what
+/// the command line actually carried: updating `--prune` alone leaves the
+/// existing interest exactly as it was, the empty one included.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(default))]
@@ -947,6 +990,26 @@ struct RootInterestArgs {
   attrib: bool,
   #[arg(long)]
   ondir: bool,
+}
+
+#[cfg(feature = "clap")]
+impl RootInterestArgs {
+  /// The flag names, in the order [`Interest`] reads them — the ONE list, so a
+  /// flag added to the group cannot be forgotten by the update rule.
+  const FLAGS: [&'static str; 6] = ["created", "removed", "modified", "moved", "attrib", "ondir"];
+
+  /// Whether the parse actually SAW an interest flag on the command line.
+  ///
+  /// `ArgMatches::get_flag` cannot answer this: a boolean argument is `false`
+  /// both when it was not given and when it defaulted, and the two mean opposite
+  /// things to an update. The value SOURCE separates them, which is what lets an
+  /// update of an unrelated argument leave an existing interest — the empty one
+  /// included — untouched.
+  fn given_on_command_line(matches: &clap::ArgMatches) -> bool {
+    Self::FLAGS
+      .iter()
+      .any(|flag| matches.value_source(flag) == Some(clap::parser::ValueSource::CommandLine))
+  }
 }
 
 #[cfg(feature = "clap")]
@@ -1021,10 +1084,35 @@ impl clap::FromArgMatches for RootOptions {
     RootOptionsArgs::from_arg_matches(matches).map(Into::into)
   }
 
+  /// Applies only what the COMMAND LINE said, leaving every other field of the
+  /// existing household exactly as it stood.
+  ///
+  /// The interest is the field that cannot be updated through the proxy, and the
+  /// reason is the proxy's own rule: no interest flag given means
+  /// [`Interest::all`], which is what makes a flagless `RootOptions` the default
+  /// household. Round-tripping an EXISTING interest through those flags therefore
+  /// erases the empty one — `RootOptions::new().with_interest(Interest::new())`
+  /// has no flag set, so the way back reads it as "every kind" — and an update of
+  /// an unrelated `--prune` would silently broaden what the caller subscribed to.
+  ///
+  /// So the flags are consulted rather than the value: the interest changes only
+  /// when at least one of them came from the command line, and otherwise the
+  /// existing one is kept whatever it says. That is the same rule the two glob
+  /// seats already get from clap's own update — a repeatable argument nobody gave
+  /// has no values, so it leaves the field alone.
   fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
     let mut args = RootOptionsArgs::from(&*self);
     args.update_from_arg_matches(matches)?;
-    *self = args.into();
+    let RootOptionsArgs {
+      interest,
+      prune,
+      include,
+    } = args;
+    if RootInterestArgs::given_on_command_line(matches) {
+      self.interest = interest.into();
+    }
+    self.prune = prune;
+    self.include = include;
     Ok(())
   }
 }
@@ -1046,6 +1134,27 @@ impl RootOptions {
   /// [`Watcher::watch`](crate::Watcher::watch) took before this household
   /// existed.
   pub const DEFAULT_INTEREST: Interest = Interest::all();
+
+  /// The most patterns EITHER glob seat may carry.
+  ///
+  /// Each pattern is bounded on its own
+  /// ([`MAX_GLOB_LEN`](tributary_proto::glob::MAX_GLOB_LEN),
+  /// [`MAX_GLOB_NESTING`](tributary_proto::glob::MAX_GLOB_NESTING)); this is the
+  /// bound on the SET, and it exists because a set has a cost no single pattern
+  /// has. The seats compile into one union automaton, which is a single pass per
+  /// candidate however many patterns it holds — but that union has a size limit
+  /// of the matcher's own, and a set that exceeds it degrades to asking each
+  /// pattern in turn ([`Globs::new`](tributary_proto::glob::Globs::new)). The
+  /// fence asks a prune seat once per DIRECTORY PREFIX of every event, so on the
+  /// degraded arm the per-event work is `patterns × depth` automaton passes.
+  ///
+  /// 256 is what makes that worst case a number rather than a document's whim: at
+  /// the ceiling, a ten-deep path costs at most 2560 passes on a set the matcher
+  /// refused to union, and the ordinary set — which unions, and which real
+  /// configurations stay two orders of magnitude below — costs ten. A seat that
+  /// wants more ground than 256 words describe wants a broader word, not a longer
+  /// list.
+  pub const MAX_SEAT_PATTERNS: usize = 256;
 
   /// The default options: deliver every kind, prune nothing, include
   /// everything.
@@ -1140,6 +1249,34 @@ impl RootOptions {
   pub fn clear_include(&mut self) -> &mut Self {
     self.include = None;
     self
+  }
+
+  /// Checks the bounded quantities this household carries — one per glob seat.
+  ///
+  /// Asked by [`watch_with`](crate::Watcher::watch_with) before a scope exists,
+  /// the way [`WatcherOptions::validate`] is asked before a watcher does: a
+  /// legal-but-extreme configuration becomes a typed refusal at the door rather
+  /// than a per-event cost nothing bounds.
+  ///
+  /// # Errors
+  ///
+  /// [`OptionsError::TooManyPrunePatterns`] /
+  /// [`OptionsError::TooManyIncludePatterns`] when a seat carries more than
+  /// [`MAX_SEAT_PATTERNS`](Self::MAX_SEAT_PATTERNS) patterns.
+  pub fn validate(&self) -> Result<(), OptionsError> {
+    if self.prune.len() > Self::MAX_SEAT_PATTERNS {
+      return Err(OptionsError::TooManyPrunePatterns {
+        supplied: self.prune.len(),
+      });
+    }
+    if let Some(include) = &self.include
+      && include.len() > Self::MAX_SEAT_PATTERNS
+    {
+      return Err(OptionsError::TooManyIncludePatterns {
+        supplied: include.len(),
+      });
+    }
+    Ok(())
   }
 
   /// The compiled seats this household names, in the shape the driver stores

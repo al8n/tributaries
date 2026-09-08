@@ -182,36 +182,117 @@ fn the_per_pattern_fallback_answers_what_the_union_answers() {
   assert!(Globs::each(Vec::new()).is_empty());
 }
 
-/// A pattern whose AUTOMATON is too large is a typed refusal, not a panic
-/// somewhere later. It parses perfectly — the syntax is a few hundred thousand
-/// single-character wildcards — and then overflows the matcher's own size limit,
-/// which is the one failure a parse-only constructor would have deferred to a
-/// place with no value to report it as.
+/// An over-long pattern is a typed refusal, and it is refused BEFORE the
+/// matcher is asked. It parses perfectly — the syntax is a few hundred thousand
+/// single-character wildcards — and every step after this one is priced by its
+/// length, up to and including an automaton the builder would have refused from
+/// a place with no value to report it as.
 ///
 /// Every face of this type comes through here, so a configuration file, a
 /// command line, or a programmatic build of such a pattern all refuse the same
-/// way instead of aborting the process that armed the root.
+/// way instead of spending the process's memory on it.
 ///
 /// Built as a string rather than by looping the compiler: the cell is about ONE
-/// pattern's cost, and the refusal is reached in a single compile.
+/// pattern's cost, and the refusal is reached before a single compile.
 #[test]
-#[cfg_attr(
-  miri,
-  ignore = "drives the automaton size limit, which costs hundreds of megabytes of interpreted allocation and exhausts a 32-bit Miri address space; the refusal is a native property, and `the_fallback_arm_compiles_nothing` beside it still runs under Miri"
-)]
-fn a_pattern_too_large_to_compile_is_a_typed_refusal() {
+fn a_pattern_over_the_length_limit_is_a_typed_refusal() {
   let huge = "?".repeat(300_000);
-  let err = Glob::new(&huge).expect_err("an automaton past the limit is refused");
+  let err = Glob::new(&huge).expect_err("a pattern past the length limit is refused");
   assert_eq!(err.pattern(), huge);
   assert!(!err.message().is_empty());
   assert!(huge.parse::<Glob>().is_err(), "and through `FromStr`");
   assert!(Glob::try_from(huge.as_str()).is_err(), "and `TryFrom`");
+
+  // The boundary is where the constant says it is, and nowhere else.
+  assert!(
+    Glob::new(&"?".repeat(MAX_GLOB_LEN)).is_ok(),
+    "the ceiling itself compiles"
+  );
+  assert!(
+    Glob::new(&"?".repeat(MAX_GLOB_LEN + 1)).is_err(),
+    "and one byte past it does not"
+  );
 
   // Non-vacuity: the size, not the syntax, is what is refused — the same shape
   // at a sane length compiles and matches.
   let ok = globs(&[&"?".repeat(4)]);
   assert!(ok.is_match("abcd"));
   assert!(!ok.is_match("abc"));
+}
+
+/// Alternation is the vocabulary's only recursive construct, and the matcher
+/// parses and renders it recursively — so a balanced, syntactically PERFECT
+/// pattern of a few thousand nested braces overflows the process stack inside
+/// the builder, before any automaton exists for the size limit to catch. A
+/// caller's configuration value must never be able to end the process, so the
+/// depth is counted in a flat scan first.
+///
+/// Reachable from every face, which is why the refusal lives at the one door
+/// they all come through.
+#[test]
+fn a_pattern_nested_past_the_limit_is_a_typed_refusal() {
+  let nest = |depth: usize| std::format!("{}a{}", "{".repeat(depth), "}".repeat(depth));
+
+  assert!(
+    Glob::new(&nest(MAX_GLOB_NESTING)).is_ok(),
+    "the ceiling itself compiles"
+  );
+  let err = Glob::new(&nest(MAX_GLOB_NESTING + 1)).expect_err("one level past it is refused");
+  assert!(!err.message().is_empty());
+
+  // The shape that motivates the ceiling: balanced, valid, and deep enough to
+  // recurse the parser off the stack. Nothing is compiled — the scan answers
+  // before the matcher is called at all.
+  let deep = nest(50_000);
+  assert!(Glob::new(&deep).is_err(), "and so is anything deeper");
+  assert!(deep.parse::<Glob>().is_err(), "through `FromStr` too");
+
+  // Depth is NESTING, not count: a hundred sibling alternations never nest.
+  assert!(
+    Glob::new(&"{a,b}".repeat(100)).is_ok(),
+    "siblings are not depth"
+  );
+  // And an escaped brace is a literal, exactly as it is to the matcher.
+  assert!(
+    Glob::new(&"\\{".repeat(100)).is_ok(),
+    "an escaped brace opens nothing"
+  );
+}
+
+/// One serialized word means the same ground on every host. The matcher's
+/// default for backslash escapes is the HOST's — escapes on Unix, a path
+/// SEPARATOR on Windows — so `foo\*` would be the literal name `foo*` on one
+/// platform and `foo/*` on the other, and one configuration would subtract
+/// different trees depending on where it was read. Escapes are stated instead,
+/// on every build.
+///
+/// This cell runs on both hosts and asserts the same answers on each.
+#[test]
+fn a_backslash_escapes_on_every_host() {
+  let escaped = globs(&["foo\\*"]);
+  assert!(
+    escaped.is_match("foo*"),
+    "the backslash escapes the wildcard, so the pattern names one literal name"
+  );
+  assert!(
+    !escaped.is_match("foobar"),
+    "it is not a wildcard the escape failed to reach"
+  );
+  assert!(
+    !escaped.is_match("foo/bar"),
+    "and above all it is not a separator: `foo\\*` is not `foo/*`"
+  );
+
+  // The separator spelling this vocabulary actually has still means what it says.
+  let separated = globs(&["foo/*"]);
+  assert!(separated.is_match("foo/bar"));
+  assert!(!separated.is_match("foo*"));
+
+  // A dangling escape has nothing to escape, and enabling escapes is what makes
+  // that a refusal rather than a host-dependent guess.
+  let err = Glob::new("foo\\").expect_err("a trailing backslash is refused");
+  assert_eq!(err.pattern(), "foo\\");
+  assert!(!err.message().is_empty());
 }
 
 /// A `Glob` that exists carries its own compiled matcher, so a [`Globs`] whose

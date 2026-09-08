@@ -1105,8 +1105,11 @@ impl<R> Watcher<R> {
   ///
   /// # Errors
   ///
-  /// The same four as [`watch`](Self::watch):
+  /// The same four as [`watch`](Self::watch), plus the household's own:
   ///
+  /// - [`WatchRootError::InvalidOptions`] when a glob seat carries more than
+  ///   [`RootOptions::MAX_SEAT_PATTERNS`] patterns — refused before any
+  ///   filesystem work;
   /// - [`WatchRootError::NotFound`] / [`WatchRootError::NotADirectory`] when
   ///   the root cannot serve as a watch target;
   /// - [`WatchRootError::Overlaps`] when it is not disjoint from an
@@ -1118,6 +1121,10 @@ impl<R> Watcher<R> {
     root: impl Into<PathBuf>,
     options: RootOptions,
   ) -> Result<RootHandle, WatchRootError> {
+    // Judged before anything is canonicalized, reserved or sent: a household
+    // whose seats are out of range is a configuration mistake, and answering it
+    // as one costs the caller no filesystem work and this watcher no state.
+    options.validate()?;
     let supplied = root.into();
     let canonical = std::fs::canonicalize(&supplied).map_err(|err| {
       if err.kind() == std::io::ErrorKind::NotFound {
@@ -1242,12 +1249,20 @@ impl<R> Watcher<R> {
   ///   make-before-break and covers its whole window with a `Rescan`.
   ///
   /// - **Every other replace** (kernel-recursive backends, widening by more
-  ///   than one segment, and disjoint or narrowing targets on the descending
-  ///   backend) is make-before-break:
+  ///   than one segment, disjoint or narrowing targets on the descending
+  ///   backend, and — whatever its shape — a replace on a scope whose
+  ///   [`prune`](RootOptions::prune) seat is engaged) is make-before-break:
   ///   the new stream is live before the old one is retired, and the commit
   ///   delivers one epoch-bumped full-root `Rescan` instructing the consumer
   ///   to re-read the (re-rooted) world — which covers the swap window and
   ///   the newly covered delta alike.
+  ///
+  ///   The prune seat is on that list because its words RE-BASE (see below) and
+  ///   the splice does not walk what it adopts: ground the re-based words stop
+  ///   covering was left unarmed by the old root and would stay unarmed and
+  ///   unannounced, while ground they newly cover would stay armed and
+  ///   reporting. The fresh stream reads the whole new root under the re-based
+  ///   seat and covers the difference with the `Rescan` it already mints.
   ///
   /// Locations are relative to [`root_path(handle)`](Self::root_path) at
   /// delivery time.

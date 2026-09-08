@@ -550,6 +550,50 @@ mod root_options {
     assert_eq!(cleared, RootOptions::new());
   }
 
+  /// Each pattern is bounded on its own; this is the bound on the SET, and it is
+  /// what keeps the fence's worst case a number. A set the matcher refuses to
+  /// union degrades to asking every pattern in turn, and the prune fence asks a
+  /// set once per directory prefix of every event — so an unbounded list buys
+  /// `patterns × depth` automaton passes per event, decided by a document rather
+  /// than by this crate.
+  ///
+  /// Both seats, both sides of the boundary, and the refusal names how many were
+  /// supplied so a person can act on it.
+  #[test]
+  fn a_seat_past_the_pattern_cap_is_a_typed_refusal() {
+    let many = |count: usize| {
+      (0..count)
+        .map(|n| glob(&std::format!("**/w{n}")))
+        .collect::<std::vec::Vec<_>>()
+    };
+    let cap = RootOptions::MAX_SEAT_PATTERNS;
+
+    assert!(
+      RootOptions::new().with_prune(many(cap)).validate().is_ok(),
+      "the ceiling itself is honoured"
+    );
+    assert_eq!(
+      RootOptions::new().with_prune(many(cap + 1)).validate(),
+      Err(OptionsError::TooManyPrunePatterns { supplied: cap + 1 }),
+      "and one past it is refused, naming what was supplied"
+    );
+    assert_eq!(
+      RootOptions::new().with_include(many(cap + 1)).validate(),
+      Err(OptionsError::TooManyIncludePatterns { supplied: cap + 1 }),
+      "the include seat carries the same ceiling"
+    );
+    assert!(
+      RootOptions::new()
+        .with_prune(many(cap + 1))
+        .validate()
+        .is_err_and(|err| err.is_too_many_prune_patterns()),
+      "and the refusal is readable without a match"
+    );
+
+    // The default household is nowhere near any of this.
+    assert!(RootOptions::new().validate().is_ok());
+  }
+
   /// The `serde` face: one object keyed by the field names, the seats lists of
   /// plain strings, every key optional.
   #[cfg(feature = "serde")]
@@ -734,6 +778,64 @@ mod root_options {
         err.render().to_string().contains("invalid glob"),
         "the type's own message reaches the command line: {}",
         err.render()
+      );
+    }
+
+    /// An UPDATE changes only what the command line carried. The interest is the
+    /// field that could not survive the proxy on its own: no flag given means
+    /// every kind, so round-tripping an EXISTING interest through those flags
+    /// erases the empty one, and an unrelated `--prune` would silently broaden
+    /// what the caller subscribed to. The flags are consulted instead of the
+    /// value.
+    ///
+    /// Revert witness: rebuild the household from the proxy unconditionally and
+    /// the first assertion reads `Interest::all()`.
+    #[test]
+    fn an_update_leaves_an_interest_the_command_line_never_mentioned() {
+      let update = |mut options: RootOptions, args: &[&str]| {
+        let matches = <Cli as clap::CommandFactory>::command_for_update()
+          .try_get_matches_from(std::iter::once("app").chain(args.iter().copied()))
+          .expect("the command line parses");
+        clap::FromArgMatches::update_from_arg_matches(&mut options, &matches)
+          .expect("the update applies");
+        options
+      };
+
+      let empty = RootOptions::new().with_interest(Interest::new());
+      let updated = update(empty.clone(), &["--prune", "**/node_modules"]);
+      assert_eq!(
+        updated.interest(),
+        Interest::new(),
+        "an explicit EMPTY interest survives an unrelated seat update"
+      );
+      assert_eq!(patterns(updated.prune()), ["**/node_modules"]);
+
+      // A narrowed interest survives the same way — the update is not free to
+      // widen it back to the household default either.
+      let narrow = RootOptions::new().with_interest(Interest::new().with_created());
+      assert_eq!(
+        update(narrow, &["--include", "**/*.mp4"]).interest(),
+        Interest::new().with_created()
+      );
+
+      // And a seat the command line did not mention keeps its value, while the
+      // one it did mention is replaced.
+      let seated = RootOptions::new()
+        .with_prune([glob("**/.git")])
+        .with_include([glob("**/*.mov")]);
+      let updated = update(seated, &["--prune", "**/node_modules"]);
+      assert_eq!(patterns(updated.prune()), ["**/node_modules"]);
+      assert_eq!(
+        updated.include().map(patterns),
+        Some(std::vec!["**/*.mov"]),
+        "the untouched seat is untouched"
+      );
+
+      // An interest flag that IS on the command line still narrows, so nothing
+      // above is a claim that updates cannot reach the interest at all.
+      assert_eq!(
+        update(empty, &["--moved"]).interest(),
+        Interest::new().with_moved()
       );
     }
   }

@@ -8224,6 +8224,56 @@ mod descending {
       assert_eq!(rig.fs.spawns(), 2, "and no further spawn was needed");
     }
 
+    /// An ENGAGED prune seat takes the same fallback, and for a reason the other
+    /// two do not share: the words are ROOT-RELATIVE, so the widen re-bases them
+    /// onto ground they never spoke for. `/r/old` watched with `cache` prunes
+    /// `/r/old/cache`; widened to `/r` the same word prunes `/r/cache` instead,
+    /// and `/r/old/cache` becomes reportable ground — which the splice would
+    /// adopt exactly as it left it, already unarmed, with no cold walk and no
+    /// covering `Rescan`, so every later change under it is silent forever.
+    ///
+    /// The fresh stream reads the whole new root under the re-based seat and
+    /// covers the difference with the `Rescan` it already mints.
+    ///
+    /// Revert witness: drop the seat from the route fork and the first half
+    /// spawns nothing, exactly as the unpruned contrast below does.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_widen_under_a_prune_seat_falls_back_to_the_stream_replace() {
+      let pruning = || {
+        crate::options::RootOptions::new().with_prune([
+          tributary_proto::glob::Glob::new("cache").expect("a valid pattern compiles")
+        ])
+      };
+
+      let rig = inotify_rig();
+      rig.fs.put("/r/old", FileKind::Dir, 5);
+      rig.fs.put("/r/old/cache", FileKind::Dir, 6);
+      rig.fs.put("/r/old/keep", FileKind::Dir, 7);
+      let scope = watch_with(&rig, "/r/old", pruning()).await;
+      fence_birth_crawl(&rig, scope, "/r/old").await;
+
+      assert!(replace(&rig, scope, "/r").await.is_ok());
+      settle(|| rig.fs.shutdowns() == 1).await;
+      assert_eq!(rig.fs.spawns(), 2, "the fallback took the new-stream path");
+      let (s, root, change) = next_rooted(&rig).await;
+      assert_eq!((s, root.as_path()), (scope, std::path::Path::new("/r")));
+      assert!(
+        change.kind().is_rescan(),
+        "so the re-based words are covered by the replace's own Rescan: {change:?}"
+      );
+
+      // The contrast, on the same shape: with NO seat there is nothing to
+      // re-base, and the one-segment widen still rides the live stream.
+      let plain = inotify_rig();
+      plain.fs.put("/r/old", FileKind::Dir, 5);
+      plain.fs.put("/r/old/keep", FileKind::Dir, 7);
+      let unpruned = watch(&plain, "/r/old").await;
+      fence_birth_crawl(&plain, unpruned, "/r/old").await;
+      assert!(replace(&plain, unpruned, "/r").await.is_ok());
+      assert_eq!(plain.fs.spawns(), 1, "the unpruned widen spawns nothing");
+      assert_eq!(plain.fs.shutdowns(), 0, "and retires nothing");
+    }
+
     /// Death wins mid-widen: a scope torn down while the pre-arm is parked
     /// answers `Retired`, and a parked unwatch resolves at quiescence — the
     /// widen's obligation is counted by the same fence as every other.
@@ -15681,7 +15731,10 @@ mod sync_cookie {
         COUNTER.fetch_add(1, Ordering::Relaxed),
       ));
       std::fs::create_dir_all(&parent).expect("create the scratch parent");
-      let dir = Arc::new(CookieDir::open_or_create(&parent).expect("a cookie directory is minted"));
+      // The scratch directory IS the walk's root, so the pin is a zero-component
+      // descent onto it — the same object a real write would end up holding.
+      let pinned = CookieParent::open(&parent, &parent).expect("the scratch parent pins");
+      let dir = Arc::new(CookieDir::open_or_create(&pinned).expect("a cookie directory is minted"));
       (parent, dir)
     }
 
@@ -17237,6 +17290,81 @@ mod sync_cookie {
       dir
     }
 
+    /// A cookie directory inside `parent`, reached the way a real write reaches
+    /// one: `parent` stands as its own root, so the pin is a zero-component
+    /// descent onto it and the directory is created relative to what that
+    /// descent holds.
+    fn cookie_dir_in(parent: &std::path::Path) -> CookieDir {
+      let pinned = CookieParent::open(parent, parent).expect("the scratch parent pins");
+      CookieDir::open_or_create(&pinned).expect("the cookie directory opens")
+    }
+
+    /// A symlink swapped in AFTER the judgement cannot redirect the create.
+    ///
+    /// This is the whole reason the parent is pinned: the write used to resolve
+    /// the directory's pathname once to canonicalize and judge it, and again,
+    /// later, to open it — two questions about a world that changes in between.
+    /// A peer that replaced an intermediate component with a symlink in exactly
+    /// that window moved the second resolution somewhere the first never
+    /// described, so the cookie landed outside the judged directory (in pruned
+    /// ground, or outside the watched root) while the write reported success and
+    /// the barrier it was placed for could never resolve.
+    ///
+    /// The swap here is total: `mid` is renamed aside and a symlink to an
+    /// entirely different tree is stood at its name, so the PATH the pin was
+    /// asked for now resolves to a different object with the same shape. The
+    /// create must reach the object, not the path.
+    ///
+    /// Revert witness: create the cookie directory by pathname (the
+    /// `DirBuilder`/`OpenOptions` pair this replaced) and it appears under
+    /// `decoy` instead.
+    #[test]
+    fn a_pinned_cookie_parent_cannot_be_redirected_by_a_later_symlink() {
+      let root = scratch("pinned-parent");
+      let judged = root.join("mid").join("sub");
+      let decoy = root.join("decoy").join("sub");
+      std::fs::create_dir_all(&judged).expect("the judged directory");
+      std::fs::create_dir_all(&decoy).expect("a directory of the same shape elsewhere");
+
+      let parent = CookieParent::open(&root, &judged).expect("the walk reaches the judged object");
+      assert_eq!(
+        parent.path(),
+        judged.as_path(),
+        "staging: the walk spells the name the verdicts are taken on"
+      );
+
+      // The swap, in the window a path-based open would have been exposed to:
+      // `mid` becomes a symlink to `decoy`'s parent, so `<root>/mid/sub` now
+      // NAMES a different directory. Nothing the pin holds moved.
+      std::fs::rename(root.join("mid"), root.join("moved")).expect("move the real tree aside");
+      std::os::unix::fs::symlink(root.join("decoy"), root.join("mid")).expect("stand the symlink");
+      assert!(
+        std::fs::canonicalize(&judged).expect("the spelling still resolves") == decoy,
+        "staging: the judged SPELLING now resolves to the decoy"
+      );
+
+      let cookies =
+        CookieDir::open_or_create(&parent).expect("the create is anchored, not resolved");
+      cookies
+        .create(".tributaries-sync-pinned")
+        .expect("a cookie");
+
+      let landed = |dir: &std::path::Path| {
+        std::fs::read_dir(dir)
+          .expect("the directory is readable")
+          .filter_map(Result::ok)
+          .any(|entry| crate::driver::is_sync_cookie_dir_name(&entry.file_name().to_string_lossy()))
+      };
+      assert!(
+        landed(&root.join("moved").join("sub")),
+        "the cookie directory is inside the object that was judged"
+      );
+      assert!(
+        !landed(&decoy),
+        "and the swapped-in name reached nothing at all"
+      );
+    }
+
     /// The replacement's contents, so the survivor is proven by what it HOLDS and
     /// not merely by something existing at the name.
     const STRANGER: &[u8] = b"a file the watcher never created";
@@ -17498,7 +17626,7 @@ mod sync_cookie {
     #[test]
     fn an_unidentifiable_cookie_is_destroyed_rather_than_tracked() {
       let root = scratch("unidentified");
-      let dir = Arc::new(CookieDir::open_or_create(&root).expect("the cookie directory opens"));
+      let dir = Arc::new(cookie_dir_in(&root));
       let name = ".tributaries-sync-unidentified";
       let created = dir.create(name).expect("a cookie is created in it");
       let path = dir.path().join(name);
@@ -17657,7 +17785,7 @@ mod sync_cookie {
       let root = scratch("unwind-anchor");
       let holder = root.join("d");
       std::fs::create_dir(&holder).expect("the cookie's own directory");
-      let dir = Arc::new(CookieDir::open_or_create(&holder).expect("the cookie directory opens"));
+      let dir = Arc::new(cookie_dir_in(&holder));
       let name = ".tributaries-sync-unwind-anchor";
       let created = dir.create(name).expect("a cookie is created in it");
       let created_at = dir.path().join(name);
@@ -17714,7 +17842,7 @@ mod sync_cookie {
     #[test]
     fn an_undestroyable_cookie_comes_back_as_a_residue() {
       let root = scratch("unwind-residue");
-      let dir = Arc::new(CookieDir::open_or_create(&root).expect("the cookie directory opens"));
+      let dir = Arc::new(cookie_dir_in(&root));
       let name = ".tributaries-sync-unwind-residue";
       let created = dir.create(name).expect("a cookie is created in it");
       // Free the name and put a DIRECTORY there: `unlinkat` without
@@ -17890,7 +18018,7 @@ mod sync_cookie {
     #[test]
     fn an_anchor_residue_is_never_retried_by_name() {
       let root = scratch("anchor-displaced");
-      let dir = Arc::new(CookieDir::open_or_create(&root).expect("the cookie directory opens"));
+      let dir = Arc::new(cookie_dir_in(&root));
       let name = ".tributaries-sync-anchor-displaced";
       let residue = anchor_residue(&dir, name);
       let path = dir.path().join(name);
@@ -17927,7 +18055,7 @@ mod sync_cookie {
     #[test]
     fn an_anchor_residue_at_its_own_name_still_unlinks() {
       let root = scratch("anchor-unlink");
-      let dir = Arc::new(CookieDir::open_or_create(&root).expect("the cookie directory opens"));
+      let dir = Arc::new(cookie_dir_in(&root));
       let name = ".tributaries-sync-anchor-unlink";
       let residue = anchor_residue(&dir, name);
       let path = dir.path().join(name);
@@ -17956,7 +18084,7 @@ mod sync_cookie {
     #[test]
     fn an_anchor_removal_with_nothing_to_promote_fails_closed() {
       let root = scratch("anchor-closed");
-      let dir = CookieDir::open_or_create(&root).expect("the cookie directory opens");
+      let dir = cookie_dir_in(&root);
       let name = ".tributaries-sync-anchor-closed";
       let path = dir.path().join(name);
       std::fs::write(&path, STRANGER).expect("something stands at the name");
@@ -18085,6 +18213,18 @@ mod sync_cookie {
       ));
       std::fs::create_dir_all(&dir).expect("create scratch dir");
       dir
+    }
+
+    /// `parent`, opened the way a real write opens it — the handle the mint is
+    /// anchored at and the verdicts are taken on. `parent` stands as its own
+    /// root here, which is what a cell reaching straight for the mint wants.
+    fn pinned(parent: &Path) -> CookieParent {
+      CookieParent::open(parent, parent).expect("the scratch parent pins")
+    }
+
+    /// A cookie directory minted inside `parent`, through that pin.
+    fn cookie_dir_in(parent: &Path) -> CookieDir {
+      CookieDir::open_or_create(&pinned(parent)).expect("the cookie directory opens")
     }
 
     /// The directory a completed write put its cookie in.
@@ -18263,7 +18403,7 @@ mod sync_cookie {
       const STRANGER: &[u8] = b"a file the watcher never created";
 
       let root = scratch("pinless");
-      let dir = CookieDir::open_or_create(&root).expect("a cookie directory is minted");
+      let dir = cookie_dir_in(&root);
       let name = ".tributaries-sync-pinless";
       let created = dir.create(name).expect("a cookie is created in it");
       let identity = identity_of_handle(&created)
@@ -18429,7 +18569,7 @@ mod sync_cookie {
       std::fs::create_dir(&variant).expect("occupy the second candidate, cased differently");
 
       let mut sequence = [7_u32, 42, 99].into_iter();
-      let dir = CookieDir::minted(&root, &mut || {
+      let dir = CookieDir::minted(&pinned(&root), &mut || {
         sequence
           .next()
           .expect("the loop asks for no more than three")
@@ -18518,7 +18658,7 @@ mod sync_cookie {
       // The mint is aimed straight at the junction, so the collision is certain
       // rather than waited for.
       let mut sequence = [7_u32, 51].into_iter();
-      let aimed = CookieDir::minted(&root, &mut || {
+      let aimed = CookieDir::minted(&pinned(&root), &mut || {
         sequence.next().expect("the loop asks for no more than two")
       })
       .expect("a junction at a candidate name costs one retry, not a failed sync");

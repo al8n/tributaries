@@ -6,8 +6,8 @@
 //! matches anything ([`Globs::is_match`]), so no pattern can ever name the root
 //! it is configured on.
 //!
-//! Two compile options are fixed for every pattern this module builds, and both
-//! are part of the vocabulary's meaning rather than a tunable:
+//! Three compile options are fixed for every pattern this module builds, and all
+//! three are part of the vocabulary's meaning rather than a tunable:
 //!
 //! - **case-insensitive**. The seats these patterns serve name real directories
 //!   (`node_modules`, `Caches`) and real extensions (`.MP4` off a camera), on
@@ -19,6 +19,23 @@
 //!   `**/*.mp4` matches both, and `**/node_modules` matches `node_modules` as
 //!   well as `a/b/node_modules`. Without it every `*` would silently be a
 //!   subtree wildcard and a pattern could never name one path component.
+//! - **backslash escapes**. `\*` is a literal asterisk, and a `\` at the very end
+//!   is a refusal. The matcher's own default for this is the HOST's — escapes on
+//!   Unix, a path separator on Windows — which would make `foo\*` mean the
+//!   literal name `foo*` on one platform and `foo/*` on the other, so one
+//!   serialized configuration would subtract different ground depending on where
+//!   it was read. Patterns here are `/`-joined on every platform, so the
+//!   backslash has no separator meaning to preserve.
+//!
+//! # Bounded input
+//!
+//! A pattern is a caller's configuration value, reachable from a JSON document or
+//! a command line, and [`Glob::new`] is the one door it comes through. Two
+//! ceilings are enforced there, before the matcher ever sees the text —
+//! [`MAX_GLOB_LEN`] and [`MAX_GLOB_NESTING`] — so no pattern any face accepts can
+//! exhaust the stack or the automaton budget. A SET of already-valid patterns is
+//! bounded in turn by the seat that carries it (see [`Globs::new`], and
+//! `tributary_fs::RootOptions::MAX_SEAT_PATTERNS` for the seat that does it).
 //!
 //! # Unicode: one canonical form on both sides
 //!
@@ -43,6 +60,35 @@ use std::{borrow::Cow, sync::Arc};
 
 use unicode_normalization::UnicodeNormalization as _;
 
+/// The longest pattern [`Glob::new`] will compile, in BYTES of the caller's own
+/// text.
+///
+/// A prune word names a directory and an include word names a file, and neither
+/// vocabulary has anything to say at four figures: the longest pattern this
+/// crate's own documentation ever shows is under thirty bytes. What the ceiling
+/// is for is the other end — a pattern is a caller's CONFIGURATION VALUE,
+/// reachable from a JSON document or a command line, and every cost the matcher
+/// pays grows with its length. Refusing here is a typed error a configuration
+/// layer can report; discovering the same limit inside the automaton builder is,
+/// at best, an opaque message and, at worst, a resource the process already
+/// spent.
+pub const MAX_GLOB_LEN: usize = 1024;
+
+/// How deeply [`Glob::new`] will let alternations (`{a,{b,c}}`) nest.
+///
+/// This one is a SAFETY limit rather than a taste one. Alternation is the only
+/// recursive construct in the vocabulary, and the matcher parses and renders it
+/// recursively: a balanced, syntactically perfect `{{{{…a…}}}}` of a few
+/// thousand levels overflows the process stack inside the builder — before any
+/// automaton exists for the size limit to catch, and with no value left to report
+/// it as. A caller's configuration value must never be able to end the process,
+/// so the depth is counted here, in a flat scan, before the pattern is handed
+/// over.
+///
+/// Eight is far above anything the vocabulary needs — `**/*.{mp4,mov,{a,b}}` is
+/// three — and far below anything a parser has to think about.
+pub const MAX_GLOB_NESTING: usize = 8;
+
 /// `text` in NFC, borrowed when it is already there.
 ///
 /// The quick check is what keeps this within the fence's budget: an ASCII path
@@ -54,6 +100,37 @@ fn nfc(text: &str) -> Cow<'_, str> {
   } else {
     Cow::Owned(text.nfc().collect())
   }
+}
+
+/// The alternation nesting depth `pattern` reaches, if that is more than
+/// [`MAX_GLOB_NESTING`] — the flat scan that stands in for the recursive parse.
+///
+/// Backslash escapes are honoured because [`Glob::new`] compiles with them
+/// enabled on every host, so `\{` is a literal brace here exactly as it is to the
+/// matcher. A brace inside a character class is counted anyway: the vocabulary
+/// has no use for eight nested `[{]`, and a count that over-refuses at that depth
+/// is cheaper to be sure of than one that has to know where a class begins.
+fn over_nested(pattern: &str) -> Option<usize> {
+  let mut depth = 0usize;
+  let mut escaped = false;
+  for byte in pattern.bytes() {
+    if escaped {
+      escaped = false;
+      continue;
+    }
+    match byte {
+      b'\\' => escaped = true,
+      b'{' => {
+        depth += 1;
+        if depth > MAX_GLOB_NESTING {
+          return Some(depth);
+        }
+      }
+      b'}' => depth = depth.saturating_sub(1),
+      _ => {}
+    }
+  }
+  None
 }
 
 /// Why a pattern is not a valid [`Glob`].
@@ -141,30 +218,57 @@ struct Compiled {
 
 impl Glob {
   /// Compiles `pattern` under this module's fixed options (case-insensitive,
-  /// `literal_separator`), from its NFC form.
+  /// `literal_separator`, backslash escapes), from its NFC form.
   ///
-  /// Compilation is TWO steps, and both are fallible here rather than one being
-  /// deferred: parsing the pattern, and building the automaton that actually
-  /// answers a match. The second has a size limit the first does not — a
-  /// syntactically perfect pattern of a few hundred thousand wildcards parses
-  /// and then overflows it — and the only place that refusal can be reported as
-  /// a value is here, at the door a caller's configuration comes through. A
-  /// pattern this constructor accepted can therefore never fail, or panic, at
-  /// match time.
+  /// Compilation is THREE steps, and every one of them is fallible HERE rather
+  /// than deferred: the input is measured against this module's own ceilings,
+  /// then parsed, then built into the automaton that actually answers a match. A
+  /// pattern this constructor accepted can therefore never fail, or panic, or
+  /// overflow the stack, at match time.
+  ///
+  /// The ceilings come first because the two steps after them are where a
+  /// caller's configuration value can cost the process something it cannot
+  /// report: the parse RECURSES on alternations, so deep nesting overflows the
+  /// stack ([`MAX_GLOB_NESTING`]), and the build has a size limit the parse does
+  /// not, so a syntactically perfect pattern of a few hundred thousand wildcards
+  /// parses and then exceeds it ([`MAX_GLOB_LEN`] keeps that cost bounded, and
+  /// the build's own refusal is still reported as a value below).
   ///
   /// # Errors
   ///
-  /// [`GlobError`] when the matcher cannot parse the pattern — an unclosed `[`,
-  /// a stray `\` at the end, a malformed alternation — or cannot build an
-  /// automaton for it within its own size limit.
+  /// [`GlobError`] when the pattern is longer than [`MAX_GLOB_LEN`] bytes or
+  /// nests alternations deeper than [`MAX_GLOB_NESTING`]; when the matcher
+  /// cannot parse it — an unclosed `[`, a stray `\` at the end, a malformed
+  /// alternation — or cannot build an automaton for it within its own size
+  /// limit.
   pub fn new(pattern: &str) -> Result<Self, GlobError> {
     let refuse = |message: String| GlobError {
       pattern: pattern.to_owned(),
       message,
     };
+    if pattern.len() > MAX_GLOB_LEN {
+      return Err(refuse(format!(
+        "the pattern is {} bytes, over the {MAX_GLOB_LEN}-byte limit",
+        pattern.len()
+      )));
+    }
+    if let Some(depth) = over_nested(pattern) {
+      return Err(refuse(format!(
+        "alternations nest at least {depth} deep, over the limit of {MAX_GLOB_NESTING}"
+      )));
+    }
     let glob = globset::GlobBuilder::new(&nfc(pattern))
       .case_insensitive(true)
       .literal_separator(true)
+      // Stated rather than inherited, because the DEFAULT is the host's: a
+      // backslash escapes on Unix and is a path SEPARATOR on Windows, so `foo\*`
+      // would mean the literal name `foo*` on one host and `foo/*` on the other,
+      // and the same serialized word would subtract different ground depending on
+      // where it was read. This vocabulary joins with `/` on every platform (see
+      // the module docs), so the backslash has no separator meaning to preserve —
+      // and enabling escapes is what makes the documented dangling-escape refusal
+      // a refusal on every host too.
+      .backslash_escape(true)
       .build()
       .map_err(|err| refuse(err.to_string()))?;
     let mut builder = globset::GlobSetBuilder::new();
@@ -352,6 +456,19 @@ impl Globs {
   /// its own construction ([`Glob::new`]), so the fallback merely asks them in
   /// turn; a matcher built lazily here would be a second place the same size
   /// limit could be met, with no value left to report it as.
+  ///
+  /// # The fallback's worst case, and who bounds it
+  ///
+  /// The fallback costs one automaton pass PER PATTERN, and a prune fence asks a
+  /// set once per directory prefix of every event — so the whole worst case is
+  /// `patterns × prefix depth` passes per event, on the pattern sets large enough
+  /// to have refused a union in the first place. That is a real cost and it is
+  /// bounded where the patterns are ADMITTED rather than here: a seat carries at
+  /// most `tributary_fs::RootOptions::MAX_SEAT_PATTERNS` (256) of them, refused
+  /// with a typed configuration error, so the worst case is 256 passes per
+  /// prefix and not "as many as a document happened to list". Bounding it here
+  /// instead would mean refusing a `Globs` — an infallible constructor whose
+  /// whole promise is that a set of valid patterns always builds.
   pub fn new(patterns: impl IntoIterator<Item = Glob>) -> Self {
     let patterns: Vec<Glob> = patterns.into_iter().collect();
     if patterns.is_empty() {

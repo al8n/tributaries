@@ -854,20 +854,233 @@ impl CookieDir {
   }
 }
 
+/// The directory a cookie directory is created IN, held open — the ONE object a
+/// sync write judges and then creates against.
+///
+/// The two are the same object by construction rather than by hope, and that is
+/// this type's whole reason to exist. The write used to resolve the parent's
+/// pathname twice: once to canonicalize and judge it, and again, later, to open
+/// it. A peer that swapped an intermediate directory for a symlink between those
+/// two resolutions moved the second one somewhere the first never described — a
+/// pruned subtree, or outside the watched root altogether — and the write
+/// reported success while the barrier it was placed for could never resolve,
+/// because the root's stream does not report from where the cookie actually
+/// landed. Judging a name and then creating at a name is two questions; judging
+/// an OPEN OBJECT and creating relative to it is one.
+///
+/// [`path`](Self::path) is that object's own name, and it is what the
+/// containment and `prune` verdicts are taken on — never the caller's spelling,
+/// and never a path the write resolved earlier and hopes still holds.
+///
+/// # What each platform binds, and what it leaves open
+///
+/// **Unix** walks from the watched ROOT's descriptor down, one `openat` per
+/// component, each with `O_DIRECTORY | O_NOFOLLOW` — the discipline the fanotify
+/// walk's pinned opens already run under. No component is followed through a
+/// symlink and none can climb above the descriptor it started from, so the
+/// root-relative name this walk spells IS a true name of the object it ends
+/// holding, and the seat is judged on the components it actually traversed. The
+/// ROOT itself is still opened by pathname, once: it is the watched tree's own
+/// anchor rather than anything this write chose, and a peer able to redirect it
+/// has redirected the whole watch, not merely one cookie.
+///
+/// **Windows** has no descriptor-relative directory open, and needs none here:
+/// its cookie directory is minted per obligation under a name bound by the
+/// create itself (see [`CookieDir`]), so what must be pinned is the PARENT that
+/// create is anchored at. It is opened once, and the judgement is then taken on
+/// the name that HANDLE answers to rather than on the path the open was asked
+/// for — so a component swapped in before the open is judged as what it became,
+/// and one swapped in after cannot reach the create at all.
+///
+/// **Everything else** cannot bind a cookie's removal to the object created (see
+/// the third [`CookieDir::open_or_create`] arm) and so never opens one.
+struct CookieParent {
+  /// The opened object's OWN name — the string every verdict is taken on, and
+  /// the prefix a cookie's landing path is reported under.
+  path: PathBuf,
+  /// Every create runs against this, never against `path`.
+  #[cfg(any(target_os = "linux", target_os = "macos"))]
+  fd: std::os::fd::OwnedFd,
+  #[cfg(all(target_os = "windows", not(miri)))]
+  handle: std::os::windows::io::OwnedHandle,
+}
+
+impl CookieParent {
+  /// The opened object's own name — what the containment and `prune` verdicts
+  /// are taken on.
+  fn path(&self) -> &Path {
+    &self.path
+  }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl CookieParent {
+  /// Walks from `root` down to `dir`, one pinned `openat` per component.
+  ///
+  /// `dir` must lie under `root` (the caller's lexical preflight has already
+  /// said so); anything else is a seam bug and refused rather than walked.
+  fn open(root: &Path, dir: &Path) -> Result<Self, std::io::Error> {
+    use std::os::fd::OwnedFd;
+
+    let relative = dir.strip_prefix(root).map_err(|_| {
+      std::io::Error::other("the cookie directory does not lie under the watched root")
+    })?;
+    let mut fd = OwnedFd::from(open_dir_no_follow(root)?);
+    let mut path = root.to_path_buf();
+    for component in relative.components() {
+      let std::path::Component::Normal(name) = component else {
+        // A canonical path yields nothing else, so this is a seam bug — and it
+        // is the one shape that could climb out of the walk. Refuse it rather
+        // than resolve it.
+        return Err(std::io::Error::other(
+          "the cookie directory's path is not a plain descent from the watched root",
+        ));
+      };
+      fd = OwnedFd::from(open_dir_at(&fd, name)?);
+      path.push(name);
+    }
+    Ok(Self { path, fd })
+  }
+}
+
+#[cfg(all(target_os = "windows", not(miri)))]
+impl CookieParent {
+  /// Opens `dir` once and answers the name that HANDLE holds.
+  ///
+  /// `root` plays no part: this platform confines the create by anchoring it at
+  /// the returned handle rather than by walking, and the containment verdict the
+  /// caller then takes reads the handle's own name.
+  fn open(root: &Path, dir: &Path) -> Result<Self, std::io::Error> {
+    use std::os::windows::io::AsHandle;
+
+    let _ = root;
+    let handle = crate::os::windows::ffi::open_cookie_parent(dir)?;
+    let path = crate::os::windows::ffi::final_path_of(handle.as_handle())?;
+    Ok(Self { path, handle })
+  }
+}
+
+#[cfg(not(any(
+  target_os = "linux",
+  target_os = "macos",
+  all(target_os = "windows", not(miri))
+)))]
+impl CookieParent {
+  /// The same refusal [`CookieDir::open_or_create`] answers on this platform,
+  /// taken one step earlier so nothing is opened at all.
+  fn open(root: &Path, dir: &Path) -> Result<Self, std::io::Error> {
+    let _ = (root, dir);
+    Err(std::io::Error::new(
+      std::io::ErrorKind::Unsupported,
+      "this platform has no way to bind a cookie's removal to the object created",
+    ))
+  }
+}
+
+/// Opens the DIRECTORY at `path`, refusing a symlink standing at its last
+/// component and anything that is not a directory.
+///
+/// The walk's first step, and the only one that resolves a pathname.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_dir_no_follow(path: &Path) -> Result<std::fs::File, std::io::Error> {
+  use std::os::unix::fs::OpenOptionsExt;
+
+  std::fs::OpenOptions::new()
+    .read(true)
+    .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+    .open(path)
+}
+
+/// Opens the child directory `name` of the directory `parent` refers to.
+///
+/// `O_DIRECTORY` refuses anything that is not a directory and `O_NOFOLLOW`
+/// refuses a symlink standing at the name, so the descent lands on the object
+/// the parent's own entry names and on no other — which is what makes the walked
+/// name a true name of what the walk ends holding.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_dir_at(
+  parent: &std::os::fd::OwnedFd,
+  name: &std::ffi::OsStr,
+) -> Result<std::fs::File, std::io::Error> {
+  use std::os::fd::{AsRawFd, FromRawFd};
+
+  let name = component_c_name(name)?;
+  // SAFETY: `parent` is an open directory descriptor owned by the caller, `name`
+  // is a live NUL-terminated C string for the call, and the mode argument is
+  // ignored without `O_CREAT`.
+  let raw = unsafe {
+    libc::openat(
+      parent.as_raw_fd(),
+      name.as_ptr(),
+      libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+      0,
+    )
+  };
+  if raw < 0 {
+    return Err(std::io::Error::last_os_error());
+  }
+  // SAFETY: `openat` returned a fresh descriptor owned by nobody else, so the
+  // `File` takes sole ownership of it.
+  Ok(unsafe { std::fs::File::from_raw_fd(raw) })
+}
+
+/// Creates the child directory `name` of the directory `parent` refers to, with
+/// `0o700`. An existing name is reported as [`AlreadyExists`], which is the
+/// caller's idempotent case rather than a failure.
+///
+/// [`AlreadyExists`]: std::io::ErrorKind::AlreadyExists
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn make_dir_at(parent: &std::os::fd::OwnedFd, name: &str) -> Result<(), std::io::Error> {
+  use std::os::fd::AsRawFd;
+
+  let name = cookie_c_name(name)?;
+  // SAFETY: `parent` is an open directory descriptor owned by the caller and
+  // `name` is a live NUL-terminated C string for the call. `0o700` is a valid
+  // mode word; a umask can only clear bits from it, and the caller re-reads what
+  // was actually made.
+  let rc = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) };
+  if rc == 0 {
+    return Ok(());
+  }
+  Err(std::io::Error::last_os_error())
+}
+
+/// One path component as the NUL-terminated C string an `*at` call takes.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn component_c_name(name: &std::ffi::OsStr) -> Result<std::ffi::CString, std::io::Error> {
+  use std::os::unix::ffi::OsStrExt;
+
+  std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+    std::io::Error::new(
+      std::io::ErrorKind::InvalidInput,
+      "a path component may not contain a NUL",
+    )
+  })
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl CookieDir {
   /// Creates (or re-opens) the cookie directory inside `parent` and verifies what
   /// it opened. Every check reads the OPENED DESCRIPTOR, never a second lookup of
   /// the name: a check against a path would describe whatever the name denotes at
   /// that instant rather than the directory the cookies are about to go into.
-  fn open_or_create(parent: &Path) -> Result<Self, std::io::Error> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+  ///
+  /// Both the create and the open are relative to the PINNED parent
+  /// ([`CookieParent`]), so neither resolves a path component of its own: this
+  /// directory lands inside the very object the write's containment and `prune`
+  /// verdicts were taken on, and no swap between those verdicts and this call has
+  /// anywhere to redirect it to. `path` is that object's own name joined with the
+  /// reserved leaf, which is what a landing is reported under — it is never
+  /// resolved again.
+  fn open_or_create(parent: &CookieParent) -> Result<Self, std::io::Error> {
+    use std::os::unix::fs::MetadataExt;
 
-    let path = parent.join(cookie_dir_name());
+    let name = cookie_dir_name();
+    let path = parent.path().join(&name);
     // `0o700` is the mode the whole argument rests on. A umask can only clear
     // bits, so the created directory is never more permissive than asked; the
     // verification below re-reads what was actually made either way.
-    match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+    match make_dir_at(&parent.fd, &name) {
       Ok(()) => {}
       // Already there — from an earlier sync, or from a previous run of this
       // process. Verified below like any other pre-existing directory.
@@ -877,10 +1090,7 @@ impl CookieDir {
     // `O_DIRECTORY` refuses anything that is not a directory and `O_NOFOLLOW`
     // refuses a symlink standing at the name, so what this descriptor refers to
     // cannot have been redirected elsewhere.
-    let opened = std::fs::OpenOptions::new()
-      .read(true)
-      .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-      .open(&path)?;
+    let opened = open_dir_at(&parent.fd, std::ffi::OsStr::new(&name))?;
     let meta = opened.metadata()?;
     // SAFETY: `geteuid` reads no memory, takes no arguments, and cannot fail.
     let euid = unsafe { libc::geteuid() };
@@ -1044,7 +1254,7 @@ impl CookieDir {
   /// never unwinds strands whatever was outstanding; see [`CookieDir`] for the two
   /// mechanisms and [`Drop`](CookieDir::drop) for what the residue costs and where it
   /// is tracked.
-  fn open_or_create(parent: &Path) -> Result<Self, std::io::Error> {
+  fn open_or_create(parent: &CookieParent) -> Result<Self, std::io::Error> {
     Self::minted(parent, &mut mint_cookie_dir_token)
   }
 
@@ -1055,27 +1265,29 @@ impl CookieDir {
   /// Two properties are load-bearing and both come from the shape of this
   /// function rather than from a check inside it.
   ///
-  /// The create is ANCHORED: `parent` is opened once, and every candidate is
-  /// created as a bare leaf beneath that handle (`ffi::create_directory_at`),
-  /// which returns the handle it made. No candidate name is ever resolved as a
-  /// path and none is ever looked up twice, so there is no create-then-open
-  /// window for a peer to unlink what this call made and stand its own directory
-  /// in its place — the atomicity that replaced the reparse verdict this arm used
-  /// to take afterwards.
+  /// The create is ANCHORED: every candidate is created as a bare leaf beneath
+  /// the PINNED parent's handle (`ffi::create_directory_at`), which returns the
+  /// handle it made. No candidate name is ever resolved as a path and none is
+  /// ever looked up twice, so there is no create-then-open window for a peer to
+  /// unlink what this call made and stand its own directory in its place — the
+  /// atomicity that replaced the reparse verdict this arm used to take
+  /// afterwards. And the handle is the one the write already judged, so the
+  /// directory lands inside the object the containment and `prune` verdicts were
+  /// taken on and not merely inside a name that once denoted it (see
+  /// [`CookieParent`]).
   ///
   /// And nothing fallible happens after a create succeeds. The handle goes
   /// straight into the guard whose [`Drop`](CookieDir::drop) disposes of it, so
   /// there is no path on which this returns `Err` having left a directory on
   /// disk — which is exactly the claim `CookieWriteError::clean` makes about the
   /// call site's failures, made true by construction rather than asserted.
-  fn minted(parent: &Path, mint: &mut dyn FnMut() -> u32) -> Result<Self, std::io::Error> {
+  fn minted(parent: &CookieParent, mint: &mut dyn FnMut() -> u32) -> Result<Self, std::io::Error> {
     use std::os::windows::io::AsHandle;
 
     use crate::os::windows::ffi;
 
-    let anchor = ffi::open_cookie_parent(parent)?;
-    let (path, handle) = bind_fresh_cookie_dir(parent, mint, &mut |leaf| {
-      ffi::create_directory_at(anchor.as_handle(), leaf)
+    let (path, handle) = bind_fresh_cookie_dir(parent.path(), mint, &mut |leaf| {
+      ffi::create_directory_at(parent.handle.as_handle(), leaf)
     })?;
     Ok(Self { path, handle })
   }
@@ -1263,7 +1475,7 @@ impl CookieDir {
   all(target_os = "windows", not(miri))
 )))]
 impl CookieDir {
-  fn open_or_create(_parent: &Path) -> Result<Self, std::io::Error> {
+  fn open_or_create(_parent: &CookieParent) -> Result<Self, std::io::Error> {
     Err(std::io::Error::new(
       std::io::ErrorKind::Unsupported,
       "this platform has no way to bind a cookie's removal to the object created",
@@ -5692,14 +5904,29 @@ pub(crate) fn excluded(exclusions: &[PathBuf], path: &Path) -> bool {
 /// - every prefix of length **at least one**. The length floor is what makes the
 ///   ROOT unprunable — its root-relative path is empty, so it has no prefix to
 ///   match with, and a seat can never silence the very root it was configured on;
-/// - `directory` says whether `path`'s OWN last segment is one of them. Prune
-///   names SUBTREES, so a directory is judged on its own name as well as its
-///   ancestors', while an object proven not to be a directory is judged on its
-///   ancestors ALONE. That is what keeps `**/.*` — a pattern a caller writes to
-///   skip dot-DIRECTORIES — from silently taking every dotfile in the tree with
-///   it, files being the `include` seat's business and not this one's. An entry
-///   still inside an already-pruned prefix is dropped whatever its class, because
-///   the walk covers its ancestors either way.
+/// - `directory` says whether `path`'s OWN last segment is one of them, and it
+///   is a PROVEN directory rather than a suspected one. Prune names SUBTREES, so
+///   a directory is judged on its own name as well as its ancestors', while
+///   everything else — an object proven to be a file, AND an object whose class
+///   nobody proved — is judged on its ancestors ALONE. That is what keeps `**/.*`
+///   — a pattern a caller writes to skip dot-DIRECTORIES — from silently taking
+///   every dotfile in the tree with it, files being the `include` seat's business
+///   and not this one's. An entry still inside an already-pruned prefix is
+///   dropped whatever its class, because the walk covers its ancestors either
+///   way.
+///
+///   The unproven class is where the two failure directions are priced against
+///   each other, and the seat takes the fail-OPEN one the rest of this function
+///   takes. Reading "unknown" as "directory" silences a real FILE: a backend
+///   whose ordinary records carry no class (RDCW's basic records) would drop
+///   every create, write and delete of a regular file named like a pruned word,
+///   with no `Rescan` to recover it — silent loss, the one outcome this layer
+///   exists to prevent. Reading it as "not a directory" costs, at worst, one
+///   directory that a pattern named and whose class the backend did not prove: it
+///   is armed, so it costs one watch and its own dirent events, and everything
+///   BELOW it still prunes, because its name is then a proper ancestor prefix of
+///   every descendant path. Coverage one level wider than asked for is a cost; a
+///   change that never arrives is a defect.
 ///
 /// An ancestor walk bounded by the path's own depth and cached nowhere: a scope's
 /// coverage moves under it (a rename re-parents a whole subtree in O(1)), so a
@@ -5754,8 +5981,8 @@ pub(crate) fn prune_prefixes<T>(
     if is_sync_cookie_dir_name(segment) {
       return None;
     }
-    // The last segment of a proven non-directory is not a prefix the seat may
-    // speak for, and it is the end of the walk either way.
+    // The last segment of anything but a proven directory is not a prefix the
+    // seat may speak for, and it is the end of the walk either way.
     if segments.peek().is_none() && !directory {
       return None;
     }
@@ -5875,35 +6102,59 @@ impl FsOps for RealFs {
     let canonical_root = std::fs::canonicalize(root).map_err(CookieWriteError::clean)?;
     if !canonical_dir.starts_with(&canonical_root) {
       // The real directory escapes the watched root — its cookie's create event
-      // could never reach this root's stream. Refuse before creating anything.
+      // could never reach this root's stream. Refuse before opening anything: the
+      // walk below descends FROM the root, so a directory that is not under it
+      // has no walk to take.
       return Err(CookieWriteError::clean(std::io::Error::other(
         "the cookie directory resolves outside the watched root",
       )));
     }
-    // The root's PRUNE seat, judged on the very directory this write is about to
-    // create in and against the canonical root the containment test just used —
-    // so the pattern is matched on the same root-relative spelling the fence will
-    // match the cookie's own event on. A seat that covers it would suppress that
-    // event, leaving the caller's barrier waiting on something that can never
-    // arrive, so the write refuses here and creates nothing. Asking the CALLER's
-    // spelling instead would be two different questions: an intermediate symlink
-    // hides a pruned destination, and a FILE subscription's own path is not the
-    // directory the cookie goes in at all.
-    if let Some(pattern) = pruned_dir_by(&canonical_root, prune, &canonical_dir) {
-      return Err(CookieWriteError::pruned(canonical_dir, pattern));
+    // The parent, OPENED — and from here on nothing this write does resolves a
+    // pathname of its own. Everything below is a verdict about the object this
+    // one call is holding, and the create at the end is anchored at it (see
+    // [`CookieParent`], which states what each platform binds).
+    //
+    // The canonicalize above is what SELECTS the directory; it is not what proves
+    // it, and it never could: a name resolved once and opened later is two
+    // questions about a world that can change between them. A peer that swapped
+    // an intermediate directory for a symlink into pruned ground in exactly that
+    // window used to get a cookie created there, a write that reported success,
+    // and a barrier that could never resolve, because the fence suppresses the
+    // event the barrier waits on.
+    let parent =
+      CookieParent::open(&canonical_root, &canonical_dir).map_err(CookieWriteError::clean)?;
+    if !parent.path().starts_with(&canonical_root) {
+      // The containment question again, asked of the OBJECT rather than of the
+      // spelling that reached it. On the walking platforms this cannot fail — the
+      // walk descends from the root's own descriptor through normal components
+      // alone — and on Windows it is the whole confinement, taken on the name the
+      // opened handle answers to.
+      return Err(CookieWriteError::clean(std::io::Error::other(
+        "the cookie directory resolves outside the watched root",
+      )));
     }
-    // This is the last path this write resolves on the platforms that keep ONE
-    // shared directory: it is opened once, and every operation on the cookie — this
+    // The root's PRUNE seat, judged on that same opened object and against the
+    // canonical root the containment test just used — so the pattern is matched
+    // on the same root-relative spelling the fence will match the cookie's own
+    // event on. A seat that covers it would suppress that event, leaving the
+    // caller's barrier waiting on something that can never arrive, so the write
+    // refuses here and creates nothing. Asking the CALLER's spelling instead
+    // would be two different questions: an intermediate symlink hides a pruned
+    // destination, and a FILE subscription's own path is not the directory the
+    // cookie goes in at all.
+    if let Some(pattern) = pruned_dir_by(&canonical_root, prune, parent.path()) {
+      return Err(CookieWriteError::pruned(
+        parent.path().to_path_buf(),
+        pattern,
+      ));
+    }
+    // The cookie DIRECTORY, created relative to the parent this write is holding:
+    // no component of its path is resolved, so it lands inside the very object
+    // the two verdicts above were taken on. On the platforms that keep ONE shared
+    // directory it is then opened once, and every operation on the cookie — this
     // create, and every removal the obligation ever attempts — goes through its
     // descriptor, which is what makes the cookie's name unbindable by anyone else
     // (see [`CookieDir`]). Windows confines neither, as the paragraphs below state.
-    //
-    // A residual the canonicalize above does not close: a symlink swapped INTO an
-    // intermediate directory between `canonicalize` and the open below is still
-    // followed, because a path-based open is not beneath-anchored. Bounded to what
-    // it can actually cause — the cookie could be placed under a directory other
-    // than the one the caller named, whose events the root's stream may never
-    // report, so the sync's barrier does not resolve.
     //
     // It cannot cause a deletion, for a DIFFERENT reason on each platform, and
     // neither reason is the other's. On Unix every removal is confined to the
@@ -5932,8 +6183,7 @@ impl FsOps for RealFs {
     // directory, which is the one operation there that resolves `path` and can
     // destroy nothing; a peer able to write the parent can interpose on it, and that
     // is a filed defect rather than a claim made here.
-    let cookies =
-      Arc::new(CookieDir::open_or_create(&canonical_dir).map_err(CookieWriteError::clean)?);
+    let cookies = Arc::new(CookieDir::open_or_create(&parent).map_err(CookieWriteError::clean)?);
     // From HERE this write has a physical fact to answer for wherever the
     // directory is minted per obligation: `clean` would claim the filesystem is
     // exactly as this write found it, and it is not. Every failure below therefore
@@ -8656,10 +8906,25 @@ pub(crate) async fn run<R, F>(
                 // else (KR, narrowing, disjoint, equal, non-UTF-8 chain — and,
                 // at the meta re-validation, a differing mount frame) takes
                 // the general new-stream path below.
+                //
+                // An ENGAGED prune seat is one of those things, and the reason
+                // is the seat's own anchoring: the words are ROOT-RELATIVE, so a
+                // widen re-bases every one of them onto ground they never spoke
+                // for. `/r/old` watched with `cache` prunes `/r/old/cache`;
+                // widened to `/r`, the same word prunes `/r/cache` and
+                // `/r/old/cache` becomes reportable ground the splice adopts
+                // UNCHANGED — already unarmed, with no cold walk and no covering
+                // `Rescan` to say so, so every later change under it is silent.
+                // The converse re-base leaves newly pruned descendants armed and
+                // reporting. Reconciling the adopted subtree against the re-based
+                // seat would mean walking it here; the fresh-stream replacement
+                // already walks the whole new root and already mints the covering
+                // `Rescan`, so the widen is simply routed through it.
                 let descending = !scope_backends
                   .get(&scope)
                   .is_some_and(BackendKind::is_kernel_recursive);
                 let widen = descending
+                  && core.scope_prune(scope).is_empty()
                   && core
                     .root_path(scope)
                     .is_some_and(|old| widen_predicate(&old, &root));

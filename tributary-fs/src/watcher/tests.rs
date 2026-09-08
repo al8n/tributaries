@@ -1236,6 +1236,39 @@ mod lifecycle {
     let _ = std::fs::remove_dir_all(&dir);
   }
 
+  /// A household whose glob seat is out of range is refused at the door, before
+  /// any filesystem work and before any state exists to unwind — the same place
+  /// the watcher-wide maxima are answered, and for the same reason: a
+  /// legal-but-extreme configuration value must not become a per-event cost that
+  /// nothing bounds.
+  ///
+  /// The root here does not exist at all, so a refusal taken AFTER the
+  /// canonicalize would answer `NotFound` instead — which is what makes this a
+  /// claim about the ORDER as well as about the verdict.
+  #[tokio::test(start_paused = true)]
+  async fn an_over_full_glob_seat_is_refused_before_any_filesystem_work() {
+    let fs = FakeFs::new(1);
+    let watcher =
+      Watcher::<TokioRuntime>::new_with(WatcherOptions::new(), fs.clone()).expect("build");
+
+    let over_full = crate::options::RootOptions::new().with_prune(
+      (0..=crate::options::RootOptions::MAX_SEAT_PATTERNS).map(|n| {
+        tributary_proto::glob::Glob::new(&format!("**/w{n}")).expect("a valid pattern compiles")
+      }),
+    );
+    let err = watcher
+      .watch_with("/no/such/root", over_full)
+      .await
+      .expect_err("the seat is out of range");
+    assert!(
+      err.is_invalid_options(),
+      "the seat is judged before the root is ever resolved: {err:?}"
+    );
+    assert_eq!(watcher.registry_len(), 0);
+
+    watcher.close().await.expect("close");
+  }
+
   /// A retargeted-but-disjoint final root goes live under the FINAL path:
   /// the registry, the handle, and event assembly all carry what is actually
   /// watched.

@@ -34,15 +34,15 @@ use windows_sys::{
       CreateFileW, DELETE, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO,
       FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO,
       FILE_DISPOSITION_INFO_EX, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-      FILE_FLAG_OVERLAPPED, FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_ATTRIBUTES,
-      FILE_NOTIFY_CHANGE_CREATION, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
-      FILE_NOTIFY_CHANGE_LAST_ACCESS, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SECURITY,
-      FILE_NOTIFY_CHANGE_SIZE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-      FILE_TYPE_DISK, FileAttributeTagInfo, FileBasicInfo, FileDispositionInfo,
+      FILE_FLAG_OVERLAPPED, FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_NAME_NORMALIZED,
+      FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_CREATION, FILE_NOTIFY_CHANGE_DIR_NAME,
+      FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_ACCESS, FILE_NOTIFY_CHANGE_LAST_WRITE,
+      FILE_NOTIFY_CHANGE_SECURITY, FILE_NOTIFY_CHANGE_SIZE, FILE_SHARE_DELETE, FILE_SHARE_READ,
+      FILE_SHARE_WRITE, FILE_TYPE_DISK, FileAttributeTagInfo, FileBasicInfo, FileDispositionInfo,
       FileDispositionInfoEx, FileIdExtdDirectoryInfo, FileIdExtdDirectoryRestartInfo, FileIdInfo,
-      GetFileInformationByHandleEx, GetFileType, OPEN_EXISTING, ReadDirectoryChangesExW,
-      ReadDirectoryChangesW, ReadDirectoryNotifyExtendedInformation, SYNCHRONIZE,
-      SetFileInformationByHandle,
+      GetFileInformationByHandleEx, GetFileType, GetFinalPathNameByHandleW, OPEN_EXISTING,
+      ReadDirectoryChangesExW, ReadDirectoryChangesW, ReadDirectoryNotifyExtendedInformation,
+      SYNCHRONIZE, SetFileInformationByHandle, VOLUME_NAME_DOS,
     },
     System::{
       IO::{
@@ -580,6 +580,69 @@ pub(crate) fn open_cookie_parent(path: &Path) -> io::Result<OwnedHandle> {
   // SAFETY: freshly returned by a successful CreateFileW and owned by no one
   // else; OwnedHandle takes over closure.
   Ok(unsafe { OwnedHandle::from_raw_handle(raw as _) })
+}
+
+/// The path the OPEN OBJECT answers to — `GetFinalPathNameByHandleW`'s
+/// normalized DOS form, the same `\\?\`-prefixed spelling `std::fs::canonicalize`
+/// produces, so the two compare directly.
+///
+/// This is what makes a verdict about a cookie's parent a verdict about the
+/// object rather than about the spelling that reached it: the handle was opened
+/// once, and the name read back off it describes what that open landed on —
+/// every reparse point on the way already followed, and nothing left to swap.
+/// `driver::CookieParent` takes both the root-containment and the `prune`
+/// decision on this string.
+///
+/// # The access mask, and why zero is enough
+///
+/// Nothing is asked for. Microsoft states a handle requirement for this call and
+/// no `dwDesiredAccess` requirement — the name comes from the object manager, not
+/// from the file's contents or its security descriptor — so the anchor
+/// [`open_cookie_parent`] returns, opened with zero access, serves it as it
+/// stands. Asking for a right here would mean asking for it THERE, and that
+/// function's contract is explicit that any bit beyond zero can turn a create
+/// this process is permitted to make into `ACCESS_DENIED`.
+///
+/// `FILE_NAME_NORMALIZED` is the documented default and is named rather than
+/// implied: the opened form is what the comparison needs, and the `OPENED`
+/// alternative can hand back a short (8.3) spelling that no canonical root would
+/// ever prefix-match.
+pub(crate) fn final_path_of(handle: BorrowedHandle<'_>) -> io::Result<std::path::PathBuf> {
+  use std::os::windows::ffi::OsStringExt;
+
+  // A DOS path is capped near `MAX_PATH` in its ordinary form and near 32k in the
+  // `\\?\` one, so this starts at a size that answers almost every call in one go
+  // and grows to whatever the kernel asks for. Two grows are more than the API can
+  // need — the second call is told the exact size — and the bound is there so a
+  // handle whose name kept changing under us ends the loop rather than spinning.
+  let mut buffer = vec![0u16; 512];
+  for _ in 0..3 {
+    // SAFETY: the borrowed handle is live for the call by construction, and the
+    // buffer is a live, writable `u16` allocation whose length is passed exactly.
+    let written = unsafe {
+      GetFinalPathNameByHandleW(
+        handle.as_raw_handle() as HANDLE,
+        buffer.as_mut_ptr(),
+        buffer.len() as u32,
+        FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+      )
+    };
+    if written == 0 {
+      return Err(io::Error::last_os_error());
+    }
+    let written = written as usize;
+    // Microsoft returns the length WITHOUT the terminating NUL on success and
+    // the required size WITH it when the buffer is too small, so a result that
+    // reaches the end of the buffer is the second case.
+    if written >= buffer.len() {
+      buffer.resize(written + 1, 0);
+      continue;
+    }
+    return Ok(std::ffi::OsString::from_wide(&buffer[..written]).into());
+  }
+  Err(io::Error::other(
+    "GetFinalPathNameByHandleW kept asking for a larger buffer",
+  ))
 }
 
 /// CREATES a directory named `leaf` directly inside the directory `parent`

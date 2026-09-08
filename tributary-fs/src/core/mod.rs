@@ -1498,6 +1498,26 @@ struct ScopeState {
   include: Option<Globs>,
 }
 
+/// What the common-layer fence makes of one planned Monitor input
+/// ([`fenced`](DriverCore::fenced)).
+///
+/// Three answers rather than two, because a located over-signal is a RECOVERY
+/// instruction and the fence may not take one away without leaving something in
+/// its place: a signal whose own leaf a `prune` word covers is re-aimed at the
+/// nearest parent the caller still hears about, and only a signal under ground
+/// the caller closed is dropped outright.
+#[derive(Debug)]
+enum Fenced {
+  /// Nothing either seat speaks for: the input reaches the Monitor as planned.
+  Stands,
+  /// Excluded ground, or ground under a pruned ancestor: the input is dropped
+  /// and nothing is owed in its place.
+  Dropped,
+  /// A located over-signal re-aimed above the pruned leaf it named. Fed in the
+  /// dropped signal's place, in its position.
+  Widened(Planned),
+}
+
 /// What one record owes the exclusion geometry, decided from the Monitor's own
 /// report of what that record did to the watch tree.
 ///
@@ -1801,6 +1821,12 @@ impl DriverCore {
   /// and the kernel-recursive sources that enforce the seat at their own boundary
   /// cannot drift apart. Here it is only bound to a scope: an unbound root (one
   /// not resolved yet) fails OPEN, exactly as a path outside the root does.
+  ///
+  /// `directory` is the caller's PROOF that `path`'s own last segment is a
+  /// directory, never its suspicion: an unproven class is judged on the
+  /// ancestors alone, so nothing this layer cannot classify is silenced by its
+  /// own name (see [`crate::driver::prune_prefixes`] for the price of each
+  /// direction).
   fn is_pruned(state: &ScopeState, directory: bool, path: &Path) -> bool {
     state
       .root
@@ -3213,12 +3239,13 @@ impl DriverCore {
   /// An entry the caller EXCLUDED is dropped outright — the cold half of the
   /// common-layer fence (see [`exclusions`](Self::exclusions)) — and so is one the
   /// root's [`prune`](ScopeState::prune) seat covers. The prune half is asked as
-  /// the seat is defined: a DIRECTORY entry (a boundary directory included) is
-  /// judged on its own root-relative path as well as its ancestors', while an
-  /// entry proven to be a non-directory is judged on its ancestors alone — so a
-  /// FILE whose name happens to match a pattern stays in the listing, and only an
-  /// already-pruned prefix above it can take it out (see
-  /// [`is_pruned`](Self::is_pruned)).
+  /// the seat is defined: an entry LISTED as a directory (a boundary directory
+  /// included) is judged on its own root-relative path as well as its ancestors',
+  /// while every other entry — a proven non-directory, and one whose kind the
+  /// read could not classify at all — is judged on its ancestors alone. So a FILE
+  /// whose name happens to match a pattern stays in the listing, an entry of
+  /// unknown kind stays with it, and only an already-pruned prefix above either
+  /// can take it out (see [`is_pruned`](Self::is_pruned)).
   ///
   /// Either drop means the Monitor never emits the entry's `Created`, never
   /// reconciles a slot for it, never arms it and never descends it. Neither
@@ -3255,13 +3282,15 @@ impl DriverCore {
             continue;
           };
           let path = dir.join(name);
-          // A kind the read could not classify is judged as a DIRECTORY here.
-          // `readdir` answers `DT_UNKNOWN` on whole filesystems, and reading that
-          // as "proven file" would let every directory on such a filesystem walk
-          // straight through a `**/node_modules` seat — the seat's own purpose,
-          // lost to an artifact of the listing rather than to anything about the
-          // object.
-          let directory = entry.kind.is_dir() || entry.kind.is_unknown();
+          // Only a LISTED directory is judged on its own name. `readdir` answers
+          // `DT_UNKNOWN` on whole filesystems, and reading that as a directory
+          // would silence every regular FILE on such a filesystem whose name
+          // happens to match a `**/.*` seat — a drop with no `Rescan` behind it,
+          // which is the one thing this fence may not do. An unknown-kind entry
+          // is therefore staged: a directory among them costs one watch and its
+          // own dirents, and its descendants prune at the next level down,
+          // because its name is a proper ancestor prefix of every one of them.
+          let directory = entry.kind.is_dir();
           if self.excluded(&path) || Self::is_pruned(state, directory, &path) {
             continue;
           }
@@ -3347,7 +3376,7 @@ impl DriverCore {
     };
     let scope = ctx.scope;
     let resolved = Self::resolve(&mut state, ctx.purpose, outcome);
-    let resolved = self.fence_resolved(&state, resolved);
+    let resolved = self.fence_resolved(&state, scope, resolved);
     let mut fed = false;
     if let Some(batch) = state.park.active.as_mut() {
       if let Some((fid, partner)) = resolved.evidences {
@@ -4540,9 +4569,17 @@ impl DriverCore {
         Vec::with_capacity(planned.len())
       };
       for planned in planned {
-        if fence && self.fenced(state, exclusions, &planned) {
-          continue;
-        }
+        let planned = if fence {
+          match self.fenced(state, exclusions, scope, &planned) {
+            Fenced::Stands => planned,
+            Fenced::Dropped => continue,
+            // The widened signal takes the dropped one's PLACE, so everything
+            // below reads the input that is actually going to the Monitor.
+            Fenced::Widened(widened) => widened,
+          }
+        } else {
+          planned
+        };
         // Only a KEPT record carries geometry: a rename half the fence just
         // suppressed has an unreported endpoint, which means no watched subtree
         // to carry across — the destination reconciles a fresh directory and
@@ -4581,9 +4618,16 @@ impl DriverCore {
       item.planned = kept;
     }
     if fence {
-      batch
-        .trailing
-        .retain(|planned| !self.fenced(state, exclusions, planned));
+      batch.trailing = core::mem::take(&mut batch.trailing)
+        .into_iter()
+        .filter_map(
+          |planned| match self.fenced(state, exclusions, scope, &planned) {
+            Fenced::Stands => Some(planned),
+            Fenced::Dropped => None,
+            Fenced::Widened(widened) => Some(widened),
+          },
+        )
+        .collect();
     }
   }
 
@@ -4615,7 +4659,7 @@ impl DriverCore {
   /// for the same reason it is needed: only FSEvents parks, and every FSEvents
   /// record is anchored at the ROOT watch with a whole root-relative location, so
   /// no reparent can change how a later one resolves.
-  fn fence_resolved(&self, state: &ScopeState, mut resolved: Resolved) -> Resolved {
+  fn fence_resolved(&self, state: &ScopeState, scope: ScopeId, mut resolved: Resolved) -> Resolved {
     let exclusions = !self.exclusions.is_empty() && !backend_enforces_exclusions(state.profile);
     if !exclusions && state.prune.is_empty() {
       return resolved;
@@ -4624,9 +4668,11 @@ impl DriverCore {
     let before = resolved.planned.len();
     let mut kept = Vec::with_capacity(before);
     for planned in core::mem::take(&mut resolved.planned) {
-      if self.fenced(state, exclusions, &planned) {
-        continue;
-      }
+      let planned = match self.fenced(state, exclusions, scope, &planned) {
+        Fenced::Stands => planned,
+        Fenced::Dropped => continue,
+        Fenced::Widened(widened) => widened,
+      };
       // The destination cover the geometry-less profiles owe, queued directly
       // behind the record that provoked it exactly as the batch-time fence
       // queues it. This is the second and last place a planned input is born, so
@@ -4943,36 +4989,91 @@ impl DriverCore {
     })
   }
 
-  /// Whether one planned Monitor input addresses only fenced ground — excluded,
-  /// pruned, or both ([`is_fenced`](Self::is_fenced)).
+  /// What the fence makes of one planned Monitor input — excluded, pruned, or
+  /// neither ([`is_fenced`](Self::is_fenced)).
   ///
   /// The prune half needs the object's CLASS as well as its path, and each arm
   /// supplies it from what it holds:
   ///
-  /// - a RECORD carries the backend's own verdict. Anything but a proven
-  ///   non-directory is judged as a directory — a class no backend proved is not
-  ///   a proof of a file, and reading it as one would let every directory on a
-  ///   filesystem whose records omit the flag walk through the seat;
-  /// - a located OVER-signal names a subtree, which is a directory by
-  ///   construction.
-  fn fenced(&self, state: &ScopeState, exclusions: bool, planned: &Planned) -> bool {
+  /// - a RECORD carries the backend's own verdict, and only a PROVEN directory
+  ///   is judged on its own last segment. A class no backend stamped is not a
+  ///   proof of a directory either, and reading it as one silences a real file:
+  ///   RDCW's basic records carry no class at all, so every create, write and
+  ///   delete of a regular `cache` under `prune = ["cache"]` would vanish with
+  ///   no `Rescan` behind it. An unproven directory instead costs one watch and
+  ///   prunes at its children (see [`crate::driver::prune_prefixes`]);
+  /// - a located OVER-signal names a subtree, but not every producer of one has
+  ///   proven a directory: a USN `HARD_LINK_CHANGE` on a regular file lowers to
+  ///   an exact-file `Rescan`, and a boundary-crossing rename covers the in-root
+  ///   END whatever its class. So prune is asked of its PROPER ancestors alone,
+  ///   and a leaf the seat covers WIDENS the signal to the nearest unpruned
+  ///   parent rather than dropping it. The parent is unpruned by construction —
+  ///   every prefix above the leaf was just asked and answered no — and one
+  ///   segment is the whole climb.
+  ///
+  /// Widening is what keeps a recovery instruction from being taken by the very
+  /// word it was owed under. Dropping it delivers neither a trustworthy delta
+  /// nor the `Rescan` that would repair one, which is the silent loss the fence
+  /// exists to prevent; a `Rescan` one level wider covers the pruned leaf's
+  /// recovery while naming only ground the caller still hears about.
+  ///
+  /// The EXCLUSION half never widens. An exclusion is a literal subtree the
+  /// caller took out of the reported world, so an over-signal inside one is
+  /// dropped exactly as it was.
+  fn fenced(
+    &self,
+    state: &ScopeState,
+    exclusions: bool,
+    scope: ScopeId,
+    planned: &Planned,
+  ) -> Fenced {
     match planned {
       Planned::Rec(rec) => {
-        !rec.kind().is_self_event()
+        let fenced = !rec.kind().is_self_event()
           && self
             .anchored_path(state, rec.watch(), rec.target())
             .is_some_and(|path| {
-              self.is_fenced(state, exclusions, rec.is_dir() != Some(false), &path)
-            })
+              self.is_fenced(state, exclusions, rec.is_dir() == Some(true), &path)
+            });
+        if fenced {
+          Fenced::Dropped
+        } else {
+          Fenced::Stands
+        }
       }
       Planned::Over(Scope::Subtree(sub)) => {
         let scope_wide = sub.watch() == state.watch && sub.descent().is_empty();
-        !scope_wide
-          && self
-            .anchored_path(state, sub.watch(), Some(sub.descent()))
-            .is_some_and(|path| self.is_fenced(state, exclusions, true, &path))
+        if scope_wide {
+          return Fenced::Stands;
+        }
+        let Some(path) = self.anchored_path(state, sub.watch(), Some(sub.descent())) else {
+          return Fenced::Stands;
+        };
+        // The proper ancestors, asked first: a signal under pruned ground has no
+        // unpruned parent to climb to inside the subtree the caller closed, and
+        // the exclusion half answers here too.
+        if self.is_fenced(state, exclusions, false, &path) {
+          return Fenced::Dropped;
+        }
+        if !Self::is_pruned(state, true, &path) {
+          return Fenced::Stands;
+        }
+        let descent = sub.descent();
+        Fenced::Widened(match descent.len().checked_sub(1) {
+          Some(parent) => Planned::Over(located(
+            sub.watch(),
+            Some(Location::from_segments(
+              descent.segments()[..parent].iter().cloned(),
+            )),
+          )),
+          // A signal at a watch's OWN directory has no descent segment to drop,
+          // so the climb would have to leave for a watch this layer cannot name.
+          // The scope-wide cover is the honest degrade — never a quiet drop, and
+          // never a `Rescan` naming the pruned path.
+          None => Planned::Over(Scope::Root(scope)),
+        })
       }
-      Planned::Over(_) => false,
+      Planned::Over(_) => Fenced::Stands,
     }
   }
 

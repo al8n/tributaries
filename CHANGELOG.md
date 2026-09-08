@@ -174,6 +174,52 @@ All notable changes to this workspace are documented here. The format is based o
     object); a synthesized delivery reports `None`. `SourceEvent` carries it too, stated
     by the new `SourceEvent::with_is_dir` and read by `SourceEvent::is_dir`;
     `tributary_fs::Event::is_dir()` is the fs layer's own accessor behind it.
+  - **`prune`'s leaf match wants a PROVEN directory.** An object whose class nothing
+    reported is judged on its ANCESTORS alone, exactly as a proven file is: reading
+    "unknown" as "directory" silenced real files — every create, write and delete of a
+    regular `cache` under `prune = ["cache"]` on a backend whose ordinary records carry
+    no class, with no `Rescan` behind them. The cost of the other direction is bounded
+    and visible: an unclassified directory a word names costs one watch, and prunes at
+    its children, where its name is a proper ancestor prefix. A located recovery signal
+    is not dropped by its own leaf either — it is WIDENED to the nearest unpruned
+    parent, so an exact-file `Rescan` (a USN `HARD_LINK_CHANGE`, a boundary-crossing
+    rename) still covers what it was owed for without naming pruned ground; a signal
+    under a pruned ANCESTOR is still dropped. fanotify renames now carry the class
+    `FAN_ONDIR` proves, and `ReadDirectoryChangesW` pairs carry the class both halves
+    agree on — two halves that contradict each other become a covering `Rescan` at
+    their common parent rather than a guess.
+  - **A replace on a scope with an engaged `prune` seat is make-before-break**, whatever
+    its shape. The words re-base with the root, and the same-transport widen adopts the
+    old subtree without walking it — so ground the re-based words stop covering would
+    stay unarmed and unannounced forever. The fresh stream reads the whole new root and
+    covers the difference with the `Rescan` it already mints.
+  - **The sync cookie is created relative to the object that was judged.** The write
+    opens the cookie's parent ONCE — on Unix through a root-confined, no-follow,
+    descriptor-relative walk from the watched root; on Windows by reading the name back
+    off the handle its mint path opens — then takes the containment and `prune` verdicts
+    on that object and creates relative to it. A symlink swapped into an intermediate
+    directory after the verdict can no longer redirect the create into pruned ground or
+    out of the watched root.
+
+- **`tributary-proto`** — `glob::MAX_GLOB_LEN` (1024 bytes) and `glob::MAX_GLOB_NESTING`
+  (8) bound what `Glob::new` will compile, as typed `GlobError`s, before the matcher is
+  asked at all. Alternation is the vocabulary's only recursive construct and the matcher
+  parses it recursively, so a balanced, syntactically perfect `{{{{…}}}}` of a few
+  thousand levels overflowed the process stack from any face — serde, clap, or a
+  programmatic build. `Glob::new` also sets `backslash_escape` explicitly on every host:
+  the matcher's default is the platform's, so `foo\*` meant the literal name `foo*` on
+  Unix and `foo/*` on Windows, and one serialized word subtracted different ground
+  depending on where it was read. Escapes are on everywhere, and a dangling `\` is a
+  refusal everywhere.
+
+- **`tributary-fs`** — `RootOptions::MAX_SEAT_PATTERNS` (256) and
+  `RootOptions::validate`, with `OptionsError::TooManyPrunePatterns` /
+  `TooManyIncludePatterns` and the new `WatchRootError::InvalidOptions` that
+  `watch_with` answers with before any filesystem work. A pattern set the matcher
+  declines to union degrades to one automaton pass per pattern, and the prune fence asks
+  a set once per directory prefix of every event — so the seat cap is what makes that
+  worst case a number (256 passes per prefix) rather than whatever a document happened
+  to list.
 
 ### Changed
 

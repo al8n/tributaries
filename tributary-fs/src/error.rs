@@ -87,12 +87,25 @@ pub enum WatchRootError {
   /// a bug in whatever minted the id; retrying cannot clear it.
   #[error("the minted scope already names a live watched root")]
   ScopeInUse,
+  /// A bounded quantity in the per-root household is out of range — the same
+  /// door-side refusal [`BuildError::InvalidOptions`] is for the watcher-wide
+  /// one, and for the same reason: a legal-but-extreme configuration value
+  /// becomes a typed error before any coverage exists rather than a cost nothing
+  /// bounds afterwards.
+  #[error(transparent)]
+  InvalidOptions(#[from] OptionsError),
   /// The watcher's driver has already stopped.
   #[error("the watcher is closed")]
   Closed,
 }
 
 impl WatchRootError {
+  /// Whether this is [`InvalidOptions`](Self::InvalidOptions).
+  #[inline]
+  pub const fn is_invalid_options(&self) -> bool {
+    matches!(self, Self::InvalidOptions(_))
+  }
+
   /// Whether this is [`NotFound`](Self::NotFound).
   #[inline]
   pub const fn is_not_found(&self) -> bool {
