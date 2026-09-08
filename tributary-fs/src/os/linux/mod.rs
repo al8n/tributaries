@@ -2058,6 +2058,11 @@ mod inotify_source {
     /// installs — the enumerate→arm rename guard. `None` leaves the arm
     /// unverified (identity was unavailable at enumerate time).
     pub(crate) expected: Option<ExpectedObject>,
+    /// The scope's descent frame. The arm re-reads the opened anchor's
+    /// `(dev, mnt_id)` and REFUSES rather than installing across it — the
+    /// prevention half of the mount design, and the guard that still runs when
+    /// [`expected`](Self::expected) is `None`.
+    pub(crate) frame: crate::os::ScopeFrame,
   }
 
   /// An arm's reply: the outcome plus, on success, the target's transient

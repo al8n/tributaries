@@ -2503,6 +2503,7 @@ mod descending {
             name: Segment::new("r"),
             path: Arc::new(PathBuf::from(path)),
             expected: None,
+            frame: crate::os::ScopeFrame::default(),
           }],
         )
         .resolutions

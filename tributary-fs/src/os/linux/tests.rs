@@ -2098,6 +2098,7 @@ mod control_port {
         parent: None,
         name: OsString::from("/r"),
         expected: None,
+        frame: crate::os::ScopeFrame::default(),
       }),
       ControlOp::Disarm(watch(2)),
       ControlOp::Arm(AnchorRequest {
@@ -2105,6 +2106,7 @@ mod control_port {
         parent: None,
         name: OsString::from("/r/child"),
         expected: None,
+        frame: crate::os::ScopeFrame::default(),
       }),
     ];
 

@@ -104,8 +104,8 @@ use tributary_proto::{
 use crate::{
   error::WatchRootError,
   os::{
-    BackendKind, BatchPayload, FsEventFlags, RawOsEvent, RootIdentity, RootMeta, SourceError,
-    SourceEvent,
+    BackendKind, BatchPayload, FsEventFlags, RawOsEvent, RootIdentity, RootMeta, ScopeFrame,
+    SourceError, SourceEvent,
     linux::{RawLinuxEvent, WatchOutcome},
     transport::BudgetPermit,
     windows::RawWindowsEvent,
@@ -304,6 +304,18 @@ pub(crate) enum Effect {
     /// leaves the arm unverified (identity was unavailable — a foreign-device or
     /// unrepresentable entry), exactly as the Monitor already reconciles.
     expected: Option<ExpectedObject>,
+    /// The scope's descent frame at the moment the arm was issued. The executor
+    /// stats the object it opened and REFUSES the arm when the landing sits
+    /// across this frame ([`ScopeFrame::crossed_by`]) — the prevention half of
+    /// the mount-boundary design, and the only one that runs on an arm the
+    /// enumerate fence never saw.
+    ///
+    /// Not the same guard as [`expected`](Self::AddWatch::expected), and it must
+    /// not be folded into it: `expected` is `None` for exactly the arms that
+    /// need this most (inotify's `Created` carries no identity), so a frame
+    /// check gated on a known object would be gated off precisely where the
+    /// boundary gets crossed.
+    frame: ScopeFrame,
   },
   /// Remove one per-directory kernel watch the Monitor dropped. Fire-and-
   /// forget: the Monitor's unwatch carries no result contract, and a wd the
@@ -1714,6 +1726,21 @@ impl ScopeState {
       .clone()
       .unwrap_or_else(|| Arc::new(self.requested.clone()))
   }
+
+  /// This scope's descent frame, as every arm carries it.
+  ///
+  /// Read LIVE at each emission, never captured once: a same-object re-mount
+  /// moves `root_mnt_id` and a replace/widen swaps both halves, and an arm must
+  /// be judged against the frame of the world that issued it. Both halves are
+  /// `None` before the stream spawns, which is the honest degrade — an arm with
+  /// nothing to fence against installs, exactly as [`crosses_mount_boundary`]
+  /// declines nothing under an unknown frame.
+  const fn frame(&self) -> ScopeFrame {
+    ScopeFrame {
+      root_dev: self.root_dev,
+      root_mnt_id: self.root_mnt_id,
+    }
+  }
 }
 
 /// Where a path fell relative to its scope root.
@@ -3118,6 +3145,11 @@ impl DriverCore {
               name: Segment::new(name),
               path: root,
               expected,
+              // The ROOT is where the frame comes FROM, so it can never be
+              // across it: the check compares the landing to the meta this same
+              // spawn just installed. Carried anyway rather than special-cased,
+              // so exactly one rule governs every arm.
+              frame: state.frame(),
             });
           }
         }
@@ -5337,6 +5369,7 @@ impl DriverCore {
               name: Segment::new(name),
               path: root,
               expected,
+              frame: state.frame(),
             });
           } else if let Some(child) = cmd.target().as_child() {
             let parent = child.parent();
@@ -5367,6 +5400,16 @@ impl DriverCore {
                 .and_then(|state| state.root_dev)
                 .map(|dev| ExpectedObject { dev, ino: id.get() })
             });
+            // THE arm this fence exists to refuse. A child learned from a
+            // `Created` record was never enumerated, so `crosses_mount_boundary`
+            // never judged it and `expected` above is `None` (inotify's
+            // `Created` carries no identity) — leaving the executor's own object
+            // guard vacuous. The frame is what the executor judges it on.
+            let frame = self
+              .scopes
+              .get(&scope)
+              .map(ScopeState::frame)
+              .unwrap_or_default();
             self.effects.push_back(Effect::AddWatch {
               scope,
               watch: cmd.id(),
@@ -5375,6 +5418,7 @@ impl DriverCore {
               name,
               path,
               expected,
+              frame,
             });
           }
         }
