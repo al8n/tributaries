@@ -7493,6 +7493,21 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
   /// timer or effect.
   fn refresh_mounts(&self, root: &Path) -> MountRefresh;
 
+  /// Rebuilds `scope`'s source-side sight of the WHOLE root (blocking), for the
+  /// coarse mount-change cover (#74).
+  ///
+  /// Only the fanotify backend has anything to do here: its sight is a FID map
+  /// seeded by a walk that stops at mount boundaries, so ground a departed mount
+  /// revealed is ground the map has never seen. Every other backend's coverage is
+  /// a kernel-side mark or a per-directory re-arm the Monitor drives itself, so
+  /// the default answers
+  /// [`Reseeded`](crate::os::RootRecovery::Reseeded) — there was nothing to
+  /// rebuild, and the cover may proceed.
+  fn recover_root(&self, scope: ScopeId) -> crate::os::RootRecovery {
+    let _ = scope;
+    crate::os::RootRecovery::Reseeded
+  }
+
   /// Attaches the arm/disarm port of `scope`'s freshly spawned source under
   /// its transport `generation` (the delivery lane), so the descending
   /// executors can route to its reader AND recognize a control batch left
@@ -10655,8 +10670,28 @@ impl FsOps for RealFs {
       root: root_liveness,
       root_mnt_id,
       root_incarnation,
+      namespace_transitions: reading.namespace,
     }
   }
+
+  /// Reseeds the scope's fanotify FID map over the whole root, through the
+  /// recovery port its spawn attached. A scope with no attached port answers
+  /// `Reseeded`: it is an inotify or a torn-down scope, and there is no map.
+  ///
+  /// No generation fence here, unlike the arm path. An arm names an old world's
+  /// PATH and must not install on a replacement's fd; a reseed names no object at
+  /// all — it asks the source that is live right now to re-walk the root it is
+  /// live on, which is never the wrong thing to do. The core's own epoch is what
+  /// decides whether the ANSWER still means anything.
+  #[cfg(all(target_os = "linux", not(miri)))]
+  fn recover_root(&self, scope: ScopeId) -> crate::os::RootRecovery {
+    let port = match self.ports.read().unwrap().get(&scope) {
+      Some((_, ScopePort::Fanotify(port))) => port.clone(),
+      _ => return crate::os::RootRecovery::Reseeded,
+    };
+    port.recover()
+  }
+
   #[cfg(all(target_os = "linux", not(miri)))]
   fn attach_scope(&self, scope: ScopeId, port: ScopePort, generation: u64) {
     self
@@ -11911,6 +11946,15 @@ enum OpResult<H> {
     /// about a world this scope has left and is dropped ([`LivenessProbes`]).
     generation: u64,
     refresh: MountRefresh,
+  },
+  /// One [`Effect::RecoverRoot`] finished: the fanotify source's FID map was
+  /// rebuilt over the whole root, or the walk could not reach it. The `epoch` is
+  /// echoed back untouched so the core can drop a reply from a world that ended
+  /// while the walk ran.
+  RootRecovered {
+    scope: ScopeId,
+    epoch: u64,
+    outcome: crate::os::RootRecovery,
   },
   TornDown {
     scope: ScopeId,
@@ -13398,6 +13442,11 @@ pub(crate) async fn run<R, F>(
               core.on_mounts_refreshed(scope, refresh, now());
             }
           }
+          OpResult::RootRecovered {
+            scope,
+            epoch,
+            outcome,
+          } => core.on_root_recovered(scope, epoch, outcome, now()),
           OpResult::WatchInstalled {
             watch,
             attempt,
@@ -14851,6 +14900,14 @@ pub(crate) async fn run<R, F>(
               core.on_mounts_refreshed(scope, refresh, now());
             }
           }
+          // A recovery that landed inside the close sweep: the scope is ending,
+          // so its cover is moot, but the reply still has to be consumed off the
+          // queue like every other terminal.
+          Ok(OpResult::RootRecovered {
+            scope,
+            epoch,
+            outcome,
+          }) => core.on_root_recovered(scope, epoch, outcome, now()),
           // A spawn that raced the close: the stream is live but has no owner —
           // tear it down INSIDE the close accounting (the handle's Drop is only
           // the backstop past the grace) and hold the close reply for its
@@ -18505,6 +18562,22 @@ fn execute_effects<R, F>(
             });
           });
         }
+      }
+      Effect::RecoverRoot { scope, epoch } => {
+        // On the blocking pool, exactly like the refresh it follows: the reseed
+        // is a full descent of the root, served by the source's reader thread,
+        // and this job waits for it. Droppable at close — the scope's cover dies
+        // with the scope, and the walk itself is the source's own business.
+        let ops = ops.clone();
+        let tx = op_tx.clone();
+        R::spawn_blocking_detach(move || {
+          let outcome = ops.recover_root(scope);
+          let _ = tx.try_send(OpResult::RootRecovered {
+            scope,
+            epoch,
+            outcome,
+          });
+        });
       }
       Effect::Emit {
         scope,

@@ -113,6 +113,8 @@ use rustix::fs::OFlags;
 use tributary_proto::WatchId;
 
 pub(crate) use fanotify::AdmittedEvent;
+#[cfg(all(target_os = "linux", not(miri)))]
+pub(crate) use fanotify::RecoveryPort;
 pub(crate) use inotify::decode::RawInotifyEvent;
 use inotify::table::WdTable;
 
@@ -1970,12 +1972,13 @@ impl SourceHandle {
     }
   }
 
-  /// The clonable arm/disarm port: the inotify control port, or `Inert` for
-  /// the kernel-recursive fanotify source (no per-directory arming).
+  /// The clonable control port: the inotify arm/disarm channel, or the fanotify
+  /// reader's whole-root RECOVERY channel (a kernel-recursive source has no
+  /// per-directory arming, but its FID map still has to be reseedable).
   pub(crate) fn scope_port(&self) -> super::ScopePort {
     match self {
       Self::Inotify(handle) => super::ScopePort::Inotify(handle.port()),
-      Self::Fanotify(_) => super::ScopePort::Inert,
+      Self::Fanotify(handle) => super::ScopePort::Fanotify(handle.recovery_port()),
     }
   }
 
