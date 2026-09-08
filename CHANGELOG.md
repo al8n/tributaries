@@ -8,6 +8,41 @@ All notable changes to this workspace are documented here. The format is based o
 
 ### Added
 
+- **`tributary-fs`**, **`tributary-proto`** — two per-ROOT **glob seats**, carried by a
+  new `tributary_fs::RootOptions` and armed through `Watcher::watch_with(root, options)`.
+  `Watcher::watch(root, interest)` stays, unchanged, as the shorthand for
+  `watch_with(root, RootOptions::new().with_interest(interest))`, and the default
+  household is byte-for-byte the behaviour it always had.
+
+  - **`prune`** subtracts SUBTREES from the watch itself: a directory whose
+    root-relative path — or any ancestor's, below the root — matches is never
+    enumerated, never armed, never descended, and nothing at or under it is
+    delivered. It is the per-root, glob-shaped twin of `WatcherOptions::exclusions`,
+    and unlike that option it never stands down to a backend: no OS API takes a
+    glob, so the enforcement is the common layer's on every backend, FSEvents and
+    fanotify included. No `Rescan` ever names a pruned path, and the watched root
+    itself can never be pruned.
+  - **`include`** narrows file DELIVERY only, changing no coverage, so it can be
+    widened later without re-arming anything. `None` — the default — delivers
+    everything. Directories, `Rescan`s, objects whose class no backend proved, and
+    renames whose SOURCE matched are always delivered: the seat fails OPEN, because
+    a folder the consumer never hears about is a hole in its view.
+
+  Patterns are `tributary_proto::glob::Glob` (re-exported as `tributary_fs::Glob`),
+  matched case-insensitively against a `/`-joined root-relative path with
+  `literal_separator` — `*.mp4` does not match `a/b.mp4`, `**/*.mp4` does, and
+  `**/node_modules` matches `node_modules` at any depth. They live behind
+  `tributary-proto`'s new `glob` feature, which `tributary-fs` and `tributaries`
+  enable unconditionally; both faces carry them (serde: lists of plain strings;
+  clap: repeatable `--prune` / `--include` flags, an absent `--include` being the
+  absent seat).
+
+- **`tributary-proto`** — `Change::is_dir()`: the object's class where the source
+  proved it, `None` where nothing did. The same three-valued fact the OS records
+  already carried, threaded through the emission path unchanged — no stat is
+  performed for it, and a consumer filtering on it must treat `None` as unknown.
+  `Change::new` takes it as a new final argument.
+
 - **`tributaries`**, **`tributary-fs`**, **`tributary-proto`** — optional **`serde`**
   and **`clap`** faces on the option households, both off by default and neither
   changing anything when off. `serde` gives every household one document keyed by its

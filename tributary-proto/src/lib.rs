@@ -16,6 +16,10 @@ pub mod action;
 pub mod capabilities;
 pub mod change;
 pub mod error;
+// Needs `std`: `globset` is a std-only matcher.
+#[cfg(feature = "glob")]
+#[cfg_attr(docsrs, doc(cfg(feature = "glob")))]
+pub mod glob;
 pub mod id;
 pub mod interest;
 pub mod monitor;
@@ -39,6 +43,9 @@ pub use action::{
 pub use capabilities::Capabilities;
 pub use change::{Change, ChangeKind};
 pub use error::WatchError;
+#[cfg(feature = "glob")]
+#[cfg_attr(docsrs, doc(cfg(feature = "glob")))]
+pub use glob::{Glob, GlobError, Globs};
 pub use id::{ArmAttempt, ChangeId, Epoch, Identity, MoveCookie, ReqId, ScopeId, WatchId};
 pub use interest::Interest;
 pub use monitor::Monitor;

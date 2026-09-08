@@ -20,7 +20,7 @@ use crate::{
   driver::{Command, CookieIngress, DriverConfig, RealFs, ScopeRegistry, run},
   error::{BuildError, CloseError, ReplaceRootError, SyncRootError, UnwatchError, WatchRootError},
   event::Event,
-  options::WatcherOptions,
+  options::{RootOptions, WatcherOptions},
   os::{BackendKind, BackendStats, RootIdentity, SourceError},
 };
 
@@ -1077,6 +1077,45 @@ impl<R> Watcher<R> {
     root: impl Into<PathBuf>,
     interest: Interest,
   ) -> Result<RootHandle, WatchRootError> {
+    self
+      .watch_with(root, RootOptions::new().with_interest(interest))
+      .await
+  }
+
+  /// Watches `root` under the whole per-root household — its delivery
+  /// [`Interest`] and its two glob seats — resolving once the native stream is
+  /// live.
+  ///
+  /// [`watch`](Self::watch) is the shorthand for
+  /// `watch_with(root, RootOptions::new().with_interest(interest))`, and
+  /// everything that method documents — canonicalization, dead-on-arrival
+  /// handles, the disjointness check — holds here unchanged. What the household
+  /// adds is per-root:
+  ///
+  /// - [`prune`](RootOptions::prune) subtracts subtrees from the watch itself:
+  ///   a matching directory is never enumerated, never armed, never descended,
+  ///   and nothing at or under it is delivered — on every backend;
+  /// - [`include`](RootOptions::include) narrows file DELIVERY only, changing no
+  ///   coverage, so it can be widened later without re-arming anything.
+  ///
+  /// See [`RootOptions`] for how the two seats match and for what they never
+  /// silence.
+  ///
+  /// # Errors
+  ///
+  /// The same four as [`watch`](Self::watch):
+  ///
+  /// - [`WatchRootError::NotFound`] / [`WatchRootError::NotADirectory`] when
+  ///   the root cannot serve as a watch target;
+  /// - [`WatchRootError::Overlaps`] when it is not disjoint from an
+  ///   already-watched root;
+  /// - [`WatchRootError::Source`] when the platform stream could not start;
+  /// - [`WatchRootError::Closed`] when the watcher is already closed.
+  pub async fn watch_with(
+    &self,
+    root: impl Into<PathBuf>,
+    options: RootOptions,
+  ) -> Result<RootHandle, WatchRootError> {
     let supplied = root.into();
     let canonical = std::fs::canonicalize(&supplied).map_err(|err| {
       if err.kind() == std::io::ErrorKind::NotFound {
@@ -1108,7 +1147,7 @@ impl<R> Watcher<R> {
       .commands
       .send(Command::Watch {
         root: canonical,
-        interest,
+        options,
         reply,
       })
       .await;

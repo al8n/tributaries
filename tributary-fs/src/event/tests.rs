@@ -12,6 +12,7 @@ fn change(kind: ChangeKind, location: Location) -> Change {
     location,
     kind,
     Epoch::START,
+    None,
   )
 }
 

@@ -265,6 +265,7 @@ async fn a_real_fs_move_carries_its_source_coordinate_into_the_move_out_projecti
     loc(&["new", "name"]),
     ChangeKind::Moved(loc(&["old", "name"])),
     Epoch::new(3),
+    Some(false),
   );
 
   // NON-VACUITY PRECONDITION, asserted before anything below leans on it: the presented

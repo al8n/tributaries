@@ -66,7 +66,11 @@ serde = { version = "1", optional = true, features = ["derive"] }
 rand_chacha = "0.9"
 thiserror = "2"
 tributary-fs = { version = "0.2", path = "../tributary-fs", optional = true }
-tributary-proto = { version = "0.2", path = "../tributary-proto" }
+# `glob` is enabled unconditionally: the per-root seats ride the umbrella's own
+# option households, whether or not the `fs` binding is compiled in.
+tributary-proto = { version = "0.2", path = "../tributary-proto", features = [
+  "glob",
+] }
 
 # The ONE place an OS entropy source is consulted: the 32-byte seed for the cookie-nonce
 # generator above, taken once when a driver is assembled and never again. Gated off
