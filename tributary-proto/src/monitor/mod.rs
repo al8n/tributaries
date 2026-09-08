@@ -1094,18 +1094,48 @@ impl RearmKickoff {
 /// Deliberately NOT `#[must_use]`. `Nothing` is the outcome of essentially every
 /// record and carries no obligation whatever, so a blanket must-use would put a
 /// `let _ =` on nearly every feed — and a codebase trained to write `let _ =` on
-/// this call is exactly how a real [`Reparented`](Self::Reparented) gets dropped.
+/// this call is exactly how a real [`Reparented`](RecordOutcome::Reparented) gets
+/// dropped.
 /// The crate reserves `#[must_use]` for values that always carry an obligation
 /// (see [`RearmKickoff`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordOutcome {
-  /// The record moved no watched subtree between parents. Every record kind
-  /// reports this except the one below — including a `MovedTo` that paired past
-  /// its window, one whose source held no watched subtree, one with no cookie,
-  /// and one whose reparent was *attempted and rejected* (a cyclic destination,
-  /// or an endpoint the attempt's own teardown removed). A consumer re-anchors
-  /// exactly when the Monitor reparented, and never when it did not.
+  /// The record moved no watched subtree between parents AND resolved no rename.
+  /// Every record kind reports this except the two below — including a `MovedTo`
+  /// that paired past its window, one with no cookie, and one whose parked source
+  /// half no longer reconstructs a path. A consumer re-anchors exactly when the
+  /// Monitor reparented, and never when it did not.
   Nothing,
+  /// A paired, in-window [`RecordKind::MovedTo`] whose SOURCE the Monitor resolved,
+  /// where no watched subtree changed parents: a kernel-recursive scope (which has
+  /// no per-directory watches to reparent at all), a non-directory source, a
+  /// nameless destination, or a held source whose O(1) reparent was attempted and
+  /// rejected.
+  ///
+  /// # Why this exists beside the delivered `Moved`
+  ///
+  /// The object at `from` is at `to` now, and a consumer holding its own
+  /// path-keyed bookkeeping has to follow it whether or not the Monitor's watch
+  /// tree moved and whether or not the consumer's own subscriber wanted to hear
+  /// about it. The delivered [`ChangeKind::Moved`] cannot carry that: it is
+  /// filtered by [`Interest`] and by the `ondir` modifier, so a `modified`-only
+  /// subscription sees the rename land in the tree and hears nothing — and
+  /// bookkeeping keyed by the pre-rename path then names ground that no longer
+  /// exists, permanently. This is the same fact, reported by the operation that
+  /// performed it, ahead of every filter.
+  ///
+  /// It reports what the FILESYSTEM did, so it fires for a rejected reparent too:
+  /// the object moved regardless of what the watch tree managed to carry across.
+  /// [`Reparented`](Self::Reparented) is the strictly stronger answer — it says the
+  /// same thing about the object AND that the tree carried the subtree — so a
+  /// consumer that only needs the rename reads both through
+  /// [`moved_from`](Self::moved_from).
+  Renamed {
+    /// The moved object's scope-relative location immediately before the pairing,
+    /// reconstructed from the live tree at report time exactly as
+    /// [`Reparented::from`](Self::Reparented) is.
+    from: Location,
+  },
   /// A paired, in-window [`RecordKind::MovedTo`] over a held watched directory
   /// whose O(1) reparent SUCCEEDED, reporting the source slot as it stood
   /// immediately BEFORE that reparent.
@@ -1134,12 +1164,30 @@ impl RecordOutcome {
     matches!(self, Self::Nothing)
   }
 
-  /// The pre-reparent source slot, or `None` for [`Nothing`](Self::Nothing).
+  /// The pre-reparent source slot, or `None` for anything that reparented no
+  /// watched subtree — [`Nothing`](Self::Nothing) and
+  /// [`Renamed`](Self::Renamed) alike.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn reparented(&self) -> Option<(WatchId, &Location)> {
     match self {
-      Self::Nothing => None,
+      Self::Nothing | Self::Renamed { .. } => None,
       Self::Reparented { from_parent, from } => Some((*from_parent, from)),
+    }
+  }
+
+  /// **Where the moved object WAS**, for every outcome that resolved a rename —
+  /// [`Renamed`](Self::Renamed) and [`Reparented`](Self::Reparented) together, and
+  /// `None` for [`Nothing`](Self::Nothing).
+  ///
+  /// This is the question a consumer's path-keyed bookkeeping asks, and asking it
+  /// here rather than matching the variants is what keeps that bookkeeping from
+  /// silently skipping every rename the watch tree did not have to reparent (a
+  /// kernel-recursive scope reparents none at all).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn moved_from(&self) -> Option<&Location> {
+    match self {
+      Self::Nothing => None,
+      Self::Renamed { from } | Self::Reparented { from, .. } => Some(from),
     }
   }
 }
@@ -6060,6 +6108,24 @@ impl Monitor {
             }
             self.rescan_dirty_pair(scope, &pending, &to);
           }
+        }
+        // THE UNFILTERED RENAME REPORT. Every arm above resolved the SAME pairing,
+        // and `resolved_from` is that pairing's one source reconstruction — the very
+        // value `emit_pair` delivers a `Moved` from, taken before any `ondir` gate
+        // and before `emit`'s interest filter. A consumer whose own bookkeeping is
+        // keyed by path must follow the object whatever the subscription asked to
+        // hear, so the fact is reported by the operation rather than inferred from
+        // the delivery it may not produce.
+        //
+        // Reported only where nothing STRONGER was: a landed reparent already
+        // carries the same `from` (and says more), so it is left standing and
+        // [`RecordOutcome::moved_from`] reads the two together. A pairing whose
+        // source no longer reconstructs a path relocated nothing nameable and stays
+        // `Nothing`, exactly as its delivery degrades to a `Created`.
+        if outcome.is_nothing()
+          && let Some(from) = resolved_from
+        {
+          outcome = RecordOutcome::Renamed { from };
         }
       }
       Some(pending) => {

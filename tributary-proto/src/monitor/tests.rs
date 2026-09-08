@@ -2675,7 +2675,17 @@ fn a_failed_carry_over_under_a_dead_parent_counts_its_root_escalation() {
       .with_is_dir(true),
     at(12),
   );
-  assert_eq!(outcome, RecordOutcome::Nothing, "no subtree was carried");
+  assert!(
+    outcome.reparented().is_none(),
+    "no subtree was carried: {outcome:?}"
+  );
+  assert_eq!(
+    outcome.moved_from(),
+    Some(&loc(&["d"])),
+    "but the OBJECT moved, and the report says so ahead of every delivery \
+     filter — a consumer's path-keyed bookkeeping has to follow it whether or \
+     not the watch tree carried anything: {outcome:?}"
+  );
   assert!(!m.is_watched(w_d));
   assert!(!m.is_watched(w_sub));
 
@@ -18916,8 +18926,15 @@ fn record_outcome_is_nothing_for_an_unheld_file_source() {
     at(11),
   );
 
-  assert_eq!(outcome, RecordOutcome::Nothing);
-  assert!(outcome.is_nothing() && outcome.reparented().is_none());
+  assert!(
+    outcome.reparented().is_none(),
+    "a non-directory source reparents nothing: {outcome:?}"
+  );
+  assert_eq!(
+    outcome.moved_from(),
+    Some(&loc(&["old"])),
+    "and the rename it IS is reported: {outcome:?}"
+  );
   let events = drain_events(&mut m);
   assert!(
     events.iter().any(|e| e.kind().is_moved()),
@@ -18963,7 +18980,15 @@ fn record_outcome_is_nothing_for_an_unarmed_directory_source() {
     at(11),
   );
 
-  assert_eq!(outcome, RecordOutcome::Nothing);
+  assert!(
+    outcome.reparented().is_none(),
+    "an unarmed source holds no subtree to carry: {outcome:?}"
+  );
+  assert_eq!(
+    outcome.moved_from(),
+    Some(&loc(&["d"])),
+    "and the rename it IS is reported: {outcome:?}"
+  );
   assert!(
     drain_actions(&mut m)
       .iter()
@@ -19132,7 +19157,16 @@ fn record_outcome_is_nothing_when_a_cyclic_reparent_is_rejected() {
     at(11),
   );
 
-  assert_eq!(outcome, RecordOutcome::Nothing);
+  assert!(
+    outcome.reparented().is_none(),
+    "a rejected reparent carried nothing, and a consumer must NOT re-anchor as \
+     if it had: {outcome:?}"
+  );
+  assert_eq!(
+    outcome.moved_from(),
+    Some(&loc(&["d"])),
+    "while the object moved regardless of what the tree managed: {outcome:?}"
+  );
   assert!(!m.is_watched(w_d) && !m.is_watched(w_sub));
   m.assert_invariants();
 }
@@ -19170,7 +19204,15 @@ fn record_outcome_is_nothing_when_the_reparent_aborts_on_a_dead_endpoint() {
     at(11),
   );
 
-  assert_eq!(outcome, RecordOutcome::Nothing);
+  assert!(
+    outcome.reparented().is_none(),
+    "the re-key ABORTED, so nothing was carried: {outcome:?}"
+  );
+  assert_eq!(
+    outcome.moved_from(),
+    Some(&loc(&["a", "d"])),
+    "and the rename it IS is still reported: {outcome:?}"
+  );
   assert!(!m.is_watched(w_a), "the replaced ancestor is dropped");
   assert!(!m.is_watched(w_d), "and the held source went with it");
   assert!(
