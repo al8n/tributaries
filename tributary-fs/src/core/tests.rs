@@ -83,11 +83,25 @@ fn probes(effects: &[Effect]) -> Vec<(ProbeId, PathBuf)> {
 /// exercise device trust without tripping the folded-in root-death check.
 fn alive_refresh(mounts: Vec<PathBuf>, authoritative: bool) -> MountRefresh {
   MountRefresh {
-    mounts,
+    mounts: mounts.into_iter().map(bare).collect(),
     authoritative,
     root: RootLiveness::Present(crate::os::RootIdentity::new(1, 1)),
     // No frame change exercised: the captured `root_mnt_id` stays intact.
     root_mnt_id: None,
+    root_incarnation: None,
+  }
+}
+
+/// A table row with no identity at all — what macOS' `getfsstat`, a kernel below
+/// every id oracle and every fake report. The suites that only care WHERE a mount
+/// is use this; the ones that exercise identity spell `MountRow` out.
+fn bare(location: impl Into<PathBuf>) -> crate::os::MountRow {
+  crate::os::MountRow {
+    location: location.into(),
+    mnt_id: None,
+    parent_id: None,
+    mnt_id_unique: None,
+    dev: None,
   }
 }
 
@@ -688,6 +702,7 @@ fn refresh_finding_root_gone_is_delete_self() {
       authoritative: true,
       root: RootLiveness::Missing,
       root_mnt_id: None,
+      root_incarnation: None,
     },
     at(5),
   );
@@ -721,6 +736,7 @@ fn refresh_finding_root_replaced_is_move_self() {
         authoritative: true,
         root,
         root_mnt_id: None,
+        root_incarnation: None,
       },
       at(5),
     );
@@ -750,10 +766,11 @@ fn refresh_finding_root_alive_only_updates_trust() {
   core.on_mounts_refreshed(
     scope,
     MountRefresh {
-      mounts: vec![PathBuf::from("/r/vol")],
+      mounts: vec![bare("/r/vol")],
       authoritative: true,
       root: RootLiveness::Present(crate::os::RootIdentity::new(1, 1)),
       root_mnt_id: None,
+      root_incarnation: None,
     },
     at(5),
   );
@@ -1191,6 +1208,7 @@ fn identity_minting_respects_devices_and_mounts() {
     root: Some(Arc::new(PathBuf::from("/r"))),
     root_dev: Some(1),
     root_mnt_id: None,
+    root_incarnation: None,
     identity: Some(crate::os::RootIdentity::new(1, 1)),
     mount_table: vec![PathBuf::from("/r/vol")],
     learned_mounts: Vec::new(),
@@ -1231,6 +1249,7 @@ fn blind_mount_table_refuses_event_side_trust() {
     root: Some(Arc::new(PathBuf::from("/r"))),
     root_dev: Some(1),
     root_mnt_id: None,
+    root_incarnation: None,
     identity: Some(crate::os::RootIdentity::new(1, 1)),
     mount_table: Vec::new(),
     learned_mounts: Vec::new(),
@@ -1876,7 +1895,7 @@ fn seeded_mount_blocks_pairing_before_any_probe_learns_it() {
       root: PathBuf::from("/r"),
       root_dev: 1,
       root_mnt_id: None,
-      mounts: vec![PathBuf::from("/r/vol")],
+      mounts: vec![bare("/r/vol")],
       identity: crate::os::RootIdentity::new(1, 1),
       ancestors: Vec::new(),
       backend: BackendKind::FsEvents,
@@ -2475,7 +2494,7 @@ fn same_batch_unmount_keeps_colliding_rename_foreign() {
       root: PathBuf::from("/r"),
       root_dev: 1,
       root_mnt_id: None,
-      mounts: vec![PathBuf::from("/r/vol")],
+      mounts: vec![bare("/r/vol")],
       identity: crate::os::RootIdentity::new(1, 1),
       ancestors: Vec::new(),
       backend: BackendKind::FsEvents,
@@ -3120,6 +3139,7 @@ mod lowering {
       root: Some(Arc::new(PathBuf::from(root))),
       root_dev: Some(1),
       root_mnt_id: None,
+      root_incarnation: None,
       identity: Some(crate::os::RootIdentity::new(1, 1)),
       mount_table: Vec::new(),
       learned_mounts: Vec::new(),
@@ -4374,6 +4394,7 @@ mod descending {
         authoritative: true,
         root: RootLiveness::Present(crate::os::RootIdentity::new(1, 1)),
         root_mnt_id: Some(77),
+        root_incarnation: None,
       },
       at(1),
     );
@@ -4452,6 +4473,7 @@ mod descending {
         authoritative: true,
         root: RootLiveness::Present(crate::os::RootIdentity::new(1, 1)),
         root_mnt_id: None,
+        root_incarnation: None,
       },
       at(1),
     );
@@ -4534,6 +4556,7 @@ mod descending {
         authoritative: true,
         root: RootLiveness::Present(crate::os::RootIdentity::new(1, 999)),
         root_mnt_id: Some(77),
+        root_incarnation: None,
       },
       at(1),
     );
@@ -4590,6 +4613,7 @@ mod descending {
         authoritative: true,
         root: RootLiveness::Present(crate::os::RootIdentity::new(1, 1)),
         root_mnt_id: Some(77),
+        root_incarnation: None,
       },
       at(1),
     );
@@ -4631,6 +4655,7 @@ mod descending {
         authoritative: true,
         root: RootLiveness::Missing,
         root_mnt_id: Some(77),
+        root_incarnation: None,
       },
       at(1),
     );
@@ -4692,6 +4717,7 @@ mod descending {
         authoritative: true,
         root: RootLiveness::Present(crate::os::RootIdentity::new(1, 1)),
         root_mnt_id: Some(77),
+        root_incarnation: None,
       },
       at(1),
     );
@@ -9664,6 +9690,7 @@ mod kernel_recursive_fanotify {
         authoritative: true,
         root: RootLiveness::Missing,
         root_mnt_id: None,
+        root_incarnation: None,
       },
       at(30_001),
     );
@@ -9916,6 +9943,7 @@ mod kernel_recursive_fanotify {
         authoritative: true,
         root: RootLiveness::Missing,
         root_mnt_id: None,
+        root_incarnation: None,
       },
       at(60_001),
     );
@@ -9968,6 +9996,7 @@ mod kernel_recursive_fanotify {
         authoritative: true,
         root: RootLiveness::Unreadable,
         root_mnt_id: None,
+        root_incarnation: None,
       },
       at(31_000),
     );
@@ -10007,10 +10036,11 @@ mod kernel_recursive_fanotify {
     core.on_mounts_refreshed(
       scope,
       MountRefresh {
-        mounts: vec![PathBuf::from("/r/stale-vol")],
+        mounts: vec![bare("/r/stale-vol")],
         authoritative: true,
         root: RootLiveness::Present(crate::os::RootIdentity::new(1, 1)),
         root_mnt_id: None,
+        root_incarnation: None,
       },
       at(31_000),
     );
@@ -10052,6 +10082,7 @@ mod kernel_recursive_fanotify {
         authoritative: true,
         root: RootLiveness::Present(crate::os::RootIdentity::new(1, 1)),
         root_mnt_id: Some(77),
+        root_incarnation: None,
       },
       at(1),
     );
@@ -12130,6 +12161,7 @@ mod root_replaced {
         authoritative: true,
         root: RootLiveness::Present(crate::os::RootIdentity::new(1, 2)),
         root_mnt_id: None,
+        root_incarnation: None,
       },
       at(3),
     );
@@ -13285,6 +13317,7 @@ mod root_widened {
         authoritative: true,
         root: RootLiveness::Present(crate::os::RootIdentity::new(1, 99)),
         root_mnt_id: None,
+        root_incarnation: None,
       },
       at(3),
     );

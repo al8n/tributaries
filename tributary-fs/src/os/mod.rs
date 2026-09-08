@@ -33,8 +33,11 @@ mod macos;
 #[cfg(all(target_os = "macos", not(miri)))]
 pub(crate) use macos::{Source, SourceHandle, mounts_under};
 
+// Linux's own table reader stays inside `linux::` (its spawn barriers seed from
+// it); the seam here is [`mount_sample`], which is what the refresh reads and the
+// only one of the two that proves the table and the root's stat belong together.
 #[cfg(all(target_os = "linux", not(miri)))]
-pub(crate) use linux::{Source, SourceHandle, mounts_under};
+pub(crate) use linux::{Source, SourceHandle};
 
 #[cfg(all(target_os = "windows", not(miri)))]
 pub(crate) use windows::{Source, SourceHandle, mounts_under};
@@ -49,6 +52,123 @@ mod unsupported;
   miri
 ))]
 pub(crate) use unsupported::{Source, SourceHandle, mounts_under};
+
+/// WHICH INCARNATION of a mount the root was living on when a refresh read it —
+/// a token compared for equality and never for order, and the one fact a
+/// recycled mount id cannot carry.
+///
+/// Mount ids are allocated lowest-free and freed on umount, so an A → B → A
+/// sequence between two refreshes puts the root back on the id the previous
+/// refresh recorded. Nothing in an id COMPARISON can see that: the refresh
+/// observes a value, not a transition, and both values are `A`. A scope that
+/// reads the match as proof of continuity keeps a descent frame that describes a
+/// mount which has since died.
+///
+/// Both forms answer the same question and neither is ordered against the other,
+/// which is why they are variants rather than a bare `u64`: a host answers one
+/// KIND for its whole life, and comparing across kinds (which cannot happen)
+/// reads as "changed", the conservative direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RootIncarnation {
+  /// `statx(STATX_MNT_ID_UNIQUE)` (Linux 6.8): a 64-bit id the kernel never
+  /// recycles, so equality is proof of the same mount object and inequality is
+  /// proof of a different one. Exact in both directions, and the only form that
+  /// costs an unrelated namespace nothing.
+  Unique(u64),
+  /// A count of the mount-namespace TRANSITIONS this process has observed
+  /// (`ns->event`, read through a held `/proc/self/mountinfo` fd — see
+  /// [`linux::NamespaceWatch`]), for the 4.11–6.7 hosts that have no unique id.
+  ///
+  /// Equality proves the root's mount is the same object, because it proves
+  /// nothing in the namespace moved at all. Inequality proves only that
+  /// SOMETHING moved — one honest degrade in one direction: a mount elsewhere on
+  /// the host reads as a frame move for every scope, which costs one whole-root
+  /// recovery per refresh on a churning pre-6.8 host. The alternative is to keep
+  /// reading a recycled id as evidence.
+  Namespace(u64),
+}
+
+/// The mount-namespace transition counter a refresh reads its
+/// [`RootIncarnation::Namespace`] token from — a real one on Linux, an inert
+/// placeholder everywhere else.
+#[cfg(not(all(target_os = "linux", not(miri))))]
+#[derive(Debug, Default)]
+pub(crate) struct NamespaceWatch;
+
+#[cfg(all(target_os = "linux", not(miri)))]
+pub(crate) use linux::NamespaceWatch;
+
+/// One refresh's coherent reading: the table under `root`, the caller's own
+/// sample of the root, and the evidence about the WINDOW the two were taken in.
+#[cfg_attr(
+  not(any(
+    all(
+      any(target_os = "macos", target_os = "linux", target_os = "windows"),
+      not(miri)
+    ),
+    test
+  )),
+  allow(dead_code)
+)]
+pub(crate) struct MountReading<S> {
+  /// The rows strictly under the root, or `None` for a read that failed (or a
+  /// window that never held still).
+  pub(crate) rows: Option<Vec<MountRow>>,
+  /// Whatever the caller sampled about the root itself, taken INSIDE the window.
+  pub(crate) root: S,
+  /// The mount-namespace generation observed inside the window, or `None` where
+  /// the host answers none.
+  pub(crate) namespace: Option<u64>,
+  /// Whether the mount namespace provably held still across the whole window.
+  ///
+  /// It is what licenses a caller to pair two SEPARATE reads of the root as one
+  /// incarnation token: the legacy mount id and the unique one come from two
+  /// `statx` calls, and a transition between them would pair the old mount's
+  /// legacy id with the new mount's unique id — a mismatched token that reads as
+  /// continuity on the very next refresh.
+  pub(crate) stable: bool,
+}
+
+/// The refresh's mount sample: the table under `root` AND the caller's own sample
+/// of the root, taken so that the two describe ONE moment.
+///
+/// Linux has to prove that: its table is a `seq_file` generated across many
+/// `read(2)` calls with the namespace lock dropped between them, so the rows and
+/// a separately-stat'd root frame can straddle a mount transition, and mount ids
+/// are recycled lowest-free — which makes "this row's id equals the root's" a
+/// coincidence a torn pair can manufacture. Its version holds an fd across both
+/// halves and rejects the pair when the namespace generation moved.
+///
+/// Everywhere else the table is a single call that returns a whole answer
+/// (`getfsstat` on macOS, nothing at all on Windows and the unsupported stub), so
+/// there is no window to straddle, the pair is just the two reads, and the
+/// namespace token those hosts have no notion of is `None`.
+#[cfg(not(all(target_os = "linux", not(miri))))]
+pub(crate) fn mount_sample<S>(
+  root: &std::path::Path,
+  _namespace: &NamespaceWatch,
+  mut sample_root: impl FnMut() -> S,
+) -> MountReading<S> {
+  MountReading {
+    rows: mounts_under(root),
+    root: sample_root(),
+    namespace: None,
+    stable: true,
+  }
+}
+
+#[cfg(all(target_os = "linux", not(miri)))]
+pub(crate) use linux::mount_sample;
+
+/// The root's UNIQUE mount id where the host has one. Only Linux 6.8+ does; every
+/// other host answers `None` and falls back to the namespace token.
+#[cfg(not(all(target_os = "linux", not(miri))))]
+pub(crate) fn root_mnt_unique_id(_root: &std::path::Path) -> Option<u64> {
+  None
+}
+
+#[cfg(all(target_os = "linux", not(miri)))]
+pub(crate) use linux::root_mnt_unique_id;
 
 pub(crate) use fsevent::{FsEventFlags, RawOsEvent};
 
@@ -609,6 +729,169 @@ impl RootIdentity {
   }
 }
 
+/// One row of a live mount table, at a location strictly under a watched root:
+/// WHERE the mount lands plus whatever IDENTITY the host can answer for it.
+///
+/// Linux reads all three identity fields off `/proc/self/mountinfo`, which
+/// carries them on every row it already parses — field 1 is the mount id,
+/// field 2 the parent mount's id, field 3 the `major:minor` of the mounted
+/// filesystem. That is what makes the table an OBSERVER rather than a list of
+/// paths: a mount replaced by a different mount at the SAME location is a
+/// change in `(mnt_id, parent_id, dev)` and in nothing else, so a paths-only
+/// read cannot see it at all.
+///
+/// Several rows can share one LOCATION — a stack, a `mount --move` onto an
+/// occupied mount point, two mounts propagated side by side — and on Linux
+/// every one of them is a row here, each with its own id. Nothing in this type
+/// or in its producer says which of them a path lookup reaches, and nothing
+/// needs to: a consumer that compares whole rows sees any of them arrive,
+/// depart or be replaced.
+///
+/// The fourth identity field, [`mnt_id_unique`](MountRow::mnt_id_unique), is not
+/// a mountinfo field at all: it is `statx(STATX_MNT_ID_UNIQUE)` on the row's own
+/// location, taken by the producer inside the same namespace-stable window as the
+/// table read. It is what makes a same-location replacement visible when the
+/// legacy id was RECYCLED.
+///
+/// Every other host answers `None` for all four. macOS' `getfsstat` reports no
+/// mount id, Windows reads no table, and the fakes have no namespace — so they
+/// say so rather than inventing a value, and the consumers degrade honestly.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct MountRow {
+  /// The mount point — where the kernel rendered this mount's path.
+  ///
+  /// A best-effort LABEL rather than a stable key on its own:
+  /// `show_mountinfo` renders each row's path by its own `seq_path_root` call,
+  /// so a rename can land between two rows of one read.
+  pub(crate) location: PathBuf,
+  /// The mount's own id, unique among LIVE mounts. `None` where the host
+  /// answers none, or where the field would not parse.
+  ///
+  /// This is the LEGACY (non-unique) id, allocated lowest-free, so an unmount
+  /// and a mount between two reads hand the new mount the just-freed id almost
+  /// deterministically. `parent_id` narrows that window — the recycled id has
+  /// to have been re-attached under the SAME mount as well — without closing
+  /// it; [`mnt_id_unique`](Self::mnt_id_unique) is what closes it.
+  pub(crate) mnt_id: Option<u64>,
+  /// The mount's NEVER-RECYCLED id (`statx(STATX_MNT_ID_UNIQUE)`, Linux 6.8), or
+  /// `None` on every host and kernel that has none.
+  ///
+  /// # Why a row carries two ids
+  ///
+  /// [`mnt_id`](Self::mnt_id) answers *which live mount is this* and nothing
+  /// more: the kernel allocates it lowest-free and frees it on umount, so a bind
+  /// that departs and a bind that arrives inside one refresh window hand the
+  /// newcomer the id the old one gave up. Two reads that agree on the whole
+  /// `(mnt_id, parent_id, dev)` tuple at one location are then INDISTINGUISHABLE
+  /// from continuity — a value re-read at a cadence taken as confirmation — and
+  /// the replacement the consumer is owed a cover for is never derived. This is
+  /// the id a recycle cannot forge, so where the host answers one the sequence
+  /// reads as the departure plus the arrival it was.
+  ///
+  /// # It is read through the PATH, so it answers for the TOPMOST mount there
+  ///
+  /// The producer reads it by `statx`ing the row's rendered location, and a path
+  /// lookup reaches whatever is on top at that point. A row HIDDEN under a stack
+  /// therefore reports the TOP row's unique id rather than its own. That is the
+  /// right answer rather than a defect: a hidden mount's own arrival or departure
+  /// reveals nothing while the mount above it stands, and the moment it becomes
+  /// the top the path's unique id changes, which a row comparison reads as the
+  /// replacement it is.
+  ///
+  /// # A per-row read that FAILS degrades that row, never the sample
+  ///
+  /// `None` covers three cases and the consumer may not tell them apart: a kernel
+  /// below 6.8 (the mask bit is simply absent), a host with no such id at all, and
+  /// a per-row `statx` that failed (a vanished mountpoint, a permission refusal).
+  /// A failed read never invalidates the reading it belongs to — the sample's own
+  /// namespace-stability bracket is what certifies that, and one unreadable row
+  /// says nothing about the others. What it costs is that the row COMPARES
+  /// differently, which a consumer reads as a change at that location: one extra
+  /// recovery, never a silence.
+  pub(crate) mnt_id_unique: Option<u64>,
+  /// The id of the mount this one is attached to. `None` where the host answers
+  /// none, or where the field would not parse.
+  ///
+  /// Held as IDENTITY, never as hierarchy. It is COMPARED — two reads that
+  /// agree on a mount id but not on its parent are looking at two different
+  /// vfsmounts, one of which inherited the other's recycled id — and it is
+  /// never WALKED: nothing resolves it to another row, climbs a chain of them,
+  /// or derives from the graph these links describe which mount a lookup
+  /// reaches.
+  pub(crate) parent_id: Option<u64>,
+  /// The device of the filesystem mounted here, packed the way `dev_t` packs
+  /// `major:minor`. `None` where the host answers none.
+  pub(crate) dev: Option<u64>,
+}
+
+/// A scope's DESCENT FRAME — the root's device and mount id — carried on every
+/// arm so the executor can refuse one that lands ACROSS it.
+///
+/// The core already fences enumerate descent on exactly these two facts
+/// (`crosses_mount_boundary`), but an arm is a second way into the same ground
+/// and the fence never sees it: a directory the Monitor learns about from a
+/// `Created` record is armed with no enumerate in between, and inotify's
+/// `Created` carries no identity at all, so the arm's own object guard
+/// ([`ExpectedObject`](linux::ExpectedObject), `None` there) passes and the
+/// watch installs on the far side of a mount. Refusing at the arm is what makes
+/// the boundary ONE boundary rather than one the crawl honours and the live
+/// stream walks straight through.
+///
+/// Travelling on the REQUEST rather than being held by the executor is
+/// deliberate. A widen re-roots the scope onto an ancestor whose frame is its
+/// own, and a replace swaps the world outright; an executor-held frame would
+/// have to be invalidated at both, whereas a frame minted beside the arm is the
+/// frame of the world that asked for it. It also reaches the fakes, which is
+/// where the refusal is testable at all.
+///
+/// # `None` PASSES — the same honest degrade the fence itself makes
+///
+/// Either half unknown leaves that half inert, exactly as
+/// `crosses_mount_boundary`'s own `None` legs do: a host that answers no mount id
+/// ANYWHERE reads `None` for every one, and an off-Linux fake answers no frame at
+/// all. A check that read unknown as "different" would refuse every arm on those
+/// hosts.
+///
+/// An UNKNOWN is not a FAILED READ, and only the first one reaches here. A
+/// `statx`/`fstat` that fails answers nothing about the object, so the executor
+/// refuses the arm outright rather than handing this table a `None` that would
+/// pass — see the inotify reader's `FrameCheck`. Everything that arrives as
+/// `None` here is a value the host genuinely cannot supply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct ScopeFrame {
+  /// The scope root's device, or `None` where the host answers none.
+  pub(crate) root_dev: Option<u64>,
+  /// The scope root's mount id, or `None` where the host answers none — off
+  /// Linux, or a kernel below every id oracle.
+  pub(crate) root_mnt_id: Option<u64>,
+}
+
+impl ScopeFrame {
+  /// Whether an object that stat'd to `(dev, mnt_id)` sits ACROSS this frame —
+  /// the SAME truth table `crosses_mount_boundary` fences enumerate descent on,
+  /// so a refused arm and a declined dir entry agree about what a boundary is.
+  ///
+  /// Two independent fences, either one a boundary: the DEVICE belt (a different
+  /// superblock is always a boundary) and the MOUNT frame (a `mount --bind` of a
+  /// same-superblock directory shares the root's device, so only a differing
+  /// mount id marks it). Reading the mount id alone would let a subvolume arm
+  /// install; reading the device alone would let a bind arm install. Both, or
+  /// the two seams disagree about what they are fencing.
+  ///
+  /// Every unknown leg PASSES (see the type doc).
+  pub(crate) fn crossed_by(self, dev: Option<u64>, mnt_id: Option<u64>) -> bool {
+    let device_boundary = matches!(
+      (self.root_dev, dev),
+      (Some(root_dev), Some(landed)) if landed != root_dev
+    );
+    let mount_boundary = matches!(
+      (self.root_mnt_id, mnt_id),
+      (Some(root_mnt), Some(landed)) if landed != root_mnt
+    );
+    device_boundary || mount_boundary
+  }
+}
+
 /// What a source's spawn learned about its root — finalized strictly BEFORE
 /// the stream can enqueue its first event, so nothing here can postdate a
 /// message the source delivers, and no fallible metadata path exists after
@@ -626,17 +909,21 @@ pub(crate) struct RootMeta {
   pub(crate) root: PathBuf,
   /// The device the root lives on.
   pub(crate) root_dev: u64,
-  /// The root's MOUNT id (from `statx(STATX_MNT_ID)` on the pinned root), or
-  /// `None` when the source could not read one (below Linux 5.8 where the field
-  /// is absent, or a non-Linux backend — FSEvents has no mount id). The core
+  /// The root's MOUNT id, read from the pinned root (`statx(STATX_MNT_ID)`, or
+  /// that fd's `/proc/self/fdinfo` line below 5.8), or `None` when the source
+  /// could not read one (a non-Linux backend — FSEvents has no mount id — or a
+  /// kernel below every id oracle). The core
   /// fences descent across a differing mount id: a `mount --bind` of a
   /// same-device directory shares [`root_dev`](Self::root_dev), so the device
   /// alone cannot mark it a boundary. `None` degrades to the device check.
   pub(crate) root_mnt_id: Option<u64>,
-  /// The trust-reducing mount seed: mount points observed strictly under the
+  /// The trust-reducing mount seed: the table rows observed strictly under the
   /// root before the stream started (empty when the table could not be read —
   /// either way, event-side trust stays closed until the post-live refresh).
-  pub(crate) mounts: Vec<PathBuf>,
+  ///
+  /// The SAME read a refresh runs, so a seeded row carries the identity a later
+  /// refresh compares against.
+  pub(crate) mounts: Vec<MountRow>,
   /// The root object's identity — what root disjointness is decided on
   /// (spelling-aliased paths share it; distinct objects never do).
   pub(crate) identity: RootIdentity,
@@ -647,6 +934,19 @@ pub(crate) struct RootMeta {
   /// The primitive backing this source — the core confirms its per-scope
   /// lowering profile against it.
   pub(crate) backend: BackendKind,
+}
+
+impl RootMeta {
+  /// This world's descent frame, for an arm issued BEFORE the meta is committed
+  /// into a scope — the widen pre-arm, whose target is the meta's own (wider)
+  /// root and whose frame is therefore the meta's, never the scope's still-old
+  /// one. Committed scopes read the frame off their state instead.
+  pub(crate) const fn frame(&self) -> ScopeFrame {
+    ScopeFrame {
+      root_dev: Some(self.root_dev),
+      root_mnt_id: self.root_mnt_id,
+    }
+  }
 }
 
 /// Everything a platform source needs to start watching.

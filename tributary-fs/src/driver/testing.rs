@@ -94,13 +94,13 @@ struct FakeState {
   /// Mount-table refreshes served, plus the configured answer (`None` = an
   /// authoritative empty table).
   refreshes: AtomicUsize,
-  refresh_answer: Mutex<Option<(Vec<PathBuf>, bool)>>,
+  refresh_answer: Mutex<Option<(Vec<crate::os::MountRow>, bool)>>,
   /// Overrides the root-liveness a refresh reports, so the hermetic suites can
   /// drive the root-death-via-refresh path (`None` = derive from the tree: the
   /// root's live identity, or `Missing` when it is gone).
   root_liveness: Mutex<Option<RootLiveness>>,
-  /// Mount prefixes the next spawn seeds its `RootMeta` with.
-  spawn_mounts: Mutex<Vec<PathBuf>>,
+  /// Mount rows the next spawn seeds its `RootMeta` with.
+  spawn_mounts: Mutex<Vec<crate::os::MountRow>>,
   /// Requested-root → final-root remaps, mirroring the backend's own
   /// re-canonicalization (a symlink retargeted between reservation and
   /// spawn): the spawned `RootMeta` carries the FINAL root.
@@ -641,7 +641,7 @@ impl FakeFs {
   }
 
   /// Configures the mount prefixes the next spawn seeds its `RootMeta` with.
-  pub(crate) fn seed_mounts(&self, mounts: Vec<PathBuf>) {
+  pub(crate) fn seed_mounts(&self, mounts: Vec<crate::os::MountRow>) {
     *self.state.spawn_mounts.lock().unwrap() = mounts;
   }
 
@@ -649,7 +649,7 @@ impl FakeFs {
   /// table: the prefixes under the root, and whether the table could be read at
   /// all. The default (an authoritative empty table) is what an unconfigured fake
   /// answers. Setting a smaller list is how a cell models a mount DEPARTING.
-  pub(crate) fn answer_refresh(&self, mounts: Vec<PathBuf>, authoritative: bool) {
+  pub(crate) fn answer_refresh(&self, mounts: Vec<crate::os::MountRow>, authoritative: bool) {
     *self.state.refresh_answer.lock().unwrap() = Some((mounts, authoritative));
   }
 
@@ -1801,6 +1801,11 @@ impl FsOps for FakeFs {
       authoritative,
       root: root_liveness,
       root_mnt_id,
+      // The fake reports no incarnation token: it has no mount namespace, so it
+      // answers the same `None` every non-Linux host does and the frame moves on
+      // the mount-id comparison alone. A cell that drives the token feeds
+      // `on_mounts_refreshed` directly.
+      root_incarnation: None,
     }
   }
 

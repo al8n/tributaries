@@ -385,8 +385,15 @@ fn the_mount_table_reader_fails_closed_on_every_unbounded_shape() {
 fn the_live_mount_table_is_still_readable() {
   let mounts = mounts_under(Path::new("/")).expect("the live mount table reads");
   assert!(
-    mounts.iter().all(|path| path != Path::new("/")),
+    mounts.iter().all(|row| row.location != Path::new("/")),
     "the root itself is not a mount UNDER the root"
+  );
+  assert!(
+    mounts
+      .iter()
+      .all(|row| row.mnt_id.is_none() && row.dev.is_none()),
+    "getfsstat answers no mount id and no device, and the rows say so rather \
+     than inventing one"
   );
   let dir = unique_dir("mounts");
   assert_eq!(
