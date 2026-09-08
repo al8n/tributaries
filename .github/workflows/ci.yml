@@ -139,6 +139,27 @@ jobs:
         # Cargo.lock is not committed, so this resolves from the manifests
         # alone and the lockfile it writes IS the assertion.
         run: cargo +nightly generate-lockfile -Z direct-minimal-versions
+      - name: Lift the three floors that sit above their major
+        # The manifests advertise plain MAJOR requirements by the owner's choice,
+        # so `-Z direct-minimal-versions` lands each of these below the version
+        # that actually compiles. These are the tested floors, pinned in the
+        # LOCKFILE alone — a consumer still sees `serde = "1"` / `clap = "4"`:
+        #
+        # - serde: `serde_derive` is reached through serde's own `derive` feature,
+        #   so it is TRANSITIVE, is not minimized, and arrives newest; the runtime
+        #   must therefore be its generation (1.0.0 against derive 1.0.229 is
+        #   `cannot find __private229 in _serde`).
+        # - clap: `Option<T>` in `#[command(flatten)]` — what the opt-in debounce
+        #   group rests on — landed in 4.2.0.
+        # - serde_json (dev only): `json!` is usable from a 2018+ edition caller
+        #   from 1.0.25; 1.0.10 still fails to resolve `json_internal!`.
+        #
+        # `--precise` is one version per invocation, hence three.
+        run: |
+          set -eu
+          cargo +nightly update -Z direct-minimal-versions -p serde --precise 1.0.229
+          cargo +nightly update -Z direct-minimal-versions -p clap --precise 4.2.0
+          cargo +nightly update -Z direct-minimal-versions -p serde_json --precise 1.0.25
       - name: Show the floors that were selected
         run: cargo tree --depth 1 --locked
       - name: Build at the floors
