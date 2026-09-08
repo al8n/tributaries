@@ -1415,7 +1415,8 @@ fn identity_minting_respects_devices_and_mounts() {
     root_dev: Some(1),
     root_mnt_id: None,
     identity: Some(crate::os::RootIdentity::new(1, 1)),
-    mounts: vec![PathBuf::from("/r/vol")],
+    mount_table: vec![PathBuf::from("/r/vol")],
+    learned_mounts: Vec::new(),
     mounts_authoritative: true,
     refresh_pending: false,
     refresh_stale: false,
@@ -1463,7 +1464,8 @@ fn blind_mount_table_refuses_event_side_trust() {
     root_dev: Some(1),
     root_mnt_id: None,
     identity: Some(crate::os::RootIdentity::new(1, 1)),
-    mounts: Vec::new(),
+    mount_table: Vec::new(),
+    learned_mounts: Vec::new(),
     mounts_authoritative: false,
     refresh_pending: false,
     refresh_stale: false,
@@ -1529,9 +1531,12 @@ fn probed_foreign_device_is_learned_as_a_mount() {
   let _ = drain(&mut core);
   let state = core.scopes.get(&scope).expect("scope lives");
   assert!(
-    state.mounts.iter().any(|m| m == Path::new("/r/vol/x")),
+    state
+      .learned_mounts
+      .iter()
+      .any(|m| m == Path::new("/r/vol/x")),
     "the foreign device's prefix is remembered: {:?}",
-    state.mounts
+    state.learned_mounts
   );
 }
 
@@ -2475,46 +2480,167 @@ fn failed_refresh_keeps_trust_closed() {
   );
 }
 
+/// An authoritative read is COMPLETE, so a row it does not list is a mount that
+/// is not there — and the table half of the veto takes the new snapshot whole.
+///
+/// The two halves pin opposite directions and neither alone is the invariant:
+/// point `install_mount_table` at `learned_mounts` as well and
+/// `a_learned_prefix_survives_the_table_replacement` fails instead.
 #[test]
-fn refresh_union_keeps_learned_foreign_prefixes() {
+fn an_authoritative_read_replaces_the_departed_table_row() {
   let (mut core, scope) = live_core();
-  // A probe learns a foreign-device prefix.
-  core.on_batch_events(
+  core.on_mounts_refreshed(
     scope,
-    vec![ev(
-      "/r/vol/x",
-      flags(&[FsEventFlags::ITEM_CREATED, FsEventFlags::ITEM_MODIFIED]),
-      1,
-      5,
-    )],
+    alive_refresh(vec![PathBuf::from("/r/vol")], true),
     at(1),
   );
-  let reqs = probes(&drain(&mut core));
-  core.on_probe_result(
-    reqs[0].0,
-    ProbeOutcome::Present {
-      kind: FileKind::File,
-      file_id: NonZeroU64::new(5),
-      dev: 9,
-    },
+  let _ = drain(&mut core);
+  let state = core.scopes.get(&scope).expect("scope is live");
+  assert!(
+    mint(state, Path::new("/r/vol/x"), NonZeroU64::new(7), None).is_none(),
+    "staging: while the row stands, an event-side identity under it refuses to mint"
+  );
+
+  core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(2));
+  let _ = drain(&mut core);
+
+  let state = core.scopes.get(&scope).expect("scope is live");
+  assert!(state.mounts_authoritative, "the read was authoritative");
+  assert!(
+    !state.mount_table.iter().any(|m| m == Path::new("/r/vol")),
+    "the departed row is gone from the table: an authoritative snapshot is \
+     complete, so a location it does not list is a mount that is not there — and \
+     retaining it forever is a leak, not a safe direction: {:?}",
+    state.mount_table
+  );
+  assert!(
+    mint(state, Path::new("/r/vol/x"), NonZeroU64::new(7), None).is_some(),
+    "and the ground the mount was hiding mints again"
+  );
+}
+
+/// N distinct mountpoints that arrive and depart leave nothing behind: the table
+/// component holds one snapshot's rows, never a history.
+///
+/// This is the leak itself. Every authoritative refresh used to append the
+/// locations it read to a vector nothing ever removed from on Linux, so a
+/// long-lived scope on a container host retained one `PathBuf` per HISTORICAL
+/// unique mountpoint — and paid a linear scan of that history per current row on
+/// every refresh, on a single-threaded driver whose stalls are the queue loss the
+/// whole file exists to avoid.
+///
+/// The cell counts against what is CURRENTLY mounted, not against a constant: the
+/// churn count is a loop bound, and the verdict is `mount_table.len()` versus the
+/// one row the last read listed. A ceiling of "at most N" would pass on the
+/// leaking code for N large enough.
+#[test]
+fn mount_churn_leaves_the_table_the_size_of_one_snapshot() {
+  let (mut core, scope) = live_core();
+  const CHURN: usize = 24;
+  for turn in 0..CHURN {
+    let vol = PathBuf::from(format!("/r/vol-{turn}"));
+    core.on_mounts_refreshed(
+      scope,
+      alive_refresh(vec![PathBuf::from("/r/live"), vol], true),
+      at(2 * turn as u64 + 1),
+    );
+    let _ = drain(&mut core);
+    // And it departs again, exactly as a container's private namespace churns.
+    core.on_mounts_refreshed(
+      scope,
+      alive_refresh(vec![PathBuf::from("/r/live")], true),
+      at(2 * turn as u64 + 2),
+    );
+    let _ = drain(&mut core);
+  }
+
+  let state = core.scopes.get(&scope).expect("scope is live");
+  assert_eq!(
+    state.mount_table.len(),
+    1,
+    "the table holds one snapshot, not a history: the last read listed one row, \
+     so one row is what a scope that watched {CHURN} mounts come and go retains: \
+     {:?}",
+    state.mount_table
+  );
+  assert!(
+    state.mount_table.iter().any(|m| m == Path::new("/r/live")),
+    "and it is the row that is still mounted: {:?}",
+    state.mount_table
+  );
+}
+
+/// The veto half. A prefix learned from something OTHER than a snapshot survives
+/// every table replacement, and only evidence its mount is gone retires it.
+///
+/// This is why the two components exist. An in-band `Mount` word can describe a
+/// mount that arrived AFTER the snapshot currently in flight was read, and a
+/// probe's foreign device is a path arbitrarily deep inside a volume that no
+/// mountinfo row will ever name — so neither is a row, and an install that
+/// replaced either away would re-trust a subtree this scope has direct evidence
+/// is foreign. The evidence that DOES retire one is the in-band unmount word,
+/// applied at settlement.
+#[test]
+fn a_learned_prefix_survives_the_table_replacement() {
+  let (mut core, scope) = live_core();
+  // An in-band mount word: the volume is live and the snapshot in flight predates
+  // it, which is exactly the case a table row cannot represent.
+  core.on_batch_events(
+    scope,
+    vec![ev("/r/late", flags(&[FsEventFlags::MOUNT]), 1, 0)],
+    at(1),
+  );
+  let _ = drain(&mut core);
+  core.on_mounts_refreshed(
+    scope,
+    alive_refresh(vec![PathBuf::from("/r/other")], true),
     at(2),
   );
   let _ = drain(&mut core);
 
-  core.on_root_overflow(scope, at(3));
-  let _ = drain(&mut core);
-  // The fresh snapshot does not list the learned prefix (it is not a real
-  // mount point); the union must keep it — replacement would re-trust a
-  // known-foreign subtree.
-  core.on_mounts_refreshed(
-    scope,
-    alive_refresh(vec![PathBuf::from("/r/other")], true),
-    at(0),
-  );
   let state = core.scopes.get(&scope).expect("scope is live");
   assert!(state.mounts_authoritative);
-  assert!(state.mounts.iter().any(|m| m == Path::new("/r/vol/x")));
-  assert!(state.mounts.iter().any(|m| m == Path::new("/r/other")));
+  assert!(
+    state.mount_table.iter().any(|m| m == Path::new("/r/other")),
+    "the snapshot's own row installed: {:?}",
+    state.mount_table
+  );
+  assert!(
+    state
+      .learned_mounts
+      .iter()
+      .any(|m| m == Path::new("/r/late")),
+    "the in-band mount word survives the authoritative install: the read that \
+     replaced the table was taken before the mount existed, so its silence about \
+     `/r/late` is ignorance rather than evidence: {:?}",
+    state.learned_mounts
+  );
+  assert!(
+    mint(state, Path::new("/r/late/x"), NonZeroU64::new(7), None).is_none(),
+    "and the veto still stands: nothing under it mints"
+  );
+
+  // The unmount word is the evidence that retires it — and the only thing that
+  // does.
+  core.on_batch_events(
+    scope,
+    vec![ev("/r/late", flags(&[FsEventFlags::UNMOUNT]), 2, 0)],
+    at(3),
+  );
+  let _ = drain(&mut core);
+  let state = core.scopes.get(&scope).expect("scope is live");
+  assert!(
+    !state
+      .learned_mounts
+      .iter()
+      .any(|m| m == Path::new("/r/late")),
+    "the unmount word retires it: {:?}",
+    state.learned_mounts
+  );
+  assert!(
+    mint(state, Path::new("/r/late/x"), NonZeroU64::new(7), None).is_some(),
+    "and the revealed ground mints again"
+  );
 }
 
 #[test]
@@ -2638,7 +2764,10 @@ fn same_batch_unmount_keeps_colliding_rename_foreign() {
   // The removal applies at settlement: the NEXT batch sees the prefix gone.
   let state = core.scopes.get(&scope).expect("scope is live");
   assert!(
-    !state.mounts.iter().any(|m| m == Path::new("/r/vol")),
+    !state
+      .learned_mounts
+      .iter()
+      .any(|m| m == Path::new("/r/vol")),
     "post-batch, the unmounted prefix leaves the table"
   );
 }
@@ -3233,7 +3362,8 @@ mod lowering {
       root_dev: Some(1),
       root_mnt_id: None,
       identity: Some(crate::os::RootIdentity::new(1, 1)),
-      mounts: Vec::new(),
+      mount_table: Vec::new(),
+      learned_mounts: Vec::new(),
       mounts_authoritative: true,
       refresh_pending: false,
       refresh_stale: false,
@@ -11803,7 +11933,7 @@ mod kernel_recursive_fanotify {
       "and it installed its table: a cadence witnesses no transition to distrust"
     );
     assert_eq!(
-      state.mounts,
+      state.mount_table,
       vec![PathBuf::from("/r/vol")],
       "the rows the tick-raced read carried are the ones that installed"
     );
@@ -11846,10 +11976,10 @@ mod kernel_recursive_fanotify {
       "a superseded snapshot restores no authority"
     );
     assert!(
-      state.mounts.is_empty(),
+      state.mount_table.is_empty(),
       "and its rows never install: a stale read may predate the lost window, so \
        the table it carries proves nothing: {:?}",
-      state.mounts
+      state.mount_table
     );
   }
 
@@ -12300,7 +12430,10 @@ mod kernel_recursive_fanotify {
       "the superseded snapshot does not restore authority"
     );
     assert!(
-      !state.mounts.iter().any(|m| m == Path::new("/r/stale-vol")),
+      !state
+        .mount_table
+        .iter()
+        .any(|m| m == Path::new("/r/stale-vol")),
       "the superseded mount-set is discarded, not installed"
     );
   }

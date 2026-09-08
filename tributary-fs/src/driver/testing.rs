@@ -707,6 +707,14 @@ impl FakeFs {
     *self.state.spawn_mounts.lock().unwrap() = mounts;
   }
 
+  /// Configures what every subsequent `refresh_mounts` reports as the live mount
+  /// table: the prefixes under the root, and whether the table could be read at
+  /// all. The default (an authoritative empty table) is what an unconfigured fake
+  /// answers. Setting a smaller list is how a cell models a mount DEPARTING.
+  pub(crate) fn answer_refresh(&self, mounts: Vec<PathBuf>, authoritative: bool) {
+    *self.state.refresh_answer.lock().unwrap() = Some((mounts, authoritative));
+  }
+
   /// Forces every subsequent refresh to report `liveness` as the root's state,
   /// driving the root-death-via-refresh path for the verdicts a present node cannot
   /// express: `RootLiveness::Missing` (vanished) or `Unreadable`. An override forces
