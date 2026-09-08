@@ -3888,6 +3888,89 @@ mod descending {
     let (_core, _scope, _req, _watch) = live_descending();
   }
 
+  /// PREVENTION, both halves: what the core hands the executor for a
+  /// `Created`-learned child, and where a refusal of that arm terminates.
+  ///
+  /// A directory the Monitor learns from a `Created` record is armed with NO
+  /// enumerate in between, so `crosses_mount_boundary` never judges it — and
+  /// inotify's `Created` compiles to a bare record with no identity, so the arm's
+  /// own object guard (`expected`) is `None` and passes whatever it opens. The
+  /// scope FRAME is therefore the only thing that can refuse the landing, which
+  /// is why it rides every arm rather than being folded into `expected`.
+  ///
+  /// The refusal's terminal is the second half, and the design ACCEPTS it: a
+  /// failed arm reaches the Monitor's `Err` arm, which emits a located `Rescan`,
+  /// books a level-persistent slot deficit and drops the node. It queues no
+  /// enumerate and calls no re-arm — the recovery for a MOUNT-backed crossing is
+  /// the mount refresh's own whole-root cover, and for a device-only one (a btrfs
+  /// subvolume: no mountinfo row, ever) there is none, so the slot stays a
+  /// deficit re-signalled ahead of every sync cookie. Signalled, not silent.
+  #[test]
+  fn a_created_childs_arm_carries_the_frame_and_its_refusal_stands_a_deficit() {
+    let (mut core, scope, req, root_watch) = live_descending_mnt(42);
+    core.on_enumerated(req, listed(Vec::new()));
+    let _ = drain(&mut core);
+
+    core.on_inotify_events(
+      scope,
+      vec![inotify(
+        &[root_watch],
+        IN_CREATE | IN_ISDIR,
+        0,
+        Some(b"subvol"),
+      )],
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let (watch, expected, frame) = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch {
+          watch,
+          path,
+          expected,
+          frame,
+          ..
+        } if path.as_path() == Path::new("/r/subvol") => Some((*watch, *expected, *frame)),
+        _ => None,
+      })
+      .expect("a created directory is armed with no enumerate in between");
+    assert_eq!(
+      expected, None,
+      "the object guard is vacuous here — a `Created` record carries no identity"
+    );
+    assert_eq!(
+      (frame.root_dev, frame.root_mnt_id),
+      (Some(1), Some(42)),
+      "so the arm carries the SCOPE FRAME, which is what can still refuse it"
+    );
+
+    // What the executor answers when the landing sits across that frame.
+    core.on_watch_installed(
+      watch,
+      core.arm_attempt(watch),
+      crate::os::linux::WatchOutcome::Failed(WatchError::Gone),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects)
+        .iter()
+        .any(|c| c.kind().is_rescan() && c.location() == &loc(&["subvol"])),
+      "the refusal is never a silent blind spot: {effects:?}"
+    );
+    assert!(
+      !effects.iter().any(
+        |e| matches!(e, Effect::Enumerate { path, .. } if path.as_path() == Path::new("/r/subvol"))
+      ),
+      "and it summons no re-enumerate of its own: {effects:?}"
+    );
+    assert!(
+      core.resignal_coverage_deficits(scope),
+      "the refused slot is the accepted terminal: a standing deficit, \
+       re-signalled ahead of every sync cookie"
+    );
+  }
+
   /// 42-10, end to end through the core: the bootstrap listing installs and arms
   /// its children in SILENCE, and the window closes with one covering `Rescan` at
   /// the scope root.

@@ -62,8 +62,8 @@ use crate::{
   },
   error::WatchRootError,
   os::{
-    Backend, BackendKind, EventReceiver, RootIdentity, RootMeta, ScopePort, SourceConfig,
-    SourceError, SourceHandle, SourceMessage, SpawnFailed, linux::WatchOutcome,
+    Backend, BackendKind, EventReceiver, RootIdentity, RootMeta, ScopeFrame, ScopePort,
+    SourceConfig, SourceError, SourceHandle, SourceMessage, SpawnFailed, linux::WatchOutcome,
   },
   watcher::{CoverOutcome, SkipReason},
 };
@@ -7128,7 +7128,9 @@ pub(crate) enum ControlRequest {
   /// Install a per-directory watch for `watch` (arming `parent`'s child
   /// `name`, addressed by absolute `path`). `expected` is the `(dev, ino)` the
   /// opened object must still have before the watch installs (the enumerate→arm
-  /// rename guard); `None` leaves the arm unverified.
+  /// rename guard); `None` leaves the arm unverified. `frame` is the scope's
+  /// descent frame, which the executor refuses a crossing landing against —
+  /// unlike `expected`, it is checked on EVERY arm.
   Arm {
     watch: WatchId,
     /// The arm ATTEMPT this request executes, echoed back in its
@@ -7145,6 +7147,7 @@ pub(crate) enum ControlRequest {
     name: Segment,
     path: Arc<PathBuf>,
     expected: Option<ExpectedObject>,
+    frame: ScopeFrame,
   },
   /// Remove `watch`'s per-directory watch (fire-and-forget; no reply).
   Disarm { watch: WatchId },
@@ -7507,7 +7510,15 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
 
   /// Installs a per-directory kernel watch for `watch` at `path` (blocking).
   /// Reached only under a descending profile. `expected` is the object the arm
-  /// must confirm the open lands on (the enumerate→arm rename guard).
+  /// must confirm the open lands on (the enumerate→arm rename guard); `frame` is
+  /// the scope's descent frame, and an arm whose landing sits ACROSS it is
+  /// refused before anything installs ([`ScopeFrame::crossed_by`]).
+  ///
+  /// The two guards are independent and both are needed. `expected` asks "is
+  /// this the object the enumerate saw" and is `None` for the arms that never
+  /// met an enumerate — precisely the ones a mount can appear under. `frame`
+  /// asks "is this object inside the scope at all", and is asked every time.
+  #[allow(clippy::too_many_arguments)]
   fn add_watch(
     &self,
     scope: ScopeId,
@@ -7516,6 +7527,7 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
     path: &Path,
     name: &Segment,
     expected: Option<ExpectedObject>,
+    frame: ScopeFrame,
   ) -> WatchOutcome;
 
   /// Removes a per-directory kernel watch (blocking, fire-and-forget).
@@ -7556,10 +7568,11 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
           name,
           path,
           expected,
+          frame,
         } => outcomes.push(ArmResolution {
           watch,
           attempt,
-          outcome: self.add_watch(scope, watch, parent, &path, &name, expected),
+          outcome: self.add_watch(scope, watch, parent, &path, &name, expected, frame),
         }),
         ControlRequest::Disarm { watch } => self.remove_watch(scope, watch),
       }
@@ -7609,6 +7622,7 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
   /// commit-or-unwind is decided by the returned outcome. The default routes
   /// through [`add_watch`](Self::add_watch) — the right shape for executors
   /// (fakes) that answer arms themselves and carry `Inert` ports.
+  #[allow(clippy::too_many_arguments)]
   fn preflight_arm(
     &self,
     port: &ScopePort,
@@ -7617,9 +7631,10 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
     path: &Path,
     name: &Segment,
     expected: Option<ExpectedObject>,
+    frame: ScopeFrame,
   ) -> WatchOutcome {
     let _ = port;
-    self.add_watch(scope, watch, watch, path, name, expected)
+    self.add_watch(scope, watch, watch, path, name, expected, frame)
   }
 
   /// Takes `watch`'s transient directory anchor, TRANSFERRING ownership to the
@@ -8082,6 +8097,7 @@ impl RealFs {
   /// through `/proc/self/fd`, but the fallback is not — and it is the common case
   /// once the cold enumerate has consumed the parent anchor).
   #[cfg(all(target_os = "linux", not(miri)))]
+  #[allow(clippy::too_many_arguments)]
   fn build_arm_request(
     &self,
     watch: WatchId,
@@ -8089,6 +8105,7 @@ impl RealFs {
     path: &Path,
     name: &Segment,
     expected: Option<ExpectedObject>,
+    frame: ScopeFrame,
   ) -> crate::os::linux::AnchorRequest {
     let expected = expected.map(|e| crate::os::linux::ExpectedObject {
       dev: e.dev,
@@ -8110,12 +8127,14 @@ impl RealFs {
         parent: Some(fd),
         name: std::ffi::OsString::from(name.as_str()),
         expected,
+        frame,
       },
       None => crate::os::linux::AnchorRequest {
         watch,
         parent: None,
         name: path.as_os_str().to_os_string(),
         expected,
+        frame,
       },
     }
   }
@@ -8189,9 +8208,10 @@ impl RealFs {
           name,
           path,
           expected,
+          frame,
         } => {
           ops.push(ControlOp::Arm(
-            self.build_arm_request(watch, parent, &path, &name, expected),
+            self.build_arm_request(watch, parent, &path, &name, expected, frame),
           ));
           plan.push(Publication::Arm(watch, attempt));
         }
@@ -10672,6 +10692,7 @@ impl FsOps for RealFs {
     path: &Path,
     name: &Segment,
     expected: Option<ExpectedObject>,
+    frame: ScopeFrame,
   ) -> WatchOutcome {
     // A direct single arm runs against the CURRENT transport (the caller is
     // synchronous, not a leftover batch), so it adopts the attached
@@ -10690,6 +10711,7 @@ impl FsOps for RealFs {
           name: name.clone(),
           path: Arc::new(path.to_path_buf()),
           expected,
+          frame,
         }],
       )
       .resolutions
@@ -10708,6 +10730,7 @@ impl FsOps for RealFs {
     _path: &Path,
     _name: &Segment,
     _expected: Option<ExpectedObject>,
+    _frame: ScopeFrame,
   ) -> WatchOutcome {
     WatchOutcome::Failed(WatchError::Io)
   }
@@ -10776,6 +10799,7 @@ impl FsOps for RealFs {
     path: &Path,
     name: &Segment,
     expected: Option<ExpectedObject>,
+    frame: ScopeFrame,
   ) -> WatchOutcome {
     use crate::os::linux::ControlOp;
 
@@ -10783,7 +10807,7 @@ impl FsOps for RealFs {
       return WatchOutcome::Failed(WatchError::Gone);
     };
     let ops = vec![ControlOp::Arm(
-      self.build_arm_request(watch, watch, path, name, expected),
+      self.build_arm_request(watch, watch, path, name, expected, frame),
     )];
     // A pre-arm needs no `answered`: a reader that never served it answers its one
     // arm `Failed(Io)`, and the commit is decided by that outcome alone — it
@@ -13169,6 +13193,11 @@ pub(crate) async fn run<R, F>(
                   dev: spawned.meta.identity.dev(),
                   ino,
                 });
+              // The REPLACEMENT world's frame, read off its own barrier: the core
+              // still holds the outgoing root's, and the two roots need not share
+              // a mount at all. Taken before the escrow is parked, which consumes
+              // the spawn.
+              let frame = spawned.meta.frame();
               match &mut streams.replace_states.get_mut(&scope).expect("just checked").mode {
                 // The slot is borrowed BEFORE the escrow is consumed, so the
                 // lookup and its `expect` are still on the guarded side.
@@ -13185,7 +13214,7 @@ pub(crate) async fn run<R, F>(
               let tx = op_tx.clone();
               R::spawn_blocking_detach(move || {
                 let outcome =
-                  ops_for_arm.preflight_arm(&port, scope, watch, &path, &name, expected);
+                  ops_for_arm.preflight_arm(&port, scope, watch, &path, &name, expected, frame);
                 let _ = tx.try_send(OpResult::RebindArmed { scope, outcome });
               });
               continue;
@@ -13643,6 +13672,11 @@ pub(crate) async fn run<R, F>(
               dev: meta.identity.dev(),
               ino,
             });
+          // The WIDENED root's own frame, never the scope's. The commit has not
+          // landed, so the core still holds the OLD root's frame — and the old
+          // root is a DESCENDANT of this arm's target, so judging the wider root
+          // against it would refuse every widen that crosses a mount upward.
+          let frame = meta.frame();
           streams.replace_states.get_mut(&scope).expect("just checked").mode = ReplaceMode::SameFd {
             phase: SameFdPhase::Arming { reserved, meta },
           };
@@ -13650,7 +13684,7 @@ pub(crate) async fn run<R, F>(
           let tx = op_tx.clone();
           R::spawn_blocking_detach(move || {
             let mut outcome =
-              ops_for_arm.preflight_arm(&port, scope, reserved, &path, &name, expected);
+              ops_for_arm.preflight_arm(&port, scope, reserved, &path, &name, expected, frame);
             // The stale-Installed bracket: the arm's own open-then-verify ran
             // at ARM time, and the commit must never accept that outcome
             // alone — re-stat the path NOW, so an object swapped in right
@@ -18257,6 +18291,7 @@ fn execute_effects<R, F>(
         name,
         path,
         expected,
+        frame,
       } => {
         // EVERY QUEUED EFFECT OF A SCOPE BELONGS TO ONE INCARNATION. A commit
         // that replaced this scope's root retired the ground this arm names, and
@@ -18287,6 +18322,7 @@ fn execute_effects<R, F>(
             name,
             path,
             expected,
+            frame,
           });
       }
       Effect::RemoveWatch {

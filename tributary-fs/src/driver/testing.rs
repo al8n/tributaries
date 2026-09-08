@@ -1171,8 +1171,10 @@ impl FakeFs {
   }
 
   /// The non-parking core of one arm: record it, then model object
-  /// correctness (identity mismatch and alias) and mint a watch descriptor,
-  /// exactly as [`add_watch`](FsOps::add_watch) does once past the hold.
+  /// correctness (identity mismatch, the scope-frame refusal, and alias) and
+  /// mint a watch descriptor, exactly as [`add_watch`](FsOps::add_watch) does
+  /// once past the hold.
+  #[allow(clippy::too_many_arguments)]
   fn arm_one(
     &self,
     _scope: ScopeId,
@@ -1181,6 +1183,7 @@ impl FakeFs {
     path: &Path,
     _name: &Segment,
     expected: Option<ExpectedObject>,
+    frame: crate::os::ScopeFrame,
   ) -> WatchOutcome {
     self
       .state
@@ -1202,6 +1205,22 @@ impl FakeFs {
       if !matches {
         return WatchOutcome::Failed(tributary_proto::WatchError::Gone);
       }
+    }
+    // The scope-frame refusal, modelled exactly as the real reader models it:
+    // read the LANDING object's `(dev, mnt_id)` — here the node the fake holds,
+    // there an `fstat` + `statx` of the pinned anchor — and refuse a landing
+    // across the frame. Run on EVERY arm, `expected` or not, which is the whole
+    // point: a `Created`-learned directory arms with no identity at all.
+    //
+    // An absent node answers `(None, None)`, so it PASSES rather than being
+    // refused here — the fake models "nothing there", and nothing there is not a
+    // boundary. Cells that want the absent case refused use `watch_failures`.
+    let landing = self.state.nodes.lock().unwrap().get(path).copied();
+    if frame.crossed_by(
+      landing.map(|node| node.dev),
+      landing.and_then(|node| node.mnt_id),
+    ) {
+      return WatchOutcome::Failed(tributary_proto::WatchError::Gone);
     }
     // The arm installs (or aliases) a kernel watch: record it live, so a reorder
     // that installs it AFTER its disarm already ran shows as a residual entry.
@@ -1460,10 +1479,11 @@ impl FakeFs {
           name,
           path,
           expected,
+          frame,
         } => outcomes.push(super::ArmResolution {
           watch,
           attempt,
-          outcome: self.arm_one(scope, watch, parent, path.as_path(), &name, expected),
+          outcome: self.arm_one(scope, watch, parent, path.as_path(), &name, expected, frame),
         }),
         ControlRequest::Disarm { watch } => {
           self.state.disarms.lock().unwrap().push(watch);
@@ -1821,10 +1841,24 @@ impl FsOps for FakeFs {
         .map(|node| RootIdentity::new(node.dev, node.ino.into()))
         .collect()
     };
+    // The FRAME is the root NODE's own mount id, exactly as the real barrier
+    // reads it off the pinned root fd (and as `resolve_root_meta` already read
+    // it) — not the fake's global default. A root placed by `put_on_mount`
+    // therefore carries ITS mount into every arm the scope issues, so the
+    // executor's frame refusal is judged against the same value a real spawn
+    // would have published. A root the test never put keeps the global default,
+    // under the synthetic-identity convention above.
+    let root_mnt_id = self
+      .state
+      .nodes
+      .lock()
+      .unwrap()
+      .get(&root)
+      .map_or(self.root_mnt_id, |node| node.mnt_id);
     let meta = RootMeta {
       root: root.clone(),
       root_dev: self.root_dev,
-      root_mnt_id: self.root_mnt_id,
+      root_mnt_id,
       mounts: self.state.spawn_mounts.lock().unwrap().clone(),
       identity,
       ancestors,
@@ -1928,9 +1962,10 @@ impl FsOps for FakeFs {
     path: &Path,
     name: &Segment,
     expected: Option<ExpectedObject>,
+    frame: crate::os::ScopeFrame,
   ) -> WatchOutcome {
     self.park_on(&self.state.arm_hold);
-    self.arm_one(scope, watch, parent, path, name, expected)
+    self.arm_one(scope, watch, parent, path, name, expected, frame)
   }
 
   // The blocking batch entry: the fake answers its own arms, so it needs no
@@ -1985,6 +2020,7 @@ impl FsOps for FakeFs {
   // (not `arm_hold`) so a test can freeze concurrent discovery batches while
   // this pre-arm still commits. The generation fence does not apply — this
   // arms the explicit new-stream port, which no other batch can reach.
+  #[allow(clippy::too_many_arguments)]
   fn preflight_arm(
     &self,
     _port: &crate::os::ScopePort,
@@ -1993,12 +2029,13 @@ impl FsOps for FakeFs {
     path: &Path,
     name: &Segment,
     expected: Option<ExpectedObject>,
+    frame: crate::os::ScopeFrame,
   ) -> WatchOutcome {
     // Entry counts BEFORE the hold parks: reaching here proves the witnessed
     // window is open (see `prearm_entries`).
     self.state.prearm_entries.fetch_add(1, Ordering::SeqCst);
     self.park_on(&self.state.prearm_hold);
-    let outcome = self.arm_one(scope, watch, watch, path, name, expected);
+    let outcome = self.arm_one(scope, watch, watch, path, name, expected, frame);
     // The arm→re-stat race, modeled deterministically: the swap lands after
     // the kernel arm bound its object, before the bracket's probe.
     if let Some((path, node)) = self.state.prearm_swap.lock().unwrap().take() {
