@@ -804,24 +804,37 @@ impl Default for WatcherOptions {
 ///
 /// # The two glob seats
 ///
-/// Both are matched against a **root-relative** path: the segments between the
-/// watched root and the object, joined with `/`, never with a leading
-/// separator. The root itself is the empty path and matches neither seat, so a
-/// pattern can never silence the root it is configured on. Patterns are
-/// case-insensitive and a `*` never crosses a `/` (see
-/// [`Glob`](tributary_proto::glob::Glob)).
+/// The seats speak for different things, and each is matched against a
+/// different string. Patterns are case-insensitive and a `*` never crosses a `/`
+/// (see [`Glob`](tributary_proto::glob::Glob)).
 ///
-/// - [`prune`](Self::prune) subtracts SUBTREES: a directory whose root-relative
-///   path — or any ancestor's, below the root — matches is never enumerated,
-///   never armed, never descended, and nothing at or under it is delivered.
+/// - [`prune`](Self::prune) subtracts SUBTREES, and it is matched against a
+///   **root-relative DIRECTORY path**: the segments between the watched root and
+///   a directory, joined with `/`, never with a leading separator. A directory
+///   whose path — or any ancestor's, below the root — matches is never
+///   enumerated, never armed, never descended, and nothing at or under it is
+///   delivered. The root itself is the empty path and matches nothing, so a
+///   pattern can never silence the root it is configured on.
+///
+///   It speaks for directories ONLY. A plain FILE whose own name matches a
+///   prune pattern is not dropped by it — narrowing which files arrive is
+///   `include`'s seat — so `**/.*`, written to skip dot-directories, does not
+///   silently ban every dotfile in the tree. Only an already-pruned directory
+///   ABOVE a file takes the file with it. Because the separator is literal,
+///   `**/node_modules` matches `node_modules` at any depth while `a/cache` names
+///   one place.
+///
 ///   It is the per-root, glob-shaped twin of
 ///   [`WatcherOptions::exclusions_slice`], and unlike that option it is enforced
 ///   on EVERY backend: no OS API takes a glob, so the enforcement never stands
 ///   down to one.
-/// - [`include`](Self::include) narrows DELIVERY to files whose last path
-///   segment matches. [`None`] — the default — delivers everything. It never
-///   changes coverage: the tree is watched exactly as it would be without it, so
-///   a pattern can be widened later without re-arming anything.
+/// - [`include`](Self::include) narrows DELIVERY, and it is matched against the
+///   object's **NAME** — the last segment of its path, alone. So `*.mp4` and
+///   `**/*.mp4` are the same seat here, and a pattern containing a `/` matches
+///   nothing at all: there is no `/` in a name to match it against. [`None`] —
+///   the default — delivers everything. It never changes coverage: the tree is
+///   watched exactly as it would be without it, so a pattern can be widened
+///   later without re-arming anything.
 ///
 /// A directory change is never silenced by `include`, and neither is a
 /// [`Rescan`](crate::EventKind::Rescan) or a change whose object class the
@@ -829,6 +842,12 @@ impl Default for WatcherOptions {
 /// the consumer never hears about is a hole in its view, while an extra event is
 /// one it can drop. A rename is admitted when EITHER end matches, so a media
 /// file renamed to a non-media name is still reported.
+///
+/// Neither seat can reach the watcher's own sync cookie: `prune` never covers
+/// the reserved cookie directory and `include` always admits what is inside it,
+/// so a `sync` barrier resolves whatever the patterns say. A cookie directory a
+/// seat WOULD have pruned is refused before any write
+/// ([`SyncRootError::DirPruned`](crate::SyncRootError::DirPruned)).
 ///
 /// # Configuration faces
 ///
@@ -906,7 +925,8 @@ impl RootOptions {
   }
 
   /// The subtrees this root never descends into, as a slice. Empty is the
-  /// default — nothing is pruned. See the type docs for what a match subtracts.
+  /// default — nothing is pruned. Matched against root-relative DIRECTORY paths;
+  /// see the type docs for what a match subtracts and what it does not.
   #[inline]
   pub fn prune(&self) -> &[Glob] {
     self.prune.as_slice()
@@ -928,8 +948,10 @@ impl RootOptions {
   }
 
   /// The file patterns delivery is narrowed to, or [`None`] — the default — for
-  /// every file. An EMPTY list is not the same thing: it is a seat that admits
-  /// no file at all (directories and `Rescan`s still deliver).
+  /// every file. Matched against the object's NAME alone, so a pattern carrying
+  /// a `/` admits nothing. An EMPTY list is not the same thing as [`None`]: it
+  /// is a seat that admits no file at all (directories and `Rescan`s still
+  /// deliver).
   #[inline]
   pub fn include(&self) -> Option<&[Glob]> {
     self.include.as_deref()

@@ -456,15 +456,33 @@ impl core::fmt::Display for IoClass {
 }
 
 /// One entry from a directory enumeration.
+///
+/// # The object's class and its descendability are two facts
+///
+/// [`kind`](Self::kind) says WHAT the entry is; [`is_boundary`](Self::is_boundary)
+/// says whether the core may follow it, and [`descends`](Self::descends) is the
+/// conjunction the core actually acts on. They are separate because a driver has
+/// reasons of its own to refuse a descent into something that genuinely IS a
+/// directory — most concretely a directory on the far side of the scope's mount
+/// boundary, which is outside the watch by definition.
+///
+/// Answering that refusal by reporting the object as a non-directory would make
+/// the entry LIE about the object, and the lie does not stay local: the class
+/// travels out to a consumer as [`Change::is_dir`](crate::Change::is_dir) and is
+/// read by whatever delivery filter sits in between, every one of which is
+/// entitled to drop a file and forbidden to drop a directory. So the class stays
+/// true and the refusal is stated on its own.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DirEntry {
   name: Segment,
   kind: FileKind,
   node: Option<Identity>,
+  boundary: bool,
 }
 
 impl DirEntry {
-  /// Builds an entry from a canonical name and its kind, with no object identity.
+  /// Builds an entry from a canonical name and its kind, with no object identity
+  /// and no descent boundary.
   ///
   /// Use [`with_node`](Self::with_node) to attach the identity the driver read for this
   /// entry; without it the core treats a same-name reappearance conservatively.
@@ -474,6 +492,7 @@ impl DirEntry {
       name,
       kind,
       node: None,
+      boundary: false,
     }
   }
 
@@ -496,11 +515,36 @@ impl DirEntry {
     self.node
   }
 
-  /// Whether the entry is a directory (the core descends into these when not
-  /// kernel-recursive).
+  /// Whether the entry IS a directory — the object's class, which is what the
+  /// core reports as [`Change::is_dir`](crate::Change::is_dir).
+  ///
+  /// Not the descent question: a boundary directory answers `true` here and
+  /// `false` to [`descends`](Self::descends).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn is_dir(&self) -> bool {
     self.kind.is_dir()
+  }
+
+  /// Whether the driver marked this entry as a place the core must NOT go —
+  /// a directory that is outside the watch even though it is listed inside it,
+  /// the mount boundary being the case that exists today.
+  ///
+  /// Meaningless on a non-directory: nothing is descended into a file.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_boundary(&self) -> bool {
+    self.boundary
+  }
+
+  /// Whether the core may descend into this entry (and so arm it, occupy its
+  /// slot with a directory, and cascade a re-arm into it): a directory that is
+  /// not a boundary.
+  ///
+  /// THE predicate for every coverage decision a listing drives, so that the
+  /// boundary answer cannot be forgotten at one of them while the object's own
+  /// class is read at another.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn descends(&self) -> bool {
+    self.kind.is_dir() && !self.boundary
   }
 
   /// Returns this entry with its object [`Identity`] set.
@@ -508,6 +552,16 @@ impl DirEntry {
   #[must_use]
   pub const fn with_node(mut self, node: Identity) -> Self {
     self.node = Some(node);
+    self
+  }
+
+  /// Returns this entry marked as a descent boundary — a directory the core
+  /// must report as the directory it is and never enter
+  /// ([`is_boundary`](Self::is_boundary)).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
+  pub const fn with_boundary(mut self) -> Self {
+    self.boundary = true;
     self
   }
 }

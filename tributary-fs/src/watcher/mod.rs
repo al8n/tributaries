@@ -228,6 +228,7 @@ impl SyncRootDenied {
         | SyncRootError::BadCookieName { .. }
         | SyncRootError::DirOutsideRoot { .. }
         | SyncRootError::DirExcluded { .. }
+        | SyncRootError::DirPruned { .. }
         | SyncRootError::WriteInFlight
         | SyncRootError::NameInUse { .. }
         | SyncRootError::TicketInUse {}
@@ -1250,6 +1251,30 @@ impl<R> Watcher<R> {
   /// Locations are relative to [`root_path(handle)`](Self::root_path) at
   /// delivery time.
   ///
+  /// # The root's words are KEPT, and they are RE-BASED
+  ///
+  /// A replace swaps the root, never the [`RootOptions`] it was armed with: the
+  /// scope keeps its interest and both of its glob seats. Those seats are
+  /// ROOT-RELATIVE by definition, so keeping them re-bases every pattern onto the
+  /// new root — the same words, read against a different origin — and a
+  /// position-sensitive pattern means something new the moment the origin moves.
+  ///
+  /// Both directions are real and neither is repaired here:
+  ///
+  /// - **over-coverage.** `prune = ["a/cache"]` on `/r` names `/r/a/cache`. After
+  ///   replacing the root with `/r/a` it names `/r/a/a/cache` and stops covering
+  ///   the directory it was written for, which is now armed and delivered.
+  /// - **under-coverage.** The mirror: replacing `/r` with its parent `/p` makes
+  ///   the same pattern name `/p/a/cache` — a directory the caller never asked
+  ///   about — while `/p/r/a/cache` is watched again.
+  ///
+  /// An `include` seat re-bases without changing meaning (it matches the object's
+  /// NAME, which no re-rooting moves), and a depth-free `prune` pattern
+  /// (`**/node_modules`) is likewise position-independent. Depth-anchored words
+  /// are the ones to restate: a caller that wants them read against the new root
+  /// should re-issue the watch under a fresh [`watch_with`](Self::watch_with)
+  /// rather than replace, which is the only way to state new words at all.
+  ///
   /// Atomic-on-failure: every error leaves the old root's coverage
   /// untouched. NOT cancel-abortive: the reservation travels with the
   /// command and the driver commits independently, so dropping this future
@@ -1515,6 +1540,9 @@ impl<R> Watcher<R> {
   /// [`DirExcluded`](SyncRootError::DirExcluded) when `dir` is inside the root but
   /// under one of the configured exclusions, whose whole purpose is to keep that
   /// subtree's events off the stream the barrier waits on;
+  /// [`DirPruned`](SyncRootError::DirPruned) when this ROOT's own
+  /// [`prune`](crate::RootOptions::prune) seat covers `dir`, for the same reason
+  /// and carrying the pattern that did it;
   /// [`Write`](SyncRootError::Write) when the
   /// create fails (a read-only tree surfaces as `PermissionDenied`);
   /// [`WriteInFlight`](SyncRootError::WriteInFlight) when a physical write for this

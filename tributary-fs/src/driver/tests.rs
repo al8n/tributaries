@@ -112,13 +112,17 @@ fn rig_with(event_capacity: usize, registry: impl ScopeRegistry) -> Rig {
 }
 
 async fn watch(rig: &Rig, root: &str) -> ScopeId {
+  watch_with(rig, root, crate::options::RootOptions::new()).await
+}
+
+async fn watch_with(rig: &Rig, root: &str, options: crate::options::RootOptions) -> ScopeId {
   let before = rig.fs.refreshes();
   let (reply, on_reply) = futures_channel::oneshot::channel();
   rig
     .commands
     .send(Command::Watch {
       root: PathBuf::from(root),
-      options: crate::options::RootOptions::new(),
+      options,
       reply,
     })
     .await
@@ -12481,6 +12485,57 @@ mod sync_cookie {
     sync_root(&rig, scope, "/r", ".tributaries-sync-1-9-2")
       .await
       .expect("a directory outside every exclusion still syncs");
+    assert_eq!(rig.fs.cookie_dispatches(), 1);
+  }
+
+  /// The per-ROOT twin of the exclusion refusal. A cookie directory the root's
+  /// own `prune` seat covers would take the write and then have its event fenced
+  /// by the very pattern that asked for the fencing — the same unobservable
+  /// barrier, reached through the other seat — so it is refused before birth,
+  /// naming the pattern that did it.
+  ///
+  /// The pattern is what makes the refusal actionable: "your cookie directory is
+  /// pruned" is not something a caller can fix, and "…by `**/cache`" is.
+  ///
+  /// Revert witness: drop the `pruned_dir` arm from the sync-root admission and
+  /// the write is dispatched, after which the caller waits on an event the fence
+  /// will never let through.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_cookie_dir_under_a_prune_pattern_is_refused() {
+    let rig = rig_with_capacity(64);
+    let scope = watch_with(
+      &rig,
+      "/r",
+      crate::options::RootOptions::new().with_prune([
+        tributary_proto::glob::Glob::new("**/cache").expect("a valid pattern compiles")
+      ]),
+    )
+    .await;
+
+    // The pruned directory itself, one below it, and a spelling that only folds
+    // into it — the same lexical discipline the exclusion refusal uses.
+    for dir in ["/r/cache", "/r/cache/deep", "/r/./cache"] {
+      match sync_root(&rig, scope, dir, ".tributaries-sync-1-9-3").await {
+        Err(crate::error::SyncRootError::DirPruned { pattern, .. }) => {
+          assert_eq!(pattern.as_str(), "**/cache");
+        }
+        other => panic!("{dir} is pruned, so no barrier there is observable: {other:?}"),
+      }
+    }
+    assert_eq!(
+      rig.fs.cookie_dispatches(),
+      0,
+      "the write was refused before it could reach the pool"
+    );
+    assert_eq!(cookie_count(&rig).await, 0);
+
+    // The refusal belongs to the pattern, not to a seat being configured: a
+    // directory the seat does not cover still places its barrier — and the
+    // reserved cookie directory the write mints inside it is exempt from the
+    // seat by construction, so the barrier the write stands is observable.
+    sync_root(&rig, scope, "/r", ".tributaries-sync-1-9-4")
+      .await
+      .expect("a directory outside every pattern still syncs");
     assert_eq!(rig.fs.cookie_dispatches(), 1);
   }
 

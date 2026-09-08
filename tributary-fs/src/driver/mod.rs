@@ -8650,6 +8650,19 @@ pub(crate) async fn run<R, F>(
                   dir,
                   exclusion,
                 }));
+              } else if let Some(pattern) = lexically_normalized(&dir)
+                .and_then(|folded| core.pruned_dir(scope, &folded))
+              {
+                // The same refusal, one seat over: the root's own prune words
+                // cover the directory, so the cookie's event would be fenced by
+                // the pattern that asked for the fencing and the barrier would
+                // wait forever. The verdict is asked of the core, which holds the
+                // compiled seat, on the DIRECTORY path — with prune evaluated on
+                // directory prefixes that is the only shape a pattern can prune —
+                // and it is asked on the lexically folded path, exactly as the
+                // exclusion test above is, so `<root>/./x` and `<root>/x` get one
+                // answer. Refused before birth; the refusal creates nothing.
+                let _ = reply.send(Err(crate::error::SyncRootError::DirPruned { dir, pattern }));
               } else if cookies.has_pending_write(scope) {
                 // Single-flight per scope: refuse a second sync while one for
                 // this scope is anywhere in the pipeline — still PARKED on its

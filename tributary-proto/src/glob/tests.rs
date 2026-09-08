@@ -182,6 +182,105 @@ fn the_per_pattern_fallback_answers_what_the_union_answers() {
   assert!(Globs::each(Vec::new()).is_empty());
 }
 
+/// A pattern whose AUTOMATON is too large is a typed refusal, not a panic
+/// somewhere later. It parses perfectly — the syntax is a few hundred thousand
+/// single-character wildcards — and then overflows the matcher's own size limit,
+/// which is the one failure a parse-only constructor would have deferred to a
+/// place with no value to report it as.
+///
+/// Every face of this type comes through here, so a configuration file, a
+/// command line, or a programmatic build of such a pattern all refuse the same
+/// way instead of aborting the process that armed the root.
+///
+/// Built as a string rather than by looping the compiler: the cell is about ONE
+/// pattern's cost, and the refusal is reached in a single compile.
+#[test]
+fn a_pattern_too_large_to_compile_is_a_typed_refusal() {
+  let huge = "?".repeat(300_000);
+  let err = Glob::new(&huge).expect_err("an automaton past the limit is refused");
+  assert_eq!(err.pattern(), huge);
+  assert!(!err.message().is_empty());
+  assert!(huge.parse::<Glob>().is_err(), "and through `FromStr`");
+  assert!(Glob::try_from(huge.as_str()).is_err(), "and `TryFrom`");
+
+  // Non-vacuity: the size, not the syntax, is what is refused — the same shape
+  // at a sane length compiles and matches.
+  let ok = globs(&[&"?".repeat(4)]);
+  assert!(ok.is_match("abcd"));
+  assert!(!ok.is_match("abc"));
+}
+
+/// A `Glob` that exists carries its own compiled matcher, so a [`Globs`] whose
+/// UNION is refused has nothing left to compile — the fallback arm cannot fail
+/// and cannot panic, whatever the caller configured.
+#[test]
+fn the_fallback_arm_compiles_nothing() {
+  let each = Globs::each([glob("**/*.mp4"), glob("**/node_modules")]);
+  assert!(each.is_match("a/b.mp4"));
+  assert!(each.is_match("a/node_modules"));
+  assert!(!each.is_match("a/b.txt"));
+}
+
+/// The two spellings of one name — composed (NFC, what an editor and a JSON
+/// document write) and decomposed (NFD, what HFS+ stores and FSEvents reports) —
+/// are DIFFERENT byte strings, so a seat that compared them raw would silently
+/// match nothing on one of the three supported platforms. Both sides are folded
+/// to NFC, so either spelling of the pattern matches either spelling of the path.
+#[test]
+fn a_pattern_matches_either_spelling_of_a_name() {
+  // "Café.mp4", composed and decomposed.
+  let composed = "Caf\u{e9}.mp4";
+  let decomposed = "Cafe\u{301}.mp4";
+  assert_ne!(composed, decomposed, "staging: the two spellings differ");
+
+  let from_composed = globs(&[&std::format!("**/{composed}")]);
+  assert!(from_composed.is_match(composed));
+  assert!(from_composed.is_match(decomposed));
+  assert!(from_composed.is_match(&std::format!("a/b/{decomposed}")));
+
+  let from_decomposed = globs(&[&std::format!("**/{decomposed}")]);
+  assert!(from_decomposed.is_match(decomposed));
+  assert!(from_decomposed.is_match(composed));
+
+  // And a name that is not the one either pattern names still misses.
+  assert!(!from_composed.is_match("Cafe.mp4"));
+  assert!(!from_decomposed.is_match("Cafe.mp4"));
+}
+
+/// The folding is for MATCHING only: a pattern keeps the caller's own bytes for
+/// `as_str`, `Display`, equality and every format built on them, so a document
+/// round-trips unchanged whichever spelling it was written in.
+#[test]
+fn the_source_text_is_never_normalized() {
+  let decomposed = "**/Cafe\u{301}.mp4";
+  let pattern = glob(decomposed);
+  assert_eq!(pattern.as_str(), decomposed);
+  assert_eq!(pattern.to_string(), decomposed);
+  assert_ne!(
+    pattern,
+    glob("**/Caf\u{e9}.mp4"),
+    "two spellings are two patterns, however identically they match"
+  );
+}
+
+/// The pattern a set matched is nameable, which is what lets a refusal tell a
+/// caller which word closed the door — and it agrees with the plain verdict on
+/// every path, including the empty one.
+#[test]
+fn a_set_names_the_pattern_that_matched() {
+  let set = globs(&["**/node_modules", "**/.git", "a/cache"]);
+  assert_eq!(
+    set.matched("x/node_modules").map(Glob::as_str),
+    Some("**/node_modules")
+  );
+  assert_eq!(set.matched("a/cache").map(Glob::as_str), Some("a/cache"));
+  assert_eq!(set.matched("a/b/cache"), None);
+  for path in ["", "node_modules", "a/cache", "src", "a/b/.git", "cache"] {
+    assert_eq!(set.matched(path).is_some(), set.is_match(path), "{path}");
+  }
+  assert_eq!(Globs::default().matched("anything"), None);
+}
+
 /// The `serde` face: a plain string, in both directions, compiled on the way in.
 #[cfg(feature = "serde")]
 mod serde_face {

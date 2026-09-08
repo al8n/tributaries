@@ -287,6 +287,28 @@ pub enum SyncRootError {
     /// The exclusion covering it, as supplied in the options.
     exclusion: PathBuf,
   },
+  /// The cookie directory lies inside the root but under a subtree the root's
+  /// own [`prune`](crate::RootOptions::prune) seat covers — the per-root,
+  /// glob-shaped twin of [`DirExcluded`](Self::DirExcluded), refused for exactly
+  /// the same reason. The write would succeed and its event would then be
+  /// suppressed by the very pattern that asked for the suppression, leaving the
+  /// barrier waiting on an event that cannot exist.
+  ///
+  /// The pattern is carried because it is the actionable half: a caller reading
+  /// "your cookie directory is pruned" cannot fix it, and one reading "…by
+  /// `**/.cache`" can. The verdict is taken on the DIRECTORY path, which with a
+  /// seat that speaks for directories alone is the only thing a pattern can
+  /// prune; pick a cookie directory no pattern covers, or widen the seat.
+  ///
+  /// Unlike the exclusions this is per ROOT, so the same directory may be
+  /// perfectly writable for a sync on another root of the same watcher.
+  #[error("cookie directory {} is pruned by {pattern}", dir.display())]
+  DirPruned {
+    /// The requested cookie directory.
+    dir: PathBuf,
+    /// The pattern of the root's prune seat that covers it.
+    pattern: tributary_proto::glob::Glob,
+  },
   /// The cookie name is not a single normal filename component — it holds a
   /// path separator, a `.`/`..`, or is absolute or empty. A name like this
   /// would escape the directory the barrier was validated for, so it is refused

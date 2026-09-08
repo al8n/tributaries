@@ -14,34 +14,64 @@ All notable changes to this workspace are documented here. The format is based o
   `watch_with(root, RootOptions::new().with_interest(interest))`, and the default
   household is byte-for-byte the behaviour it always had.
 
-  - **`prune`** subtracts SUBTREES from the watch itself: a directory whose
-    root-relative path — or any ancestor's, below the root — matches is never
-    enumerated, never armed, never descended, and nothing at or under it is
-    delivered. It is the per-root, glob-shaped twin of `WatcherOptions::exclusions`,
-    and unlike that option it never stands down to a backend: no OS API takes a
-    glob, so the enforcement is the common layer's on every backend, FSEvents and
-    fanotify included. No `Rescan` ever names a pruned path, and the watched root
-    itself can never be pruned.
+  - **`prune`** subtracts SUBTREES from the watch itself, matched against
+    root-relative DIRECTORY paths: a directory whose path — or any ancestor's,
+    below the root — matches is never enumerated, never armed, never descended,
+    and nothing at or under it is delivered. It speaks for DIRECTORIES only — a
+    plain file whose own name matches is not dropped by it, so `**/.*` skips
+    dot-directories without silently banning every dotfile — and narrowing which
+    files arrive is `include`'s job. It is the per-root, glob-shaped twin of
+    `WatcherOptions::exclusions`, and unlike that option it never stands down to a
+    backend: no OS API takes a glob, so the enforcement is the common layer's on
+    every backend, FSEvents and fanotify included. No `Rescan` ever names a pruned
+    path, and the watched root itself can never be pruned.
   - **`include`** narrows file DELIVERY only, changing no coverage, so it can be
-    widened later without re-arming anything. `None` — the default — delivers
-    everything. Directories, `Rescan`s, objects whose class no backend proved, and
-    renames whose SOURCE matched are always delivered: the seat fails OPEN, because
-    a folder the consumer never hears about is a hole in its view.
+    widened later without re-arming anything. It is matched against the object's
+    NAME — the last path segment, alone — so `*.mp4` and `**/*.mp4` are the same
+    seat and a pattern containing a `/` matches nothing. `None` — the default —
+    delivers everything. Directories, `Rescan`s, objects whose class no backend
+    proved, and renames whose SOURCE matched are always delivered: the seat fails
+    OPEN, because a folder the consumer never hears about is a hole in its view.
+
+  Neither seat reaches the watcher's own sync cookie, so a `sync` barrier resolves
+  whatever the patterns say; a cookie directory `prune` would have covered is
+  refused before any write, as the new `SyncRootError::DirPruned`.
 
   Patterns are `tributary_proto::glob::Glob` (re-exported as `tributary_fs::Glob`),
-  matched case-insensitively against a `/`-joined root-relative path with
-  `literal_separator` — `*.mp4` does not match `a/b.mp4`, `**/*.mp4` does, and
-  `**/node_modules` matches `node_modules` at any depth. They live behind
-  `tributary-proto`'s new `glob` feature, which `tributary-fs` and `tributaries`
-  enable unconditionally; both faces carry them (serde: lists of plain strings;
-  clap: repeatable `--prune` / `--include` flags, an absent `--include` being the
-  absent seat).
+  matched case-insensitively with `literal_separator` — `*` never crosses a `/`,
+  `**/` spans any depth including zero, so `**/node_modules` matches
+  `node_modules` at any depth while `a/cache` names one place. Pattern and
+  candidate are both folded to NFC, so a composed pattern matches a decomposed
+  filesystem name (and back). They live behind `tributary-proto`'s new `glob`
+  feature, which `tributary-fs` and `tributaries` enable unconditionally; both
+  faces carry them (serde: lists of plain strings; clap: repeatable `--prune` /
+  `--include` flags, an absent `--include` being the absent seat).
+
+  `Watcher::replace_root` keeps the root's words and RE-BASES them onto the new
+  root — they are root-relative — so a depth-anchored `prune` pattern means
+  something different after a replace; `replace_root`'s own docs name both the
+  over- and the under-coverage consequence.
+
+  `Glob::new` PROVES a pattern can be matched with, not merely parsed: it builds
+  the pattern's own automaton and reports the size limit as a `GlobError`, so no
+  face — serde, clap, or a programmatic build — can turn a caller's configuration
+  value into a panic. `Globs::matched` names which pattern of a set answered,
+  which is what makes the `DirPruned` refusal actionable.
 
 - **`tributary-proto`** — `Change::is_dir()`: the object's class where the source
   proved it, `None` where nothing did. The same three-valued fact the OS records
   already carried, threaded through the emission path unchanged — no stat is
   performed for it, and a consumer filtering on it must treat `None` as unknown.
   `Change::new` takes it as a new final argument.
+
+- **`tributary-proto`** — `DirEntry::with_boundary()` / `is_boundary()` /
+  `descends()`: a listing can now say "a directory the core must NOT descend into"
+  without lying about the object's class. A driver marks a directory across the
+  scope's mount boundary this way instead of lowering its kind to a non-directory,
+  so the boundary directory is still announced as a directory (`Change::is_dir()`
+  is `Some(true)`) while the Monitor arms, descends and claims coverage over it
+  exactly as before. `DirEntry::is_dir()` is the object's class; `descends()` is
+  the coverage question.
 
 - **`tributaries`**, **`tributary-fs`**, **`tributary-proto`** — optional **`serde`**
   and **`clap`** faces on the option households, both off by default and neither

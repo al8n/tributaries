@@ -4007,6 +4007,11 @@ impl Monitor {
         for entry in res.entries() {
           // Delivery honors the `ondir` modifier (the kind gate is in `emit`); the
           // coverage install below runs regardless.
+          //
+          // The class it carries is the OBJECT's, not the descent verdict: a
+          // boundary directory is announced as the directory it is and installed
+          // as a leaf (`listed_occupant`). Reporting it as a non-directory would
+          // hand every downstream file filter licence to drop a real directory.
           if self.ondir_allows(scope, Some(entry.is_dir())) {
             let location = self.child_location(dir, entry.name());
             self.emit(
@@ -4019,7 +4024,7 @@ impl Monitor {
           }
           // A cold enumerate is discovery, not a replace, so an already-watched slot
           // is reused (`replaced = false`).
-          let occupant = Self::entry_occupant(entry.kind());
+          let occupant = Self::listed_occupant(entry);
           let _ = self.reconcile_slot(dir, scope, entry.name(), occupant, false, entry.node());
         }
       }
@@ -4072,7 +4077,7 @@ impl Monitor {
       .iter()
       .filter(|entry| {
         entry.kind().is_unknown()
-          || (entry.is_dir() && self.child_watch(dir, entry.name()).is_none())
+          || (entry.descends() && self.child_watch(dir, entry.name()).is_none())
       })
       .cloned()
       .collect()
@@ -4110,7 +4115,7 @@ impl Monitor {
     // `Created` — the `Rescan` below refreshes consumer content. A freshly-installed
     // child is picked up by the cascade that follows (it is now in the adjacency set).
     for entry in entries {
-      let occupant = Self::entry_occupant(entry.kind());
+      let occupant = Self::listed_occupant(entry);
       // The occupation check, taken BEFORE the reconcile that performs the
       // install — the fresh/survivor distinction both of the window's loss
       // halves key on. Named install site #2; the HELD route is the reason it is
@@ -4413,7 +4418,7 @@ impl Monitor {
     let present: BTreeMap<Segment, Option<Identity>> = res
       .entries()
       .iter()
-      .filter(|entry| entry.is_dir())
+      .filter(|entry| entry.descends())
       .map(|entry| (entry.name().clone(), entry.node()))
       .collect();
     // Names the listing could not classify. They are absent from `present`, but that
@@ -4529,7 +4534,7 @@ impl Monitor {
     // its own; this covers vanished-then-new, replaced, and genuinely new names), marked
     // to continue the re-arm so its subtree rebuilds recursively.
     for entry in res.entries() {
-      if !entry.is_dir() {
+      if !entry.descends() {
         continue;
       }
       if self.child_watch(dir, entry.name()).is_none() {
@@ -4729,7 +4734,7 @@ impl Monitor {
     // the name discharge another object's debt — which is the whole shape of a
     // dark-window substitution.
     let confirmed = self.child_watch(dir, &marker.name) == Some(marker.adopted)
-      && entry.is_some_and(|entry| entry.is_dir() && entry.node() == Some(marker.identity));
+      && entry.is_some_and(|entry| entry.descends() && entry.node() == Some(marker.identity));
     if confirmed {
       // STAGED, not released: the confirming direction is the one that needs an
       // ordering fence behind it, and the marker keeps standing — holding the
@@ -6673,6 +6678,24 @@ impl Monitor {
   /// [`reconcile_slot`]: Self::reconcile_slot
   fn record_occupant(rec: &OsRecord) -> SlotOccupant {
     Self::class_occupant(rec.is_dir())
+  }
+
+  /// Maps one LISTED entry to a [`SlotOccupant`] — [`entry_occupant`] over the
+  /// entry's kind, except that a DESCENT BOUNDARY occupies its slot as a leaf.
+  ///
+  /// A boundary directory is a directory this monitor may not enter
+  /// ([`DirEntry::descends`](crate::DirEntry::descends)), and a slot's occupant
+  /// is precisely the coverage decision: `Dir` installs a watch and cascades a
+  /// re-arm into it. So the boundary is answered here, once, rather than at each
+  /// of the sites that reads an occupant — while the entry's own class stays
+  /// true for the `Created` this same listing emits.
+  ///
+  /// [`entry_occupant`]: Self::entry_occupant
+  fn listed_occupant(entry: &DirEntry) -> SlotOccupant {
+    if entry.is_boundary() {
+      return SlotOccupant::File;
+    }
+    Self::entry_occupant(entry.kind())
   }
 
   /// Maps a listed entry's [`FileKind`](crate::FileKind) to a [`SlotOccupant`]:

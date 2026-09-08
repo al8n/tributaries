@@ -85,7 +85,7 @@ use tributary_proto::{
   ArmAttempt, Capabilities, Change, ChangeKind, DirEntry, EnumerateResult, Evidence, FileKind,
   Identity, Instant, IoClass, Location, Monitor, MoveCookie, OsRecord, RecordKind, ReqId, Scope,
   ScopeId, Segment, StatEntry, StatResult, SubtreeScope, WatchError, WatchId,
-  glob::Globs,
+  glob::{Glob, Globs},
   monitor::{CoverageWorkEpoch, RecordOutcome},
 };
 
@@ -1467,11 +1467,18 @@ struct ScopeState {
   pending_widen: Option<PendingWiden>,
   /// The root's PRUNED subtrees, compiled once when the root is registered.
   ///
-  /// The per-root, glob-shaped half of the common-layer fence: a directory whose
+  /// The per-root, glob-shaped half of the common-layer fence: a DIRECTORY whose
   /// root-relative path — or that of any ancestor below the root — matches is
   /// never staged by a listing, never armed, never descended, and nothing at or
   /// under it is delivered. Empty is the common case and short-circuits every
   /// test.
+  ///
+  /// It speaks for directories ONLY. A pattern is matched against the directory
+  /// prefixes of a path, so a plain file whose own name matches stays visible —
+  /// narrowing which FILES are delivered is [`include`](Self::include)'s seat,
+  /// and conflating the two turns a `**/.*` written to skip dot-directories into
+  /// a silent ban on every dotfile in the tree. This driver's own sync cookie is
+  /// exempt outright ([`prune_prefixes`](DriverCore::prune_prefixes)).
   ///
   /// Unlike the watcher-wide [`exclusions`](DriverCore::exclusions) it NEVER
   /// stands down for a backend that enforces exclusions itself: no OS API takes
@@ -1479,7 +1486,8 @@ struct ScopeState {
   /// [`fence_exclusions`](DriverCore::fence_exclusions)).
   prune: Globs,
   /// The root's INCLUDE seat: `None` — the default — delivers every file, and
-  /// `Some` narrows delivery to files whose last location segment matches.
+  /// `Some` narrows delivery to files whose last location segment (the object's
+  /// NAME) matches.
   ///
   /// Purely a DELIVERY gate, applied in [`route_event`](DriverCore::route_event):
   /// it changes no coverage, arms nothing differently and consumes no lag
@@ -1785,20 +1793,49 @@ impl DriverCore {
     crate::driver::excluded(&self.exclusions, path)
   }
 
-  /// The SHALLOWEST pruned ancestor of `path` (or `path` itself), or `None` when
-  /// nothing on the way down is pruned.
+  /// Walks the DIRECTORY prefixes of `path`'s root-relative form from the
+  /// shallowest down, asking `ask` for each, and answers the first `Some`.
   ///
-  /// "Pruned" for a path is: some prefix of its root-relative segments, of length
-  /// **at least one**, matches the scope's [`prune`](ScopeState::prune) set. The
-  /// length floor is what makes the ROOT unprunable — its root-relative path is
-  /// empty, so it has no prefix to match with, and a seat can never silence the
-  /// very root it was configured on.
+  /// The prefixes are what the [`prune`](ScopeState::prune) seat may speak for,
+  /// and they are the seat's whole definition:
   ///
-  /// An ancestor walk from the shallowest segment down, bounded by the path's own
-  /// depth and cached nowhere: a scope's coverage moves under it (a rename
-  /// re-parents a whole subtree in O(1)), so a memo keyed on a path would be a
-  /// second description of a tree the Monitor already owns — the mirror
-  /// [`path_of`](Self::path_of) exists to have deleted.
+  /// - every prefix of length **at least one**. The length floor is what makes
+  ///   the ROOT unprunable — its root-relative path is empty, so it has no prefix
+  ///   to match with, and a seat can never silence the very root it was
+  ///   configured on;
+  /// - `directory` says whether `path`'s OWN last segment is one of them. Prune
+  ///   names SUBTREES, so a directory is judged on its own name as well as its
+  ///   ancestors', while an object proven not to be a directory is judged on its
+  ///   ancestors ALONE. That is what keeps `**/.*` — a pattern a caller writes to
+  ///   skip dot-DIRECTORIES — from silently taking every dotfile in the tree with
+  ///   it, files being [`include`](ScopeState::include)'s business and not this
+  ///   seat's. An entry still inside an already-pruned prefix is dropped whatever
+  ///   its class, because the walk covers its ancestors either way.
+  ///
+  /// An ancestor walk bounded by the path's own depth and cached nowhere: a
+  /// scope's coverage moves under it (a rename re-parents a whole subtree in
+  /// O(1)), so a memo keyed on a path would be a second description of a tree the
+  /// Monitor already owns — the mirror [`path_of`](Self::path_of) exists to have
+  /// deleted.
+  ///
+  /// # The sync cookie is never pruned
+  ///
+  /// A segment naming this driver's own cookie directory
+  /// ([`is_sync_cookie_dir_name`](crate::is_sync_cookie_dir_name)) ends the walk
+  /// at once, answering `None` for that directory and everything under it. The
+  /// cookie is the WATCHER's artifact, not the tree's: its event is what a sync
+  /// barrier waits on, and a seat that suppressed it would leave the caller
+  /// waiting on an event that can no longer exist — a hang produced by a pattern
+  /// that was only ever meant to describe the caller's own files.
+  ///
+  /// The reserved directory can stand at any depth (a sync is placed under the
+  /// SUBSCRIPTION's directory, which need not be the root), so the exemption is
+  /// stated over every segment rather than the first one alone. It exempts the
+  /// reserved NAME, never the caller's own directories above it: a pattern that
+  /// prunes the directory the caller asked to sync IN is a real refusal, and
+  /// `sync_root` makes it one before any write
+  /// ([`pruned_dir`](Self::pruned_dir)) rather than letting the write land and
+  /// the barrier hang.
   ///
   /// FAILS OPEN — answers `None` — for a scope with no prune seat, a path outside
   /// the scope root, a root that is not known yet, and a segment that is not
@@ -1806,49 +1843,89 @@ impl DriverCore {
   /// have meant). The direction is the fence's own: not suppressing costs a
   /// delivery the caller did not want, suppressing on an unresolved path costs one
   /// it may have needed.
-  fn prune_root(state: &ScopeState, path: &Path) -> Option<PathBuf> {
+  fn prune_prefixes<T>(
+    state: &ScopeState,
+    directory: bool,
+    path: &Path,
+    mut ask: impl FnMut(&str) -> Option<T>,
+  ) -> Option<T> {
     if state.prune.is_empty() {
       return None;
     }
     let root = state.root.as_deref()?;
     let relative = path.strip_prefix(root).ok()?;
     let mut walked = String::new();
-    let mut fence = root.clone();
-    for segment in relative.iter() {
+    let mut segments = relative.iter().peekable();
+    while let Some(segment) = segments.next() {
       let segment = segment.to_str()?;
+      if crate::driver::is_sync_cookie_dir_name(segment) {
+        return None;
+      }
+      // The last segment of a proven non-directory is not a prefix the seat may
+      // speak for, and it is the end of the walk either way.
+      if segments.peek().is_none() && !directory {
+        return None;
+      }
       if !walked.is_empty() {
         walked.push('/');
       }
       walked.push_str(segment);
-      fence.push(segment);
-      if state.prune.is_match(&walked) {
-        return Some(fence);
+      if let Some(hit) = ask(&walked) {
+        return Some(hit);
       }
     }
     None
   }
 
-  /// The nearest FENCED ancestor of `path` — the ONE containment predicate both
-  /// halves of the common-layer fence are asked through.
+  /// Whether the [`prune`](ScopeState::prune) seat covers `path` — some directory
+  /// prefix of it matches ([`prune_prefixes`](Self::prune_prefixes)).
+  ///
+  /// The hot form, and the only one the fence asks: it wants a verdict, not a
+  /// path, so it asks the compiled union in one pass per prefix and allocates
+  /// nothing beyond the prefix buffer itself.
+  fn is_pruned(state: &ScopeState, directory: bool, path: &Path) -> bool {
+    Self::prune_prefixes(state, directory, path, |prefix| {
+      state.prune.is_match(prefix).then_some(())
+    })
+    .is_some()
+  }
+
+  /// WHICH pattern prunes `path`, for the one caller that must name it to a
+  /// person: the sync-cookie birth refusal, whose whole value is telling the
+  /// caller which word closed the directory it asked to write in.
+  ///
+  /// Always asked about a DIRECTORY, because with the seat evaluated on directory
+  /// prefixes that is the only thing a pattern can prune.
+  pub(crate) fn pruned_dir(&self, scope: ScopeId, dir: &Path) -> Option<Glob> {
+    let state = self.scopes.get(&scope)?;
+    Self::prune_prefixes(state, true, dir, |prefix| {
+      state.prune.matched(prefix).cloned()
+    })
+  }
+
+  /// Whether `path` lies inside EITHER half of the common-layer fence — the ONE
+  /// containment predicate the fence is asked through.
   ///
   /// Two seats, one question: the watcher-wide exclusion covering `path` (an
-  /// absolute-path subtree test), or the scope's shallowest pruned ancestor of it
-  /// (a root-relative glob test, [`prune_root`](Self::prune_root)). A path is
-  /// fenced iff this answers `Some`, and what it answers is the fence's own root
-  /// — the directory the suppression begins at.
+  /// absolute-path subtree test), or a pruned directory prefix of it (a
+  /// root-relative glob test, [`is_pruned`](Self::is_pruned)).
   ///
   /// `exclusions` is whether the EXCLUSION half is live for this scope: it stands
   /// down where the backend decides exclusions at admission
   /// ([`backend_enforces_exclusions`]). The PRUNE half never stands down — no OS
   /// API takes a glob, so no backend can have decided that question already.
-  fn fence_root(&self, state: &ScopeState, exclusions: bool, path: &Path) -> Option<PathBuf> {
+  ///
+  /// `directory` is the prune half's own question and the exclusion half ignores
+  /// it: an exclusion is a literal subtree, so it covers a file inside it exactly
+  /// as it covers the directory holding it.
+  fn is_fenced(&self, state: &ScopeState, exclusions: bool, directory: bool, path: &Path) -> bool {
     if exclusions
       && !self.exclusions.is_empty()
-      && let Some(exclusion) = crate::driver::cookie_dir_excluded(&self.exclusions, path)
+      && crate::driver::cookie_dir_excluded(&self.exclusions, path).is_some()
     {
-      return Some(exclusion.to_path_buf());
+      return true;
     }
-    Self::prune_root(state, path)
+    Self::is_pruned(state, directory, path)
   }
 
   /// Where one watch of `state`'s scope IS: the scope root's canonical path
@@ -3210,24 +3287,47 @@ impl DriverCore {
   /// uses (enumerate-side identity is the authority; a foreign-device entry
   /// mints `None`). A DIRECTORY across the scope's MOUNT boundary — a differing
   /// mount id, or (as a belt, and when the mount id is unavailable) a differing
-  /// device — is lowered as [`FileKind::Other`]: the mount boundary is the scope
-  /// boundary, so the Monitor must not descend it — the entry still delivers, the
-  /// subtree beyond the boundary is deliberately outside coverage. The mount-id
-  /// fence catches a `mount --bind` of a same-DEVICE directory the device check
-  /// alone would descend across (the same breach the fanotify walk closes with the
-  /// same fence); the device belt still governs when either mount id is unknown
-  /// (the honest below-5.8 degrade).
+  /// device — is marked a DESCENT BOUNDARY ([`DirEntry::with_boundary`]): the
+  /// mount boundary is the scope boundary, so the Monitor must not descend it —
+  /// the entry still delivers, as the directory it is, and the subtree beyond the
+  /// boundary is deliberately outside coverage. The mount-id fence catches a
+  /// `mount --bind` of a same-DEVICE directory the device check alone would
+  /// descend across (the same breach the fanotify walk closes with the same
+  /// fence); the device belt still governs when either mount id is unknown (the
+  /// honest below-5.8 degrade).
   ///
-  /// An entry the caller EXCLUDED is dropped from the listing outright — the cold
-  /// half of the common-layer fence (see [`exclusions`](Self::exclusions)). An
-  /// excluded directory is therefore never staged, so the Monitor never emits its
-  /// `Created`, never reconciles a slot for it, never arms it and never descends
-  /// it. The drop deliberately does NOT set `lossy`: a `Partial` listing means the
-  /// read could not report everything, which forces a covering `Rescan` and a
-  /// bounded retry, whereas this omission is exactly what the caller asked for and
-  /// has nothing to recover. This fence needs no backend gate — an enumerate only
-  /// ever happens on a descending profile, and a descending backend by
-  /// construction has no admission-time enforcement of its own.
+  /// The boundary is stated ALONGSIDE the kind rather than by rewriting it. A
+  /// kind rewritten to a non-directory would travel out to the consumer as
+  /// `is_dir: Some(false)` and let a file-shaped delivery seat — the root's
+  /// [`include`](ScopeState::include) — silently drop a real directory's
+  /// `Created`; the Monitor's own arm, descent and coverage decisions read
+  /// [`DirEntry::descends`] and are unchanged by the split.
+  ///
+  /// # What the listing drops
+  ///
+  /// An entry the caller EXCLUDED is dropped outright — the cold half of the
+  /// common-layer fence (see [`exclusions`](Self::exclusions)) — and so is one the
+  /// root's [`prune`](ScopeState::prune) seat covers. The prune half is asked as
+  /// the seat is defined: a DIRECTORY entry (a boundary directory included) is
+  /// judged on its own root-relative path as well as its ancestors', while an
+  /// entry proven to be a non-directory is judged on its ancestors alone — so a
+  /// FILE whose name happens to match a pattern stays in the listing, and only an
+  /// already-pruned prefix above it can take it out (see
+  /// [`is_pruned`](Self::is_pruned)).
+  ///
+  /// Either drop means the Monitor never emits the entry's `Created`, never
+  /// reconciles a slot for it, never arms it and never descends it. Neither
+  /// deliberately sets `lossy`: a `Partial` listing means the read could not
+  /// report everything, which forces a covering `Rescan` and a bounded retry,
+  /// whereas this omission is exactly what the caller asked for and has nothing to
+  /// recover — and a `Rescan` naming a pruned or excluded path is the one thing
+  /// both seats must never produce. The exclusion half needs no backend gate — an
+  /// enumerate only ever happens on a descending profile, and a descending backend
+  /// by construction has no admission-time enforcement of its own — and the prune
+  /// half never stands down for a backend at all.
+  ///
+  /// [`DirEntry::with_boundary`]: tributary_proto::DirEntry::with_boundary
+  /// [`DirEntry::descends`]: tributary_proto::DirEntry::descends
   pub(crate) fn on_enumerated(&mut self, req: ReqId, raw: RawEnumerate) {
     let Some((scope, dir)) = self.enum_reqs.remove(&req) else {
       return;
@@ -3250,16 +3350,21 @@ impl DriverCore {
             continue;
           };
           let path = dir.join(name);
-          if self.excluded(&path) || Self::prune_root(state, &path).is_some() {
+          // A kind the read could not classify is judged as a DIRECTORY here.
+          // `readdir` answers `DT_UNKNOWN` on whole filesystems, and reading that
+          // as "proven file" would let every directory on such a filesystem walk
+          // straight through a `**/node_modules` seat — the seat's own purpose,
+          // lost to an artifact of the listing rather than to anything about the
+          // object.
+          let directory = entry.kind.is_dir() || entry.kind.is_unknown();
+          if self.excluded(&path) || Self::is_pruned(state, directory, &path) {
             continue;
           }
           let node = mint(state, &path, NonZeroU64::new(entry.ino), Some(entry.dev));
-          let kind = if entry.kind.is_dir() && crosses_mount_boundary(state, &entry) {
-            FileKind::Other
-          } else {
-            entry.kind
-          };
-          let mut dir_entry = DirEntry::new(Segment::new(name), kind);
+          let mut dir_entry = DirEntry::new(Segment::new(name), entry.kind);
+          if entry.kind.is_dir() && crosses_mount_boundary(state, &entry) {
+            dir_entry = dir_entry.with_boundary();
+          }
           if let Some(node) = node {
             dir_entry = dir_entry.with_node(node);
           }
@@ -4493,8 +4598,10 @@ impl DriverCore {
     let fence = exclusions || !state.prune.is_empty();
     // The geometry half additionally stands down for a kernel-recursive profile
     // (see [`reparent_geometry`](Self::reparent_geometry)); the fence itself does
-    // not.
+    // not. What the profiles WITHOUT geometry owe a prune seat instead is the
+    // blunt destination cover ([`reveals_ground`](Self::reveals_ground)).
     let geometry = fence && runs_rename_geometry(state.profile);
+    let reveals = Self::reveals_ground(state);
     if !fence && !at_classify {
       return;
     }
@@ -4525,6 +4632,14 @@ impl DriverCore {
         } else {
           None
         };
+        // The same question the geometry pass answers from the Monitor's report,
+        // asked of the record alone because on these profiles there is no report
+        // to read (see [`revealed`](Self::revealed)).
+        let revealed = if reveals {
+          Self::revealed(&planned)
+        } else {
+          None
+        };
         let outcome = Self::accept(&mut self.monitor, state, &mut kept, planned, now);
         // The repair is by construction anchored at a reported destination, so
         // it needs no fencing of its own. It follows the record it repairs, in
@@ -4533,6 +4648,9 @@ impl DriverCore {
           && let Geometry::Repair(repair) =
             self.reparent_geometry(state, exclusions, scope, watch, target.as_ref(), &outcome)
         {
+          Self::accept(&mut self.monitor, state, &mut kept, repair, now);
+        }
+        if let Some(repair) = revealed {
           Self::accept(&mut self.monitor, state, &mut kept, repair, now);
         }
       }
@@ -4578,10 +4696,27 @@ impl DriverCore {
     if !exclusions && state.prune.is_empty() {
       return resolved;
     }
+    let reveals = Self::reveals_ground(state);
     let before = resolved.planned.len();
-    resolved
-      .planned
-      .retain(|planned| !self.fenced(state, exclusions, planned));
+    let mut kept = Vec::with_capacity(before);
+    for planned in core::mem::take(&mut resolved.planned) {
+      if self.fenced(state, exclusions, &planned) {
+        continue;
+      }
+      // The destination cover the geometry-less profiles owe, queued directly
+      // behind the record that provoked it exactly as the batch-time fence
+      // queues it. This is the second and last place a planned input is born, so
+      // a rename resolved through a probe owes the same repair one judged at
+      // compile time does.
+      let revealed = if reveals {
+        Self::revealed(&planned)
+      } else {
+        None
+      };
+      kept.push(planned);
+      kept.extend(revealed);
+    }
+    resolved.planned = kept;
     if before > 0 && resolved.planned.is_empty() {
       resolved.candidate = None;
     }
@@ -4621,10 +4756,10 @@ impl DriverCore {
   }
 
   /// Whether the fence's MEMBERSHIP over the subtree rooted at `path` depends on
-  /// where that subtree sits — the mirror of [`fence_root`](Self::fence_root),
+  /// where that subtree sits — the mirror of [`is_fenced`](Self::is_fenced),
   /// asked the other way round.
   ///
-  /// [`fence_root`](Self::fence_root) answers "is this path inside a fence", which
+  /// [`is_fenced`](Self::is_fenced) answers "is this path inside a fence", which
   /// is what suppression needs. Re-parenting needs "does this subtree CONTAIN
   /// fenced ground", because that is what decides whether rewriting the subtree's
   /// path changes which of its descendants are reported.
@@ -4685,6 +4820,61 @@ impl DriverCore {
     }
   }
 
+  /// Whether this scope owes a DESTINATION COVER on every directory rename it
+  /// keeps: a live prune seat on a profile that runs no rename geometry.
+  ///
+  /// The defect it answers is [`reparent_geometry`](Self::reparent_geometry)'s,
+  /// in the one shape that pass cannot reach. A prune pattern can be
+  /// position-sensitive (`a/cache` names one place, not a name at any depth), so
+  /// a rename that relocates a subtree changes which of its descendants are
+  /// pruned — and BOTH endpoints of such a rename are reported, so the
+  /// record-by-record fence preserves the pair and suppresses nothing. On a
+  /// descending profile the Monitor answers that rename by re-parenting a watch
+  /// subtree and SAYS SO, and the geometry pass re-enumerates from its report.
+  /// The other profiles have no such report to read: FSEvents and fanotify decide
+  /// exclusions at admission and RDCW and USN are kernel-recursive, so none of
+  /// them keeps per-directory watches to re-parent. Their consumer is left
+  /// holding a `Moved(a → b)` and no way to learn that `b/cache/x`, silent until
+  /// now, has become reportable — silent, permanent, and invisible in exactly the
+  /// direction the caller cannot audit.
+  ///
+  /// So they pay the same conservatism the geometry pass pays, without the
+  /// report: every kept directory rename gets one located `Rescan` at its
+  /// destination, and the consumer re-enumerates. It repairs no coverage — a
+  /// kernel-recursive stream already covers the destination the moment the
+  /// re-parent lands — and it does not need to: what was lost is the consumer's
+  /// VIEW, and a `Rescan` is exactly the instruction to rebuild it.
+  ///
+  /// Costed honestly: one extra `Rescan` per directory rename, on a root that
+  /// configured a prune seat, on four of the five backends. A scope with no
+  /// pattern pays nothing.
+  fn reveals_ground(state: &ScopeState) -> bool {
+    !state.prune.is_empty() && !runs_rename_geometry(state.profile)
+  }
+
+  /// The destination cover one record owes under
+  /// [`reveals_ground`](Self::reveals_ground), or `None`.
+  ///
+  /// Owed by a rename's DESTINATION half whose object is not a proven
+  /// non-directory: a proven file move relocates no subtree and can reveal
+  /// nothing, while an unproven class is judged as a directory for the same
+  /// reason the fence judges it as one — a backend that reported no class has not
+  /// reported a file.
+  ///
+  /// Needs no fencing of its own: it is anchored at the destination of a record
+  /// the fence just KEPT, and a kept record's endpoint is by construction not
+  /// pruned.
+  fn revealed(planned: &Planned) -> Option<Planned> {
+    match planned {
+      Planned::Rec(rec)
+        if matches!(rec.kind(), RecordKind::MovedTo) && rec.is_dir() != Some(false) =>
+      {
+        Some(Planned::Over(located(rec.watch(), rec.target().cloned())))
+      }
+      _ => None,
+    }
+  }
+
   /// Re-enumerates a moved directory subtree whose RENAME changed the exclusion
   /// geometry over it — the one thing the record-by-record fence structurally
   /// cannot see.
@@ -4709,9 +4899,12 @@ impl DriverCore {
   ///   spending kernel watches — and delivering — on ground the caller excluded to
   ///   shed exactly that cost.
   ///
-  /// The rule is [`exclusion_under`](Self::exclusion_under) at EITHER endpoint, which
+  /// The rule is [`fence_under`](Self::fence_under) at EITHER endpoint, which
   /// is how the fanotify admission map and the USN journal decide the same question:
-  /// one predicate, asked of both ends, never a second matching rule. Deliberately
+  /// one predicate, asked of both ends, never a second matching rule. Its prune half
+  /// is the constant `true` — a glob's language cannot be enumerated, so whether some
+  /// unseen descendant's verdict flips is not a question the matcher can be asked, and
+  /// a scope with any pattern answers "changed" at both ends. Deliberately
   /// CONSERVATIVE in the same way — an exclusion sitting under both endpoints at the
   /// same relative offset leaves the geometry genuinely unchanged yet answers `true`,
   /// costing one re-enumeration on a path this rare.
@@ -4827,22 +5020,33 @@ impl DriverCore {
   }
 
   /// Whether one planned Monitor input addresses only fenced ground — excluded,
-  /// pruned, or both ([`fence_root`](Self::fence_root)).
+  /// pruned, or both ([`is_fenced`](Self::is_fenced)).
+  ///
+  /// The prune half needs the object's CLASS as well as its path, and each arm
+  /// supplies it from what it holds:
+  ///
+  /// - a RECORD carries the backend's own verdict. Anything but a proven
+  ///   non-directory is judged as a directory — a class no backend proved is not
+  ///   a proof of a file, and reading it as one would let every directory on a
+  ///   filesystem whose records omit the flag walk through the seat;
+  /// - a located OVER-signal names a subtree, which is a directory by
+  ///   construction.
   fn fenced(&self, state: &ScopeState, exclusions: bool, planned: &Planned) -> bool {
-    let inside = |path: &Path| self.fence_root(state, exclusions, path).is_some();
     match planned {
       Planned::Rec(rec) => {
         !rec.kind().is_self_event()
           && self
             .anchored_path(state, rec.watch(), rec.target())
-            .is_some_and(|path| inside(&path))
+            .is_some_and(|path| {
+              self.is_fenced(state, exclusions, rec.is_dir() != Some(false), &path)
+            })
       }
       Planned::Over(Scope::Subtree(sub)) => {
         let scope_wide = sub.watch() == state.watch && sub.descent().is_empty();
         !scope_wide
           && self
             .anchored_path(state, sub.watch(), Some(sub.descent()))
-            .is_some_and(|path| inside(&path))
+            .is_some_and(|path| self.is_fenced(state, exclusions, true, &path))
       }
       Planned::Over(_) => false,
     }
@@ -5545,7 +5749,11 @@ impl DriverCore {
 
   /// Whether `state`'s [`include`](ScopeState::include) seat admits `change`.
   ///
-  /// Five admitting clauses, and every one of them widens rather than narrows:
+  /// The seat matches one thing: the object's NAME — the LAST segment of its
+  /// location. A pattern containing a `/` therefore never admits anything, and
+  /// `*.mp4` and `**/*.mp4` are the same seat.
+  ///
+  /// Six admitting clauses, and every one of them widens rather than narrows:
   ///
   /// - **(a)** a [`Rescan`](ChangeKind::Rescan). It is the no-silent-loss escape
   ///   and names a subtree to re-read rather than an object, so no file pattern
@@ -5556,8 +5764,19 @@ impl DriverCore {
   ///   ([`Change::is_dir`] `!= Some(false)`). Directories always pass, so a moved
   ///   or removed folder is never silent, and an unproven class fails OPEN — a
   ///   backend that reported no class has not reported a file;
-  /// - **(d)** a last location segment that matches;
-  /// - **(e)** a [`Moved`](ChangeKind::Moved) whose SOURCE's last segment
+  /// - **(d)** this driver's OWN sync cookie: a change some location segment of
+  ///   which is a cookie directory's name
+  ///   ([`is_sync_cookie_dir_name`](crate::is_sync_cookie_dir_name)). The marker
+  ///   is a file, and it is the file a `sync` barrier waits on — a caller's
+  ///   pattern about the caller's own media has no business deciding whether the
+  ///   watcher can observe its own artifact, and a seat that dropped it would
+  ///   turn every restricted-include sync into a timeout. Read over every segment
+  ///   because a sync is placed under the SUBSCRIPTION's directory, which need
+  ///   not be the root. The layer that owns the namespace keeps these off the
+  ///   consumer's stream regardless, so admitting here widens the barrier's view
+  ///   and not the caller's;
+  /// - **(e)** a last location segment that matches;
+  /// - **(f)** a [`Moved`](ChangeKind::Moved) whose SOURCE's last segment
   ///   matches. A media file renamed to a non-media name is still reported, so
   ///   the consumer can drop what it was holding rather than keep a name that no
   ///   longer exists.
@@ -5570,6 +5789,14 @@ impl DriverCore {
       return true;
     };
     if change.kind().is_rescan() || change.is_dir() != Some(false) {
+      return true;
+    }
+    if change
+      .location()
+      .segments()
+      .iter()
+      .any(|segment| crate::driver::is_sync_cookie_dir_name(segment.as_str()))
+    {
       return true;
     }
     let matches = |location: &Location| {
