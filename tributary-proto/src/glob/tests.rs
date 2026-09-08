@@ -195,6 +195,10 @@ fn the_per_pattern_fallback_answers_what_the_union_answers() {
 /// Built as a string rather than by looping the compiler: the cell is about ONE
 /// pattern's cost, and the refusal is reached in a single compile.
 #[test]
+#[cfg_attr(
+  miri,
+  ignore = "drives the automaton size limit, which costs hundreds of megabytes of interpreted allocation and exhausts a 32-bit Miri address space; the refusal is a native property, and `the_fallback_arm_compiles_nothing` beside it still runs under Miri"
+)]
 fn a_pattern_too_large_to_compile_is_a_typed_refusal() {
   let huge = "?".repeat(300_000);
   let err = Glob::new(&huge).expect_err("an automaton past the limit is refused");
