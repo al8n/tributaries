@@ -512,7 +512,7 @@ impl Default for TributariesOptions {
 ///   OPEN, because a folder the consumer never hears about is a hole in its
 ///   view while an extra event is one it can drop.
 ///
-/// # One root, one set of words
+/// # One root, one set of words — and `prune` is anchored to that root
 ///
 /// These are the words a ROOT is armed with, and the umbrella folds overlapping
 /// subscriptions onto shared roots — so every subscription a root serves carries
@@ -524,11 +524,33 @@ impl Default for TributariesOptions {
 /// are just another value here; they conflict with engaged ones. Equality is this
 /// type's own [`PartialEq`]: the same patterns, as written, in the same order.
 ///
+/// Equal TEXT is not yet equal MEANING, and the two seats differ on exactly that.
+/// [`include`](Self::include) matches an object's NAME, so it says the same thing
+/// under any root. [`prune`](Self::prune) matches the root-relative DIRECTORY
+/// path, so what it names is fixed by the root it is anchored to — the same
+/// pattern under a different root is a different instruction. So a subscription
+/// may share a root only when the words are EQUAL **and** either its key IS that
+/// root's key, or neither side carries a `prune` seat:
+///
+/// - a watch DEEPER than the root already covering it would ride words written
+///   for the shallower root, so `prune = ["sub"]` there would mean the covering
+///   root's `sub`, not its own;
+/// - a WIDEN always moves the anchor the other way — the retained words are
+///   re-based onto the wider key — so `prune = ["sub"]` on a root at `/r/sub`
+///   comes to name the WHOLE of that root once the watch widens to `/r`,
+///   silencing a subscription that stays published.
+///
+/// Both are refused as
+/// [`WordsConflict::Anchored`](crate::WordsConflict::Anchored); differing text is
+/// [`WordsConflict::Differ`](crate::WordsConflict::Differ). An `include`-only
+/// household is unaffected at any depth.
+///
 /// The refusal is decided before anything is armed, disarmed or re-pointed, so a
 /// conflicting watch costs no coverage and owes no
 /// [`Rescan`](crate::EventKind::Rescan). A narrowing that must be this
 /// subscription's own whatever else is watched around it belongs in the
-/// per-subscription [`Filter`](crate::Filter), which gates delivery alone.
+/// per-subscription [`Filter`](crate::Filter), which gates delivery alone — and
+/// carries no anchor, so it survives every re-scoping the root does.
 ///
 /// # A source that cannot honour a seat must SAY so
 ///
@@ -661,6 +683,13 @@ impl RootGlobs {
 /// [`WatchError::RootWordsConflict`](crate::WatchError::RootWordsConflict), never silently
 /// re-scoped. A caller that needs a narrowing which is unconditionally its own, whatever else
 /// is watched around it, wants the [`Filter`].
+///
+/// [`prune`](Self::prune) additionally binds a watch to ONE anchor: it is matched
+/// root-relative, so a subscription carrying one may share a root only at that root's own key.
+/// A watch deeper than its covering root, and a widen over any pruned root, are refused
+/// ([`WordsConflict::Anchored`](crate::WordsConflict::Anchored)) even when the pattern text is
+/// identical — see [`RootGlobs`]. [`include`](Self::include) matches names and carries no
+/// anchor, so it is shareable at any depth.
 ///
 /// # Cloning shares the [`Filter`] slot
 ///

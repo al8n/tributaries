@@ -21,7 +21,7 @@ pub use demux::{Demux, Lane};
 pub use driver::Tributaries;
 pub use error::{
   BuildError, CloseError, FaultKind, SourceCloseError, SourceFault, SyncError, UnwatchError,
-  WatchError,
+  WatchError, WordsConflict,
 };
 pub use event::{Event, EventKind};
 pub use filter::{Filter, FilterInput};

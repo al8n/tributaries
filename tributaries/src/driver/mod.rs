@@ -4037,6 +4037,7 @@ where
               root_depth: conflict.root_depth,
               armed: conflict.armed,
               requested: globs.clone(),
+              reason: conflict.reason,
             }
             .into(),
           );

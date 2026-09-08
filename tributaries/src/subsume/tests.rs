@@ -8,7 +8,7 @@ use std::{
 use proptest::prelude::*;
 
 use super::{Subscription, Subsumer, UnwatchOutcome, WatchOutcome};
-use crate::{interest::Interest, options::RootGlobs};
+use crate::{error::WordsConflict, interest::Interest, options::RootGlobs};
 
 /// The subsumer under test: fs key component `OsString`, no per-watch value, `u32`
 /// handles (the trivial stand-in for the real `tributary-fs` handle).
@@ -274,23 +274,21 @@ fn a_widen_refuses_when_any_subsumed_root_disagrees_before_naming_a_teardown() {
   assert_eq!(s.pending_len(), 0);
 }
 
-/// The rule is EQUALITY, not "no words engaged": a watch carrying the same seats as the root it
-/// would share plans exactly as it always did, on both paths — `Covered` under an engaged root,
-/// and `Widen` over one. The newcomer's words are built separately from the root's, so what
-/// passes is the value, not a shared allocation.
+/// The rule is EQUALITY, not "no words engaged", and an `include`-only household is the seat
+/// equality is sufficient for: `include` matches an object's NAME, which no anchor can change,
+/// so such a watch plans exactly as it always did on both paths — `Covered` under an engaged
+/// root, and `Widen` over one. The newcomer's words are built separately from the root's, so
+/// what passes is the value, not a shared allocation.
 #[test]
-fn equal_words_plan_as_they_always_did_on_both_paths() {
+fn equal_include_only_words_plan_as_they_always_did_on_both_paths() {
   let mut s = S::new();
   let mut h = Handles::default();
 
-  let words = || {
-    RootGlobs::new()
-      .with_prune([glob("**/skip")])
-      .with_include([glob("*.mp4")])
-  };
+  let words = || RootGlobs::new().with_include([glob("*.mp4")]);
   let (rb, sb) = watch_with_globs(&mut s, &mut h, "/a/b", &words());
 
-  // Covered: an equal-worded newcomer joins the root's cohort, arming nothing.
+  // Covered, and DEEPER than the root: an equal-worded newcomer joins the root's cohort,
+  // arming nothing. The depth is safe here precisely because no seat is root-relative.
   let (covered_root, covered_sub) = watch_with_globs(&mut s, &mut h, "/a/b/c", &words());
   assert_eq!(covered_root, rb, "covered by the /a/b root");
   assert_eq!(s.subscribers(rb), vec![sb, covered_sub]);
@@ -298,7 +296,7 @@ fn equal_words_plan_as_they_always_did_on_both_paths() {
   // Widen: an equal-worded ancestor subsumes it, re-pointing both subscribers.
   let outcome = match s.plan_watch(&key("/a"), (), Interest::all(), &words()) {
     Ok(outcome) => outcome,
-    Err(_) => panic!("equal words never conflict"),
+    Err(_) => panic!("equal include-only words never conflict"),
   };
   let wide = match &outcome {
     WatchOutcome::Widen {
@@ -317,6 +315,113 @@ fn equal_words_plan_as_they_always_did_on_both_paths() {
     s.root_globs(wide),
     Some(&words()),
     "the widened root is armed with the words every subscription it serves carries"
+  );
+}
+
+/// A `prune` seat is ANCHORED to the root that carries it: it is matched against the
+/// root-relative directory path, so the identical pattern text under a different root names
+/// different ground. Equal text is therefore necessary but not sufficient — the ANCHOR has to
+/// be the same one too.
+///
+/// At the root's OWN key it is: the newcomer arms nothing and the words it rides are the words
+/// it wrote, for the very root it wrote them for. One component deeper they are not: `prune`
+/// of `x` would mean the covering root's `x`, not this watch's, so serving it would silently
+/// re-aim the seat. Refused, with the anchor named as the reason.
+#[test]
+fn a_pruned_watch_shares_a_root_only_at_that_root_s_own_key() {
+  let mut s = S::new();
+  let mut h = Handles::default();
+
+  let words = || RootGlobs::new().with_prune([glob("x")]);
+  let (rb, sb) = watch_with_globs(&mut s, &mut h, "/a/b", &words());
+
+  // Same key, same words: the anchor never moves, so this joins the cohort.
+  let (same_root, same_sub) = watch_with_globs(&mut s, &mut h, "/a/b", &words());
+  assert_eq!(same_root, rb, "an equal-keyed newcomer rides the same root");
+  assert_eq!(s.subscribers(rb), vec![sb, same_sub]);
+
+  // One component deeper, with the SAME text: refused, because `x` there is not the `x` this
+  // watch wrote.
+  let refused = match s.plan_watch(&key("/a/b/c"), (), Interest::all(), &words()) {
+    Ok(outcome) => panic!("expected a refusal, got {outcome:?}"),
+    Err(conflict) => conflict,
+  };
+  assert_eq!(refused.root, rb, "the refusal names the covering root");
+  assert_eq!(refused.root_depth, key("/a/b").len());
+  assert_eq!(
+    refused.reason,
+    WordsConflict::Anchored,
+    "the TEXT is equal — the anchor is what conflicts"
+  );
+  assert_eq!(
+    refused.armed,
+    words(),
+    "and it still carries the words that root is armed with"
+  );
+
+  assert_eq!(root_keys(&s), BTreeSet::from([key("/a/b")]));
+  assert_eq!(
+    s.subscribers(rb),
+    vec![sb, same_sub],
+    "the cohort is untouched"
+  );
+  assert_eq!(s.pending_len(), 0);
+}
+
+/// A WIDEN always moves the anchor — the retained words are re-based from every subsumed root
+/// onto the strictly-shallower new key — so a `prune` seat on EITHER side refuses it, however
+/// equal the text.
+///
+/// The damage this closes is the sharp one. `/r/sub` armed with `prune = ["sub"]` prunes
+/// nothing (its own root-relative `sub` does not exist); widening to `/r` with the same text
+/// re-anchors it, and `sub` now names the WHOLE of the original root. Its subscriber stays
+/// published, receives one re-point `Rescan`, and then never hears anything under its key
+/// again — coverage lost with no `Rescan` that can un-lose it.
+///
+/// And, as on every other refusal path, the verdict comes off the records: the plan never gets
+/// as far as naming a root to release, so the subsumed root is still live, still armed, still
+/// carrying its cohort.
+#[test]
+fn a_widen_over_a_pruned_root_is_refused_before_naming_a_teardown() {
+  let mut s = S::new();
+  let mut h = Handles::default();
+
+  let words = || RootGlobs::new().with_prune([glob("sub")]);
+  let (rb, sb) = watch_with_globs(&mut s, &mut h, "/r/sub", &words());
+
+  let refused = match s.plan_watch(&key("/r"), (), Interest::all(), &words()) {
+    Ok(outcome) => panic!("expected a refusal, got {outcome:?}"),
+    Err(conflict) => conflict,
+  };
+  assert_eq!(refused.root, rb, "the refusal names the subsumed root");
+  assert_eq!(refused.root_depth, key("/r/sub").len());
+  assert_eq!(
+    refused.reason,
+    WordsConflict::Anchored,
+    "equal text, re-based onto a root it was not written for"
+  );
+
+  assert_eq!(
+    root_keys(&s),
+    BTreeSet::from([key("/r/sub")]),
+    "the subsumed root was not torn down for a watch that is then refused"
+  );
+  assert_eq!(s.subscribers(rb), vec![sb]);
+  assert_eq!(s.root_globs(rb), Some(&words()));
+  assert_eq!(s.pending_len(), 0);
+
+  // The newcomer's OWN seat is enough on its own: a widen over an unworded root is refused
+  // just the same, because the re-based seat would be the wider root's from then on.
+  let (rc, _) = watch_with_globs(&mut s, &mut h, "/q/sub", &RootGlobs::new());
+  let refused = match s.plan_watch(&key("/q"), (), Interest::all(), &words()) {
+    Ok(outcome) => panic!("expected a refusal, got {outcome:?}"),
+    Err(conflict) => conflict,
+  };
+  assert_eq!(refused.root, rc);
+  assert_eq!(
+    refused.reason,
+    WordsConflict::Differ,
+    "an unworded subsumed root disagrees on the TEXT before the anchor is even asked"
   );
 }
 

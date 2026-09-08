@@ -30,7 +30,7 @@
 //! A `watch` cannot mutate committed state up front: the real root handle does not
 //! exist until *after* the source is armed, and if that arming fails no state may have
 //! changed. So [`Subsumer::plan_watch`] is a pure read returning a [`WatchOutcome`]
-//! describing the operations the driver must perform — or a [`WordsConflict`] refusing the watch
+//! describing the operations the driver must perform — or a [`WordsRefusal`] refusing the watch
 //! before any of them is issued — and [`Subsumer::commit_watch`]
 //! applies the state transition once the real handle is known. `unwatch` needs no such
 //! split — the handle already exists — so [`Subsumer::plan_unwatch`] mutates
@@ -44,6 +44,7 @@ use iradix::sync::Radix;
 use tributary_proto::ScopeId;
 
 use crate::{
+  error::WordsConflict,
   event::Event,
   filter::Filter,
   interest::Interest,
@@ -415,9 +416,12 @@ pub(crate) enum WatchOutcome<H> {
 /// root the SOURCE has already forgotten owes nobody a refusal, and is retired and re-planned past
 /// instead.
 #[must_use = "this carries the refused watch's caller value — place its release deliberately"]
-pub(crate) struct WordsConflict<V, H> {
+pub(crate) struct WordsRefusal<V, H> {
   /// The conflicting root's armed handle — the driver's liveness probe coordinate.
   pub(crate) root: H,
+  /// Which way the words failed to fit: the text differs, or the text is equal but the
+  /// anchor would move under a root-relative `prune` seat.
+  pub(crate) reason: WordsConflict,
   /// How deep the conflicting root's own key is, in key components. Reported rather than the key
   /// itself: the key is `Vec<C>` of CALLER components, which nothing above this seam can render.
   pub(crate) root_depth: usize,
@@ -427,11 +431,12 @@ pub(crate) struct WordsConflict<V, H> {
   pub(crate) value: V,
 }
 
-impl<V, H: Copy> WordsConflict<V, H> {
-  /// The refusal `record` earns against a newcomer carrying `value`.
-  fn against<C>(record: &RootRecord<C, H>, value: V) -> Self {
+impl<V, H: Copy> WordsRefusal<V, H> {
+  /// The refusal `record` earns against a newcomer carrying `value`, for `reason`.
+  fn against<C>(record: &RootRecord<C, H>, value: V, reason: WordsConflict) -> Self {
     Self {
       root: record.handle,
+      reason,
       root_depth: record.key.len(),
       armed: record.globs.clone(),
       value,
@@ -971,7 +976,7 @@ where
     value: V,
     interest: Interest,
     globs: &RootGlobs,
-  ) -> Result<WatchOutcome<H>, WordsConflict<V, H>> {
+  ) -> Result<WatchOutcome<H>, WordsRefusal<V, H>> {
     // Case 1 — Covered: an existing root at or above `key` already watches this
     // subtree. Disjointness guarantees at most one such ancestor, and its presence
     // rules out any strict descendant. The covering root is armed `Interest::all`
@@ -983,7 +988,21 @@ where
       // ... but only under the covering root's OWN words: this newcomer arms nothing, so
       // different words here are a request the commit could not carry out.
       Some(record) if record.globs != *globs => {
-        return Err(WordsConflict::against(record, value));
+        return Err(WordsRefusal::against(record, value, WordsConflict::Differ));
+      }
+      // Equal text is not yet equal MEANING. A `prune` pattern is matched against the
+      // root-relative directory path, so what it names is fixed by the root it is anchored
+      // to: a newcomer DEEPER than the covering root would ride words written for the
+      // shallower one, and `sub` would then mean the covering root's `sub` rather than this
+      // watch's. `include` carries no anchor at all (it matches the object's NAME), so an
+      // include-only household is served at any depth — which keeps the common seat usable
+      // exactly where it is safe.
+      Some(record) if record.key.len() != key.len() && !globs.prune().is_empty() => {
+        return Err(WordsRefusal::against(
+          record,
+          value,
+          WordsConflict::Anchored,
+        ));
       }
       // Covered-OUTSIDE (the set-cover reconcile): the covering root's source coverage was narrowed (`retained_cover`
       // is `Some`) to prefixes NONE of which is an ancestor-or-equal of this newcomer's key. The
@@ -1012,7 +1031,21 @@ where
       // ANY subsumed root whose words differ refuses the whole widen, and it refuses it while
       // `unwatch` is still a local list of handles nobody has been asked to release.
       if record.globs != *globs {
-        return Err(WordsConflict::against(record, value));
+        return Err(WordsRefusal::against(record, value, WordsConflict::Differ));
+      }
+      // A widen ALWAYS moves the anchor — the retained words are re-based from each subsumed
+      // root onto this strictly-shallower key — so equal text is not equal meaning here
+      // either, and the direction is the dangerous one: a `prune` that named one subsumed
+      // root's own subdirectory can come to name that ENTIRE root, silencing a subscription
+      // that stays published and gets one `Rescan` and then nothing. Refused for either side's
+      // seat, and refused HERE, while `unwatch` is still a local list nobody has been asked to
+      // release.
+      if !globs.prune().is_empty() || !record.globs.prune().is_empty() {
+        return Err(WordsRefusal::against(
+          record,
+          value,
+          WordsConflict::Anchored,
+        ));
       }
       if let Some(cohort) = self.root_subs.get(&record.handle) {
         repointed.extend_from_slice(cohort);

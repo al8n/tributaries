@@ -147,6 +147,19 @@ All notable changes to this workspace are documented here. The format is based o
     the same order. The verdict is the planner's, taken off the root records BEFORE
     anything is armed, disarmed, retargeted or re-pointed — the gapless in-place widen
     included — so a refused watch moves no coverage and owes nobody a `Rescan`.
+  - **`prune` is anchored to the root that carries it.** It is matched root-relative,
+    so the same pattern text under a different root names different ground — while
+    `include` matches an object's NAME and means the same thing anywhere. A
+    subscription may therefore share a root only when the words are EQUAL *and*
+    either its key IS that root's key or neither side carries a `prune` seat: a watch
+    DEEPER than its covering root would ride words written for the shallower one, and
+    a WIDEN re-bases every subsumed root's words onto the wider key — which is how
+    `prune = ["sub"]` on a root at `/r/sub` came to name that entire root, and its
+    still-published subscriber to fall silent after one `Rescan`. Both are refused
+    with the same `WatchError::RootWordsConflict`, whose new `reason` field carries
+    the new `WordsConflict` enum: `Differ` when the text conflicts, `Anchored` when
+    equal text would be re-aimed. An `include`-only household is shareable at any
+    depth, and the per-subscription `Filter` carries no anchor at all.
   - A cookie directory the root's own `prune` seat covers reaches a `sync` caller as
     `SyncError::CookieDirUncovered` — the same verdict as one outside the root or under a
     watcher exclusion, all three being "no event could ever arrive there" — rather than as

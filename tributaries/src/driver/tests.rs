@@ -1866,6 +1866,12 @@ fn pruning(pattern: &str) -> WatchOptions<OsString> {
   WatchOptions::new().with_prune([glob(pattern)])
 }
 
+/// The per-watch options carrying just the `include` seat — the ANCHOR-FREE half, which matches
+/// an object's name and so means the same thing under every root.
+fn including(pattern: &str) -> WatchOptions<OsString> {
+  WatchOptions::new().with_include([glob(pattern)])
+}
+
 /// ONE ROOT, ONE SET OF WORDS, on the covered path: a newcomer an existing root would serve arms
 /// nothing of its own, so seats that differ from that root's cannot be honoured — the watch is
 /// REFUSED instead of being quietly served under the root's words.
@@ -1902,10 +1908,16 @@ async fn a_covered_watch_whose_words_conflict_is_refused_with_no_source_call() {
       root_depth,
       armed,
       requested,
+      reason,
     } => {
       assert_eq!(*root_depth, key("/a").len());
       assert_eq!(texts(armed.prune()), ["**/node_modules"]);
       assert!(requested.is_unengaged(), "and what this watch asked for");
+      assert_eq!(
+        *reason,
+        crate::WordsConflict::Differ,
+        "the TEXT is what conflicts here"
+      );
     }
     other => panic!("expected RootWordsConflict, got {other:?}"),
   }
@@ -1993,9 +2005,14 @@ async fn a_widen_whose_words_conflict_is_refused_before_any_disarm() {
 
 /// And on the GAPLESS widen — the sole-subsumed-root path that would retarget the source's own
 /// root in place. `Source::replace` re-keys a watch, it does not re-configure it, so a retarget
-/// under conflicting words would leave the newcomer riding the old root's seats with the handle
-/// preserved and nothing to fall back to. The planner refuses first, so the retarget is never
-/// issued.
+/// under words the newcomer did not write for THAT root would leave the newcomer riding seats it
+/// never asked for, with the handle preserved and nothing to fall back to. The planner refuses
+/// first, so the retarget is never issued.
+///
+/// Both refusals are here because they are the same seam: differing text, and equal text whose
+/// ANCHOR the retarget would move — a `prune` is matched root-relative, and `replace` re-bases
+/// it onto the wider key. The `include`-only widen that still succeeds is what keeps the two
+/// refusals verdicts on the WORDS rather than on the path.
 #[tokio::test]
 async fn a_conflicting_in_place_widen_is_refused_before_the_retarget() {
   let mut h = Harness::new();
@@ -2014,18 +2031,44 @@ async fn a_conflicting_in_place_widen_is_refused_before_the_retarget() {
     refused.is_root_words_conflict(),
     "the typed refusal: {refused:?}"
   );
+
+  // EQUAL text, and still refused: the retarget re-bases the seat onto `/a`, where `**/skip`
+  // is a different instruction than it was under `/a/b`.
+  let refused = h
+    .watch_with("/a", pruning("**/skip"))
+    .await
+    .expect_err("an equal-worded PRUNE widen moves the anchor, so it is refused too");
+  match &refused {
+    WatchError::RootWordsConflict { reason, .. } => assert_eq!(
+      *reason,
+      crate::WordsConflict::Anchored,
+      "the text is equal — the anchor is what conflicts"
+    ),
+    other => panic!("expected RootWordsConflict, got {other:?}"),
+  }
   assert_eq!(
     h.owner.source.calls(),
     vec![Call::Arm(PathBuf::from("/a/b"))],
-    "no Replace was issued — the root keeps its key and its words"
+    "no Replace was issued for either refusal — the root keeps its key and its words"
+  );
+  assert_eq!(
+    h.owner.subsumer.subscribers(1),
+    vec![s_narrow],
+    "and its cohort is untouched"
   );
 
-  // Equal words on the same shape DO widen in place, which is what makes the refusal above a
-  // verdict on the words rather than on the path.
-  let s_wide = h
-    .watch_with("/a", pruning("**/skip"))
+  // An `include`-only household carries no anchor, so an equal-worded widen over one DOES
+  // retarget in place — the gapless path is intact for the seat it is safe for.
+  let mut h = Harness::new();
+  h.owner.source.supports_replace = true;
+  let s_narrow = h
+    .watch_with("/a/b", including("*.mp4"))
     .await
-    .expect("an equal-worded widen still retargets in place");
+    .expect("watch /a/b");
+  let s_wide = h
+    .watch_with("/a", including("*.mp4"))
+    .await
+    .expect("an equal-worded include-only widen still retargets in place");
   assert_eq!(
     h.owner.source.calls(),
     vec![
@@ -2040,8 +2083,11 @@ async fn a_conflicting_in_place_widen_is_refused_before_the_retarget() {
     "both subscriptions ride the retargeted root"
   );
   assert_eq!(
-    h.owner.subsumer.root_globs(1).map(|g| texts(g.prune())),
-    Some(vec!["**/skip"]),
+    h.owner
+      .subsumer
+      .root_globs(1)
+      .map(|g| texts(g.include().unwrap_or_default())),
+    Some(vec!["*.mp4"]),
     "under the words they both carry"
   );
 }
