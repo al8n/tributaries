@@ -11752,6 +11752,107 @@ mod kernel_recursive_fanotify {
     );
   }
 
+  /// The tick is COALESCING, not invalidation — and conflating the two starves
+  /// every publication behind `on_mounts_refreshed`'s stale gate.
+  ///
+  /// The interval is any nonzero duration the caller likes, and refresh latency
+  /// is whatever a blocking pool gives it, so latency at or past the interval is
+  /// an ordinary operating point rather than a corner. There EVERY completion
+  /// lands with a tick already fired on top of it. A tick that condemned the
+  /// in-flight snapshot would therefore discard every completion in turn — the
+  /// mount-table install and the frame adoption both sit BEHIND that gate — and
+  /// the re-armed read would be condemned by the next tick, forever. Only the
+  /// root-death check would survive, because it is evaluated in FRONT of the
+  /// gate.
+  ///
+  /// Driven here with no completion between two ticks, which is that steady
+  /// state exactly: every read this scope completes was tick-raced.
+  #[test]
+  fn a_tick_coalescing_onto_an_in_flight_refresh_still_publishes_it() {
+    let (mut core, scope) = live_fanotify();
+    // Tick one arms the read that carries the table...
+    core.on_timeout(at(30_000));
+    assert_eq!(
+      refresh_requests(&drain(&mut core)),
+      1,
+      "the due tick arms one refresh"
+    );
+    // ...and tick two comes due before it lands. Pure cadence: no second
+    // effect, and no condemnation of the read already out.
+    core.on_timeout(at(60_000));
+    assert_eq!(
+      refresh_requests(&drain(&mut core)),
+      0,
+      "a tick over an in-flight read stacks no second effect"
+    );
+
+    core.on_mounts_refreshed(
+      scope,
+      alive_refresh(vec![PathBuf::from("/r/vol")], true),
+      at(60_001),
+    );
+    let effects = drain(&mut core);
+    assert_eq!(
+      refresh_requests(&effects),
+      0,
+      "the tick-raced completion is PUBLISHED, not discarded-and-re-armed: {effects:?}"
+    );
+    let state = core.scopes.get(&scope).expect("scope is live");
+    assert!(
+      state.mounts_authoritative,
+      "and it installed its table: a cadence witnesses no transition to distrust"
+    );
+    assert_eq!(
+      state.mounts,
+      vec![PathBuf::from("/r/vol")],
+      "the rows the tick-raced read carried are the ones that installed"
+    );
+  }
+
+  /// The half of `refresh_stale` a coalescing tick must NOT touch: a LOSS
+  /// condemnation stands, and a tick riding the same in-flight read cannot
+  /// absolve it. The loss window may have carried a mount transition, so its
+  /// snapshot is suspect no matter how many ticks agree it is due.
+  #[test]
+  fn a_tick_never_absolves_a_loss_condemned_refresh() {
+    let (mut core, scope) = live_fanotify();
+    core.on_timeout(at(30_000));
+    assert_eq!(
+      refresh_requests(&drain(&mut core)),
+      1,
+      "the due tick arms one refresh"
+    );
+    // A loss overlaps the in-flight read: condemned.
+    core.on_root_overflow(scope, at(30_500));
+    let _ = drain(&mut core);
+    // A tick rides the same read afterwards. It must change nothing.
+    core.on_timeout(at(60_000));
+    let _ = drain(&mut core);
+
+    core.on_mounts_refreshed(
+      scope,
+      alive_refresh(vec![PathBuf::from("/r/vol")], true),
+      at(60_001),
+    );
+    let effects = drain(&mut core);
+    assert_eq!(
+      refresh_requests(&effects),
+      1,
+      "the loss-condemned completion is still discarded and re-armed: {effects:?}"
+    );
+    let state = core.scopes.get(&scope).expect("scope is live");
+    assert!(
+      !state.mounts_authoritative,
+      "a superseded snapshot restores no authority"
+    );
+    assert!(
+      state.mounts.is_empty(),
+      "and its rows never install: a stale read may predate the lost window, so \
+       the table it carries proves nothing: {:?}",
+      state.mounts
+    );
+  }
+
   /// The tick's payoff end to end: a fanotify root unmounted with no loss (the
   /// L4.1 quiet case) is caught when the periodic refresh finds it gone — the
   /// refresh completion runs the same terminal Removed + Rescan + teardown a

@@ -29,9 +29,12 @@
 //! root is terminal regardless of snapshot staleness, so its death evidence is never
 //! discarded by a stale flag. Everything the snapshot then carries — the mount TABLE
 //! and the root's descent FRAME (`root_mnt_id`) — publishes ONLY when the snapshot is
-//! not stale: a stale completion (a loss or tick overlapped its read, so the snapshot
-//! may predate the lost window, and the table + frame come from that one read)
-//! publishes neither and re-arms one fresh read. So `state.root_mnt_id` is only ever
+//! not stale: a stale completion (an INVALIDATING arming — a loss, or a world swap —
+//! overlapped its read, so the snapshot may predate the lost window, and the table +
+//! frame come from that one read) publishes neither and re-arms one fresh read. The
+//! periodic tick is NOT such an arming: it coalesces onto an in-flight read and lets
+//! it publish, because a cadence witnesses no transition (see [`RefreshCause`]).
+//! So `state.root_mnt_id` is only ever
 //! the last AUTHORITATIVE frame, never a stale/pre-window one, and the frame
 //! [`crosses_mount_boundary`] consumes for enumerate descent is always authoritative.
 //! A non-stale frame CHANGE (a same-object re-mount moved the root to a different
@@ -189,6 +192,39 @@ pub(crate) struct MountRefresh {
   /// leaves the captured value intact — a transient read miss never drops a known
   /// frame.
   pub(crate) root_mnt_id: Option<u64>,
+}
+
+/// Why one mount refresh is being armed.
+///
+/// The two causes agree completely when nothing is in flight — both arm one
+/// read. They differ ONLY in what they say about a refresh that IS in flight,
+/// because they carry opposite evidence about its snapshot:
+///
+/// - an **invalidating** arming happened BECAUSE the world moved (a loss window,
+///   a root replace or widen, a birth), so the in-flight read may have sampled
+///   the far side of that transition — it is suspect, and
+///   [`refresh_stale`](ScopeState::refresh_stale) condemns it.
+/// - a **periodic** arming is pure cadence: nothing happened. The in-flight
+///   snapshot is exactly as good as the one this tick would take, so the tick
+///   coalesces onto it and lets it PUBLISH.
+///
+/// Conflating the two starves everything that publishes past
+/// [`on_mounts_refreshed`](DriverCore::on_mounts_refreshed)'s stale gate — the
+/// mount-table install and the frame adoption. With refresh latency at or past
+/// the interval (a backed-up blocking pool, or simply a short interval — any
+/// nonzero duration is configurable), a tick that stale-marked would condemn
+/// EVERY completion in turn: each is discarded and re-armed, and the next tick
+/// condemns the next read. The root-death check survives that only because it is
+/// evaluated BEFORE the gate; everything else sits behind it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefreshCause {
+  /// The world moved under the in-flight read: a loss signal, a root replace or
+  /// widen, or the birth arming. Condemns an outstanding snapshot.
+  Invalidating,
+  /// The periodic tick came due. Coalesces onto an outstanding read without
+  /// condemning it — and without ever CLEARING a condemnation an invalidating
+  /// arming already made.
+  Periodic,
 }
 
 /// One I/O obligation the driver task must execute for the core.
@@ -1691,9 +1727,16 @@ struct ScopeState {
   /// An [`Effect::RefreshMounts`] is outstanding; repeated loss signals
   /// coalesce onto it instead of stacking effects.
   refresh_pending: bool,
-  /// A loss signal arrived while a refresh was in flight: that snapshot may
-  /// predate the newly-lost window, so its result is discarded and one more
-  /// refresh re-arms.
+  /// An INVALIDATING arming ([`RefreshCause::Invalidating`] — a loss signal, or
+  /// a world swap's own re-arm) landed while a refresh was in flight: that
+  /// snapshot may predate the newly-lost window, so its result is discarded and
+  /// one more refresh re-arms.
+  ///
+  /// The periodic tick pointedly does NOT set it. A tick carries no evidence
+  /// against the in-flight snapshot — it is a cadence, not a transition — and a
+  /// tick that condemned it would starve every publication behind
+  /// [`on_mounts_refreshed`](DriverCore::on_mounts_refreshed)'s stale gate for
+  /// as long as refresh latency stayed at or past the interval.
   refresh_stale: bool,
   /// The ONE watch-set recovery a probe-BUDGET episode owes, already made: a
   /// refresh this scope armed was declined because every liveness-probe slot in
@@ -4036,7 +4079,7 @@ impl DriverCore {
         // this birth refresh, whose post-live read the stream orders against
         // every later mount transition; until it installs, event-side
         // identity and cookies fail closed (the non-authoritative default).
-        Self::arm_refresh(&mut self.effects, scope, state);
+        Self::arm_refresh(&mut self.effects, scope, state, RefreshCause::Invalidating);
         match backend {
           // Kernel-recursive: the live stream IS the root's coverage, so the
           // spawn doubles as the root's watch-result AND the moment the caller's
@@ -5021,16 +5064,28 @@ impl DriverCore {
   /// mount table; repeated losses coalesce onto one outstanding refresh.
   fn trust_lost(effects: &mut VecDeque<Effect>, scope: ScopeId, state: &mut ScopeState) {
     state.mounts_authoritative = false;
-    Self::arm_refresh(effects, scope, state);
+    Self::arm_refresh(effects, scope, state, RefreshCause::Invalidating);
   }
 
   /// Arms one mount-table refresh for `scope`, coalescing onto an outstanding
-  /// one: a refresh raced by a newer arming re-runs once (`refresh_stale`)
-  /// instead of stacking effects. Serves both the birth refresh (authority is
-  /// never presumed at spawn) and every post-loss re-read.
-  fn arm_refresh(effects: &mut VecDeque<Effect>, scope: ScopeId, state: &mut ScopeState) {
+  /// one instead of stacking effects. Serves the birth refresh (authority is
+  /// never presumed at spawn), every post-loss re-read, and the periodic tick.
+  ///
+  /// What the coalescing DOES to the outstanding read is `cause`'s business (see
+  /// [`RefreshCause`]): an invalidating arming condemns it (`refresh_stale`, so
+  /// its completion is discarded and one fresh read re-runs), a periodic one
+  /// merely rides on it. Only the invalidating branch ever writes the flag, so a
+  /// tick can neither condemn a sound snapshot nor absolve a condemned one.
+  fn arm_refresh(
+    effects: &mut VecDeque<Effect>,
+    scope: ScopeId,
+    state: &mut ScopeState,
+    cause: RefreshCause,
+  ) {
     if state.refresh_pending {
-      state.refresh_stale = true;
+      if matches!(cause, RefreshCause::Invalidating) {
+        state.refresh_stale = true;
+      }
       return;
     }
     // No canonical root means no live stream: nothing to read yet, and the
@@ -5548,8 +5603,16 @@ impl DriverCore {
     // Fire due liveness ticks: each arms the existing `RefreshMounts` (whose
     // completion runs the root-death mapping) and re-arms the deadline for the
     // next interval. Collected first so `arm_refresh` can take `&mut effects`
-    // while each scope is mutated in turn. A refresh already in flight coalesces
-    // (arm_refresh sets `refresh_stale`), so a tick never stacks effects.
+    // while each scope is mutated in turn.
+    //
+    // A refresh already in flight coalesces — `RefreshCause::Periodic`, so the
+    // tick rides that read rather than condemning it. The deadline still
+    // advances here, so a coalesced tick loses no obligation: the read it rode
+    // publishes (installing the table and adopting the frame) and re-seeds the
+    // deadline itself on its alive completion, so the cadence simply re-bases
+    // off whichever of the two lands later. Condemning it instead is what
+    // starves the whole publication path once refresh latency reaches the
+    // interval (see [`RefreshCause`]).
     let interval = self.root_liveness_interval;
     let due: Vec<ScopeId> = self
       .scopes
@@ -5563,7 +5626,7 @@ impl DriverCore {
       .collect();
     for scope in due {
       if let Some(state) = self.scopes.get_mut(&scope) {
-        Self::arm_refresh(&mut self.effects, scope, state);
+        Self::arm_refresh(&mut self.effects, scope, state, RefreshCause::Periodic);
         Self::arm_liveness(state, interval, now);
       }
     }
