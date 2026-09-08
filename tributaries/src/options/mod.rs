@@ -4,6 +4,10 @@
 
 use core::{num::NonZeroUsize, time::Duration};
 
+use std::vec::Vec;
+
+use tributary_proto::glob::Glob;
+
 use crate::{filter::Filter, interest::Interest};
 
 #[cfg(test)]
@@ -474,16 +478,151 @@ impl Default for TributariesOptions {
   }
 }
 
+/// The per-ROOT glob words a [`Source`](crate::Source) is armed with — the two
+/// seats a subscription's [`WatchOptions`] carries, extracted for the seam
+/// ([`Source::arm`](crate::Source::arm)).
+///
+/// Both are matched against a **root-relative** path: the segments between the
+/// armed root and the object, joined with `/`, never with a leading separator.
+/// The root itself is the empty path and matches neither seat, so a pattern can
+/// never silence the root it is configured on. Patterns are case-insensitive
+/// and a `*` never crosses a `/` (see [`Glob`]).
+///
+/// - [`prune`](Self::prune) subtracts SUBTREES from the watch itself: a
+///   directory whose root-relative path — or any ancestor's, below the root —
+///   matches is never enumerated, never armed, never descended, and nothing at
+///   or under it is delivered. Empty (the default) prunes nothing.
+/// - [`include`](Self::include) narrows DELIVERY to files whose last path
+///   segment matches, changing no coverage. [`None`] — the default — delivers
+///   everything; an EMPTY list is not the same thing, but a seat admitting no
+///   file at all. Directories, re-enumeration signals, an object whose class
+///   the source did not prove, and a rename whose SOURCE matched are always
+///   delivered: the seat fails OPEN, because a folder the consumer never hears
+///   about is a hole in its view while an extra event is one it can drop.
+///
+/// # A source that cannot honour a seat must SAY so
+///
+/// These are words the umbrella hands down, not a filter it applies afterwards:
+/// nothing above the seam re-checks them, so a source that ignores one delivers
+/// events the caller asked not to receive — or watches a subtree the caller
+/// asked it not to enter — with nothing anywhere to notice. The stock
+/// filesystem binding honours both. A source that cannot honour one MUST
+/// document that in its own [`Source`](crate::Source) implementation's docs, so
+/// a caller reads the limitation where it configures the seat rather than
+/// inferring it from events that should not have arrived.
+///
+/// The default ([`new`](Self::new)) is both seats unengaged, which is exactly
+/// the behaviour every source had before the seats existed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RootGlobs {
+  prune: Vec<Glob>,
+  include: Option<Vec<Glob>>,
+}
+
+impl RootGlobs {
+  /// The unengaged words: prune nothing, deliver every file.
+  #[inline]
+  pub const fn new() -> Self {
+    Self {
+      prune: Vec::new(),
+      include: None,
+    }
+  }
+
+  /// Whether NEITHER seat is engaged — the [`new`](Self::new) words, which ask a
+  /// source for exactly what it did before the seats existed.
+  #[inline]
+  pub fn is_unengaged(&self) -> bool {
+    self.prune.is_empty() && self.include.is_none()
+  }
+
+  /// The subtrees this root never descends into. Empty is the default.
+  #[inline]
+  pub fn prune(&self) -> &[Glob] {
+    self.prune.as_slice()
+  }
+
+  /// Returns these words with the pruned subtrees set.
+  #[inline]
+  #[must_use]
+  pub fn with_prune(mut self, prune: impl IntoIterator<Item = Glob>) -> Self {
+    self.prune = prune.into_iter().collect();
+    self
+  }
+
+  /// Sets the pruned subtrees.
+  #[inline]
+  pub fn set_prune(&mut self, prune: impl IntoIterator<Item = Glob>) -> &mut Self {
+    self.prune = prune.into_iter().collect();
+    self
+  }
+
+  /// The file patterns delivery is narrowed to, or [`None`] — the default — for
+  /// every file.
+  #[inline]
+  pub fn include(&self) -> Option<&[Glob]> {
+    self.include.as_deref()
+  }
+
+  /// Returns these words with delivery narrowed to the given file patterns.
+  #[inline]
+  #[must_use]
+  pub fn with_include(mut self, include: impl IntoIterator<Item = Glob>) -> Self {
+    self.include = Some(include.into_iter().collect());
+    self
+  }
+
+  /// Sets the file patterns delivery is narrowed to.
+  #[inline]
+  pub fn set_include(&mut self, include: impl IntoIterator<Item = Glob>) -> &mut Self {
+    self.include = Some(include.into_iter().collect());
+    self
+  }
+
+  /// Returns these words delivering every file again — the [`None`] seat.
+  #[inline]
+  #[must_use]
+  pub fn without_include(mut self) -> Self {
+    self.include = None;
+    self
+  }
+
+  /// Clears the include seat, delivering every file again.
+  #[inline]
+  pub fn clear_include(&mut self) -> &mut Self {
+    self.include = None;
+    self
+  }
+}
+
 /// Per-watch options for one [`watch`](crate::Tributaries::watch) call: the fan-out
-/// [`Interest`] gate (design §5), the admission [`Filter`] (design §7), and the
-/// [`Debounce`] posture (design §6).
+/// [`Interest`] gate (design §5), the admission [`Filter`] (design §7), the
+/// [`Debounce`] posture (design §6), and the two per-root glob seats
+/// ([`prune`](Self::prune) / [`include`](Self::include), carried down to the source as
+/// [`RootGlobs`]).
 ///
 /// [`new`](Self::new) is the deliver-everything default — every kind, every change,
-/// the watcher-global debounce — and narrowing is the opt-in act, one `with_*` builder
-/// per knob. Not to be confused with the fs watcher's transport-level
-/// `WatcherOptions` (an `fs`-feature item): these options configure one *subscription*,
-/// never the underlying kernel watch (every root is armed with the source's widest
-/// policy, design §4).
+/// the watcher-global debounce, no subtree pruned, every file delivered — and narrowing
+/// is the opt-in act, one `with_*` builder per knob. Not to be confused with the fs
+/// watcher's transport-level `WatcherOptions` (an `fs`-feature item), which configures a
+/// whole watcher rather than one watch.
+///
+/// # Three of the knobs narrow DELIVERY; one re-scopes the WATCH
+///
+/// The [`Interest`] gate, the [`Filter`] and the [`Debounce`] posture are the
+/// umbrella's own, applied to a root armed at the source's widest policy (design §4) —
+/// so they narrow what this *subscription* sees and never what the underlying watch
+/// collects, and two subscriptions sharing a root can hold entirely different ones.
+///
+/// The glob seats are not that. They are handed to [`Source::arm`](crate::Source::arm)
+/// as the words the root itself is armed with, so [`prune`](Self::prune) subtracts
+/// coverage rather than filtering it — which is exactly why it can keep a watcher out
+/// of a `node_modules` tree instead of merely dropping its events. The consequence to
+/// hold: they are per-ROOT, and roots are shared. A root armed for this subscription
+/// carries THESE words, and a later subscription merely *covered* by it — or one whose
+/// wider watch subsumes it — is served by the root its own reconcile armed. A caller
+/// that needs a narrowing which is unconditionally its own, whatever else is watched
+/// around it, wants the [`Filter`].
 ///
 /// # Cloning shares the [`Filter`] slot
 ///
@@ -497,10 +636,17 @@ impl Default for TributariesOptions {
 ///
 /// With the `serde` feature the subscription is one object keyed by the field names,
 /// every key optional and defaulted from [`new`](Self::new) — so the empty document
-/// is the deliver-everything default and a key is a narrowing:
+/// is the deliver-everything default and a key is a narrowing. The two glob seats are
+/// lists of plain strings, and an invalid pattern is a document error rather than a
+/// value that matches nothing later:
 ///
 /// ```json
-/// { "interest": ["created", "modified"], "debounce": "off" }
+/// {
+///   "interest": ["created", "modified"],
+///   "debounce": "off",
+///   "prune": ["**/node_modules"],
+///   "include": ["**/*.{mp4,mov}"]
+/// }
 /// ```
 ///
 /// The [`Filter`] is on neither face and never round-trips: it is a caller's own
@@ -509,12 +655,15 @@ impl Default for TributariesOptions {
 /// admits, and a caller that wants a predicate installs it afterwards with
 /// [`with_filter`](Self::with_filter). Neither face constrains `C`.
 ///
-/// With the `clap` feature it is a `clap::Args` group of [`Interest`]'s own flags.
-/// The [`Debounce`] posture is skipped there: [`Debounce::Custom`] carries a whole
-/// [`DebounceConfig`], which one flag cannot name (see [`Debounce`]).
+/// With the `clap` feature it is a `clap::Args` group of [`Interest`]'s own flags plus
+/// a repeatable `--prune` and `--include`, once per pattern; `--include` given no times
+/// at all is [`None`] (deliver every file), which is what makes the seat's ABSENCE
+/// expressible from a command line. The [`Debounce`] posture is skipped there:
+/// [`Debounce::Custom`] carries a whole [`DebounceConfig`], which one flag cannot name
+/// (see [`Debounce`]).
 ///
 /// ```text
-/// $ app --moved=false --removed=false
+/// $ app --moved=false --removed=false --prune '**/node_modules' --include '**/*.mp4'
 /// ```
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(default, bound = ""))]
@@ -527,6 +676,10 @@ pub struct WatchOptions<C> {
   filter: Filter<C>,
   #[cfg_attr(feature = "clap", arg(skip))]
   debounce: Debounce,
+  #[cfg_attr(feature = "clap", arg(long))]
+  prune: Vec<Glob>,
+  #[cfg_attr(feature = "clap", arg(long))]
+  include: Option<Vec<Glob>>,
 }
 
 impl<C> WatchOptions<C> {
@@ -546,6 +699,8 @@ impl<C> WatchOptions<C> {
       interest: Self::DEFAULT_INTEREST,
       filter: Filter::all(),
       debounce: Self::DEFAULT_DEBOUNCE,
+      prune: Vec::new(),
+      include: None,
     }
   }
 
@@ -618,12 +773,100 @@ impl<C> WatchOptions<C> {
     self
   }
 
-  /// Consumes these options, yielding the parts the driver commits: the fan-out
-  /// interest (recorded in the subsumer's plan), the admission filter, and the debounce
-  /// posture (the latter two registered adjacently at commit).
+  /// The subtrees a root armed for this subscription never descends into — the
+  /// [`prune`](RootGlobs::prune) half of the per-root words handed to
+  /// [`Source::arm`](crate::Source::arm). Empty (the default) prunes nothing.
+  ///
+  /// Unlike the [`interest`](Self::interest) gate and the
+  /// [`filter`](Self::filter), this is NOT a delivery narrowing the umbrella
+  /// applies on top of a full watch: it re-scopes the underlying watch itself,
+  /// so a pruned subtree is never even covered. See [`RootGlobs`].
   #[inline]
-  pub(crate) fn into_parts(self) -> (Interest, Filter<C>, Debounce) {
-    (self.interest, self.filter, self.debounce)
+  pub fn prune(&self) -> &[Glob] {
+    self.prune.as_slice()
+  }
+
+  /// Returns these options with the pruned subtrees set.
+  #[inline]
+  #[must_use]
+  pub fn with_prune(mut self, prune: impl IntoIterator<Item = Glob>) -> Self {
+    self.prune = prune.into_iter().collect();
+    self
+  }
+
+  /// Sets the pruned subtrees.
+  #[inline]
+  pub fn set_prune(&mut self, prune: impl IntoIterator<Item = Glob>) -> &mut Self {
+    self.prune = prune.into_iter().collect();
+    self
+  }
+
+  /// The file patterns delivery is narrowed to, or [`None`] — the default — for
+  /// every file: the [`include`](RootGlobs::include) half of the per-root words
+  /// handed to [`Source::arm`](crate::Source::arm). An EMPTY list is not the
+  /// same thing but a seat admitting no file at all (see [`RootGlobs`] for what
+  /// the seat always admits regardless).
+  #[inline]
+  pub fn include(&self) -> Option<&[Glob]> {
+    self.include.as_deref()
+  }
+
+  /// Returns these options with delivery narrowed to the given file patterns.
+  #[inline]
+  #[must_use]
+  pub fn with_include(mut self, include: impl IntoIterator<Item = Glob>) -> Self {
+    self.include = Some(include.into_iter().collect());
+    self
+  }
+
+  /// Sets the file patterns delivery is narrowed to.
+  #[inline]
+  pub fn set_include(&mut self, include: impl IntoIterator<Item = Glob>) -> &mut Self {
+    self.include = Some(include.into_iter().collect());
+    self
+  }
+
+  /// Returns these options delivering every file again — the [`None`] seat.
+  #[inline]
+  #[must_use]
+  pub fn without_include(mut self) -> Self {
+    self.include = None;
+    self
+  }
+
+  /// Clears the include seat, delivering every file again.
+  #[inline]
+  pub fn clear_include(&mut self) -> &mut Self {
+    self.include = None;
+    self
+  }
+
+  /// The two glob seats as the [`RootGlobs`] a [`Source`](crate::Source) is
+  /// armed with — the same words the driver takes at commit, read here without
+  /// consuming the options.
+  #[inline]
+  pub fn root_globs(&self) -> RootGlobs {
+    RootGlobs {
+      prune: self.prune.clone(),
+      include: self.include.clone(),
+    }
+  }
+
+  /// Consumes these options, yielding the parts the driver commits: the fan-out
+  /// interest (recorded in the subsumer's plan), the admission filter, the debounce
+  /// posture (the latter two registered adjacently at commit), and the per-root
+  /// [`RootGlobs`] the arm carries down to the source.
+  #[inline]
+  pub(crate) fn into_parts(self) -> (Interest, Filter<C>, Debounce, RootGlobs) {
+    (
+      self.interest,
+      self.filter,
+      self.debounce,
+      RootGlobs {
+        prune: self.prune,
+        include: self.include,
+      },
+    )
   }
 }
 
@@ -646,6 +889,8 @@ impl<C> Clone for WatchOptions<C> {
       interest: self.interest,
       filter: self.filter.clone(),
       debounce: self.debounce,
+      prune: self.prune.clone(),
+      include: self.include.clone(),
     }
   }
 }
@@ -658,6 +903,8 @@ impl<C> core::fmt::Debug for WatchOptions<C> {
       .field("interest", &self.interest)
       .field("filter", &self.filter)
       .field("debounce", &self.debounce)
+      .field("prune", &self.prune)
+      .field("include", &self.include)
       .finish()
   }
 }

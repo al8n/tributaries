@@ -68,6 +68,38 @@ All notable changes to this workspace are documented here. The format is based o
     `clap::Command` beside `TributariesOptions`'s `--event-capacity`. The `serde` key
     is unchanged.
 
+- **`tributaries`** — the two glob seats reach the umbrella, so a subscription carries
+  them and every source is armed with them.
+
+  - `WatchOptions::prune` / `WatchOptions::include`, with `with_prune`/`set_prune`,
+    `with_include`/`set_include`/`without_include`/`clear_include` and getters. They
+    are the one pair of knobs on that household that re-scopes the WATCH rather than
+    narrowing this subscription's delivery: `prune` subtracts coverage, so a pruned
+    subtree is never entered at all, while `interest`, the `Filter` and the `Debounce`
+    posture stay per-subscription gates over a root armed at the source's widest
+    policy. Both faces carry them (serde: lists of plain strings, an invalid pattern
+    being a document error; clap: repeatable `--prune` / `--include`, an absent
+    `--include` being the absent seat), and neither constrains `C`.
+  - `RootGlobs` — the per-root words a source receives, `WatchOptions::root_globs`
+    extracts them, and a root remembers the ones it was ARMED with, so a widen's
+    restore re-arms a survivor under its own words rather than the newcomer's.
+  - `Event::is_dir()`: the affected object's class where the source proved it, `None`
+    where nothing did. A move's two projections carry it (both endpoints are one
+    object); a synthesized delivery reports `None`. `SourceEvent` carries it too, stated
+    by the new `SourceEvent::with_is_dir` and read by `SourceEvent::is_dir`;
+    `tributary_fs::Event::is_dir()` is the fs layer's own accessor behind it.
+
+### Changed
+
+- **`tributaries`** — **BREAKING for a custom `Source`**: `Source::arm` and
+  `LocalSource::arm` take the per-root `&RootGlobs` as a third argument
+  (`arm(&mut self, key: &[C], globs: &RootGlobs)`). An out-of-tree source must accept
+  the parameter and either honour both seats or document in its own docs that it cannot
+  — nothing above the seam re-checks them, so a source that ignores one silently
+  watches or delivers what the caller asked it not to. `RootGlobs::new()` (both seats
+  unengaged) asks for exactly the behaviour every source had before the seats existed.
+  Every other seam item is unchanged, including canonical-key adoption.
+
 ## [0.1.0]
 
 ### Added

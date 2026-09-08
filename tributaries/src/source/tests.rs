@@ -1,4 +1,5 @@
 use super::Source;
+use crate::options::RootGlobs;
 
 /// Compile-time proof that the **two** async [`Source`] futures — [`arm`](Source::arm) and the event
 /// pump [`next`](Source::next) — are `Send`, so the owner (which drives them inline in one `select!`
@@ -9,9 +10,14 @@ use super::Source;
 /// guarantee, so this holds for every implementor (including an out-of-tree custom source), not just
 /// [`FsSource`].
 #[allow(dead_code)]
-fn assert_source_futures_send<C, S: Source<C>>(s: &mut S, key: &[C], handle: S::Handle) {
+fn assert_source_futures_send<C, S: Source<C>>(
+  s: &mut S,
+  key: &[C],
+  globs: &RootGlobs,
+  handle: S::Handle,
+) {
   fn needs_send<F: Send>(_: F) {}
-  needs_send(s.arm(key));
+  needs_send(s.arm(key, globs));
   needs_send(s.next());
   // `disarm` is synchronous — no future to prove `Send`; the call keeps `handle` exercised.
   s.disarm(handle);
@@ -45,6 +51,7 @@ fn blanket_local_source_forwards_every_item() {
     fn arm(
       &mut self,
       key: &[u8],
+      _globs: &RootGlobs,
     ) -> impl Future<Output = Result<Armed<u8, u8>, WatchError>> + Send {
       self.calls.push("arm");
       let canonical = key.to_vec();
@@ -87,7 +94,7 @@ fn blanket_local_source_forwards_every_item() {
     LocalSource::canonicalize_key(&probe, &[1u8]).expect("canonicalize_key forwards"),
     vec![1u8],
   );
-  let armed = LocalSource::arm(&mut probe, &[1u8])
+  let armed = LocalSource::arm(&mut probe, &[1u8], &RootGlobs::new())
     .now_or_never()
     .expect("the forwarded arm future is ready")
     .expect("arm forwards");

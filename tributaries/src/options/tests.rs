@@ -1,13 +1,25 @@
 use std::ffi::OsString;
 
-use super::{Debounce, DebounceConfig, WatchOptions};
+use super::{Debounce, DebounceConfig, RootGlobs, WatchOptions};
 use crate::{
   event::EventKind,
   filter::{Filter, FilterInput},
   interest::Interest,
 };
 
-use tributary_proto::Location;
+use tributary_proto::{Location, glob::Glob};
+
+/// One validated pattern — the vocabulary is `tributary-proto`'s, so a cell here only
+/// has to be able to name one.
+fn glob(pattern: &str) -> Glob {
+  pattern.parse().expect("a valid pattern compiles")
+}
+
+/// The patterns a seat carries, as their source text — what a cell can compare against a
+/// literal list.
+fn texts(patterns: &[Glob]) -> Vec<&str> {
+  patterns.iter().map(Glob::as_str).collect()
+}
 
 #[test]
 fn debounce_default_is_inherit() {
@@ -49,6 +61,104 @@ fn watch_options_new_is_the_deliver_everything_default() {
   let defaulted: WatchOptions<OsString> = WatchOptions::default();
   assert_eq!(defaulted.interest(), options.interest());
   assert_eq!(defaulted.debounce(), options.debounce());
+
+  // Both glob seats start unengaged, which is what asks a source for exactly the
+  // coverage and delivery it had before the seats existed.
+  assert!(options.prune().is_empty(), "nothing pruned");
+  assert!(
+    options.include().is_none(),
+    "the ABSENT seat, not an empty list"
+  );
+  assert_eq!(options.root_globs(), RootGlobs::new());
+  assert!(options.root_globs().is_unengaged());
+}
+
+/// The unengaged [`RootGlobs`] is the words every source had before the seats existed,
+/// and each seat is set, replaced and cleared independently of the other.
+#[test]
+fn root_globs_default_is_unengaged_and_each_seat_moves_alone() {
+  let unengaged = RootGlobs::new();
+  assert_eq!(unengaged, RootGlobs::default());
+  assert!(unengaged.is_unengaged());
+  assert!(unengaged.prune().is_empty());
+  assert!(unengaged.include().is_none());
+
+  let pruned = RootGlobs::new().with_prune([glob("**/node_modules"), glob("**/.git")]);
+  assert_eq!(texts(pruned.prune()), ["**/node_modules", "**/.git"]);
+  assert!(pruned.include().is_none(), "the other seat is untouched");
+  assert!(!pruned.is_unengaged());
+
+  let narrowed = pruned.clone().with_include([glob("**/*.mp4")]);
+  assert_eq!(texts(narrowed.prune()), ["**/node_modules", "**/.git"]);
+  assert_eq!(
+    narrowed.include().map(texts),
+    Some(std::vec!["**/*.mp4"]),
+    "the include seat is engaged"
+  );
+
+  // An EMPTY include list is the engaged seat admitting no file — not the absent one.
+  let none_admitted = RootGlobs::new().with_include([]);
+  assert_eq!(none_admitted.include(), Some(&[][..]));
+  assert!(!none_admitted.is_unengaged());
+  assert!(
+    none_admitted.clone().without_include().include().is_none(),
+    "clearing gives the ABSENT seat back"
+  );
+
+  let mut mutated = RootGlobs::new();
+  mutated
+    .set_prune([glob("**/target")])
+    .set_include([glob("**/*.mov")]);
+  assert_eq!(texts(mutated.prune()), ["**/target"]);
+  assert_eq!(mutated.include().map(texts), Some(std::vec!["**/*.mov"]));
+  mutated.clear_include();
+  assert!(mutated.include().is_none());
+  assert_eq!(texts(mutated.prune()), ["**/target"], "prune is untouched");
+}
+
+/// The two seats round-trip through both builder forms, and
+/// [`root_globs`](WatchOptions::root_globs) extracts exactly what they hold — the words
+/// the driver hands `Source::arm`.
+#[test]
+fn watch_options_glob_seats_round_trip() {
+  let mut options: WatchOptions<OsString> = WatchOptions::new()
+    .with_prune([glob("**/node_modules"), glob("**/.git")])
+    .with_include([glob("**/*.{mp4,mov}")]);
+  assert_eq!(texts(options.prune()), ["**/node_modules", "**/.git"]);
+  assert_eq!(
+    options.include().map(texts),
+    Some(std::vec!["**/*.{mp4,mov}"])
+  );
+  assert_eq!(
+    options.root_globs(),
+    RootGlobs::new()
+      .with_prune([glob("**/node_modules"), glob("**/.git")])
+      .with_include([glob("**/*.{mp4,mov}")]),
+    "the extracted words are the seats verbatim"
+  );
+
+  // A clone carries them, like every other knob (the filter slot aside).
+  let cloned = options.clone();
+  assert_eq!(texts(cloned.prune()), texts(options.prune()));
+  assert_eq!(cloned.include().map(texts), options.include().map(texts));
+
+  options.set_prune([glob("**/Caches")]).set_include([]);
+  assert_eq!(texts(options.prune()), ["**/Caches"]);
+  assert_eq!(
+    options.include(),
+    Some(&[][..]),
+    "an empty list is the engaged seat"
+  );
+
+  options.clear_include();
+  assert!(options.include().is_none());
+  let widened = options.clone().without_include();
+  assert!(widened.include().is_none());
+  assert_eq!(
+    texts(widened.prune()),
+    ["**/Caches"],
+    "clearing one seat leaves the other"
+  );
 }
 
 #[test]
@@ -96,7 +206,10 @@ fn watch_options_clone_shares_the_filter_slot() {
 mod serde_face {
   use core::{num::NonZeroUsize, time::Duration};
 
-  use super::super::{Debounce, DebounceConfig, TributariesOptions, WatchOptions};
+  use super::{
+    super::{Debounce, DebounceConfig, TributariesOptions, WatchOptions},
+    glob, texts,
+  };
   use crate::{
     event::EventKind,
     filter::{Filter, FilterInput},
@@ -257,15 +370,71 @@ mod serde_face {
     );
   }
 
+  /// The two glob seats are lists of plain strings, both ways.
+  #[test]
+  fn the_glob_seats_are_lists_of_plain_strings() {
+    let options: WatchOptions<OsString> = WatchOptions::new()
+      .with_prune([glob("**/node_modules"), glob("**/.git")])
+      .with_include([glob("**/*.mp4")]);
+    let json = serde_json::to_value(&options).unwrap();
+    assert_eq!(
+      json["prune"],
+      serde_json::json!(["**/node_modules", "**/.git"])
+    );
+    assert_eq!(json["include"], serde_json::json!(["**/*.mp4"]));
+
+    let parsed: WatchOptions<OsString> = serde_json::from_value(json).unwrap();
+    assert_eq!(texts(parsed.prune()), texts(options.prune()));
+    assert_eq!(parsed.include().map(texts), options.include().map(texts));
+  }
+
+  /// A document naming NEITHER seat leaves both at the default — the absent `include` is
+  /// the ABSENT seat (every file), which is what an empty list is not.
+  #[test]
+  fn a_document_naming_neither_seat_leaves_both_defaulted() {
+    let parsed: WatchOptions<OsString> = serde_json::from_str(r#"{"debounce": "off"}"#).unwrap();
+    assert!(parsed.debounce().is_off(), "the key it DID name landed");
+    assert!(parsed.prune().is_empty());
+    assert!(parsed.include().is_none());
+
+    let engaged: WatchOptions<OsString> = serde_json::from_str(r#"{"include": []}"#).unwrap();
+    assert_eq!(
+      engaged.include(),
+      Some(&[][..]),
+      "an empty list is the engaged seat, not the absent one"
+    );
+  }
+
+  /// An uncompilable pattern is refused by the DOCUMENT, so a seat never carries a value
+  /// that would silently match nothing at every later delivery.
+  #[test]
+  fn an_invalid_pattern_is_a_document_error() {
+    for document in [
+      r#"{"prune": ["[unclosed"]}"#,
+      r#"{"include": ["[unclosed"]}"#,
+    ] {
+      let err = serde_json::from_str::<WatchOptions<OsString>>(document).unwrap_err();
+      assert!(
+        err.to_string().contains("invalid glob"),
+        "{document}: {err}"
+      );
+    }
+  }
+
   /// Neither face constrains `C`: the only field mentioning it is skipped.
   #[test]
   fn neither_face_constrains_the_component_parameter() {
     struct NotSerde;
 
-    let options: WatchOptions<NotSerde> = WatchOptions::new().with_interest(Interest::none());
+    let options: WatchOptions<NotSerde> = WatchOptions::new()
+      .with_interest(Interest::none())
+      .with_prune([glob("**/node_modules")])
+      .with_include([glob("**/*.mp4")]);
     let json = serde_json::to_string(&options).unwrap();
     let parsed: WatchOptions<NotSerde> = serde_json::from_str(&json).unwrap();
     assert!(parsed.interest().is_none());
+    assert_eq!(texts(parsed.prune()), ["**/node_modules"]);
+    assert_eq!(parsed.include().map(texts), Some(std::vec!["**/*.mp4"]));
   }
 }
 
@@ -274,7 +443,10 @@ mod serde_face {
 mod clap_face {
   use core::{num::NonZeroUsize, time::Duration};
 
-  use super::super::{DebounceConfig, TributariesOptions, WatchOptions};
+  use super::{
+    super::{DebounceConfig, TributariesOptions, WatchOptions},
+    texts,
+  };
   use crate::{
     event::EventKind,
     filter::{Filter, FilterInput},
@@ -407,6 +579,32 @@ mod clap_face {
         "{flags:?}"
       );
     }
+  }
+
+  /// `--prune` and `--include` repeat, once per pattern; an `--include` given no times
+  /// at all is the ABSENT seat, which is what makes a seat's absence expressible from a
+  /// command line.
+  #[test]
+  fn the_glob_flags_repeat_and_an_absent_include_is_the_absent_seat() {
+    let options =
+      WatchCli::parse_from(args(&["--prune", "**/node_modules", "--prune", "**/.git"])).options;
+    assert_eq!(texts(options.prune()), ["**/node_modules", "**/.git"]);
+    assert!(options.include().is_none(), "no `--include` is no seat");
+
+    let options = WatchCli::parse_from(args(&["--include", "**/*.mp4"])).options;
+    assert_eq!(options.include().map(texts), Some(std::vec!["**/*.mp4"]));
+    assert!(options.prune().is_empty());
+
+    let bare = WatchCli::parse_from(args(&[])).options;
+    assert!(bare.prune().is_empty());
+    assert!(bare.include().is_none());
+
+    // An uncompilable pattern is refused at the FLAG, by kind — this crate takes clap
+    // with `default-features = false`, so the rendering carries no source context.
+    let err = WatchCli::try_parse_from(args(&["--prune", "[unclosed"]))
+      .err()
+      .expect("an uncompilable pattern is refused at the flag");
+    assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
   }
 
   /// The subscription's flags are the interest's own; the filter is skipped and comes
