@@ -744,7 +744,26 @@ async fn dropped_replacement_still_displaces_the_predecessor_lane() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lane_churn_leaves_no_tracked_residue() {
   let (w, mut feed) = rig(1024);
-  let (demux, _rest) = Demux::spawn(w.clone(), 16);
+  let (demux, rest) = Demux::spawn(w.clone(), 16);
+  // The default lane is DROPPED, not held: this cell is about the lane table's
+  // residue, and nothing here ever reads what falls outside it.
+  //
+  // Holding it undrained is a wedge, not a convenience. Every churn cycle below
+  // ends its subscription, and the terminal `Rescan` that ends it can reach the
+  // router AFTER the lane it belonged to is dropped — whenever the router lags the
+  // loop, which is what an instrumented or contended build produces. Each of those
+  // is then unclaimed, `deliver` AWAITS the default lane, and thirty-two cycles
+  // overrun a sixteen-deep buffer nobody is draining: the routing task parks inside
+  // that send and every later lane goes silent, so the NEXT iteration's `recv`
+  // waits out its whole deadline while the rest of the suite finishes around it.
+  // That is how this cell went red on the asan-lsan lane, and no deadline can fix
+  // it — the router is stopped, not slow.
+  //
+  // Dropped, the router's first unclaimed send fails and it discards every later
+  // one (`rest = None` in the routing loop), which is precisely this cell's intent.
+  // `an_undrained_default_lane_parks_routing_until_it_is_dropped` holds both halves
+  // of that.
+  drop(rest);
 
   for i in 0..32 {
     let path = format!("/churn{i}");
@@ -769,6 +788,63 @@ async fn lane_churn_leaves_no_tracked_residue() {
     "32 churn cycles left zero residue — only the live probe lane is tracked \
      (bounded by concurrent lanes, not lifetime registrations)"
   );
+}
+
+/// The default lane is a BOUNDED lane like any other, and `deliver` AWAITS it — so
+/// a caller that holds it without draining it parks the routing task once it
+/// overruns, and every lane goes silent behind that park.
+///
+/// This is the property `lane_churn_leaves_no_tracked_residue` had to be written
+/// against, and the reason it drops its own default lane rather than binding it to
+/// `_rest`. A churn loop retires subscriptions, the terminal `Rescan` that retires
+/// one can reach the router after its lane is gone, and enough of those overrun any
+/// fixed buffer nobody reads — after which the next `recv` on a LIVE lane waits out
+/// its whole deadline. No budget answers that: the router is stopped, not slow.
+///
+/// Both directions, one staging: the negative leg's window IS its observation
+/// ([`STARVED`]), and the positive leg asserts the delivery the same staging
+/// produces once the default lane is dropped.
+#[tokio::test]
+async fn an_undrained_default_lane_parks_routing_until_it_is_dropped() {
+  for hold_rest in [true, false] {
+    let (w, mut feed) = rig(1024);
+    // Two deep, so a handful of unclaimed events overruns it.
+    let (demux, rest) = Demux::spawn(w.clone(), 2);
+    if !hold_rest {
+      drop(rest);
+    }
+
+    // A retired lane, so everything its subscription emits afterwards is unclaimed
+    // and takes the default lane.
+    let stale = watch(&w, "/stale").await;
+    drop(demux.lane(stale, 1).await);
+    for i in 0..8 {
+      feed.modified("/stale", &format!("/stale/f{i}")).await;
+    }
+
+    // A LIVE lane behind the park.
+    let sub = watch(&w, "/live").await;
+    let lane = demux.lane(sub, 4).await;
+    feed.modified("/live", "/live/touch").await;
+    let delivered = tokio::time::timeout(STARVED, lane.recv()).await;
+
+    if hold_rest {
+      assert!(
+        delivered.is_err(),
+        "an undrained default lane parked routing: the live lane is silent behind it"
+      );
+    } else {
+      let event = delivered
+        .expect("routing is not parked once the default lane is gone")
+        .expect("the stream is still open");
+      assert_eq!(
+        event.subscription(),
+        sub,
+        "dropping the default lane makes the router DISCARD the unclaimed events \
+         instead of parking on them, and every later lane keeps flowing"
+      );
+    }
+  }
 }
 
 /// Closing the watcher through the caller's clone ends the shared stream: the routing
