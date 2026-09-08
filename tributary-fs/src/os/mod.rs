@@ -649,8 +649,41 @@ pub(crate) enum ScopePort {
   /// A live inotify reader's control port.
   #[cfg(all(target_os = "linux", not(miri)))]
   Inotify(linux::ControlPort),
-  /// No arm traffic is possible (kernel-recursive source, or a fake).
+  /// A live fanotify reader's recovery port. The kernel-recursive source carries
+  /// no ARM traffic, but it does carry the one request the coarse mount-change
+  /// cover needs of it: rebuild the FID map over the whole root (#74).
+  #[cfg(all(target_os = "linux", not(miri)))]
+  Fanotify(linux::RecoveryPort),
+  /// No control traffic is possible (a source with nothing to arm and no map to
+  /// reseed, or a fake).
   Inert,
+}
+
+/// Whether one whole-root recovery restored the source's sight (#74).
+///
+/// Two answers, because there are only two things the core can do with one. A
+/// rebuilt map is sight, and the cover the recovery was requested for follows it.
+/// A root the walk could not reach at all is a root DEATH — the same verdict a
+/// refresh's own liveness gate reaches, funnelled the same way — and no cover is
+/// owed for a tree that is gone.
+///
+/// A walk that failed for any other reason answers
+/// [`Unreachable`](Self::Unreachable) too, and deliberately: a fanotify source
+/// whose map could not be rebuilt is BLIND under the revealed ground, and a blind
+/// source that keeps running is the silent-loss shape this stack exists to
+/// refuse. The producer already retries once before conceding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RootRecovery {
+  /// The whole-root seed walk completed and the source's map was rebuilt from it.
+  Reseeded,
+  /// The walk could not reach the root, or could not complete: the source has no
+  /// trustworthy sight of the tree, and the scope takes the root-death path.
+  ///
+  /// Only the fanotify producer can answer it — every other backend has no map to
+  /// rebuild and answers [`Reseeded`](Self::Reseeded) unconditionally — so an
+  /// off-Linux library build constructs it nowhere.
+  #[cfg_attr(not(any(all(target_os = "linux", not(miri)), test)), allow(dead_code))]
+  Unreachable,
 }
 
 /// The ONE seam payload every source reports: each backend wraps its own

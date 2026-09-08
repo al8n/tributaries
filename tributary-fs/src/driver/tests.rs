@@ -819,6 +819,57 @@ async fn refresh_finding_root_gone_dies_end_to_end() {
   );
 }
 
+/// A mount change under a FANOTIFY root reaches the source through the effect
+/// path, on the blocking pool, and its answer decides what the consumer hears
+/// (#74).
+///
+/// The fanotify source's sight is a FID map seeded by a walk that stops at every
+/// mount boundary, so ground a departed mount revealed is ground the map has
+/// never seen. The core therefore raises `Effect::RecoverRoot` rather than
+/// covering directly, and the driver executes it exactly as it executes the
+/// refresh that raised it — end to end, this is the observable that the walk was
+/// requested at all.
+///
+/// The UNREACHABLE answer is the verdict this cell drives, because it is the one
+/// with a terminal the driver can be watched to reach: a source whose map cannot
+/// be rebuilt has no trustworthy sight of the root, so the scope takes the same
+/// death lifecycle a refresh's own liveness gate takes and the registry entry is
+/// reclaimed.
+#[tokio::test(start_paused = true)]
+async fn a_mount_change_under_a_fanotify_root_walks_it_and_an_unreachable_walk_dies() {
+  let registry = RecordingRegistry::default();
+  let rig = rig_with(64, registry.clone());
+  rig.fs.spawn_backend(BackendKind::Fanotify);
+  // The mount is there at the spawn seed AND at the birth refresh, so the birth
+  // refresh installs it as the baseline rather than staging a departure.
+  rig.fs.seed_mounts(vec![bare_mount("/r/vol")]);
+  rig.fs.answer_refresh(vec![bare_mount("/r/vol")], true);
+  let scope = watch(&rig, "/r").await;
+  assert!(
+    rig.fs.recovery_requests().is_empty(),
+    "a table that has not moved asks for no walk"
+  );
+
+  // `umount -l /r/vol`, and the walk that follows cannot reach the root.
+  rig
+    .fs
+    .answer_root_recovery(crate::os::RootRecovery::Unreachable);
+  rig.fs.answer_refresh(Vec::new(), true);
+  rig.fs.send_lossy("/r");
+
+  settle(|| registry.dead() == [scope]).await;
+  assert_eq!(
+    rig.fs.recovery_requests(),
+    [scope],
+    "the departure asked for exactly one whole-root walk"
+  );
+  assert_eq!(
+    registry.dead(),
+    [scope],
+    "a root the walk cannot reach takes the death path"
+  );
+}
+
 /// The refresh samples the root's identity AND its mount frame from ONE object, so
 /// a replaced/re-mounted root can never pair the OLD identity's verdict with a NEW
 /// object's frame (the mixed sample the atomic `statx` restructure closes). The fake

@@ -76,10 +76,75 @@ pub(crate) struct ReaderShared {
   pub(crate) stats: std::sync::Arc<BackendStatsShared>,
 }
 
-/// One control request. fanotify has no arm traffic, so shutdown is the only
-/// message.
+/// One control request. fanotify has no arm traffic; the two messages are the
+/// teardown and the whole-root reseed the core asks for when the mount table
+/// under the root changed (#74).
 pub(crate) enum Control {
   Shutdown,
+  /// Rebuild the FID map over the WHOLE root and answer on `reply`.
+  ///
+  /// Served on the reader thread because the map lives there and nowhere else,
+  /// and served BETWEEN reads so a walk never runs concurrently with a decode of
+  /// the same map. The requester blocks on `reply` on the driver's blocking pool
+  /// — never on its task — so a long walk costs a pool thread and nothing else;
+  /// a reader that exits without answering DROPS the sender, which the requester
+  /// reads as the failure it is rather than waiting forever.
+  Reseed {
+    reply: mpsc::SyncSender<crate::os::RootRecovery>,
+  },
+}
+
+/// Drains every pending control message, SERVICING each reseed inline, and
+/// answers whether a shutdown was among them.
+///
+/// One drain rather than one `try_recv`, because a `Reseed` sitting in front of a
+/// `Shutdown` would otherwise be taken off the queue and discarded by a
+/// shutdown-only match — leaving the requester blocked until the reader's exit
+/// dropped the channel. Every message is looked at; teardown still wins, because
+/// the answer only says whether one was seen.
+fn service_control(
+  control: &mpsc::Receiver<Control>,
+  map: &mut FidMap,
+  reseed: &ReseedContext,
+  stats: &BackendStatsShared,
+) -> bool {
+  let mut shutdown = false;
+  while let Ok(message) = control.try_recv() {
+    match message {
+      Control::Shutdown => shutdown = true,
+      Control::Reseed { reply } => {
+        // A refused send is a requester that gave up (its pool thread went away
+        // with the scope); the map is rebuilt either way, which is the half that
+        // matters to the stream.
+        let _ = reply.send(run_root_recovery(map, reseed, stats));
+      }
+    }
+  }
+  shutdown
+}
+
+/// Rebuilds the map over the whole root for one [`Control::Reseed`], on the same
+/// retry-then-concede policy a post-loss reseed uses.
+///
+/// It does NOT signal a fatal on failure, and that is the one difference. A
+/// loss-driven reseed that goes blind has no other reporting path, so it
+/// escalates itself; this one is a REQUEST with a reply, and the core is owed the
+/// verdict — it turns an unreachable root into the same death lifecycle a
+/// refresh's liveness gate does. Escalating here as well would race two terminals
+/// for one fact.
+fn run_root_recovery(
+  map: &mut FidMap,
+  reseed: &ReseedContext,
+  stats: &BackendStatsShared,
+) -> crate::os::RootRecovery {
+  stats.record_reseed();
+  let started = std::time::Instant::now();
+  let outcome = reseed_map(map, || reseed.walk());
+  stats.record_walk(walk_micros(started));
+  match outcome {
+    ReseedOutcome::Reseeded => crate::os::RootRecovery::Reseeded,
+    ReseedOutcome::Blind => crate::os::RootRecovery::Unreachable,
+  }
 }
 
 /// Starts the reader thread. The fd, the wake eventfd, the seeded `FidMap`, and
@@ -142,7 +207,7 @@ fn run(
     // (the lost-wakeup guard — see `WakeState`; a shutdown enqueued before the
     // fence is visible here).
     wake.arm_park();
-    if matches!(control.try_recv(), Ok(Control::Shutdown)) {
+    if service_control(control, map, reseed, &shared.stats) {
       return;
     }
     let event = wake.event_fd();
@@ -168,7 +233,7 @@ fn run(
 
     if event_ready {
       wake.drain();
-      if matches!(control.try_recv(), Ok(Control::Shutdown)) {
+      if service_control(control, map, reseed, &shared.stats) {
         return;
       }
     }
@@ -203,8 +268,9 @@ enum DrainExit {
 /// the top of the loop, before the next read/decode, so a reseed or subtree walk
 /// from the PREVIOUS buffer has fully completed before it runs: a shutdown that
 /// lands mid-reseed quiesces cleanly at the next read boundary rather than
-/// interrupting the walk. fanotify has no arm traffic, so shutdown is the only
-/// control message. Returns [`DrainExit::Died`] when the stream died (fatal
+/// interrupting the walk. A requested whole-root reseed ([`Control::Reseed`]) is
+/// served at that same boundary and for the same reason — the walk and a decode
+/// of the map never overlap. Returns [`DrainExit::Died`] when the stream died (fatal
 /// already signaled — a failed read, a foreign event-metadata ABI version, or a
 /// recovery that could not restore sight), [`DrainExit::Shutdown`] on a
 /// mid-drain shutdown, and [`DrainExit::Parked`] when the instance drained
@@ -218,7 +284,7 @@ fn drain_events(
   shared: &ReaderShared,
 ) -> DrainExit {
   loop {
-    if matches!(control.try_recv(), Ok(Control::Shutdown)) {
+    if service_control(control, map, reseed, &shared.stats) {
       return DrainExit::Shutdown;
     }
     let n = match rustix::io::read(fd, &mut *buf) {

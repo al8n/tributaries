@@ -79,12 +79,73 @@
 //! | RDCW (Windows) | any terminal read completion → fatal source error → self-event | same signal; RDCW draws no in-band distinction from unmount |
 //! | USN journal (Windows) | a failed journal read → fatal source error → self-event | the root's own FRN named in a delete/rename record → `RootDeath` |
 //!
-//! Only fanotify's unmount emits nothing in-band, so only fanotify arms the
-//! tick (gated by [`liveness_ticked`](DriverCore::liveness_ticked)). Its in-tree
-//! self-events, and every other backend's death signal, already lower a
-//! terminal `Removed`/`Rescan` through the existing paths; the tick's role is
-//! solely to make the quiet unmount observable within a bounded latency — a
-//! loss-triggered refresh already catches it immediately when one occurs.
+//! Only fanotify's unmount emits nothing in-band, so only fanotify NEEDS the
+//! tick for the ROOT's own death. Its in-tree self-events, and every other
+//! backend's death signal, already lower a terminal `Removed`/`Rescan` through
+//! the existing paths; the tick's role there is solely to make the quiet unmount
+//! observable within a bounded latency — a loss-triggered refresh already catches
+//! it immediately when one occurs. The tick is ALSO the mount sampler below,
+//! which is why both Linux profiles arm it
+//! ([`liveness_ticked`](DriverCore::liveness_ticked)).
+//!
+//! # A mount change UNDER the root (#74)
+//!
+//! A mount that departs below a watched root emits no kernel signal, on any
+//! backend, because there is no such signal to emit: a lazy unmount (`umount -l`)
+//! detaches the tree and the per-directory watches inside it simply stop meaning
+//! anything — no `IN_UNMOUNT`, no `IN_IGNORED`, nothing. The mirror case is as
+//! silent and as consequential: a mount that ARRIVES hides ground this scope
+//! already enumerated and armed, and one that is REPLACED at an unchanged path
+//! does both at once. In every case the coverage the scope believes it holds
+//! stops describing the tree that is there.
+//!
+//! The only witness is the table itself, so the periodic sample is the mechanism
+//! and the rule over it is deliberately COARSE:
+//!
+//! > On ANY difference between two authoritative samples of the rows strictly
+//! > under the root, cover the WHOLE root once.
+//!
+//! The fingerprint is the sorted multiset of
+//! [`MountRow`](crate::os::MountRow)s — `(location, dev, mnt_id, parent_id,
+//! mnt_id_unique)` — and the cover fires when the rows differ, when the root's own
+//! incarnation moved (the frame-adoption legs above), or, on a kernel whose rows
+//! carry no never-recycled id, when the mount-namespace transition count moved
+//! since the last sample. That last clause is the conservative one: a legacy mount
+//! id is allocated lowest-free, so a departure and an arrival at one location
+//! inside a single interval can leave two samples comparing EQUAL, and a
+//! transition the host counted is the only fact left that can contradict them. It
+//! over-fires on unrelated namespace churn, and that is the accepted price of
+//! never being silent.
+//!
+//! What a cover IS depends only on how the profile SEES the tree.
+//! [`cover_whole_root`](DriverCore::cover_whole_root) is `on_overflow(Scope::Root)`
+//! on every profile but one — the Monitor re-enumerates and re-arms, the consumer
+//! gets one `Rescan` at the root. Fanotify is the exception, because its sight is
+//! a FID map seeded by a walk that stops at every mount boundary: ground a
+//! departed mount revealed was never walked, so the map holds no handle there and
+//! events under it decode as outside-root. That scope reseeds FIRST
+//! ([`Effect::RecoverRoot`], one walk in flight per scope, epoch-stamped so a
+//! reply from a world that ended is dropped) and covers on the reseed's
+//! completion — telling the consumer to re-read a subtree the source is still
+//! blind to would buy it one listing and then permanent silence.
+//!
+//! # Why it is coarse
+//!
+//! There is no census of the boundaries under a root and no ledger keyed on them.
+//! A located cover — "the mount at `sub/vol` went away" — needs both: a record of
+//! every boundary the crawl declined at, kept correct across renames of the
+//! directories above it, bounded against a namespace that can hold thousands of
+//! rows, and reconciled with every arrival that lands between two samples. All of
+//! that machinery exists to compute a LOCATION, and a `Rescan` is a coverage
+//! statement rather than a delivery: the consumer answers a located one by
+//! re-reading that subtree and answers this one by re-reading the root, which it
+//! was going to do anyway for anything that moved near the top.
+//!
+//! So the proof is one paragraph, and it is the reason for the shape. Every mount
+//! transition under the root changes the table. Every table change fires the
+//! cover. There is no third case to reason about, no state to keep consistent,
+//! and nothing that can drift out of agreement with the kernel — the price being
+//! one whole-root re-read per interval in which the table moved.
 
 use std::{
   collections::{BTreeMap, BTreeSet, VecDeque},
@@ -104,8 +165,8 @@ use tributary_proto::{
 use crate::{
   error::WatchRootError,
   os::{
-    BackendKind, BatchPayload, FsEventFlags, RawOsEvent, RootIdentity, RootMeta, ScopeFrame,
-    SourceError, SourceEvent,
+    BackendKind, BatchPayload, FsEventFlags, RawOsEvent, RootIdentity, RootMeta, RootRecovery,
+    ScopeFrame, SourceError, SourceEvent,
     linux::{RawLinuxEvent, WatchOutcome},
     transport::BudgetPermit,
     windows::RawWindowsEvent,
@@ -206,6 +267,18 @@ pub(crate) struct MountRefresh {
   /// leaves the scope's last PROVEN token standing — the frame then moves on the
   /// mount-id comparison alone, exactly as it did before this existed.
   pub(crate) root_incarnation: Option<crate::os::RootIncarnation>,
+  /// The mount-namespace TRANSITION COUNT this refresh observed, where the host
+  /// keeps one (`ns->event`, read through the same held fd the table came from);
+  /// `None` off Linux and on every fake.
+  ///
+  /// [`root_incarnation`](Self::root_incarnation) already carries this number on
+  /// a host with no unique mount id, but it carries it INSTEAD of the unique id,
+  /// and the coarse cover needs both at once: on a kernel that answers unique ids
+  /// the root's token is `Unique`, and the transition count is then the only
+  /// thing left that can speak for a sample whose rows carry no unique id of
+  /// their own (an empty table, or a per-row `statx` that failed). Kept as its
+  /// own field rather than derived, so the rule reads what it means.
+  pub(crate) namespace_transitions: Option<u64>,
 }
 
 /// Why one mount refresh is being armed.
@@ -346,6 +419,32 @@ pub(crate) enum Effect {
     scope: ScopeId,
     /// The canonical root to enumerate mounts under.
     root: Arc<PathBuf>,
+  },
+  /// Re-seed a kernel-recursive fanotify scope's FID map over the WHOLE root,
+  /// then feed the outcome back through
+  /// [`on_root_recovered`](DriverCore::on_root_recovered).
+  ///
+  /// The one asynchronous round trip in the mount-change cover (#74), and it
+  /// exists because a fanotify source's sight is a MAP rather than a mark. The
+  /// seed walk stops at every mount boundary, so ground a departed mount had
+  /// been covering was never walked: the map holds no handle for any directory
+  /// there, and every later event under it decodes as outside-root. Telling the
+  /// consumer to re-read first would hand it a listing the source is still blind
+  /// to — it would re-enumerate the revealed subtree, see it, and then hear
+  /// nothing more about it. So the reseed runs FIRST and the `Rescan` is emitted
+  /// on its completion.
+  ///
+  /// `epoch` is what makes the reply judgeable. The walk runs on the blocking
+  /// pool while the world can move under it (a root replace, a widen), so the
+  /// core stamps each request and drops a reply whose stamp is no longer the
+  /// scope's current one. One recovery is in flight per scope at a time; a fire
+  /// during one is coalesced onto a single follow-up
+  /// ([`ScopeState::recovery_dirty`]).
+  RecoverRoot {
+    /// The scope whose whole-root sight is being rebuilt.
+    scope: ScopeId,
+    /// The stamp the reply must still carry to be acted on.
+    epoch: u64,
   },
 }
 
@@ -1494,6 +1593,45 @@ struct ScopeState {
   /// table is blind), so event-side device trust is refused. Revoked by every
   /// loss signal — a dropped window may have carried a mount transition.
   mounts_authoritative: bool,
+  /// The last AUTHORITATIVE sample's rows strictly under the root, SORTED — the
+  /// fingerprint the coarse mount-change cover compares each new sample against
+  /// (#74; see the module doc's "A mount change under the root" section).
+  ///
+  /// Whole [`MountRow`](crate::os::MountRow)s rather than locations, because the
+  /// change this exists to see is often only an identity: a `mount --move` and a
+  /// same-path replacement both leave the LOCATION set untouched. Sorted on
+  /// install so the comparison is order-insensitive — mountinfo's row order is
+  /// the kernel's list order, which a mount elsewhere can permute without
+  /// anything under this root having changed.
+  ///
+  /// `None` until the first authoritative sample of this world, which therefore
+  /// only INSTALLS: registration's own crawl already covered the tree, so the
+  /// birth refresh has nothing to cover. A world swap resets it to `None` for the
+  /// same reason.
+  table_fingerprint: Option<Vec<crate::os::MountRow>>,
+  /// The mount-namespace transition count the last authoritative sample carried
+  /// ([`MountRefresh::namespace_transitions`]), or `None` where the host answers
+  /// none.
+  ///
+  /// Read ONLY where the sample carries no per-row unique mount ids, and then it
+  /// is the conservative rule that keeps the cover honest on a kernel whose ids
+  /// recycle: a mount that departs and one that arrives at the same location
+  /// inside one refresh interval can hand the newcomer the freed id, leaving two
+  /// samples that compare EQUAL across a replacement. A transition the host
+  /// counted is the fact the rows could not carry.
+  namespace_transitions_seen: Option<u64>,
+  /// The stamp on this scope's current whole-root recovery
+  /// ([`Effect::RecoverRoot`]) — bumped per request and by every world swap, so
+  /// a reply from a world that ended is dropped rather than acted on.
+  recovery_epoch: u64,
+  /// A [`Effect::RecoverRoot`] is outstanding: further fires coalesce onto
+  /// [`recovery_dirty`](Self::recovery_dirty) instead of stacking reseed walks.
+  recovery_in_flight: bool,
+  /// A fire landed while a recovery was in flight. The in-flight walk may have
+  /// been mid-descent when the table moved again, so its map cannot be trusted to
+  /// cover the newer change: exactly one more recovery runs when this one lands,
+  /// however many fires arrived meanwhile.
+  recovery_dirty: bool,
   /// An [`Effect::RefreshMounts`] is outstanding; repeated loss signals
   /// coalesce onto it instead of stacking effects.
   refresh_pending: bool,
@@ -2013,12 +2151,30 @@ impl DriverCore {
   /// | RDCW (Windows) | fatal source error on any terminal read completion | same signal | no |
   /// | USN journal (Windows) | fatal source error on a failed journal read | `RootDeath` (the root's own FRN in a delete/rename record) | no |
   ///
-  /// Only fanotify's unmount is signal-silent, so only fanotify arms the tick;
-  /// its in-tree self-events and every other backend's death signal already
-  /// reach [`on_mounts_refreshed`](Self::on_mounts_refreshed)'s death mapping
-  /// (via a loss-triggered refresh) or the Monitor's self-event path directly.
+  /// Only fanotify's unmount is signal-silent, so only fanotify NEEDS the tick
+  /// for its root's own death; its in-tree self-events and every other backend's
+  /// death signal already reach
+  /// [`on_mounts_refreshed`](Self::on_mounts_refreshed)'s death mapping (via a
+  /// loss-triggered refresh) or the Monitor's self-event path directly.
+  ///
+  /// # The tick is also the mount SAMPLER, and that is why inotify ticks too
+  ///
+  /// A mount that departs BELOW the root is silent on every backend — there is no
+  /// such thing as an unmount signal for a subtree you are not the mount of — so
+  /// the only way any scope learns of one is by re-reading the table (#74). That
+  /// makes the cadence a second obligation, owed by every profile whose coverage
+  /// a mount change can invalidate:
+  ///
+  /// - **inotify**: per-directory watches under a departed mount go quiet with no
+  ///   `IN_UNMOUNT` and no `IN_IGNORED`, and a mount that ARRIVES hides a subtree
+  ///   whose watches now describe nothing reachable. Both need the sample.
+  /// - **fanotify**: the FID map holds no handle under revealed ground, so the
+  ///   sample drives the reseed as well as the cover.
+  /// - **FSEvents / RDCW / USN**: kept off the tick, exactly as they were. Their
+  ///   streams follow nested volumes themselves, so a table sample would buy the
+  ///   consumer nothing and cost every macOS and Windows root a periodic read.
   const fn liveness_ticked(profile: BackendKind) -> bool {
-    matches!(profile, BackendKind::Fanotify)
+    matches!(profile, BackendKind::Fanotify | BackendKind::Inotify)
   }
 
   /// Mints the next `FAN_RENAME` pairing cookie.
@@ -2065,6 +2221,11 @@ impl DriverCore {
         mount_table: Vec::new(),
         learned_mounts: Vec::new(),
         mounts_authoritative: false,
+        table_fingerprint: None,
+        namespace_transitions_seen: None,
+        recovery_epoch: 0,
+        recovery_in_flight: false,
+        recovery_dirty: false,
         refresh_pending: false,
         refresh_stale: false,
         refresh_world_stale: false,
@@ -3078,6 +3239,7 @@ impl DriverCore {
         // starts with none: comparing this world's first reading against the
         // previous root's token would read every fresh scope as a frame move.
         state.root_incarnation = None;
+        retire_root_recovery(state);
         state.identity = Some(meta.identity);
         install_mount_table(state, meta.mounts.into_iter().map(|row| row.location));
         // A brand-new world: nothing learned about the previous one survives, and
@@ -3450,6 +3612,7 @@ impl DriverCore {
     // with none: comparing this world's first reading against the previous root's
     // token would read the swap as a frame move on top of the swap itself.
     state.root_incarnation = None;
+    retire_root_recovery(state);
     state.identity = Some(meta.identity);
     install_mount_table(state, meta.mounts.into_iter().map(|row| row.location));
     // A brand-new world: nothing learned about the previous one survives, and
@@ -3778,8 +3941,32 @@ impl DriverCore {
     // with none: comparing this world's first reading against the previous root's
     // token would read the swap as a frame move on top of the swap itself.
     state.root_incarnation = None;
+    retire_root_recovery(state);
     state.identity = Some(meta.identity);
-    install_mount_table(state, meta.mounts.into_iter().map(|row| row.location));
+    install_mount_table(state, meta.mounts.iter().map(|row| row.location.clone()));
+    // The ONE world entry that seeds its own mount-change baseline (#74) instead
+    // of leaving the first authoritative refresh to install one.
+    //
+    // A registration and a replace both hand the consumer a covering statement
+    // for the whole new root — the crawl's closing `Rescan`, the commit's
+    // epoch-bumped one — so nothing is owed for the window between the barrier's
+    // table read and the first refresh, and the refresh may simply install. A
+    // widen deliberately splices WITHOUT domination: it mints no covering
+    // `Rescan` at all, and the ADDED ground is read by the chain arm's cold
+    // enumerate, which declines beneath every mount it finds. So a mount that is
+    // listed by this barrier and gone by the first refresh leaves ground that was
+    // declined by the crawl and never re-read by anything — invisible forever, if
+    // that first refresh were the baseline rather than the first comparison.
+    //
+    // The two readings are comparable by construction: the seed reader enriches
+    // its rows with the same per-row unique ids the refresh sampler reads, for
+    // exactly this reason (see `os::linux::mounts_under`). A seed row that
+    // degrades where the refresh's does not costs one whole-root cover on this
+    // scope's first refresh — bounded, once per widen, and in the covering
+    // direction.
+    let mut seeded = meta.mounts;
+    seeded.sort_unstable();
+    state.table_fingerprint = Some(seeded);
     // A brand-new world: nothing learned about the previous one survives, and
     // nothing else may empty this set (see [`ScopeState::learned_mounts`]).
     state.learned_mounts.clear();
@@ -4030,7 +4217,61 @@ impl DriverCore {
     // itself could be read below.
     Self::arm_liveness(state, interval, now);
 
+    // The COARSE COVER (#74) begins here, and the frame move above is one of its
+    // three legs: a root that moved to a different mount is a table change like
+    // any other, and folding it in is what keeps a scope from being told twice
+    // about one transition.
+    let mut fire = frame_changed;
+
     if refresh.authoritative {
+      // The FINGERPRINT, taken before the table half is installed off the same
+      // rows. Sorted, because mountinfo's row order is the kernel's own list
+      // order: a mount created ELSEWHERE on the host can permute it with nothing
+      // under this root having changed, and an order-sensitive comparison would
+      // read that as a departure and cover for it every time.
+      let mut rows = refresh.mounts;
+      rows.sort_unstable();
+
+      // Whether this sample's rows can speak for themselves about a REPLACEMENT.
+      // A row's `mnt_id_unique` is never recycled, so two samples that differ by
+      // a same-location replacement differ in the rows; a sample carrying none
+      // (a kernel below 6.8, a table with no rows at all, or per-row reads that
+      // all failed) has only the LEGACY id, which the kernel hands to the next
+      // mount as soon as the old one frees it — so a departure and an arrival
+      // inside one interval can compare EQUAL.
+      //
+      // Read off the sample rather than off the per-process tier memo on
+      // purpose: the memo answers what the KERNEL can do, and the question here
+      // is what THIS reading actually carries. A reading whose per-row reads
+      // failed is exactly as blind to a recycled id as a 6.7 kernel is, and it
+      // is the reading that gets compared.
+      let per_row_unique = rows.iter().any(|row| row.mnt_id_unique.is_some());
+
+      // The conservative leg, and the only one that can over-fire: a namespace
+      // transition is SOMETHING mounting or unmounting anywhere on the host, not
+      // necessarily under this root. Consumed as a whole-root cover only where
+      // the rows cannot answer for themselves, and the alternative there is to
+      // keep reading a recycled id as proof of continuity — a silence, which is
+      // the one outcome this design refuses. On a busy pre-6.8 host it costs one
+      // whole-root `Rescan` per refresh interval; that cost is the ruling.
+      let namespace_moved = matches!(
+        (state.namespace_transitions_seen, refresh.namespace_transitions),
+        (Some(held), Some(read)) if held != read
+      );
+      if refresh.namespace_transitions.is_some() {
+        state.namespace_transitions_seen = refresh.namespace_transitions;
+      }
+
+      // A held fingerprint is what makes a comparison possible at all. Its
+      // absence is the FIRST authoritative sample of this world — registration's
+      // crawl (or the swap's own `Rescan`) already covered the tree, so this one
+      // installs and says nothing.
+      if let Some(held) = state.table_fingerprint.as_ref()
+        && (*held != rows || (!per_row_unique && namespace_moved))
+      {
+        fire = true;
+      }
+
       // REPLACEMENT, never union: the reads are serialized and this one is not
       // stale, so a location it does not list is a mount the host says is gone —
       // and unioning retained one `PathBuf` per HISTORICAL mountpoint for the life
@@ -4039,7 +4280,8 @@ impl DriverCore {
       // that arrived after this read was taken, and a probe's foreign device is a
       // path no mountinfo row will ever name. Probe-carried device evidence still
       // decides what it can.
-      install_mount_table(state, refresh.mounts.into_iter().map(|row| row.location));
+      install_mount_table(state, rows.iter().map(|row| row.location.clone()));
+      state.table_fingerprint = Some(rows);
       state.mounts_authoritative = true;
     } else {
       // The live table could not be read, so this refresh installs no table — and a
@@ -4053,18 +4295,111 @@ impl DriverCore {
       state.mounts_authoritative = false;
     }
 
-    // A CHANGED frame means a same-object re-mount moved the root to a different
-    // mount: every child the last enumerate already classified carries the OLD
-    // verdict — those now on the root's mount were fenced as boundaries, those left
-    // behind are boundaries now — and adopting the frame does not re-read them. Only
-    // a descending scope consumes the frame (a kernel-recursive mark covers the whole
-    // subtree, so its frame is inert), so only it needs the replay: rescan and re-arm
-    // the root under the now-authoritative frame. The loss that drove this refresh
-    // also rescans, but that rescan races AHEAD of this completion and reads the
-    // pre-adoption frame; this replay reruns it once the frame is current.
-    if frame_changed && !state.profile.is_kernel_recursive() {
+    // One difference, one whole-root cover. Nothing here asks WHICH row moved or
+    // WHERE it was: a located cover would need a census of the boundaries under
+    // the root and a ledger to keep it honest across renames, and neither buys
+    // the consumer anything it cannot get from re-reading the tree it was told to
+    // re-read. The whole proof is one line — every mount transition under the
+    // root changes the table, and every table change covers the root.
+    if fire {
+      self.cover_whole_root(scope, now);
+    }
+  }
+
+  /// Covers this scope's WHOLE root once: the consumer is told to re-read from
+  /// the root, and a descending scope's per-directory coverage is re-established
+  /// under it.
+  ///
+  /// `on_overflow(Scope::Root(..))` is the primitive on every profile but one —
+  /// the Monitor re-enumerates and re-arms, synchronously, and the consumer gets
+  /// its `Rescan`. It is the same call a root overflow and a frame change already
+  /// made; nothing about it is new here except what asks for it.
+  ///
+  /// Fanotify is the exception, and the reason is that its sight is a FID map
+  /// rather than a kernel-recursive mark on the tree. A mount that departs
+  /// reveals ground the seed walk stopped short of, so the map holds no handle
+  /// there and events under it decode as outside-root — a `Rescan` alone would
+  /// have the consumer read a subtree the source will then never speak about
+  /// again. The reseed goes first ([`Effect::RecoverRoot`]) and the cover follows
+  /// its completion.
+  fn cover_whole_root(&mut self, scope: ScopeId, now: Instant) {
+    let Some(state) = self.scopes.get_mut(&scope) else {
+      return;
+    };
+    if !matches!(state.profile, BackendKind::Fanotify) {
       self.monitor.on_overflow(Scope::Root(scope), now);
       self.drain_monitor();
+      return;
+    }
+    // Exactly one walk at a time, and exactly one follow-up however many fires
+    // arrive during it: a reseed is a full descent of the root, and stacking them
+    // would let a churning table hold the blocking pool indefinitely.
+    if state.recovery_in_flight {
+      state.recovery_dirty = true;
+      return;
+    }
+    // No canonical root means no live stream to reseed; the spawn's own seed walk
+    // covers that case.
+    if state.root.is_none() {
+      return;
+    }
+    state.recovery_epoch = state.recovery_epoch.wrapping_add(1);
+    state.recovery_in_flight = true;
+    let epoch = state.recovery_epoch;
+    self.effects.push_back(Effect::RecoverRoot { scope, epoch });
+  }
+
+  /// Feeds the outcome of one [`Effect::RecoverRoot`]: the fanotify source's FID
+  /// map has been rebuilt over the whole root, so the consumer may now be told to
+  /// re-read it.
+  ///
+  /// The ORDER is the whole point. The `Rescan` is emitted here, on the reseed's
+  /// completion, and never beside the request — a consumer that re-enumerated
+  /// while the source was still blind to the revealed ground would see the
+  /// subtree once and hear nothing about it afterwards.
+  ///
+  /// A reply whose `epoch` is no longer the scope's is dropped whole: the world
+  /// moved (the root was replaced or widened) while the walk ran, so the map it
+  /// rebuilt describes a root this scope no longer watches, and the swap has
+  /// already covered the new one.
+  pub(crate) fn on_root_recovered(
+    &mut self,
+    scope: ScopeId,
+    epoch: u64,
+    outcome: RootRecovery,
+    now: Instant,
+  ) {
+    let Some(state) = self.scopes.get_mut(&scope) else {
+      return;
+    };
+    if state.recovery_epoch != epoch {
+      return;
+    }
+    state.recovery_in_flight = false;
+    if matches!(outcome, RootRecovery::Unreachable) {
+      // The walk could not reach the root at all. That is a root death and takes
+      // the SAME funnel a refresh's death gate takes — terminal `Removed`/`Rescan`
+      // and registry reclamation — rather than a cover for a tree that is gone.
+      // Nothing is owed after it, so the dirty flag dies with the scope.
+      let watch = state.watch;
+      state.recovery_dirty = false;
+      self
+        .monitor
+        .on_os_record(OsRecord::new(watch, RecordKind::DeleteSelf), now);
+      self.drain_monitor();
+      return;
+    }
+    self.monitor.on_overflow(Scope::Root(scope), now);
+    self.drain_monitor();
+    // A fire during the walk: the table moved again, possibly under ground this
+    // walk had already descended, so its map cannot be trusted to have seen it.
+    // One more round, and only one.
+    if self
+      .scopes
+      .get_mut(&scope)
+      .is_some_and(|state| std::mem::take(&mut state.recovery_dirty))
+    {
+      self.cover_whole_root(scope, now);
     }
   }
 
@@ -6021,6 +6356,26 @@ fn learn_device(state: &mut ScopeState, path: &Path, dev: u64) {
 fn install_mount_table(state: &mut ScopeState, rows: impl IntoIterator<Item = PathBuf>) {
   state.mount_table.clear();
   state.mount_table.extend(rows);
+}
+
+/// Retires everything the coarse mount-change cover (#74) holds about the world
+/// that just ended — at a spawn, and at both world swaps.
+///
+/// The fingerprint goes first: it describes the table under a DIFFERENT root, so
+/// comparing the new world's first sample against it would read the swap itself
+/// as a mount change and cover a tree the swap's own `Rescan` already covered.
+/// `None` makes that first sample an install, exactly as it is at birth.
+///
+/// The epoch BUMPS rather than resets, and that is what makes an in-flight reseed
+/// safe to abandon: its reply carries the old stamp, so it is dropped instead of
+/// covering the new world off a walk of the old one. Nothing is cancelled — the
+/// walk finishes on the blocking pool and its answer is discarded.
+fn retire_root_recovery(state: &mut ScopeState) {
+  state.table_fingerprint = None;
+  state.namespace_transitions_seen = None;
+  state.recovery_epoch = state.recovery_epoch.wrapping_add(1);
+  state.recovery_in_flight = false;
+  state.recovery_dirty = false;
 }
 
 /// Lowers an absolute event path to its place under the scope root.

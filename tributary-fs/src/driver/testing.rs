@@ -95,6 +95,12 @@ struct FakeState {
   /// authoritative empty table).
   refreshes: AtomicUsize,
   refresh_answer: Mutex<Option<(Vec<crate::os::MountRow>, bool)>>,
+  /// The scopes a whole-root recovery has been requested for, in request order —
+  /// the observable that a cover REQUESTED the reseed before it emitted anything.
+  recoveries: Mutex<Vec<ScopeId>>,
+  /// What every subsequent recovery answers. `None` is the default a source with
+  /// a healthy map gives.
+  recovery_answer: Mutex<Option<crate::os::RootRecovery>>,
   /// Overrides the root-liveness a refresh reports, so the hermetic suites can
   /// drive the root-death-via-refresh path (`None` = derive from the tree: the
   /// root's live identity, or `Missing` when it is gone).
@@ -346,6 +352,8 @@ impl Default for FakeState {
       spawns: AtomicUsize::new(0),
       refreshes: AtomicUsize::new(0),
       refresh_answer: Mutex::default(),
+      recoveries: Mutex::default(),
+      recovery_answer: Mutex::default(),
       root_liveness: Mutex::default(),
       spawn_mounts: Mutex::default(),
       spawn_remaps: Mutex::default(),
@@ -651,6 +659,20 @@ impl FakeFs {
   /// answers. Setting a smaller list is how a cell models a mount DEPARTING.
   pub(crate) fn answer_refresh(&self, mounts: Vec<crate::os::MountRow>, authoritative: bool) {
     *self.state.refresh_answer.lock().unwrap() = Some((mounts, authoritative));
+  }
+
+  /// Configures what every subsequent whole-root recovery answers. The default
+  /// (an unconfigured fake) is
+  /// [`RootRecovery::Reseeded`](crate::os::RootRecovery::Reseeded) — a source
+  /// whose map rebuilt; `Unreachable` is how a cell models a root that vanished
+  /// under the walk.
+  pub(crate) fn answer_root_recovery(&self, outcome: crate::os::RootRecovery) {
+    *self.state.recovery_answer.lock().unwrap() = Some(outcome);
+  }
+
+  /// The scopes a whole-root recovery has been requested for, in request order.
+  pub(crate) fn recovery_requests(&self) -> Vec<ScopeId> {
+    self.state.recoveries.lock().unwrap().clone()
   }
 
   /// Forces every subsequent refresh to report `liveness` as the root's state,
@@ -1840,7 +1862,18 @@ impl FsOps for FakeFs {
       // the mount-id comparison alone. A cell that drives the token feeds
       // `on_mounts_refreshed` directly.
       root_incarnation: None,
+      namespace_transitions: None,
     }
+  }
+
+  fn recover_root(&self, scope: ScopeId) -> crate::os::RootRecovery {
+    self.state.recoveries.lock().unwrap().push(scope);
+    self
+      .state
+      .recovery_answer
+      .lock()
+      .unwrap()
+      .unwrap_or(crate::os::RootRecovery::Reseeded)
   }
 
   fn attach_scope(&self, scope: ScopeId, _port: crate::os::ScopePort, generation: u64) {

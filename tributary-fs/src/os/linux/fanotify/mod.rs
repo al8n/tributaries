@@ -1345,7 +1345,7 @@ pub(crate) mod reader;
 
 #[cfg(all(target_os = "linux", not(miri)))]
 #[allow(unused_imports)]
-pub(crate) use source::{FanotifySpawn, Source, SourceHandle};
+pub(crate) use source::{FanotifySpawn, RecoveryPort, Source, SourceHandle};
 
 #[cfg(all(target_os = "linux", not(miri)))]
 mod source;
