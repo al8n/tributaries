@@ -215,63 +215,207 @@ pub(crate) fn derive_move_window(move_window: Duration, latency: Duration) -> Du
 /// Uncapped (`max_map_directories = None`) is deliberately NOT expressible from a
 /// flag — its own documentation explains why the default is finite — nor from a
 /// document format without a null literal; a caller that wants it says so in code.
+///
+/// An UPDATE (`clap::FromArgMatches::update_from_arg_matches`) changes only the
+/// knobs the command line actually carried: `--latency` alone leaves the backend,
+/// the buffer size, the exclusions and both capacities exactly as they stood.
+/// `--exclusions` REPLACES the list it updates — the flag repeats to spell a whole
+/// list, and there is no spelling for "add one to what is already there" — so an
+/// update that names it states the complete set of exclusion paths, and one that
+/// does not name it leaves the existing set alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(default))]
-#[cfg_attr(feature = "clap", derive(clap::Args))]
 pub struct WatcherOptions {
   #[cfg_attr(feature = "serde", serde(with = "humantime_serde"))]
-  #[cfg_attr(
-    feature = "clap",
-    arg(
-      long,
-      value_parser = humantime::parse_duration,
-      default_value = clap_duration_default(WatcherOptions::DEFAULT_LATENCY),
-    )
-  )]
   latency: Duration,
   #[cfg_attr(feature = "serde", serde(with = "humantime_serde"))]
-  #[cfg_attr(
-    feature = "clap",
-    arg(
-      long,
-      value_parser = humantime::parse_duration,
-      default_value = clap_duration_default(WatcherOptions::DEFAULT_MOVE_WINDOW),
-    )
+  move_window: Duration,
+  event_capacity: NonZeroUsize,
+  os_batch_capacity: NonZeroUsize,
+  os_buffer_bytes: NonZeroU32,
+  exclusions: Vec<PathBuf>,
+  backend: Backend,
+  #[cfg_attr(feature = "serde", serde(with = "humantime_serde"))]
+  root_liveness_interval: Duration,
+  max_map_directories: Option<usize>,
+}
+
+/// The `clap` face of [`WatcherOptions`]: the same nine flags the household derived
+/// before, kept in a proxy so the UPDATE can be written by hand (see
+/// [`command_line_value`]). The group id is pinned to the household's own name, so a
+/// command that flattens the group is unchanged.
+#[cfg(feature = "clap")]
+#[derive(Debug, Clone, clap::Args)]
+#[group(id = "WatcherOptions")]
+struct WatcherOptionsArgs {
+  #[arg(
+    long,
+    value_parser = humantime::parse_duration,
+    default_value = clap_duration_default(WatcherOptions::DEFAULT_LATENCY),
+  )]
+  latency: Duration,
+  #[arg(
+    long,
+    value_parser = humantime::parse_duration,
+    default_value = clap_duration_default(WatcherOptions::DEFAULT_MOVE_WINDOW),
   )]
   move_window: Duration,
   // The ONE flag that is not its field's name — see the type docs. Both the id and
   // the long form move: clap rejects a duplicate ID, so renaming only the long form
   // would leave the very collision this avoids.
-  #[cfg_attr(
-    feature = "clap",
-    arg(
-      id = "watcher_event_capacity",
-      long = "watcher-event-capacity",
-      default_value_t = WatcherOptions::DEFAULT_EVENT_CAPACITY,
-    )
+  #[arg(
+    id = "watcher_event_capacity",
+    long = "watcher-event-capacity",
+    default_value_t = WatcherOptions::DEFAULT_EVENT_CAPACITY,
   )]
   event_capacity: NonZeroUsize,
-  #[cfg_attr(feature = "clap", arg(long, default_value_t = WatcherOptions::DEFAULT_OS_BATCH_CAPACITY))]
+  #[arg(long, default_value_t = WatcherOptions::DEFAULT_OS_BATCH_CAPACITY)]
   os_batch_capacity: NonZeroUsize,
-  #[cfg_attr(feature = "clap", arg(long, default_value_t = WatcherOptions::DEFAULT_OS_BUFFER_BYTES))]
+  #[arg(long, default_value_t = WatcherOptions::DEFAULT_OS_BUFFER_BYTES)]
   os_buffer_bytes: NonZeroU32,
-  #[cfg_attr(feature = "clap", arg(long))]
+  #[arg(long)]
   exclusions: Vec<PathBuf>,
-  #[cfg_attr(feature = "clap", arg(long, value_enum, default_value_t = WatcherOptions::DEFAULT_BACKEND))]
+  #[arg(long, value_enum, default_value_t = WatcherOptions::DEFAULT_BACKEND)]
   backend: Backend,
-  #[cfg_attr(feature = "serde", serde(with = "humantime_serde"))]
-  #[cfg_attr(
-    feature = "clap",
-    arg(
-      long,
-      value_parser = humantime::parse_duration,
-      default_value = clap_duration_default(WatcherOptions::DEFAULT_ROOT_LIVENESS_INTERVAL),
-    )
+  #[arg(
+    long,
+    value_parser = humantime::parse_duration,
+    default_value = clap_duration_default(WatcherOptions::DEFAULT_ROOT_LIVENESS_INTERVAL),
   )]
   root_liveness_interval: Duration,
-  #[cfg_attr(feature = "clap", arg(long, default_value = clap_default_max_map_directories()))]
+  #[arg(long, default_value = clap_default_max_map_directories())]
   max_map_directories: Option<usize>,
+}
+
+/// The value an argument carried, but ONLY when the COMMAND LINE is where it came
+/// from — the one question `ArgMatches::get_one` cannot answer, because a DEFAULTED
+/// argument reads there exactly like a given one.
+///
+/// It is what the hand-written updates in this module stand on. A derived update
+/// asks `contains_id`, which a default satisfies, so it writes every flag default
+/// over whatever the caller had already configured.
+#[cfg(feature = "clap")]
+fn command_line_value<T>(matches: &clap::ArgMatches, id: &str) -> Option<T>
+where
+  T: Clone + Send + Sync + 'static,
+{
+  if matches.value_source(id) != Some(clap::parser::ValueSource::CommandLine) {
+    return None;
+  }
+  matches.get_one::<T>(id).cloned()
+}
+
+/// The same, for a repeatable argument: every value it carried, when the command
+/// line is where they came from. A named list REPLACES the one it updates (see the
+/// type docs).
+#[cfg(feature = "clap")]
+fn command_line_values<T>(matches: &clap::ArgMatches, id: &str) -> Option<Vec<T>>
+where
+  T: Clone + Send + Sync + 'static,
+{
+  if matches.value_source(id) != Some(clap::parser::ValueSource::CommandLine) {
+    return None;
+  }
+  Some(
+    matches
+      .get_many::<T>(id)
+      .into_iter()
+      .flatten()
+      .cloned()
+      .collect(),
+  )
+}
+
+#[cfg(feature = "clap")]
+impl From<WatcherOptionsArgs> for WatcherOptions {
+  fn from(args: WatcherOptionsArgs) -> Self {
+    let WatcherOptionsArgs {
+      latency,
+      move_window,
+      event_capacity,
+      os_batch_capacity,
+      os_buffer_bytes,
+      exclusions,
+      backend,
+      root_liveness_interval,
+      max_map_directories,
+    } = args;
+    Self {
+      latency,
+      move_window,
+      event_capacity,
+      os_batch_capacity,
+      os_buffer_bytes,
+      exclusions,
+      backend,
+      root_liveness_interval,
+      max_map_directories,
+    }
+  }
+}
+
+#[cfg(feature = "clap")]
+impl clap::FromArgMatches for WatcherOptions {
+  fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+    WatcherOptionsArgs::from_arg_matches(matches).map(Into::into)
+  }
+
+  /// Applies only what the COMMAND LINE said, leaving every other knob of the
+  /// existing household exactly as it stood.
+  ///
+  /// Every knob here but `--exclusions` carries a flag default, and a derived
+  /// update cannot tell a default from a given value: one `--latency` would reset
+  /// the backend selection, the native buffer size, both capacities and the
+  /// liveness interval to what a flagless command line means, silently discarding
+  /// whatever the configuration layer had loaded.
+  fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+    if let Some(latency) = command_line_value(matches, "latency") {
+      self.latency = latency;
+    }
+    if let Some(move_window) = command_line_value(matches, "move_window") {
+      self.move_window = move_window;
+    }
+    if let Some(event_capacity) = command_line_value(matches, "watcher_event_capacity") {
+      self.event_capacity = event_capacity;
+    }
+    if let Some(os_batch_capacity) = command_line_value(matches, "os_batch_capacity") {
+      self.os_batch_capacity = os_batch_capacity;
+    }
+    if let Some(os_buffer_bytes) = command_line_value(matches, "os_buffer_bytes") {
+      self.os_buffer_bytes = os_buffer_bytes;
+    }
+    if let Some(exclusions) = command_line_values(matches, "exclusions") {
+      self.exclusions = exclusions;
+    }
+    if let Some(backend) = command_line_value(matches, "backend") {
+      self.backend = backend;
+    }
+    if let Some(interval) = command_line_value(matches, "root_liveness_interval") {
+      self.root_liveness_interval = interval;
+    }
+    // Uncapped has no flag (see the type docs), so a named cap can only ever be a
+    // cap — an update never says "remove the ceiling".
+    if let Some(cap) = command_line_value::<usize>(matches, "max_map_directories") {
+      self.max_map_directories = Some(cap);
+    }
+    Ok(())
+  }
+}
+
+#[cfg(feature = "clap")]
+impl clap::Args for WatcherOptions {
+  fn group_id() -> Option<clap::Id> {
+    WatcherOptionsArgs::group_id()
+  }
+
+  fn augment_args(cmd: clap::Command) -> clap::Command {
+    WatcherOptionsArgs::augment_args(cmd)
+  }
+
+  fn augment_args_for_update(cmd: clap::Command) -> clap::Command {
+    WatcherOptionsArgs::augment_args_for_update(cmd)
+  }
 }
 
 /// A flag default rendered from the constant it mirrors, so the flag and the

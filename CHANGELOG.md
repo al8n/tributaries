@@ -253,6 +253,21 @@ All notable changes to this workspace are documented here. The format is based o
   narrowed. The optional flattened debounce group is instantiated only when one of its
   own flags was given, which is the rule a parse already followed.
 
+- **`tributary-fs`** — a `clap` UPDATE on `WatcherOptions` applies only the knobs the
+  COMMAND LINE carried: `--latency` alone leaves the backend selection, the native
+  buffer size, both capacities, the liveness interval and the map cap exactly as they
+  stood, where a derived update reset every one of them to its flag default.
+  `--exclusions` REPLACES the list it updates — the flag repeats to spell a whole list,
+  and there is no spelling for adding one path — and a list nobody names is left alone.
+  The flags, their defaults and the parse result are unchanged.
+
+- **`tributary-proto`** — a `clap` UPDATE on `Interest` writes only the bits the command
+  line NAMED. A bare boolean flag carries clap's own `false` default, so a derived
+  update unsubscribed every kind the command line did not mention — `--attrib` alone
+  emptied the rest of the mask, and an update for an argument in some other group of the
+  same command emptied it outright. The flagless PARSE still means the empty mask, which
+  is what makes this group's flags the whole value they are.
+
 - **`tributaries`** — a per-root household the fs layer refuses
   (`WatchRootError::InvalidOptions`) reaches a `watch` caller as an explicitly
   classified `FaultKind::Other`, with the typed refusal recoverable through

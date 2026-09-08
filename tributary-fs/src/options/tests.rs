@@ -477,6 +477,65 @@ mod clap_face {
       );
     }
   }
+
+  /// An UPDATE applies what the COMMAND LINE carried, and nothing else.
+  ///
+  /// Every knob here but `--exclusions` has a flag default, and a derived update
+  /// cannot tell a default from a value someone gave — so one `--latency` used to
+  /// reset the backend selection, the native buffer size, both capacities, the
+  /// liveness interval and the map cap to what a flagless command line means,
+  /// silently discarding whatever a configuration layer had loaded.
+  #[test]
+  fn an_update_changes_only_the_knobs_the_command_line_carried() {
+    use clap::{CommandFactory as _, FromArgMatches as _};
+
+    fn matches(args: &[&str]) -> clap::ArgMatches {
+      Cli::command_for_update().get_matches_from(std::iter::once("app").chain(args.iter().copied()))
+    }
+
+    let configured = WatcherOptions::new()
+      .with_backend(Backend::Inotify)
+      .with_event_capacity(NonZeroUsize::new(4096).unwrap())
+      .with_os_batch_capacity(NonZeroUsize::new(16).unwrap())
+      .with_os_buffer_bytes(NonZeroU32::new(128 * 1024).unwrap())
+      .with_move_window(Duration::from_millis(750))
+      .with_root_liveness_interval(Duration::from_secs(90))
+      .with_max_map_directories(Some(250_000))
+      .with_exclusions(std::vec![PathBuf::from("/repo/target")]);
+
+    let mut options = configured.clone();
+    options
+      .update_from_arg_matches(&matches(&["--latency", "25ms"]))
+      .expect("the update applies");
+    assert_eq!(
+      options,
+      configured.clone().with_latency(Duration::from_millis(25)),
+      "the named knob moves and every other one stands"
+    );
+
+    // An update naming nothing of this group changes nothing at all.
+    let mut options = configured.clone();
+    options
+      .update_from_arg_matches(&matches(&[]))
+      .expect("the update applies");
+    assert_eq!(options, configured);
+
+    // The repeatable seat REPLACES the list it updates, and only when it is named.
+    let mut options = configured.clone();
+    options
+      .update_from_arg_matches(&matches(&["--exclusions", "/a", "--exclusions", "/b"]))
+      .expect("the update applies");
+    assert_eq!(
+      options.exclusions_slice(),
+      [PathBuf::from("/a"), PathBuf::from("/b")],
+      "a named list is the whole list — there is no spelling for appending one path"
+    );
+    assert_eq!(
+      options.backend(),
+      Backend::Inotify,
+      "and it carries nothing else with it"
+    );
+  }
 }
 
 /// The per-ROOT household: its defaults, its builders and its two faces.
