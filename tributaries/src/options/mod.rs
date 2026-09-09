@@ -4,7 +4,13 @@
 
 use core::{num::NonZeroUsize, time::Duration};
 
-use std::{string::String, vec::Vec};
+use std::vec::Vec;
+
+// Only the clap-face proxy types (`SeatArgs`'s `Vec<String>` fields, `compile_seat`)
+// name `String` directly; every other type in this module is `Vec<Glob>` or plain
+// `Glob`, so the bare name has no consumer once `clap` is off.
+#[cfg(feature = "clap")]
+use std::string::String;
 
 use tributary_proto::glob::Glob;
 
