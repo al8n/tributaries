@@ -1519,6 +1519,16 @@ impl<R> Watcher<R> {
   /// that. Reap what this call RETURNED; a path re-derived from `dir` and `name`
   /// names nothing.
   ///
+  /// That path is the spelling at WRITE time: it is built from the names the write
+  /// walked through, and a peer that renames one of those directories between the
+  /// walk and the create leaves the cookie under the new name while this reply
+  /// keeps the old one. Nothing is broken by that — the removal is anchored to the
+  /// directory the create was made through, and a reap of this path resolves the
+  /// same record it was published under — but a caller must not treat the returned
+  /// path as the marker's ADDRESS. What identifies the marker on the stream is its
+  /// last component: the `name` given here, minted unpredictable per sync, whose
+  /// create event arrives under whatever path the marker's parent has by then.
+  ///
   /// The write is parked on the scope's coverage-settle fence: under a
   /// descending backend, a change inside a subtree whose per-directory watch
   /// is mid-re-arm was never kernel-reported and no queue ordering covers it,
@@ -1579,7 +1589,7 @@ impl<R> Watcher<R> {
   /// # Platform notes
   ///
   /// On Windows this write's cookie path is still path-addressed at three
-  /// points (opening the cookie parent by pathname after the root pin check;
+  /// points (opening the cookie parent by pathname after the root identity check;
   /// a cookie directory renamed between mint and marker create passing
   /// revalidation with a stale reported landing; a post-create validation
   /// failure dropping the marker handle). A concurrent rename of `root` or of

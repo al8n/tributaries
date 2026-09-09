@@ -883,155 +883,129 @@ impl CookieDir {
   }
 }
 
-/// The directory a cookie directory is created IN, held open — the ONE object a
-/// sync write judges and then creates against.
+/// A scope's LIVE root, as the cookie registry holds it: the canonical path the
+/// spawn recorded, and the IDENTITY that same spawn read for the object standing
+/// at it.
 ///
-/// The two are the same object by construction rather than by hope, and that is
-/// this type's whole reason to exist. The write used to resolve the parent's
-/// pathname twice: once to canonicalize and judge it, and again, later, to open
-/// it. A peer that swapped an intermediate directory for a symlink between those
-/// two resolutions moved the second one somewhere the first never described — a
-/// pruned subtree, or outside the watched root altogether — and the write
-/// reported success while the barrier it was placed for could never resolve,
-/// because the root's stream does not report from where the cookie actually
-/// landed. Judging a name and then creating at a name is two questions; judging
-/// an OPEN OBJECT and creating relative to it is one.
+/// The two travel together and are replaced together, which is the point — a path
+/// whose object was never established is exactly the thing a cookie write must not
+/// descend from, and an identity with no path could name nothing to the caller or
+/// to the `prune` seat.
 ///
-/// [`path`](Self::path) is that object's own name, and it is what the
-/// containment and `prune` verdicts are taken on — never the caller's spelling,
-/// and never a path the write resolved earlier and hopes still holds.
+/// # Why an identity, and not a descriptor held open
 ///
-/// # What each platform binds, and what it leaves open
+/// A pathname is not an object. The registry records a scope's canonical root and
+/// a write later resolves it again, and between those two moments an ancestor (or
+/// the root itself) can be renamed aside and a fresh directory stood in its place:
+/// the live source stays attached to the ORIGINAL object while both canonical
+/// paths now resolve inside the REPLACEMENT. Every containment and generation
+/// check passes, the write reports success, and the marker lands in a tree whose
+/// events this stream will never carry — a barrier that resolved nowhere.
 ///
-/// **Unix** walks from the watched ROOT's descriptor down, one `openat` per
-/// component, each with `O_DIRECTORY | O_NOFOLLOW` — the discipline the fanotify
-/// walk's pinned opens already run under. No component is followed through a
-/// symlink and none can climb above the descriptor it started from, so the
-/// root-relative name this walk spells IS a true name of the object it ends
-/// holding, and the seat is judged on the components it actually traversed. The
-/// ROOT is not opened by pathname at all: the walk starts from the descriptor the
-/// scope's spawn pinned ([`RootPin`]), so a root renamed aside and replaced is
-/// descended from as the object the stream is still attached to.
+/// Holding the root's own descriptor open for the whole life of the scope closes
+/// that, and costs more than it buys: an open directory can still be removed, but
+/// the kernel defers the removal's OWN announcement until the last reference to it
+/// drops — Linux queues a watched root's `IN_DELETE_SELF` only then — so a root
+/// deleted under the caller's feet stops being reported dead for as long as this
+/// driver keeps it open. A barrier mechanism may not postpone root death; that is
+/// the one fact every other teardown hangs off.
 ///
-/// **Windows** has no descriptor-relative directory open, and needs none for the
-/// leaf: its cookie directory is minted per obligation under a name bound by the
-/// create itself (see [`CookieDir`]), so what must be pinned is the PARENT that
-/// create is anchored at. It is opened once, and the judgement is then taken on
-/// the name that HANDLE answers to rather than on the path the open was asked
-/// for — so a component swapped in before the open is judged as what it became,
-/// and one swapped in after cannot reach the create at all. What the pinned root
-/// supplies there is the FLOOR that judgement is taken against, read off the root
-/// object rather than off a pathname.
-///
-/// **Everything else** cannot bind a cookie's removal to the object created (see
-/// the third [`CookieDir::open_or_create`] arm) and so never opens one.
-/// The WATCHED ROOT, held open for as long as the scope is live — the object a
-/// cookie's descent starts from, rather than the pathname that once named it.
-///
-/// A pathname is not an object. The registry records a scope's canonical root
-/// and a write later re-resolved it, and between those two moments an ancestor
-/// (or the root itself) can be renamed aside and a fresh directory stood in its
-/// place: the live source stays attached to the ORIGINAL object while both
-/// canonical paths now resolve inside the REPLACEMENT. Every containment and
-/// generation check passes, the write reports success, and the marker lands in a
-/// tree whose events this stream will never carry — a barrier that resolved
-/// nowhere.
-///
-/// So the root is opened ONCE, at the spawn that learned it, and the descriptor
-/// travels with the scope's registry entry (a replace or a retirement drops it,
-/// exactly as they drop the root path and the generation beside it). Every cookie
-/// write descends from THIS descriptor, so what it enters is the object the
-/// stream is attached to whatever a name now denotes.
-///
-/// The identity is the spawn's own reading, kept so the descriptor can be checked
-/// against the scope it was armed for rather than merely assumed to be it: the
-/// object could already have been replaced between the source's canonicalize and
-/// this open, and a pin whose object is not the scope's is worse than none.
-///
-/// - **Unix** opens the root `O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC` and walks down
-///   from it with one pinned `openat` per component ([`CookieParent`]).
-/// - **Windows** has no descriptor-relative directory open, so what the handle
-///   buys there is the FLOOR: the name the root object itself answers to
-///   (`GetFinalPathNameByHandleW`), which a renamed-aside root carries with it,
-///   so a cookie parent resolved inside a replacement fails the containment test
-///   the pin takes.
-/// - **Everything else** cannot bind a cookie's removal to the object created
-///   (see the third [`CookieDir::open_or_create`] arm), so no pin is opened and
-///   no cookie is ever written.
-pub(crate) struct RootPin {
-  /// The root object itself. A directory handle and nothing more: nothing is
-  /// read through it, nothing is written through it, and it pins no name — the
-  /// opens both platforms use share deletion, so holding it cannot stop a peer
-  /// from renaming or removing the tree.
-  dir: std::fs::File,
-  /// The identity the SPAWN read for the root it canonicalized, re-checked
-  /// against this descriptor before any descent.
+/// So nothing is held. What travels with the scope is the identity, and the proof
+/// is taken at the one moment it is needed: a cookie write opens the root by path,
+/// reads the identity off THAT descriptor, and refuses unless it is the one the
+/// scope was armed on (see [`open_verified_root`]). A replacement standing at the
+/// name answers a different identity and is refused; an original renamed aside is
+/// not at the name at all and the open itself fails. Both are fail-closed, and
+/// both surface as the ordinary write failure a caller already handles.
+#[derive(Clone)]
+pub(crate) struct LiveRoot {
+  path: PathBuf,
   identity: RootIdentity,
 }
 
-impl RootPin {
-  /// Opens `root` and keeps it, for a scope armed on `identity`.
-  ///
-  /// Runs on the blocking pool, in the spawn that produced `identity` — never on
-  /// the owner loop, which must not resolve a pathname against a mount that can
-  /// hang.
-  pub(crate) fn open(root: &Path, identity: RootIdentity) -> Result<Self, std::io::Error> {
-    Ok(Self {
-      dir: open_root_object(root)?,
-      identity,
-    })
+impl LiveRoot {
+  pub(crate) fn new(path: PathBuf, identity: RootIdentity) -> Self {
+    Self { path, identity }
   }
 
-  /// The pinned descriptor, after re-reading its identity and finding it the
-  /// one the scope was armed on.
+  /// The live root a cell's scratch directory stands for: the directory itself as
+  /// the floor, identified the way a spawn identifies one.
   ///
-  /// Three answers, and only one of them is a refusal:
-  ///
-  /// - the identity reads and MATCHES — the descriptor is handed back;
-  /// - the identity reads and differs: the object this descriptor holds is not
-  ///   the scope's root, so nothing may descend from it. That is the root-gone
-  ///   verdict, reported as the write failure a caller already handles;
-  /// - the identity cannot be read at all. `Err` propagates as the same refusal
-  ///   (a root that cannot be `fstat`ed is not one to write a barrier under),
-  ///   while a platform that HAS no identity to give answers `Ok(None)` and the
-  ///   descriptor stands: the binding this pin exists for is the descriptor
-  ///   itself, and the identity only ever narrows it.
-  fn verified(&self) -> Result<&std::fs::File, std::io::Error> {
-    match identity_of_handle(&self.dir)? {
-      Some(live) if live != self.identity => Err(std::io::Error::other(
-        "the watched root is no longer the object this scope was armed on",
-      )),
-      _ => Ok(&self.dir),
-    }
+  /// Exactly the union of the real-filesystem cells that call it — the Unix
+  /// identity cells, the Windows non-adoption cell, and the directory-only cells
+  /// that run on any of linux/macos/windows — none of them under Miri. Any
+  /// narrower cfg leaves a configuration where this constructor compiles with no
+  /// caller.
+  #[cfg(all(
+    test,
+    not(miri),
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+  ))]
+  pub(crate) fn for_tests(path: &Path) -> Self {
+    let dir = open_root_object(path).expect("a scratch root opens");
+    let identity = identity_of_handle(&dir)
+      .expect("a scratch root answers its identity")
+      .unwrap_or(RootIdentity::new(0, 0));
+    Self::new(path.to_path_buf(), identity)
+  }
+
+  /// The canonical root the spawn recorded — the FLOOR a cookie may never be
+  /// written above, and the prefix its `prune` verdict is spelled against.
+  pub(crate) fn path(&self) -> &Path {
+    &self.path
+  }
+
+  /// The object the scope was armed on, which every cookie write re-proves the
+  /// root's name against before it descends.
+  pub(crate) fn identity(&self) -> RootIdentity {
+    self.identity
   }
 }
 
-// Exactly the union of the real-filesystem cells that call this: the Unix
-// identity cell, the Windows non-adoption cell, and the directory-only cell
-// that runs on any of linux/macos/windows (all of which collapse into
-// `any(unix, windows)`), none of them under Miri. Any narrower cfg leaves a
-// configuration where this constructor compiles with no caller.
-#[cfg(all(test, not(miri), any(unix, windows)))]
-impl RootPin {
-  /// The pin a spawn WOULD have opened for `root`, reading the identity off the
-  /// descriptor it just opened rather than from a source's own bracket.
-  ///
-  /// For the real-filesystem cells, which stand a scratch directory in a live
-  /// scope's place and have no spawn to take an identity from. Production must
-  /// not take this shortcut: the spawn's reading is what lets [`verified`] catch
-  /// a root already replaced between the source's canonicalize and this open, and
-  /// an identity read from the descriptor itself can only ever agree with it.
-  ///
-  /// [`verified`]: RootPin::verified
-  pub(crate) fn for_tests(root: &Path) -> Result<Self, std::io::Error> {
-    let dir = open_root_object(root)?;
-    let identity = identity_of_handle(&dir)?.unwrap_or(RootIdentity::new(0, 0));
-    Ok(Self { dir, identity })
+/// Opens the watched root and PROVES it is still the object the scope was armed
+/// on, before anything descends from it.
+///
+/// The open is the one pathname resolution a cookie write makes for the root, and
+/// by itself it establishes nothing: a peer that renamed the root aside and stood
+/// a replacement at its name is resolved to just as cleanly as the original would
+/// have been. The identity is what separates them — read off THIS descriptor and
+/// compared against the one the spawn recorded — so only the object the stream is
+/// attached to is ever descended from.
+///
+/// Three answers, and only one of them is a pass:
+///
+/// - the identity reads and MATCHES — the descriptor is handed back;
+/// - the identity reads and DIFFERS: whatever stands at the root's name is not
+///   this scope's root, so nothing may descend from it. That is the root-gone
+///   verdict, reported as the write failure a caller already handles;
+/// - the identity cannot be read at all. `Err` propagates as the same refusal (a
+///   root that cannot be `fstat`ed is not one to write a barrier under), while a
+///   platform that HAS no identity to give answers `Ok(None)` and the descriptor
+///   stands: the comparison only ever narrows what the open already reached.
+///
+/// Runs on the blocking pool, inside the cookie write — never on the owner loop,
+/// which must not resolve a pathname against a mount that can hang.
+#[cfg(any(
+  target_os = "linux",
+  target_os = "macos",
+  all(target_os = "windows", not(miri))
+))]
+fn open_verified_root(
+  root: &Path,
+  identity: RootIdentity,
+) -> Result<std::fs::File, std::io::Error> {
+  let dir = open_root_object(root)?;
+  match identity_of_handle(&dir)? {
+    Some(live) if live != identity => Err(std::io::Error::other(
+      "the watched root is no longer the object this scope was armed on",
+    )),
+    _ => Ok(dir),
   }
 }
 
 /// Opens the watched root as a bare directory object — the one pathname
-/// resolution a scope's cookies ever depend on, taken once at spawn.
+/// resolution a scope's cookies ever depend on, taken per write and immediately
+/// proven by [`open_verified_root`].
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn open_root_object(root: &Path) -> Result<std::fs::File, std::io::Error> {
   open_dir_no_follow(root)
@@ -1046,72 +1020,54 @@ fn open_root_object(root: &Path) -> Result<std::fs::File, std::io::Error> {
   crate::os::windows::ffi::open_cookie_parent(root).map(std::fs::File::from)
 }
 
-/// A platform with no anchored removal writes no cookie at all, so it opens
-/// nothing either — the refusal [`CookieDir::open_or_create`] answers, taken at
-/// the spawn instead of at the write.
-#[cfg(not(any(
-  target_os = "linux",
-  target_os = "macos",
-  all(target_os = "windows", not(miri))
-)))]
-fn open_root_object(root: &Path) -> Result<std::fs::File, std::io::Error> {
-  let _ = root;
-  Err(std::io::Error::new(
-    std::io::ErrorKind::Unsupported,
-    "this platform has no way to bind a cookie's removal to the object created",
-  ))
-}
-
-/// A scope's LIVE root, as the cookie registry holds it: the canonical path the
-/// spawn recorded, and the object that same spawn pinned.
+/// The directory a cookie directory is created IN, held open — the ONE object a
+/// sync write judges and then creates against.
 ///
-/// The two travel together and are replaced together, which is the point — a
-/// path with no object behind it is exactly the thing a cookie write must not
-/// descend from, and an object with no path could name nothing to the caller or
-/// to the `prune` seat.
+/// The two are the same object by construction rather than by hope, and that is
+/// this type's whole reason to exist. The write used to resolve the parent's
+/// pathname twice: once to canonicalize and judge it, and again, later, to open
+/// it. A peer that swapped an intermediate directory for a symlink between those
+/// two resolutions moved the second one somewhere the first never described — a
+/// pruned subtree, or outside the watched root altogether — and the write
+/// reported success while the barrier it was placed for could never resolve,
+/// because the root's stream does not report from where the cookie actually
+/// landed. Judging a name and then creating at a name is two questions; judging
+/// an OPEN OBJECT and creating relative to it is one.
 ///
-/// The pin is [`None`] only where one could not be had: a platform that writes no
-/// cookie at all, and the fake filesystem the driver's own cells run against,
-/// whose tree has no descriptors. A real write refuses without one rather than
-/// falling back to the pathname the pin exists to replace.
-#[derive(Clone)]
-pub(crate) struct LiveRoot {
-  path: PathBuf,
-  pin: Option<Arc<RootPin>>,
-}
-
-impl LiveRoot {
-  pub(crate) fn new(path: PathBuf, pin: Option<Arc<RootPin>>) -> Self {
-    Self { path, pin }
-  }
-
-  /// The live root a cell's scratch directory stands for: the directory itself
-  /// as the floor, pinned the way a spawn pins one ([`RootPin::for_tests`]).
-  ///
-  /// Same cfg as [`RootPin::for_tests`] and for the same reason: only the Unix
-  /// identity cell and the Windows non-adoption cell call this one.
-  #[cfg(all(test, not(miri), any(unix, windows)))]
-  pub(crate) fn for_tests(path: &Path) -> Self {
-    Self::new(
-      path.to_path_buf(),
-      Some(Arc::new(
-        RootPin::for_tests(path).expect("a scratch root opens"),
-      )),
-    )
-  }
-
-  /// The canonical root the spawn recorded — the FLOOR a cookie may never be
-  /// written above, and the prefix its `prune` verdict is spelled against.
-  pub(crate) fn path(&self) -> &Path {
-    &self.path
-  }
-
-  /// The pinned root object, when the platform could hold one.
-  fn pin(&self) -> Option<&RootPin> {
-    self.pin.as_deref()
-  }
-}
-
+/// [`path`](Self::path) is that object's own name AT THE MOMENT OF THE WALK, and
+/// it is what the containment and `prune` verdicts are taken on — never the
+/// caller's spelling, and never a path the write resolved earlier and hopes still
+/// holds. It is a spelling, not a binding: a peer that renames one of the
+/// traversed directories after the walk has passed through it leaves this path
+/// naming ground the cookie is no longer under, and nothing the write does
+/// afterwards resolves it again (see [`CookieFile::path`], which reports it and
+/// says what does and does not rest on it).
+///
+/// # What each platform binds, and what it leaves open
+///
+/// **Unix** walks from the watched ROOT's descriptor down, one `openat` per
+/// component, each with `O_DIRECTORY | O_NOFOLLOW` — the discipline the fanotify
+/// walk's pinned opens already run under. No component is followed through a
+/// symlink and none can climb above the descriptor it started from, so the
+/// root-relative name this walk spells IS a true name of the object it ends
+/// holding, and the seat is judged on the components it actually traversed. The
+/// ROOT the walk starts from is opened by pathname once and PROVEN to be the
+/// object the scope was armed on before a single component is descended
+/// ([`open_verified_root`]), so a root renamed aside and replaced is refused
+/// rather than walked into.
+///
+/// **Windows** has no descriptor-relative directory open, and needs none for the
+/// leaf: its cookie directory is minted per obligation under a name bound by the
+/// create itself (see [`CookieDir`]), so what must be pinned is the PARENT that
+/// create is anchored at. It is opened once, and the judgement is then taken on
+/// the name that HANDLE answers to rather than on the path the open was asked
+/// for — so a component swapped in before the open is judged as what it became,
+/// and one swapped in after cannot reach the create at all. What the verified root
+/// supplies there is the FLOOR that judgement is taken against, read off the root
+/// object rather than off a pathname.
+///
+/// **Everything else** cannot bind a cookie's removal to the object created (see
+/// the third [`CookieDir::open_or_create`] arm) and so never opens one.
 struct CookieParent {
   /// The opened object's OWN name — the string every verdict is taken on, and
   /// the prefix a cookie's landing path is reported under.
@@ -1133,27 +1089,28 @@ impl CookieParent {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl CookieParent {
-  /// Walks from the PINNED root down to `dir`, one pinned `openat` per
+  /// Walks from the VERIFIED root down to `dir`, one pinned `openat` per
   /// component.
   ///
-  /// `root` supplies the SPELLING the descent is measured in and nothing else:
-  /// the walk's first descriptor is the scope's own root object ([`RootPin`]),
-  /// duplicated so the pin outlives this parent, so a root renamed aside between
-  /// the caller's `canonicalize` and this call is descended from as the object it
-  /// still is — never as whatever now stands at its name.
+  /// `root` supplies the SPELLING the descent is measured in and the name the
+  /// walk's first descriptor is opened by; `identity` is what makes that
+  /// descriptor an OBJECT rather than a name, the descent starting only once what
+  /// stands at that spelling is proven to be the object the scope was armed on
+  /// ([`open_verified_root`]). A root renamed aside and replaced between the
+  /// caller's `canonicalize` and this call is refused here, never walked into.
   ///
   /// `dir` must lie under `root` (the caller's lexical preflight has already
   /// said so); anything else is a seam bug and refused rather than walked.
-  fn open(pin: &RootPin, root: &Path, dir: &Path) -> Result<Self, std::io::Error> {
+  fn open(identity: RootIdentity, root: &Path, dir: &Path) -> Result<Self, std::io::Error> {
     use std::os::fd::OwnedFd;
 
     let relative = dir.strip_prefix(root).map_err(|_| {
       std::io::Error::other("the cookie directory does not lie under the watched root")
     })?;
-    // DUPLICATED rather than borrowed: the walk consumes its descriptor at every
-    // step, and a zero-component descent (the cookie goes in the root itself)
-    // would otherwise have to hand back the scope's own pin.
-    let mut fd = OwnedFd::from(pin.verified()?.try_clone()?);
+    // The walk OWNS this descriptor: it consumes one at every step, and a
+    // zero-component descent (the cookie goes in the root itself) simply ends
+    // holding the very root the verification opened.
+    let mut fd = OwnedFd::from(open_verified_root(root, identity)?);
     let mut path = root.to_path_buf();
     for component in relative.components() {
       let std::path::Component::Normal(name) = component else {
@@ -1174,26 +1131,23 @@ impl CookieParent {
 #[cfg(all(target_os = "windows", not(miri)))]
 impl CookieParent {
   /// Opens `dir` once, answers the name that HANDLE holds, and requires that
-  /// name to lie under the name the PINNED ROOT holds.
+  /// name to lie under the name the VERIFIED ROOT holds.
   ///
   /// This platform confines the create by anchoring it at the returned handle
-  /// rather than by walking, so what the pin buys here is the FLOOR. Both sides
+  /// rather than by walking, so what the root buys here is the FLOOR. Both sides
   /// of the containment test are names read off open objects: the root's from the
-  /// descriptor the spawn kept, the parent's from the handle this call just
-  /// produced. A root renamed aside carries its own name with it, so a cookie
-  /// parent resolved inside a REPLACEMENT standing at the old name is refused
-  /// here — which is precisely the escape a pathname-to-pathname comparison
-  /// cannot see, both spellings being perfectly contained.
-  ///
-  /// `root` plays no part: the floor comes from the object, never from the
-  /// spelling that once named it.
-  fn open(pin: &RootPin, root: &Path, dir: &Path) -> Result<Self, std::io::Error> {
+  /// descriptor this call opened and proved against the identity the scope was
+  /// armed on, the parent's from the handle this call just produced. A root
+  /// renamed aside carries its own name with it, so a cookie parent resolved
+  /// inside a REPLACEMENT standing at the old name is refused here — which is
+  /// precisely the escape a pathname-to-pathname comparison cannot see, both
+  /// spellings being perfectly contained.
+  fn open(identity: RootIdentity, root: &Path, dir: &Path) -> Result<Self, std::io::Error> {
     use std::os::windows::io::AsHandle;
 
     use crate::os::windows::ffi;
 
-    let _ = root;
-    let floor = ffi::final_path_of(pin.verified()?.as_handle())?;
+    let floor = ffi::final_path_of(open_verified_root(root, identity)?.as_handle())?;
     let handle = ffi::open_cookie_parent(dir)?;
     let path = ffi::final_path_of(handle.as_handle())?;
     if !path.starts_with(&floor) {
@@ -1212,10 +1166,10 @@ impl CookieParent {
 )))]
 impl CookieParent {
   /// The same refusal [`CookieDir::open_or_create`] answers on this platform,
-  /// taken one step earlier so nothing is opened at all. Unreachable in practice:
-  /// no [`RootPin`] can be opened here for a caller to have one to pass.
-  fn open(pin: &RootPin, root: &Path, dir: &Path) -> Result<Self, std::io::Error> {
-    let _ = (pin, root, dir);
+  /// taken one step earlier so nothing is opened at all — not even the root this
+  /// platform has no way to descend from.
+  fn open(identity: RootIdentity, root: &Path, dir: &Path) -> Result<Self, std::io::Error> {
+    let _ = (identity, root, dir);
     Err(std::io::Error::new(
       std::io::ErrorKind::Unsupported,
       "this platform has no way to bind a cookie's removal to the object created",
@@ -2104,6 +2058,23 @@ pub(crate) enum CookieProof {
 /// told and what a path-addressed cleanup request resolves through. No removal
 /// ever resolves it.
 ///
+/// # The reported path is the spelling at WRITE time
+///
+/// It is built from the names the parent walk traversed ([`CookieParent`]), so it
+/// describes where the cookie went at the instant of the walk. A peer that renames
+/// one of those directories between the walk and the create leaves the cookie
+/// under the NEW name while this record keeps the old spelling — the create is
+/// anchored at the directory descriptor, so the object is exactly where it should
+/// be, and only the words for it are stale.
+///
+/// Nothing this driver does depends on those words denoting anything: the removal
+/// is anchored, and the cleanup registry keys a path-addressed reap on THIS same
+/// reported spelling, so the two agree with each other whether or not either
+/// agrees with the tree. What must not depend on them is the CALLER's barrier, and
+/// it does not — the umbrella correlates a pending barrier by the marker's own
+/// name under the root it was written for, so a marker reported at one path and
+/// observed at another still resolves it.
+///
 /// # The pin, and why an identity alone proves nothing
 ///
 /// Inode numbers and Windows file ids are ALLOCATOR slots, not names: each is
@@ -2975,9 +2946,9 @@ struct CookieRegistry<F: FsOps> {
   /// scope (the write holds its own clone), so this never accrues dead scopes.
   retiring: HashMap<ScopeId, Arc<AtomicBool>>,
   /// Each live scope's LIVE ROOT: the canonical path its cookies may never be
-  /// written above (see [`cookie_dir`]) together with the root OBJECT the spawn
-  /// pinned, which every write descends from ([`RootPin`]). Dropped with the
-  /// scope, like the flags — so a retirement closes the descriptor, and a
+  /// written above (see [`cookie_dir`]) together with the IDENTITY of the object
+  /// the spawn armed on, which every write re-proves that path against before it
+  /// descends ([`LiveRoot`]). Dropped with the scope, like the flags — and a
   /// replace's commit swaps in the new stream's own.
   roots: HashMap<ScopeId, LiveRoot>,
   /// Each live scope's root GENERATION, cloned into each dispatched write and
@@ -3905,14 +3876,10 @@ enum SameFdPhase {
   /// The no-spawn [`RootMeta`] resolve ([`FsOps::resolve_root_meta`]) is on
   /// the blocking pool.
   MetaPending,
-  ///`reserved` is pre-arming the widened root on the LIVE port; `meta` is the
-  /// resolved, re-validated world the commit will adopt, and `root_pin` the
-  /// object that meta named.
-  Arming {
-    reserved: WatchId,
-    meta: RootMeta,
-    root_pin: Option<Arc<RootPin>>,
-  },
+  ///`reserved` is pre-arming the widened root on the LIVE port and `meta` is the
+  /// resolved, re-validated world the commit will adopt — including the identity
+  /// the new cookie floor is recorded under.
+  Arming { reserved: WatchId, meta: RootMeta },
   /// The pre-arm succeeded and the commit is CATCHING UP to the lane: the
   /// NORMAL source arm processes the scope's queued messages one per loop
   /// iteration — benign records deliver at the (still current) old root,
@@ -3930,8 +3897,6 @@ enum SameFdPhase {
   CatchUp {
     reserved: WatchId,
     meta: RootMeta,
-    /// The widened root's pinned object, travelling with the meta that named it.
-    root_pin: Option<Arc<RootPin>>,
     /// The pre-arm outcome the commit replays (`Installed`/`Aliased`).
     replay: WatchOutcome,
     /// Prefix messages still to be processed by the arm before the commit
@@ -4954,14 +4919,9 @@ pub(crate) struct SpawnedSource<H> {
   pub(crate) handle: H,
   /// The stream's single ordered message queue.
   pub(crate) receiver: EventReceiver,
-  /// What the spawn learned about the root.
+  /// What the spawn learned about the root — including the identity the scope's
+  /// cookie floor is recorded under ([`LiveRoot`]).
   pub(crate) meta: RootMeta,
-  /// The root OBJECT this spawn pinned, to travel with the scope's cookie
-  /// registry entry ([`LiveRoot`]). Opened here because this is the one place a
-  /// root is resolved on the blocking pool with its identity already in hand;
-  /// [`None`] where the platform can hold no pin, and from the fake filesystem
-  /// the driver's own cells run against.
-  pub(crate) root_pin: Option<Arc<RootPin>>,
 }
 
 /// The watcher-side registry of live scopes, written EXCLUSIVELY by the
@@ -5195,30 +5155,16 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
   /// `lstat`s one path (blocking).
   fn probe(&self, path: &Path) -> ProbeOutcome;
 
-  /// Opens `root` and keeps it, for a scope armed on `identity` (blocking) — the
-  /// object every later cookie write for that scope descends from ([`RootPin`]).
-  ///
-  /// Called on the blocking pool, in the same job that learned `identity`, and
-  /// never on the owner loop: it resolves a pathname, and a pathname on a hung
-  /// mount must not be resolved where the driver's own progress depends on it.
-  ///
-  /// `None` is a REFUSAL of barriers, not of the watch: the stream is up and its
-  /// events are unaffected, and a `sync` on a pinless scope answers a typed write
-  /// failure rather than descending from the name the pin exists to replace. A
-  /// platform with no anchored removal answers `None` always, and so does a fake
-  /// filesystem with no descriptors to hand out.
-  fn pin_root(&self, root: &Path, identity: RootIdentity) -> Option<Arc<RootPin>>;
-
   /// Creates the sync cookie `name` for `dir`, inside `root` (blocking),
   /// returning WHERE it landed and what authorizes its later removal. The
-  /// root is the scope's LIVE one — the canonical path AND the object the spawn
-  /// pinned ([`LiveRoot`]) — and a real implementation descends from that object
-  /// rather than resolving its path again: a root renamed aside and replaced
-  /// leaves both spellings perfectly contained while the live stream stays
-  /// attached to the original, so a write that trusted the name would land its
-  /// marker where no event of this scope can ever come from. An implementation
-  /// with no pin to descend from refuses; it must never fall back to the
-  /// pathname.
+  /// root is the scope's LIVE one — the canonical path AND the identity of the
+  /// object the spawn armed on ([`LiveRoot`]) — and a real implementation proves
+  /// the path still reaches that object before it descends: a root renamed aside
+  /// and replaced leaves both spellings perfectly contained while the live stream
+  /// stays attached to the original, so a write that trusted the name alone would
+  /// land its marker where no event of this scope can ever come from. An
+  /// implementation that cannot take that proof refuses; it must never write
+  /// under an unproven name.
   ///
   /// cookie's whole purpose is the kernel event its creation mints: it rides the
   /// root's ordered queue behind every change the backend reported before it, so
@@ -6394,24 +6340,11 @@ impl FsOps for RealFs {
     // the metadata is a safe authority for every event on the queue; deriving
     // any of it here, after start, could postdate events already enqueued.
     let (handle, receiver, meta) = crate::os::spawn_source(config)?;
-    // The root OBJECT, opened HERE — on the blocking pool, in the one call that
-    // already holds the canonical root and the identity read for it, and before
-    // the scope can be recorded live. A failure is not the WATCH's failure: the
-    // stream is up and every event it carries is unaffected, and only a sync
-    // barrier — which refuses without a pin rather than falling back to the
-    // pathname — is denied. Failing the spawn instead would turn a root this
-    // process may watch but not open into a watch that cannot start at all.
-    let root_pin = self.pin_root(&meta.root, meta.identity);
     Ok(SpawnedSource {
       handle,
       receiver,
       meta,
-      root_pin,
     })
-  }
-
-  fn pin_root(&self, root: &Path, identity: RootIdentity) -> Option<Arc<RootPin>> {
-    RootPin::open(root, identity).ok().map(Arc::new)
   }
 
   fn probe(&self, path: &Path) -> ProbeOutcome {
@@ -6484,19 +6417,14 @@ impl FsOps for RealFs {
     // and a barrier that could never resolve, because the fence suppresses the
     // event the barrier waits on.
     //
-    // It descends from the scope's own pinned ROOT OBJECT, not from the root's
-    // name: the canonicalize above cannot tell a live root from a replacement
-    // standing at its name, and a marker written into the replacement rides no
-    // queue this scope reads. A scope with no pin has no object to descend from
-    // and refuses here rather than resolving the name a second time.
-    let Some(pin) = root.pin() else {
-      return Err(CookieWriteError::clean(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "this scope holds no pinned root object to write a cookie under",
-      )));
-    };
-    let parent =
-      CookieParent::open(pin, canonical_root, &canonical_dir).map_err(CookieWriteError::clean)?;
+    // It descends from the scope's own ROOT OBJECT, not from the root's name: the
+    // canonicalize above cannot tell a live root from a replacement standing at
+    // its name, and a marker written into the replacement rides no queue this
+    // scope reads. So the walk's first descriptor is opened by name and then
+    // PROVEN against the identity the scope was armed on, and a mismatch refuses
+    // the write outright rather than descending into whatever answered.
+    let parent = CookieParent::open(root.identity(), canonical_root, &canonical_dir)
+      .map_err(CookieWriteError::clean)?;
     if !parent.path().starts_with(canonical_root) {
       // The containment question again, asked of the OBJECT rather than of the
       // spelling that reached it. On the walking platforms this cannot fail — the
@@ -7494,11 +7422,6 @@ enum OpResult<H> {
   ReplaceMeta {
     scope: ScopeId,
     result: Result<RootMeta, SourceError>,
-    /// The widened root's OBJECT, pinned in the same blocking job that resolved
-    /// the meta — the widen reuses its transport, so nothing else on its path
-    /// opens a root and the cookie registry would otherwise be left recording a
-    /// path with no object behind it.
-    root_pin: Option<Arc<RootPin>>,
   },
   /// A same-transport widen's pre-arm of the widened root on the LIVE port
   /// resolved: commit, or unwind with the old coverage untouched.
@@ -8414,11 +8337,12 @@ pub(crate) async fn run<R, F>(
               if backend.is_kernel_recursive() {
                 let replace = streams.replace_states.remove(&scope).expect("just checked");
                 let widened = spawned.meta.root.clone();
-                // The new stream's OWN root object, taken before the spawn moves
-                // into the commit: the cookie floor and the object cookies
-                // descend from are re-recorded together, so a barrier dispatched
-                // after this replace can never descend from the retired root.
-                let widened_pin = spawned.root_pin.clone();
+                // The new stream's OWN root identity, taken before the spawn
+                // moves into the commit: the cookie floor and the object every
+                // write proves that floor against are re-recorded together, so a
+                // barrier dispatched after this replace can never descend from
+                // the retired root.
+                let widened_identity = spawned.meta.identity;
                 let outcome = commit_replace::<F>(
                   &mut core,
                   &ops,
@@ -8447,7 +8371,7 @@ pub(crate) async fn run<R, F>(
                   // the lane swap. This only RE-records the cookie floor for the
                   // widened root.
                   revoke_uncovered_parked_cookies(&mut core, &mut parked_cookies, &cookies, scope, &widened);
-                  cookies.scope_live(scope, LiveRoot::new(widened, widened_pin));
+                  cookies.scope_live(scope, LiveRoot::new(widened, widened_identity));
                 }
                 // The reservation releases HERE — commit or failure alike —
                 // after the registry overwrite (commit) has already made the
@@ -8517,7 +8441,7 @@ pub(crate) async fn run<R, F>(
               // conflict check and the port attach between them are caller code
               // and a lock the backend can leave poisoned, either of which can
               // unwind past a plain local (see [`StreamEscrow`]).
-              let EscrowedSpawn { stream, receiver, meta, root_pin } =
+              let EscrowedSpawn { stream, receiver, meta } =
                 EscrowedSpawn::new(spawned, reaper.sink());
               let canonical_root = meta.root.clone();
               let identity = meta.identity;
@@ -8589,7 +8513,7 @@ pub(crate) async fn run<R, F>(
                 scope_backends.insert(scope, backend);
                 // The cookie floor travels with the stream: a sync for this
                 // scope may write inside this root, never above it.
-                cookies.scope_live(scope, LiveRoot::new(canonical_root.clone(), root_pin));
+                cookies.scope_live(scope, LiveRoot::new(canonical_root.clone(), identity));
                 match backend {
                   // Descending: the stream is live but covers NOTHING until
                   // the root's kernel watch arms; the grant defers to the
@@ -8731,9 +8655,9 @@ pub(crate) async fn run<R, F>(
           // the commit below are both on the far side of the handoff.
           let spawned = EscrowedSpawn::new(spawned, reaper.sink());
           let widened = spawned.meta.root.clone();
-          // The new stream's own root object, taken before the spawn moves into
+          // The new stream's own root identity, taken before the spawn moves into
           // the commit — see the kernel-recursive arm above.
-          let widened_pin = spawned.root_pin.clone();
+          let widened_identity = spawned.meta.identity;
           let outcome = if !streams.handles.contains_key(&scope) {
             // Death wins: the scope ended while the pre-arm was in flight.
             retire_refused::<F>(&op_tx, &reaper, &mut pending_teardowns, scope, spawned);
@@ -8778,12 +8702,12 @@ pub(crate) async fn run<R, F>(
             // at the lane swap. Parked barriers the new root no longer covers are
             // revoked first.
             revoke_uncovered_parked_cookies(&mut core, &mut parked_cookies, &cookies, scope, &widened);
-            cookies.scope_live(scope, LiveRoot::new(widened, widened_pin));
+            cookies.scope_live(scope, LiveRoot::new(widened, widened_identity));
           }
           drop(replace.reservation);
           let _ = replace.reply.send(outcome.map(|_| ()));
         }
-        OpResult::ReplaceMeta { scope, result, root_pin } => {
+        OpResult::ReplaceMeta { scope, result } => {
           if !streams.replace_states.contains_key(&scope) {
             // Swept by close; the resolve owned nothing.
             continue;
@@ -8904,7 +8828,7 @@ pub(crate) async fn run<R, F>(
               ino,
             });
           streams.replace_states.get_mut(&scope).expect("just checked").mode = ReplaceMode::SameFd {
-            phase: SameFdPhase::Arming { reserved, meta, root_pin },
+            phase: SameFdPhase::Arming { reserved, meta },
           };
           let ops_for_arm = ops.clone();
           let tx = op_tx.clone();
@@ -8945,7 +8869,7 @@ pub(crate) async fn run<R, F>(
             continue;
           };
           let ReplaceMode::SameFd {
-            phase: SameFdPhase::Arming { reserved, meta, root_pin },
+            phase: SameFdPhase::Arming { reserved, meta },
           } = replace.mode
           else {
             debug_assert!(false, "WidenArmed only follows a widen pre-arm");
@@ -8990,7 +8914,6 @@ pub(crate) async fn run<R, F>(
                   phase: SameFdPhase::CatchUp {
                     reserved,
                     meta,
-                    root_pin,
                     replay: outcome,
                     remaining,
                   },
@@ -9325,16 +9248,7 @@ pub(crate) async fn run<R, F>(
                   let path = root;
                   R::spawn_blocking_detach(move || {
                     let result = ops_for_meta.resolve_root_meta(&path);
-                    // Pinned HERE, beside the meta, for the reason the spawn
-                    // pins beside its own: this job is on the blocking pool and
-                    // already holds the widened root's identity, and the commit
-                    // that records the new floor runs on the owner loop, which
-                    // may not resolve a pathname at all.
-                    let root_pin = result
-                      .as_ref()
-                      .ok()
-                      .and_then(|meta| ops_for_meta.pin_root(&meta.root, meta.identity));
-                    let _ = tx.try_send(OpResult::ReplaceMeta { scope, result, root_pin });
+                    let _ = tx.try_send(OpResult::ReplaceMeta { scope, result });
                   });
                   slot.insert(ReplaceState {
                     reservation,
@@ -11016,7 +10930,6 @@ struct EscrowedSpawn<H: SourceControl + Send + 'static> {
   stream: StreamEscrow<H>,
   receiver: EventReceiver,
   meta: RootMeta,
-  root_pin: Option<Arc<RootPin>>,
 }
 
 impl<H: SourceControl + Send + 'static> EscrowedSpawn<H> {
@@ -11025,7 +10938,6 @@ impl<H: SourceControl + Send + 'static> EscrowedSpawn<H> {
       stream: StreamEscrow::new(spawned.handle, sink),
       receiver: spawned.receiver,
       meta: spawned.meta,
-      root_pin: spawned.root_pin,
     }
   }
 
@@ -11042,13 +10954,11 @@ impl<H: SourceControl + Send + 'static> EscrowedSpawn<H> {
       mut stream,
       receiver,
       meta,
-      root_pin,
     } = self;
     *slot = Some(SpawnedSource {
       handle: stream.disarm(),
       receiver,
       meta,
-      root_pin,
     });
   }
 
@@ -11858,7 +11768,6 @@ where
         SameFdPhase::CatchUp {
           reserved,
           meta,
-          root_pin,
           replay,
           ..
         },
@@ -11869,6 +11778,9 @@ where
     };
     resolved_any = true;
     let widened = meta.root.clone();
+    // Read before the meta moves into the commit: the widened floor and the
+    // identity every later write proves it against are recorded together.
+    let widened_identity = meta.identity;
     let outcome = if dead {
       // Death won during the catch-up: the arm's one end-marker/death path
       // already ran the funnel; the witnessed window closes with the widen.
@@ -11905,7 +11817,7 @@ where
         // stream did not retire, and an in-flight cookie write under the
         // old root must still claim on it.
         revoke_uncovered_parked_cookies(core, parked_cookies, cookies, scope, &widened);
-        cookies.scope_live(scope, LiveRoot::new(widened, root_pin));
+        cookies.scope_live(scope, LiveRoot::new(widened, widened_identity));
         Ok(())
       }
       Ok(WidenOutcome::FallBack(taint)) => {
@@ -12058,7 +11970,6 @@ where
     stream,
     receiver,
     meta,
-    root_pin: _,
   } = spawned;
   // Bump the cookie root generation AT the lane swap, under the ledger lock: a
   // write dispatched under the retiring root can no longer claim once the new

@@ -95,6 +95,20 @@ struct IndexerSource<R: RuntimeLite> {
   /// a future dropped mid-write still leaves `cancel_sync` a precise address for a marker that may
   /// yet land — the fs binding's own arrangement, mirrored here.
   pending_syncs: HashMap<RootHandle, (SyncToken, SyncTicket)>,
+  /// Cell-scoped: rewrite one `Seg` of a completed write's REPORTED landing, `(true, reported)`.
+  ///
+  /// It models the one thing a binding cannot promise about that report — that its ancestor path
+  /// still names the ground the marker is on. A real write spells the landing out of the
+  /// directories its walk traversed, so a peer that renames one of them between the walk and the
+  /// create leaves the marker under the new name and the report under the old. That window is
+  /// microseconds wide inside the lower crate's write and cannot be entered from a test, so the
+  /// perturbation is applied where the owner sees it: the marker is created and observed where it
+  /// truly is, and only the report is stale.
+  stale_landing: Option<(String, String)>,
+  /// The TRUE landing each perturbed report stands for, so the reap still addresses the marker
+  /// that exists — the real binding's report and its cleanup key are one and the same stale
+  /// spelling, and this keeps that true here.
+  reported_landings: HashMap<Vec<Comp>, Vec<Comp>>,
 }
 
 /// Mirror of the fs source's [`OPPORTUNISTIC_RELEASE_HANDOFFS`](../src/source/fs/mod.rs): the oldest
@@ -126,7 +140,31 @@ impl<R: RuntimeLite> IndexerSource<R> {
       pending_releases: VecDeque::new(),
       pending_set: HashSet::new(),
       pending_syncs: HashMap::new(),
+      stale_landing: None,
+      reported_landings: HashMap::new(),
     }
+  }
+
+  /// Reports every later landing with the `Seg(true_seg)` component rewritten to
+  /// `Seg(reported_seg)` — see [`stale_landing`](Self::stale_landing).
+  fn report_landings_under(&mut self, true_seg: &str, reported_seg: &str) {
+    self.stale_landing = Some((true_seg.to_string(), reported_seg.to_string()));
+  }
+
+  /// The key a completed write REPORTS for `landed`, and the record that maps it back.
+  fn report_landing(&mut self, landed: Vec<Comp>) -> Vec<Comp> {
+    let Some((truth, reported)) = self.stale_landing.clone() else {
+      return landed;
+    };
+    let stale: Vec<Comp> = landed
+      .iter()
+      .map(|comp| match comp {
+        Comp::Seg(seg) if *seg == truth => Comp::Seg(reported.clone()),
+        other => other.clone(),
+      })
+      .collect();
+    self.reported_landings.insert(stale.clone(), landed);
+    stale
   }
 
   /// The one key → path conversion: the longest mount whose key-prefix begins `key`, with
@@ -180,8 +218,9 @@ const MARKER_NONCE_DIGITS: usize = 16;
 /// identity.
 ///
 /// **All four fields are rendered, and the last one is the load-bearing one.** The umbrella
-/// resolves a barrier by MATCHING the marker's key and nothing else, and `(instance, pid, seq)`
-/// is fully computable from any marker already lying under the watched tree — so a rendering of
+/// resolves a barrier by MATCHING the marker's NAME under its root and nothing else, and
+/// `(instance, pid, seq)` is fully computable from any marker already lying under the watched
+/// tree — so a rendering of
 /// those three alone hands a co-user the NEXT marker's name, which is enough to create-and-remove
 /// it ahead of time and leave a stale matching event that resolves the barrier before the
 /// caller's own pre-call changes have drained. `nonce` is the one field an observer cannot
@@ -477,7 +516,12 @@ impl<R: RuntimeLite> Source<Comp> for IndexerSource<R> {
     // only the dropped-future path above leaves it behind.
     self.pending_syncs.remove(&handle);
     match placed {
-      Ok(path) => self.path_to_key(&path).ok_or(SyncError::CookieDirUncovered),
+      Ok(path) => {
+        let landed = self
+          .path_to_key(&path)
+          .ok_or(SyncError::CookieDirUncovered)?;
+        Ok(self.report_landing(landed))
+      }
       // The fs-to-neutral map at this binding, the sync half of `fs_fault`: honest and
       // conservative, with a refusal this source cannot classify degrading to a write failure
       // rather than to a silent success.
@@ -497,7 +541,14 @@ impl<R: RuntimeLite> Source<Comp> for IndexerSource<R> {
   /// watcher owns every cookie it wrote and unlinks it at teardown regardless, so a reap that
   /// arrives late (or to an already-closed watcher) leaks nothing.
   fn end_sync(&mut self, _handle: RootHandle, cookie_key: &[Comp]) {
-    if let Some(path) = self.key_to_path(cookie_key) {
+    // The reap addresses the marker that EXISTS, which is what the real binding does too: its
+    // report and its cleanup key are the same spelling, stale or not. Only here are the two
+    // deliberately different, so the mapping recorded at the report is what puts them back.
+    let landed = self
+      .reported_landings
+      .remove(cookie_key)
+      .unwrap_or_else(|| cookie_key.to_vec());
+    if let Some(path) = self.key_to_path(&landed) {
       self.watcher.request_remove_cookie(path);
     }
   }
@@ -571,10 +622,22 @@ struct Rig {
 
 /// Builds a single-mount indexer over a real watcher, with the given umbrella options.
 fn rig(prefix: &str, volume: u64, options: TributariesOptions) -> Rig {
+  rig_with(prefix, volume, options, |_| {})
+}
+
+/// [`rig`], with one hook on the source before the driver takes ownership of it — for the cell
+/// that needs this binding to report its landings under a spelling the tree does not use.
+fn rig_with(
+  prefix: &str,
+  volume: u64,
+  options: TributariesOptions,
+  tune: impl FnOnce(&mut IndexerSource<TokioRuntime>),
+) -> Rig {
   let (dir, root) = scratch(prefix);
   let watcher = Watcher::<TokioRuntime>::new(WatcherOptions::new()).expect("build watcher");
   let volume_key = std::vec![Comp::Volume(volume)];
-  let source = IndexerSource::new(watcher, std::vec![(volume_key.clone(), root.clone())]);
+  let mut source = IndexerSource::new(watcher, std::vec![(volume_key.clone(), root.clone())]);
+  tune(&mut source);
   let w: Indexer =
     Tributaries::with_source(source, options).expect("the default capacities are in range");
   Rig {
@@ -1349,9 +1412,10 @@ async fn deleted_root_delivers_terminal_rescan_and_is_retired() {
 /// identity fields it can name — `(instance, pid, seq)` — while ignoring the one it cannot
 /// compute. Such a binding compiles, satisfies every other clause of the seam, suppresses its own
 /// markers correctly, and still breaks the barrier: the umbrella resolves a barrier by MATCHING
-/// the marker's key and nothing else, so a co-user under the watched tree can read one marker,
-/// compute the NEXT one, create-and-remove it ahead of time, and leave a stale matching event
-/// that resolves a later barrier before the caller's own pre-call changes have drained.
+/// the marker's NAME under its root and nothing else, so a co-user under the watched tree can
+/// read one marker, compute the NEXT one, create-and-remove it ahead of time, and leave a stale
+/// matching event that resolves a later barrier before the caller's own pre-call changes have
+/// drained.
 ///
 /// # Why the assertion is a decode, not a count
 ///
@@ -1493,6 +1557,81 @@ async fn sync_barrier_resolves_over_the_custom_binding() {
       "the barrier promised {name} was deliverable, but a plain drain missed it (seen: {seen:?})"
     );
   }
+
+  w.close().await.expect("close");
+}
+
+/// (j.3) The barrier is identified by its marker's LEAF under its root — never by the ancestor
+/// path the write reported.
+///
+/// A binding reports where its marker landed by spelling out the directories its walk traversed,
+/// and that spelling is a fact about the moment of the walk. A peer that renames one of those
+/// directories between the walk and the create leaves the marker under the NEW name (correctly:
+/// the create is anchored at a descriptor, not at a path) while the report keeps the old one, and
+/// the backend orders the rename ahead of the create — so the owner is told about the marker at a
+/// path the write never mentioned. Matching the reported key whole then misses it, and the caller
+/// waits out its whole deadline over a source that placed its marker exactly where the ordered
+/// queue says it is.
+///
+/// That window lives inside the lower crate's write, microseconds wide, and no test above it can
+/// enter it. So this cell perturbs the one thing the window produces and the owner can see: the
+/// binding REPORTS its landing under a segment the tree does not use, while the marker is created,
+/// observed and reaped where it truly is (see [`IndexerSource::stale_landing`]). Everything else
+/// is the live path — the real watcher, the real driver, the real classifier.
+///
+/// Every round must RESOLVE — that alone is what a whole-key match fails — and at least one must
+/// resolve by DELIVERY rather than by domination: a `Rescan` standing in for the barrier would
+/// have resolved it under a whole-key match too, and proved nothing. The first round absorbs the
+/// registration's own debt, so the rounds after it are ordinarily delivery.
+///
+/// FAIL-ON-REVERT: match the pending key whole in `Owner::resolve_matching_pending_sync` and the
+/// marker can no longer meet a barrier at all — the first round the registration's own debt does
+/// not dominate fails on its deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sync_barrier_resolves_when_the_reported_landing_is_stale() {
+  let Rig {
+    _dir,
+    root,
+    volume,
+    mut w,
+  } = rig_with("sync-stale", 11, TributariesOptions::new(), |source| {
+    source.report_landings_under("live", "renamed-away");
+  });
+  std::fs::create_dir_all(root.join("live")).expect("the directory the barrier writes into");
+
+  let sub = w
+    .watch(key(&volume, &["live"]), Loc { id: 1 }, WatchOptions::new())
+    .await
+    .expect("watch the directory the marker goes in");
+
+  let mut delivered = false;
+  for round in 0..4 {
+    std::fs::write(root.join("live").join(format!("pre-{round}.txt")), b"x")
+      .expect("a pre-call change");
+    let outcome = w
+      .sync(sub, DEADLINE)
+      .await
+      .expect("the barrier resolves on the marker's leaf, not on the path the write reported");
+    delivered |= outcome.is_delivered();
+    // Drain what the barrier just promised, and prove no artifact is among it: the classifier
+    // reads the leaf and its parent, neither of which the reported spelling touches.
+    while let Some(event) = w.next().now_or_never().flatten() {
+      if event.kind().is_rescan() {
+        continue;
+      }
+      if let Some(Comp::Seg(leaf)) = event.key().last() {
+        assert!(
+          !is_marker_leaf(leaf) && !is_sync_cookie_dir_name(leaf),
+          "a barrier artifact must NEVER surface on a consumer stream: {leaf}"
+        );
+      }
+    }
+  }
+  assert!(
+    delivered,
+    "every round resolved, but none of them by DELIVERY — the marker itself never met a \
+     barrier, so nothing here distinguishes the leaf match from a whole-key one"
+  );
 
   w.close().await.expect("close");
 }

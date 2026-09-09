@@ -604,12 +604,15 @@ pub trait LocalSource<C> {
   /// [`is_sync_artifact`](Self::is_sync_artifact) MUST answer `true` for the key it returns.
   ///
   /// The nonce is load-bearing, not decoration. The owner resolves a barrier by MATCHING the
-  /// marker's key and nothing else, so a marker identity a co-user under the watched tree can
-  /// predict lets that co-user create-and-remove the NEXT one ahead of time and leave a stale
-  /// matching event behind — one that resolves the barrier before the caller's own pre-call
-  /// changes have drained, which is the one thing the barrier promises. `(instance, pid, seq)` is
-  /// fully computable from any marker already observed, so a binding that renders those three and
-  /// drops the nonce satisfies every other clause here and still breaks the barrier, silently.
+  /// marker's NAME — the last component of the key this returns — under the root the sync was
+  /// begun on, and nothing else: the ancestor path is a spelling the write reported, which an
+  /// in-flight rename can invalidate, so it cannot be part of the identity. A marker name a
+  /// co-user under the watched tree can predict therefore lets that co-user create-and-remove
+  /// the NEXT one ahead of time and leave a stale matching event behind — one that resolves the
+  /// barrier before the caller's own pre-call changes have drained, which is the one thing the
+  /// barrier promises. `(instance, pid, seq)` is fully computable from any marker already
+  /// observed, so a binding that renders those three and drops the nonce satisfies every other
+  /// clause here and still breaks the barrier, silently.
   /// (The fs binding renders all four: `.tributaries-sync-<instance>-<pid>-<seq>-<nonce>`.)
   ///
   /// A source that must park the write behind its own coverage-settle machinery does so INSIDE
@@ -946,12 +949,15 @@ pub trait Source<C> {
   /// [`is_sync_artifact`](Self::is_sync_artifact) MUST answer `true` for the key it returns.
   ///
   /// The nonce is load-bearing, not decoration. The owner resolves a barrier by MATCHING the
-  /// marker's key and nothing else, so a marker identity a co-user under the watched tree can
-  /// predict lets that co-user create-and-remove the NEXT one ahead of time and leave a stale
-  /// matching event behind — one that resolves the barrier before the caller's own pre-call
-  /// changes have drained, which is the one thing the barrier promises. `(instance, pid, seq)` is
-  /// fully computable from any marker already observed, so a binding that renders those three and
-  /// drops the nonce satisfies every other clause here and still breaks the barrier, silently.
+  /// marker's NAME — the last component of the key this returns — under the root the sync was
+  /// begun on, and nothing else: the ancestor path is a spelling the write reported, which an
+  /// in-flight rename can invalidate, so it cannot be part of the identity. A marker name a
+  /// co-user under the watched tree can predict therefore lets that co-user create-and-remove
+  /// the NEXT one ahead of time and leave a stale matching event behind — one that resolves the
+  /// barrier before the caller's own pre-call changes have drained, which is the one thing the
+  /// barrier promises. `(instance, pid, seq)` is fully computable from any marker already
+  /// observed, so a binding that renders those three and drops the nonce satisfies every other
+  /// clause here and still breaks the barrier, silently.
   /// (The fs binding renders all four: `.tributaries-sync-<instance>-<pid>-<seq>-<nonce>`.)
   ///
   /// A source that must park the write behind its own coverage-settle machinery does so INSIDE

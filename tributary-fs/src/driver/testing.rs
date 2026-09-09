@@ -1738,7 +1738,6 @@ impl FsOps for FakeFs {
       },
       receiver,
       meta,
-      root_pin: None,
     })
   }
 
@@ -1945,19 +1944,6 @@ impl FsOps for FakeFs {
       ancestors,
       backend: *self.state.spawn_backend.lock().unwrap(),
     })
-  }
-
-  /// No descriptors exist in a modelled tree, so this fake pins nothing and the
-  /// [`LiveRoot`] the driver records for it carries no object. What the real
-  /// implementation would refuse for, the fake never reaches: its whole world is
-  /// the path map below.
-  fn pin_root(
-    &self,
-    root: &Path,
-    identity: crate::os::RootIdentity,
-  ) -> Option<std::sync::Arc<crate::driver::RootPin>> {
-    let _ = (root, identity);
-    None
   }
 
   fn write_cookie(

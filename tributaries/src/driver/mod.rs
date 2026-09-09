@@ -146,7 +146,10 @@ struct SyncRequest {
 /// One in-flight sync barrier: the cookie the owner is waiting to see, whose
 /// subscription (and root) it belongs to, and the caller's parked reply.
 struct PendingSync<C, H> {
-  /// The cookie's canonical key — matched EXACTLY against arriving events.
+  /// The cookie's canonical key AS THE WRITE REPORTED IT — what
+  /// [`Source::end_sync`] is handed to reap the marker, and the source of the
+  /// marker's LEAF, which is what the barrier is actually correlated by (see
+  /// [`names`](Self::names)). Never compared whole against an arriving event.
   cookie_key: Vec<C>,
   /// The subscription whose barrier this is.
   sub: Subscription,
@@ -168,6 +171,42 @@ struct PendingSync<C, H> {
   /// Resolved `Delivered` when the cookie is seen, `Dominated` when a covering
   /// `Rescan` (or a root death) stands in for it.
   reply: futures_channel::oneshot::Sender<Result<SyncOutcome, SyncError>>,
+}
+
+impl<C: PartialEq, H> PendingSync<C, H> {
+  /// Whether `location` names THIS barrier's marker: its last segment is the
+  /// marker's leaf.
+  ///
+  /// # Why the leaf, and not the whole key
+  ///
+  /// The write reports where the marker landed by spelling out the directories it
+  /// traversed, and that spelling is a fact about the moment of the walk, not a
+  /// binding. A peer that renames one of those directories between the walk and
+  /// the create leaves the marker (correctly) under the NEW name: the backend
+  /// orders the rename ahead of the create, so the owner is told about the marker
+  /// at a path the write never mentioned. Comparing whole keys misses it, and the
+  /// barrier then waits out its caller's deadline over a source that did
+  /// everything right — while the marker itself is exactly where the ordered
+  /// queue says it is, which is all the barrier ever needed.
+  ///
+  /// The leaf is enough to identify it because the binding mints it to be: the
+  /// marker's name incorporates the sync's unpredictable nonce
+  /// ([`Source::begin_sync`] requires this), so no other object under this root
+  /// can carry it, and the caller of this test has already established that the
+  /// endpoint lies in the source's reserved namespace. The ROOT is what bounds
+  /// it — a barrier resolves only on a change of the root it was written under,
+  /// which the caller checks — so two roots reachable at once cannot answer each
+  /// other's markers.
+  ///
+  /// A key with no last segment matches nothing: an empty location names no
+  /// object, and treating two of them as equal would resolve a barrier on a
+  /// change that identified nothing at all.
+  fn names(&self, location: &[C]) -> bool {
+    match (self.cookie_key.last(), location.last()) {
+      (Some(marker), Some(leaf)) => marker == leaf,
+      _ => false,
+    }
+  }
 }
 
 /// A reply-less grant-resolution notice on the [`Owner`]'s dedicated [`cleanup_rx`](Owner::cleanup_rx)
@@ -987,7 +1026,7 @@ where
   ///
   /// On Windows the cookie path this barrier writes through is still
   /// path-addressed at three points (opening the cookie parent by pathname
-  /// after the root pin check; a cookie directory renamed between mint and
+  /// after the root identity check; a cookie directory renamed between mint and
   /// marker create passing revalidation with a stale reported landing; a
   /// post-create validation failure dropping the marker handle). A concurrent
   /// rename of the watched root or of the cookie directory during a `sync`
@@ -1364,9 +1403,10 @@ where
   ///
   /// The barrier's whole integrity argument is that a co-user under the watched tree cannot
   /// predict the NEXT cookie name:
-  /// [`resolve_matching_pending_sync`](Self::resolve_matching_pending_sync) compares the key and
-  /// nothing else, so anyone who can pre-create and remove the coming name leaves a stale event
-  /// that resolves the barrier over changes the caller has not been shown.
+  /// [`resolve_matching_pending_sync`](Self::resolve_matching_pending_sync) matches the marker's
+  /// NAME under its root and nothing else, so anyone who can pre-create and remove the coming
+  /// name leaves a stale event that resolves the barrier over changes the caller has not been
+  /// shown.
   ///
   /// That name's last field is a word off this generator. ChaCha20 is a cryptographic stream
   /// cipher, so its output is computationally unpredictable to anyone who does not hold the seed
@@ -6788,7 +6828,8 @@ where
       // The cookie's own event, however it arrived: created in place, unlinked, RENAMED
       // INTO the reserved namespace, or renamed OUT of it — each is a cookie observation on
       // the same terms as any other, so the classification travels with the event and the
-      // resolver matches the pending key against every endpoint it names as reserved.
+      // resolver matches the pending marker's name against every endpoint it names as
+      // reserved.
       // Resolved under the identical discipline the `Rescan` above obeys — strictly after
       // this change's own publication, so a caller waking on another thread cannot drain
       // past a delivery this barrier's resolution implies it will find. A `Rescan` is never
@@ -7120,11 +7161,19 @@ where
   /// `Rescan` by a full channel during the flush): the caller must re-read,
   /// not replay, so telling it `Delivered` would risk stale state.
   ///
+  /// # The barrier is identified by its marker's LEAF, under its own root
+  ///
+  /// A pending barrier is `(root, marker leaf)` and nothing else — never the ancestor path the
+  /// write reported, which is a spelling from the moment of the walk that an in-root rename can
+  /// invalidate before the marker is even created (see [`PendingSync::names`]). So the root
+  /// handle must match this change's, and one of the change's endpoints must END in the marker's
+  /// name.
+  ///
   /// # The cookie is whichever endpoint the classification reserved
   ///
   /// `reserved` is this change's own [`ReservedEndpoints`] verdict, computed once at the
   /// [`Source`] seam ([`reserved_endpoints`](Self::reserved_endpoints)) and threaded here rather
-  /// than re-derived, and the pending key is matched against **every** endpoint it names.
+  /// than re-derived, and the pending marker is matched against **every** endpoint it names.
   /// [`SourceEvent::key`] is a move's DESTINATION, so matching it alone answers only half the
   /// question: a cookie renamed OUT of the reserved namespace
   /// ([`Source`](ReservedEndpoints::Source)) is the move's `move_from`, and a rename BETWEEN two
@@ -7134,8 +7183,10 @@ where
   /// post-cookie state — so a key-only match left those barriers unresolved until their caller's
   /// own timeout fired, over a source that had done nothing wrong.
   ///
-  /// The two arms cannot both fire for one pending entry: a move whose two endpoints are the
-  /// same key is not a move, so at most one of them names any given cookie.
+  /// Both arms CAN name one entry, now that the test is on the leaf: a marker moved between two
+  /// directories keeps its name at both ends. That resolves the barrier once, which is right —
+  /// either endpoint alone already proves the queue reached it — and the short-circuit below is
+  /// what makes it once rather than twice.
   ///
   /// # Every matching barrier resolves, not just the first
   ///
@@ -7157,13 +7208,15 @@ where
     event: &SourceEvent<C, S::Handle>,
     reserved: ReservedEndpoints,
   ) {
+    let handle = event.handle();
     let move_from = event.move_from();
     let key = event.key();
     let mut i = 0;
     while i < self.pending_syncs.len() {
-      let cookie = self.pending_syncs[i].cookie_key.as_slice();
-      let matched = (reserved.masks_destination() && cookie == key)
-        || (reserved.masks_source() && move_from.is_some_and(|from| cookie == from));
+      let pending = &self.pending_syncs[i];
+      let matched = pending.root == handle
+        && ((reserved.masks_destination() && pending.names(key))
+          || (reserved.masks_source() && move_from.is_some_and(|from| pending.names(from))));
       if !matched {
         i += 1;
         continue;

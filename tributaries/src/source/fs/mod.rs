@@ -769,7 +769,12 @@ impl<R> Source<OsString> for FsSource<R> {
     // classifier exists to prevent and strictly worse than the cost.
     //
     // Neither ground reads any deeper component, so a user file merely living under
-    // some ancestor whose name shares the stem stays a user change.
+    // some ancestor whose name shares the stem stays a user change — and, the other
+    // way round, a marker whose ancestor directory is renamed while it stands is
+    // classified the same under either path. That is what keeps it off consumer
+    // streams and available to its own barrier wherever the queue reports it from:
+    // the barrier is correlated by the marker's leaf under its root, so the two
+    // halves read exactly the same components.
     //
     // GROUND 2 IS DECIDED FIRST, and reads only the PARENT component — because "whatever
     // the leaf" has to include a leaf that is not UTF-8. Paths on Unix are bytes, so an

@@ -9748,7 +9748,6 @@ mod descending {
           ancestors: Vec::new(),
           backend: BackendKind::Inotify,
         },
-        root_pin: None,
         replay: WatchOutcome::Installed(1),
         remaining: rx.len(),
       };
@@ -15792,10 +15791,12 @@ mod sync_cookie {
         COUNTER.fetch_add(1, Ordering::Relaxed),
       ));
       std::fs::create_dir_all(&parent).expect("create the scratch parent");
-      // The scratch directory IS the walk's root, so the pin is a zero-component
-      // descent onto it — the same object a real write would end up holding.
-      let root = crate::driver::RootPin::for_tests(&parent).expect("the scratch root pins");
-      let pinned = CookieParent::open(&root, &parent, &parent).expect("the scratch parent pins");
+      // The scratch directory IS the walk's root, so the descent is a
+      // zero-component one onto it — the same object a real write would end up
+      // holding.
+      let live = crate::driver::LiveRoot::for_tests(&parent);
+      let pinned =
+        CookieParent::open(live.identity(), &parent, &parent).expect("the scratch parent opens");
       let dir = Arc::new(CookieDir::open_or_create(&pinned).expect("a cookie directory is minted"));
       (parent, dir)
     }
@@ -17329,7 +17330,7 @@ mod sync_cookie {
   /// addressed by pathname and a directory nobody owns, and no fake tree can
   /// witness what a kernel does with a name whose object was swapped underneath
   /// it — only the syscalls themselves can.
-  #[cfg(all(unix, not(miri)))]
+  #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
   mod identity {
     use super::*;
 
@@ -17353,12 +17354,13 @@ mod sync_cookie {
     }
 
     /// A cookie directory inside `parent`, reached the way a real write reaches
-    /// one: `parent` stands as its own root, so the pin is a zero-component
-    /// descent onto it and the directory is created relative to what that
-    /// descent holds.
+    /// one: `parent` stands as its own root, so the descent is a zero-component
+    /// one onto it and the directory is created relative to what that descent
+    /// holds.
     fn cookie_dir_in(parent: &std::path::Path) -> CookieDir {
-      let root = crate::driver::RootPin::for_tests(parent).expect("the scratch root pins");
-      let pinned = CookieParent::open(&root, parent, parent).expect("the scratch parent pins");
+      let live = crate::driver::LiveRoot::for_tests(parent);
+      let pinned =
+        CookieParent::open(live.identity(), parent, parent).expect("the scratch parent opens");
       CookieDir::open_or_create(&pinned).expect("the cookie directory opens")
     }
 
@@ -17389,9 +17391,9 @@ mod sync_cookie {
       std::fs::create_dir_all(&judged).expect("the judged directory");
       std::fs::create_dir_all(&decoy).expect("a directory of the same shape elsewhere");
 
-      let pin = crate::driver::RootPin::for_tests(&root).expect("the scratch root pins");
-      let parent =
-        CookieParent::open(&pin, &root, &judged).expect("the walk reaches the judged object");
+      let live = crate::driver::LiveRoot::for_tests(&root);
+      let parent = CookieParent::open(live.identity(), &root, &judged)
+        .expect("the walk reaches the judged object");
       assert_eq!(
         parent.path(),
         judged.as_path(),
@@ -17442,24 +17444,24 @@ mod sync_cookie {
     /// marker sits in a tree whose events this stream will never carry: a barrier
     /// that resolved nowhere and a caller parked until it times out.
     ///
-    /// The pin makes the answer object-shaped instead. The descent starts at the
-    /// descriptor the spawn opened, so the write either lands in the original
-    /// object or refuses outright; the one outcome it may not have is the
-    /// replacement.
+    /// The retained IDENTITY makes the answer object-shaped instead. The write
+    /// opens the root's name and then compares what it reached against the object
+    /// the scope was armed on, so a replacement is refused outright; the one
+    /// outcome the write may not have is landing inside it.
     ///
     /// Real syscalls, because what is being tested is which OBJECT a name reaches
     /// after a rename — a question no modelled tree can be asked.
     ///
-    /// Revert witness: descend from `canonicalize(root)` again and the cookie
-    /// appears under the replacement.
+    /// Revert witness: descend from `canonicalize(root)` without comparing the
+    /// identity and the cookie appears under the replacement.
     #[test]
     fn a_cookie_never_descends_into_a_replacement_of_the_watched_root() {
       let base = scratch("root-replaced");
       let root = base.join("root");
       std::fs::create_dir_all(root.join("sub")).expect("the watched tree");
 
-      // The scope goes live HERE: the canonical root and the object behind it are
-      // recorded together, exactly as a spawn records them.
+      // The scope goes live HERE: the canonical root and the identity of the
+      // object behind it are recorded together, exactly as a spawn records them.
       let live = crate::driver::LiveRoot::for_tests(&root);
 
       // …and a peer then swaps the whole tree out from under the name, leaving a
@@ -17488,18 +17490,115 @@ mod sync_cookie {
       };
       assert!(
         !landed(&root.join("sub")),
-        "nothing of this write reached the replacement, whether it succeeded or \
-         refused: {written:?}"
+        "nothing of this write reached the replacement: {written:?}"
       );
-      if written.is_ok() {
-        assert!(
-          landed(&base.join("moved").join("sub")),
-          "and a write that DID succeed went into the object the scope is \
-           attached to"
-        );
-      }
+      assert!(
+        written.is_err(),
+        "the write refused rather than descending into whatever now stands at \
+         the root's name"
+      );
+      assert!(
+        !landed(&base.join("moved").join("sub")),
+        "and the refusal is total: the renamed-aside original was not written \
+         into either"
+      );
 
       let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A cookie's PARENT renamed inside the root, after the walk has passed
+    /// through it: the marker follows the object, and only the write's reported
+    /// spelling is left stale.
+    ///
+    /// The walk holds a descriptor, so the create goes into the directory it
+    /// opened wherever a peer has since moved that directory to. What the write
+    /// REPORTS, though, is built by appending the names it traversed, so the
+    /// landing it hands back still spells the pre-rename path — a path that now
+    /// names nothing. The backend orders the rename ahead of the marker's create,
+    /// so the observation the caller's barrier waits on arrives under the NEW
+    /// path, and a barrier correlated by that reported spelling would never match
+    /// it. This cell pins both halves of that fact — the marker is under the new
+    /// name, its LEAF is unchanged, and the anchored cleanup still reaches it —
+    /// so the umbrella's leaf-under-root correlation has something to rest on.
+    ///
+    /// Real syscalls: which object a descriptor still refers to after its name
+    /// moved is a question no modelled tree can be asked.
+    #[test]
+    fn a_cookie_follows_its_parent_renamed_inside_the_root() {
+      let root = scratch("parent-renamed");
+      let judged = root.join("a");
+      std::fs::create_dir_all(&judged).expect("the directory the sync names");
+
+      let live = crate::driver::LiveRoot::for_tests(&root);
+      let parent = CookieParent::open(live.identity(), &root, &judged)
+        .expect("the walk reaches the judged object");
+
+      // The peer's rename, in the window between the walk and the create — still
+      // inside the root, so the marker's event rides this root's queue either way
+      // and nothing about the barrier's coverage changes.
+      let moved = root.join("b");
+      std::fs::rename(&judged, &moved).expect("the parent is renamed inside the root");
+
+      let dir = CookieDir::open_or_create(&parent).expect("the cookie directory is minted");
+      let name = ".tributaries-sync-renamed-parent";
+      let created = dir.create(name).expect("the marker is created");
+      let identity = identity_of_handle(&created)
+        .expect("the create's own handle answers")
+        .expect("this filesystem reads an identity off a handle");
+
+      // What the write would report, and what it now denotes: nothing.
+      let reported = dir.path().join(name);
+      assert!(
+        reported.starts_with(&judged),
+        "staging: the reported landing is the spelling the walk traversed, {reported:?}"
+      );
+      assert!(
+        !reported.exists(),
+        "and that spelling names nothing once the parent has moved"
+      );
+
+      // Where the marker actually is: under the new name, in this driver's own
+      // directory, carrying the very leaf the barrier correlates on.
+      let holder = std::fs::read_dir(&moved)
+        .expect("the renamed parent is readable")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+          path
+            .file_name()
+            .and_then(|leaf| leaf.to_str())
+            .is_some_and(crate::is_sync_cookie_dir_name)
+        })
+        .expect("the cookie directory moved with the parent it was created in");
+      let landed = holder.join(name);
+      assert!(
+        landed.is_file(),
+        "the marker landed inside the object the walk opened, under its new name"
+      );
+      assert_eq!(
+        landed.file_name().and_then(|leaf| leaf.to_str()),
+        Some(name),
+        "and its leaf is unchanged by the rename: the one thing the barrier reads"
+      );
+
+      // Cleanup is anchored to the directory descriptor, so it reaches the object
+      // without resolving either spelling.
+      drop(created);
+      let verdict = remove_anchored(&dir, name, CookieProof::Object(identity), None);
+      let present = landed.exists();
+      drop(dir);
+      let _ = std::fs::remove_dir_all(&root);
+
+      assert_eq!(
+        verdict.expect("the anchored removal reaches the object"),
+        CookieRemoval::Unlinked,
+        "the name still denoted the created object, through the descriptor rather \
+         than through a path"
+      );
+      assert!(
+        !present,
+        "and the marker is gone from where it actually was"
+      );
     }
 
     /// The replacement's contents, so the survivor is proven by what it HOLDS and
@@ -18356,8 +18455,8 @@ mod sync_cookie {
     /// anchored at and the verdicts are taken on. `parent` stands as its own
     /// root here, which is what a cell reaching straight for the mint wants.
     fn pinned(parent: &Path) -> CookieParent {
-      let root = crate::driver::RootPin::for_tests(parent).expect("the scratch root pins");
-      CookieParent::open(&root, parent, parent).expect("the scratch parent pins")
+      let live = crate::driver::LiveRoot::for_tests(parent);
+      CookieParent::open(live.identity(), parent, parent).expect("the scratch parent opens")
     }
 
     /// A cookie directory minted inside `parent`, through that pin.
