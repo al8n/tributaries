@@ -982,6 +982,18 @@ where
   /// On `wasm32-unknown-unknown`, which has no entropy source at all, no seed
   /// is ever taken and every barrier ends here;
   /// [`Timeout`](SyncError::Timeout); [`Closed`](SyncError::Closed).
+  ///
+  /// # Platform notes
+  ///
+  /// On Windows the cookie path this barrier writes through is still
+  /// path-addressed at three points (opening the cookie parent by pathname
+  /// after the root pin check; a cookie directory renamed between mint and
+  /// marker create passing revalidation with a stale reported landing; a
+  /// post-create validation failure dropping the marker handle). A concurrent
+  /// rename of the watched root or of the cookie directory during a `sync`
+  /// can therefore leave the barrier unresolved until it times out, rather
+  /// than resolving or reporting a definite refusal. Tracked as
+  /// <https://github.com/al8n/tributaries/issues/134>.
   pub async fn sync(
     &self,
     sub: Subscription,

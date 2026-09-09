@@ -1575,6 +1575,18 @@ impl<R> Watcher<R> {
   /// [`DirPruned`](SyncRootError::DirPruned), [`Retired`](SyncRootError::Retired),
   /// and [`Closed`](SyncRootError::Closed), whose sequence is spent — re-mint to
   /// retry those.
+  ///
+  /// # Platform notes
+  ///
+  /// On Windows this write's cookie path is still path-addressed at three
+  /// points (opening the cookie parent by pathname after the root pin check;
+  /// a cookie directory renamed between mint and marker create passing
+  /// revalidation with a stale reported landing; a post-create validation
+  /// failure dropping the marker handle). A concurrent rename of `root` or of
+  /// the cookie directory during this call can therefore leave the caller's
+  /// barrier unresolved until it times out, rather than resolving or
+  /// reporting a definite refusal. Tracked as
+  /// <https://github.com/al8n/tributaries/issues/134>.
   pub async fn sync_root(
     &self,
     root: RootHandle,

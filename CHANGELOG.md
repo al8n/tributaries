@@ -360,6 +360,15 @@ All notable changes to this workspace are documented here. The format is based o
   unengaged) asks for exactly the behaviour every source had before the seats existed.
   Every other seam item is unchanged, including canonical-key adoption.
 
+### Known limitations
+
+- **`tributary-fs`**, **`tributaries`** — on Windows, `Watcher::sync_root` and
+  `Tributaries::sync`'s cookie path is still path-addressed at three points, so
+  a concurrent rename of the watched root or of the cookie directory during a
+  sync can leave the barrier unresolved until it times out rather than
+  resolving or reporting a definite refusal. Tracked as
+  [#134](https://github.com/al8n/tributaries/issues/134).
+
 ## [0.1.0]
 
 ### Added
