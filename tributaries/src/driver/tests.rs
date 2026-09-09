@@ -9130,6 +9130,124 @@ async fn teardown_publishes_empty_read_plane_so_view_stops_advertising_dead_subs
   );
 }
 
+/// Regression (the seat ceiling is enforced BEFORE arming): a watch whose per-root glob
+/// seat carries more patterns than [`WatchOptions::MAX_SEAT_PATTERNS`] is refused by
+/// [`Tributaries::watch`](super::Tributaries::watch) itself, with the typed verdict, and
+/// the source is never entered at all.
+///
+/// The seats are not a delivery gate this crate applies: they are handed to
+/// [`Source::arm`] as the words the root is armed with, and asked by the source once per
+/// candidate for as long as the root lives. So a length nobody checked is per-event work
+/// a caller writes and a source pays — which is why the refusal has to stand ahead of the
+/// arm rather than inside whatever the source chooses to do with the words.
+///
+/// The counters are the proof it stands EARLY: not one `canonicalize_key` and not one
+/// `arm`, so the request never even reached the owner. A watch AT the ceiling still
+/// commits, so the cell pins the boundary rather than merely "large is refused".
+#[tokio::test]
+async fn an_over_full_seat_is_refused_before_the_source_is_entered() {
+  #[derive(Clone, Default)]
+  struct Counts {
+    canonicalizations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    arms: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+  }
+
+  fn bump(counter: &std::sync::atomic::AtomicUsize) {
+    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+  }
+
+  fn read(counter: &std::sync::atomic::AtomicUsize) -> usize {
+    counter.load(std::sync::atomic::Ordering::Relaxed)
+  }
+
+  /// A [`DrainableSource`] that records every entry into the two calls a watch makes
+  /// on it.
+  struct CountingSource {
+    inner: DrainableSource,
+    counts: Counts,
+  }
+
+  impl Source<OsString> for CountingSource {
+    type Handle = u32;
+
+    fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
+      bump(&self.counts.canonicalizations);
+      self.inner.canonicalize_key(key)
+    }
+
+    async fn arm(
+      &mut self,
+      key: &[OsString],
+      globs: &RootGlobs,
+    ) -> Result<Armed<OsString, u32>, WatchError> {
+      bump(&self.counts.arms);
+      self.inner.arm(key, globs).await
+    }
+
+    fn disarm(&mut self, handle: u32) {
+      self.inner.disarm(handle);
+    }
+
+    async fn next(&mut self) -> Option<SourceEvent<OsString, u32>> {
+      self.inner.next().await
+    }
+
+    fn root_key(&self, handle: u32) -> Option<Vec<OsString>> {
+      self.inner.root_key(handle)
+    }
+  }
+
+  let counts = Counts::default();
+  let (_drain_tx, drain_rx) = async_channel::bounded::<std::convert::Infallible>(1);
+  let source = CountingSource {
+    inner: DrainableSource {
+      next_handle: 0,
+      live: HashMap::new(),
+      drain: drain_rx,
+    },
+    counts: counts.clone(),
+  };
+  let w: super::Tributaries<OsString, (), TokioRuntime, u32> =
+    super::Tributaries::with_source(source, TributariesOptions::new())
+      .expect("the default capacities are in range");
+
+  let cap = WatchOptions::<OsString>::MAX_SEAT_PATTERNS;
+  let words = |count: usize| (0..count).map(|n| glob(&std::format!("**/w{n}")));
+
+  for options in [
+    WatchOptions::new().with_prune(words(cap + 1)),
+    WatchOptions::new().with_include(words(cap + 1)),
+  ] {
+    let err = w
+      .watch(key("/a"), (), options)
+      .await
+      .expect_err("a seat past the ceiling is refused");
+    assert!(err.is_invalid_options(), "the typed verdict: {err}");
+    let refused = err.options().expect("it carries the options verdict");
+    assert!(
+      refused.is_too_many_prune_patterns() || refused.is_too_many_include_patterns(),
+      "…naming the seat: {refused}"
+    );
+    assert_eq!(
+      read(&counts.arms),
+      0,
+      "nothing was armed for a watch refused at the door"
+    );
+    assert_eq!(
+      read(&counts.canonicalizations),
+      0,
+      "…and the source was not entered at all: the request never reached the owner"
+    );
+  }
+
+  // The ceiling itself is not refused: the boundary is exactly one past it.
+  let _sub = w
+    .watch(key("/a"), (), WatchOptions::new().with_prune(words(cap)))
+    .await
+    .expect("a seat AT the ceiling commits");
+  assert_eq!(read(&counts.arms), 1, "and that one did arm");
+}
+
 /// A `u64`-valued [`Owner`] over a [`FakeSource`], with its drainable event stream — the
 /// value-baking regression rig. `V = u64` (not [`Harness`]'s `()`) so attribution values are
 /// distinguishable; the tests drive the owner's reconcile/emit primitives directly, then assert

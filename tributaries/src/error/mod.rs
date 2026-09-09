@@ -445,6 +445,22 @@ pub enum WatchError {
   /// would run. A caller that needs another subscription builds a new watcher.
   #[error("the watcher's source plane is retired; no new watch can be established on it")]
   SourceRetired,
+  /// The [`WatchOptions`](crate::WatchOptions) themselves cannot be honored: one of
+  /// the two per-root glob seats carries more patterns than
+  /// [`WatchOptions::MAX_SEAT_PATTERNS`](crate::WatchOptions::MAX_SEAT_PATTERNS).
+  ///
+  /// The seats are the words the root is ARMED with, which makes them the one part
+  /// of a watch request handed straight down to a [`Source`](crate::Source) and then
+  /// asked per event. A caller writes their length, so refusing it at the door is
+  /// what keeps a source from being handed a set it would have to walk pattern by
+  /// pattern on every candidate.
+  ///
+  /// Refused by [`watch`](crate::Tributaries::watch) itself, before the request is
+  /// even submitted to the owner: nothing is canonicalized, classified, armed or
+  /// re-pointed, and the source is never called. Not retryable as written — the
+  /// remedy is a broader pattern rather than a longer list.
+  #[error("the watch options cannot be honored")]
+  InvalidOptions(#[source] OptionsError),
 }
 
 impl WatchError {
@@ -532,6 +548,33 @@ impl WatchError {
     matches!(self, Self::SourceRetired)
   }
 
+  /// Whether this is [`InvalidOptions`](Self::InvalidOptions) — the watch's own
+  /// options were refused at the door, so nothing was planned and the source was
+  /// never called.
+  #[inline]
+  pub const fn is_invalid_options(&self) -> bool {
+    matches!(self, Self::InvalidOptions(_))
+  }
+
+  /// The refused options verdict this error carries, for
+  /// [`InvalidOptions`](Self::InvalidOptions).
+  #[inline]
+  pub const fn options(&self) -> Option<&OptionsError> {
+    match self {
+      Self::InvalidOptions(err) => Some(err),
+      Self::Canonicalize { .. }
+      | Self::Source(_)
+      | Self::DeadOnArrival
+      | Self::CanonicalRace
+      | Self::RescanBacklog
+      | Self::Closed
+      | Self::CoverageIncomplete
+      | Self::RootWordsConflict { .. }
+      | Self::FilterRetired
+      | Self::SourceRetired => None,
+    }
+  }
+
   /// The classified fault this error carries, for the two fault-carrying variants
   /// ([`Canonicalize`](Self::Canonicalize) and [`Source`](Self::Source)).
   #[inline]
@@ -545,7 +588,8 @@ impl WatchError {
       | Self::CoverageIncomplete
       | Self::RootWordsConflict { .. }
       | Self::FilterRetired
-      | Self::SourceRetired => None,
+      | Self::SourceRetired
+      | Self::InvalidOptions(_) => None,
     }
   }
 

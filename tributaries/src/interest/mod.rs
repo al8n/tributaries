@@ -98,6 +98,15 @@ struct InterestArgs {
 }
 
 #[cfg(feature = "clap")]
+impl Interest {
+  /// The flag names, in field order — the ONE list, so a bit added to the mask
+  /// cannot be forgotten by the update rule, nor by the arg group of a household
+  /// that flattens these flags (an outer group must name every nested id, or the
+  /// flag cannot make an optional household present).
+  pub(crate) const FLAGS: [&'static str; 4] = ["created", "modified", "removed", "moved"];
+}
+
+#[cfg(feature = "clap")]
 impl From<InterestArgs> for Interest {
   fn from(args: InterestArgs) -> Self {
     let InterestArgs {
@@ -125,12 +134,12 @@ impl clap::FromArgMatches for Interest {
   /// as it stood — one list of flags, so a bit added to the mask cannot be
   /// forgotten here.
   fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
-    for (flag, bit) in [
-      ("created", &mut self.created),
-      ("modified", &mut self.modified),
-      ("removed", &mut self.removed),
-      ("moved", &mut self.moved),
-    ] {
+    for (flag, bit) in Self::FLAGS.into_iter().zip([
+      &mut self.created,
+      &mut self.modified,
+      &mut self.removed,
+      &mut self.moved,
+    ]) {
       if let Some(given) = crate::options::command_line_value(matches, flag) {
         *bit = given;
       }

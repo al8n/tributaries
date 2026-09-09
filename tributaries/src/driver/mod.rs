@@ -746,6 +746,8 @@ impl<C, V, R, H> Tributaries<C, V, R, H> {
   /// - [`WatchError::RootWordsConflict`] when the per-root glob seats differ from those of the
   ///   root whose coverage this watch would share — refused by the planner, so nothing was
   ///   armed, disarmed or re-pointed;
+  /// - [`WatchError::InvalidOptions`] when a glob seat carries more patterns than
+  ///   [`WatchOptions::MAX_SEAT_PATTERNS`] — refused here, before the request is even submitted;
   /// - [`WatchError::Closed`] when the owner is gone.
   pub async fn watch(
     &self,
@@ -753,6 +755,17 @@ impl<C, V, R, H> Tributaries<C, V, R, H> {
     value: V,
     options: WatchOptions<C>,
   ) -> Result<Subscription, WatchError> {
+    // THE SEAT CEILING, ahead of the mailbox — the earliest point a watch request exists, and
+    // the last one before the words leave the caller's hands. The two glob seats are not a
+    // delivery gate this crate applies: they are handed to [`Source::arm`] as the words the root
+    // is armed with, and asked by the source once per candidate thereafter. So a length nobody
+    // checked is per-event work a caller writes and a source pays, on a set past the ceiling the
+    // matcher unions at (see [`WatchOptions::MAX_SEAT_PATTERNS`]).
+    //
+    // It is checked HERE rather than in the reconcile because refusing before the submission is
+    // what makes "the source never saw it" true of the whole request: nothing is canonicalized,
+    // nothing is planned, and no command occupies a mailbox slot behind a busy owner.
+    options.validate().map_err(WatchError::InvalidOptions)?;
     let (reply, response) = futures_channel::oneshot::channel();
     if self
       .commands

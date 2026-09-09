@@ -13,16 +13,24 @@ use crate::{filter::Filter, interest::Interest};
 #[cfg(test)]
 mod tests;
 
-/// Why a [`TributariesOptions`] value cannot be honored.
+/// Why an options household cannot be honored — the watcher-global
+/// [`TributariesOptions`] capacities, or one of the two per-root glob seats
+/// [`WatchOptions`] and [`RootGlobs`] carry.
 ///
-/// The two channel capacities are the umbrella's only unbounded quantities, and
-/// both are spent EAGERLY: assembling a [`Tributaries`](crate::Tributaries)
-/// allocates each channel up front, one slot per item, so a capacity near
-/// [`usize::MAX`] is not a large buffer but an allocation-size overflow — a panic
-/// deep inside the channel rather than a verdict a caller can read. Every face
-/// turns such a value into one of these instead
-/// ([`TributariesOptions::validate`]), and construction refuses on it before a
-/// single channel exists.
+/// Each of them names a quantity a caller writes and the watcher then SPENDS, so
+/// each carries a ceiling. The two channel capacities are spent eagerly:
+/// assembling a [`Tributaries`](crate::Tributaries) allocates each channel up
+/// front, one slot per item, so a capacity near [`usize::MAX`] is not a large
+/// buffer but an allocation-size overflow — a panic deep inside the channel rather
+/// than a verdict a caller can read. A glob seat is spent per EVENT instead: its
+/// patterns compile into one matcher the source asks on every candidate, and past
+/// [`RootGlobs::MAX_SEAT_PATTERNS`] that matcher stops unioning them and asks each
+/// pattern in turn.
+///
+/// Every face turns such a value into one of these instead
+/// ([`TributariesOptions::validate`], [`WatchOptions::validate`],
+/// [`RootGlobs::validate`]), and it is refused before a single channel — or a
+/// single source watch — exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum OptionsError {
@@ -46,6 +54,26 @@ pub enum OptionsError {
     /// The capacity the options carried.
     supplied: NonZeroUsize,
   },
+  /// The per-root [`prune`](RootGlobs::prune) seat carries more patterns than
+  /// [`RootGlobs::MAX_SEAT_PATTERNS`].
+  #[error(
+    "{supplied} prune patterns exceed the per-seat limit of {}",
+    RootGlobs::MAX_SEAT_PATTERNS
+  )]
+  TooManyPrunePatterns {
+    /// How many patterns the seat carried.
+    supplied: usize,
+  },
+  /// The per-root [`include`](RootGlobs::include) seat carries more patterns than
+  /// [`RootGlobs::MAX_SEAT_PATTERNS`].
+  #[error(
+    "{supplied} include patterns exceed the per-seat limit of {}",
+    RootGlobs::MAX_SEAT_PATTERNS
+  )]
+  TooManyIncludePatterns {
+    /// How many patterns the seat carried.
+    supplied: usize,
+  },
 }
 
 impl OptionsError {
@@ -59,6 +87,18 @@ impl OptionsError {
   #[inline]
   pub const fn is_command_capacity_too_large(&self) -> bool {
     matches!(self, Self::CommandCapacityTooLarge { .. })
+  }
+
+  /// Whether this is [`TooManyPrunePatterns`](Self::TooManyPrunePatterns).
+  #[inline]
+  pub const fn is_too_many_prune_patterns(&self) -> bool {
+    matches!(self, Self::TooManyPrunePatterns { .. })
+  }
+
+  /// Whether this is [`TooManyIncludePatterns`](Self::TooManyIncludePatterns).
+  #[inline]
+  pub const fn is_too_many_include_patterns(&self) -> bool {
+    matches!(self, Self::TooManyIncludePatterns { .. })
   }
 }
 
@@ -80,6 +120,146 @@ const fn check_command_capacity(capacity: NonZeroUsize) -> Result<NonZeroUsize, 
     return Err(OptionsError::CommandCapacityTooLarge { supplied: capacity });
   }
   Ok(capacity)
+}
+
+/// The ONE ceiling rule behind both glob seats of both households that carry them
+/// ([`WatchOptions`] and [`RootGlobs`]), stated over the two LENGTHS so a builder,
+/// a document and a command line are all judged by the same number.
+///
+/// The seats are the words a [`Source`](crate::Source) is armed with, and the
+/// umbrella never asks them itself — so the ceiling has to be met before the arm,
+/// which is what [`Tributaries::watch`](crate::Tributaries::watch) does with it.
+const fn check_seats(prune: usize, include: Option<usize>) -> Result<(), OptionsError> {
+  if prune > RootGlobs::MAX_SEAT_PATTERNS {
+    return Err(OptionsError::TooManyPrunePatterns { supplied: prune });
+  }
+  if let Some(include) = include
+    && include > RootGlobs::MAX_SEAT_PATTERNS
+  {
+    return Err(OptionsError::TooManyIncludePatterns { supplied: include });
+  }
+  Ok(())
+}
+
+/// Reads ONE glob seat, refusing the element past
+/// [`RootGlobs::MAX_SEAT_PATTERNS`] rather than the list after it.
+///
+/// The refusal has to happen mid-sequence to mean anything: a document is an
+/// untrusted length, and collecting it whole so the count can be checked
+/// afterwards has already built — and kept — every pattern the bound exists to
+/// refuse. So the element that would take the seat past the ceiling is where this
+/// stops, with at most the ceiling's worth of patterns ever compiled.
+#[cfg(feature = "serde")]
+fn deserialize_seat<'de, D>(deserializer: D) -> Result<Vec<Glob>, D::Error>
+where
+  D: serde::Deserializer<'de>,
+{
+  struct Seat;
+
+  impl<'de> serde::de::Visitor<'de> for Seat {
+    type Value = Vec<Glob>;
+
+    fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+      write!(f, "at most {} glob patterns", RootGlobs::MAX_SEAT_PATTERNS)
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+      A: serde::de::SeqAccess<'de>,
+    {
+      use serde::de::Error as _;
+
+      // The hint is a document's own claim, so it steers the allocation and
+      // never the bound: capped at the ceiling, it cannot be used to ask for a
+      // reservation nothing will fill.
+      let hint = seq
+        .size_hint()
+        .unwrap_or(0)
+        .min(RootGlobs::MAX_SEAT_PATTERNS);
+      let mut patterns = Vec::with_capacity(hint);
+      while let Some(glob) = seq.next_element::<Glob>()? {
+        if patterns.len() == RootGlobs::MAX_SEAT_PATTERNS {
+          return Err(A::Error::custom(std::format!(
+            "more glob patterns than the per-seat limit of {}",
+            RootGlobs::MAX_SEAT_PATTERNS
+          )));
+        }
+        patterns.push(glob);
+      }
+      Ok(patterns)
+    }
+  }
+
+  deserializer.deserialize_seq(Seat)
+}
+
+/// The include seat: the same bound, through the [`None`] that seat can also be.
+#[cfg(feature = "serde")]
+fn deserialize_optional_seat<'de, D>(deserializer: D) -> Result<Option<Vec<Glob>>, D::Error>
+where
+  D: serde::Deserializer<'de>,
+{
+  struct Engaged;
+
+  impl<'de> serde::de::Visitor<'de> for Engaged {
+    type Value = Option<Vec<Glob>>;
+
+    fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+      write!(
+        f,
+        "null, or at most {} glob patterns",
+        RootGlobs::MAX_SEAT_PATTERNS
+      )
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E>
+    where
+      E: serde::de::Error,
+    {
+      Ok(None)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+      E: serde::de::Error,
+    {
+      Ok(None)
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+      D: serde::Deserializer<'de>,
+    {
+      deserialize_seat(deserializer).map(Some)
+    }
+  }
+
+  deserializer.deserialize_option(Engaged)
+}
+
+/// The `clap` face of the two per-root glob seats, shared by both households that
+/// carry them: the flags are ONE definition, so the spelling
+/// [`RootGlobs`] gives them and the spelling [`WatchOptions`] gives them cannot
+/// drift apart.
+///
+/// Its own group is skipped ([`RootGlobs`] and [`WatchOptions`] each declare a
+/// real one naming these ids), so flattening it registers the two arguments and
+/// nothing else.
+#[cfg(feature = "clap")]
+#[derive(Debug, Clone, clap::Args)]
+#[group(skip)]
+struct SeatArgs {
+  #[arg(long)]
+  prune: Vec<Glob>,
+  #[arg(long)]
+  include: Option<Vec<Glob>>,
+}
+
+#[cfg(feature = "clap")]
+impl SeatArgs {
+  /// The seat flag names — the ONE list, so a seat added to the vocabulary cannot
+  /// be forgotten by a household's arg group.
+  const FLAGS: [&'static str; 2] = ["prune", "include"];
 }
 
 /// The value an argument carried, but ONLY when the COMMAND LINE is where it came
@@ -523,6 +703,10 @@ impl Debounce {
 /// the command line actually carried: updating `--event-capacity` alone leaves the
 /// command mailbox and the debounce posture exactly as they stood, and an
 /// unrelated flag never switches settling on.
+///
+/// The group is explicitly populated with every argument the household carries, the
+/// nested debounce flags included, so `#[command(flatten)] options:
+/// Option<TributariesOptions>` is `Some` exactly when one of them was given.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(default))]
@@ -537,11 +721,13 @@ pub struct TributariesOptions {
 /// The `clap` face of [`TributariesOptions`]: the two capacity flags plus
 /// [`DebounceConfig`]'s own group, flattened as the opt-in it is. It is a proxy
 /// for the same reason [`DebounceConfigArgs`] is — the UPDATE is written by hand
-/// so a defaulted flag cannot overwrite a configured knob — and its group id is
-/// pinned to the household's name.
+/// so a defaulted flag cannot overwrite a configured knob.
+///
+/// Its own group is skipped: the household declares the real one, which has to
+/// name the nested debounce flags as well (see [`TributariesOptions::GROUP_ID`]).
 #[cfg(feature = "clap")]
 #[derive(Debug, Clone, clap::Args)]
-#[group(id = "TributariesOptions")]
+#[group(skip)]
 struct TributariesOptionsArgs {
   #[arg(
     long,
@@ -647,18 +833,59 @@ impl clap::FromArgMatches for TributariesOptions {
   }
 }
 
+/// The stable [`clap::ArgGroup`] id this household answers to, and the arguments
+/// it holds — every one of them, direct and nested alike.
+///
+/// It exists because an OPTIONAL flatten (`#[command(flatten)] options:
+/// Option<TributariesOptions>`) is decided entirely by this group: clap asks
+/// [`clap::Args::group_id`] while it builds the command — panicking outright if
+/// there is none — and then reads `ArgMatches::contains_id` on that group to tell
+/// `Some` from `None`. A group is marked present only by an EXPLICIT value source,
+/// so membership is exactly "the caller spelled one of these", which is what the
+/// optional flatten means.
+///
+/// Leaving it to the derive would not do, and the reason is a documented
+/// limitation rather than an oversight: clap's derive leaves the generated group
+/// EMPTY for any struct that itself contains a `#[command(flatten)]` — nested arg
+/// groups are not validated yet — and the proxy flattens the settle policy. An
+/// empty group is never present, so `--quiet-window` alone would parse and then be
+/// silently discarded.
+///
+/// So the members are named here, and named EXHAUSTIVELY: the debounce flags come
+/// from [`DebounceConfigArgs::FLAGS`] — the one list a new knob must be added to —
+/// and the two capacities are spelled beside them.
+#[cfg(feature = "clap")]
+impl TributariesOptions {
+  /// The group's id, stable across releases: a downstream `ArgGroup` that names
+  /// this household refers to it by this string.
+  const GROUP_ID: &'static str = "TributariesOptions";
+
+  /// [`augment_args`](clap::Args::augment_args) and its update twin differ only in
+  /// which proxy augmentation they run, so the group is added in one place.
+  fn with_group(cmd: clap::Command) -> clap::Command {
+    cmd.group(
+      clap::ArgGroup::new(Self::GROUP_ID).multiple(true).args(
+        ["event_capacity", "command_capacity"]
+          .into_iter()
+          .chain(DebounceConfigArgs::FLAGS)
+          .map(clap::Id::from),
+      ),
+    )
+  }
+}
+
 #[cfg(feature = "clap")]
 impl clap::Args for TributariesOptions {
   fn group_id() -> Option<clap::Id> {
-    TributariesOptionsArgs::group_id()
+    Some(clap::Id::from(Self::GROUP_ID))
   }
 
   fn augment_args(cmd: clap::Command) -> clap::Command {
-    TributariesOptionsArgs::augment_args(cmd)
+    Self::with_group(TributariesOptionsArgs::augment_args(cmd))
   }
 
   fn augment_args_for_update(cmd: clap::Command) -> clap::Command {
-    TributariesOptionsArgs::augment_args_for_update(cmd)
+    Self::with_group(TributariesOptionsArgs::augment_args_for_update(cmd))
   }
 }
 
@@ -919,6 +1146,16 @@ impl Default for TributariesOptions {
 /// The default ([`new`](Self::new)) is both seats unengaged, which is exactly
 /// the behaviour every source had before the seats existed.
 ///
+/// # Each seat is BOUNDED
+///
+/// A seat is asked once per candidate by the source it is armed on, so its length
+/// is per-event work — and the length is a caller's to write. Both are capped at
+/// [`MAX_SEAT_PATTERNS`](Self::MAX_SEAT_PATTERNS), which
+/// [`validate`](Self::validate) checks, the `serde` face refuses mid-document, and
+/// [`Tributaries::watch`](crate::Tributaries::watch) refuses on before anything is
+/// planned. Beneath all of them the matcher's own constructor carries the same
+/// bound, so words this household never saw are bounded too.
+///
 /// # Configuration faces
 ///
 /// The words a custom source is armed with are configurable in their own right,
@@ -927,9 +1164,10 @@ impl Default for TributariesOptions {
 /// document or a command line without re-deriving the vocabulary.
 ///
 /// With the `serde` feature the seats are one object of two optional keys, each a
-/// list of plain pattern strings, and an invalid pattern is a document error
-/// rather than a value that matches nothing later. An absent `include` is the
-/// ABSENT seat ([`None`], deliver every file), which an empty list is not:
+/// list of plain pattern strings, and an invalid pattern — or a list longer than
+/// the ceiling — is a document error rather than a value that matches nothing
+/// later. An absent `include` is the ABSENT seat ([`None`], deliver every file),
+/// which an empty list is not:
 ///
 /// ```json
 /// { "prune": ["**/node_modules"], "include": ["**/*.{mp4,mov}"] }
@@ -948,19 +1186,115 @@ impl Default for TributariesOptions {
 /// other, never both (clap refuses a duplicate argument id, and a command that
 /// tried would fail its own `debug_assert`). An UPDATE changes only the seat the
 /// command line named: neither flag carries a default, so a seat nobody gave is
-/// left exactly as it stood.
+/// left exactly as it stood. The group is explicitly populated, so
+/// `#[command(flatten)] globs: Option<RootGlobs>` is `Some` exactly when one of
+/// the two flags was given.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(default))]
-#[cfg_attr(feature = "clap", derive(clap::Args))]
 pub struct RootGlobs {
-  #[cfg_attr(feature = "clap", arg(long))]
+  #[cfg_attr(feature = "serde", serde(deserialize_with = "deserialize_seat"))]
   prune: Vec<Glob>,
-  #[cfg_attr(feature = "clap", arg(long))]
+  #[cfg_attr(
+    feature = "serde",
+    serde(deserialize_with = "deserialize_optional_seat")
+  )]
   include: Option<Vec<Glob>>,
 }
 
+#[cfg(feature = "clap")]
+impl From<SeatArgs> for RootGlobs {
+  fn from(args: SeatArgs) -> Self {
+    let SeatArgs { prune, include } = args;
+    Self { prune, include }
+  }
+}
+
+#[cfg(feature = "clap")]
+impl From<&RootGlobs> for SeatArgs {
+  fn from(globs: &RootGlobs) -> Self {
+    Self {
+      prune: globs.prune.clone(),
+      include: globs.include.clone(),
+    }
+  }
+}
+
+#[cfg(feature = "clap")]
+impl clap::FromArgMatches for RootGlobs {
+  fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+    SeatArgs::from_arg_matches(matches).map(Into::into)
+  }
+
+  /// Applies the seat the COMMAND LINE named and leaves the other as it stood —
+  /// which is what the shared flags already give it: neither carries a default, so
+  /// a repeatable argument nobody spelled has no values to write.
+  fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+    let mut args = SeatArgs::from(&*self);
+    args.update_from_arg_matches(matches)?;
+    let SeatArgs { prune, include } = args;
+    self.prune = prune;
+    self.include = include;
+    Ok(())
+  }
+}
+
+/// The stable [`clap::ArgGroup`] id this household answers to, and the arguments
+/// it holds.
+///
+/// It exists because an OPTIONAL flatten (`#[command(flatten)] globs:
+/// Option<RootGlobs>`) is decided entirely by this group: clap asks
+/// [`clap::Args::group_id`] while it builds the command — panicking outright if
+/// there is none — and then reads `ArgMatches::contains_id` on that group to tell
+/// `Some` from `None`. A group is marked present only by an EXPLICIT value source,
+/// so membership is exactly "the caller spelled one of these", which is what the
+/// optional flatten means.
+///
+/// The members are named rather than left to the derive, and named EXHAUSTIVELY
+/// from [`SeatArgs::FLAGS`]: an argument missing from this group is one whose
+/// presence cannot turn an optional household `Some`.
+#[cfg(feature = "clap")]
 impl RootGlobs {
+  /// The group's id, stable across releases: a downstream `ArgGroup` that names
+  /// this household refers to it by this string.
+  const GROUP_ID: &'static str = "RootGlobs";
+
+  /// [`augment_args`](clap::Args::augment_args) and its update twin differ only in
+  /// which proxy augmentation they run, so the group is added in one place.
+  fn with_group(cmd: clap::Command) -> clap::Command {
+    cmd.group(
+      clap::ArgGroup::new(Self::GROUP_ID)
+        .multiple(true)
+        .args(SeatArgs::FLAGS.map(clap::Id::from)),
+    )
+  }
+}
+
+#[cfg(feature = "clap")]
+impl clap::Args for RootGlobs {
+  fn group_id() -> Option<clap::Id> {
+    Some(clap::Id::from(Self::GROUP_ID))
+  }
+
+  fn augment_args(cmd: clap::Command) -> clap::Command {
+    Self::with_group(SeatArgs::augment_args(cmd))
+  }
+
+  fn augment_args_for_update(cmd: clap::Command) -> clap::Command {
+    Self::with_group(SeatArgs::augment_args_for_update(cmd))
+  }
+}
+
+impl RootGlobs {
+  /// The most patterns EITHER seat may carry — the VOCABULARY's own bound,
+  /// [`tributary_proto::glob::MAX_SEAT_PATTERNS`], named here because this is the
+  /// household the words are configured through.
+  ///
+  /// It is not restated: the matcher a source compiles these into enforces the
+  /// same number, so words that never passed through this household are bounded
+  /// too. See the constant's own documentation for what the number buys.
+  pub const MAX_SEAT_PATTERNS: usize = tributary_proto::glob::MAX_SEAT_PATTERNS;
+
   /// The unengaged words: prune nothing, deliver every file.
   #[inline]
   pub const fn new() -> Self {
@@ -968,6 +1302,24 @@ impl RootGlobs {
       prune: Vec::new(),
       include: None,
     }
+  }
+
+  /// Checks both seats against [`MAX_SEAT_PATTERNS`](Self::MAX_SEAT_PATTERNS).
+  ///
+  /// The builders are infallible — a seat is set, not negotiated — so this is
+  /// where words assembled by hand meet the ceiling the other two faces already
+  /// enforce at their door. A consumer arming its own [`Source`](crate::Source)
+  /// with these words runs it for the reason
+  /// [`Tributaries::watch`](crate::Tributaries::watch) runs it on its own:
+  /// everything below is per-event work.
+  ///
+  /// # Errors
+  ///
+  /// [`OptionsError::TooManyPrunePatterns`] /
+  /// [`OptionsError::TooManyIncludePatterns`].
+  #[inline]
+  pub fn validate(&self) -> Result<(), OptionsError> {
+    check_seats(self.prune.len(), self.include.as_ref().map(Vec::len))
   }
 
   /// Whether NEITHER seat is engaged — the [`new`](Self::new) words, which ask a
@@ -1080,6 +1432,17 @@ impl RootGlobs {
 /// identical — see [`RootGlobs`]. [`include`](Self::include) matches names and carries no
 /// anchor, so it is shareable at any depth.
 ///
+/// # Both glob seats are BOUNDED
+///
+/// Because they are the ROOT's words rather than a gate this crate applies, their
+/// length is work a source pays once per candidate — so each is capped at
+/// [`MAX_SEAT_PATTERNS`](Self::MAX_SEAT_PATTERNS) on every face:
+/// [`validate`](Self::validate) for a household built by hand, a mid-document
+/// refusal for a loaded one, and [`watch`](crate::Tributaries::watch) itself, which
+/// runs the same check before it submits anything
+/// ([`WatchError::InvalidOptions`](crate::WatchError::InvalidOptions)). A seat past
+/// the ceiling therefore never reaches a [`Source`](crate::Source).
+///
 /// # Cloning shares the [`Filter`] slot
 ///
 /// `Clone` clones each field, and [`Filter`]'s own [`Clone` contract](Filter#impl-Clone-for-Filter<C>)
@@ -1093,8 +1456,8 @@ impl RootGlobs {
 /// With the `serde` feature the subscription is one object keyed by the field names,
 /// every key optional and defaulted from [`new`](Self::new) — so the empty document
 /// is the deliver-everything default and a key is a narrowing. The two glob seats are
-/// lists of plain strings, and an invalid pattern is a document error rather than a
-/// value that matches nothing later:
+/// lists of plain strings, and an invalid pattern — or a list longer than the ceiling
+/// — is a document error rather than a value that matches nothing later:
 ///
 /// ```json
 /// {
@@ -1129,21 +1492,168 @@ impl RootGlobs {
 /// no flag default at all, so a seat nobody named keeps the patterns it had. The
 /// [`Filter`] and the [`Debounce`] posture are on no face, and an update leaves
 /// them untouched.
+///
+/// The group is explicitly populated with every argument the household carries, the
+/// nested interest flags included, so `#[command(flatten)] watch:
+/// Option<WatchOptions<C>>` is `Some` exactly when one of them was given.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(default, bound = ""))]
-#[cfg_attr(feature = "clap", derive(clap::Args))]
 pub struct WatchOptions<C> {
-  #[cfg_attr(feature = "clap", command(flatten))]
   interest: Interest,
   #[cfg_attr(feature = "serde", serde(skip))]
-  #[cfg_attr(feature = "clap", arg(skip))]
   filter: Filter<C>,
-  #[cfg_attr(feature = "clap", arg(skip))]
   debounce: Debounce,
-  #[cfg_attr(feature = "clap", arg(long))]
+  #[cfg_attr(feature = "serde", serde(deserialize_with = "deserialize_seat"))]
   prune: Vec<Glob>,
-  #[cfg_attr(feature = "clap", arg(long))]
+  #[cfg_attr(
+    feature = "serde",
+    serde(deserialize_with = "deserialize_optional_seat")
+  )]
   include: Option<Vec<Glob>>,
+}
+
+/// The `clap` face of [`WatchOptions`]: the [`Interest`] flags plus the shared
+/// seat flags, and NOTHING generic — the two knobs this face skips
+/// ([`Filter`] and [`Debounce`]) are the only place `C` reaches, so the proxy
+/// carries no parameter and one definition serves every component type.
+///
+/// Its own group is skipped: [`WatchOptions`] declares the real one, which has to
+/// name the nested interest flags as well (see [`WatchOptions::GROUP_ID`]).
+#[cfg(feature = "clap")]
+#[derive(Debug, Clone, clap::Args)]
+#[group(skip)]
+struct WatchOptionsArgs {
+  #[command(flatten)]
+  interest: Interest,
+  #[command(flatten)]
+  seats: SeatArgs,
+}
+
+#[cfg(feature = "clap")]
+impl<C> From<&WatchOptions<C>> for WatchOptionsArgs {
+  fn from(options: &WatchOptions<C>) -> Self {
+    Self {
+      interest: options.interest,
+      seats: SeatArgs {
+        prune: options.prune.clone(),
+        include: options.include.clone(),
+      },
+    }
+  }
+}
+
+#[cfg(feature = "clap")]
+impl<C> clap::FromArgMatches for WatchOptions<C> {
+  /// The two knobs on no face come back at their [`new`](WatchOptions::new)
+  /// values: a fresh accept-all [`Filter`] — never one shared with a caller's —
+  /// and the inherited [`Debounce`] posture.
+  fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+    let WatchOptionsArgs {
+      interest,
+      seats: SeatArgs { prune, include },
+    } = WatchOptionsArgs::from_arg_matches(matches)?;
+    Ok(Self {
+      interest,
+      filter: Filter::all(),
+      debounce: Self::DEFAULT_DEBOUNCE,
+      prune,
+      include,
+    })
+  }
+
+  /// Applies only what the COMMAND LINE said. The [`Interest`] gate gets that from
+  /// its own face (it consults each flag's value SOURCE, so a gate the caller
+  /// narrowed is never re-opened by an unrelated flag), the two seats from
+  /// carrying no flag default at all, and the [`Filter`] and [`Debounce`] posture
+  /// from being on no face: an update never writes them.
+  fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+    let mut args = WatchOptionsArgs::from(&*self);
+    args.update_from_arg_matches(matches)?;
+    let WatchOptionsArgs {
+      interest,
+      seats: SeatArgs { prune, include },
+    } = args;
+    self.interest = interest;
+    self.prune = prune;
+    self.include = include;
+    Ok(())
+  }
+}
+
+#[cfg(feature = "clap")]
+impl<C> clap::Args for WatchOptions<C> {
+  fn group_id() -> Option<clap::Id> {
+    Some(clap::Id::from(Self::GROUP_ID))
+  }
+
+  fn augment_args(cmd: clap::Command) -> clap::Command {
+    Self::with_group(WatchOptionsArgs::augment_args(cmd))
+  }
+
+  fn augment_args_for_update(cmd: clap::Command) -> clap::Command {
+    Self::with_group(WatchOptionsArgs::augment_args_for_update(cmd))
+  }
+}
+
+/// The stable [`clap::ArgGroup`] id this household answers to, and the arguments
+/// it holds — every one of them, direct and nested alike.
+///
+/// It exists because an OPTIONAL flatten (`#[command(flatten)] watch:
+/// Option<WatchOptions<C>>`) is decided entirely by this group: clap asks
+/// [`clap::Args::group_id`] while it builds the command — panicking outright if
+/// there is none — and then reads `ArgMatches::contains_id` on that group to tell
+/// `Some` from `None`.
+///
+/// Leaving it to the derive would not do, and the reason is a documented
+/// limitation rather than an oversight: clap's derive leaves the generated group
+/// EMPTY for any struct that itself contains a `#[command(flatten)]` — nested arg
+/// groups are not validated yet — and this household flattens both the interest
+/// flags and the shared seats. An empty group is never present, so every flag
+/// would be parsed and then silently discarded.
+///
+/// So the members are named here, and named EXHAUSTIVELY, from the two lists a
+/// new flag has to be added to anyway: [`Interest::FLAGS`] and
+/// [`SeatArgs::FLAGS`].
+#[cfg(feature = "clap")]
+impl<C> WatchOptions<C> {
+  /// The group's id, stable across releases: a downstream `ArgGroup` that names
+  /// this household refers to it by this string.
+  const GROUP_ID: &'static str = "WatchOptions";
+
+  /// [`augment_args`](clap::Args::augment_args) and its update twin differ only in
+  /// which proxy augmentation they run, so the group is added in one place.
+  fn with_group(cmd: clap::Command) -> clap::Command {
+    cmd.group(
+      clap::ArgGroup::new(Self::GROUP_ID).multiple(true).args(
+        SeatArgs::FLAGS
+          .into_iter()
+          .chain(Interest::FLAGS)
+          .map(clap::Id::from),
+      ),
+    )
+  }
+}
+
+impl<C> WatchOptions<C> {
+  /// The most patterns EITHER glob seat may carry —
+  /// [`RootGlobs::MAX_SEAT_PATTERNS`], the words' own bound, since these two seats
+  /// ARE the words a source is armed with.
+  pub const MAX_SEAT_PATTERNS: usize = RootGlobs::MAX_SEAT_PATTERNS;
+
+  /// Checks both glob seats against
+  /// [`MAX_SEAT_PATTERNS`](Self::MAX_SEAT_PATTERNS) — what
+  /// [`Tributaries::watch`](crate::Tributaries::watch) runs before it plans
+  /// anything, so an over-full seat is refused where it was written rather than
+  /// handed down to a source.
+  ///
+  /// # Errors
+  ///
+  /// [`OptionsError::TooManyPrunePatterns`] /
+  /// [`OptionsError::TooManyIncludePatterns`].
+  #[inline]
+  pub fn validate(&self) -> Result<(), OptionsError> {
+    check_seats(self.prune.len(), self.include.as_ref().map(Vec::len))
+  }
 }
 
 impl<C> WatchOptions<C> {

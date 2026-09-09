@@ -556,6 +556,75 @@ mod serde_face {
     }
   }
 
+  /// A seat past the ceiling is a DOCUMENT error, on BOTH households that carry
+  /// the words — and refused mid-list rather than collected whole and measured
+  /// afterwards.
+  ///
+  /// The bound is a resource bound, so a face that reads an untrusted length to
+  /// the end before judging it has already paid what the bound exists to refuse:
+  /// every pattern in the list compiles on the way in. The element that would take
+  /// the seat past the ceiling is where the read stops.
+  ///
+  /// Revert witness: derive the four fields plainly and a 257-entry document
+  /// parses into a household `validate` — and `watch` — then have to catch, after
+  /// compiling every one of them.
+  #[test]
+  fn a_document_past_the_pattern_ceiling_is_refused() {
+    let cap = RootGlobs::MAX_SEAT_PATTERNS;
+    let list = |count: usize| {
+      (0..count)
+        .map(|n| std::format!("\"**/w{n}\""))
+        .collect::<Vec<_>>()
+        .join(",")
+    };
+    let names_the_ceiling = |err: serde_json::Error| {
+      assert!(
+        err.to_string().contains(&std::format!("{cap}")),
+        "the refusal names the ceiling: {err}"
+      );
+    };
+
+    // The ceiling itself is honoured, on both seats of both households.
+    let full: RootGlobs =
+      serde_json::from_str(&std::format!(r#"{{"prune": [{}]}}"#, list(cap))).expect("at the cap");
+    assert_eq!(full.prune().len(), cap);
+    let full: WatchOptions<OsString> =
+      serde_json::from_str(&std::format!(r#"{{"include": [{}]}}"#, list(cap))).expect("at the cap");
+    assert_eq!(full.include().map(|seat| seat.len()), Some(cap));
+
+    for seat in ["prune", "include"] {
+      let document = std::format!(r#"{{"{seat}": [{}]}}"#, list(cap + 1));
+      names_the_ceiling(
+        serde_json::from_str::<RootGlobs>(&document).expect_err("one past the cap is refused"),
+      );
+      names_the_ceiling(
+        serde_json::from_str::<WatchOptions<OsString>>(&document)
+          .expect_err("the subscription household carries the same ceiling"),
+      );
+    }
+
+    // The include seat's other two shapes are untouched: absent is the absent
+    // seat, and an explicit empty list is the engaged one that admits nothing.
+    assert_eq!(
+      serde_json::from_str::<RootGlobs>(r#"{}"#)
+        .expect("an empty document parses")
+        .include(),
+      None
+    );
+    assert_eq!(
+      serde_json::from_str::<RootGlobs>(r#"{"include": []}"#)
+        .expect("an empty seat parses")
+        .include(),
+      Some(&[][..])
+    );
+    assert_eq!(
+      serde_json::from_str::<RootGlobs>(r#"{"include": null}"#)
+        .expect("an explicit null parses")
+        .include(),
+      None
+    );
+  }
+
   /// Neither face constrains `C`: the only field mentioning it is skipped.
   #[test]
   fn neither_face_constrains_the_component_parameter() {
@@ -953,6 +1022,125 @@ mod clap_face {
       .err()
       .expect("an uncompilable pattern is refused at the flag");
     assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+  }
+
+  /// Every household composes as an OPTIONAL flatten, which is the one shape that
+  /// needs a real arg group underneath it.
+  ///
+  /// clap decides `Some` from `None` by asking whether the household's `ArgGroup`
+  /// was matched, and it asks for that group's id while BUILDING the command —
+  /// panicking outright when there is none. Leaving the group to the derive would
+  /// not do either: clap's derive leaves it EMPTY for any struct containing a
+  /// nested flatten, and an empty group is never present, so every flag would parse
+  /// and then be discarded.
+  ///
+  /// Both halves are asserted per household: `None` when the caller spelled nothing
+  /// of it, and `Some` — carrying the value — after ANY of its arguments, the
+  /// NESTED ones included.
+  ///
+  /// Revert witness: forward a derived `group_id` and the two households with a
+  /// nested flatten come back `None` from a command line that named their flags.
+  #[test]
+  fn an_optional_flatten_is_present_exactly_when_a_flag_was_given() {
+    #[derive(clap::Parser)]
+    struct OptionalCli {
+      #[arg(long)]
+      unrelated: bool,
+      #[command(flatten)]
+      watcher: Option<TributariesOptions>,
+    }
+
+    #[derive(clap::Parser)]
+    struct OptionalWatchCli {
+      #[arg(long)]
+      unrelated: bool,
+      #[command(flatten)]
+      watch: Option<WatchOptions<OsString>>,
+    }
+
+    #[derive(clap::Parser)]
+    struct OptionalGlobsCli {
+      #[arg(long)]
+      unrelated: bool,
+      #[command(flatten)]
+      globs: Option<RootGlobs>,
+    }
+
+    // The whole-command audit runs on each: an `ArgGroup` naming an id no argument
+    // carries is exactly what it catches.
+    OptionalCli::command().debug_assert();
+    OptionalWatchCli::command().debug_assert();
+    OptionalGlobsCli::command().debug_assert();
+
+    // The watcher household — a DIRECT flag, then a NESTED one.
+    let watcher = |rest: &[&str]| OptionalCli::parse_from(args(rest)).watcher;
+    assert!(
+      watcher(&[]).is_none(),
+      "nothing of the household was spelled"
+    );
+    assert!(
+      watcher(&["--unrelated"]).is_none(),
+      "and another argument entirely does not conjure one"
+    );
+    assert_eq!(
+      watcher(&["--event-capacity", "4096"])
+        .expect("a direct flag makes it present")
+        .event_capacity(),
+      nonzero(4096)
+    );
+    assert_eq!(
+      watcher(&["--quiet-window", "250ms"])
+        .expect("a nested debounce flag makes it present too")
+        .debounce_config(),
+      Some(DebounceConfig::new().with_quiet_window(Duration::from_millis(250))),
+      "the half a derived group would have lost"
+    );
+
+    // The subscription household — a seat, then an interest flag.
+    let watch = |rest: &[&str]| OptionalWatchCli::parse_from(args(rest)).watch;
+    assert!(watch(&[]).is_none());
+    assert!(watch(&["--unrelated"]).is_none());
+    assert_eq!(
+      texts(
+        watch(&["--prune", "**/node_modules"])
+          .expect("a seat flag makes it present")
+          .prune()
+      ),
+      ["**/node_modules"]
+    );
+    assert_eq!(
+      watch(&["--include", "*.mp4"])
+        .expect("the other seat too")
+        .include()
+        .map(texts),
+      Some(std::vec!["*.mp4"])
+    );
+    assert_eq!(
+      watch(&["--moved=false"])
+        .expect("a nested interest flag makes it present")
+        .interest(),
+      *Interest::all().clear_moved()
+    );
+
+    // The words on their own: two direct flags, and nothing else.
+    let globs = |rest: &[&str]| OptionalGlobsCli::parse_from(args(rest)).globs;
+    assert!(globs(&[]).is_none());
+    assert!(globs(&["--unrelated"]).is_none());
+    assert_eq!(
+      texts(
+        globs(&["--prune", "**/.git"])
+          .expect("a seat flag makes it present")
+          .prune()
+      ),
+      ["**/.git"]
+    );
+    assert_eq!(
+      globs(&["--include", "*.mkv"])
+        .expect("the other seat too")
+        .include()
+        .map(texts),
+      Some(std::vec!["*.mkv"])
+    );
   }
 
   /// The subscription's flags are the interest's own; the filter is skipped and comes

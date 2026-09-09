@@ -257,6 +257,26 @@ All notable changes to this workspace are documented here. The format is based o
   proxy's own derived group would not have helped, that group being left empty by the
   derive for any struct containing a nested flatten.
 
+- **`tributaries`** — every optional household on the `clap` face answers a stable,
+  explicitly populated `ArgGroup`: `TributariesOptions`, `WatchOptions` and `RootGlobs`
+  each name every argument they carry, the nested debounce, interest and seat flags
+  included. `#[command(flatten)] options: Option<TributariesOptions>` used to build a
+  command whose group was EMPTY — clap's derive leaves it so for any struct containing a
+  nested flatten — and an empty group is never present, so `--event-capacity 4096` parsed
+  and was then silently discarded as `None`. The same held of `Option<WatchOptions<C>>`
+  under `--prune` or an interest flag.
+
+- **`tributaries`** — the per-root glob seats are bounded before anything is armed.
+  `RootGlobs::MAX_SEAT_PATTERNS` (the vocabulary's own `glob::MAX_SEAT_PATTERNS`) caps
+  either seat of `RootGlobs` and `WatchOptions`; `validate` on both households and the
+  new `OptionsError::TooManyPrunePatterns` / `OptionsError::TooManyIncludePatterns` state
+  it, both serde faces refuse an over-full list MID-DOCUMENT rather than after building
+  every pattern in it, and `Tributaries::watch` refuses one with the new
+  `WatchError::InvalidOptions` before the request is even submitted. The seats are the
+  words handed to `Source::arm` and asked once per candidate thereafter, so an unchecked
+  length was per-event work a caller wrote and a custom source paid, with nothing above
+  the seam to notice.
+
 - **`tributary-proto`** — `glob::MAX_GLOB_LEN` (1024 bytes) and `glob::MAX_GLOB_NESTING`
   (8) bound what `Glob::new` will compile, as typed `GlobError`s, before the matcher is
   asked at all. Alternation is the vocabulary's only recursive construct and the matcher
