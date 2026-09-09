@@ -241,7 +241,23 @@ fn a_set_past_the_pattern_ceiling_is_a_typed_refusal() {
 fn a_pattern_over_the_length_limit_is_a_typed_refusal() {
   let huge = "?".repeat(300_000);
   let err = Glob::new(&huge).expect_err("a pattern past the length limit is refused");
-  assert_eq!(err.pattern(), huge);
+  // The refusal reports the TRUE length of what it refused, in the message —
+  // it just never pays to copy that much of it into the error value itself.
+  assert!(
+    err.message().contains(&huge.len().to_string()),
+    "the true length is reported: {}",
+    err.message()
+  );
+  assert!(
+    err.pattern().len() <= 64,
+    "only a bounded prefix is stored, not the whole {}-byte input",
+    huge.len()
+  );
+  assert_eq!(
+    err.pattern(),
+    &huge[..err.pattern().len()],
+    "and what is stored is a genuine prefix of the input, not something else"
+  );
   assert!(!err.message().is_empty());
   assert!(huge.parse::<Glob>().is_err(), "and through `FromStr`");
   assert!(Glob::try_from(huge.as_str()).is_err(), "and `TryFrom`");

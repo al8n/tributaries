@@ -126,6 +126,27 @@ fn nfc(text: &str) -> Cow<'_, str> {
   }
 }
 
+/// How much of an over-length pattern [`GlobError::pattern`] keeps, for the
+/// one refusal whose input has no other bound. Enough to recognize the
+/// pattern in a log line; small enough that refusing a caller's oversized
+/// value never itself allocates in proportion to that value's size.
+const OVER_LENGTH_PREVIEW_BYTES: usize = 64;
+
+/// The largest byte index `<= len` (and `<= s.len()`) that lands on a UTF-8
+/// char boundary of `s` — a stable stand-in for the nightly-only
+/// `str::floor_char_boundary`, needed so the over-length preview never
+/// slices through a multibyte character.
+fn floor_char_boundary(s: &str, len: usize) -> usize {
+  if len >= s.len() {
+    return s.len();
+  }
+  let mut i = len;
+  while i > 0 && !s.is_char_boundary(i) {
+    i -= 1;
+  }
+  i
+}
+
 /// The alternation nesting depth `pattern` reaches, if that is more than
 /// [`MAX_GLOB_NESTING`] — the flat scan that stands in for the recursive parse.
 ///
@@ -170,6 +191,13 @@ pub struct GlobError {
 
 impl GlobError {
   /// The pattern text that could not be compiled.
+  ///
+  /// For every refusal but one this is the whole rejected input. The
+  /// exception is an over-length pattern ([`MAX_GLOB_LEN`]): a caller's
+  /// value that is refused for being too long must not itself cost this
+  /// error a copy of the whole thing, so this returns only a bounded prefix
+  /// — at most the first 64 bytes, cut to a char boundary. The true length
+  /// is reported in [`message`](Self::message).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn pattern(&self) -> &str {
     &self.pattern
@@ -303,10 +331,19 @@ impl Glob {
       message,
     };
     if pattern.len() > MAX_GLOB_LEN {
-      return Err(refuse(format!(
-        "the pattern is {} bytes, over the {MAX_GLOB_LEN}-byte limit",
-        pattern.len()
-      )));
+      // The one refusal whose input is unbounded by construction — that is
+      // the whole reason it is being refused — so this is the one refusal
+      // that must not pay for a full `to_owned()` of it. Only a bounded
+      // prefix is kept; the true length still reaches the caller, in the
+      // message.
+      let boundary = floor_char_boundary(pattern, OVER_LENGTH_PREVIEW_BYTES);
+      return Err(GlobError {
+        pattern: pattern[..boundary].to_owned(),
+        message: format!(
+          "the pattern is {} bytes, over the {MAX_GLOB_LEN}-byte limit",
+          pattern.len()
+        ),
+      });
     }
     if let Some(depth) = over_nested(pattern) {
       return Err(refuse(format!(
