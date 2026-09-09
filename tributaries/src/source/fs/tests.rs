@@ -247,6 +247,17 @@ fn sync_error_from_fs_classifies_a_refused_cookie_honestly() {
   // Transient and retryable — nothing was written.
   assert!(super::sync_error_from_fs(SyncRootError::WriteInFlight).is_busy());
   assert!(super::sync_error_from_fs(SyncRootError::CleanupBacklog).is_busy());
+  // A cookie directory replaced under an admitted barrier is the same shape: nothing was
+  // written, the caller named a directory that is still there and still covered, and a
+  // re-minted sync is admitted for whatever now stands at the name. Reaching the wildcard it
+  // would read as `CookieWrite` — "your filesystem refused this" — which is the untrue,
+  // unactionable answer this whole mapping exists to avoid.
+  assert!(
+    super::sync_error_from_fs(SyncRootError::DirReplaced {
+      dir: PathBuf::from("/root/a"),
+    })
+    .is_busy()
+  );
   // The subscription's coverage went away underneath the barrier.
   assert!(super::sync_error_from_fs(SyncRootError::UnknownRoot).is_retired());
   assert!(super::sync_error_from_fs(SyncRootError::Retired).is_retired());

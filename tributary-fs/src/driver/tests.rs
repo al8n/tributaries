@@ -3149,6 +3149,7 @@ mod descending {
         .send(Command::SyncRoot {
           scope,
           dir: PathBuf::from("/r"),
+          target: None,
           name: ".tributaries-sync-1-2-3".to_owned(),
           ticket: ticket(),
           reply,
@@ -3349,6 +3350,7 @@ mod descending {
         .send(Command::SyncRoot {
           scope,
           dir: PathBuf::from("/r"),
+          target: None,
           name: ".tributaries-sync-9-9-9".to_owned(),
           ticket: ticket(),
           reply,
@@ -5290,6 +5292,7 @@ mod descending {
         .send(Command::SyncRoot {
           scope,
           dir: PathBuf::from("/r"),
+          target: None,
           name: name.to_owned(),
           ticket,
           reply,
@@ -5729,6 +5732,7 @@ mod descending {
         .send(Command::SyncRoot {
           scope,
           dir: PathBuf::from("/r"),
+          target: None,
           name: ".tributaries-sync-dead-batch".to_owned(),
           ticket: ticket(),
           reply: sync_reply,
@@ -5920,6 +5924,7 @@ mod descending {
         .send(Command::SyncRoot {
           scope,
           dir: PathBuf::from("/r"),
+          target: None,
           name: ".tributaries-sync-unanswered-batch".to_owned(),
           ticket: ticket(),
           reply: sync_reply,
@@ -7370,6 +7375,7 @@ mod descending {
         .send(Command::SyncRoot {
           scope,
           dir: PathBuf::from(dir),
+          target: None,
           name: name.to_owned(),
           // These cells never cancel by ticket, so a fresh per-call ticket suffices.
           ticket: ticket(),
@@ -8379,6 +8385,7 @@ mod descending {
         .send(Command::SyncRoot {
           scope,
           dir: PathBuf::from("/r/sub"),
+          target: None,
           name: ".tributaries-sync-widen-claim".to_owned(),
           ticket: ticket(),
           reply,
@@ -8464,6 +8471,7 @@ mod descending {
         .send(Command::SyncRoot {
           scope,
           dir: PathBuf::from("/r"),
+          target: None,
           name: ".tributaries-sync-adopt".to_owned(),
           ticket: ticket(),
           reply,
@@ -8579,6 +8587,7 @@ mod descending {
         .send(Command::SyncRoot {
           scope,
           dir: PathBuf::from("/r"),
+          target: None,
           name: ".tributaries-sync-after-teardown".to_owned(),
           ticket: ticket(),
           reply,
@@ -8654,6 +8663,7 @@ mod descending {
         .send(Command::SyncRoot {
           scope,
           dir: PathBuf::from("/r"),
+          target: None,
           name: ".tributaries-sync-verify".to_owned(),
           ticket: ticket(),
           reply,
@@ -8708,6 +8718,7 @@ mod descending {
         .send(Command::SyncRoot {
           scope,
           dir: PathBuf::from("/r"),
+          target: None,
           name: ".tributaries-sync-seal".to_owned(),
           ticket: ticket(),
           reply,
@@ -11797,6 +11808,7 @@ mod sync_cookie {
       .send(Command::SyncRoot {
         scope,
         dir: PathBuf::from(dir),
+        target: None,
         name: name.to_owned(),
         ticket,
         reply,
@@ -11887,6 +11899,7 @@ mod sync_cookie {
       .send(Command::SyncRoot {
         scope,
         dir: PathBuf::from(dir),
+        target: None,
         name: name.to_owned(),
         ticket,
         reply,
@@ -17528,6 +17541,19 @@ mod sync_cookie {
       dir
     }
 
+    /// The identity a real ADMISSION would have read for a sync of `dir` under
+    /// `root` — the reading the production write compares the object its own
+    /// descent reaches against ([`cookie_target_identity`]).
+    ///
+    /// Where a cell calls it is where its admission stands relative to the write.
+    /// Taken at the call, it reads whatever the cell's staging left behind — which
+    /// is the same object for a peer that RENAMES a directory, that rename carrying
+    /// the object with it. A cell about a REPLACEMENT binds it earlier instead, at
+    /// the moment its sync would have been admitted.
+    fn admitted(root: &Path, dir: &Path) -> Option<RootIdentity> {
+      crate::driver::cookie_target_identity(root, dir)
+    }
+
     /// A cookie directory inside `parent`, reached the way a real write reaches
     /// one: `parent` stands as its own root, so the descent is a zero-component
     /// one onto it and the directory is created relative to what that descent
@@ -17653,6 +17679,7 @@ mod sync_cookie {
       let written = RealFs::new().write_cookie(
         &live,
         &root.join("sub"),
+        admitted(&root, &root.join("sub")),
         ".tributaries-sync-replaced",
         &tributary_proto::glob::Globs::default(),
         &[],
@@ -17680,6 +17707,115 @@ mod sync_cookie {
       );
 
       let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A cookie never enters a REPLACEMENT of the directory its sync was admitted
+    /// for, even one standing perfectly inside the proven root.
+    ///
+    /// The escape this closes is one level below the root's. The walk descends
+    /// from the root OBJECT, so the root cannot be swapped under it — but every
+    /// step below the root is opened BY NAME, and a peer that renames a covered
+    /// directory aside and stands a fresh one at its name is descended into
+    /// exactly as the original would have been. The window is the whole distance
+    /// between the admission and the write: a settle fence, then a detached
+    /// blocking job.
+    ///
+    /// What that used to buy: the marker is created inside a directory whose
+    /// per-directory coverage this scope has not armed yet, so its create enters no
+    /// ordered queue at all. The queued parent event later installs the replacement
+    /// and cold-enumerates it, and those independent crawls can synthesize the
+    /// marker's create ahead of descendants that were on disk before it — a barrier
+    /// that resolves while certifying an ordering nothing proved.
+    ///
+    /// The admission's own reading of the directory is what tells the two objects
+    /// apart, so the write refuses and creates nothing at all — not in the
+    /// replacement, not in the original, and no residue to hand back.
+    ///
+    /// Real syscalls, because the whole question is which OBJECT a name reaches
+    /// after a rename, which no modelled tree can be asked.
+    ///
+    /// Revert witness: drop the admitted-identity comparison and the marker appears
+    /// inside the replacement.
+    #[test]
+    fn a_cookie_never_enters_a_replacement_of_the_admitted_directory() {
+      let root = scratch("dir-replaced");
+      let target = root.join("a");
+      std::fs::create_dir_all(target.join("deep")).expect("the covered subtree");
+      let live = crate::driver::LiveRoot::for_tests(&root);
+      // The admission: the sync is admitted for THIS object, and the barrier it
+      // promises is a promise about this one.
+      let admitted_target = admitted(&root, &target);
+
+      // …and a peer then swaps that directory out for a fresh one of the same
+      // shape, with a descendant already inside it — the change a cold crawl of
+      // the replacement would have to order the marker behind.
+      std::fs::rename(&target, root.join("moved")).expect("the covered directory moves aside");
+      std::fs::create_dir_all(target.join("deep")).expect("a replacement of the same shape");
+      std::fs::write(target.join("deep").join("pre"), b"older").expect("content inside it");
+
+      let written = RealFs::new().write_cookie(
+        &live,
+        &target,
+        admitted_target,
+        ".tributaries-sync-1-2-11-0000000000000012",
+        &tributary_proto::glob::Globs::default(),
+        &[],
+      );
+
+      let refusal = written.expect_err(
+        "the write refused rather than marking a directory the admission never \
+         judged",
+      );
+      assert!(
+        refusal.replaced.is_some(),
+        "and it refused as a REPLACEMENT, naming the directory whose object \
+         moved: {refusal:?}"
+      );
+      assert!(
+        refusal.residue.is_none(),
+        "a refusal taken before anything is created owes nothing: {refusal:?}"
+      );
+      assert!(
+        !cookie_dir_landed(&target),
+        "nothing of this write reached the replacement"
+      );
+      assert!(
+        !cookie_dir_landed(&root.join("moved")),
+        "and the refusal is total: the renamed-aside original was not written \
+         into either"
+      );
+
+      let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The other half of the same rule: a target nobody touched is the object the
+    /// admission judged, so it still writes.
+    ///
+    /// Without this the refusal above could be satisfied by a comparison that
+    /// never passes, and every barrier in the workspace would be one.
+    #[test]
+    fn an_unreplaced_admitted_directory_still_writes() {
+      let root = scratch("dir-unreplaced");
+      let target = root.join("a");
+      std::fs::create_dir_all(target.join("deep")).expect("the covered subtree");
+      let live = crate::driver::LiveRoot::for_tests(&root);
+
+      RealFs::new()
+        .write_cookie(
+          &live,
+          &target,
+          admitted(&root, &target),
+          ".tributaries-sync-1-2-12-0000000000000013",
+          &tributary_proto::glob::Globs::default(),
+          &[],
+        )
+        .expect("an untouched target is the object the admission judged");
+      assert!(
+        cookie_dir_landed(&target),
+        "and the marker stands inside it"
+      );
+
+      let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A cookie's PARENT renamed inside the root, after the walk has passed
@@ -17844,6 +17980,7 @@ mod sync_cookie {
       let written = RealFs::new().write_cookie(
         &live,
         &judged,
+        admitted(&root, &judged),
         ".tributaries-sync-1-2-3-000000000000000a",
         &tributary_proto::glob::Globs::default(),
         std::slice::from_ref(&hidden),
@@ -17873,6 +18010,7 @@ mod sync_cookie {
         .write_cookie(
           &live,
           &unmoved,
+          admitted(&root, &unmoved),
           ".tributaries-sync-1-2-4-000000000000000b",
           &tributary_proto::glob::Globs::default(),
           std::slice::from_ref(&hidden),
@@ -17913,6 +18051,7 @@ mod sync_cookie {
       let written = RealFs::new().write_cookie(
         &live,
         &judged,
+        admitted(&root, &judged),
         ".tributaries-sync-1-2-5-000000000000000c",
         &prune,
         &[],
@@ -17945,6 +18084,7 @@ mod sync_cookie {
         .write_cookie(
           &live,
           &unmoved,
+          admitted(&root, &unmoved),
           ".tributaries-sync-1-2-6-000000000000000d",
           &prune,
           &[],
@@ -17981,6 +18121,7 @@ mod sync_cookie {
       let written = RealFs::new().write_cookie(
         &crate::driver::LiveRoot::for_tests(&root),
         &live,
+        admitted(&root, &live),
         ".tributaries-sync-1-2-7-000000000000000e",
         &tributary_proto::glob::Globs::default(),
         std::slice::from_ref(&reserved),
@@ -18010,6 +18151,7 @@ mod sync_cookie {
         .write_cookie(
           &crate::driver::LiveRoot::for_tests(&root),
           &live,
+          admitted(&root, &live),
           ".tributaries-sync-1-2-8-000000000000000f",
           &tributary_proto::glob::Globs::default(),
           std::slice::from_ref(&root.join("elsewhere")),
@@ -18082,6 +18224,7 @@ mod sync_cookie {
       let written = RealFs::new().write_cookie(
         &live,
         &judged,
+        admitted(&root, &judged),
         name,
         &tributary_proto::glob::Globs::default(),
         std::slice::from_ref(&hidden),
@@ -18129,6 +18272,7 @@ mod sync_cookie {
         .write_cookie(
           &live,
           &unmoved,
+          admitted(&root, &unmoved),
           ".tributaries-sync-1-2-10-0000000000000011",
           &tributary_proto::glob::Globs::default(),
           std::slice::from_ref(&hidden),
@@ -18167,6 +18311,7 @@ mod sync_cookie {
         .write_cookie(
           &crate::driver::LiveRoot::for_tests(&root),
           &root,
+          admitted(&root, &root),
           ".tributaries-sync-displaced",
           &tributary_proto::glob::Globs::default(),
           &[],
@@ -18210,6 +18355,7 @@ mod sync_cookie {
         .write_cookie(
           &crate::driver::LiveRoot::for_tests(&root),
           &root,
+          admitted(&root, &root),
           ".tributaries-sync-plain",
           &tributary_proto::glob::Globs::default(),
           &[],
@@ -18262,6 +18408,7 @@ mod sync_cookie {
         .write_cookie(
           &crate::driver::LiveRoot::for_tests(&root),
           &root,
+          admitted(&root, &root),
           ".tributaries-sync-gone",
           &tributary_proto::glob::Globs::default(),
           &[],
@@ -18339,6 +18486,7 @@ mod sync_cookie {
         .write_cookie(
           &crate::driver::LiveRoot::for_tests(&root),
           &root,
+          admitted(&root, &root),
           ".tributaries-sync-reuse",
           &tributary_proto::glob::Globs::default(),
           &[],
@@ -18467,6 +18615,7 @@ mod sync_cookie {
         .write_cookie(
           &crate::driver::LiveRoot::for_tests(&root),
           &dir,
+          admitted(&root, &dir),
           ".tributaries-sync-unprovable",
           &tributary_proto::glob::Globs::default(),
           &[],
@@ -18521,6 +18670,7 @@ mod sync_cookie {
         .write_cookie(
           &crate::driver::LiveRoot::for_tests(&root),
           &root,
+          admitted(&root, &root),
           ".tributaries-sync-fifo",
           &tributary_proto::glob::Globs::default(),
           &[],
@@ -18699,6 +18849,7 @@ mod sync_cookie {
         .write_cookie(
           &crate::driver::LiveRoot::for_tests(&root),
           &root,
+          admitted(&root, &root),
           ".tributaries-sync-reap-pin",
           &tributary_proto::glob::Globs::default(),
           &[],
@@ -18751,6 +18902,7 @@ mod sync_cookie {
         .write_cookie(
           &crate::driver::LiveRoot::for_tests(&root),
           &dir,
+          admitted(&root, &dir),
           ".tributaries-sync-reap-pin-kept",
           &tributary_proto::glob::Globs::default(),
           &[],
@@ -18917,6 +19069,7 @@ mod sync_cookie {
         .write_cookie(
           &crate::driver::LiveRoot::for_tests(&root),
           &root,
+          admitted(&root, &root),
           ".tributaries-sync-dir-mode",
           &tributary_proto::glob::Globs::default(),
           &[],
@@ -18934,6 +19087,7 @@ mod sync_cookie {
       let widened = fs.write_cookie(
         &crate::driver::LiveRoot::for_tests(&root),
         &root,
+        admitted(&root, &root),
         ".tributaries-sync-dir-mode-2",
         &tributary_proto::glob::Globs::default(),
         &[],
@@ -18955,6 +19109,7 @@ mod sync_cookie {
         fs.write_cookie(
           &crate::driver::LiveRoot::for_tests(&root),
           &root,
+          admitted(&root, &root),
           ".tributaries-sync-dir-owner",
           &tributary_proto::glob::Globs::default(),
           &[],
@@ -19010,6 +19165,19 @@ mod sync_cookie {
       ));
       std::fs::create_dir_all(&dir).expect("create scratch dir");
       dir
+    }
+
+    /// The identity a real ADMISSION would have read for a sync of `dir` under
+    /// `root` — the reading the production write compares the object its own
+    /// descent reaches against ([`cookie_target_identity`]).
+    ///
+    /// Where a cell calls it is where its admission stands relative to the write.
+    /// Taken at the call, it reads whatever the cell's staging left behind — which
+    /// is the same object for a peer that RENAMES a directory, that rename carrying
+    /// the object with it. A cell about a REPLACEMENT binds it earlier instead, at
+    /// the moment its sync would have been admitted.
+    fn admitted(root: &Path, dir: &Path) -> Option<RootIdentity> {
+      crate::driver::cookie_target_identity(root, dir)
     }
 
     /// `parent`, opened the way a real write opens it — the handle the mint is
@@ -19069,6 +19237,7 @@ mod sync_cookie {
         .write_cookie(
           &crate::driver::LiveRoot::for_tests(&root),
           &root,
+          admitted(&root, &root),
           ".tributaries-sync-dispose",
           &tributary_proto::glob::Globs::default(),
           &[],
@@ -19133,6 +19302,7 @@ mod sync_cookie {
         .write_cookie(
           &crate::driver::LiveRoot::for_tests(&root),
           &root,
+          admitted(&root, &root),
           ".tributaries-sync-renamed",
           &tributary_proto::glob::Globs::default(),
           &[],
@@ -19282,6 +19452,7 @@ mod sync_cookie {
         .write_cookie(
           &crate::driver::LiveRoot::for_tests(&root),
           &root,
+          admitted(&root, &root),
           ".tributaries-sync-dispose-refused",
           &tributary_proto::glob::Globs::default(),
           &[],
@@ -19475,6 +19646,7 @@ mod sync_cookie {
       let written = fs.write_cookie(
         &crate::driver::LiveRoot::for_tests(&root),
         &root,
+        admitted(&root, &root),
         ".tributaries-sync-junk",
         &tributary_proto::glob::Globs::default(),
         &[],
@@ -19571,6 +19743,7 @@ mod sync_cookie {
         .write_cookie(
           &crate::driver::LiveRoot::for_tests(&root),
           &root,
+          admitted(&root, &root),
           ".tributaries-sync-residue",
           &tributary_proto::glob::Globs::default(),
           &[],

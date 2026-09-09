@@ -1950,10 +1950,16 @@ impl FsOps for FakeFs {
     &self,
     root: &crate::driver::LiveRoot,
     dir: &Path,
+    target: Option<RootIdentity>,
     name: &str,
     prune: &tributary_proto::glob::Globs,
     exclusions: &[PathBuf],
   ) -> Result<CookieFile, CookieWriteError> {
+    // The modelled tree has no relationship to the real filesystem the admission
+    // door samples, so no admitted identity ever names a node here. The
+    // object-replacement verdict is a real-syscall property and is proven where it
+    // lives, against real inodes.
+    let _ = target;
     let root = root.path();
     // The dispatch is counted BEFORE the hold: a cell that must race a scope
     // retirement (or an abandoned reply) against a write in flight needs to know
@@ -2067,6 +2073,7 @@ impl FsOps for FakeFs {
         residue: Some(Box::new(CookieResidue::File(file))),
         pruned: None,
         excluded: None,
+        replaced: None,
       });
     }
     Ok(file)

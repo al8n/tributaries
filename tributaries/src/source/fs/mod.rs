@@ -1010,6 +1010,13 @@ fn sync_error_from_fs(error: SyncRootError) -> SyncError {
     // a failing unlink the driver is retrying). No physical write happened;
     // it is transient and retryable, the same shape as `WriteInFlight`.
     SyncRootError::CleanupBacklog => SyncError::Busy,
+    // The cookie directory was replaced between the admission and the write, so the barrier's
+    // promise is about an object that is no longer there. Nothing was written and nothing about
+    // the CALLER's request is wrong — the directory it named still exists and is still covered —
+    // so this is neither a write failure nor an uncovered directory but the same transient,
+    // retryable shape the two above have: a fresh sync is admitted for whatever now stands at
+    // the name.
+    SyncRootError::DirReplaced { .. } => SyncError::Busy,
     SyncRootError::Closed => SyncError::Closed,
     _ => SyncError::CookieWrite(SourceFault::new(FaultKind::Other)),
   }

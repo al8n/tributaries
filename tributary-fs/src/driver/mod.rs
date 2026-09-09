@@ -186,6 +186,10 @@ pub(crate) type WatchReply = futures_channel::oneshot::Sender<Result<WatchGrant,
 /// entry here exists exactly while its obligation is `Parked`.
 struct ParkedCookie {
   dir: PathBuf,
+  /// The identity the admission read for `dir` — carried so the detached write can
+  /// prove the directory it reaches is the OBJECT the barrier was promised for
+  /// ([`cookie_target_identity`]).
+  target: Option<RootIdentity>,
   reply: futures_channel::oneshot::Sender<Result<PathBuf, crate::error::SyncRootError>>,
 }
 
@@ -1268,6 +1272,18 @@ struct CookieParent {
   /// good spelling of the same directory (a short `TEMP` name, a mapped drive)
   /// that no normalized final path ever begins with.
   floor: PathBuf,
+  /// The identity of the object this value HOLDS, read off the descriptor the
+  /// walk ended on — one `fstat` of a pinned descriptor, taken at the instant the
+  /// walk finished and never re-derived from a name.
+  ///
+  /// A name is not an object, and every verdict above is about a name. This is the
+  /// one fact that says WHICH directory the walk reached, so a caller can ask
+  /// whether it is the directory a sync was admitted for
+  /// ([`cookie_target_identity`]) rather than merely a directory standing at that
+  /// spelling. `None` where the platform or volume has no identity to give, which
+  /// is the same absence [`cookie_target_identity`] answers there — the comparison
+  /// then narrows nothing, exactly as the root's own does.
+  identity: Option<RootIdentity>,
   /// Every create runs against this, never against `path`.
   #[cfg(any(target_os = "linux", target_os = "macos"))]
   fd: std::os::fd::OwnedFd,
@@ -1280,6 +1296,12 @@ impl CookieParent {
   /// are taken on.
   fn path(&self) -> &Path {
     &self.path
+  }
+
+  /// The identity of the object the walk ended holding — what the admission's own
+  /// reading of the cookie directory is compared against.
+  fn identity(&self) -> Option<RootIdentity> {
+    self.identity
   }
 
   /// The watched root's name in [`path`](Self::path)'s own form — the floor those
@@ -1409,8 +1431,32 @@ impl CookieParent {
     // closes is the window the descent itself opens, which is the one a check
     // against the walked components can never see.
     let path = current_path_of_dir(&fd)?;
-    Ok(Self { path, floor, fd })
+    // And the OBJECT that descriptor refers to, in the same breath. A read that
+    // FAILS refuses the walk here, before anything is created: a write that cannot
+    // say which directory it is holding cannot say the barrier it is about to
+    // place covers the directory the sync was admitted for.
+    let identity = identity_of_dir(&fd)?;
+    Ok(Self {
+      path,
+      floor,
+      identity,
+      fd,
+    })
   }
+}
+
+/// The identity of an open DIRECTORY descriptor — the `fstat` twin of
+/// [`current_path_of_dir`], for the walk that owns its descriptor as a bare
+/// [`OwnedFd`](std::os::fd::OwnedFd) rather than as a [`File`](std::fs::File).
+///
+/// The duplicate is what keeps the walk's ownership intact: `try_clone` hands back
+/// a second descriptor onto the SAME open file description, so the `fstat`
+/// underneath [`identity_of_handle`] reads the very object the walk is holding and
+/// the walk's own descriptor is neither consumed nor closed. It resolves no
+/// pathname, so the one-sample rule the module doc states is kept.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn identity_of_dir(fd: &std::os::fd::OwnedFd) -> Result<Option<RootIdentity>, std::io::Error> {
+  identity_of_handle(&std::fs::File::from(fd.try_clone()?))
 }
 
 /// The path the kernel currently answers for an open DIRECTORY descriptor.
@@ -1497,9 +1543,15 @@ impl CookieParent {
         "the cookie directory does not lie under the watched root object",
       ));
     }
+    // The object behind that handle, read the same way the admission read the
+    // directory it was given ([`cookie_target_identity`]): a duplicate of this
+    // handle, and one identity read of it. A failure refuses before anything is
+    // created, for the reason the walking arm states.
+    let identity = identity_of_handle(&std::fs::File::from(handle.try_clone()?))?;
     Ok(Self {
       path,
       floor,
+      identity,
       handle,
     })
   }
@@ -2752,6 +2804,15 @@ pub(crate) struct CookieWriteError {
   /// Always a clean failure with no residue beside it, on the same terms `pruned`
   /// is. Boxed for the same reason the others are.
   pub(crate) excluded: Option<Box<ExcludedCookieDir>>,
+  /// Set when the write refused because the directory its walk reached is not the
+  /// OBJECT the sync was admitted for — a peer replaced that directory between the
+  /// admission and this write. Carries the name the replacement stands at, as the
+  /// descriptor answered it.
+  ///
+  /// Always a clean failure with no residue beside it: the verdict is taken on the
+  /// walk's own descriptor, before anything at all is created. Boxed for the
+  /// reason `pruned` and `excluded` are.
+  pub(crate) replaced: Option<Box<PathBuf>>,
 }
 
 /// The prune verdict a cookie write refused on: the canonical directory it
@@ -2789,6 +2850,22 @@ impl CookieWriteError {
       residue: None,
       pruned: None,
       excluded: None,
+      replaced: None,
+    }
+  }
+
+  /// The replacement refusal: the directory the walk reached is not the object the
+  /// admission judged, so nothing of this write is on disk and the caller learns
+  /// the name whose object changed under it.
+  pub(crate) fn replaced(dir: PathBuf) -> Self {
+    Self {
+      source: std::io::Error::other(
+        "the cookie directory was replaced after the sync was admitted",
+      ),
+      residue: None,
+      pruned: None,
+      excluded: None,
+      replaced: Some(Box::new(dir)),
     }
   }
 
@@ -2802,6 +2879,7 @@ impl CookieWriteError {
       residue: None,
       pruned: Some(Box::new(PrunedCookieDir { dir, pattern })),
       excluded: None,
+      replaced: None,
     }
   }
 
@@ -2816,6 +2894,7 @@ impl CookieWriteError {
       residue: None,
       pruned: None,
       excluded: Some(Box::new(ExcludedCookieDir { dir, exclusion })),
+      replaced: None,
     }
   }
 }
@@ -4579,6 +4658,12 @@ pub(crate) enum Command {
     scope: ScopeId,
     /// The directory to place it in (validated inside the root by the watcher).
     dir: PathBuf,
+    /// The identity `dir` answered at the admission door, read there because that
+    /// is the moment the barrier's promise is made — the write is detached from it
+    /// by a settle fence and a blocking pool, and only this says whether the
+    /// directory it reaches is still the object that was judged
+    /// ([`cookie_target_identity`]).
+    target: Option<RootIdentity>,
     /// The minted cookie name (the caller owns the reserved namespace).
     name: String,
     /// The watcher-minted ticket keying this admission — the `by_ticket` address a
@@ -4921,8 +5006,8 @@ where
       let ops = ops.clone();
       let tx = op_tx.clone();
       R::spawn_blocking_detach(move || {
-        let ParkedCookie { dir, reply } = cookie;
-        match ops.write_cookie(&root, &dir, &name, &prune, &exclusions) {
+        let ParkedCookie { dir, target, reply } = cookie;
+        match ops.write_cookie(&root, &dir, target, &name, &prune, &exclusions) {
           Ok(file) => {
             // Hand the cookie to the registry — the path the write ACTUALLY
             // landed at (which only the write knows: a covered FILE
@@ -4955,6 +5040,24 @@ where
                 }
               }
             }
+          }
+          Err(CookieWriteError {
+            replaced: Some(dir),
+            ..
+          }) => {
+            // The write's descriptor walk reached a directory that is not the
+            // OBJECT the admission judged: a peer renamed the cookie directory
+            // aside and stood a replacement at its name after the sync was
+            // admitted. A barrier promises an ordering for the directory that
+            // existed at admission, and the replacement's coverage is not yet
+            // armed — a marker born there rides no queue this stream reads, so a
+            // cold enumeration of the replacement could report its create ahead of
+            // changes that truly preceded it. Refused with nothing created, so the
+            // obligation reaches the same pre-physical terminal a clean failure
+            // does, and the caller is told the name whose object moved rather than
+            // handed a barrier that certifies nothing.
+            lock_ledger(&guard.ledger).retire(guard.id, Reaped::NeverCreated);
+            let _ = reply.send(Err(crate::error::SyncRootError::DirReplaced { dir: *dir }));
           }
           Err(CookieWriteError {
             excluded: Some(excluded),
@@ -5653,10 +5756,21 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
   /// so a marker the fence will suppress is a barrier that can only time out;
   /// success here means the marker was observable ground when this write last
   /// could ask.
+  /// `target` is the identity the ADMISSION read for the directory this cookie was
+  /// admitted for ([`cookie_target_identity`]). A barrier certifies an ordering for
+  /// the directory OBJECT that existed at admission and for no other, so an
+  /// implementation that can name the object it reached must compare the two and,
+  /// on a mismatch, create NOTHING and answer [`CookieWriteError::replaced`] —
+  /// which the caller reports as
+  /// [`SyncRootError::DirReplaced`](crate::SyncRootError::DirReplaced). A
+  /// replacement standing at the name is a directory whose coverage this scope has
+  /// not yet armed, so a marker born inside it rides no ordering the caller's
+  /// stream reads.
   fn write_cookie(
     &self,
     root: &LiveRoot,
     dir: &Path,
+    target: Option<RootIdentity>,
     name: &str,
     prune: &Globs,
     exclusions: &[PathBuf],
@@ -6534,6 +6648,59 @@ fn cookie_dir<'a>(root: &Path, dir: &'a Path) -> &'a Path {
   }
 }
 
+/// The identity of the directory a sync is ADMITTED for — the object a later
+/// write must find still standing there, or refuse.
+///
+/// Read at the admission door, which is the moment the barrier's promise is made:
+/// what a sync certifies is an ordering for the directory OBJECT that was there
+/// when it was admitted, and the write is detached from that moment by a settle
+/// fence and a blocking pool. A peer that renames the directory aside and stands a
+/// replacement at its name inside that window leaves every pathname the write
+/// resolves perfectly valid and perfectly wrong: the replacement is a legitimate
+/// child of the proven root, so the walk descends into it, while the queue that
+/// would carry the marker's create is not yet attached to it. This identity is
+/// what tells the two apart.
+///
+/// The object it names is the one the write itself will end up holding, selected
+/// by the same rule ([`cookie_dir`], so a covered FILE subscription answers for
+/// the directory the cookie truly goes in) and read through a symlink-FOLLOWING
+/// sample, because the write's `canonicalize` follows them too. A pathname's
+/// spelling does not enter the answer at all — a device and inode are the same
+/// pair through every alias of one directory.
+///
+/// `None` is a definite absence of proof and is treated as one: the platform has
+/// no identity to give (and neither will the write's own read, so the comparison
+/// narrows nothing there, exactly as the root's does), or the sample FAILED —
+/// which on a platform that does have identities means no directory answered at
+/// this name when the sync was admitted, so a write that later walks into one has
+/// walked into an object the admission never judged.
+///
+/// One `stat` on the caller's own thread, in the [`watch`](crate::Watcher::watch)
+/// door's mold — never on the driver's owner loop, which must not resolve a
+/// pathname against a mount that can hang.
+pub(crate) fn cookie_target_identity(root: &Path, dir: &Path) -> Option<RootIdentity> {
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = std::fs::metadata(cookie_dir(root, dir)).ok()?;
+    Some(RootIdentity::new(meta.dev(), meta.ino().into()))
+  }
+  // No `Metadata` on this platform answers a file id, so the identity comes off an
+  // OPEN handle — the same read, through the same sentinel filtering, that the
+  // write's own descriptor gets ([`identity_of_handle`]).
+  #[cfg(all(target_os = "windows", not(miri)))]
+  {
+    let opened = open_root_object(cookie_dir(root, dir)).ok()?;
+    identity_of_handle(&opened).ok().flatten()
+  }
+  #[cfg(not(any(unix, all(target_os = "windows", not(miri)))))]
+  {
+    let _ = (root, dir);
+    None
+  }
+}
+
 /// The longest cookie leaf this driver will carry, in bytes — `NAME_MAX` on
 /// every filesystem the supported platforms mount, so a longer name is one no
 /// create could ever land anyway.
@@ -6978,6 +7145,7 @@ impl FsOps for RealFs {
     &self,
     root: &LiveRoot,
     dir: &Path,
+    target: Option<RootIdentity>,
     name: &str,
     prune: &Globs,
     exclusions: &[PathBuf],
@@ -7032,6 +7200,27 @@ impl FsOps for RealFs {
     // the write outright rather than descending into whatever answered.
     let parent = CookieParent::open(root.identity(), canonical_root, &canonical_dir)
       .map_err(CookieWriteError::clean)?;
+    // And that object is compared against the one the ADMISSION judged.
+    //
+    // The walk above proves the descent started at the scope's root OBJECT, which
+    // is a different question: every step below the root is opened by name, so a
+    // directory renamed aside and replaced under the root between the admission
+    // and this write is descended into exactly as the original would have been.
+    // Both spellings are contained, both walks are correct, and the marker lands
+    // inside a directory whose coverage this scope has not armed — its create
+    // enters no queue this stream reads, and a later cold enumeration of the
+    // replacement can synthesize that create ahead of changes that truly preceded
+    // it. The barrier would then certify an ordering nobody proved.
+    //
+    // So the promise is made object-shaped: a sync certifies ordering for the
+    // directory that existed when it was admitted, and a replacement is a refusal
+    // taken here, before anything is created. The comparison is EXACT in both
+    // directions — an admission that could read no identity where this write can
+    // read one is an admission that judged no object at all — and narrows nothing
+    // on a platform where neither side has an identity to give.
+    if parent.identity() != target {
+      return Err(CookieWriteError::replaced(parent.path().to_path_buf()));
+    }
     // The seat verdict, taken on that opened object rather than on the spelling
     // that reached it and measured against the floor the OPEN was proven under
     // ([`cookie_ground_refusal`] states each of the three questions and why every
@@ -7711,6 +7900,7 @@ fn destroy_unidentified(
       )))),
       pruned: None,
       excluded: None,
+      replaced: None,
     },
   }
 }
@@ -7765,6 +7955,7 @@ fn withdraw_marker(
       )))),
       pruned: None,
       excluded: None,
+      replaced: None,
     },
   }
 }
@@ -7801,6 +7992,7 @@ fn post_mint_failure(dir: &Arc<CookieDir>, name: &str, source: std::io::Error) -
       residue: Some(Box::new(CookieResidue::Dir(owed))),
       pruned: None,
       excluded: None,
+      replaced: None,
     },
     None => CookieWriteError::clean(source),
   }
@@ -10103,6 +10295,7 @@ pub(crate) async fn run<R, F>(
         Ok(Command::SyncRoot {
           scope,
           dir,
+          target,
           name,
           ticket,
           reply,
@@ -10256,7 +10449,7 @@ pub(crate) async fn run<R, F>(
                 // it belongs to, and removed in the same step it leaves `Parked` —
                 // the lockstep that keeps this local from ever being a second
                 // opinion about which syncs are parked.
-                parked_cookies.insert(fence, ParkedCookie { dir, reply });
+                parked_cookies.insert(fence, ParkedCookie { dir, target, reply });
               }
             }
           }

@@ -344,6 +344,30 @@ pub enum SyncRootError {
     /// The pattern of the root's prune seat that covers it.
     pattern: tributary_proto::glob::Glob,
   },
+  /// The directory the cookie would have gone in is no longer the OBJECT the
+  /// sync was admitted for: a peer renamed that directory aside and stood a
+  /// replacement at its name after the admission and before the write.
+  ///
+  /// A barrier certifies ordering for the directory object that existed at
+  /// admission, and only for it. A replacement standing at the same name is a
+  /// different object, and the queue that would carry the marker's create is not
+  /// yet attached to it — so a marker born there rides no ordering this root's
+  /// stream reads, and a later cold enumeration of the replacement could
+  /// synthesize that create ahead of changes that truly preceded it. The write is
+  /// therefore refused with nothing created, rather than reporting a barrier that
+  /// certifies an ordering nobody proved.
+  ///
+  /// The admission's sequence is SPENT: the verdict needs the object only the
+  /// write's own descriptor walk can reach, so it is taken after the sync was
+  /// admitted. Re-mint through
+  /// [`mint_sync_ticket`](crate::Watcher::mint_sync_ticket) to retry, which
+  /// re-reads the directory that now stands at the name.
+  #[error("cookie directory {} was replaced after the sync was admitted", dir.display())]
+  DirReplaced {
+    /// The cookie parent the write resolved — the name the replacement stands
+    /// at, as the descriptor answered it.
+    dir: PathBuf,
+  },
   /// The cookie name is not a single normal filename component — it holds a
   /// path separator, a `.`/`..`, is absolute or empty, or is longer than 255
   /// bytes (`NAME_MAX` on every supported filesystem, so a longer leaf names

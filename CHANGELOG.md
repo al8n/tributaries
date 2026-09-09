@@ -453,6 +453,29 @@ All notable changes to this workspace are documented here. The format is based o
   a `clap` `ValueValidation`), the accepted inputs are unchanged up to and including the
   ceiling, and `validate` keeps the same check for lists assembled in code.
 
+- **`tributary-fs`** — a sync barrier certifies an ordering for the DIRECTORY OBJECT its
+  cookie directory named when the sync was admitted, and a replacement standing at that
+  name is the new typed `SyncRootError::DirReplaced` refusal. The write is detached from
+  the admission by the coverage-settle fence and the blocking pool, and every step of its
+  descent below the root is opened by name: a peer that renamed a covered directory aside
+  and stood a fresh one at its name inside that window was descended into exactly as the
+  original would have been. The marker then landed inside a directory whose coverage the
+  scope had not armed, so its create entered no ordered queue, and a later cold
+  enumeration of the replacement could report that create ahead of descendants that were
+  on disk before it — a barrier that resolved while proving nothing. The directory's
+  identity is now read at the admission door and re-read off the descriptor the write
+  ends holding; a mismatch refuses before anything is created, so no marker is ever born
+  inside an object whose coverage the admission did not judge. The sequence is spent by
+  the refusal (the verdict needs the object only the write can reach), so a retry
+  re-mints, which re-reads whatever now stands at the name.
+
+- **`tributaries`** — the umbrella classifies that refusal as
+  `SyncError::Busy`, beside the two transient refusals it already reported that way.
+  Nothing was written and nothing about the caller's request is wrong — the directory it
+  named still exists and is still covered — so it is neither a write failure nor an
+  uncovered cookie directory, and a fresh sync is admitted for whatever now stands at
+  the name.
+
 - **`tributaries`** — **BREAKING for a custom `Source`**: `Source::arm` and
   `LocalSource::arm` take the per-root `&RootGlobs` as a third argument
   (`arm(&mut self, key: &[C], globs: &RootGlobs)`). An out-of-tree source must accept
