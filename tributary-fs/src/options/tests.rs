@@ -143,6 +143,16 @@ fn every_out_of_range_value_is_a_typed_refusal() {
       supplied: WatcherOptions::MAX_EXCLUSIONS + 1
     })
   );
+  let over_long = "/".repeat(WatcherOptions::MAX_EXCLUSION_LEN + 1);
+  assert_eq!(
+    WatcherOptions::new()
+      .with_exclusions(vec![PathBuf::from(&over_long)])
+      .validate(),
+    Err(OptionsError::ExclusionTooLong {
+      supplied: WatcherOptions::MAX_EXCLUSION_LEN + 1
+    }),
+    "the length bound is the builders' backstop for what the faces refuse as they parse"
+  );
   assert_eq!(
     WatcherOptions::new().with_latency(Duration::MAX).validate(),
     Err(OptionsError::LatencyTooLarge {
@@ -199,7 +209,12 @@ fn the_documented_maxima_are_themselves_in_range() {
     .with_os_batch_capacity(WatcherOptions::MAX_OS_BATCH_CAPACITY)
     .with_os_buffer_bytes(WatcherOptions::MAX_OS_BUFFER_BYTES)
     .with_root_liveness_interval(WatcherOptions::MAX_ROOT_LIVENESS_INTERVAL)
-    .with_exclusions(vec![PathBuf::from("/x"); WatcherOptions::MAX_EXCLUSIONS])
+    .with_exclusions(vec![
+      PathBuf::from(
+        "/".repeat(WatcherOptions::MAX_EXCLUSION_LEN)
+      );
+      WatcherOptions::MAX_EXCLUSIONS
+    ])
     .validate()
     .expect("the maxima are admissible");
   WatcherOptions::new()
@@ -317,6 +332,73 @@ mod serde_face {
         .expect("an empty list parses")
         .exclusions_slice()
         .is_empty()
+    );
+  }
+
+  /// The per-path LENGTH ceiling, judged on the bytes the format is holding
+  /// rather than after a `PathBuf` has been built out of them.
+  ///
+  /// The count ceiling above bounds nothing on its own: eight entries is a small
+  /// number, and one of them can be as long as an untrusted document cares to make
+  /// it. Deserializing straight into `PathBuf` handed the document one allocation
+  /// of its own choosing per entry, paid in full before the household existed to
+  /// run `validate` on.
+  ///
+  /// The refusal is asserted through its SHAPE — it names the length it measured
+  /// and the ceiling — which is what a caller sees instead of an allocation.
+  ///
+  /// Revert witness: read the element as a plain `PathBuf` and the over-long first
+  /// exclusion is owned before anything measures it; only `validate` would catch
+  /// it, and only after the fact.
+  #[test]
+  fn an_over_long_exclusion_is_refused_before_its_path_is_built() {
+    let cap = WatcherOptions::MAX_EXCLUSION_LEN;
+
+    let full: WatcherOptions =
+      serde_json::from_str(&format!(r#"{{"exclusions": ["{}"]}}"#, "x".repeat(cap)))
+        .expect("the ceiling itself is honoured");
+    assert_eq!(full.exclusions_slice()[0].as_os_str().len(), cap);
+    full.validate().expect("and it is an admissible household");
+
+    let err = serde_json::from_str::<WatcherOptions>(&format!(
+      r#"{{"exclusions": ["{}"]}}"#,
+      "x".repeat(cap + 1)
+    ))
+    .expect_err("one byte past it is a document error");
+    let message = err.to_string();
+    assert!(
+      message.contains(&format!("{}", cap + 1)) && message.contains(&format!("{cap}")),
+      "the refusal names the length it measured and the ceiling: {err}"
+    );
+  }
+
+  /// The element past the SEAT is refused by its count, and is never read as a
+  /// path at all — so an enormous ninth entry costs the refusal and nothing else.
+  ///
+  /// The two bounds are independent, and the order they are asked in is what makes
+  /// the second one free: a count check taken after deserializing the ninth
+  /// element still allocates the one entry the seat is certain to refuse. The
+  /// ninth here is far past the LENGTH ceiling too, so whichever message comes
+  /// back says which check ran.
+  ///
+  /// Revert witness: check the count after `next_element::<Exclusion>` and the
+  /// refusal flips to the length message — the ninth path was read before anyone
+  /// counted it.
+  #[test]
+  fn an_over_long_ninth_exclusion_is_refused_by_count() {
+    let cap = WatcherOptions::MAX_EXCLUSIONS;
+    let mut list = (0..cap).map(|n| format!("\"/x{n}\"")).collect::<Vec<_>>();
+    list.push(format!(
+      "\"{}\"",
+      "x".repeat(WatcherOptions::MAX_EXCLUSION_LEN * 4)
+    ));
+
+    let err =
+      serde_json::from_str::<WatcherOptions>(&format!(r#"{{"exclusions": [{}]}}"#, list.join(",")))
+        .expect_err("the ninth element is refused");
+    assert!(
+      err.to_string().contains(&format!("limit of {cap}")),
+      "the refusal is the seat's count, taken without reading the element as a path: {err}"
     );
   }
 
@@ -518,6 +600,77 @@ mod clap_face {
       options.exclusions_slice().is_empty(),
       "and the household it refused is left exactly as it stood"
     );
+  }
+
+  /// The per-value LENGTH ceiling, at the same flag: a value longer than
+  /// [`WatcherOptions::MAX_EXCLUSION_LEN`] is refused as the parse reads it,
+  /// before any path is built and long before the household collects one.
+  ///
+  /// The occurrence count above bounds the number of paths, not their size, and a
+  /// `parse_from` can hand this flag a value of any length at all. The refusal is
+  /// the flag's own `ValueValidation`, naming the length it measured.
+  ///
+  /// Revert witness: drop the `value_parser` and the over-long value parses into a
+  /// household `validate` then has to catch — after the path has been built.
+  #[test]
+  fn an_over_long_exclusion_value_is_refused() {
+    let cap = WatcherOptions::MAX_EXCLUSION_LEN;
+
+    let full = Cli::parse_from(["app", "--exclusions", &"x".repeat(cap)]).options;
+    assert_eq!(
+      full.exclusions_slice()[0].as_os_str().len(),
+      cap,
+      "the ceiling itself parses"
+    );
+    full.validate().expect("and it is an admissible household");
+
+    let err = Cli::try_parse_from(["app", "--exclusions", &"x".repeat(cap + 1)])
+      .err()
+      .expect("one byte past the ceiling is refused");
+    assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    assert!(
+      err.render().to_string().contains(&format!("{cap}")),
+      "the refusal names the ceiling: {}",
+      err.render()
+    );
+
+    // An UPDATE is judged at the same door, and one door EARLIER than the
+    // occurrence count is: the value parser runs inside the parse, so an over-long
+    // value never reaches the matches an update would read, let alone the
+    // household it would have been written into.
+    let refused =
+      <WatcherOptions as clap::Args>::augment_args_for_update(clap::Command::new("app"))
+        .try_get_matches_from(["app", "--exclusions", &"x".repeat(cap + 1)]);
+    assert_eq!(
+      refused
+        .expect_err("an over-long update value is refused by the parse itself")
+        .kind(),
+      clap::error::ErrorKind::ValueValidation
+    );
+  }
+
+  /// The full seat of in-range values is accepted on this face: eight paths, each
+  /// at the length ceiling.
+  ///
+  /// Without it the two refusals above could be satisfied by a face that refuses
+  /// everything.
+  #[test]
+  fn a_full_seat_of_in_range_exclusions_parses() {
+    let value = "x".repeat(WatcherOptions::MAX_EXCLUSION_LEN);
+    let mut args = vec!["app".to_owned()];
+    for _ in 0..WatcherOptions::MAX_EXCLUSIONS {
+      args.push("--exclusions".to_owned());
+      args.push(value.clone());
+    }
+
+    let options = Cli::parse_from(args).options;
+    assert_eq!(
+      options.exclusions_slice().len(),
+      WatcherOptions::MAX_EXCLUSIONS
+    );
+    options
+      .validate()
+      .expect("both ceilings are inclusive on every face");
   }
 
   /// Every `Backend` variant is reachable under the tag `as_str` reports.

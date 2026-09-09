@@ -35,6 +35,16 @@ pub enum OptionsError {
     /// How many exclusion paths the options carried.
     supplied: usize,
   },
+  /// One exclusion path is longer than
+  /// [`WatcherOptions::MAX_EXCLUSION_LEN`] bytes.
+  #[error(
+    "an exclusion path of {supplied} bytes exceeds the {}-byte ceiling",
+    WatcherOptions::MAX_EXCLUSION_LEN
+  )]
+  ExclusionTooLong {
+    /// How many bytes the offending path carried.
+    supplied: usize,
+  },
   /// The OS event-coalescing latency exceeds
   /// [`WatcherOptions::MAX_LATENCY`].
   #[error(
@@ -115,6 +125,12 @@ impl OptionsError {
     matches!(self, Self::TooManyExclusions { .. })
   }
 
+  /// Whether this is [`ExclusionTooLong`](Self::ExclusionTooLong).
+  #[inline]
+  pub const fn is_exclusion_too_long(&self) -> bool {
+    matches!(self, Self::ExclusionTooLong { .. })
+  }
+
   /// Whether this is [`TooManyPrunePatterns`](Self::TooManyPrunePatterns).
   #[inline]
   pub const fn is_too_many_prune_patterns(&self) -> bool {
@@ -182,10 +198,14 @@ pub(crate) fn derive_move_window(move_window: Duration, latency: Duration) -> Du
 /// }
 /// ```
 ///
-/// The exclusion list is the one key with a ceiling of its own on this face:
-/// [`MAX_EXCLUSIONS`](Self::MAX_EXCLUSIONS) paths, refused at the element past it
-/// rather than after the whole list has been read, so a document cannot spend the
-/// process's memory naming exclusions no watcher would accept.
+/// The exclusion list is the one key with ceilings of its own on this face, and
+/// both bind WHILE the document is read rather than after it:
+/// [`MAX_EXCLUSIONS`](Self::MAX_EXCLUSIONS) paths, refused at the element past it,
+/// and [`MAX_EXCLUSION_LEN`](Self::MAX_EXCLUSION_LEN) bytes per path, refused on
+/// the bytes the format is holding before a path is built out of them. The element
+/// past the ceiling is refused by its COUNT without being read as a path at all.
+/// So neither an enormous entry nor an enormous list can spend the process's
+/// memory on exclusions no watcher would accept.
 ///
 /// Deserializing is otherwise exactly as unchecked as the builders are: it never
 /// runs [`validate`](Self::validate). A configuration layer that wants a bad setting
@@ -195,9 +215,11 @@ pub(crate) fn derive_move_window(move_window: Duration, latency: Duration) -> Du
 /// With the `clap` feature it is a `clap::Args` group of one `--<field>` flag
 /// per knob, each defaulting to the same value [`new`](Self::new) gives it, so a
 /// flagless command line is the default household. `--exclusions` repeats, once
-/// per path, and carries the serde face's ceiling at the same door: the
-/// occurrence past [`MAX_EXCLUSIONS`](Self::MAX_EXCLUSIONS) is a parse refusal,
-/// taken before the household is built.
+/// per path, and carries both of the serde face's ceilings at the same door: a
+/// value longer than [`MAX_EXCLUSION_LEN`](Self::MAX_EXCLUSION_LEN) bytes is
+/// refused as the parse reads it, and the occurrence past
+/// [`MAX_EXCLUSIONS`](Self::MAX_EXCLUSIONS) is refused before the household is
+/// built.
 ///
 /// ```text
 /// $ app --latency 25ms --watcher-event-capacity 4096 --backend fanotify \
@@ -249,8 +271,76 @@ pub struct WatcherOptions {
   max_map_directories: Option<usize>,
 }
 
+/// ONE exclusion path, read through a STRING VISITOR so
+/// [`WatcherOptions::MAX_EXCLUSION_LEN`] is judged on the bytes the format is
+/// already holding rather than after a `PathBuf` of the document's own choosing
+/// has been built.
+///
+/// The distinction is the whole point of that ceiling, and it is the same one the
+/// glob vocabulary draws ([`Glob`]'s own face): asking the format for an owned
+/// path first hands the document control of one allocation per rejected entry — a
+/// first exclusion of a few hundred megabytes costs exactly that before the bound
+/// it is about to fail is ever consulted. The visitor takes the borrowed text and
+/// measures it, so a refusal costs the typed message and nothing proportional to
+/// the input.
+///
+/// What it does NOT bound is the FORMAT's own reading: a format that must allocate
+/// to hand over a string — one unescaping `\u0041`, or reading from a stream
+/// rather than a slice — still allocates the source once, before any visitor is
+/// called. That is the format's contract; a document whose SIZE must be bounded is
+/// bounded by a limited reader on the caller's side.
+#[cfg(feature = "serde")]
+struct Exclusion(PathBuf);
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for Exclusion {
+  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+  where
+    D: serde::Deserializer<'de>,
+  {
+    struct Directory;
+
+    impl serde::de::Visitor<'_> for Directory {
+      type Value = Exclusion;
+
+      fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+          f,
+          "an exclusion directory of at most {} bytes",
+          WatcherOptions::MAX_EXCLUSION_LEN
+        )
+      }
+
+      /// The one door, and the one every other arm reaches: `visit_borrowed_str`
+      /// and `visit_string` are serde's own forwards to it, so text the format
+      /// borrows out of its input is measured without being copied at all, and
+      /// text the format already owns is measured before a path is made of it.
+      fn visit_str<E>(self, path: &str) -> Result<Self::Value, E>
+      where
+        E: serde::de::Error,
+      {
+        if path.len() > WatcherOptions::MAX_EXCLUSION_LEN {
+          return Err(E::custom(format!(
+            "an exclusion directory of {} bytes is over the {}-byte limit",
+            path.len(),
+            WatcherOptions::MAX_EXCLUSION_LEN
+          )));
+        }
+        Ok(Exclusion(PathBuf::from(path)))
+      }
+    }
+
+    // `deserialize_str` rather than `deserialize_string`: this face needs to READ
+    // the text, not to own it, and the hint is what lets a format borrow straight
+    // out of its input instead of allocating a copy it would only be measured
+    // against.
+    deserializer.deserialize_str(Directory)
+  }
+}
+
 /// Reads the exclusion set, refusing the element past
-/// [`WatcherOptions::MAX_EXCLUSIONS`] rather than the list after it.
+/// [`WatcherOptions::MAX_EXCLUSIONS`] rather than the list after it, and each
+/// element's own length before the path is owned ([`Exclusion`]).
 ///
 /// The refusal has to happen mid-sequence to mean anything: a document is an
 /// untrusted length, and reading it whole so the count can be checked afterwards
@@ -260,9 +350,16 @@ pub struct WatcherOptions {
 /// would take the set past the ceiling is where this stops, with at most the
 /// ceiling's worth of paths ever held.
 ///
-/// [`validate`](WatcherOptions::validate) keeps the same check for the
-/// programmatic builders, which are the one face that hands a whole list over at
-/// once and can therefore only be judged after it exists.
+/// And the ninth element is refused by COUNT, without being read as a path at all:
+/// once the seat is full the sequence is probed with
+/// [`IgnoredAny`](serde::de::IgnoredAny), which asks the format whether anything
+/// follows and lets it skip whatever does. A count check taken AFTER deserializing
+/// the ninth element would still allocate it — the one entry the bound is certain
+/// to refuse, and the one an untrusted document would make enormous.
+///
+/// [`validate`](WatcherOptions::validate) keeps both checks for the programmatic
+/// builders, which are the one face that hands a whole list over at once and can
+/// therefore only be judged after it exists.
 #[cfg(feature = "serde")]
 fn deserialize_exclusions<'de, D>(deserializer: D) -> Result<Vec<PathBuf>, D::Error>
 where
@@ -276,8 +373,9 @@ where
     fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
       write!(
         f,
-        "at most {} exclusion directories",
-        WatcherOptions::MAX_EXCLUSIONS
+        "at most {} exclusion directories of at most {} bytes each",
+        WatcherOptions::MAX_EXCLUSIONS,
+        WatcherOptions::MAX_EXCLUSION_LEN
       )
     }
 
@@ -295,14 +393,17 @@ where
         .unwrap_or(0)
         .min(WatcherOptions::MAX_EXCLUSIONS);
       let mut exclusions = Vec::with_capacity(hint);
-      while let Some(path) = seq.next_element::<PathBuf>()? {
-        if exclusions.len() == WatcherOptions::MAX_EXCLUSIONS {
-          return Err(A::Error::custom(format!(
-            "more exclusion directories than the limit of {}",
-            WatcherOptions::MAX_EXCLUSIONS
-          )));
-        }
-        exclusions.push(path);
+      while exclusions.len() < WatcherOptions::MAX_EXCLUSIONS {
+        let Some(exclusion) = seq.next_element::<Exclusion>()? else {
+          return Ok(exclusions);
+        };
+        exclusions.push(exclusion.0);
+      }
+      if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+        return Err(A::Error::custom(format!(
+          "more exclusion directories than the limit of {}",
+          WatcherOptions::MAX_EXCLUSIONS
+        )));
       }
       Ok(exclusions)
     }
@@ -311,7 +412,36 @@ where
   deserializer.deserialize_seq(Exclusions)
 }
 
-/// The same bound on the command line, asked of the OCCURRENCE COUNT before a
+/// The LENGTH bound on the command line, asked of each value as the parse reads it
+/// — before a `PathBuf` is made of it and long before the household collects one.
+///
+/// `--exclusions` repeats, and a `parse_from` can hand it values of any length at
+/// all, so a face that builds every path and measures the list afterwards has
+/// already paid what the ceiling exists to refuse. A `value_parser` is where clap
+/// lets a value be judged on the bytes it arrived as; the refusal it produces is
+/// the flag's own [`ValueValidation`](clap::error::ErrorKind::ValueValidation),
+/// naming the value the caller must shorten.
+///
+/// It measures the `OsString` rather than a `String` because a path need not be
+/// UTF-8 on either platform, and requiring it here would refuse perfectly ordinary
+/// directories the rest of this crate handles.
+#[cfg(feature = "clap")]
+fn bounded_exclusion() -> impl clap::builder::TypedValueParser<Value = PathBuf> {
+  use clap::builder::TypedValueParser as _;
+
+  clap::builder::OsStringValueParser::new().try_map(|value: std::ffi::OsString| {
+    if value.len() > WatcherOptions::MAX_EXCLUSION_LEN {
+      return Err(format!(
+        "an exclusion directory of {} bytes is over the {}-byte limit",
+        value.len(),
+        WatcherOptions::MAX_EXCLUSION_LEN
+      ));
+    }
+    Ok(PathBuf::from(value))
+  })
+}
+
+/// The COUNT bound on the command line, asked of the OCCURRENCE COUNT before a
 /// single path is taken out of the parse.
 ///
 /// `--exclusions` repeats, and a programmatic `parse_from` can hand it an
@@ -369,7 +499,7 @@ struct WatcherOptionsArgs {
   os_batch_capacity: NonZeroUsize,
   #[arg(long, default_value_t = WatcherOptions::DEFAULT_OS_BUFFER_BYTES)]
   os_buffer_bytes: NonZeroU32,
-  #[arg(long)]
+  #[arg(long, value_parser = bounded_exclusion())]
   exclusions: Vec<PathBuf>,
   #[arg(long, value_enum, default_value_t = WatcherOptions::DEFAULT_BACKEND)]
   backend: Backend,
@@ -609,6 +739,21 @@ impl WatcherOptions {
   /// [`validate`](Self::validate) at a list handed over whole.
   pub const MAX_EXCLUSIONS: usize = crate::os::MAX_EXCLUSIONS;
 
+  /// The longest exclusion path this household will carry, in BYTES — `PATH_MAX`
+  /// on every platform the crate supports, so a longer one names nothing any
+  /// filesystem could resolve and no exclusion could ever match.
+  ///
+  /// The ceiling is a MEMORY bound rather than a taste one, and it is measured
+  /// where the bytes arrive. An exclusion is a caller's configuration value,
+  /// reachable from a JSON document or a command line, and eight of them is a
+  /// small enough count that the COUNT alone bounds nothing: one entry of a few
+  /// hundred megabytes costs exactly that, paid in full before a household exists
+  /// to run [`validate`](Self::validate) on. So the serde face measures the bytes
+  /// the format is holding before it builds a `PathBuf` out of them, the
+  /// `--exclusions` flag refuses an over-long value before the household collects
+  /// it, and `validate` keeps the same bound for a list assembled in code.
+  pub const MAX_EXCLUSION_LEN: usize = 4096;
+
   /// The default per-root backend selection: [`Backend::Auto`] — resolved to
   /// the host's own primitive at the spawn barrier (Linux probes for
   /// fanotify-FILESYSTEM and falls back to inotify).
@@ -676,6 +821,15 @@ impl WatcherOptions {
     if self.exclusions.len() > Self::MAX_EXCLUSIONS {
       return Err(OptionsError::TooManyExclusions {
         supplied: self.exclusions.len(),
+      });
+    }
+    if let Some(exclusion) = self
+      .exclusions
+      .iter()
+      .find(|exclusion| exclusion.as_os_str().len() > Self::MAX_EXCLUSION_LEN)
+    {
+      return Err(OptionsError::ExclusionTooLong {
+        supplied: exclusion.as_os_str().len(),
       });
     }
     if self.latency > Self::MAX_LATENCY {
@@ -861,8 +1015,9 @@ impl WatcherOptions {
   /// The load-shedding exclusion directories applied to every root, as a
   /// slice.
   ///
-  /// Purely an optimization (at most [`MAX_EXCLUSIONS`](Self::MAX_EXCLUSIONS),
-  /// enforced by both configuration faces as they parse and by
+  /// Purely an optimization (at most [`MAX_EXCLUSIONS`](Self::MAX_EXCLUSIONS) of
+  /// them, each at most [`MAX_EXCLUSION_LEN`](Self::MAX_EXCLUSION_LEN) bytes, both
+  /// enforced by the two configuration faces as they parse and by
   /// [`Watcher::new`](crate::Watcher::new) for a list assembled in code);
   /// correctness never depends on them. Subtracting ground you do not care about
   /// is how you keep a build cache's churn from costing you watches, map entries

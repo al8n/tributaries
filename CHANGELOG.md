@@ -492,6 +492,20 @@ All notable changes to this workspace are documented here. The format is based o
   document whose size must be bounded is bounded by a limited reader on the caller's
   side.
 
+- **`tributary-fs`** — an exclusion path is LENGTH-bounded on every face, by the new
+  `WatcherOptions::MAX_EXCLUSION_LEN` (4096 bytes, `PATH_MAX`). The seat's count ceiling
+  bounded nothing on its own: eight is a small number, and a single entry can be as long
+  as an untrusted document cares to make it, so a first exclusion of a few hundred
+  megabytes was allocated in full before any bound was consulted. The `serde` face now
+  reads each element through a string visitor and measures the bytes the format is
+  already holding before it builds a `PathBuf`, and refuses the element PAST the seat by
+  its count alone — probing for it without deserializing it into a path — so the one
+  entry the seat is certain to refuse is never allocated either. `--exclusions` refuses
+  an over-long value as the parse reads it, as a `clap` `ValueValidation`, and
+  `validate` carries the same bound as the backstop for a list assembled in code, as the
+  new `OptionsError::ExclusionTooLong`. Accepted inputs are unchanged up to and
+  including both ceilings.
+
 - **`tributary-fs`** — the identity proof now reaches the object a marker is actually
   born in: the RESERVED COOKIE DIRECTORY the watcher keeps inside the directory a sync
   names. A `mkdirat` that succeeds is its own proof — the directory is new, empty, named
