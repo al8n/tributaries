@@ -1496,12 +1496,21 @@ struct ScopeState {
   /// OPEN, because a folder the consumer never hears about is a hole in its view
   /// while an extra event is one it can drop.
   include: Option<Globs>,
-  /// The LEAF names of this scope's sync markers that are still pending — armed
-  /// when a `sync` is admitted ([`DriverCore::arm_sync_marker`]) and released
-  /// when its obligation reaches its typed terminal
+  /// The LEAF names of this scope's sync markers that are still pending, each
+  /// mapped to the cookie obligation that OWNS it — armed when a `sync` is
+  /// admitted ([`DriverCore::arm_sync_marker`]) and released when that
+  /// obligation reaches its typed terminal
   /// ([`DriverCore::release_sync_markers`]).
   ///
-  /// The set is what makes the marker exemption an IDENTITY rather than a claim
+  /// The owner is what makes a release safe against name REUSE. A name frees at
+  /// its holder's terminal, so a successor sync may be admitted under the very
+  /// leaf a retired predecessor is still queueing a release for; keyed by name
+  /// alone, that queued release would disarm the successor's live exemption and
+  /// hand the seat the one file its barrier waits on. Keyed by the obligation,
+  /// the successor's admission takes ownership on insertion and the predecessor's
+  /// release finds an owner that is not its own and removes nothing.
+  ///
+  /// The map is what makes the marker exemption an IDENTITY rather than a claim
   /// about its parent's spelling. Both seats exempt this driver's own cookie
   /// artifact POSITIONALLY ([`crate::driver::is_sync_cookie_artifact_segment`]:
   /// the reserved directory, and the marker standing directly in it), and that
@@ -1518,7 +1527,7 @@ struct ScopeState {
   /// in-flight artifact under this root and nothing else. Bounded by the cookie
   /// ledger's own admission caps — one entry per live obligation of this scope —
   /// and EMPTY for every scope that never syncs, which short-circuits both seats.
-  markers: BTreeSet<String>,
+  markers: BTreeMap<Arc<str>, crate::driver::CookieId>,
 }
 
 /// What the common-layer fence makes of one planned Monitor input
@@ -2087,7 +2096,7 @@ impl DriverCore {
         pending_widen: None,
         prune,
         include,
-        markers: BTreeSet::new(),
+        markers: BTreeMap::new(),
       },
     );
     self.watch_scopes.insert(watch, scope);
@@ -2396,34 +2405,56 @@ impl DriverCore {
     fence
   }
 
-  /// Arms `name` as an ACTIVE sync marker of `scope`: from here until it is
-  /// released, no seat of that scope may take a change whose object wears it
+  /// Arms `name` as an ACTIVE sync marker of `scope`, OWNED by the cookie
+  /// obligation `owner`: from here until that obligation releases it, no seat of
+  /// that scope may take a change whose object wears the leaf
   /// ([`markers`](ScopeState::markers)).
   ///
   /// Called at the sync's ADMISSION — the same step that births its cookie
-  /// obligation — so the exemption is standing before any write can be
-  /// dispatched, let alone land. A name armed for a scope that is not registered
-  /// is dropped: there is no state to exempt anything on, and the sync's own
-  /// admission refuses a scope with no live stream.
-  pub(crate) fn arm_sync_marker(&mut self, scope: ScopeId, name: String) {
+  /// obligation, whose id is the owner recorded here — so the exemption is
+  /// standing before any write can be dispatched, let alone land. A name armed
+  /// for a scope that is not registered is dropped: there is no state to exempt
+  /// anything on, and the sync's own admission refuses a scope with no live
+  /// stream.
+  ///
+  /// An arm under a leaf some earlier obligation still holds TAKES ownership: a
+  /// name is only reusable once its previous holder retired, so the newcomer is
+  /// the live owner by construction and the predecessor's pending release is the
+  /// stale one.
+  pub(crate) fn arm_sync_marker(
+    &mut self,
+    scope: ScopeId,
+    name: Arc<str>,
+    owner: crate::driver::CookieId,
+  ) {
     if let Some(state) = self.scopes.get_mut(&scope) {
-      state.markers.insert(name);
+      state.markers.insert(name, owner);
     }
   }
 
-  /// Releases marker names whose obligations have retired — the ledger's typed
-  /// terminals, drained into the core by the driver loop.
+  /// Releases marker leaves whose obligations have retired — the ledger's typed
+  /// terminals, drained into the core by the driver loop — each removed only
+  /// while the RELEASED obligation still owns it.
   ///
   /// The release runs on the far side of the barrier it protects: an obligation
   /// retires when its cookie is confirmed gone (the umbrella reaps it only after
   /// the delivery it was waiting for) or when nothing was ever created, so a
   /// marker leaves this set only once no change can still be owed for it.
+  ///
+  /// The ownership condition is what keeps that true across a name REUSE. A
+  /// retirement queues its release under the ledger lock and the drain applies it
+  /// a loop pass later; in between, the freed name may already have been admitted
+  /// again, and a name-keyed removal would then disarm a LIVE successor whose
+  /// marker has not been written yet. Comparing the owner makes the stale release
+  /// a no-op instead.
   pub(crate) fn release_sync_markers(
     &mut self,
-    released: impl IntoIterator<Item = (ScopeId, String)>,
+    released: impl IntoIterator<Item = (ScopeId, Arc<str>, crate::driver::CookieId)>,
   ) {
-    for (scope, name) in released {
-      if let Some(state) = self.scopes.get_mut(&scope) {
+    for (scope, name, owner) in released {
+      if let Some(state) = self.scopes.get_mut(&scope)
+        && state.markers.get(&name) == Some(&owner)
+      {
         state.markers.remove(&name);
       }
     }
@@ -6025,7 +6056,7 @@ impl DriverCore {
     }
     let matches = |location: &Location| {
       location.segments().last().is_some_and(|segment| {
-        include.is_match(segment.as_str()) || state.markers.contains(segment.as_str())
+        include.is_match(segment.as_str()) || state.markers.contains_key(segment.as_str())
       })
     };
     matches(change.location()) || change.kind().moved_from().is_some_and(matches)
@@ -6039,7 +6070,7 @@ impl DriverCore {
     !state.markers.is_empty()
       && location
         .and_then(|location| location.segments().last())
-        .is_some_and(|segment| state.markers.contains(segment.as_str()))
+        .is_some_and(|segment| state.markers.contains_key(segment.as_str()))
   }
 
   fn route_event(&mut self, change: Change) {

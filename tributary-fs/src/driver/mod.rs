@@ -197,8 +197,15 @@ struct ParkedCookie {
 /// record mutation it performs is conditioned on the id still matching — the
 /// record-level mirror of the per-scope root generation (R6-5): stale actors
 /// become no-ops instead of acting on the wrong incarnation.
+///
+/// Visible to the core because the core's active-marker set is keyed by it: an
+/// exemption belongs to ONE obligation, so the release that ends it has to name
+/// the same incarnation the arm did (see
+/// [`arm_sync_marker`](crate::core::DriverCore::arm_sync_marker)). It is a token
+/// to COMPARE, never a number to interpret: nothing outside the mint reads the
+/// counter, and the order it happens to carry means nothing.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-struct CookieId(u64);
+pub(crate) struct CookieId(pub(crate) u64);
 
 /// A test-only tally of every obligation BIRTH and every typed terminal, kept
 /// under the ledger mutex so it cannot race the transitions it counts. It exists
@@ -282,7 +289,7 @@ struct LedgerInner {
   /// retire (removed only while it still names that id) is retained as the
   /// defensive rule for state minted below the public surface (tests, future
   /// internal callers).
-  by_name: HashMap<String, CookieId>,
+  by_name: HashMap<Arc<str>, CookieId>,
   /// Ticket sequence -> incarnation id, for the incarnation-precise cancel/reap a
   /// [`request_cancel_sync`] addresses. Unlike `by_name`, a ticket sequence is
   /// minted once by the watcher and NEVER re-minted, so this map carries temporal
@@ -311,9 +318,18 @@ struct LedgerInner {
   /// record's `last_failure_seq` — so a record that keeps failing keeps moving
   /// to the BACK of the recovery selection order (`rearm_parked_batch`).
   failure_clock: u64,
-  /// Retired obligations' `(scope, name)` pairs, awaiting the driver loop's
-  /// drain into the core's per-scope active-marker sets
+  /// Retired obligations' `(scope, leaf, owner)` triples, awaiting the driver
+  /// loop's drain into the core's per-scope active-marker sets
   /// ([`DriverCore::release_sync_markers`](crate::core::DriverCore)).
+  ///
+  /// The incarnation id travels WITH the leaf because a name outlives its
+  /// holder: it frees at this very retirement, so a successor sync may be
+  /// admitted under it before the drain runs, and a name-keyed release would then
+  /// disarm the successor's live exemption. The core removes the entry only while
+  /// the released incarnation still owns it.
+  ///
+  /// The leaf is the obligation's own `Arc<str>`, shared rather than copied, so
+  /// queueing a release costs a refcount and no allocation.
   ///
   /// A queue rather than a direct call because [`retire`](Self::retire) is the
   /// ledger's single terminal funnel and several of its callers are the blocking
@@ -324,7 +340,7 @@ struct LedgerInner {
   /// Bounded by admission: an obligation retires exactly once and is only born
   /// through the driver loop, so nothing can accrue here across a drain beyond
   /// the ledger's own global cap.
-  released_markers: Vec<(ScopeId, String)>,
+  released_markers: Vec<(ScopeId, Arc<str>, CookieId)>,
   #[cfg(all(test, feature = "tokio"))]
   census: Census,
 }
@@ -372,7 +388,7 @@ impl LedgerInner {
     {
       self.by_path.remove(residue.path());
     }
-    if self.by_name.get(&ob.name) == Some(&id) {
+    if self.by_name.get(ob.name.as_ref()) == Some(&id) {
       self.by_name.remove(&ob.name);
     }
     if self.by_ticket.get(&ob.ticket) == Some(&id) {
@@ -382,7 +398,9 @@ impl LedgerInner {
     // reap funnels through, so the exemption's lifetime is the obligation's and
     // no path can end a sync while leaving its leaf armed forever. Queued rather
     // than applied: a job holds this lock, and the core belongs to the loop.
-    self.released_markers.push((ob.scope, ob.name.clone()));
+    self
+      .released_markers
+      .push((ob.scope, Arc::clone(&ob.name), ob.id));
     Some(ob)
   }
 
@@ -2453,6 +2471,14 @@ pub(crate) struct CookieWriteError {
   /// failure: the verdict is reached before anything is created, so it never
   /// carries a residue. Boxed for the same reason `residue` is.
   pub(crate) pruned: Option<Box<PrunedCookieDir>>,
+  /// Set when the write refused because one of the WATCHER's exclusions covers
+  /// the directory the descriptor walk actually resolved — the exclusions' twin
+  /// of `pruned`, reached for the same reason and at the same point. The
+  /// admission checked the caller's LEXICAL spelling, which an intermediate
+  /// symlink can make a different directory entirely; only the walk knows where
+  /// the cookie would truly land. Always a clean failure: the verdict is reached
+  /// before anything is created. Boxed for the same reason the others are.
+  pub(crate) excluded: Option<Box<ExcludedCookieDir>>,
 }
 
 /// The prune verdict a cookie write refused on: the canonical directory it
@@ -2467,6 +2493,17 @@ pub(crate) struct PrunedCookieDir {
   pub(crate) pattern: Glob,
 }
 
+/// The exclusion verdict a cookie write refused on: the directory the walk
+/// actually resolved (symlinks followed and the file-target-goes-beside-it rule
+/// already applied) and the watcher exclusion that covers it.
+#[derive(Debug)]
+pub(crate) struct ExcludedCookieDir {
+  /// The cookie parent the write resolved.
+  pub(crate) dir: PathBuf,
+  /// The exclusion covering it, as supplied in the options.
+  pub(crate) exclusion: PathBuf,
+}
+
 impl CookieWriteError {
   /// The pre-physical failure: nothing of this write is on disk.
   ///
@@ -2478,6 +2515,7 @@ impl CookieWriteError {
       source,
       residue: None,
       pruned: None,
+      excluded: None,
     }
   }
 
@@ -2489,6 +2527,19 @@ impl CookieWriteError {
       source: std::io::Error::other("the cookie directory is pruned"),
       residue: None,
       pruned: Some(Box::new(PrunedCookieDir { dir, pattern })),
+      excluded: None,
+    }
+  }
+
+  /// The exclusion refusal: the resolved cookie parent `dir` lies under
+  /// `exclusion`, so the write created nothing and the caller learns which
+  /// excluded subtree its cookie would have landed in.
+  pub(crate) fn excluded(dir: PathBuf, exclusion: PathBuf) -> Self {
+    Self {
+      source: std::io::Error::other("the cookie directory is excluded"),
+      residue: None,
+      pruned: None,
+      excluded: Some(Box::new(ExcludedCookieDir { dir, exclusion })),
     }
   }
 }
@@ -2520,7 +2571,11 @@ enum Reaped {
 /// the reap mark, its LRU re-arm key, and its lifecycle phase.
 struct Obligation {
   scope: ScopeId,
-  name: String,
+  /// The rendered cookie LEAF, shared as an `Arc<str>` with the `by_name` index,
+  /// the core's active-marker set and the release queue rather than copied into
+  /// each — one validated, length-bounded allocation per obligation
+  /// ([`MAX_COOKIE_NAME_LEN`]).
+  name: Arc<str>,
   /// The [`SyncTicket`] sequence this admission was keyed by (kept so retiring the
   /// record can also drop its `by_ticket` index without recomputation). Minted once
   /// by the watcher and never re-minted, so it names this incarnation alone.
@@ -3106,7 +3161,7 @@ impl<F: FsOps> CookieRegistry<F> {
   fn admit_parked(
     &mut self,
     scope: ScopeId,
-    name: String,
+    name: Arc<str>,
     ticket: u64,
     fence: FenceId,
   ) -> CookieId {
@@ -3117,7 +3172,7 @@ impl<F: FsOps> CookieRegistry<F> {
       id,
       Obligation {
         scope,
-        name: name.clone(),
+        name: Arc::clone(&name),
         ticket,
         id,
         residue: None,
@@ -3151,12 +3206,12 @@ impl<F: FsOps> CookieRegistry<F> {
   /// LEDGER is what knows a sync is parked; `parked_cookies` only routes the
   /// fence to its caller's reply, so this reads the truth rather than the local.
   /// O(ledger), which the global cap bounds.
-  fn parked_on(&self, fence: FenceId) -> Option<(CookieId, ScopeId, String)> {
+  fn parked_on(&self, fence: FenceId) -> Option<(CookieId, ScopeId, Arc<str>)> {
     lock_ledger(&self.ledger)
       .obligations
       .values()
       .find(|ob| matches!(ob.phase, Phase::Parked { fence: on } if on == fence))
-      .map(|ob| (ob.id, ob.scope, ob.name.clone()))
+      .map(|ob| (ob.id, ob.scope, Arc::clone(&ob.name)))
   }
 
   /// The DISPATCH decision for the obligation parked on a settled fence: either
@@ -3272,13 +3327,14 @@ impl<F: FsOps> CookieRegistry<F> {
     lock_ledger(&self.ledger).by_name.contains_key(name)
   }
 
-  /// Takes the marker leaves of every obligation retired since the last take —
-  /// the driver loop's drain into the core's per-scope active-marker sets.
+  /// Takes the marker leaves of every obligation retired since the last take,
+  /// each with the incarnation that owned it — the driver loop's drain into the
+  /// core's per-scope active-marker sets.
   ///
   /// Empty in the steady state (one `Vec::take` of an empty vector, no
   /// allocation), so a loop that never syncs pays a mutex acquisition and
   /// nothing else.
-  fn take_released_markers(&self) -> Vec<(ScopeId, String)> {
+  fn take_released_markers(&self) -> Vec<(ScopeId, Arc<str>, CookieId)> {
     core::mem::take(&mut lock_ledger(&self.ledger).released_markers)
   }
 
@@ -4462,6 +4518,7 @@ fn resolve_cover_settlements<R, F>(
   cover_replies: &mut BTreeMap<FenceId, futures_channel::oneshot::Sender<CoverOutcome>>,
   parked_cookies: &mut BTreeMap<FenceId, ParkedCookie>,
   cookies: &mut CookieRegistry<F>,
+  exclusions: &[PathBuf],
   live: &dyn Fn(ScopeId) -> bool,
   pass: SettlePass<'_>,
 ) -> bool
@@ -4581,11 +4638,15 @@ where
       // only the blocking write knows, and the core — the seat's owner — is not
       // reachable from there.
       let prune = core.scope_prune(scope);
+      // And the WATCHER's exclusions with it, for the same reason: the directory
+      // the write resolves is the first one anybody can judge, and the admission's
+      // lexical verdict was taken on a spelling that need not name it.
+      let exclusions = exclusions.to_vec();
       let ops = ops.clone();
       let tx = op_tx.clone();
       R::spawn_blocking_detach(move || {
         let ParkedCookie { dir, reply } = cookie;
-        match ops.write_cookie(&root, &dir, &name, &prune) {
+        match ops.write_cookie(&root, &dir, &name, &prune, &exclusions) {
           Ok(file) => {
             // Hand the cookie to the registry — the path the write ACTUALLY
             // landed at (which only the write knows: a covered FILE
@@ -4620,6 +4681,25 @@ where
             }
           }
           Err(CookieWriteError {
+            excluded: Some(excluded),
+            ..
+          }) => {
+            // The write resolved the directory it would have created in — every
+            // symlink followed and the file-target rule applied — and a watcher
+            // exclusion covers it: the cookie's event would be suppressed by the
+            // very option that asked for the suppression, so the barrier could
+            // never resolve. The admission's lexical check could not see this
+            // (that is what a symlink is), so the refusal is taken here, before
+            // anything is created, and the obligation reaches the same
+            // pre-physical terminal a clean failure does.
+            lock_ledger(&guard.ledger).retire(guard.id, Reaped::NeverCreated);
+            let ExcludedCookieDir { dir, exclusion } = *excluded;
+            let _ = reply.send(Err(crate::error::SyncRootError::DirExcluded {
+              dir,
+              exclusion,
+            }));
+          }
+          Err(CookieWriteError {
             pruned: Some(pruned),
             ..
           }) => {
@@ -4649,7 +4729,7 @@ where
             // uncount a live obligation.
             lock_ledger(&guard.ledger).retire(guard.id, Reaped::NeverCreated);
             let _ = reply.send(Err(crate::error::SyncRootError::Write {
-              path: dir.join(&name),
+              path: dir.join(&*name),
               source,
             }));
           }
@@ -4672,7 +4752,7 @@ where
             let claimed = guard.claim(&residue);
             self_reap(&ops, &guard, residue, claimed);
             let _ = reply.send(Err(crate::error::SyncRootError::Write {
-              path: dir.join(&name),
+              path: dir.join(&*name),
               source,
             }));
           }
@@ -5276,12 +5356,23 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
   /// that directory must create NOTHING and answer
   /// [`CookieWriteError::pruned`], which the caller reports as
   /// [`SyncRootError::DirPruned`](crate::SyncRootError::DirPruned).
+  ///
+  /// `exclusions` is the WATCHER-wide exclusion set, judged here for exactly the
+  /// same reason and at exactly the same point. The admission already refused the
+  /// caller's lexical spelling, and that is not the same question: an intermediate
+  /// symlink resolves a spelling outside every exclusion into a directory inside
+  /// one, and a covered FILE subscription's key is not the cookie's directory at
+  /// all. An implementation that finds an exclusion covers the directory it
+  /// resolved must create NOTHING and answer
+  /// [`CookieWriteError::excluded`], which the caller reports as
+  /// [`SyncRootError::DirExcluded`](crate::SyncRootError::DirExcluded).
   fn write_cookie(
     &self,
     root: &LiveRoot,
     dir: &Path,
     name: &str,
     prune: &Globs,
+    exclusions: &[PathBuf],
   ) -> Result<CookieFile, CookieWriteError>;
 
   /// Removes a sync cookie (blocking) through the anchor it was created with,
@@ -6156,12 +6247,31 @@ fn cookie_dir<'a>(root: &Path, dir: &'a Path) -> &'a Path {
   }
 }
 
+/// The longest cookie leaf this driver will carry, in bytes — `NAME_MAX` on
+/// every filesystem the supported platforms mount, so a longer name is one no
+/// create could ever land anyway.
+///
+/// The bound is a MEMORY bound, not a convenience: the leaf is the only
+/// caller-supplied, unbounded-length value the cookie machinery retains, and it
+/// is retained in several places at once (the obligation, the `by_name` index,
+/// the core's active-marker set, the release queue). The ledger's caps count
+/// RECORDS, so without a length bound a caller could hold a few hundred megabytes
+/// per record — the entry-count caps would still be honoured while the process
+/// died of allocation. Refusing at admission, before the name is stored anywhere,
+/// is what turns the record caps into real memory caps.
+pub(crate) const MAX_COOKIE_NAME_LEN: usize = 255;
+
 /// Whether a minted cookie NAME is exactly one normal filename component — no
-/// separators, no `.`/`..`, not absolute, not empty. The umbrella mints
-/// `.tributaries-sync-…`, always normal; anything else is a contract violation
+/// separators, no `.`/`..`, not absolute, not empty — and no longer than
+/// [`MAX_COOKIE_NAME_LEN`] bytes. The umbrella mints `.tributaries-sync-…`,
+/// always normal and far inside the bound; anything else is a contract violation
 /// that must be refused BEFORE it reaches a path join, where an absolute or
-/// `..` name would escape the directory the barrier was validated for.
+/// `..` name would escape the directory the barrier was validated for — and
+/// before it is stored, where an unbounded one would defeat the ledger's caps.
 pub(crate) fn is_normal_cookie_name(name: &str) -> bool {
+  if name.len() > MAX_COOKIE_NAME_LEN {
+    return false;
+  }
   let mut components = Path::new(name).components();
   matches!(
     (components.next(), components.next()),
@@ -6464,6 +6574,7 @@ impl FsOps for RealFs {
     dir: &Path,
     name: &str,
     prune: &Globs,
+    exclusions: &[PathBuf],
   ) -> Result<CookieFile, CookieWriteError> {
     // The root's canonical path, as the SPAWN resolved it — recorded together
     // with the object below and replaced together with it, so the two can never
@@ -6529,6 +6640,22 @@ impl FsOps for RealFs {
       return Err(CookieWriteError::clean(std::io::Error::other(
         "the cookie directory resolves outside the watched root",
       )));
+    }
+    // The watcher's EXCLUSIONS, judged on that same opened object. The admission
+    // asked this question of the caller's spelling, and a spelling is not a
+    // location: `<root>/link/sub` where `link` targets `<root>/hidden` passes a
+    // lexical test against an exclusion of `<root>/hidden` and lands squarely
+    // inside it, and a covered FILE subscription's key is not the cookie's
+    // directory at all. An exclusion is an instruction to the source NOT to report
+    // a subtree, so a marker created there is a marker no delivery can ever carry
+    // — the barrier waits out its caller's deadline over a source that did exactly
+    // what it was told. The same refusal the prune seat gets below, for the same
+    // reason, taken before anything is created.
+    if let Some(exclusion) = cookie_dir_excluded(exclusions, parent.path()) {
+      return Err(CookieWriteError::excluded(
+        parent.path().to_path_buf(),
+        exclusion.to_path_buf(),
+      ));
     }
     // The root's PRUNE seat, judged on that same opened object and against the
     // same FLOOR the containment test just used — so the root-relative remainder
@@ -7154,6 +7281,7 @@ fn destroy_unidentified(
         handle,
       )))),
       pruned: None,
+      excluded: None,
     },
   }
 }
@@ -7189,6 +7317,7 @@ fn post_mint_failure(dir: &Arc<CookieDir>, name: &str, source: std::io::Error) -
       source,
       residue: Some(Box::new(CookieResidue::Dir(owed))),
       pruned: None,
+      excluded: None,
     },
     None => CookieWriteError::clean(source),
   }
@@ -8162,6 +8291,7 @@ pub(crate) async fn run<R, F>(
       &mut cover_replies,
       &mut parked_cookies,
       &mut cookies,
+      &config.exclusions,
       &|scope| streams.handles.contains_key(&scope),
       SettlePass::Live {
         unspent: &source_unspent,
@@ -9613,14 +9743,27 @@ pub(crate) async fn run<R, F>(
                 // in-flight re-arms to quiesce, which is precisely the ordering
                 // the barrier needs.
                 let fence = core.open_cover_fence(scope);
+                // The validated leaf, allocated ONCE and shared from here on: the
+                // obligation, the ledger's name index, the core's active-marker
+                // set and the release queue all hold this same `Arc`, so the
+                // record caps that bound the ledger bound its bytes too (the
+                // length is already refused above, see [`MAX_COOKIE_NAME_LEN`]).
+                let name: Arc<str> = Arc::from(name);
                 // The marker's identity, armed with the obligation and released
                 // with it: from here no seat of this scope may take a change
                 // whose object wears this leaf, whatever the directories above it
                 // are called by the time the create lands. Armed BEFORE the
                 // write is dispatched — a parked sync's write can leave for the
-                // pool on the very next loop-top poll.
-                core.arm_sync_marker(scope, name.clone());
-                cookies.admit_parked(scope, name, ticket.seq(), fence);
+                // pool on the very next loop-top poll — and armed under the
+                // obligation's OWN id, so a predecessor that freed this name and
+                // queued its release cannot disarm this one.
+                //
+                // The order is admit-then-arm because the id is minted by the
+                // admission, and it costs nothing: both run in this one command
+                // step, and the release drain is the loop top's, so no release can
+                // be applied in between.
+                let id = cookies.admit_parked(scope, Arc::clone(&name), ticket.seq(), fence);
+                core.arm_sync_marker(scope, name, id);
                 // The routing half: which caller this fence answers, and where its
                 // cookie is to be written. Inserted in the same step as the record
                 // it belongs to, and removed in the same step it leaves `Parked` —
@@ -10030,6 +10173,7 @@ pub(crate) async fn run<R, F>(
     &mut cover_replies,
     &mut parked_cookies,
     &mut cookies,
+    &config.exclusions,
     &|_| false,
     SettlePass::Closing,
   );

@@ -289,6 +289,17 @@ pub enum SyncRootError {
   /// Exclusions apply to every root on every platform, so the refusal is the
   /// same everywhere — it does not depend on which backend resolved, and it is
   /// made before the write rather than discovered by waiting.
+  ///
+  /// The verdict is taken TWICE, because a spelling is not a location. The
+  /// admission judges `dir` as supplied, which costs nothing and refuses the
+  /// common case synchronously; the write then judges the directory it actually
+  /// resolved — every symlink on the way followed, and the
+  /// cookie-goes-beside-a-file rule applied — because only that one is where the
+  /// marker would land. A link whose spelling clears every exclusion and whose
+  /// target sits inside one is refused by the second check, with
+  /// [`dir`](Self::DirExcluded::dir) naming the resolved directory rather than
+  /// the spelling. Since the caller cannot tell which check refused, the
+  /// admission's sequence is treated as spent for both — re-mint to retry.
   #[error(
     "cookie directory {} is under excluded directory {}",
     dir.display(),
@@ -334,10 +345,14 @@ pub enum SyncRootError {
     pattern: tributary_proto::glob::Glob,
   },
   /// The cookie name is not a single normal filename component — it holds a
-  /// path separator, a `.`/`..`, or is absolute or empty. A name like this
-  /// would escape the directory the barrier was validated for, so it is refused
-  /// before any write. The umbrella mints names that never trip this; a caller
-  /// that hits it violated the reserved-namespace contract.
+  /// path separator, a `.`/`..`, is absolute or empty, or is longer than 255
+  /// bytes (`NAME_MAX` on every supported filesystem, so a longer leaf names
+  /// nothing that could ever be created). A name like this would escape the
+  /// directory the barrier was validated for, so it is refused before any write
+  /// — and before it is stored, so an unbounded one cannot be retained by a
+  /// bookkeeping that counts records rather than bytes. The umbrella mints names
+  /// that never trip this; a caller that hits it violated the reserved-namespace
+  /// contract.
   #[error("cookie name {name:?} is not a single normal filename component")]
   BadCookieName {
     /// The offending name as supplied.

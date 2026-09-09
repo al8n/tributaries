@@ -1208,7 +1208,7 @@ fn identity_minting_respects_devices_and_mounts() {
     pending_widen: None,
     prune: Globs::default(),
     include: None,
-    markers: BTreeSet::new(),
+    markers: BTreeMap::new(),
   };
   let fid = NonZeroU64::new(7);
   assert!(mint(&state, Path::new("/r/a"), fid, None).is_some());
@@ -1250,7 +1250,7 @@ fn blind_mount_table_refuses_event_side_trust() {
     pending_widen: None,
     prune: Globs::default(),
     include: None,
-    markers: BTreeSet::new(),
+    markers: BTreeMap::new(),
   };
   let fid = NonZeroU64::new(7);
   assert!(
@@ -3014,7 +3014,7 @@ mod lowering {
       pending_widen: None,
       prune: Globs::default(),
       include: None,
-      markers: BTreeSet::new(),
+      markers: BTreeMap::new(),
     }
   }
 
@@ -17275,9 +17275,10 @@ mod prune {
   #[test]
   fn an_active_sync_marker_is_delivered_from_pruned_ground() {
     const MARKER: &str = ".tributaries-sync-1-2-3-abcdef";
+    const OWNER: crate::driver::CookieId = crate::driver::CookieId(1);
     let mut core = DriverCore::new(WINDOW, LIVENESS);
     let scope = live_fsevents(&mut core, &pruning(&["blocked"]));
-    core.arm_sync_marker(scope, MARKER.to_owned());
+    core.arm_sync_marker(scope, Arc::from(MARKER), OWNER);
 
     core.on_batch_events(
       scope,
@@ -17313,7 +17314,7 @@ mod prune {
     );
 
     // Released with its obligation: the exemption is the sync's, not the name's.
-    core.release_sync_markers([(scope, MARKER.to_owned())]);
+    core.release_sync_markers([(scope, Arc::from(MARKER), OWNER)]);
     core.on_batch_events(
       scope,
       vec![ev(
@@ -18004,9 +18005,10 @@ mod include {
   #[test]
   fn an_active_marker_is_admitted_under_a_renamed_cookie_directory() {
     const MARKER: &str = ".tributaries-sync-1-2-3-abcdef";
+    const OWNER: crate::driver::CookieId = crate::driver::CookieId(1);
     let mut core = DriverCore::new(WINDOW, LIVENESS);
     let scope = live_fsevents(&mut core, &including(&["**/*.mp4"]));
-    core.arm_sync_marker(scope, MARKER.to_owned());
+    core.arm_sync_marker(scope, Arc::from(MARKER), OWNER);
 
     core.on_batch_events(
       scope,
@@ -18039,7 +18041,7 @@ mod include {
     );
 
     // Released with its obligation: the exemption is the sync's, not the name's.
-    core.release_sync_markers([(scope, MARKER.to_owned())]);
+    core.release_sync_markers([(scope, Arc::from(MARKER), OWNER)]);
     core.on_batch_events(
       scope,
       vec![ev(
@@ -18055,6 +18057,80 @@ mod include {
     assert!(
       changes.is_empty(),
       "a released leaf is an ordinary name again: {changes:?}"
+    );
+  }
+
+  /// A marker leaf frees at its obligation's terminal, so the very name a
+  /// retiring sync is queueing a release for may already belong to a SUCCESSOR by
+  /// the time the drain runs. The exact interleaving: the loop-top drain runs; an
+  /// unlink worker retires the predecessor and queues its release under the
+  /// ledger lock; the command step admits a successor under the same scope and
+  /// leaf, whose arm takes ownership of the entry; the next drain applies the
+  /// predecessor's release.
+  ///
+  /// Keyed by the leaf alone that release removes the SUCCESSOR's live exemption,
+  /// and the marker the successor's barrier waits on is then taken by an include
+  /// seat naming the caller's own media — a `sync` that reported success and can
+  /// never resolve. Keyed by the obligation, the stale release finds an owner that
+  /// is not its own and removes nothing.
+  ///
+  /// Revert witness: drop the owner comparison from `release_sync_markers` and
+  /// the successor's marker is silenced by `**/*.mp4`.
+  #[test]
+  fn a_stale_release_never_disarms_a_same_name_successor() {
+    const MARKER: &str = ".tributaries-sync-1-2-3-abcdef";
+    const PREDECESSOR: crate::driver::CookieId = crate::driver::CookieId(7);
+    const SUCCESSOR: crate::driver::CookieId = crate::driver::CookieId(8);
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_fsevents(&mut core, &including(&["**/*.mp4"]));
+
+    // The predecessor's admission, then its retirement — which only QUEUES the
+    // release; nothing has reached the core yet.
+    core.arm_sync_marker(scope, Arc::from(MARKER), PREDECESSOR);
+    // The successor is admitted under the freed name before that drain runs, and
+    // its arm takes ownership of the entry.
+    core.arm_sync_marker(scope, Arc::from(MARKER), SUCCESSOR);
+    // The drain, applying the predecessor's queued release.
+    core.release_sync_markers([(scope, Arc::from(MARKER), PREDECESSOR)]);
+
+    core.on_batch_events(
+      scope,
+      vec![ev(
+        &format!("/r/ordinary/{MARKER}"),
+        flags(&[FsEventFlags::ITEM_CREATED, FsEventFlags::ITEM_IS_FILE]),
+        1,
+        10,
+      )],
+      at(1),
+    );
+    let changes = drain(&mut core);
+    let changes = emits(&changes);
+    assert_eq!(
+      located(&changes),
+      vec![loc(&["ordinary", MARKER])],
+      "the successor owns the leaf, so its predecessor's release disarmed \
+       nothing: {changes:?}"
+    );
+
+    // Non-vacuity: the successor's OWN release still ends the exemption, so the
+    // ownership test is a guard on the release and not a way to keep a leaf armed
+    // forever.
+    core.release_sync_markers([(scope, Arc::from(MARKER), SUCCESSOR)]);
+    core.on_batch_events(
+      scope,
+      vec![ev(
+        &format!("/r/ordinary/{MARKER}"),
+        flags(&[FsEventFlags::ITEM_CREATED, FsEventFlags::ITEM_IS_FILE]),
+        2,
+        11,
+      )],
+      at(2),
+    );
+    let changes = drain(&mut core);
+    let changes = emits(&changes);
+    assert!(
+      changes.is_empty(),
+      "the owner's own release frees the leaf: {changes:?}"
     );
   }
 

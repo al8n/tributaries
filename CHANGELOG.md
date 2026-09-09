@@ -164,6 +164,24 @@ All notable changes to this workspace are documented here. The format is based o
     `SyncError::CookieDirUncovered` — the same verdict as one outside the root or under a
     watcher exclusion, all three being "no event could ever arrive there" — rather than as
     a write failure it would be pointless to retry.
+  - **The watcher's exclusions are judged where the cookie actually lands, too.**
+    `sync_root` checked them against the caller's spelling alone, and a spelling is not a
+    location: an intermediate symlink resolves one that clears every exclusion into a
+    directory inside one, and the marker written there is a marker the source is under
+    instruction never to report. The write now takes the same verdict the `prune` seat
+    gets, on the directory its descriptor walk resolved, and answers
+    `SyncRootError::DirExcluded` before creating anything — which also makes that variant
+    spend its admission (`SyncRootDenied::admission` is `None` for it), since the caller
+    cannot tell the pre-birth refusal from the post-birth one. A rename INTO excluded
+    ground after the walk still lands the marker under the exclusion, where the barrier
+    times out exactly as it would for any excluded delivery; `sync_root`'s docs say so.
+  - **A cookie leaf is length-bounded at 255 bytes** (`NAME_MAX` on every supported
+    filesystem), refused as `SyncRootError::BadCookieName` with the other name-shape
+    violations. It is the only caller-supplied value of unbounded length the cookie
+    machinery retains, and it retains it in several places at once — so the ledger's
+    record caps bounded entries while a single invalid filename could still exhaust the
+    allocator. The validated leaf is now shared across the ledger, the name index and the
+    delivery seats' active-marker set rather than copied into each.
   - `Source::replace`'s contract states what the fs binding's `replace_root` does: a
     retarget swaps the root's key and KEEPS its words, which are root-relative and are
     therefore re-based onto the new key, so a depth-anchored `prune` pattern names a

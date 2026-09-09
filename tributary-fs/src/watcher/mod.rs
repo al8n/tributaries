@@ -195,7 +195,8 @@ impl SyncAdmission {
 /// [`sync_root`](Watcher::sync_root) to retry under the SAME sequence — the paired
 /// [`SyncTicket`] stays valid. `None` means the sequence is spent or its fate is
 /// ambiguous — the write was admitted then retired
-/// ([`Write`](SyncRootError::Write), [`DirPruned`](SyncRootError::DirPruned)), the
+/// ([`Write`](SyncRootError::Write), [`DirPruned`](SyncRootError::DirPruned),
+/// [`DirExcluded`](SyncRootError::DirExcluded)), the
 /// sync reached a post-birth terminal ([`Retired`](SyncRootError::Retired)), or the
 /// watcher is [`Closed`](SyncRootError::Closed) — so a retry must re-mint through
 /// [`mint_sync_ticket`](Watcher::mint_sync_ticket).
@@ -221,7 +222,10 @@ impl SyncRootDenied {
   /// the returned set: `Write` (admitted, then retired before the reply — the
   /// sequence is burned), `DirPruned` (the same shape: the verdict needs the canonical
   /// directory only the write can resolve, so it too is admitted and then retired),
-  /// `Retired` (a post-admission terminal), and `Closed`.
+  /// `DirExcluded` (refused at the admission for the caller's SPELLING and again at
+  /// the write for the directory that spelling resolved to — the caller cannot tell
+  /// the two apart, so the post-birth reading governs), `Retired` (a post-admission
+  /// terminal), and `Closed`.
   pub(crate) fn classify(error: SyncRootError, admission: SyncAdmission) -> Self {
     let admission = if matches!(
       error,
@@ -229,7 +233,6 @@ impl SyncRootDenied {
         | SyncRootError::ForeignTicket
         | SyncRootError::BadCookieName { .. }
         | SyncRootError::DirOutsideRoot { .. }
-        | SyncRootError::DirExcluded { .. }
         | SyncRootError::WriteInFlight
         | SyncRootError::NameInUse { .. }
         | SyncRootError::TicketInUse {}
@@ -1565,7 +1568,9 @@ impl<R> Watcher<R> {
   /// root (including via `..` traversal);
   /// [`DirExcluded`](SyncRootError::DirExcluded) when `dir` is inside the root but
   /// under one of the configured exclusions, whose whole purpose is to keep that
-  /// subtree's events off the stream the barrier waits on;
+  /// subtree's events off the stream the barrier waits on — judged both on the
+  /// spelling given here and on the directory the write actually resolves, so a
+  /// symlink into an excluded subtree is refused too;
   /// [`DirPruned`](SyncRootError::DirPruned) when this ROOT's own
   /// [`prune`](crate::RootOptions::prune) seat covers the CANONICAL directory the
   /// write resolves for `dir`, for the same reason and carrying the pattern that did
@@ -1582,11 +1587,21 @@ impl<R> Watcher<R> {
   /// root died while the write was parked; [`Closed`](SyncRootError::Closed) once
   /// the watcher is closed. The admission is returned (retryable) for every refusal
   /// except [`Write`](SyncRootError::Write),
-  /// [`DirPruned`](SyncRootError::DirPruned), [`Retired`](SyncRootError::Retired),
+  /// [`DirPruned`](SyncRootError::DirPruned),
+  /// [`DirExcluded`](SyncRootError::DirExcluded),
+  /// [`Retired`](SyncRootError::Retired),
   /// and [`Closed`](SyncRootError::Closed), whose sequence is spent — re-mint to
   /// retry those.
   ///
   /// # Platform notes
+  ///
+  /// A directory renamed INTO excluded ground between the write's descriptor walk
+  /// and its create leaves the marker where the walk put it, under a parent the
+  /// exclusion now covers; the exclusion is the SOURCE's contract, so that
+  /// delivery is suppressed exactly as any other excluded one is and the barrier
+  /// waits out its deadline. Refusing the write cannot close that window — no
+  /// check precedes a rename that happens after it — and the outcome is the
+  /// exclusions' documented semantics rather than a hole in this call.
   ///
   /// On Windows this write's cookie path is still path-addressed at three
   /// points (opening the cookie parent by pathname after the root identity check;

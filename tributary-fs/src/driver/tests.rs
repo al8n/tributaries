@@ -11852,7 +11852,7 @@ mod sync_cookie {
     ticket: u64,
   ) -> CookieGuard {
     let fence = core.open_cover_fence(scope);
-    let id = reg.admit_parked(scope, name.to_owned(), ticket, fence);
+    let id = reg.admit_parked(scope, Arc::from(name), ticket, fence);
     reg
       .dispatch_guard(scope, id)
       .expect("a freshly admitted obligation dispatches")
@@ -12534,6 +12534,80 @@ mod sync_cookie {
     assert_eq!(cookie_count(&rig).await, 0);
   }
 
+  /// The cookie leaf is the only caller-supplied value of unbounded length the
+  /// cookie machinery RETAINS, and it retains it in four places at once (the
+  /// obligation, the name index, the core's active-marker set, the release
+  /// queue). The ledger's caps count RECORDS, so a leaf of a few hundred
+  /// megabytes would honour every one of them while the process died of
+  /// allocation — a name a create could never have landed anyway, since it
+  /// exceeds `NAME_MAX` on every filesystem these platforms mount.
+  ///
+  /// So the length is refused with the other name-shape violations, at
+  /// admission, before the leaf is stored anywhere.
+  ///
+  /// Revert witness: drop the length test from `is_normal_cookie_name` and a
+  /// 256-byte leaf is admitted, cloned into the ledger, and only refused by the
+  /// filesystem.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_cookie_name_past_the_length_bound_is_refused() {
+    let rig = rig_with_capacity(64);
+    let scope = watch(&rig, "/r").await;
+
+    let over = "n".repeat(crate::driver::MAX_COOKIE_NAME_LEN + 1);
+    match sync_root(&rig, scope, "/r", &over).await {
+      Err(crate::error::SyncRootError::BadCookieName { name }) => {
+        assert_eq!(name.len(), crate::driver::MAX_COOKIE_NAME_LEN + 1);
+      }
+      other => panic!("a leaf past the bound is a contract violation: {other:?}"),
+    }
+    assert_eq!(
+      rig.fs.cookie_dispatches(),
+      0,
+      "the write was refused before it could reach the pool"
+    );
+    assert_eq!(cookie_count(&rig).await, 0);
+
+    // The bound itself is IN range: the refusal is a ceiling, not an off-by-one
+    // that also rejects the longest legal name.
+    let at_bound = "n".repeat(crate::driver::MAX_COOKIE_NAME_LEN);
+    sync_root(&rig, scope, "/r", &at_bound)
+      .await
+      .expect("the longest legal leaf still places its barrier");
+    assert_eq!(rig.fs.cookie_dispatches(), 1);
+  }
+
+  /// One validated leaf, one allocation. The obligation, the ledger's name index
+  /// and the release queue hold the SAME `Arc<str>`, so the release the core
+  /// drains carries a refcount rather than a copy — which is what makes the
+  /// record caps a memory bound and not merely an entry count.
+  ///
+  /// Revert witness: store the leaf as an owned `String` anywhere in that chain
+  /// and the pointer identity below stops holding.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_released_marker_shares_the_obligation_leaf() {
+    let (mut reg, _cleanup, _wake) = registry_with_ingress(FakeFs::new(1));
+    let mut core = fence_source();
+    let scope = ScopeId::new(NonZeroU64::new(1).unwrap());
+    let fence = core.open_cover_fence(scope);
+
+    let name: Arc<str> = Arc::from(".tributaries-sync-shared-leaf");
+    let id = reg.admit_parked(scope, Arc::clone(&name), ticket().seq(), fence);
+    lock_ledger(&reg.ledger).retire(id, Reaped::NeverCreated);
+
+    let released = reg.take_released_markers();
+    assert_eq!(released.len(), 1);
+    let (released_scope, released_name, owner) = &released[0];
+    assert_eq!(*released_scope, scope);
+    assert_eq!(
+      *owner, id,
+      "the release names the incarnation that armed it"
+    );
+    assert!(
+      Arc::ptr_eq(released_name, &name),
+      "the queued release shares the obligation's leaf rather than copying it"
+    );
+  }
+
   // A directory that only appears inside the root through `..` traversal —
   // `/r/../outside` starts_with `/r` component-wise, yet escapes the tree once
   // folded — is refused, closing the lexical escape a plain `starts_with` misses.
@@ -12697,6 +12771,105 @@ mod sync_cookie {
       "nothing was created for a barrier that could never resolve"
     );
     assert_eq!(cookie_count(&rig).await, 0);
+  }
+
+  /// The exclusions' twin of the symlink cell above, and the reason the verdict
+  /// cannot be left to the admission alone. The admission judges the caller's
+  /// SPELLING — which is free, and right for the common case — but a spelling is
+  /// not a location: `/r/link` is an existing symlink to the excluded `/r/hidden`,
+  /// so `/r/link/sub` really is `/r/hidden/sub`. The lexical check clears it, the
+  /// walk resolves the real parent inside the exclusion, and a marker created
+  /// there is a marker the source is under instruction never to report — the
+  /// barrier then waits out its caller's deadline with nothing wrong anywhere.
+  ///
+  /// So the write asks the question again, on the directory IT resolved, and
+  /// refuses before creating anything.
+  ///
+  /// Revert witness: drop the exclusion check from `write_cookie` and the cookie
+  /// lands under `/r/hidden`, the write reports success, and the sync times out.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_symlink_into_an_excluded_directory_is_refused_before_any_write() {
+    let rig = rig_with_config(
+      64,
+      DriverConfig {
+        exclusions: vec![PathBuf::from("/r/hidden")],
+        ..config()
+      },
+    );
+    let scope = watch(&rig, "/r").await;
+    rig.fs.put("/r/link/sub", FileKind::Dir, 2);
+    rig.fs.resolve_cookie_dir_to("/r/link/sub", "/r/hidden/sub");
+
+    match sync_root(&rig, scope, "/r/link/sub", ".tributaries-sync-1-9-11").await {
+      Err(crate::error::SyncRootError::DirExcluded { dir, exclusion }) => {
+        assert_eq!(exclusion, PathBuf::from("/r/hidden"));
+        assert_eq!(
+          dir,
+          PathBuf::from("/r/hidden/sub"),
+          "the refusal names the directory the write resolved, not the spelling it was given"
+        );
+      }
+      other => panic!("a link into an excluded subtree is refused: {other:?}"),
+    }
+    assert!(
+      rig.fs.cookie_writes().is_empty(),
+      "nothing was created for a barrier that could never resolve"
+    );
+    assert_eq!(cookie_count(&rig).await, 0);
+  }
+
+  /// The other half of the same seat, and the other direction the lexical check
+  /// gets wrong: a covered FILE subscription's key is a FILE, and the cookie goes
+  /// BESIDE it — so the directory to judge is the file's PARENT, which only the
+  /// write selects. A file inside an excluded subtree is refused there; a file
+  /// whose parent is clear still places its barrier, exclusions configured or not.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_file_target_inside_an_exclusion_is_refused_by_the_write() {
+    let rig = rig_with_config(
+      64,
+      DriverConfig {
+        exclusions: vec![PathBuf::from("/r/hidden")],
+        ..config()
+      },
+    );
+    let scope = watch(&rig, "/r").await;
+    rig.fs.put("/r/hidden", FileKind::Dir, 2);
+    rig.fs.put("/r/hidden/f.txt", FileKind::File, 3);
+    // The caller's spelling reaches the file through a link, so even the file's
+    // own path clears the admission's lexical test.
+    rig.fs.put("/r/seen", FileKind::Dir, 4);
+    rig.fs.put("/r/seen/f.txt", FileKind::File, 5);
+    rig.fs.resolve_cookie_dir_to("/r/seen", "/r/hidden");
+
+    match sync_root(&rig, scope, "/r/seen/f.txt", ".tributaries-sync-1-9-12").await {
+      Err(crate::error::SyncRootError::DirExcluded { dir, exclusion }) => {
+        assert_eq!(exclusion, PathBuf::from("/r/hidden"));
+        assert_eq!(
+          dir,
+          PathBuf::from("/r/hidden"),
+          "the file's PARENT is what the cookie would have gone in"
+        );
+      }
+      other => panic!("a file inside an excluded subtree is refused: {other:?}"),
+    }
+    assert!(
+      rig.fs.cookie_writes().is_empty(),
+      "the refusal is taken BEFORE anything is created"
+    );
+
+    // The refusal belongs to the exclusion, not to exclusions being configured:
+    // a resolved parent outside every one of them still places its barrier.
+    rig.fs.put("/r/plain.txt", FileKind::File, 6);
+    let landed = sync_root(&rig, scope, "/r/plain.txt", ".tributaries-sync-1-9-13")
+      .await
+      .expect("a file whose real parent is clear still places its barrier");
+    assert!(
+      landed.starts_with("/r/"),
+      "the cookie landed beside the file: {}",
+      landed.display()
+    );
+    assert_eq!(rig.fs.cookie_writes().len(), 1);
+    assert_eq!(cookie_count(&rig).await, 1);
   }
 
   /// A covered FILE subscription's key is a FILE, and the cookie goes BESIDE it —
@@ -15582,7 +15755,7 @@ mod sync_cookie {
         m,
         Obligation {
           scope,
-          name: name.to_owned(),
+          name: Arc::from(name),
           ticket: m.0,
           id: m,
           residue: Some(fs.cookie_residue_at(&path)),
@@ -15594,7 +15767,7 @@ mod sync_cookie {
           },
         },
       );
-      inner.by_name.insert(name.to_owned(), m);
+      inner.by_name.insert(Arc::from(name), m);
       inner.by_path.insert(path.clone(), m);
       inner.failure_clock = 5;
     }
@@ -15654,7 +15827,7 @@ mod sync_cookie {
         m,
         Obligation {
           scope,
-          name: "n".to_owned(),
+          name: Arc::from("n"),
           ticket: m.0,
           id: m,
           residue: Some(fs.cookie_residue_at(&path)),
@@ -15666,7 +15839,7 @@ mod sync_cookie {
           },
         },
       );
-      inner.by_name.insert("n".to_owned(), m);
+      inner.by_name.insert(Arc::from("n"), m);
       inner.by_path.insert(path.clone(), m);
     }
     let k = CookieId(m.0 + 7);
@@ -15726,7 +15899,7 @@ mod sync_cookie {
         f,
         Obligation {
           scope,
-          name: "n2".to_owned(),
+          name: Arc::from("n2"),
           ticket: f.0,
           id: f,
           residue: Some(fs.cookie_residue_at(&fresh)),
@@ -15735,7 +15908,7 @@ mod sync_cookie {
           phase: Phase::Owned,
         },
       );
-      inner.by_name.insert("n2".to_owned(), f);
+      inner.by_name.insert(Arc::from("n2"), f);
       inner.by_path.insert(fresh.clone(), f);
     }
     cleanup.request_remove(&fresh);
@@ -16152,7 +16325,7 @@ mod sync_cookie {
         id,
         Obligation {
           scope,
-          name: name.to_owned(),
+          name: Arc::from(name),
           ticket: id.0,
           id,
           residue: Some(CookieResidue::File(CookieFile::new(
@@ -16164,7 +16337,7 @@ mod sync_cookie {
           phase: Phase::Owned,
         },
       );
-      inner.by_name.insert(name.to_owned(), id);
+      inner.by_name.insert(Arc::from(name), id);
       inner.by_path.insert(path.to_path_buf(), id);
       id
     }
@@ -16975,7 +17148,7 @@ mod sync_cookie {
       let name = ".tributaries-sync-phase-parked";
       let t = ticket();
       let fence = core.open_cover_fence(scope);
-      let id = reg.admit_parked(scope, name.to_owned(), t.seq(), fence);
+      let id = reg.admit_parked(scope, Arc::from(name), t.seq(), fence);
       cleanup.request_cancel(t);
       assert!(
         reg.dispatch_guard(scope, id).is_none(),
@@ -17480,6 +17653,7 @@ mod sync_cookie {
         &root.join("sub"),
         ".tributaries-sync-replaced",
         &tributary_proto::glob::Globs::default(),
+        &[],
       );
 
       let landed = |dir: &std::path::Path| {
@@ -17623,6 +17797,7 @@ mod sync_cookie {
           &root,
           ".tributaries-sync-displaced",
           &tributary_proto::glob::Globs::default(),
+          &[],
         )
         .expect("a cookie is created in a writable scratch root");
 
@@ -17665,6 +17840,7 @@ mod sync_cookie {
           &root,
           ".tributaries-sync-plain",
           &tributary_proto::glob::Globs::default(),
+          &[],
         )
         .expect("a cookie is created in a writable scratch root");
       assert_eq!(
@@ -17716,6 +17892,7 @@ mod sync_cookie {
           &root,
           ".tributaries-sync-gone",
           &tributary_proto::glob::Globs::default(),
+          &[],
         )
         .expect("a cookie is created in a writable scratch root");
       std::fs::remove_file(cookie.path()).expect("someone else reaps it first");
@@ -17792,6 +17969,7 @@ mod sync_cookie {
           &root,
           ".tributaries-sync-reuse",
           &tributary_proto::glob::Globs::default(),
+          &[],
         )
         .expect("a cookie is created in a writable scratch root");
       std::fs::remove_file(cookie.path()).expect("the stranger deletes the cookie");
@@ -17919,6 +18097,7 @@ mod sync_cookie {
           &dir,
           ".tributaries-sync-unprovable",
           &tributary_proto::glob::Globs::default(),
+          &[],
         )
         .expect("a cookie is created in a writable scratch root");
 
@@ -17972,6 +18151,7 @@ mod sync_cookie {
           &root,
           ".tributaries-sync-fifo",
           &tributary_proto::glob::Globs::default(),
+          &[],
         )
         .expect("a cookie is created in a writable scratch root");
       std::fs::remove_file(cookie.path()).expect("the cookie's name is freed");
@@ -18149,6 +18329,7 @@ mod sync_cookie {
           &root,
           ".tributaries-sync-reap-pin",
           &tributary_proto::glob::Globs::default(),
+          &[],
         )
         .expect("a cookie is created in a writable scratch root");
       assert!(
@@ -18200,6 +18381,7 @@ mod sync_cookie {
           &dir,
           ".tributaries-sync-reap-pin-kept",
           &tributary_proto::glob::Globs::default(),
+          &[],
         )
         .expect("a cookie is created in a writable scratch root");
 
@@ -18365,6 +18547,7 @@ mod sync_cookie {
           &root,
           ".tributaries-sync-dir-mode",
           &tributary_proto::glob::Globs::default(),
+          &[],
         )
         .expect("a cookie is created in a writable scratch root");
       let cookie_dir = cookie
@@ -18381,6 +18564,7 @@ mod sync_cookie {
         &root,
         ".tributaries-sync-dir-mode-2",
         &tributary_proto::glob::Globs::default(),
+        &[],
       );
 
       // SAFETY: `geteuid` reads no memory, takes no arguments, and cannot fail.
@@ -18401,6 +18585,7 @@ mod sync_cookie {
           &root,
           ".tributaries-sync-dir-owner",
           &tributary_proto::glob::Globs::default(),
+          &[],
         )
       });
       let _ = std::fs::set_permissions(&cookie_dir, std::fs::Permissions::from_mode(0o700));
@@ -18514,6 +18699,7 @@ mod sync_cookie {
           &root,
           ".tributaries-sync-dispose",
           &tributary_proto::glob::Globs::default(),
+          &[],
         )
         .expect("a cookie is created in a writable scratch root");
       let cookie_dir = cookie_dir_of(&cookie);
@@ -18577,6 +18763,7 @@ mod sync_cookie {
           &root,
           ".tributaries-sync-renamed",
           &tributary_proto::glob::Globs::default(),
+          &[],
         )
         .expect("a cookie is created in a writable scratch root");
       let cookie_dir = cookie_dir_of(&cookie);
@@ -18725,6 +18912,7 @@ mod sync_cookie {
           &root,
           ".tributaries-sync-dispose-refused",
           &tributary_proto::glob::Globs::default(),
+          &[],
         )
         .expect("a cookie is created in a writable scratch root");
       let cookie_dir = cookie_dir_of(&cookie);
@@ -18917,6 +19105,7 @@ mod sync_cookie {
         &root,
         ".tributaries-sync-junk",
         &tributary_proto::glob::Globs::default(),
+        &[],
       );
       let landed = written.as_ref().ok().map(cookie_dir_of);
       let removal = written.as_ref().ok().map(|cookie| fs.remove_cookie(cookie));
@@ -19012,6 +19201,7 @@ mod sync_cookie {
           &root,
           ".tributaries-sync-residue",
           &tributary_proto::glob::Globs::default(),
+          &[],
         )
         .expect("a stale cookie directory beside it blocks nothing");
       let landed = cookie_dir_of(&cookie);

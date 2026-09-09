@@ -437,9 +437,11 @@ async fn sync_root_refuses_a_foreign_ticket_at_the_door() {
 /// (`SyncRootDenied::classify`). A refusal raised BEFORE the sync is admitted (the synchronous door
 /// errors and the reply-borne refusals) hands the admission back — `Some`, and it is the SAME
 /// admission (its sequence is preserved), so a retry keeps the sequence and its paired cancel
-/// ticket. A post-birth or ambiguous outcome — `Write` (admitted then retired), `Retired`, `Closed`,
-/// and, by the `_ => None` default, any future variant — consumes it (`None`), the fail-safe
-/// direction that forces a re-mint rather than re-presenting a spent sequence.
+/// ticket. A post-birth or ambiguous outcome — `Write` (admitted then retired), `DirPruned` and
+/// `DirExcluded` (whose verdicts need the directory only the write resolves, so they are admitted
+/// and then retired too), `Retired`, `Closed`, and, by the `_ => None` default, any future variant
+/// — consumes it (`None`), the fail-safe direction that forces a re-mint rather than re-presenting
+/// a spent sequence.
 ///
 /// Fail-on-old: move any pre-birth variant into the default arm (or `Write`/`Retired`/`Closed` into
 /// the returned set) and its assertion flips immediately — this match is the only place the
@@ -483,11 +485,22 @@ async fn sync_root_denied_classifies_each_variant_pre_or_post_birth() {
 
   // Post-birth or ambiguous: the sequence is spent (or its fate unknown), so the admission is
   // consumed and a retry must re-mint. `Write` retires its record before replying (the sequence is
-  // burned), `Retired` is a post-admission terminal, and `Closed` is fail-safe.
+  // burned), `DirPruned` and `DirExcluded` are the same shape — the verdict is taken on the
+  // directory the WRITE resolves, which the admission's lexical spelling cannot name, so the sync
+  // is admitted and then retired — `Retired` is a post-admission terminal, and `Closed` is
+  // fail-safe.
   let post_birth = [
     SyncRootError::Write {
       path: PathBuf::from("/r/.tributaries-sync-x"),
       source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+    },
+    SyncRootError::DirPruned {
+      dir: PathBuf::from("/r/cache"),
+      pattern: tributary_proto::glob::Glob::new("**/cache").expect("a valid pattern compiles"),
+    },
+    SyncRootError::DirExcluded {
+      dir: PathBuf::from("/r/hidden"),
+      exclusion: PathBuf::from("/r/hidden"),
     },
     SyncRootError::Retired,
     SyncRootError::Closed,
