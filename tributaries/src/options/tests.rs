@@ -103,6 +103,61 @@ fn the_capacities_are_bounded_and_their_maxima_are_in_range() {
   }
 }
 
+/// The coalescer's buffered-entry cap is bounded, and BOTH households that can
+/// carry a policy refuse an unbounded one: the watcher-global default, and a
+/// subscription's own [`Debounce::Custom`] override. The cap is the structural
+/// memory bound in front of the bounded event channel, so a value no burst can
+/// reach does not describe a large settle buffer — it removes the bound, and the
+/// overflow-to-`Rescan` shedding that answers a full buffer never engages.
+///
+/// The ceiling itself is in range, like every other maximum here.
+///
+/// Revert witness: drop the `check_max_buffered` call from either `validate` and
+/// a `usize::MAX` cap sails through the one door every constructor goes past.
+#[test]
+fn the_buffered_cap_is_bounded_on_every_household_and_its_maximum_is_in_range() {
+  let at_ceiling = DebounceConfig::new().with_max_buffered(DebounceConfig::MAX_BUFFERED_ENTRIES);
+  assert!(
+    TributariesOptions::new()
+      .debounce(at_ceiling)
+      .validate()
+      .is_ok(),
+    "the documented maximum is a value the household can hold"
+  );
+  assert!(
+    WatchOptions::<OsString>::new()
+      .with_debounce(Debounce::Custom(at_ceiling))
+      .validate()
+      .is_ok()
+  );
+
+  let unbounded = DebounceConfig::new().with_max_buffered(usize::MAX);
+  let err = TributariesOptions::new()
+    .debounce(unbounded)
+    .validate()
+    .expect_err("a settle buffer nothing bounds is refused");
+  assert!(err.is_max_buffered_too_large(), "got {err:?}");
+  assert!(!err.is_event_capacity_too_large());
+
+  let err = WatchOptions::<OsString>::new()
+    .with_debounce(Debounce::Custom(unbounded))
+    .validate()
+    .expect_err("a per-subscription override is judged by the same number");
+  assert!(err.is_max_buffered_too_large(), "got {err:?}");
+
+  // One past the ceiling: the bound is the documented value itself.
+  assert!(
+    TributariesOptions::new()
+      .debounce(DebounceConfig::new().with_max_buffered(DebounceConfig::MAX_BUFFERED_ENTRIES + 1))
+      .validate()
+      .is_err()
+  );
+
+  // A household with no policy at all has no cap to judge.
+  assert!(TributariesOptions::new().validate().is_ok());
+  assert!(WatchOptions::<OsString>::new().validate().is_ok());
+}
+
 #[test]
 fn watch_options_new_is_the_deliver_everything_default() {
   let options: WatchOptions<OsString> = WatchOptions::new();
@@ -413,6 +468,33 @@ mod serde_face {
     let parsed: DebounceConfig = serde_json::from_str(r#"{"max_buffered": 0}"#).unwrap();
     assert_eq!(parsed.max_buffered(), 1);
     assert_eq!(parsed, DebounceConfig::new().with_max_buffered(0));
+  }
+
+  /// And the other end of the same rule: a cap past the ceiling dies at the KEY,
+  /// with the verdict `validate` gives the builders. A document is exactly where an
+  /// unbounded settle buffer would otherwise be written — the number is a plain
+  /// integer, and nothing downstream of the key ever looks at it again until the
+  /// coalescer is already growing.
+  #[test]
+  fn an_out_of_range_buffered_cap_is_a_document_error() {
+    let document = std::format!(r#"{{"max_buffered": {}}}"#, usize::MAX);
+    assert!(serde_json::from_str::<DebounceConfig>(&document).is_err());
+    // Through the households that nest the policy, too.
+    let global = std::format!(r#"{{"debounce": {{"max_buffered": {}}}}}"#, usize::MAX);
+    assert!(serde_json::from_str::<TributariesOptions>(&global).is_err());
+    let custom = std::format!(
+      r#"{{"debounce": {{"custom": {{"max_buffered": {}}}}}}}"#,
+      usize::MAX
+    );
+    assert!(serde_json::from_str::<WatchOptions<OsString>>(&custom).is_err());
+
+    // The ceiling itself loads.
+    let document = std::format!(
+      r#"{{"max_buffered": {}}}"#,
+      DebounceConfig::MAX_BUFFERED_ENTRIES
+    );
+    let parsed: DebounceConfig = serde_json::from_str(&document).unwrap();
+    assert_eq!(parsed.max_buffered(), DebounceConfig::MAX_BUFFERED_ENTRIES);
   }
 
   /// Durations are humantime TEXT in both directions.
@@ -789,6 +871,27 @@ mod clap_face {
         .config
         .max_buffered(),
       1
+    );
+  }
+
+  /// And the ceiling, at the same flag: a cap past it is refused where the number
+  /// is written rather than at the settle buffer it would grow without bound.
+  #[test]
+  fn an_out_of_range_buffered_cap_flag_is_refused() {
+    let err = DebounceCli::try_parse_from(args(&["--max-buffered", "18446744073709551615"]))
+      .err()
+      .expect("a cap above its ceiling is refused");
+    assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+
+    // The ceiling itself parses.
+    assert_eq!(
+      DebounceCli::parse_from(args(&[
+        "--max-buffered",
+        &DebounceConfig::MAX_BUFFERED_ENTRIES.to_string(),
+      ]))
+      .config
+      .max_buffered(),
+      DebounceConfig::MAX_BUFFERED_ENTRIES
     );
   }
 
