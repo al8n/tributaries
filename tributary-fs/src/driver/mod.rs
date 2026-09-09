@@ -905,6 +905,18 @@ pub(crate) struct CookieDir {
   /// Every `openat`/`unlinkat` runs against this, never against `path`.
   #[cfg(any(target_os = "linux", target_os = "macos"))]
   fd: std::os::fd::OwnedFd,
+  /// Whether THIS call bound the reserved name — the `mkdirat` succeeded — rather
+  /// than finding the object the admission had already judged standing at it.
+  ///
+  /// It is carried OUT of the create because the proof the created arm owes
+  /// cannot be taken inside it: what that arm has to establish is that the
+  /// directory holds nothing the marker could be ordered behind, and the marker
+  /// does not exist yet ([`dir_holds_only`], and the arm's own paragraph in
+  /// [`open_or_create`](Self::open_or_create)). The write takes that reading once
+  /// the create has landed, and this is what tells it which of the two arms it is
+  /// holding.
+  #[cfg(any(target_os = "linux", target_os = "macos"))]
+  minted: bool,
   /// The handle the directory's own CREATE returned, held open for as long as
   /// any cookie created through it is outstanding — the Unix descriptor's
   /// lifetime, on a platform with no `openat` to spend it on.
@@ -1382,6 +1394,31 @@ thread_local! {
     const { std::cell::RefCell::new(None) };
 }
 
+#[cfg(all(
+  test,
+  feature = "tokio",
+  not(miri),
+  any(target_os = "linux", target_os = "macos")
+))]
+thread_local! {
+  /// A seam between the reserved directory this write ended holding and the
+  /// marker's own create, called once per write.
+  ///
+  /// The window it exposes is the one the created arm cannot close by reading the
+  /// directory earlier: the descriptor is taken, the reserved leaf is one every
+  /// peer under the tree predicts, and nothing of the write is inside it yet. A
+  /// same-uid writer that drops an entry in right here leaves a change older than
+  /// the marker that no queue of this scope reported, and staging that
+  /// deterministically means acting between those two points, which nothing
+  /// outside the write can do.
+  ///
+  /// Thread-local, so parallel cells cannot see each other's peer; production
+  /// compiles no call to it at all. Its cfg is exactly the union of the cells that
+  /// arm it (the real-filesystem identity module).
+  pub(crate) static COOKIE_MARKER_STEP: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+    const { std::cell::RefCell::new(None) };
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl CookieParent {
   /// Walks from the VERIFIED root down to `dir`, one pinned `openat` per
@@ -1627,7 +1664,7 @@ fn open_dir_no_follow(path: &Path) -> Result<std::fs::File, std::io::Error> {
 /// whatever the name resolved to at that instant, and a write whose own
 /// resolution lands somewhere else is refused by the comparison rather than
 /// admitted by it.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
 fn open_dir_pin(path: &Path) -> Result<std::fs::File, std::io::Error> {
   use std::os::unix::fs::OpenOptionsExt;
 
@@ -1716,19 +1753,31 @@ fn errno_slot() -> *mut libc::c_int {
   }
 }
 
-/// Whether the directory `fd` refers to holds nothing but `.` and `..`.
+/// Whether the only non-dot entry the directory `fd` refers to holds is
+/// `marker`.
 ///
 /// Read through the DESCRIPTOR, never through a name: this is a statement about
-/// the object a marker is about to be created in, and a name would only describe
-/// whatever stands at that spelling when the read is taken.
+/// the object the marker was created in, and a name would only describe whatever
+/// stands at that spelling when the read is taken.
 ///
-/// It is what the create arm of [`CookieDir::open_or_create`] proves in place of
-/// an identity it has nothing to compare against. Emptiness is not "this is the
-/// object I made"; it is the property that makes the difference harmless — a
-/// directory holding nothing holds no change the marker's create could be
-/// enumerated ahead of.
+/// It is what the created arm of [`CookieDir::open_or_create`] proves in place of
+/// an identity it has nothing to compare against, and it is taken ONCE THE MARKER
+/// EXISTS, which is the only instant from which the answer covers the whole
+/// window. A reading taken before the create says the directory held nothing
+/// THEN, and nothing at all about what landed between that reading and the
+/// create: the reserved leaf is one every peer under the tree can predict, so a
+/// same-uid writer that inserts an entry in exactly that window leaves a change
+/// older than the marker that no queue of this scope reported — and a cold
+/// enumeration of the new directory may answer the marker before it, which is
+/// the ordering a barrier must never certify. Taken after, the same read refuses
+/// that directory: the stranger is there to be found.
+///
+/// The marker itself is expected to be found, this write having created it under
+/// a name nobody else could bind and held the directory open ever since, so its
+/// ABSENCE is as much an anomaly as a stranger's entry and is answered the same
+/// way.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn dir_is_empty(fd: &std::os::fd::OwnedFd) -> Result<bool, std::io::Error> {
+fn dir_holds_only(fd: &std::os::fd::OwnedFd, marker: &str) -> Result<bool, std::io::Error> {
   use std::os::fd::IntoRawFd;
 
   // `fdopendir` takes OWNERSHIP of the descriptor it is given and `closedir`
@@ -1749,7 +1798,8 @@ fn dir_is_empty(fd: &std::os::fd::OwnedFd) -> Result<bool, std::io::Error> {
     unsafe { libc::close(duplicate) };
     return Err(failure);
   }
-  let mut empty = true;
+  let mut marker_found = false;
+  let mut stranger = false;
   let mut failure = None;
   loop {
     // SAFETY: the slot is this thread's own `errno` location, valid for the
@@ -1772,17 +1822,23 @@ fn dir_is_empty(fd: &std::os::fd::OwnedFd) -> Result<bool, std::io::Error> {
     // entry, and it is read before any such call is made.
     let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
     let name = name.to_bytes();
-    if name != b"." && name != b".." {
-      empty = false;
-      break;
+    if name == b"." || name == b".." {
+      continue;
     }
+    if name == marker.as_bytes() {
+      marker_found = true;
+      continue;
+    }
+    // One stranger is the whole answer, so the walk stops at the first.
+    stranger = true;
+    break;
   }
   // SAFETY: `dir` is the live `DIR` this frame owns and is not used again; the
   // descriptor it took over is closed with it.
   unsafe { libc::closedir(dir) };
   match failure {
     Some(err) => Err(err),
-    None => Ok(empty),
+    None => Ok(marker_found && !stranger),
   }
 }
 
@@ -1815,11 +1871,13 @@ enum CookieDirRefusal {
   /// The create, the open, or one of the descriptor reads failed.
   Io(std::io::Error),
   /// The directory the open reached is not one a marker may be placed in: it
-  /// stood at the reserved name and is not the object the admission judged
-  /// (replaced after the cut, or appeared after it), or this write created the
-  /// name and what the open reached HOLDS something — an object exchanged for the
-  /// one the create made, carrying changes no queue of this scope reported.
-  /// Carries the name it stands at.
+  /// stood at the reserved name and is not the object the admission judged —
+  /// replaced after the cut, or appeared after it. Carries the name it stands at.
+  ///
+  /// The CREATED arm answers no verdict of its own here: what it owes is a
+  /// statement about a marker that does not exist yet, so its refusal is taken by
+  /// the write once the create has landed and is spelled the same way there (see
+  /// [`minted_dir_holds_only_marker`]).
   #[cfg_attr(
     not(any(target_os = "linux", target_os = "macos")),
     allow(
@@ -1886,14 +1944,23 @@ impl CookieDir {
   ///   directory, and there is no earlier object for it to be a replacement OF —
   ///   but there is no admitted reading to prove the descriptor against either,
   ///   the admission having read the name as free. What the write can prove is the
-  ///   one property the ordering rests on: the directory it is about to write into
-  ///   HOLDS NOTHING. A directory a peer exchanged in is refused exactly when it
-  ///   carries the descendants that make it dangerous — changes older than the
-  ///   marker that no queue of this scope reported, which a cold enumeration could
-  ///   order behind it — and a directory that holds nothing has no such change to
-  ///   order. The emptiness is read through the descriptor itself
-  ///   ([`dir_is_empty`]), so it describes the object the marker will go into and
-  ///   not whatever the name denotes.
+  ///   one property the ordering rests on: that once the marker exists, it is the
+  ///   ONLY thing the directory holds. A directory a peer exchanged in is refused
+  ///   exactly when it carries the entries that make it dangerous — changes older
+  ///   than the marker that no queue of this scope reported, which a cold
+  ///   enumeration could order behind it — and a directory holding nothing else
+  ///   has no such change to order.
+  ///
+  ///   That reading is NOT taken here, and taking it here is what makes it prove
+  ///   nothing: it would describe what the directory held BEFORE the marker's
+  ///   create, and the reserved leaf is one every peer under the tree predicts
+  ///   exactly, so a same-uid writer needs only the window between the reading and
+  ///   the create to insert an entry the reading never saw. So this arm hands the
+  ///   descriptor back with [`minted`](Self::minted) set, the write creates the
+  ///   marker, and the enumeration is taken THROUGH THIS DESCRIPTOR afterwards
+  ///   ([`dir_holds_only`]) — accepting only if that exact marker is the sole
+  ///   non-dot entry, and otherwise withdrawing it again ([`withdraw_marker`]) so
+  ///   nothing of the write is left on disk.
   ///
   /// A directory reached on EITHER arm must live on the PARENT's own device. A
   /// mount standing at the reserved name is ground the crawl does not descend
@@ -1946,16 +2013,12 @@ impl CookieDir {
     // The object this descriptor holds, read off the descriptor itself — the same
     // reading, of the same shape, the admission took at this name.
     let standing = RootIdentity::new(meta.dev(), meta.ino().into());
-    if minted {
-      // Nothing to compare the created object against, so the property the
-      // ordering actually needs is proven directly. A failure to READ it is
-      // fail-closed for the reason every unreadable fact here is: a write that
-      // cannot say what the directory holds cannot say the marker is the youngest
-      // thing in it.
-      if !dir_is_empty(&opened)? {
-        return Err(CookieDirRefusal::Replaced(path));
-      }
-    } else if admitted != Some(standing) {
+    // A directory this write did not make is judged against the object the
+    // admission is holding. One it DID make has no earlier object to be judged
+    // against, and owes instead the enumeration the write takes once its marker
+    // exists — which is why the arm is carried out of here rather than answered
+    // here (see the arms above).
+    if !minted && admitted != Some(standing) {
       return Err(CookieDirRefusal::Replaced(path));
     }
     // The parent's device, off the identity the walk already read for the
@@ -1989,7 +2052,11 @@ impl CookieDir {
         .into(),
       );
     }
-    Ok(Self { path, fd: opened })
+    Ok(Self {
+      path,
+      fd: opened,
+      minted,
+    })
   }
 
   /// Creates `name` inside this directory and returns the descriptor the create
@@ -7005,6 +7072,107 @@ fn cookie_dir<'a>(root: &Path, dir: &'a Path) -> &'a Path {
   }
 }
 
+/// The watcher-wide allowance every admission pin is opened under — the bound on
+/// how many syncs may be HOLDING descriptors at once.
+///
+/// The door opens up to three directories per call ([`AdmittedDirs`]) on the
+/// caller's own thread, before the command carrying them can reach the driver.
+/// Nothing downstream bounds that: the driver's caps are counted when it READS a
+/// command, and a caller may poll thousands of `sync_root` futures together
+/// before the driver gets a turn — each of them holding its pins while its send
+/// waits behind a sixteen-deep mailbox. That reaches `EMFILE` before a single cap
+/// is consulted, and takes the process's unrelated I/O down with it.
+///
+/// So admission is bounded BEFORE anything is opened. A permit is taken first and
+/// then travels inside the sampling it authorized, which makes it a bound on
+/// DESCRIPTORS rather than on calls: it is released exactly when the pins close —
+/// when the write, the refusal or the retirement drops the obligation, or when a
+/// caller drops its future before the send.
+///
+/// It is sized by the ledger's own global cookie cap, which already bounds how
+/// many syncs one watcher may have outstanding, so the two agree by construction:
+/// pins in flight ≤ 3 × cap. A door that has to wait for a slot is a door under
+/// exactly the pressure that cap describes, and waiting is what a caller can act
+/// on — its own timeout, or dropping the future — where an exhausted descriptor
+/// table is not.
+///
+/// A permit is a message occupying a slot of a bounded channel: acquiring one is
+/// an ordinary cancellation-safe await (a dropped acquire has taken no slot),
+/// and releasing one is a `try_recv` of the token this permit itself put there.
+///
+/// The receiving half is behind an `Arc` for the reason the watcher's event
+/// stream is behind a `Pin<Box<_>>`: a channel receiver embeds a pinned listener
+/// and is therefore not `Unpin`, and a `Watcher` that held one directly would not
+/// be either. The `Arc` is what a permit carries anyway — one allowance, shared
+/// by every clone of one watcher and by every permit outstanding against it.
+#[derive(Debug, Clone)]
+pub(crate) struct SyncPinAllowance {
+  taken: async_channel::Sender<()>,
+  freed: Arc<async_channel::Receiver<()>>,
+}
+
+impl SyncPinAllowance {
+  /// An allowance of `permits` concurrent samplings. A zero would be a door that
+  /// admits nothing, so the floor is one — the caps this is sized from are
+  /// validated elsewhere and never zero, which makes this a fail-closed
+  /// invariant rather than a knob.
+  pub(crate) fn new(permits: usize) -> Self {
+    let (taken, freed) = async_channel::bounded(permits.max(1));
+    Self {
+      taken,
+      freed: Arc::new(freed),
+    }
+  }
+
+  /// Waits for a slot and takes it.
+  ///
+  /// This value holds BOTH ends of the channel, so it cannot be closed while the
+  /// borrow lasts: the send resolves by occupying a slot or not at all.
+  pub(crate) async fn acquire(&self) -> SyncPinPermit {
+    let _ = self.taken.send(()).await;
+    SyncPinPermit {
+      freed: Arc::clone(&self.freed),
+    }
+  }
+
+  /// A permit taken WITHOUT waiting, against an allowance of its own — for the
+  /// cells that sample an admission directly, with no door in front of them to
+  /// take one from. The slot is free by construction: the allowance is fresh and
+  /// nothing else can reach it.
+  ///
+  /// Its cfg is exactly the union of the modules that call it (the real-filesystem
+  /// directory-only, identity and Windows non-adoption cells).
+  #[cfg(all(
+    test,
+    feature = "tokio",
+    not(miri),
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+  ))]
+  pub(crate) fn permit() -> SyncPinPermit {
+    let allowance = Self::new(1);
+    let _ = allowance.taken.try_send(());
+    SyncPinPermit {
+      freed: allowance.freed,
+    }
+  }
+}
+
+/// One slot of a [`SyncPinAllowance`], held for exactly as long as the pins it
+/// authorized ([`AdmittedDirs`] carries it, and drops it with them).
+#[derive(Debug)]
+pub(crate) struct SyncPinPermit {
+  freed: Arc<async_channel::Receiver<()>>,
+}
+
+impl Drop for SyncPinPermit {
+  fn drop(&mut self) {
+    // The slot this permit occupies. Every permit put exactly one token in, so a
+    // queue with none left is one whose channel has already been closed — there
+    // is no allowance left for anything to wait on.
+    let _ = self.freed.try_recv();
+  }
+}
+
 /// One directory the admission door judged — and, where the platform can hold an
 /// object, the descriptor that keeps it from becoming a different one.
 ///
@@ -7030,6 +7198,13 @@ fn cookie_dir<'a>(root: &Path, dir: &'a Path) -> &'a Path {
 /// before — the comparison narrows there what it always narrowed, and no more.
 /// (Windows' cookie path is fenced as a whole,
 /// <https://github.com/al8n/tributaries/issues/134>.)
+///
+/// UNDER MIRI the tuple is what EVERY platform keeps, the two that can hold an
+/// object included: the interpreter implements no `O_DIRECTORY` open, so a door
+/// that insisted on holding one would abort the run rather than sample anything.
+/// An interpreter that cannot open a directory still proves what it can — the
+/// same `(dev, ino)` reading this type kept before it began holding objects, with
+/// the same meaning and the same stated weakness.
 #[derive(Debug, Default)]
 pub(crate) struct AdmittedDir {
   /// The descriptor the door opened, held until the admission record is dropped.
@@ -7037,14 +7212,14 @@ pub(crate) struct AdmittedDir {
   /// `None` is a definite absence and is read as one: nothing answered at that
   /// name when the sync was admitted, or the open failed — and either way there
   /// is no object here for a later reading to be equal to.
-  #[cfg(any(target_os = "linux", target_os = "macos"))]
+  #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
   pin: Option<std::os::fd::OwnedFd>,
   /// The identity the door read where nothing can be held open for it.
-  #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+  #[cfg(not(all(any(target_os = "linux", target_os = "macos"), not(miri))))]
   identity: Option<RootIdentity>,
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
 impl AdmittedDir {
   /// The object the door is HOLDING, read off that descriptor now.
   ///
@@ -7064,7 +7239,7 @@ impl AdmittedDir {
   }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(all(any(target_os = "linux", target_os = "macos"), not(miri))))]
 impl AdmittedDir {
   /// The identity the door read, unchanged — there is no descriptor here to
   /// re-read it from.
@@ -7104,40 +7279,66 @@ impl AdmittedDir {
 /// One open on the caller's own thread, in the [`watch`](crate::Watcher::watch)
 /// door's mold — never on the driver's owner loop, which must not resolve a
 /// pathname against a mount that can hang.
-pub(crate) fn cookie_target_identity(root: &Path, dir: &Path) -> AdmittedDir {
-  #[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn cookie_target_identity(
+  root: &Path,
+  dir: &Path,
+) -> Result<AdmittedDir, std::io::Error> {
+  #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
   {
-    AdmittedDir {
-      pin: open_dir_pin(cookie_dir(root, dir))
-        .ok()
-        .map(std::os::fd::OwnedFd::from),
-    }
+    Ok(AdmittedDir {
+      pin: definite_pin(open_dir_pin(cookie_dir(root, dir)))?,
+    })
   }
-  #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+  #[cfg(all(
+    unix,
+    not(all(any(target_os = "linux", target_os = "macos"), not(miri)))
+  ))]
   {
     use std::os::unix::fs::MetadataExt;
 
-    AdmittedDir {
+    Ok(AdmittedDir {
       identity: std::fs::metadata(cookie_dir(root, dir))
         .ok()
         .map(|meta| RootIdentity::new(meta.dev(), meta.ino().into())),
-    }
+    })
   }
   // No `Metadata` on this platform answers a file id, so the identity comes off an
   // OPEN handle — the same read, through the same sentinel filtering, that the
   // write's own descriptor gets ([`identity_of_handle`]).
   #[cfg(all(target_os = "windows", not(miri)))]
   {
-    AdmittedDir {
+    Ok(AdmittedDir {
       identity: open_root_object(cookie_dir(root, dir))
         .ok()
         .and_then(|opened| identity_of_handle(&opened).ok().flatten()),
-    }
+    })
   }
   #[cfg(not(any(unix, all(target_os = "windows", not(miri)))))]
   {
     let _ = (root, dir);
-    AdmittedDir::default()
+    Ok(AdmittedDir::default())
+  }
+}
+
+/// The pin the door took, or the definite ABSENCE a missing name is.
+///
+/// The two used to be one answer, and they are not one fact. `None` here MEANS
+/// "no directory answered at this name when the sync was admitted", a reading the
+/// write depends on and reasons from; a descriptor table that is full, a
+/// directory this process may not open, and a name that is not a directory at all
+/// are failures to READ, and reporting one of those as an absence hides the
+/// failure behind a verdict about the tree — which is exactly how a door that
+/// runs out of descriptors goes on opening more. So only `NotFound` is an
+/// absence, and every other error goes back to the door, which refuses that one
+/// sync instead of flooding on.
+#[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+fn definite_pin(
+  opened: Result<std::fs::File, std::io::Error>,
+) -> Result<Option<std::os::fd::OwnedFd>, std::io::Error> {
+  match opened {
+    Ok(pin) => Ok(Some(std::os::fd::OwnedFd::from(pin))),
+    Err(absent) if absent.kind() == std::io::ErrorKind::NotFound => Ok(None),
+    Err(failed) => Err(failed),
   }
 }
 
@@ -7158,8 +7359,9 @@ pub(crate) fn cookie_target_identity(root: &Path, dir: &Path) -> AdmittedDir {
 /// keep a stable reserved name: nothing stood there when the sync was admitted.
 /// That is not the harmless case it looks like — a directory that then EXISTS at
 /// write time is one that appeared after the cut, so the write must have created
-/// it itself — and prove that what it then opened holds nothing — or refuse (see
-/// [`CookieDir::open_or_create`]). It is also what every other platform answers:
+/// it itself — and prove, once its marker is on disk, that the marker is the only
+/// thing that directory holds — or refuse (see [`CookieDir::open_or_create`] and
+/// [`minted_dir_holds_only_marker`]). It is also what every other platform answers:
 /// Windows mints a fresh directory per obligation inside the call that creates
 /// it, so there is no name to sample in advance, and its cookie path is fenced as
 /// a whole (<https://github.com/al8n/tributaries/issues/134>).
@@ -7167,19 +7369,19 @@ pub(crate) fn cookie_target_identity(root: &Path, dir: &Path) -> AdmittedDir {
 /// The open refuses a symlink at that last component, because the write's own
 /// `openat` of this name does: a name the write can only fail on is a name the
 /// door has no object to hold at.
-fn reserved_cookie_dir_identity(root: &Path, dir: &Path) -> AdmittedDir {
-  #[cfg(any(target_os = "linux", target_os = "macos"))]
+fn reserved_cookie_dir_identity(root: &Path, dir: &Path) -> Result<AdmittedDir, std::io::Error> {
+  #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
   {
-    AdmittedDir {
-      pin: open_dir_no_follow(&cookie_dir(root, dir).join(cookie_dir_name()))
-        .ok()
-        .map(std::os::fd::OwnedFd::from),
-    }
+    Ok(AdmittedDir {
+      pin: definite_pin(open_dir_no_follow(
+        &cookie_dir(root, dir).join(cookie_dir_name()),
+      ))?,
+    })
   }
-  #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+  #[cfg(not(all(any(target_os = "linux", target_os = "macos"), not(miri))))]
   {
     let _ = (root, dir);
-    AdmittedDir::default()
+    Ok(AdmittedDir::default())
   }
 }
 
@@ -7196,19 +7398,17 @@ fn reserved_cookie_dir_identity(root: &Path, dir: &Path) -> AdmittedDir {
 /// The open refuses a symlink at the last component, exactly as
 /// [`open_root_object`] does — the door and the write must be holding the same
 /// kind of thing or the lifetime proves nothing about what the write reached.
-fn watched_root_identity(root: &Path) -> AdmittedDir {
-  #[cfg(any(target_os = "linux", target_os = "macos"))]
+fn watched_root_identity(root: &Path) -> Result<AdmittedDir, std::io::Error> {
+  #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
   {
-    AdmittedDir {
-      pin: open_dir_no_follow(root)
-        .ok()
-        .map(std::os::fd::OwnedFd::from),
-    }
+    Ok(AdmittedDir {
+      pin: definite_pin(open_dir_no_follow(root))?,
+    })
   }
-  #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+  #[cfg(not(all(any(target_os = "linux", target_os = "macos"), not(miri))))]
   {
     let _ = root;
-    AdmittedDir::default()
+    Ok(AdmittedDir::default())
   }
 }
 
@@ -7238,17 +7438,50 @@ pub(crate) struct AdmittedDirs {
   root: AdmittedDir,
   target: AdmittedDir,
   cookies: AdmittedDir,
+  /// The door's allowance slot this sampling was taken under, released when the
+  /// pins are ([`SyncPinAllowance`]).
+  ///
+  /// It rides HERE rather than beside the future that took it because what has
+  /// to be bounded is the descriptors, and these are the descriptors: a sampling
+  /// that reached the driver keeps its slot until the obligation carrying it
+  /// writes, refuses or retires, and one whose caller dropped the future before
+  /// the send gives its slot back with the pins it opened. `None` is a sampling
+  /// that holds nothing at all — the default the driver's own suites admit
+  /// through, and every platform that pins no object.
+  #[expect(
+    dead_code,
+    reason = "the slot is HELD, never read: dropping this field is what gives it back"
+  )]
+  permit: Option<SyncPinPermit>,
 }
 
 impl AdmittedDirs {
   /// Samples — and holds — all three directories for a sync of `dir` under
-  /// `root`.
-  pub(crate) fn read(root: &Path, dir: &Path) -> Self {
-    Self {
-      root: watched_root_identity(root),
-      target: cookie_target_identity(root, dir),
-      cookies: reserved_cookie_dir_identity(root, dir),
-    }
+  /// `root`, under the `permit` that bounds how many such samplings may be held
+  /// at once.
+  ///
+  /// The permit is acquired by the DOOR, before this is called, and then travels
+  /// inside the value it authorized: nothing opens a descriptor here that the
+  /// allowance has not already made room for, and the room is given back with the
+  /// descriptors and never before them.
+  ///
+  /// A pin that could not be opened is one of two different facts and is reported
+  /// as the one it is ([`definite_pin`]): a name nothing answered at is a definite
+  /// ABSENCE, which each sampler's own doc gives the meaning of, while any other
+  /// failure — a full descriptor table above all — is returned, so the door
+  /// refuses this sync rather than reporting an absence it never read and opening
+  /// more.
+  pub(crate) fn read(
+    permit: SyncPinPermit,
+    root: &Path,
+    dir: &Path,
+  ) -> Result<Self, std::io::Error> {
+    Ok(Self {
+      root: watched_root_identity(root)?,
+      target: cookie_target_identity(root, dir)?,
+      cookies: reserved_cookie_dir_identity(root, dir)?,
+      permit: Some(permit),
+    })
   }
 
   /// The watched root, as the door held it.
@@ -7651,6 +7884,57 @@ fn current_cookie_dir_path(dir: &CookieDir) -> Option<Result<PathBuf, std::io::E
   None
 }
 
+/// Whether the directory this write's marker now stands in holds NOTHING BUT
+/// that marker — the proof the created arm of [`CookieDir::open_or_create`] owes,
+/// taken through the descriptor that arm handed back and only once the marker
+/// exists.
+///
+/// It is the one statement that covers the whole window. The arm bound a name
+/// every peer under the tree can predict, and between the moment it bound it and
+/// the moment the marker exists a same-uid writer may insert whatever it likes;
+/// a reading taken any earlier describes the directory before that insertion and
+/// says nothing about it. Taken here, the stranger is there to be found — and
+/// what it is measured against is the marker's own leaf rather than emptiness,
+/// because by now the directory is not empty: this write's marker is in it.
+///
+/// What it costs, stated rather than argued away: the answer is about the whole
+/// directory, so a SECOND same-uid watcher — another process, or another watcher
+/// of this one — that was admitted while this directory already stood and creates
+/// its own marker inside this window is a stranger by this reading, and refuses a
+/// write that was doing nothing wrong. It is bounded on every axis. The window is
+/// one create and one enumeration wide; a driver single-flights the physical
+/// writes of its own root, so it takes a second watcher to reach at all; the
+/// refusal is the retryable, pre-birth-shaped [`DirReplaced`] with the marker
+/// withdrawn and nothing left on disk; and the retry cannot repeat it, the
+/// reserved directory now standing where the next admission reads it and the
+/// EEXIST arm answering instead. The other direction is not bounded at all: a
+/// stranger accepted is a barrier certifying an ordering nobody proved.
+///
+/// [`DirReplaced`]: crate::SyncRootError::DirReplaced
+///
+/// `None` where no such proof is owed or possible: a directory the write did not
+/// mint (that arm compares the OBJECT the admission is holding, which settles the
+/// same question outright), the Windows arm — whose cookie path is fenced as a
+/// whole (<https://github.com/al8n/tributaries/issues/134>) and whose directory is
+/// minted per obligation inside the call that creates it — and the remaining
+/// targets, which mint no cookie directory at all.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn minted_dir_holds_only_marker(
+  dir: &CookieDir,
+  name: &str,
+) -> Option<Result<bool, std::io::Error>> {
+  dir.minted.then(|| dir_holds_only(&dir.fd, name))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn minted_dir_holds_only_marker(
+  dir: &CookieDir,
+  name: &str,
+) -> Option<Result<bool, std::io::Error>> {
+  let _ = (dir, name);
+  None
+}
+
 impl FsOps for RealFs {
   type Handle = SourceHandle;
 
@@ -7909,9 +8193,61 @@ impl FsOps for RealFs {
     // non-empty directory, and — under `clean` — frees the cap slot, so every
     // repeat leaves another permanent reserved directory with nothing bounding
     // them.
+    #[cfg(all(
+      test,
+      feature = "tokio",
+      not(miri),
+      any(target_os = "linux", target_os = "macos")
+    ))]
+    COOKIE_MARKER_STEP.with_borrow_mut(|peer| {
+      if let Some(peer) = peer.as_mut() {
+        peer();
+      }
+    });
     let created = cookies
       .create(name)
       .map_err(|err| post_mint_failure(&cookies, name, err))?;
+    // The proof the CREATED arm owes, discharged here because here is the first
+    // instant at which it proves anything ([`minted_dir_holds_only_marker`], and
+    // the arm's own paragraph in [`CookieDir::open_or_create`]). A directory this
+    // write minted has no admitted reading to be compared against, so what stands
+    // in for one is that the marker is the only thing in it: any other entry is a
+    // change older than the marker that no queue of this scope reported, which a
+    // cold enumeration may answer BEFORE the marker's own create, and a barrier
+    // resolving on that certifies an ordering nobody proved.
+    //
+    // Taking it before the create — where it used to be taken — leaves exactly the
+    // window it was meant to close: the reserved leaf is one every peer under the
+    // tree predicts, so a same-uid writer that inserts an entry between the
+    // reading and the create is never seen at all.
+    //
+    // A refusal here WITHDRAWS the marker through the anchors that created it, so
+    // the typed verdict is again a true statement about a filesystem this write
+    // left as it found it. `DirReplaced` is the honest one: the directory the
+    // marker ended up in is not an object the cut can certify. A failure to READ
+    // the directory is fail-closed for the reason every unreadable fact here is —
+    // a write that cannot say what the directory holds cannot say the marker is
+    // the youngest thing in it.
+    match minted_dir_holds_only_marker(&cookies, name) {
+      Some(Ok(true)) | None => {}
+      Some(Ok(false)) => {
+        let landing = cookies.path().to_path_buf();
+        return Err(withdraw_marker(
+          cookies,
+          name,
+          created,
+          CookieWriteError::replaced(landing),
+        ));
+      }
+      Some(Err(err)) => {
+        return Err(withdraw_marker(
+          cookies,
+          name,
+          created,
+          CookieWriteError::clean(err),
+        ));
+      }
+    }
     // The verdict again, RE-TAKEN on the ground the marker now actually stands on
     // ([`current_cookie_dir_path`]).
     //
@@ -8514,23 +8850,25 @@ fn destroy_unidentified(
 /// Withdraws a marker the seat closed the ground under, and answers the refusal
 /// that closed it.
 ///
-/// The create landed, and then the ground it landed on turned out to be ground no
+/// The create landed, and then the object or the ground it landed on turned out
+/// to be one no barrier may rest on: a directory this write minted that holds
+/// something besides the marker ([`minted_dir_holds_only_marker`]), or ground no
 /// delivery can come off ([`cookie_ground_refusal`], re-taken after the create).
 /// Leaving the marker there and reporting the refusal would leave a file nobody
-/// records; reporting success would hand the barrier an event the fence eats. So
-/// the marker is destroyed first, through the same anchors every other removal
-/// uses — an entry of the directory the create was made through, no path resolved
-/// — and the refusal is returned only once nothing of this write is on disk, which
-/// is what makes the typed verdicts' `clean` claim true again.
+/// records; reporting success would hand the barrier an event no consumer can
+/// trust. So the marker is destroyed first, through the same anchors every other
+/// removal uses — an entry of the directory the create was made through, no path
+/// resolved — and the refusal is returned only once nothing of this write is on
+/// disk, which is what makes the typed verdicts' `clean` claim true again.
 ///
 /// A destroy that FAILS leaves the file, so the refusal it answers with is the
 /// residue-carrying one instead: the marker comes back as an owned, counted,
 /// retried obligation exactly as [`destroy_unidentified`] hands one back, keeping
 /// the create's descriptor so the record's identity can still be promoted. The
-/// typed `pruned`/`excluded` verdict is dropped there deliberately — the caller
-/// reads those two fields BEFORE the residue, so a value carrying both would
-/// report the seat refusal and drop the file on the floor — and the refusal's own
-/// message rides the residue's `source`.
+/// typed verdict is dropped there deliberately — the caller reads those fields
+/// BEFORE the residue, so a value carrying both would report the refusal and drop
+/// the file on the floor — and the refusal's own message rides the residue's
+/// `source`.
 ///
 /// It is the platforms whose cookie directory is SHARED that reach this, and the
 /// destroy-succeeded arm relies on it: where a directory is a per-obligation debt,

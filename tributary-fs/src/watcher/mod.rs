@@ -285,7 +285,9 @@ impl SyncAdmission {
 /// a same-sequence retry.
 ///
 /// `admission` is `Some` **iff** the refusal is provably PRE-BIRTH: a synchronous
-/// door refusal, or a driver refusal raised before the sync was admitted
+/// door refusal — except the door's own pin failure, which is spelled
+/// [`Write`](SyncRootError::Write) and is classified with the rest of that
+/// variant — or a driver refusal raised before the sync was admitted
 /// ([`WriteInFlight`](SyncRootError::WriteInFlight),
 /// [`NameInUse`](SyncRootError::NameInUse),
 /// [`TicketInUse`](SyncRootError::TicketInUse),
@@ -324,7 +326,10 @@ impl SyncRootDenied {
   /// so a future refusal is fail-safe — an unnecessary re-mint, never a reused
   /// sequence. Post-birth by construction and therefore deliberately absent from
   /// the returned set: `Write` (admitted, then retired before the reply — the
-  /// sequence is burned), `DirPruned` (the same shape: the verdict needs the canonical
+  /// sequence is burned; the DOOR's own pin failure creates nothing and could have
+  /// kept its sequence, but it wears the same variant, and one variant gets one
+  /// classification — the fail-safe direction of an unnecessary re-mint),
+  /// `DirPruned` (the same shape: the verdict needs the canonical
   /// directory only the write can resolve, so it too is admitted and then retired),
   /// `DirExcluded` (refused at the admission for the caller's SPELLING and again at
   /// the write for the directory that spelling resolved to — the caller cannot tell
@@ -1046,6 +1051,17 @@ pub struct Watcher<R> {
   /// the sequence is behind an `Arc`: clones of one watcher must draw from ONE
   /// stream, never from two copies that would publish the same words twice.
   nonces: Option<Arc<Mutex<ChaCha20Rng>>>,
+  /// The bound on the descriptors the sync door may be HOLDING at once
+  /// ([`SyncPinAllowance`](crate::driver::SyncPinAllowance)). Every
+  /// [`sync_root`](Self::sync_root) takes a slot of it before it opens the pins
+  /// its admission is judged on, and the slot travels with those pins, so a
+  /// caller that polls a flood of syncs together waits at this door instead of
+  /// exhausting the process's descriptor table on the way to one that counts
+  /// them.
+  ///
+  /// Shared across clones of one watcher, like the mint above: the bound belongs
+  /// to the watcher, not to a handle.
+  pins: crate::driver::SyncPinAllowance,
   events: EventStream,
   roots: Arc<RwLock<RootSet>>,
   // `fn() -> R`, not `R`: the watcher holds no runtime value, so its auto
@@ -1093,6 +1109,10 @@ impl<R: RuntimeLite> Watcher<R> {
     ops: impl crate::driver::FsOps,
   ) -> Result<Self, BuildError> {
     let (command_tx, command_rx) = async_channel::bounded(16);
+    // The sync door's descriptor bound, sized by the ledger cap that already
+    // bounds how many syncs this watcher may have outstanding — read before the
+    // config is handed to the task, which owns it from there on.
+    let pins = crate::driver::SyncPinAllowance::new(config.cookie_global_cap);
     // The cookie-cleanup ingress: ONE ledger, minted HERE and shared between this
     // handle and the driver task below, because a public cleanup request must
     // address the very records that driver admits. Its two halves are created
@@ -1120,10 +1140,35 @@ impl<R: RuntimeLite> Watcher<R> {
       cleanup,
       sync_tickets: Arc::new(AtomicU64::new(1)),
       nonces: sync_nonce_generator().map(|generator| Arc::new(Mutex::new(generator))),
+      pins,
       events: Box::pin(event_rx),
       roots,
       _runtime: PhantomData,
     })
+  }
+
+  /// A watcher over a fake platform whose global cookie cap — the ledger's bound,
+  /// and the size of the sync door's descriptor allowance — is the cell's to
+  /// choose. What those cells stage is the door's bound itself, and the
+  /// production one is far too wide to stand a flood against.
+  ///
+  /// Its cfg is exactly the union of the cells that call it (the
+  /// real-filesystem identity module).
+  #[cfg(all(
+    test,
+    feature = "tokio",
+    not(miri),
+    any(target_os = "linux", target_os = "macos")
+  ))]
+  pub(crate) fn new_with_cookie_cap(
+    options: WatcherOptions,
+    ops: impl crate::driver::FsOps,
+    cookie_global_cap: usize,
+  ) -> Result<Self, BuildError> {
+    options.validate()?;
+    let mut config = driver_config(&options, crate::os::BackendKind::FsEvents);
+    config.cookie_global_cap = cookie_global_cap;
+    Self::spawn_with(options, config, ops)
   }
 
   /// A watcher over a fake platform, for hermetic lifecycle tests.
@@ -1727,16 +1772,21 @@ impl<R> Watcher<R> {
   /// directory the create just bound for one it prepared — same owner, same mode,
   /// descendants already inside it. Ownership and mode cannot tell those apart. So
   /// the create arm proves the property the ordering actually rests on instead:
-  /// the directory the marker is about to be born in HOLDS NOTHING, read through
-  /// the descriptor the write is holding. A prepared directory is refused exactly
-  /// when it carries what makes it dangerous — changes older than the marker that
-  /// no queue of this scope reported, which a cold enumeration could order behind
-  /// it — and a directory holding nothing has no such change to order. The
-  /// residual is stated plainly: an EMPTY directory exchanged into the reserved
-  /// name during the create IS entered — its emptiness is exactly what the proof
-  /// needs — so a marker written into it may, under a descending backend whose
-  /// coverage was never armed on that object, wait out its caller's timeout
-  /// rather than resolve; no ordering is ever falsely certified by it.
+  /// once the marker exists, it is the ONLY thing the directory holds — enumerated
+  /// through the descriptor the write is holding, AFTER the create rather than
+  /// before it. Before it, the reading would describe the directory as it was and
+  /// leave a peer the whole window up to the create to insert something into it;
+  /// after it, that entry is there to be found. A directory carrying what makes it
+  /// dangerous — changes older than the marker that no queue of this scope
+  /// reported, which a cold enumeration could order behind it — is refused, the
+  /// marker is destroyed again through the descriptors that created it, and the
+  /// call answers [`DirReplaced`](SyncRootError::DirReplaced) with nothing of the
+  /// write left on disk. The residual is stated plainly: a directory exchanged
+  /// into the reserved name during the create IS entered if it turns out to hold
+  /// nothing but this write's marker — that is exactly what the proof needs — so a
+  /// marker written into it may, under a descending backend whose coverage was
+  /// never armed on that object, wait out its caller's timeout rather than
+  /// resolve; no ordering is ever falsely certified by it.
   ///
   /// A directory reached either way must live on the parent's own device: a mount
   /// standing at the reserved name is ground no crawl of this root descends into,
@@ -1828,12 +1878,16 @@ impl<R> Watcher<R> {
   /// own descent reaches is not the object `dir` named at admission — a peer
   /// replaced it in the meantime, and the barrier promises an ordering for the
   /// object that was judged — or when the reserved cookie directory inside it is
-  /// not the object the admission read there;
+  /// not the object the admission read there, or is one this write created and
+  /// something besides its own marker turns out to be standing in;
   /// [`DirCrossesMount`](SyncRootError::DirCrossesMount) when a directory already
   /// standing at that reserved name lies on another device, which is ground this
   /// root's crawl never descends into;
   /// [`Write`](SyncRootError::Write) when the
-  /// create fails (a read-only tree surfaces as `PermissionDenied`);
+  /// create fails (a read-only tree surfaces as `PermissionDenied`), and when this
+  /// call cannot HOLD the directories the sync is judged against — a descriptor
+  /// table with no room left above all, which is reported rather than mistaken for
+  /// a directory that was not there;
   /// [`WriteInFlight`](SyncRootError::WriteInFlight) when a physical write for this
   /// root is already in flight;
   /// [`TicketInUse`](SyncRootError::TicketInUse) when a live sync of this watcher
@@ -1952,7 +2006,35 @@ impl<R> Watcher<R> {
     // surely. Two `stat`s on this caller's own thread, in [`watch`](Self::watch)'s
     // mold — never on the driver's owner loop, which must not resolve a pathname
     // against a mount that can hang.
-    let admitted = crate::driver::AdmittedDirs::read(&root_path, &dir);
+    //
+    // Bounded FIRST, and by the watcher rather than by the driver: the caps that
+    // bound a sync are counted when the driver READS the command below, which is
+    // far too late to bound what this thread opens. A caller may poll thousands of
+    // these futures together, and every one of them would hold its pins while its
+    // send waited behind a sixteen-deep mailbox — `EMFILE` for the whole process,
+    // reached before a single cap was consulted, with the watcher's own I/O and
+    // the application's going down with it. So a slot of the watcher's allowance
+    // is taken before any descriptor is, and it travels INSIDE the sampling: it
+    // comes back when the pins do, including when this future is dropped before
+    // the send below ([`SyncPinAllowance`](crate::driver::SyncPinAllowance)).
+    let permit = self.pins.acquire().await;
+    let admitted = match crate::driver::AdmittedDirs::read(permit, &root_path, &dir) {
+      Ok(admitted) => admitted,
+      // A pin this door could not TAKE is not a reading about the tree, and
+      // answering it as one is what hid a full descriptor table behind a verdict
+      // about a directory. It is reported as the write failure it is, carrying the
+      // OS error the caller can act on — a definite absence, by contrast, is a
+      // reading and is carried in the sampling as one.
+      Err(source) => {
+        return Err(SyncRootDenied::classify(
+          SyncRootError::Write {
+            path: dir.join(&name),
+            source,
+          },
+          admission,
+        ));
+      }
+    };
 
     // The wire is UNCHANGED: build the seq-bearing ticket the driver still keys
     // `by_ticket` on FROM the admission (a plain read of its two fields, no move),

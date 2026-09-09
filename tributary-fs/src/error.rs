@@ -357,6 +357,17 @@ pub enum SyncRootError {
   /// therefore refused with nothing created, rather than reporting a barrier that
   /// certifies an ordering nobody proved.
   ///
+  /// It also answers for the watcher's own reserved cookie directory one level
+  /// inside `dir`, on the two questions that directory raises. One standing there
+  /// must be the object the admission read; one this write CREATED must hold
+  /// nothing but this write's marker once that marker exists, because a directory
+  /// a peer exchanged in carries changes older than the marker that no queue of
+  /// this root reported. The second reading is about the whole directory, so a
+  /// second watcher of the same user that creates a marker of its own inside that
+  /// one create-and-enumerate window is refused here too — retry, and the reserved
+  /// directory now standing is read by the fresh admission and adopted on the
+  /// identity instead.
+  ///
   /// The admission's sequence is SPENT: the verdict needs the object only the
   /// write's own descriptor walk can reach, so it is taken after the sync was
   /// admitted. Re-mint through
@@ -418,6 +429,16 @@ pub enum SyncRootError {
   /// [`std::io::ErrorKind::PermissionDenied`] — the honest refusal: a tree
   /// with no writable covered location cannot support a kernel-mediated
   /// barrier at all.
+  ///
+  /// It is also what the admission door answers when it cannot HOLD the
+  /// directories a sync is judged against — a descriptor table with no room left
+  /// (`EMFILE`/`ENFILE`), a directory this process may not open, or a
+  /// non-directory standing at the watcher's reserved cookie name. That refusal
+  /// creates nothing, but a caller cannot tell it apart from the write's own
+  /// failure and neither can the classification, so its sequence is spent with
+  /// every other `Write`'s. A name nothing answers at is NOT one of these: an
+  /// absent directory is a reading the write reasons from, not a failure to take
+  /// one.
   #[error("could not write sync cookie {}: {source}", path.display())]
   Write {
     /// Where the write was aimed — `dir` joined with the cookie name. It is a

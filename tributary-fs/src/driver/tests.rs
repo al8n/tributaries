@@ -15989,7 +15989,12 @@ mod sync_cookie {
       let live = crate::driver::LiveRoot::for_tests(&parent);
       let pinned =
         CookieParent::open(live.identity(), &parent, &parent).expect("the scratch parent opens");
-      let admitted = crate::driver::AdmittedDirs::read(&parent, &parent);
+      let admitted = crate::driver::AdmittedDirs::read(
+        crate::driver::SyncPinAllowance::permit(),
+        &parent,
+        &parent,
+      )
+      .expect("the scratch parent's directories are readable");
       let dir = Arc::new(
         CookieDir::open_or_create(&pinned, admitted.cookies())
           .expect("a cookie directory is minted"),
@@ -17560,7 +17565,8 @@ mod sync_cookie {
     /// the object with it. A cell about a REPLACEMENT binds it earlier instead, at
     /// the moment its sync would have been admitted.
     fn admitted(root: &Path, dir: &Path) -> crate::driver::AdmittedDirs {
-      crate::driver::AdmittedDirs::read(root, dir)
+      crate::driver::AdmittedDirs::read(crate::driver::SyncPinAllowance::permit(), root, dir)
+        .expect("the staged directories are readable")
     }
 
     /// A cookie directory inside `parent`, reached the way a real write reaches
@@ -18129,6 +18135,149 @@ mod sync_cookie {
       let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Arms `peer` to run ONCE between the reserved directory this write ended
+    /// holding and the marker's own create, and disarms it again when the
+    /// returned guard drops.
+    ///
+    /// One shot, for [`MidMintPeer`]'s reason: the peer must act in that one
+    /// window and on no later create this cell makes.
+    struct MidMarkerPeer;
+
+    impl MidMarkerPeer {
+      fn arm(peer: impl FnOnce() + 'static) -> Self {
+        let mut peer = Some(peer);
+        crate::driver::COOKIE_MARKER_STEP.with_borrow_mut(|slot| {
+          *slot = Some(Box::new(move || {
+            if let Some(peer) = peer.take() {
+              peer();
+            }
+          }));
+        });
+        Self
+      }
+    }
+
+    impl Drop for MidMarkerPeer {
+      fn drop(&mut self) {
+        crate::driver::COOKIE_MARKER_STEP.with_borrow_mut(|slot| *slot = None);
+      }
+    }
+
+    /// Every leaf `dir` holds, sorted — what the created arm's own enumeration is
+    /// checked against from the outside.
+    fn leaves_in(dir: &Path) -> Vec<String> {
+      let mut leaves = std::fs::read_dir(dir)
+        .expect("the directory is readable")
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect::<Vec<_>>();
+      leaves.sort();
+      leaves
+    }
+
+    /// An entry a peer inserts while the reserved directory is EMPTY is found
+    /// once the marker exists, and the marker is withdrawn instead of accepted.
+    ///
+    /// This is the window a reading taken before the create cannot see. The
+    /// created arm used to prove the directory held nothing at the moment it
+    /// opened it, which is a true statement about an instant and says nothing
+    /// about the interval up to the create: the reserved leaf is
+    /// `cookie_dir_name_for` of an effective uid, so a same-uid writer predicts it
+    /// exactly, waits for it to appear, and drops a file of its own in. Both
+    /// entries then land before a descending backend arms the new directory, and
+    /// the cold enumeration that follows may answer the MARKER first — directory
+    /// order is unspecified — so a leaf-keyed barrier can resolve while the older
+    /// entry is still undelivered. Neither the mode, nor the descriptor, nor the
+    /// unpredictable marker leaf closes it: the writer owns the directory and
+    /// never has to guess that leaf.
+    ///
+    /// Moving the proof to the far side of the create closes it exactly: the
+    /// stranger is on disk by then, the enumeration finds it, and what the write
+    /// answers is the refusal that names what happened, with the marker destroyed
+    /// again through the anchors that created it.
+    ///
+    /// Real syscalls and a seam between the two creates, because what is being
+    /// staged is an entry appearing in a real directory between two real calls,
+    /// which no modelled tree can be asked and nothing outside those calls can
+    /// time.
+    ///
+    /// Revert witness: take the enumeration where it used to be — before the
+    /// marker's create — and the peer's file is invisible to it, the write
+    /// succeeds, and the marker stands beside an entry no queue of this scope
+    /// reported.
+    #[test]
+    fn an_entry_inserted_before_the_marker_is_found_after_it() {
+      let root = scratch("marker-window-insert");
+      let target = root.join("a");
+      std::fs::create_dir_all(&target).expect("the directory the sync names");
+      let fs = RealFs::new();
+      let live = crate::driver::LiveRoot::for_tests(&root);
+      let admitted_dirs = admitted(&root, &target);
+      assert!(
+        admitted_dirs.cookies().is_none(),
+        "staging: the reserved name is free when the sync is admitted"
+      );
+
+      // The peer runs with the directory bound, opened and verified, and with
+      // nothing of this write inside it yet — the instant the old reading had
+      // already passed.
+      let older = target.join(cookie_dir_name()).join("older");
+      let peer = MidMarkerPeer::arm(move || {
+        std::fs::write(&older, STRANGER).expect("the peer inserts an entry of its own");
+      });
+      let written = fs.write_cookie(
+        &live,
+        &target,
+        admitted_dirs,
+        ".tributaries-sync-1-2-41-0000000000000041",
+        &tributary_proto::glob::Globs::default(),
+        &[],
+      );
+      drop(peer);
+
+      let refusal = written.expect_err(
+        "a directory holding a change this scope never reported is not one a \
+         marker may stand in",
+      );
+      assert!(
+        refusal.replaced.is_some(),
+        "and it refused as a REPLACEMENT, naming the reserved directory: {refusal:?}"
+      );
+      assert!(
+        refusal.residue.is_none(),
+        "the marker was withdrawn, so this write owes nothing: {refusal:?}"
+      );
+      assert_eq!(
+        leaves_in(&target.join(cookie_dir_name())),
+        vec!["older".to_owned()],
+        "and nothing of this write is left on disk — the peer's own entry is all \
+         the directory holds"
+      );
+
+      // And the undisturbed create still writes. A fresh target, so the mint arm
+      // runs again with nobody in its window, and the enumeration finds exactly
+      // the marker it just made.
+      let undisturbed = root.join("b");
+      std::fs::create_dir_all(&undisturbed).expect("a second directory to sync");
+      let name = ".tributaries-sync-1-2-42-0000000000000042";
+      fs.write_cookie(
+        &live,
+        &undisturbed,
+        admitted(&root, &undisturbed),
+        name,
+        &tributary_proto::glob::Globs::default(),
+        &[],
+      )
+      .expect("a directory holding nothing but this write's marker is entered");
+      assert_eq!(
+        leaves_in(&undisturbed.join(cookie_dir_name())),
+        vec![name.to_owned()],
+        "and the marker is the only thing in it"
+      );
+
+      let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The inode number the admission's identity is taken on cannot be handed to
     /// another object while the sync is in flight, because the admission is
     /// HOLDING the object rather than remembering its number.
@@ -18310,6 +18459,208 @@ mod sync_cookie {
       }
       let end = buffer.iter().position(|&byte| byte == 0).unwrap_or(0);
       Some(PathBuf::from(std::ffi::OsStr::from_bytes(&buffer[..end])))
+    }
+
+    /// A watcher over the fake platform whose global cookie cap — and so the size
+    /// of its sync door's descriptor allowance — is `cap`, watching the REAL
+    /// scratch `root`.
+    ///
+    /// The platform underneath is fake because none of these cells is about what a
+    /// write does; the door's pins are real either way, opened on the caller's own
+    /// thread against the real tree, which is what makes them countable.
+    async fn doored_watcher(
+      root: &Path,
+      cap: usize,
+    ) -> (crate::Watcher<TokioRuntime>, crate::RootHandle) {
+      let fs = FakeFs::new(1);
+      fs.put(root, FileKind::Dir, 1);
+      let watcher =
+        crate::Watcher::<TokioRuntime>::new_with_cookie_cap(crate::WatcherOptions::new(), fs, cap)
+          .expect("the watcher builds");
+      let handle = watcher
+        .watch(root, crate::Interest::all())
+        .await
+        .expect("the scratch root is watchable");
+      (watcher, handle)
+    }
+
+    /// However many callers poll their `sync_root` futures together, the door
+    /// holds no more admission pins than its allowance.
+    ///
+    /// The door opens up to three directories per call, on the CALLER's thread,
+    /// before the command carrying them can reach the driver — and the driver's
+    /// caps are counted when it reads that command. So an unbounded door is
+    /// unbounded in exactly the way that matters: a caller that polls thousands of
+    /// these futures together opens every pin on the first poll, and the sends
+    /// past a sixteen-deep mailbox then sit there holding them. That is `EMFILE`
+    /// for the whole process — the watcher's own reads and the application's
+    /// unrelated I/O failing — reached before a single cap had an opinion.
+    ///
+    /// Single-threaded on purpose. The driver task cannot run while this cell's
+    /// own polling loop holds the thread, so the count below is exactly what the
+    /// door let through rather than a race with whatever the driver has drained.
+    ///
+    /// Revert witness: open the pins before taking a slot and all `CALLERS` of
+    /// them are held at once.
+    #[tokio::test]
+    async fn concurrent_first_polls_hold_no_more_pins_than_the_door_allows() {
+      const ALLOWED: usize = 4;
+      const CALLERS: usize = 64;
+
+      let root = scratch("door-pin-bound");
+      let target = root.join("a");
+      std::fs::create_dir_all(&target).expect("the directory the syncs name");
+      let (watcher, handle) = doored_watcher(&root, ALLOWED).await;
+      assert_eq!(
+        descriptors_naming(&target),
+        0,
+        "staging: nothing in this process is holding the target yet"
+      );
+
+      let mut pending = Vec::new();
+      for _ in 0..CALLERS {
+        let (admission, _ticket) = watcher
+          .mint_sync_ticket()
+          .expect("this host seeds a watcher");
+        pending.push(Box::pin(watcher.sync_root(handle, &target, admission)));
+      }
+      for call in &mut pending {
+        // ONE poll each, which is all a flood needs: everything up to the first
+        // pending await runs, and that is where the pins used to be opened.
+        let _ = futures_util::poll!(call.as_mut());
+      }
+      assert_eq!(
+        descriptors_naming(&target),
+        ALLOWED,
+        "{CALLERS} callers polled together hold exactly the allowance's worth of \
+         pins, and the rest are waiting for a slot"
+      );
+
+      drop(pending);
+      drop(watcher);
+      let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A door future dropped before its send gives back BOTH the slot it took and
+    /// the descriptors it opened.
+    ///
+    /// A caller that abandons a sync — its own timeout, a close winning the race —
+    /// drops the future wherever it stood, and the state that has to survive that
+    /// is the one between the pins and the send: the command has not been queued,
+    /// so nothing downstream will ever drop them for it. The permit is carried
+    /// INSIDE the sampling for exactly this reason, so releasing one is releasing
+    /// the other.
+    ///
+    /// The allowance is deliberately wider than the driver's sixteen-deep mailbox
+    /// (a change to that depth is meant to fail this cell rather than pass it
+    /// quietly): the callers past the mailbox are the ones parked with their pins
+    /// open, and they are what this drops.
+    ///
+    /// Revert witness: leak the permit or the pins past the future — hold them in
+    /// the door's frame instead of in the sampling — and the second count still
+    /// reads the allowance.
+    #[tokio::test]
+    async fn a_door_future_dropped_before_its_send_gives_back_its_pins() {
+      const MAILBOX: usize = 16;
+      const ALLOWED: usize = 20;
+      const CALLERS: usize = 24;
+
+      let root = scratch("door-pin-dropped");
+      let target = root.join("a");
+      std::fs::create_dir_all(&target).expect("the directory the syncs name");
+      let (watcher, handle) = doored_watcher(&root, ALLOWED).await;
+
+      let mut pending = Vec::new();
+      for _ in 0..CALLERS {
+        let (admission, _ticket) = watcher
+          .mint_sync_ticket()
+          .expect("this host seeds a watcher");
+        pending.push(Box::pin(watcher.sync_root(handle, &target, admission)));
+      }
+      for call in &mut pending {
+        let _ = futures_util::poll!(call.as_mut());
+      }
+      assert_eq!(
+        descriptors_naming(&target),
+        ALLOWED,
+        "staging: the allowance is full, {} of it parked on a send the mailbox has \
+         no room for",
+        ALLOWED - MAILBOX
+      );
+
+      // Everything that never reached the driver: the callers parked on the send
+      // with their pins open, and the callers still waiting for a slot.
+      pending.truncate(MAILBOX);
+      assert_eq!(
+        descriptors_naming(&target),
+        MAILBOX,
+        "an abandoned call takes its pins with it, and only the samplings the \
+         driver is holding are left"
+      );
+
+      drop(pending);
+      drop(watcher);
+      let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A pin the door cannot TAKE is a typed refusal, not an absence.
+    ///
+    /// The two readings are one enum's worth apart and were being collapsed into
+    /// one: an admission that holds nothing for a directory MEANS nothing answered
+    /// at that name, which the write reasons from, while a descriptor table with
+    /// no room left is a failure to ask. Reporting the failure as the reading is
+    /// what lets a door run out of descriptors and keep opening more, so only a
+    /// missing name is an absence now and everything else refuses the sync.
+    ///
+    /// The failure staged here is a plain FILE at the watcher's reserved cookie
+    /// name: the door opens that name with `O_DIRECTORY`, so it is a definite
+    /// `ENOTDIR` on any host and needs no privilege to arrange — unlike the
+    /// exhaustion itself, which cannot be staged without taking the whole test
+    /// binary's descriptor table with it.
+    ///
+    /// The fake platform underneath is what makes the refusal's ORIGIN visible: a
+    /// write there would have succeeded, so a refusal at all is the door's, and
+    /// the fake tree holding no file proves the command never reached the driver.
+    ///
+    /// Revert witness: collapse the failed open back to an absent identity and the
+    /// sync is admitted and answered with a path.
+    #[tokio::test]
+    async fn a_pin_the_door_cannot_take_is_a_typed_refusal() {
+      let root = scratch("door-pin-refused");
+      let target = root.join("a");
+      std::fs::create_dir_all(&target).expect("the directory the sync names");
+      std::fs::write(target.join(cookie_dir_name()), STRANGER)
+        .expect("a non-directory at the reserved cookie name");
+
+      let fs = FakeFs::new(1);
+      fs.put(&root, FileKind::Dir, 1);
+      let watcher =
+        crate::Watcher::<TokioRuntime>::new_with(crate::WatcherOptions::new(), fs.clone())
+          .expect("the watcher builds");
+      let handle = watcher
+        .watch(&root, crate::Interest::all())
+        .await
+        .expect("the scratch root is watchable");
+      let (admission, _ticket) = watcher
+        .mint_sync_ticket()
+        .expect("this host seeds a watcher");
+
+      let denied = watcher
+        .sync_root(handle, &target, admission)
+        .await
+        .expect_err("a pin the door cannot take refuses the sync");
+      assert!(
+        matches!(denied.error, crate::SyncRootError::Write { .. }),
+        "and it refuses as a write failure carrying the OS error, got {:?}",
+        denied.error
+      );
+      assert!(
+        fs.files_under(&root).is_empty(),
+        "and nothing was written: the command never left the door"
+      );
+
+      watcher.close().await.expect("the watcher closes");
+      let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A reserved directory standing across a MOUNT BOUNDARY is refused, even
@@ -19742,7 +20093,8 @@ mod sync_cookie {
     /// the object with it. A cell about a REPLACEMENT binds it earlier instead, at
     /// the moment its sync would have been admitted.
     fn admitted(root: &Path, dir: &Path) -> crate::driver::AdmittedDirs {
-      crate::driver::AdmittedDirs::read(root, dir)
+      crate::driver::AdmittedDirs::read(crate::driver::SyncPinAllowance::permit(), root, dir)
+        .expect("the staged directories are readable")
     }
 
     /// `parent`, opened the way a real write opens it — the handle the mint is

@@ -26,6 +26,9 @@ fn manual_watcher() -> (Watcher<TokioRuntime>, async_channel::Receiver<Command>)
       cleanup,
       sync_tickets: Arc::new(AtomicU64::new(1)),
       nonces: super::sync_nonce_generator().map(|generator| Arc::new(Mutex::new(generator))),
+      pins: crate::driver::SyncPinAllowance::new(
+        crate::driver::DriverConfig::DEFAULT_COOKIE_GLOBAL_CAP,
+      ),
       events: Box::pin(event_rx),
       roots: Arc::new(RwLock::new(RootSet::default())),
       _runtime: PhantomData,
