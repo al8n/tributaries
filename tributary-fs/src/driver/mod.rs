@@ -963,11 +963,20 @@ impl LiveRoot {
     any(target_os = "linux", target_os = "macos", target_os = "windows")
   ))]
   pub(crate) fn for_tests(path: &Path) -> Self {
-    let dir = open_root_object(path).expect("a scratch root opens");
+    // CANONICALIZED, exactly as every production commit point records it (each
+    // spawn canonicalizes the supplied root before it mints a `RootMeta`). The
+    // recorded path is a FLOOR the write compares canonicalized resolutions
+    // against, so a raw spelling here is not a smaller version of the production
+    // value but a different one: a Windows scratch root reached through the
+    // short-name `TEMP` spelling (`C:\Users\RUNNER~1\...`) or a macOS one under
+    // `/var` never prefixes the `\\?\`-verbatim long name `canonicalize` answers,
+    // and every write from such a root refuses as escaping its own tree.
+    let path = std::fs::canonicalize(path).expect("a scratch root canonicalizes");
+    let dir = open_root_object(&path).expect("a scratch root opens");
     let identity = identity_of_handle(&dir)
       .expect("a scratch root answers its identity")
       .unwrap_or(RootIdentity::new(0, 0));
-    Self::new(path.to_path_buf(), identity)
+    Self::new(path, identity)
   }
 
   /// The canonical root the spawn recorded — the FLOOR a cookie may never be
@@ -1093,6 +1102,18 @@ struct CookieParent {
   /// The opened object's OWN name — the string every verdict is taken on, and
   /// the prefix a cookie's landing path is reported under.
   path: PathBuf,
+  /// The WATCHED ROOT's name in the same form `path` is spelled in — the floor
+  /// every verdict about `path` is measured against.
+  ///
+  /// It is carried rather than re-derived because the two names have to come from
+  /// one resolution scheme or the containment test compares nothing. On the
+  /// walking platforms that is trivially the spelling the walk descended in, so
+  /// this is the caller's canonical root verbatim. On Windows it is the name the
+  /// VERIFIED ROOT HANDLE answers, read through the same API and flags as the
+  /// parent's own — never the path the scope recorded, which may be a perfectly
+  /// good spelling of the same directory (a short `TEMP` name, a mapped drive)
+  /// that no normalized final path ever begins with.
+  floor: PathBuf,
   /// Every create runs against this, never against `path`.
   #[cfg(any(target_os = "linux", target_os = "macos"))]
   fd: std::os::fd::OwnedFd,
@@ -1105,6 +1126,13 @@ impl CookieParent {
   /// are taken on.
   fn path(&self) -> &Path {
     &self.path
+  }
+
+  /// The watched root's name in [`path`](Self::path)'s own form — the floor those
+  /// verdicts are measured against, and the prefix the `prune` seat's
+  /// root-relative spelling is taken off.
+  fn floor(&self) -> &Path {
+    &self.floor
   }
 }
 
@@ -1145,7 +1173,11 @@ impl CookieParent {
       fd = OwnedFd::from(open_dir_at(&fd, name)?);
       path.push(name);
     }
-    Ok(Self { path, fd })
+    Ok(Self {
+      path,
+      floor: root.to_path_buf(),
+      fd,
+    })
   }
 }
 
@@ -1176,7 +1208,11 @@ impl CookieParent {
         "the cookie directory does not lie under the watched root object",
       ));
     }
-    Ok(Self { path, handle })
+    Ok(Self {
+      path,
+      floor,
+      handle,
+    })
   }
 }
 
@@ -6479,26 +6515,34 @@ impl FsOps for RealFs {
     // the write outright rather than descending into whatever answered.
     let parent = CookieParent::open(root.identity(), canonical_root, &canonical_dir)
       .map_err(CookieWriteError::clean)?;
-    if !parent.path().starts_with(canonical_root) {
+    if !parent.path().starts_with(parent.floor()) {
       // The containment question again, asked of the OBJECT rather than of the
-      // spelling that reached it. On the walking platforms this cannot fail — the
-      // walk descends from the root's own descriptor through normal components
-      // alone — and on Windows it is the whole confinement, taken on the name the
-      // opened handle answers to.
+      // spelling that reached it — and measured against the floor that OPEN was
+      // proven under ([`CookieParent::floor`]), never against the path the scope
+      // recorded. The two names must come from one resolution scheme: on Windows
+      // both are normalized final paths read off open handles, and comparing one
+      // of them against a recorded string refuses every root whose recorded
+      // spelling is merely a different good name for the same directory. On the
+      // walking platforms the floor IS the canonical root, so this cannot fail —
+      // the walk descends from the root's own descriptor through normal
+      // components alone — and on Windows it is the whole confinement.
       return Err(CookieWriteError::clean(std::io::Error::other(
         "the cookie directory resolves outside the watched root",
       )));
     }
     // The root's PRUNE seat, judged on that same opened object and against the
-    // canonical root the containment test just used — so the pattern is matched
-    // on the same root-relative spelling the fence will match the cookie's own
-    // event on. A seat that covers it would suppress that event, leaving the
+    // same FLOOR the containment test just used — so the root-relative remainder
+    // is the one the fence will match the cookie's own event on. It has to be
+    // that floor rather than the recorded path: a prefix that does not strip
+    // answers "unpruned" for every pattern, which is the fail-open direction and
+    // a silent hole wherever the two names are spelled differently. A seat that
+    // covers it would suppress that event, leaving the
     // caller's barrier waiting on something that can never arrive, so the write
     // refuses here and creates nothing. Asking the CALLER's spelling instead
     // would be two different questions: an intermediate symlink hides a pruned
     // destination, and a FILE subscription's own path is not the directory the
     // cookie goes in at all.
-    if let Some(pattern) = pruned_dir_by(canonical_root, prune, parent.path()) {
+    if let Some(pattern) = pruned_dir_by(parent.floor(), prune, parent.path()) {
       return Err(CookieWriteError::pruned(
         parent.path().to_path_buf(),
         pattern,

@@ -18434,10 +18434,14 @@ mod sync_cookie {
 
     /// A unique real directory for one cell.
     ///
-    /// Deliberately NOT canonicalized, unlike the Unix `scratch`: production
-    /// canonicalizes both sides of its own beneath-check, so nothing here needs
-    /// the verbatim `\\?\` form — and the junction cell drives `mklink`, a `cmd`
-    /// builtin under no obligation to understand one.
+    /// Deliberately NOT canonicalized, unlike the Unix `scratch`: the junction
+    /// cell drives `mklink`, a `cmd` builtin under no obligation to understand a
+    /// verbatim `\\?\` path, and the cells hand this spelling to the write as the
+    /// SUBSCRIPTION's directory, which a caller is free to spell any way it
+    /// likes. What must be canonical is the recorded ROOT, and
+    /// [`LiveRoot::for_tests`] canonicalizes it exactly as every production
+    /// spawn does — `TEMP` can reach a runner through a short name
+    /// (`C:\Users\RUNNER~1\...`) that no normalized resolution ever begins with.
     fn scratch(tag: &str) -> PathBuf {
       use std::sync::atomic::{AtomicU32, Ordering};
       static COUNTER: AtomicU32 = AtomicU32::new(0);
