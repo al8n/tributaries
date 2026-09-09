@@ -1714,17 +1714,56 @@ impl<R> Watcher<R> {
   /// same mode, descendants already inside it — and moves it into the reserved name
   /// after the admission would otherwise be adopted on those looks alone. So the
   /// reserved name is sampled at admission too, and the write's own create decides
-  /// between two cases and no others. A create that SUCCEEDS made the directory:
-  /// it is new, empty, named by nobody else, and its create is kernel-ordered
-  /// after the cut that proved its parent. A create that finds a directory already
-  /// there adopts it only if it is EXACTLY the object the admission read — device
-  /// and inode — and refuses otherwise ([`DirReplaced`](SyncRootError::DirReplaced)
-  /// again, including for a reserved directory that appeared after the cut). A
-  /// pre-existing one on another device is a mount, which no crawl of this root
-  /// descends into, and is refused as
+  /// between two cases and no others. A directory already standing there is
+  /// adopted only if it is EXACTLY the object the admission read — device and
+  /// inode — and refused otherwise
+  /// ([`DirReplaced`](SyncRootError::DirReplaced) again, including for a reserved
+  /// directory that appeared after the cut).
+  ///
+  /// Where nothing stands there the write makes one, and its own `mkdirat` is not
+  /// by itself a licence to enter what the following `openat` reaches: the
+  /// reserved name is `.tributaries-sync-cookies-<uid>`, which every peer under
+  /// the tree can predict, so a peer with rename rights can exchange the empty
+  /// directory the create just bound for one it prepared — same owner, same mode,
+  /// descendants already inside it. Ownership and mode cannot tell those apart. So
+  /// the create arm proves the property the ordering actually rests on instead:
+  /// the directory the marker is about to be born in HOLDS NOTHING, read through
+  /// the descriptor the write is holding. A prepared directory is refused exactly
+  /// when it carries what makes it dangerous — changes older than the marker that
+  /// no queue of this scope reported, which a cold enumeration could order behind
+  /// it — and a directory holding nothing has no such change to order. The
+  /// residual is stated plainly: an EMPTY directory exchanged into the reserved
+  /// name during the create IS entered — its emptiness is exactly what the proof
+  /// needs — so a marker written into it may, under a descending backend whose
+  /// coverage was never armed on that object, wait out its caller's timeout
+  /// rather than resolve; no ordering is ever falsely certified by it.
+  ///
+  /// A directory reached either way must live on the parent's own device: a mount
+  /// standing at the reserved name is ground no crawl of this root descends into,
+  /// and is refused as
   /// [`DirCrossesMount`](SyncRootError::DirCrossesMount). Ownership and mode are
   /// still checked, and are still only ever grounds to REFUSE: no directory is
   /// entered because its bits look right.
+  ///
+  /// # The judged objects are held for the sync's duration
+  ///
+  /// An identity is a `(dev, ino)` pair, and an inode number is a slot the
+  /// filesystem reclaims. A peer that removes one of the judged directories,
+  /// churns allocations until a replacement of its own receives that number, and
+  /// moves the replacement onto the name satisfies every field of the comparison
+  /// above — so the comparison alone would certify an ordering for a directory the
+  /// cut never covered. This call therefore does not merely READ those objects; on
+  /// the platforms that can hold one it opens a descriptor onto the watched root,
+  /// onto `dir`, and onto the reserved directory where one already stands, and
+  /// holds them. A held inode is not reclaimable, so an equality at write time is
+  /// an object identity rather than a coincidence of numbering.
+  ///
+  /// They are held for the SYNC'S DURATION and no longer: the descriptors travel
+  /// with the admission and are dropped when it writes, refuses, or retires. One
+  /// visible consequence is worth stating — a judged directory deleted while the
+  /// sync is in flight stays allocated until the sync settles, so the kernel's own
+  /// deletion notice for it is deferred to that moment rather than arriving at the
+  /// unlink. The window is bounded by the same caps that bound parked syncs.
   ///
   /// # The leaf is minted, never chosen
   ///

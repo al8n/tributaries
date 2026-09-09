@@ -11563,6 +11563,10 @@ mod sync_cookie {
       // POSIX's invalid-uid sentinel, so no `geteuid()` hands it to `cookie_dir_name`. See
       // this cell's disclosed correction — it was asserted as a MINTED name here.
       ".tributaries-sync-cookies-4294967295",
+      // A dot after a mintable uid is no licence either: `cookie_dir_name_for`
+      // renders a bare qualifier and nothing more.
+      ".tributaries-sync-cookies-0.",
+      ".tributaries-sync-cookies-0.0123456789abcdef",
     ] {
       assert!(
         !crate::is_sync_cookie_dir_name(user_leaf),
@@ -17942,6 +17946,11 @@ mod sync_cookie {
         cookie_dir_landed(&target),
         "and the marker stands inside the directory it made"
       );
+      assert_eq!(
+        reserved_leaves_in(&target),
+        vec![cookie_dir_name()],
+        "and the create left exactly one reserved directory standing"
+      );
 
       let _ = std::fs::remove_dir_all(&root);
     }
@@ -17989,6 +17998,318 @@ mod sync_cookie {
       .expect("the object the admission read is the object the write entered");
 
       let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Arms `peer` to run ONCE inside the reserved directory's create — between
+    /// the `mkdirat` that binds the name and the `openat` that resolves it — and
+    /// disarms it again when the returned guard drops.
+    ///
+    /// One shot, for [`MidWalkPeer`]'s reason: the peer must act in that one
+    /// window and on no later create this cell makes.
+    struct MidMintPeer;
+
+    impl MidMintPeer {
+      fn arm(peer: impl FnOnce() + 'static) -> Self {
+        let mut peer = Some(peer);
+        crate::driver::COOKIE_MINT_STEP.with_borrow_mut(|slot| {
+          *slot = Some(Box::new(move || {
+            if let Some(peer) = peer.take() {
+              peer();
+            }
+          }));
+        });
+        Self
+      }
+    }
+
+    impl Drop for MidMintPeer {
+      fn drop(&mut self) {
+        crate::driver::COOKIE_MINT_STEP.with_borrow_mut(|slot| *slot = None);
+      }
+    }
+
+    /// Every leaf under `dir` the exported classifier claims as this crate's own.
+    fn reserved_leaves_in(dir: &Path) -> Vec<String> {
+      let mut leaves = std::fs::read_dir(dir)
+        .expect("the directory is readable")
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|leaf| crate::is_sync_cookie_dir_name(leaf))
+        .collect::<Vec<_>>();
+      leaves.sort();
+      leaves
+    }
+
+    /// A directory a peer EXCHANGES for the one this write just created, inside
+    /// the window between the `mkdirat` and the `openat`, is never entered.
+    ///
+    /// This is the window the create arm cannot close by choosing a better name:
+    /// the reserved leaf is `cookie_dir_name_for` of an effective uid, so every
+    /// peer under the tree predicts it exactly, and a create is not an open. A
+    /// peer with rename rights swaps the empty directory this write bound for one
+    /// it prepared — same owner, `0o700`, and descendants already inside it — and
+    /// the `openat` resolves the name onto the impostor. Ownership and mode are no
+    /// help: the peer's directory passes both, being its own.
+    ///
+    /// What the write proves instead is the property the ordering actually rests
+    /// on. Those prepared descendants are changes older than the marker that no
+    /// queue of this scope ever reported, and a cold enumeration of that directory
+    /// can report the marker's create ahead of them — a barrier resolving while
+    /// certifying an ordering nobody proved. A directory that HOLDS NOTHING has no
+    /// such change in it, so the create arm requires exactly that, read through
+    /// the descriptor it is about to write into.
+    ///
+    /// Real syscalls, and a seam inside the create, because the question is which
+    /// object a name reaches after an exchange — which no modelled tree can be
+    /// asked, and which nothing outside those two calls can stage.
+    ///
+    /// Revert witness: accept the opened directory because the `mkdirat`
+    /// succeeded, and the marker lands in the peer's directory beside the
+    /// descendants it prepared.
+    #[test]
+    fn a_directory_exchanged_inside_the_create_is_never_entered() {
+      use std::os::unix::fs::PermissionsExt;
+
+      let root = scratch("mint-window-exchange");
+      let target = root.join("a");
+      std::fs::create_dir_all(&target).expect("the directory the sync names");
+      let live = crate::driver::LiveRoot::for_tests(&root);
+      let admitted_dirs = admitted(&root, &target);
+      assert!(
+        admitted_dirs.cookies().is_none(),
+        "staging: the reserved name is free when the sync is admitted"
+      );
+
+      // The peer's directory, prepared under the same user with a descendant
+      // already inside it, exchanged for the one this write binds — a rename onto
+      // an EMPTY directory, which is exactly what the create just made.
+      let prepared = root.join("prepared");
+      std::fs::create_dir_all(&prepared).expect("the peer's own directory");
+      std::fs::write(prepared.join("older"), STRANGER).expect("content inside it");
+      std::fs::set_permissions(&prepared, std::fs::Permissions::from_mode(0o700))
+        .expect("as private as the watcher's own");
+      let reserved = target.join(cookie_dir_name());
+      let (from, to) = (prepared.clone(), reserved.clone());
+      let peer = MidMintPeer::arm(move || {
+        std::fs::rename(&from, &to).expect("the peer exchanges the created directory");
+      });
+
+      let written = RealFs::new().write_cookie(
+        &live,
+        &target,
+        admitted_dirs,
+        ".tributaries-sync-1-2-31-0000000000000031",
+        &tributary_proto::glob::Globs::default(),
+        &[],
+      );
+      drop(peer);
+
+      let refusal = written.expect_err(
+        "a directory holding changes this scope never reported is not one a \
+         marker may be placed in",
+      );
+      assert!(
+        refusal.replaced.is_some(),
+        "and it refused as a REPLACEMENT, naming the reserved directory: {refusal:?}"
+      );
+      assert!(
+        refusal.residue.is_none(),
+        "a refusal taken before anything is created owes nothing: {refusal:?}"
+      );
+      assert_eq!(
+        std::fs::read_dir(&reserved)
+          .expect("the peer's directory is still there")
+          .filter_map(Result::ok)
+          .map(|entry| entry.file_name())
+          .collect::<Vec<_>>(),
+        vec![std::ffi::OsString::from("older")],
+        "nothing of this write reached it — the peer's own file is all it holds"
+      );
+
+      let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The inode number the admission's identity is taken on cannot be handed to
+    /// another object while the sync is in flight, because the admission is
+    /// HOLDING the object rather than remembering its number.
+    ///
+    /// An inode number is a slot the filesystem reclaims, so a tuple remembered at
+    /// the door and compared at the write can be satisfied by a directory the door
+    /// never saw: remove the judged directory, churn allocations until a
+    /// replacement receives its number, fill the replacement and move it onto the
+    /// name. Every field of the comparison matches, and the marker is placed in a
+    /// directory whose descendants no queue of this scope carried — the ordering
+    /// failure the identity exists to close, reached through the identity.
+    ///
+    /// The cell CALIBRATES first, because the staging only exists where the
+    /// filesystem recycles promptly: a probe directory is created, its number
+    /// read, the directory removed, and the churn run against it. Where no
+    /// allocation takes that number back — APFS and tmpfs number monotonically —
+    /// there is no ABA to stage on this host and nothing here to observe, so the
+    /// cell says so by returning rather than asserting about a tree it never
+    /// staged.
+    ///
+    /// Revert witness: keep the identity as a remembered `(dev, ino)` and the
+    /// churn takes the judged number back on the first host that recycles.
+    #[test]
+    fn a_held_target_inode_is_never_recycled() {
+      let root = scratch("target-held");
+      let probe = root.join("probe");
+      std::fs::create_dir(&probe).expect("the calibration probe");
+      let probed = inode_of_dir(&probe);
+      std::fs::remove_dir(&probe).expect("and it goes away");
+      if !churn_takes_back(&root, probed) {
+        // This filesystem does not recycle promptly, so the sequence this cell is
+        // about cannot be staged on it.
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+      }
+
+      let target = root.join("a");
+      std::fs::create_dir(&target).expect("the directory the sync names");
+      let judged = inode_of_dir(&target);
+      let admitted_dirs = admitted(&root, &target);
+      std::fs::remove_dir(&target).expect("the peer removes the judged directory");
+      assert!(
+        !churn_takes_back(&root, judged),
+        "a held inode is out of the allocator's reach: nothing this churn created \
+         received the judged number"
+      );
+      // And the hold is the admission's, not the process's: it ends here.
+      drop(admitted_dirs);
+
+      let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The inode number of the directory at `path`.
+    fn inode_of_dir(path: &Path) -> u64 {
+      use std::os::unix::fs::MetadataExt;
+
+      std::fs::metadata(path)
+        .expect("the directory answers its metadata")
+        .ino()
+    }
+
+    /// Creates directories under `root` — keeping them, so the allocator must hand
+    /// out a fresh number each time — until one receives `inode`, and answers
+    /// whether any did. Everything it made is removed before it returns.
+    fn churn_takes_back(root: &Path, inode: u64) -> bool {
+      let mut taken = false;
+      let mut made = Vec::new();
+      for step in 0..256 {
+        let churn = root.join(format!("churn-{step}"));
+        if std::fs::create_dir(&churn).is_err() {
+          break;
+        }
+        let seen = inode_of_dir(&churn);
+        made.push(churn);
+        if seen == inode {
+          taken = true;
+          break;
+        }
+      }
+      for churn in made {
+        let _ = std::fs::remove_dir(&churn);
+      }
+      taken
+    }
+
+    /// The admission HOLDS the objects it judged, and lets go of them when its
+    /// record retires — not before, and not after.
+    ///
+    /// The hold is what makes the identity comparison an object comparison; its
+    /// LIFETIME is what keeps that from being the scope-long root pin this driver
+    /// deliberately does not keep. One sync's worth, dropped with the record.
+    ///
+    /// Revert witness: sample the identities without holding anything and the
+    /// first assertion fails; leak the descriptors past the record and the last
+    /// one does.
+    #[test]
+    fn the_admissions_held_objects_are_released_when_it_retires() {
+      let root = scratch("admission-holds");
+      let target = root.join("a");
+      std::fs::create_dir(&target).expect("the directory the sync names");
+      assert_eq!(
+        descriptors_naming(&target),
+        0,
+        "staging: nothing in this process is holding the target yet"
+      );
+
+      let admitted_dirs = admitted(&root, &target);
+      assert_eq!(
+        descriptors_naming(&target),
+        1,
+        "the admission holds the directory the sync is admitted for"
+      );
+      assert_eq!(
+        descriptors_naming(&root),
+        1,
+        "and the root every descent of the write starts from"
+      );
+      assert!(
+        admitted_dirs.target().is_some(),
+        "and answers that object's identity off the descriptor it is holding"
+      );
+
+      drop(admitted_dirs);
+      assert_eq!(
+        descriptors_naming(&target),
+        0,
+        "and lets the target go when the record retires"
+      );
+      assert_eq!(descriptors_naming(&root), 0, "and the root with it");
+
+      let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// How many descriptors THIS PROCESS holds that name `path`.
+    ///
+    /// Linux reads its own `/proc/self/fd`; macOS asks each live descriptor number
+    /// for its path. Both answer about names, so a cell's own unique scratch
+    /// directory can never be confused with a descriptor some parallel test
+    /// happens to be holding.
+    fn descriptors_naming(path: &Path) -> usize {
+      #[cfg(target_os = "linux")]
+      {
+        std::fs::read_dir("/proc/self/fd")
+          .expect("the process's own descriptor table is readable")
+          .filter_map(Result::ok)
+          .filter(|entry| std::fs::read_link(entry.path()).is_ok_and(|named| named == path))
+          .count()
+      }
+      #[cfg(target_os = "macos")]
+      {
+        (0..1024)
+          .filter(|fd| path_of_descriptor(*fd).is_some_and(|named| named == path))
+          .count()
+      }
+    }
+
+    /// The path a descriptor number currently answers, or `None` where that number
+    /// is not open.
+    #[cfg(target_os = "macos")]
+    fn path_of_descriptor(fd: libc::c_int) -> Option<PathBuf> {
+      use std::os::unix::ffi::OsStrExt;
+
+      let mut buffer = [0_u8; libc::PATH_MAX as usize];
+      // SAFETY: `F_GETPATH` only READS the descriptor's name and writes into the
+      // caller's buffer, which is a live allocation of exactly the `MAXPATHLEN`
+      // bytes Apple documents it to require; the pointer is cast only from `u8` to
+      // `c_char` (both one byte, no alignment change). An `fd` that is not open
+      // answers `EBADF` rather than touching the buffer, and nothing is read out
+      // of it unless the call reported success.
+      let rc = unsafe {
+        libc::fcntl(
+          fd,
+          libc::F_GETPATH,
+          buffer.as_mut_ptr().cast::<libc::c_char>(),
+        )
+      };
+      if rc < 0 {
+        return None;
+      }
+      let end = buffer.iter().position(|&byte| byte == 0).unwrap_or(0);
+      Some(PathBuf::from(std::ffi::OsStr::from_bytes(&buffer[..end])))
     }
 
     /// A reserved directory standing across a MOUNT BOUNDARY is refused, even
