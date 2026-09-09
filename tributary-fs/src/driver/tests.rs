@@ -17954,6 +17954,190 @@ mod sync_cookie {
       let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// An exclusion naming the COOKIE DIRECTORY ITSELF closes the ground the
+    /// marker stands on, and the write refuses before it creates anything.
+    ///
+    /// The parent is not the cookie's directory, and this is the case where the
+    /// difference is the whole verdict. The marker does not land in the directory
+    /// the sync names: it lands one level deeper, in the reserved directory this
+    /// driver owns inside it. An exclusion spelled at that reserved path covers
+    /// every event the marker will ever mint while leaving the named directory
+    /// perfectly reportable — so a fence asked only about the parent answers
+    /// "admissible", the marker is created inside ground the source has been told
+    /// never to report from, the write returns `Ok`, and the caller's barrier waits
+    /// out its whole deadline for an event the fence eats.
+    ///
+    /// Revert witness: judge only `CookieParent::path` and the write succeeds, with
+    /// a marker standing inside the excluded directory.
+    #[test]
+    fn an_exclusion_naming_the_cookie_directory_itself_is_refused() {
+      let root = scratch("cookie-dir-excluded");
+      let live = root.join("live");
+      std::fs::create_dir_all(&live).expect("the directory the sync names");
+      // The exclusion is the reserved directory the marker would go in — a path no
+      // caller-facing spelling in this write ever mentions.
+      let reserved = live.join(crate::driver::cookie_dir_name());
+
+      let written = RealFs::new().write_cookie(
+        &crate::driver::LiveRoot::for_tests(&root),
+        &live,
+        ".tributaries-sync-1-2-7-000000000000000e",
+        &tributary_proto::glob::Globs::default(),
+        std::slice::from_ref(&reserved),
+      );
+
+      let excluded = written
+        .expect_err("a marker inside an excluded directory is one no delivery can carry")
+        .excluded
+        .expect("the refusal names the exclusion it was taken on");
+      assert_eq!(
+        excluded.dir, reserved,
+        "the verdict is taken on the directory the MARKER stands in, not on the \
+         one the sync named"
+      );
+      assert_eq!(
+        excluded.exclusion, reserved,
+        "and it names the covering seat"
+      );
+      assert!(
+        !cookie_dir_landed(&live),
+        "the refusal precedes every create: nothing of this write is on disk"
+      );
+
+      // Non-vacuity: the very same directory, with the exclusion naming something
+      // else, still writes.
+      RealFs::new()
+        .write_cookie(
+          &crate::driver::LiveRoot::for_tests(&root),
+          &live,
+          ".tributaries-sync-1-2-8-000000000000000f",
+          &tributary_proto::glob::Globs::default(),
+          std::slice::from_ref(&root.join("elsewhere")),
+        )
+        .expect("an unexcluded cookie directory still writes");
+
+      let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Arms `peer` to run ONCE between the write's seat verdict and everything it
+    /// creates, and disarms it again when the returned guard drops.
+    ///
+    /// One shot, for [`MidWalkPeer`]'s reason: the peer must act in that one
+    /// window and on no later write this cell makes.
+    struct PostVerdictPeer;
+
+    impl PostVerdictPeer {
+      fn arm(peer: impl FnOnce() + 'static) -> Self {
+        let mut peer = Some(peer);
+        crate::driver::COOKIE_CREATE_STEP.with_borrow_mut(|slot| {
+          *slot = Some(Box::new(move || {
+            if let Some(peer) = peer.take() {
+              peer();
+            }
+          }));
+        });
+        Self
+      }
+    }
+
+    impl Drop for PostVerdictPeer {
+      fn drop(&mut self) {
+        crate::driver::COOKIE_CREATE_STEP.with_borrow_mut(|slot| *slot = None);
+      }
+    }
+
+    /// A parent renamed into EXCLUDED ground after the verdict and before the
+    /// marker create: the write withdraws the marker and refuses, rather than
+    /// reporting a success the barrier can never observe.
+    ///
+    /// No check can be moved early enough to close this. Every create the write
+    /// makes is anchored at the descriptor it judged, so it correctly follows that
+    /// object wherever a peer has moved it — and where it has been moved to is
+    /// ground the source has been told never to report from. The marker exists, its
+    /// event is suppressed, and a write that reported `Ok` would leave the caller
+    /// parked until its deadline expires.
+    ///
+    /// So the ground is read back off the cookie directory's own descriptor once
+    /// the marker stands in it, and a marker on ground that has since closed is
+    /// destroyed through the anchors that created it. What the caller gets is the
+    /// same typed refusal an earlier rename would have produced, with nothing of
+    /// the write left behind — no marker, and no residue for anyone to reap.
+    ///
+    /// Revert witness: drop the re-reading after the create and the write returns
+    /// `Ok`, naming a marker inside the excluded subtree.
+    #[test]
+    fn a_parent_renamed_into_excluded_ground_after_the_verdict_withdraws_the_marker() {
+      let root = scratch("post-verdict-excluded");
+      let judged = root.join("a");
+      std::fs::create_dir_all(&judged).expect("the directory the sync names");
+      let hidden = root.join("hidden");
+      std::fs::create_dir_all(&hidden).expect("the excluded subtree");
+
+      let live = crate::driver::LiveRoot::for_tests(&root);
+      let (from, to) = (judged.clone(), hidden.join("a"));
+      let peer = PostVerdictPeer::arm(move || {
+        std::fs::rename(&from, &to).expect("the peer moves the judged directory");
+      });
+      let name = ".tributaries-sync-1-2-9-0000000000000010";
+      let written = RealFs::new().write_cookie(
+        &live,
+        &judged,
+        name,
+        &tributary_proto::glob::Globs::default(),
+        std::slice::from_ref(&hidden),
+      );
+      drop(peer);
+
+      let moved = hidden.join("a");
+      let refusal = written
+        .expect_err("a marker the exclusion fence will eat is not a success this write may report");
+      assert!(
+        refusal.residue.is_none(),
+        "nothing survives for anyone to reap: the marker was withdrawn before the \
+         refusal was answered"
+      );
+      let excluded = refusal
+        .excluded
+        .expect("the refusal names the exclusion it was taken on");
+      assert_eq!(
+        excluded.dir.parent(),
+        Some(moved.as_path()),
+        "the verdict is taken on where the marker's own directory ENDED UP, \
+         {excluded:?}"
+      );
+      assert_eq!(excluded.exclusion, hidden, "and it names the covering seat");
+      let holder = std::fs::read_dir(&moved)
+        .expect("the renamed directory is readable")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+          path
+            .file_name()
+            .and_then(|leaf| leaf.to_str())
+            .is_some_and(crate::is_sync_cookie_dir_name)
+        })
+        .expect("staging: the create followed the object, so the directory moved with it");
+      assert!(
+        !holder.join(name).exists(),
+        "and the marker itself is gone from the ground the seat closed"
+      );
+
+      // Non-vacuity: with no peer to move it, the very same descent writes.
+      let unmoved = root.join("b");
+      std::fs::create_dir_all(&unmoved).expect("an unmoved directory");
+      RealFs::new()
+        .write_cookie(
+          &live,
+          &unmoved,
+          ".tributaries-sync-1-2-10-0000000000000011",
+          &tributary_proto::glob::Globs::default(),
+          std::slice::from_ref(&hidden),
+        )
+        .expect("an unmoved parent outside every exclusion still writes");
+
+      let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Whether this driver's own cookie directory stands inside `dir`.
     fn cookie_dir_landed(dir: &std::path::Path) -> bool {
       std::fs::read_dir(dir).is_ok_and(|entries| {

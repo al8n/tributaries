@@ -1762,15 +1762,27 @@ impl<R> Watcher<R> {
   /// # Platform notes
   ///
   /// The exclusion and `prune` verdicts are taken on the name the OS answers for
-  /// the descriptor the write ended holding, so a directory renamed INTO excluded
-  /// or pruned ground at any point up to that reading — including mid-descent,
-  /// which the descriptor-relative walk itself cannot notice — is refused before
-  /// anything is created. A rename that lands AFTER the reading leaves the marker
-  /// where the create put it, under a parent the exclusion now covers; the
-  /// exclusion is the SOURCE's contract, so that delivery is suppressed exactly as
-  /// any other excluded one is and the barrier waits out its deadline. No check
-  /// precedes a rename that happens after it, and that residue is the exclusions'
-  /// documented semantics rather than a hole in this call.
+  /// the descriptor the write ended holding — and on the reserved directory the
+  /// marker itself goes in, which an exclusion may name exactly while leaving its
+  /// parent perfectly reportable. A directory renamed INTO excluded or pruned
+  /// ground at any point up to that reading, including mid-descent, which the
+  /// descriptor-relative walk itself cannot notice, is refused before anything is
+  /// created.
+  ///
+  /// The verdict is then RE-TAKEN once the marker exists, because the create is
+  /// descriptor-relative and follows the object it was aimed at: a peer that
+  /// renames the judged directory into fenced ground while the write is in flight
+  /// carries the marker there with it. Such a write does not succeed — the marker
+  /// is removed again through the anchors that created it and the call answers
+  /// [`DirExcluded`](SyncRootError::DirExcluded) or
+  /// [`DirPruned`](SyncRootError::DirPruned), with nothing of the write left on
+  /// disk. So a rename into fenced ground during this call is a refusal a caller
+  /// can act on rather than a barrier that can only time out, and success means
+  /// the marker stood on reportable ground at the last instant this call could
+  /// ask. Nothing precedes a rename that lands after that instant; a marker the
+  /// seats close over only then is suppressed exactly as any other excluded or
+  /// pruned delivery is, which is those seats' documented semantics rather than a
+  /// hole in this call.
   ///
   /// On Windows this write's cookie path is still path-addressed at three
   /// points (opening the cookie parent by pathname after the root identity check;

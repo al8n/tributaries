@@ -1313,6 +1313,28 @@ thread_local! {
     const { std::cell::RefCell::new(None) };
 }
 
+#[cfg(all(
+  test,
+  feature = "tokio",
+  not(miri),
+  any(target_os = "linux", target_os = "macos")
+))]
+thread_local! {
+  /// A seam between the seat verdict and everything the write creates, called
+  /// once per write.
+  ///
+  /// The window it exposes is the one no earlier check can see: the verdict has
+  /// been taken, nothing is on disk yet, and a peer that renames the judged
+  /// directory into fenced ground right here moves every create that follows with
+  /// it. Acting between those two points is what nothing outside the write can do.
+  ///
+  /// Thread-local, so parallel cells cannot see each other's peer; production
+  /// compiles no call to it at all. Its cfg is exactly the union of the cells that
+  /// arm it (the real-filesystem identity module).
+  pub(crate) static COOKIE_CREATE_STEP: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+    const { std::cell::RefCell::new(None) };
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl CookieParent {
   /// Walks from the VERIFIED root down to `dir`, one pinned `openat` per
@@ -2715,18 +2737,20 @@ pub(crate) struct CookieWriteError {
   /// rather than a whole cookie record on every `Result` the write returns.
   pub(crate) residue: Option<Box<CookieResidue>>,
   /// Set when the write refused because the root's `prune` seat covers the
-  /// CANONICAL directory the cookie would have gone in — a typed refusal the
-  /// caller can act on, not an `io::Error` it can only print. Always a clean
-  /// failure: the verdict is reached before anything is created, so it never
-  /// carries a residue. Boxed for the same reason `residue` is.
+  /// directory the cookie would have gone in — a typed refusal the caller can act
+  /// on, not an `io::Error` it can only print. Always a clean failure, and never
+  /// with a residue beside it: the verdict is either reached before anything is
+  /// created, or reached after the marker was created and answered only once that
+  /// marker has been withdrawn ([`withdraw_marker`]). Boxed for the same reason
+  /// `residue` is.
   pub(crate) pruned: Option<Box<PrunedCookieDir>>,
   /// Set when the write refused because one of the WATCHER's exclusions covers
-  /// the directory the descriptor walk actually resolved — the exclusions' twin
-  /// of `pruned`, reached for the same reason and at the same point. The
-  /// admission checked the caller's LEXICAL spelling, which an intermediate
-  /// symlink can make a different directory entirely; only the walk knows where
-  /// the cookie would truly land. Always a clean failure: the verdict is reached
-  /// before anything is created. Boxed for the same reason the others are.
+  /// the directory the marker resolved to — the exclusions' twin of `pruned`,
+  /// reached for the same reason and at the same points. The admission checked the
+  /// caller's LEXICAL spelling, which an intermediate symlink can make a different
+  /// directory entirely; only the descriptor knows where the cookie truly lands.
+  /// Always a clean failure with no residue beside it, on the same terms `pruned`
+  /// is. Boxed for the same reason the others are.
   pub(crate) excluded: Option<Box<ExcludedCookieDir>>,
 }
 
@@ -2768,9 +2792,10 @@ impl CookieWriteError {
     }
   }
 
-  /// The prune refusal: the canonical cookie parent `dir` is covered by
-  /// `pattern`, so the write created nothing and the caller learns which word
-  /// closed the directory it named.
+  /// The prune refusal: the cookie's own directory `dir` is covered by `pattern`,
+  /// so nothing of this write is on disk and the caller learns which word closed
+  /// the directory it named. A write that had already created its marker
+  /// withdraws it before answering with this ([`withdraw_marker`]).
   pub(crate) fn pruned(dir: PathBuf, pattern: Glob) -> Self {
     Self {
       source: std::io::Error::other("the cookie directory is pruned"),
@@ -2780,9 +2805,11 @@ impl CookieWriteError {
     }
   }
 
-  /// The exclusion refusal: the resolved cookie parent `dir` lies under
-  /// `exclusion`, so the write created nothing and the caller learns which
-  /// excluded subtree its cookie would have landed in.
+  /// The exclusion refusal: the cookie's own directory `dir` lies under
+  /// `exclusion`, so nothing of this write is on disk and the caller learns which
+  /// excluded subtree its cookie would have landed in. A write that had already
+  /// created its marker withdraws it before answering with this
+  /// ([`withdraw_marker`]).
   pub(crate) fn excluded(dir: PathBuf, exclusion: PathBuf) -> Self {
     Self {
       source: std::io::Error::other("the cookie directory is excluded"),
@@ -5597,24 +5624,35 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
   /// left the filesystem exactly as it found it.
   ///
   /// `prune` is the ROOT's compiled prune seat, and the write is where that seat
-  /// is judged: only here is the CANONICAL cookie parent known — the target's own
+  /// is judged: only here is the cookie's own directory known — the target's own
   /// directory, or its parent when the target is a file, with every symlink on the
-  /// way resolved — and a verdict taken on any other spelling would refuse a file
-  /// subscription whose parent is perfectly reportable, or admit a symlink that
-  /// lands inside a pruned subtree. An implementation that finds the seat covers
-  /// that directory must create NOTHING and answer
-  /// [`CookieWriteError::pruned`], which the caller reports as
-  /// [`SyncRootError::DirPruned`](crate::SyncRootError::DirPruned).
+  /// way resolved and the reserved directory the marker goes in beneath that — and
+  /// a verdict taken on any other spelling would refuse a file subscription whose
+  /// parent is perfectly reportable, or admit a symlink that lands inside a pruned
+  /// subtree. An implementation that finds the seat covers that directory must
+  /// create NOTHING and answer [`CookieWriteError::pruned`], which the caller
+  /// reports as [`SyncRootError::DirPruned`](crate::SyncRootError::DirPruned).
   ///
   /// `exclusions` is the WATCHER-wide exclusion set, judged here for exactly the
-  /// same reason and at exactly the same point. The admission already refused the
+  /// same reason and at exactly the same points. The admission already refused the
   /// caller's lexical spelling, and that is not the same question: an intermediate
   /// symlink resolves a spelling outside every exclusion into a directory inside
-  /// one, and a covered FILE subscription's key is not the cookie's directory at
-  /// all. An implementation that finds an exclusion covers the directory it
-  /// resolved must create NOTHING and answer
+  /// one, a covered FILE subscription's key is not the cookie's directory at all,
+  /// and an exclusion naming the reserved cookie directory itself covers no
+  /// spelling either of them mentions. An implementation that finds an exclusion
+  /// covers the directory it resolved must create NOTHING and answer
   /// [`CookieWriteError::excluded`], which the caller reports as
   /// [`SyncRootError::DirExcluded`](crate::SyncRootError::DirExcluded).
+  ///
+  /// Both verdicts bind AFTER the create as well as before it, and that is the
+  /// whole of the promise a successful write makes: an implementation whose marker
+  /// has landed on ground one of the two seats closes — a peer renaming an
+  /// ancestor into it while the create was in flight — must destroy that marker
+  /// through the anchors it created it with and answer the same typed refusal,
+  /// never report success. The caller's barrier waits on the marker's own event,
+  /// so a marker the fence will suppress is a barrier that can only time out;
+  /// success here means the marker was observable ground when this write last
+  /// could ask.
   fn write_cookie(
     &self,
     root: &LiveRoot,
@@ -6765,6 +6803,121 @@ pub(crate) fn pruned_ancestor_depth(
   })
 }
 
+/// THE verdict on a directory a sync cookie is about to be written in, or has
+/// just been written in: contained by the watched root, outside every exclusion,
+/// and outside every word of the root's `prune` seat. `None` is admissible
+/// ground.
+///
+/// One function because one write asks it of THREE names — the opened parent, the
+/// reserved directory the marker's own create will go into, and, once that create
+/// has landed, the name the OS then answers for the directory holding it — and
+/// three copies of a fence are three fences that agree until one of them is
+/// edited.
+///
+/// `dir` is always a name read off an OPEN OBJECT rather than a spelling a caller
+/// supplied, and `floor` is the watched root's name in that same form. The two
+/// have to come from one resolution scheme or the containment test compares
+/// nothing: a root whose recorded spelling is merely a different good name for the
+/// same directory (a short `TEMP` name, a mapped drive) would refuse every write.
+///
+/// Each of the three questions is a live one:
+///
+/// - **containment.** A descent whose ancestor was renamed OUT of the watched tree
+///   while the walk held it lands under a name that no longer begins with the
+///   root's, and a marker there rides no queue this scope reads.
+/// - **exclusions.** An exclusion is an instruction to the source NOT to report a
+///   subtree, so a marker created under one is a marker no delivery can ever carry
+///   — the barrier waits out its caller's deadline over a source that did exactly
+///   what it was told. The admission asked this of the caller's SPELLING, which is
+///   not a location: `<root>/link/sub` where `link` targets `<root>/hidden` passes
+///   a lexical test against an exclusion of `<root>/hidden` and lands squarely
+///   inside it, and a covered FILE subscription's key is not the cookie's directory
+///   at all.
+/// - **`prune`.** The same hole through the other seat, and measured against the
+///   same floor: a prefix that does not strip answers "unpruned" for every pattern,
+///   which is the fail-open direction. A word that covers the ground suppresses the
+///   marker's own create, leaving the caller's barrier waiting on something that
+///   can never arrive.
+///
+/// Every refusal it builds is CLEAN in the sense [`CookieWriteError::clean`] means
+/// it: it describes ground, not a file, so a caller that has already created
+/// something must destroy that first ([`withdraw_marker`]) rather than return one
+/// of these as it stands.
+fn cookie_ground_refusal(
+  floor: &Path,
+  dir: &Path,
+  prune: &Globs,
+  exclusions: &[PathBuf],
+) -> Option<CookieWriteError> {
+  if !dir.starts_with(floor) {
+    return Some(CookieWriteError::clean(std::io::Error::other(
+      "the cookie directory resolves outside the watched root",
+    )));
+  }
+  if let Some(exclusion) = cookie_dir_excluded(exclusions, dir) {
+    return Some(CookieWriteError::excluded(
+      dir.to_path_buf(),
+      exclusion.to_path_buf(),
+    ));
+  }
+  if let Some(pattern) = pruned_dir_by(floor, prune, dir) {
+    return Some(CookieWriteError::pruned(dir.to_path_buf(), pattern));
+  }
+  None
+}
+
+/// Where this write's marker directory WILL stand, on the platforms whose cookie
+/// directory carries a name known before the create — the opened parent's own
+/// current name joined with the reserved leaf.
+///
+/// It is what lets the seat verdict be taken on the ground the MARKER's event
+/// comes off rather than on its parent's. The two are not the same question: an
+/// exclusion naming the reserved directory itself leaves the parent perfectly
+/// reportable and still suppresses every event the barrier waits on. Nothing is
+/// resolved here — the name is assembled from a name already read off the open
+/// parent, and the create below is descriptor-relative either way.
+///
+/// `None` where the leaf is not knowable in advance: Windows mints one per
+/// obligation inside the very call that creates it, so there is no name to judge
+/// until the directory exists. That platform's cookie path is fenced as a whole
+/// (<https://github.com/al8n/tributaries/issues/134>).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn reserved_cookie_dir(parent: &CookieParent) -> Option<PathBuf> {
+  Some(parent.path().join(cookie_dir_name()))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn reserved_cookie_dir(parent: &CookieParent) -> Option<PathBuf> {
+  let _ = parent;
+  None
+}
+
+/// The name the OS answers RIGHT NOW for the directory a marker was just created
+/// in, read off that directory's own descriptor.
+///
+/// The verdict the write took before the create describes where the ground was
+/// then. A peer that renames an ancestor while the create is in flight moves the
+/// marker with it — the create is descriptor-relative, so it lands in the object
+/// that was judged, wherever that object now is — and the fence then judges the
+/// delivery by where it ENDED UP. Reading the descriptor back is how the write
+/// learns which of those two it is holding, and it is the same call, on the same
+/// kind of object, the parent's own name came from ([`current_path_of_dir`]).
+///
+/// `None` where no such re-reading is taken: the Windows arm's cookie path is
+/// fenced as a whole (<https://github.com/al8n/tributaries/issues/134>) and its
+/// directory is a per-obligation debt a typed ground refusal has no way to hand
+/// back, and the remaining targets mint no cookie directory at all.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn current_cookie_dir_path(dir: &CookieDir) -> Option<Result<PathBuf, std::io::Error>> {
+  Some(current_path_of_dir(&dir.fd))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn current_cookie_dir_path(dir: &CookieDir) -> Option<Result<PathBuf, std::io::Error>> {
+  let _ = dir;
+  None
+}
+
 impl FsOps for RealFs {
   type Handle = SourceHandle;
 
@@ -6879,57 +7032,41 @@ impl FsOps for RealFs {
     // the write outright rather than descending into whatever answered.
     let parent = CookieParent::open(root.identity(), canonical_root, &canonical_dir)
       .map_err(CookieWriteError::clean)?;
-    if !parent.path().starts_with(parent.floor()) {
-      // The containment question again, asked of the OBJECT rather than of the
-      // spelling that reached it — and measured against the floor that OPEN was
-      // proven under ([`CookieParent::floor`]), never against the path the scope
-      // recorded. The two names must come from one resolution scheme: both are
-      // read off open objects — the parent's off the descriptor or handle the open
-      // ended holding, the root's off the descriptor the identity was proven on —
-      // and comparing either against a recorded string refuses every root whose
-      // recorded spelling is merely a different good name for the same directory.
-      // It is a live test on every platform: a descent whose ancestor was renamed
-      // OUT of the watched tree while the walk held it lands under a name that no
-      // longer begins with the root's, and a marker there rides no queue this scope
-      // reads.
-      return Err(CookieWriteError::clean(std::io::Error::other(
-        "the cookie directory resolves outside the watched root",
-      )));
+    // The seat verdict, taken on that opened object rather than on the spelling
+    // that reached it and measured against the floor the OPEN was proven under
+    // ([`cookie_ground_refusal`] states each of the three questions and why every
+    // one of them is live). Refused here, nothing is created at all.
+    if let Some(refusal) = cookie_ground_refusal(parent.floor(), parent.path(), prune, exclusions) {
+      return Err(refusal);
     }
-    // The watcher's EXCLUSIONS, judged on that same opened object. The admission
-    // asked this question of the caller's spelling, and a spelling is not a
-    // location: `<root>/link/sub` where `link` targets `<root>/hidden` passes a
-    // lexical test against an exclusion of `<root>/hidden` and lands squarely
-    // inside it, and a covered FILE subscription's key is not the cookie's
-    // directory at all. An exclusion is an instruction to the source NOT to report
-    // a subtree, so a marker created there is a marker no delivery can ever carry
-    // — the barrier waits out its caller's deadline over a source that did exactly
-    // what it was told. The same refusal the prune seat gets below, for the same
-    // reason, taken before anything is created.
-    if let Some(exclusion) = cookie_dir_excluded(exclusions, parent.path()) {
-      return Err(CookieWriteError::excluded(
-        parent.path().to_path_buf(),
-        exclusion.to_path_buf(),
-      ));
+    // And the same verdict on the directory the MARKER will stand in — the parent's
+    // name joined with the reserved leaf, where that leaf is known before the
+    // create ([`reserved_cookie_dir`]).
+    //
+    // A parent is not its cookie directory, and an exclusion that names the
+    // reserved directory exactly is the difference: the parent passes every test
+    // above, the marker lands inside a subtree the source has been told never to
+    // report, and the write returns success for a barrier that can only time out.
+    // The `prune` half of the question cannot currently refuse (the seat exempts
+    // this driver's own artifact, see [`prune_prefixes`]), and it is asked anyway —
+    // the fence is one rule about one directory, not a set of per-seat exceptions
+    // that have to be rediscovered whenever either seat changes.
+    if let Some(reserved) = reserved_cookie_dir(&parent)
+      && let Some(refusal) = cookie_ground_refusal(parent.floor(), &reserved, prune, exclusions)
+    {
+      return Err(refusal);
     }
-    // The root's PRUNE seat, judged on that same opened object and against the
-    // same FLOOR the containment test just used — so the root-relative remainder
-    // is the one the fence will match the cookie's own event on. It has to be
-    // that floor rather than the recorded path: a prefix that does not strip
-    // answers "unpruned" for every pattern, which is the fail-open direction and
-    // a silent hole wherever the two names are spelled differently. A seat that
-    // covers it would suppress that event, leaving the
-    // caller's barrier waiting on something that can never arrive, so the write
-    // refuses here and creates nothing. Asking the CALLER's spelling instead
-    // would be two different questions: an intermediate symlink hides a pruned
-    // destination, and a FILE subscription's own path is not the directory the
-    // cookie goes in at all.
-    if let Some(pattern) = pruned_dir_by(parent.floor(), prune, parent.path()) {
-      return Err(CookieWriteError::pruned(
-        parent.path().to_path_buf(),
-        pattern,
-      ));
-    }
+    #[cfg(all(
+      test,
+      feature = "tokio",
+      not(miri),
+      any(target_os = "linux", target_os = "macos")
+    ))]
+    COOKIE_CREATE_STEP.with_borrow_mut(|peer| {
+      if let Some(peer) = peer.as_mut() {
+        peer();
+      }
+    });
     // The cookie DIRECTORY, created relative to the parent this write is holding:
     // no component of its path is resolved, so it lands inside the very object
     // the two verdicts above were taken on. On the platforms that keep ONE shared
@@ -6981,6 +7118,43 @@ impl FsOps for RealFs {
     let created = cookies
       .create(name)
       .map_err(|err| post_mint_failure(&cookies, name, err))?;
+    // The verdict again, RE-TAKEN on the ground the marker now actually stands on
+    // ([`current_cookie_dir_path`]).
+    //
+    // Everything above judged where the marker WOULD land. Between the last of
+    // those readings and this create there is a window nothing can close by
+    // checking earlier: a peer that renames an ancestor into excluded or pruned
+    // ground moves the whole open descent with it, the create lands — correctly —
+    // inside the object that was judged, and that object is now somewhere the
+    // source has been told never to report from. Reporting success there hands the
+    // barrier a marker whose event the fence will eat, and the caller waits out its
+    // whole deadline for it.
+    //
+    // So the ground is read once more, and a marker standing on ground that has
+    // since closed is WITHDRAWN — destroyed through the anchors that created it —
+    // and the write answers the same typed refusal it would have answered a moment
+    // earlier. The barrier is never told a marker exists that the fence will eat;
+    // the honest outcomes are a marker that can be observed, or a refusal naming
+    // the seat that closed the ground.
+    //
+    // A failure to READ that name is fail-closed for the same reason: a write that
+    // cannot say where its marker is cannot promise the marker is reportable.
+    match current_cookie_dir_path(&cookies) {
+      Some(Ok(landing)) => {
+        if let Some(refusal) = cookie_ground_refusal(parent.floor(), &landing, prune, exclusions) {
+          return Err(withdraw_marker(cookies, name, created, refusal));
+        }
+      }
+      Some(Err(err)) => {
+        return Err(withdraw_marker(
+          cookies,
+          name,
+          created,
+          CookieWriteError::clean(err),
+        ));
+      }
+      None => {}
+    }
     // The identity comes off the descriptor the create just returned — one
     // `fstat` of the object we made, in obedience to the one-sample rule (see the
     // module doc). Re-opening the name to read it would defeat the purpose: it
@@ -7529,6 +7703,60 @@ fn destroy_unidentified(
     // so there is no second debt to hand back here.
     Err(_) => CookieWriteError {
       source: err,
+      residue: Some(Box::new(CookieResidue::File(CookieFile::anchored(
+        dir,
+        name,
+        CookieProof::Anchor,
+        handle,
+      )))),
+      pruned: None,
+      excluded: None,
+    },
+  }
+}
+
+/// Withdraws a marker the seat closed the ground under, and answers the refusal
+/// that closed it.
+///
+/// The create landed, and then the ground it landed on turned out to be ground no
+/// delivery can come off ([`cookie_ground_refusal`], re-taken after the create).
+/// Leaving the marker there and reporting the refusal would leave a file nobody
+/// records; reporting success would hand the barrier an event the fence eats. So
+/// the marker is destroyed first, through the same anchors every other removal
+/// uses — an entry of the directory the create was made through, no path resolved
+/// — and the refusal is returned only once nothing of this write is on disk, which
+/// is what makes the typed verdicts' `clean` claim true again.
+///
+/// A destroy that FAILS leaves the file, so the refusal it answers with is the
+/// residue-carrying one instead: the marker comes back as an owned, counted,
+/// retried obligation exactly as [`destroy_unidentified`] hands one back, keeping
+/// the create's descriptor so the record's identity can still be promoted. The
+/// typed `pruned`/`excluded` verdict is dropped there deliberately — the caller
+/// reads those two fields BEFORE the residue, so a value carrying both would
+/// report the seat refusal and drop the file on the floor — and the refusal's own
+/// message rides the residue's `source`.
+///
+/// It is the platforms whose cookie directory is SHARED that reach this, and the
+/// destroy-succeeded arm relies on it: where a directory is a per-obligation debt,
+/// a clean typed refusal is not a true statement about the write (see
+/// [`post_mint_failure`]) and the ground is not re-read at all
+/// ([`current_cookie_dir_path`]).
+fn withdraw_marker(
+  dir: Arc<CookieDir>,
+  name: &str,
+  handle: std::fs::File,
+  refusal: CookieWriteError,
+) -> CookieWriteError {
+  // Held across the destroy for the reason `destroy_unidentified` holds it: the
+  // entry goes away, the object does not, so its identity slot stays out of the
+  // allocator's reach for as long as a residue below might need it.
+  match dir.destroy_created(name, &handle) {
+    Ok(()) => refusal,
+    // Already gone — a peer swept it, or the directory it was in went with the
+    // rename. Either way no file of this write survives, so the refusal stands.
+    Err(gone) if gone.kind() == std::io::ErrorKind::NotFound => refusal,
+    Err(_) => CookieWriteError {
+      source: refusal.source,
       residue: Some(Box::new(CookieResidue::File(CookieFile::anchored(
         dir,
         name,

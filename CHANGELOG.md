@@ -426,6 +426,19 @@ All notable changes to this workspace are documented here. The format is based o
   reported landing keeps its documented meaning: the spelling at write time, for reaping,
   never the marker's address.
 
+- **`tributary-fs`** — on Unix a sync cookie's exclusion and `prune` verdicts are taken
+  on the cookie's OWN directory — the reserved directory the marker is created in — and
+  re-taken once the marker exists. Judging only the parent left two holes with the same
+  outcome: an exclusion naming `<dir>/.tributaries-sync-cookies-<uid>` exactly covered
+  every event the marker could mint while the parent passed every test, and a rename of
+  the judged directory into excluded or pruned ground during the write carried the
+  marker there with it, the create being descriptor-relative. Both used to return `Ok`
+  for a marker the fence then suppressed, leaving the caller's barrier to wait out its
+  whole deadline. Both are now the typed `DirExcluded` / `DirPruned` refusals: the first
+  before anything is created, the second after the marker is removed again through the
+  anchors that created it, so nothing of the write is on disk either way. A rename that
+  lands after that last reading is unchanged — the seats' own documented semantics.
+
 - **`tributaries`** — **BREAKING for a custom `Source`**: `Source::arm` and
   `LocalSource::arm` take the per-root `&RootGlobs` as a third argument
   (`arm(&mut self, key: &[C], globs: &RootGlobs)`). An out-of-tree source must accept
