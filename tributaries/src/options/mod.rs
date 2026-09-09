@@ -4,7 +4,7 @@
 
 use core::{num::NonZeroUsize, time::Duration};
 
-use std::vec::Vec;
+use std::{string::String, vec::Vec};
 
 use tributary_proto::glob::Glob;
 
@@ -292,8 +292,14 @@ where
 #[derive(Debug, Clone, clap::Args)]
 #[group(skip)]
 struct SeatArgs {
+  /// Held as the STRINGS the command line carried, not as compiled patterns, and
+  /// compiled only once the count has been judged ([`compile_seat`]). A
+  /// `value_parser` builds one automaton per occurrence as the parse walks the
+  /// arguments, so a `parse_from` handed an arbitrarily long iterator has compiled
+  /// — and is holding — every one of them before any household can count them,
+  /// which is exactly the work [`RootGlobs::MAX_SEAT_PATTERNS`] exists to bound.
   #[arg(long)]
-  prune: Vec<Glob>,
+  prune: Vec<String>,
   /// `num_args = 0..=1` is what gives the seat all THREE of its states a command
   /// line can otherwise only spell two of. The seat is `Option<Vec<Glob>>`: absent
   /// (deliver every file), engaged-and-EMPTY (deliver no file — directories and
@@ -302,8 +308,10 @@ struct SeatArgs {
   /// every other face can express — had no spelling at all here, and no parse could
   /// produce it. Taking zero values makes a bare `--include` exactly that seat,
   /// while occurrences still append, so `--include a --include b` is unchanged.
+  ///
+  /// Raw strings for `prune`'s reason, and bounded the same way.
   #[arg(long, num_args = 0..=1)]
-  include: Option<Vec<Glob>>,
+  include: Option<Vec<String>>,
 }
 
 #[cfg(feature = "clap")]
@@ -311,6 +319,64 @@ impl SeatArgs {
   /// The seat flag names — the ONE list, so a seat added to the vocabulary cannot
   /// be forgotten by a household's arg group.
   const FLAGS: [&'static str; 2] = ["prune", "include"];
+
+  /// Both seats compiled — the one site either household compiles at, and only
+  /// after [`compile_seat`] has judged their length.
+  fn compiled(self) -> Result<(Vec<Glob>, Option<Vec<Glob>>), clap::Error> {
+    Ok((
+      compile_seat(self.prune, "--prune")?,
+      self
+        .include
+        .map(|include| compile_seat(include, "--include"))
+        .transpose()?,
+    ))
+  }
+
+  /// The way back, for an UPDATE: a compiled seat renders to the patterns it was
+  /// compiled from, which is the spelling the flags carry.
+  fn spelled(prune: &[Glob], include: Option<&[Glob]>) -> Self {
+    let pattern = |glob: &Glob| glob.as_str().to_owned();
+    Self {
+      prune: prune.iter().map(pattern).collect(),
+      include: include.map(|include| include.iter().map(pattern).collect()),
+    }
+  }
+}
+
+/// Compiles ONE glob seat off the command line, refusing a list longer than
+/// [`RootGlobs::MAX_SEAT_PATTERNS`] BEFORE it compiles anything.
+///
+/// The order is the whole point. A seat past the ceiling is refused for a resource
+/// reason — every pattern in it is an automaton the source then asks per candidate
+/// — so a face that compiles first and counts afterwards has already paid what the
+/// bound exists to refuse. The count is a property of the list, not of any pattern
+/// in it, so it can be answered without touching one.
+///
+/// A pattern the matcher cannot compile is still the flag's own refusal, carrying
+/// the type's message, so the value a person mistyped is the one they are told
+/// about.
+#[cfg(feature = "clap")]
+fn compile_seat(patterns: Vec<String>, flag: &str) -> Result<Vec<Glob>, clap::Error> {
+  if patterns.len() > RootGlobs::MAX_SEAT_PATTERNS {
+    return Err(clap::Error::raw(
+      clap::error::ErrorKind::ValueValidation,
+      std::format!(
+        "more {flag} patterns than the per-seat limit of {}\n",
+        RootGlobs::MAX_SEAT_PATTERNS
+      ),
+    ));
+  }
+  patterns
+    .iter()
+    .map(|pattern| {
+      Glob::new(pattern).map_err(|err| {
+        clap::Error::raw(
+          clap::error::ErrorKind::ValueValidation,
+          std::format!("invalid value for {flag}: {err}\n"),
+        )
+      })
+    })
+    .collect()
 }
 
 /// The value an argument carried, but ONLY when the COMMAND LINE is where it came
@@ -1239,10 +1305,12 @@ impl Default for TributariesOptions {
 /// A seat is asked once per candidate by the source it is armed on, so its length
 /// is per-event work — and the length is a caller's to write. Both are capped at
 /// [`MAX_SEAT_PATTERNS`](Self::MAX_SEAT_PATTERNS), which
-/// [`validate`](Self::validate) checks, the `serde` face refuses mid-document, and
-/// [`Tributaries::watch`](crate::Tributaries::watch) refuses on before anything is
-/// planned. Beneath all of them the matcher's own constructor carries the same
-/// bound, so words this household never saw are bounded too.
+/// [`validate`](Self::validate) checks, the `serde` face refuses mid-document, the
+/// `clap` face refuses at the occurrence past it — before a pattern of the seat is
+/// compiled at all — and [`Tributaries::watch`](crate::Tributaries::watch) refuses
+/// on before anything is planned. Beneath all of them the matcher's own
+/// constructor carries the same bound, so words this household never saw are
+/// bounded too.
 ///
 /// # Configuration faces
 ///
@@ -1294,27 +1362,17 @@ pub struct RootGlobs {
 }
 
 #[cfg(feature = "clap")]
-impl From<SeatArgs> for RootGlobs {
-  fn from(args: SeatArgs) -> Self {
-    let SeatArgs { prune, include } = args;
-    Self { prune, include }
-  }
-}
-
-#[cfg(feature = "clap")]
 impl From<&RootGlobs> for SeatArgs {
   fn from(globs: &RootGlobs) -> Self {
-    Self {
-      prune: globs.prune.clone(),
-      include: globs.include.clone(),
-    }
+    Self::spelled(&globs.prune, globs.include.as_deref())
   }
 }
 
 #[cfg(feature = "clap")]
 impl clap::FromArgMatches for RootGlobs {
   fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
-    SeatArgs::from_arg_matches(matches).map(Into::into)
+    let (prune, include) = SeatArgs::from_arg_matches(matches)?.compiled()?;
+    Ok(Self { prune, include })
   }
 
   /// Applies the seat the COMMAND LINE named and leaves the other as it stood —
@@ -1323,7 +1381,7 @@ impl clap::FromArgMatches for RootGlobs {
   fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
     let mut args = SeatArgs::from(&*self);
     args.update_from_arg_matches(matches)?;
-    let SeatArgs { prune, include } = args;
+    let (prune, include) = args.compiled()?;
     self.prune = prune;
     self.include = include;
     Ok(())
@@ -1627,10 +1685,7 @@ impl<C> From<&WatchOptions<C>> for WatchOptionsArgs {
   fn from(options: &WatchOptions<C>) -> Self {
     Self {
       interest: options.interest,
-      seats: SeatArgs {
-        prune: options.prune.clone(),
-        include: options.include.clone(),
-      },
+      seats: SeatArgs::spelled(&options.prune, options.include.as_deref()),
     }
   }
 }
@@ -1641,10 +1696,8 @@ impl<C> clap::FromArgMatches for WatchOptions<C> {
   /// values: a fresh accept-all [`Filter`] — never one shared with a caller's —
   /// and the inherited [`Debounce`] posture.
   fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
-    let WatchOptionsArgs {
-      interest,
-      seats: SeatArgs { prune, include },
-    } = WatchOptionsArgs::from_arg_matches(matches)?;
+    let WatchOptionsArgs { interest, seats } = WatchOptionsArgs::from_arg_matches(matches)?;
+    let (prune, include) = seats.compiled()?;
     Ok(Self {
       interest,
       filter: Filter::all(),
@@ -1662,10 +1715,8 @@ impl<C> clap::FromArgMatches for WatchOptions<C> {
   fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
     let mut args = WatchOptionsArgs::from(&*self);
     args.update_from_arg_matches(matches)?;
-    let WatchOptionsArgs {
-      interest,
-      seats: SeatArgs { prune, include },
-    } = args;
+    let WatchOptionsArgs { interest, seats } = args;
+    let (prune, include) = seats.compiled()?;
     self.interest = interest;
     self.prune = prune;
     self.include = include;

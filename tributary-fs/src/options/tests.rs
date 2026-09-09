@@ -275,6 +275,51 @@ mod serde_face {
     }
   }
 
+  /// The exclusion list past its ceiling is a DOCUMENT error, refused mid-list
+  /// rather than read whole and measured afterwards.
+  ///
+  /// The bound is a resource bound — the OS honours eight per root — so a face
+  /// that reads an untrusted length to the end before judging it has already
+  /// allocated everything the bound exists to refuse: a streaming document naming
+  /// millions of exclusions costs the process its memory before the caller ever
+  /// holds a value to validate. The element that would take the set past the
+  /// ceiling is where the read stops.
+  ///
+  /// Revert witness: derive the field plainly and a nine-entry document parses
+  /// into a household `validate` then has to catch — after allocating every path.
+  #[test]
+  fn a_document_past_the_exclusion_ceiling_is_refused() {
+    let cap = WatcherOptions::MAX_EXCLUSIONS;
+    let list = |count: usize| {
+      (0..count)
+        .map(|n| format!("\"/x{n}\""))
+        .collect::<Vec<_>>()
+        .join(",")
+    };
+
+    let full: WatcherOptions =
+      serde_json::from_str(&format!(r#"{{"exclusions": [{}]}}"#, list(cap)))
+        .expect("the ceiling itself is honoured");
+    assert_eq!(full.exclusions_slice().len(), cap);
+    full.validate().expect("and it is an admissible household");
+
+    let err =
+      serde_json::from_str::<WatcherOptions>(&format!(r#"{{"exclusions": [{}]}}"#, list(cap + 1)))
+        .expect_err("one past it is a document error");
+    assert!(
+      err.to_string().contains(&format!("{cap}")),
+      "the refusal names the ceiling: {err}"
+    );
+
+    // The empty list is untouched: no exclusion is the default household.
+    assert!(
+      serde_json::from_str::<WatcherOptions>(r#"{"exclusions": []}"#)
+        .expect("an empty list parses")
+        .exclusions_slice()
+        .is_empty()
+    );
+  }
+
   /// Durations are humantime TEXT in both directions.
   #[test]
   fn durations_are_humantime_text() {
@@ -421,6 +466,57 @@ mod clap_face {
     assert_eq!(
       parse(&["--exclusions", "/a", "--exclusions", "/b"]).exclusions_slice(),
       [PathBuf::from("/a"), PathBuf::from("/b")]
+    );
+  }
+
+  /// And the ceiling, at the same flag: the occurrence past
+  /// [`WatcherOptions::MAX_EXCLUSIONS`] is refused before the household is built.
+  ///
+  /// `--exclusions` repeats, and a programmatic `parse_from` can hand it an
+  /// arbitrarily long iterator, so a face that reads the values into an owned list
+  /// and measures it afterwards has already built what the bound exists to refuse.
+  /// The count is asked of the matches, which own the values either way.
+  ///
+  /// Revert witness: drop the count check and the nine-flag row parses into a
+  /// household `validate` then has to catch.
+  #[test]
+  fn an_over_full_exclusions_flag_is_refused() {
+    let cap = WatcherOptions::MAX_EXCLUSIONS;
+    let flags = |count: usize| {
+      (0..count)
+        .flat_map(|n| ["--exclusions".to_owned(), format!("/x{n}")])
+        .collect::<Vec<_>>()
+    };
+
+    let full = Cli::parse_from(std::iter::once("app".to_owned()).chain(flags(cap))).options;
+    assert_eq!(full.exclusions_slice().len(), cap, "the ceiling parses");
+    full.validate().expect("and it is an admissible household");
+
+    let err = Cli::try_parse_from(std::iter::once("app".to_owned()).chain(flags(cap + 1)))
+      .err()
+      .expect("one occurrence past the ceiling is refused");
+    assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    assert!(
+      err.render().to_string().contains(&format!("{cap}")),
+      "the refusal names the ceiling: {}",
+      err.render()
+    );
+
+    // An UPDATE is judged by the same rule, and by the same number.
+    let matches = |rest: Vec<String>| {
+      <WatcherOptions as clap::Args>::augment_args_for_update(clap::Command::new("app"))
+        .try_get_matches_from(std::iter::once("app".to_owned()).chain(rest))
+        .expect("the parse itself accepts repeated flags")
+    };
+    let mut options = WatcherOptions::new();
+    assert!(
+      clap::FromArgMatches::update_from_arg_matches(&mut options, &matches(flags(cap + 1)))
+        .is_err(),
+      "an over-full update is refused before it writes the household"
+    );
+    assert!(
+      options.exclusions_slice().is_empty(),
+      "and the household it refused is left exactly as it stood"
     );
   }
 
@@ -969,6 +1065,74 @@ mod root_options {
         Bare::parse_from(["app"]).interest,
         Interest::new(),
         "flattening `Interest` on its own is untouched by the household's proxy"
+      );
+    }
+
+    /// A seat past its ceiling is refused at the FLAG, and refused WITHOUT
+    /// compiling the patterns it carries.
+    ///
+    /// The count is a property of the list, not of any pattern in it, so it can be
+    /// answered before a single automaton exists — and it has to be, because a
+    /// `parse_from` takes an arbitrarily long iterator and every value clap
+    /// compiled on the way past is memory the ceiling was written to refuse.
+    ///
+    /// The pattern that would fail to compile sits AFTER the 256th, so the refusal
+    /// this asserts can only be the count: a face that compiled as it parsed would
+    /// answer with that pattern's own error instead, which is precisely the work
+    /// this cell says never happens.
+    ///
+    /// Revert witness: parse the seats as `Vec<Glob>` again and the row below is
+    /// refused for the unclosed bracket rather than for its length.
+    #[test]
+    fn an_over_full_seat_is_refused_before_it_compiles() {
+      let cap = RootOptions::MAX_SEAT_PATTERNS;
+      let flags = |flag: &str, count: usize, tail: Option<&str>| {
+        (0..count)
+          .flat_map(|n| [flag.to_owned(), std::format!("**/w{n}")])
+          .chain(
+            tail
+              .into_iter()
+              .flat_map(|tail| [flag.to_owned(), tail.to_owned()]),
+          )
+          .collect::<Vec<_>>()
+      };
+      let run =
+        |args: Vec<String>| Cli::try_parse_from(std::iter::once("app".to_owned()).chain(args));
+
+      // The ceiling itself parses, and compiles every one of its patterns.
+      assert_eq!(
+        run(flags("--prune", cap, None))
+          .expect("the ceiling itself is honoured")
+          .options
+          .prune()
+          .len(),
+        cap
+      );
+
+      let err =
+        run(flags("--prune", cap, Some("[unclosed"))).expect_err("one past the ceiling is refused");
+      assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+      let rendered = err.render().to_string();
+      assert!(
+        rendered.contains(&std::format!("{cap}")),
+        "the refusal is the COUNT, naming the ceiling: {rendered}"
+      );
+      assert!(
+        !rendered.contains("invalid glob"),
+        "and the pattern past the ceiling was never compiled: {rendered}"
+      );
+
+      // The include seat carries the same ceiling, through the same helper.
+      let err =
+        run(flags("--include", cap + 1, None)).expect_err("the include seat is bounded too");
+      assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+      assert_eq!(
+        run(flags("--include", cap, None))
+          .expect("its ceiling is honoured too")
+          .options
+          .include()
+          .map(<[Glob]>::len),
+        Some(cap)
       );
     }
 

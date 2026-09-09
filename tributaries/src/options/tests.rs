@@ -971,6 +971,74 @@ mod clap_face {
     assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
   }
 
+  /// A seat past its ceiling is refused at the FLAG, on BOTH households that carry
+  /// the shared flags, and refused WITHOUT compiling the patterns it carries.
+  ///
+  /// The count is a property of the list, not of any pattern in it, so it can be
+  /// answered before a single automaton exists — and it has to be, because a
+  /// `parse_from` takes an arbitrarily long iterator and every value compiled on the
+  /// way past is memory the ceiling was written to refuse.
+  ///
+  /// The pattern that would fail to compile sits AFTER the 256th, so the refusal this
+  /// asserts can only be the count: a face that compiled as it parsed would answer with
+  /// that pattern's own error instead, which is precisely the work this cell says never
+  /// happens. `RootGlobs` and `WatchOptions` share one definition of the flags, so both
+  /// are pinned here.
+  ///
+  /// Revert witness: parse the seats as `Vec<Glob>` again and each over-full row is
+  /// refused for its unclosed bracket rather than for its length.
+  #[test]
+  fn an_over_full_seat_is_refused_before_it_compiles() {
+    let cap = RootGlobs::MAX_SEAT_PATTERNS;
+    let flags = |flag: &str, count: usize, tail: Option<&str>| {
+      std::iter::once("app".to_owned())
+        .chain((0..count).flat_map(|n| [flag.to_owned(), std::format!("**/w{n}")]))
+        .chain(
+          tail
+            .into_iter()
+            .flat_map(|tail| [flag.to_owned(), tail.to_owned()]),
+        )
+        .collect::<std::vec::Vec<_>>()
+    };
+
+    // The ceiling itself parses, and compiles every one of its patterns.
+    assert_eq!(
+      GlobsCli::try_parse_from(flags("--prune", cap, None))
+        .expect("the ceiling itself is honoured")
+        .globs
+        .prune()
+        .len(),
+      cap
+    );
+    assert_eq!(
+      WatchCli::try_parse_from(flags("--include", cap, None))
+        .expect("the other household honours it too")
+        .options
+        .include()
+        .map(<[_]>::len),
+      Some(cap)
+    );
+
+    // One past it, with the uncompilable pattern in that last position: the refusal
+    // is the COUNT, and the pattern was never compiled.
+    for over_full in [
+      GlobsCli::try_parse_from(flags("--prune", cap, Some("[unclosed"))).err(),
+      WatchCli::try_parse_from(flags("--prune", cap, Some("[unclosed"))).err(),
+    ] {
+      let err = over_full.expect("one past the ceiling is refused");
+      assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+      let rendered = err.render().to_string();
+      assert!(
+        rendered.contains(&std::format!("{cap}")),
+        "the refusal names the ceiling: {rendered}"
+      );
+      assert!(
+        !rendered.contains("invalid glob"),
+        "and the pattern past the ceiling was never compiled: {rendered}"
+      );
+    }
+  }
+
   /// An UPDATE applies what the COMMAND LINE carried and nothing else — the rule every
   /// household on this face follows.
   ///

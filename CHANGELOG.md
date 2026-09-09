@@ -439,6 +439,20 @@ All notable changes to this workspace are documented here. The format is based o
   anchors that created it, so nothing of the write is on disk either way. A rename that
   lands after that last reading is unchanged — the seats' own documented semantics.
 
+- **`tributary-fs`**, **`tributaries`** — both configuration faces enforce their
+  collection ceilings WHILE THEY PARSE, rather than leaving them to `validate` after the
+  whole input has been read. `WatcherOptions::exclusions` refuses the element past
+  `MAX_EXCLUSIONS` mid-document and the occurrence past it on the command line; the four
+  glob seats (`tributary_fs::RootOptions`, `RootGlobs`, `WatchOptions`) hold the flags'
+  values as strings and refuse a seat longer than `MAX_SEAT_PATTERNS` BEFORE compiling
+  any of them. Both ceilings are resource bounds — a path list allocated per entry, an
+  automaton compiled and kept per pattern — so a face that read an untrusted length to
+  the end before judging it had already paid what the bound exists to refuse; a
+  `parse_from` or a streaming document could spend the process's memory on a household
+  that could only ever be rejected. The refusals are the format's own (a document error,
+  a `clap` `ValueValidation`), the accepted inputs are unchanged up to and including the
+  ceiling, and `validate` keeps the same check for lists assembled in code.
+
 - **`tributaries`** — **BREAKING for a custom `Source`**: `Source::arm` and
   `LocalSource::arm` take the per-root `&RootGlobs` as a third argument
   (`arm(&mut self, key: &[C], globs: &RootGlobs)`). An out-of-tree source must accept

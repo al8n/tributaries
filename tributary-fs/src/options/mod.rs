@@ -182,15 +182,22 @@ pub(crate) fn derive_move_window(move_window: Duration, latency: Duration) -> Du
 /// }
 /// ```
 ///
-/// Deserializing is exactly as unchecked as the builders are: it never runs
-/// [`validate`](Self::validate). A configuration layer that wants a bad setting
+/// The exclusion list is the one key with a ceiling of its own on this face:
+/// [`MAX_EXCLUSIONS`](Self::MAX_EXCLUSIONS) paths, refused at the element past it
+/// rather than after the whole list has been read, so a document cannot spend the
+/// process's memory naming exclusions no watcher would accept.
+///
+/// Deserializing is otherwise exactly as unchecked as the builders are: it never
+/// runs [`validate`](Self::validate). A configuration layer that wants a bad setting
 /// refused where the setting is READ calls it on the loaded value — the same one
 /// explicit step [`Watcher::new`](crate::Watcher::new) runs.
 ///
 /// With the `clap` feature it is a `clap::Args` group of one `--<field>` flag
 /// per knob, each defaulting to the same value [`new`](Self::new) gives it, so a
 /// flagless command line is the default household. `--exclusions` repeats, once
-/// per path.
+/// per path, and carries the serde face's ceiling at the same door: the
+/// occurrence past [`MAX_EXCLUSIONS`](Self::MAX_EXCLUSIONS) is a parse refusal,
+/// taken before the household is built.
 ///
 /// ```text
 /// $ app --latency 25ms --watcher-event-capacity 4096 --backend fanotify \
@@ -234,11 +241,99 @@ pub struct WatcherOptions {
   event_capacity: NonZeroUsize,
   os_batch_capacity: NonZeroUsize,
   os_buffer_bytes: NonZeroU32,
+  #[cfg_attr(feature = "serde", serde(deserialize_with = "deserialize_exclusions"))]
   exclusions: Vec<PathBuf>,
   backend: Backend,
   #[cfg_attr(feature = "serde", serde(with = "humantime_serde"))]
   root_liveness_interval: Duration,
   max_map_directories: Option<usize>,
+}
+
+/// Reads the exclusion set, refusing the element past
+/// [`WatcherOptions::MAX_EXCLUSIONS`] rather than the list after it.
+///
+/// The refusal has to happen mid-sequence to mean anything: a document is an
+/// untrusted length, and reading it whole so the count can be checked afterwards
+/// has already allocated every path the bound exists to refuse — a streaming
+/// document naming millions of exclusions costs the process its memory before the
+/// caller has a value to run [`WatcherOptions::validate`] on. So the element that
+/// would take the set past the ceiling is where this stops, with at most the
+/// ceiling's worth of paths ever held.
+///
+/// [`validate`](WatcherOptions::validate) keeps the same check for the
+/// programmatic builders, which are the one face that hands a whole list over at
+/// once and can therefore only be judged after it exists.
+#[cfg(feature = "serde")]
+fn deserialize_exclusions<'de, D>(deserializer: D) -> Result<Vec<PathBuf>, D::Error>
+where
+  D: serde::Deserializer<'de>,
+{
+  struct Exclusions;
+
+  impl<'de> serde::de::Visitor<'de> for Exclusions {
+    type Value = Vec<PathBuf>;
+
+    fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+      write!(
+        f,
+        "at most {} exclusion directories",
+        WatcherOptions::MAX_EXCLUSIONS
+      )
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+      A: serde::de::SeqAccess<'de>,
+    {
+      use serde::de::Error as _;
+
+      // The hint is a document's own claim, so it steers the allocation and never
+      // the bound: capped at the ceiling, it cannot be used to ask for a
+      // reservation nothing will fill.
+      let hint = seq
+        .size_hint()
+        .unwrap_or(0)
+        .min(WatcherOptions::MAX_EXCLUSIONS);
+      let mut exclusions = Vec::with_capacity(hint);
+      while let Some(path) = seq.next_element::<PathBuf>()? {
+        if exclusions.len() == WatcherOptions::MAX_EXCLUSIONS {
+          return Err(A::Error::custom(format!(
+            "more exclusion directories than the limit of {}",
+            WatcherOptions::MAX_EXCLUSIONS
+          )));
+        }
+        exclusions.push(path);
+      }
+      Ok(exclusions)
+    }
+  }
+
+  deserializer.deserialize_seq(Exclusions)
+}
+
+/// The same bound on the command line, asked of the OCCURRENCE COUNT before a
+/// single path is taken out of the parse.
+///
+/// `--exclusions` repeats, and a programmatic `parse_from` can hand it an
+/// arbitrarily long iterator: reading the values into the household first and
+/// measuring them afterwards builds the whole owned list the bound exists to
+/// refuse. Counting the matches costs one pass over borrowed values and clones
+/// nothing, so the ninth occurrence is refused before the household exists.
+#[cfg(feature = "clap")]
+fn refuse_over_full_exclusions(matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+  let supplied = matches
+    .get_many::<PathBuf>("exclusions")
+    .map_or(0, Iterator::count);
+  if supplied > WatcherOptions::MAX_EXCLUSIONS {
+    return Err(clap::Error::raw(
+      clap::error::ErrorKind::ValueValidation,
+      format!(
+        "more --exclusions directories than the limit of {}\n",
+        WatcherOptions::MAX_EXCLUSIONS
+      ),
+    ));
+  }
+  Ok(())
 }
 
 /// The `clap` face of [`WatcherOptions`]: the same nine flags the household derived
@@ -358,6 +453,7 @@ impl From<WatcherOptionsArgs> for WatcherOptions {
 #[cfg(feature = "clap")]
 impl clap::FromArgMatches for WatcherOptions {
   fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+    refuse_over_full_exclusions(matches)?;
     WatcherOptionsArgs::from_arg_matches(matches).map(Into::into)
   }
 
@@ -370,6 +466,7 @@ impl clap::FromArgMatches for WatcherOptions {
   /// liveness interval to what a flagless command line means, silently discarding
   /// whatever the configuration layer had loaded.
   fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+    refuse_over_full_exclusions(matches)?;
     if let Some(latency) = command_line_value(matches, "latency") {
       self.latency = latency;
     }
@@ -506,6 +603,10 @@ impl WatcherOptions {
 
   /// The most exclusion directories the OS honors per root
   /// (`FSEventStreamSetExclusionPaths` accepts at most eight).
+  ///
+  /// The one constant every face measures against: the serde list stops at the
+  /// element past it, the `--exclusions` flag at the occurrence past it, and
+  /// [`validate`](Self::validate) at a list handed over whole.
   pub const MAX_EXCLUSIONS: usize = crate::os::MAX_EXCLUSIONS;
 
   /// The default per-root backend selection: [`Backend::Auto`] — resolved to
@@ -761,9 +862,11 @@ impl WatcherOptions {
   /// slice.
   ///
   /// Purely an optimization (at most [`MAX_EXCLUSIONS`](Self::MAX_EXCLUSIONS),
-  /// enforced at [`Watcher::new`](crate::Watcher::new)); correctness never
-  /// depends on them. Subtracting ground you do not care about is how you keep a
-  /// build cache's churn from costing you watches, map entries and deliveries.
+  /// enforced by both configuration faces as they parse and by
+  /// [`Watcher::new`](crate::Watcher::new) for a list assembled in code);
+  /// correctness never depends on them. Subtracting ground you do not care about
+  /// is how you keep a build cache's churn from costing you watches, map entries
+  /// and deliveries.
   ///
   /// # What an exclusion guarantees
   ///
@@ -1047,10 +1150,10 @@ impl Default for WatcherOptions {
 /// nesting) and one seat by [`MAX_SEAT_PATTERNS`](Self::MAX_SEAT_PATTERNS), which
 /// [`validate`](Self::validate) checks and
 /// [`watch_with`](crate::Watcher::watch_with) refuses on before any coverage
-/// exists. The `serde` face refuses an over-full seat mid-document, so a list
-/// past the ceiling never even compiles; and beneath every one of those the
-/// matcher's own constructor carries the same bound, so a seat this household
-/// never saw is bounded too.
+/// exists. The `serde` face refuses an over-full seat mid-document and the `clap`
+/// face at the occurrence past the ceiling, so on neither of them does a list past
+/// it ever compile; and beneath every one of those the matcher's own constructor
+/// carries the same bound, so a seat this household never saw is bounded too.
 ///
 /// With the `serde` feature the household is one object keyed by the field
 /// names, every key optional and defaulted from [`new`](Self::new); the two glob
@@ -1062,10 +1165,12 @@ impl Default for WatcherOptions {
 /// ```
 ///
 /// With the `clap` feature it is a `clap::Args` group whose `--prune` and
-/// `--include` flags repeat, once per pattern. `--include` spells all THREE of the
-/// seat's states: given no times at all it is [`None`] (deliver everything); given
-/// once with NO VALUE it is the engaged-but-empty seat (deliver no file —
-/// directories and `Rescan`s only); given with values it carries them.
+/// `--include` flags repeat, once per pattern, up to the ceiling — the occurrence
+/// past it is a parse refusal, taken before the seat is compiled. `--include`
+/// spells all THREE of the seat's states: given no times at all it is [`None`]
+/// (deliver everything); given once with NO VALUE it is the engaged-but-empty
+/// seat (deliver no file — directories and `Rescan`s only); given with values it
+/// carries them.
 ///
 /// ```text
 /// $ app --prune '**/node_modules' --prune '**/.git' --include '**/*.mp4'
@@ -1224,8 +1329,14 @@ where
 struct RootOptionsArgs {
   #[command(flatten)]
   interest: RootInterestArgs,
+  /// Held as the STRINGS the command line carried, not as compiled patterns, and
+  /// compiled only once the count has been judged ([`compile_seat`]). A
+  /// `value_parser` builds one automaton per occurrence as the parse walks the
+  /// arguments, so a `parse_from` handed an arbitrarily long iterator has compiled
+  /// — and is holding — every one of them before any face can count them, which is
+  /// exactly the work [`RootOptions::MAX_SEAT_PATTERNS`] exists to bound.
   #[arg(long)]
-  prune: Vec<Glob>,
+  prune: Vec<String>,
   /// `num_args = 0..=1` is what gives the seat all THREE of its states a command
   /// line can otherwise only spell two of. The seat is `Option<Vec<Glob>>`: absent
   /// (deliver every file), engaged-and-EMPTY (deliver no file — directories and
@@ -1234,8 +1345,46 @@ struct RootOptionsArgs {
   /// every other face can express — had no spelling at all here, and no parse could
   /// produce it. Taking zero values makes a bare `--include` exactly that seat,
   /// while occurrences still append, so `--include a --include b` is unchanged.
+  ///
+  /// Raw strings for `prune`'s reason, and bounded the same way.
   #[arg(long, num_args = 0..=1)]
-  include: Option<Vec<Glob>>,
+  include: Option<Vec<String>>,
+}
+
+/// Compiles ONE glob seat off the command line, refusing a list longer than
+/// [`RootOptions::MAX_SEAT_PATTERNS`] BEFORE it compiles anything.
+///
+/// The order is the whole point. A seat past the ceiling is refused for a resource
+/// reason — every pattern in it is an automaton the fence then asks per directory
+/// prefix of every event — so a face that compiles first and counts afterwards has
+/// already paid what the bound exists to refuse. The count is a property of the
+/// list, not of any pattern in it, so it can be answered without touching one.
+///
+/// A pattern the matcher cannot compile is still the flag's own refusal, carrying
+/// the type's message, so the value a person mistyped is the one they are told
+/// about.
+#[cfg(feature = "clap")]
+fn compile_seat(patterns: Vec<String>, flag: &str) -> Result<Vec<Glob>, clap::Error> {
+  if patterns.len() > RootOptions::MAX_SEAT_PATTERNS {
+    return Err(clap::Error::raw(
+      clap::error::ErrorKind::ValueValidation,
+      format!(
+        "more {flag} patterns than the per-seat limit of {}\n",
+        RootOptions::MAX_SEAT_PATTERNS
+      ),
+    ));
+  }
+  patterns
+    .iter()
+    .map(|pattern| {
+      Glob::new(pattern).map_err(|err| {
+        clap::Error::raw(
+          clap::error::ErrorKind::ValueValidation,
+          format!("invalid value for {flag}: {err}\n"),
+        )
+      })
+    })
+    .collect()
 }
 
 /// One `--<field>` flag per [`Interest`] bit, read as "narrow to exactly these".
@@ -1321,31 +1470,47 @@ impl From<Interest> for RootInterestArgs {
 }
 
 #[cfg(feature = "clap")]
-impl From<RootOptionsArgs> for RootOptions {
-  fn from(args: RootOptionsArgs) -> Self {
-    Self {
-      interest: args.interest.into(),
-      prune: args.prune,
-      include: args.include,
-    }
+impl RootOptionsArgs {
+  /// The household these arguments spell — the one site the two seats are compiled
+  /// at, and only after [`compile_seat`] has judged their length.
+  fn into_options(self) -> Result<RootOptions, clap::Error> {
+    Ok(RootOptions {
+      interest: self.interest.into(),
+      prune: compile_seat(self.prune, "--prune")?,
+      include: self
+        .include
+        .map(|include| compile_seat(include, "--include"))
+        .transpose()?,
+    })
   }
 }
 
 #[cfg(feature = "clap")]
 impl From<&RootOptions> for RootOptionsArgs {
+  /// The way back, for an UPDATE: a compiled seat renders to the patterns it was
+  /// compiled from, which is the spelling the flags carry.
   fn from(options: &RootOptions) -> Self {
     Self {
       interest: options.interest.into(),
-      prune: options.prune.clone(),
-      include: options.include.clone(),
+      prune: options.prune.iter().map(seat_pattern).collect(),
+      include: options
+        .include
+        .as_ref()
+        .map(|include| include.iter().map(seat_pattern).collect()),
     }
   }
+}
+
+/// One compiled pattern as the string a command line spells it with.
+#[cfg(feature = "clap")]
+fn seat_pattern(glob: &Glob) -> String {
+  glob.as_str().to_owned()
 }
 
 #[cfg(feature = "clap")]
 impl clap::FromArgMatches for RootOptions {
   fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
-    RootOptionsArgs::from_arg_matches(matches).map(Into::into)
+    RootOptionsArgs::from_arg_matches(matches)?.into_options()
   }
 
   /// Applies only what the COMMAND LINE said, leaving every other field of the
@@ -1367,16 +1532,12 @@ impl clap::FromArgMatches for RootOptions {
   fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
     let mut args = RootOptionsArgs::from(&*self);
     args.update_from_arg_matches(matches)?;
-    let RootOptionsArgs {
-      interest,
-      prune,
-      include,
-    } = args;
+    let updated = args.into_options()?;
     if RootInterestArgs::given_on_command_line(matches) {
-      self.interest = interest.into();
+      self.interest = updated.interest;
     }
-    self.prune = prune;
-    self.include = include;
+    self.prune = updated.prune;
+    self.include = updated.include;
     Ok(())
   }
 }
