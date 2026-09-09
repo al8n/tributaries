@@ -7075,8 +7075,8 @@ fn cookie_dir<'a>(root: &Path, dir: &'a Path) -> &'a Path {
 /// The watcher-wide allowance every admission pin is opened under — the bound on
 /// how many syncs may be HOLDING descriptors at once.
 ///
-/// The door opens up to three directories per call ([`AdmittedDirs`]) on the
-/// caller's own thread, before the command carrying them can reach the driver.
+/// The door opens up to three directories per call ([`AdmittedDirs`]) — on the
+/// blocking pool, and before the command carrying them can reach the driver.
 /// Nothing downstream bounds that: the driver's caps are counted when it READS a
 /// command, and a caller may poll thousands of `sync_root` futures together
 /// before the driver gets a turn — each of them holding its pins while its send
@@ -7087,7 +7087,10 @@ fn cookie_dir<'a>(root: &Path, dir: &'a Path) -> &'a Path {
 /// then travels inside the sampling it authorized, which makes it a bound on
 /// DESCRIPTORS rather than on calls: it is released exactly when the pins close —
 /// when the write, the refusal or the retirement drops the obligation, or when a
-/// caller drops its future before the send.
+/// caller drops its future before the send. A caller that walks away mid-sampling
+/// gives its slot back on the POOL thread, when the opens it is waiting on
+/// finally return; the accounting is the same, and nothing the caller owns is
+/// waiting for it.
 ///
 /// It is sized by the ledger's own global cookie cap, which already bounds how
 /// many syncs one watcher may have outstanding, so the two agree by construction:
@@ -7455,15 +7458,73 @@ pub(crate) struct AdmittedDirs {
   permit: Option<SyncPinPermit>,
 }
 
+/// The sampling is produced ON the blocking pool and handed back to the door
+/// through a oneshot, so it crosses a thread boundary on every call. That is a
+/// property of the FIELDS — owned descriptors, an identity tuple, and the
+/// allowance receiver behind an `Arc` — rather than of anything written in the
+/// door, which is why it is asserted here rather than assumed there: a field
+/// that stopped being `Send` is then a type error beside the type that lost the
+/// property, not inside the caller that needed it.
+const _: () = {
+  const fn crosses_threads<T: Send>() {}
+  crosses_threads::<AdmittedDirs>();
+};
+
+/// A seam at the top of the door's sampling: a one-shot step, armed for ONE
+/// directory, run by the [`AdmittedDirs::read`] that samples that directory and
+/// by no other.
+///
+/// The window it exposes is the one the pool exists to survive: a pathname
+/// resolved against a mount that never answers. Nothing in a test can stage a
+/// hung mount, so a step that parks here stands in for one, and what the cells
+/// then ask is the whole of what matters about it — that the caller's future,
+/// the close behind it and the allowance slot are all free of it.
+///
+/// PROCESS-GLOBAL rather than thread-local, because the sampling runs on a pool
+/// thread that no thread-local of the test's own thread could reach. Every door
+/// in the process therefore consults this one slot, and two properties keep that
+/// from reaching past the cell that armed it: the DIRECTORY is part of the
+/// arming, so a door sampling anything else leaves the step where it is; and the
+/// door that matches TAKES the step out and runs it with the lock released, so a
+/// step that parks holds neither the next door nor a parallel cell's — and it is
+/// spent, which is what lets the arming cell sample again afterwards.
+///
+/// Production compiles no call to it at all. Its cfg is exactly the union of the
+/// cells that arm it (the real-filesystem identity module).
+#[cfg(all(
+  test,
+  feature = "tokio",
+  not(miri),
+  any(target_os = "linux", target_os = "macos")
+))]
+pub(crate) static SYNC_DOOR_STEP: Mutex<Option<ArmedDoorStep>> = Mutex::new(None);
+
+/// One [`SYNC_DOOR_STEP`] arming: the directory it speaks for, and the one-shot
+/// job the door that samples that directory runs.
+#[cfg(all(
+  test,
+  feature = "tokio",
+  not(miri),
+  any(target_os = "linux", target_os = "macos")
+))]
+type ArmedDoorStep = (PathBuf, Box<dyn FnOnce() + Send>);
+
 impl AdmittedDirs {
   /// Samples — and holds — all three directories for a sync of `dir` under
   /// `root`, under the `permit` that bounds how many such samplings may be held
   /// at once.
   ///
+  /// Called ON the blocking pool, never on the thread that polls the door: every
+  /// open below resolves a pathname against a mount that may never answer, and
+  /// the door's whole cancellation story rests on the polling thread being able
+  /// to walk away from one ([`Watcher::sync_root`](crate::Watcher::sync_root)).
+  ///
   /// The permit is acquired by the DOOR, before this is called, and then travels
   /// inside the value it authorized: nothing opens a descriptor here that the
   /// allowance has not already made room for, and the room is given back with the
-  /// descriptors and never before them.
+  /// descriptors and never before them — including when the caller has walked
+  /// away, in which case this value is dropped on the pool thread the moment the
+  /// last of these calls returns.
   ///
   /// A pin that could not be opened is one of two different facts and is reported
   /// as the one it is ([`definite_pin`]): a name nothing answered at is a definite
@@ -7476,6 +7537,29 @@ impl AdmittedDirs {
     root: &Path,
     dir: &Path,
   ) -> Result<Self, std::io::Error> {
+    // Taken OUT of the slot to run, and only when this is the directory it was
+    // armed for: a step that parks must hold neither the lock the next door has
+    // to take nor an arming that was never meant for it ([`SYNC_DOOR_STEP`]).
+    #[cfg(all(
+      test,
+      feature = "tokio",
+      not(miri),
+      any(target_os = "linux", target_os = "macos")
+    ))]
+    {
+      let step = {
+        let mut armed = SYNC_DOOR_STEP
+          .lock()
+          .unwrap_or_else(PoisonError::into_inner);
+        match armed.as_ref() {
+          Some((armed_for, _)) if armed_for == dir => armed.take().map(|(_, step)| step),
+          _ => None,
+        }
+      };
+      if let Some(step) = step {
+        step();
+      }
+    }
     Ok(Self {
       root: watched_root_identity(root)?,
       target: cookie_target_identity(root, dir)?,

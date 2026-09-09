@@ -1062,6 +1062,9 @@ pub struct Watcher<R> {
   /// Shared across clones of one watcher, like the mint above: the bound belongs
   /// to the watcher, not to a handle.
   pins: crate::driver::SyncPinAllowance,
+  /// The blocking pool the sync door samples its admission pins on
+  /// ([`BlockingSpawner`]).
+  blocking: BlockingSpawner,
   events: EventStream,
   roots: Arc<RwLock<RootSet>>,
   // `fn() -> R`, not `R`: the watcher holds no runtime value, so its auto
@@ -1076,6 +1079,24 @@ pub struct Watcher<R> {
 /// `Watcher: Sync`, hence `&Watcher: Send`.
 type EventStream =
   Pin<Box<dyn Stream<Item = (ScopeId, Arc<PathBuf>, Change)> + Send + Sync + 'static>>;
+
+/// The blocking-job spawner the sync door hands its sampling to — captured from
+/// `R` at the one place the runtime bound is in scope (the constructors) and
+/// type-erased from there, in the mold of the cookie registry's own detached
+/// spawner.
+///
+/// The erasure is what keeps [`sync_root`](Watcher::sync_root) on the unbounded
+/// `impl<R> Watcher<R>` where every other channel method lives. That is not a
+/// tidiness preference: the umbrella's `impl<R> Source<OsString> for FsSource<R>`
+/// carries no runtime bound, and a `R: RuntimeLite` reached for here would
+/// propagate out to it through a trait impl that cannot take one.
+///
+/// `Arc` rather than `Box` for the reason the mint and the allowance are behind
+/// one — one pool per watcher, shared by everything that samples through it —
+/// and `Send + Sync` (the captured closure is zero-capture, so it is both) keeps
+/// the watcher's own auto traits independent of `R`, which is the whole point of
+/// holding `PhantomData<fn() -> R>` rather than an `R`.
+type BlockingSpawner = Arc<dyn Fn(Box<dyn FnOnce() + Send>) + Send + Sync + 'static>;
 
 impl<R> core::fmt::Debug for Watcher<R> {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -1141,6 +1162,9 @@ impl<R: RuntimeLite> Watcher<R> {
       sync_tickets: Arc::new(AtomicU64::new(1)),
       nonces: sync_nonce_generator().map(|generator| Arc::new(Mutex::new(generator))),
       pins,
+      // The ONE place `R` is in scope for the door: the sampling's pool is
+      // captured here and erased ([`BlockingSpawner`]).
+      blocking: Arc::new(|job| R::spawn_blocking_detach(job)),
       events: Box::pin(event_rx),
       roots,
       _runtime: PhantomData,
@@ -2003,13 +2027,11 @@ impl<R> Watcher<R> {
     // Two of them, because the marker is not born in the directory the caller
     // named but in the reserved cookie directory one level inside it, and a
     // replacement THERE is a directory whose coverage the cut never proved just as
-    // surely. Two `stat`s on this caller's own thread, in [`watch`](Self::watch)'s
-    // mold — never on the driver's owner loop, which must not resolve a pathname
-    // against a mount that can hang.
+    // surely.
     //
     // Bounded FIRST, and by the watcher rather than by the driver: the caps that
     // bound a sync are counted when the driver READS the command below, which is
-    // far too late to bound what this thread opens. A caller may poll thousands of
+    // far too late to bound what the sampling opens. A caller may poll thousands of
     // these futures together, and every one of them would hold its pins while its
     // send waited behind a sixteen-deep mailbox — `EMFILE` for the whole process,
     // reached before a single cap was consulted, with the watcher's own I/O and
@@ -2017,19 +2039,63 @@ impl<R> Watcher<R> {
     // is taken before any descriptor is, and it travels INSIDE the sampling: it
     // comes back when the pins do, including when this future is dropped before
     // the send below ([`SyncPinAllowance`](crate::driver::SyncPinAllowance)).
+    //
+    // Then opened ON THE BLOCKING POOL, for exactly the reason the write itself is:
+    // a pathname resolved against a mount that can hang must never be resolved on a
+    // thread that owns other work. This future is not polled in a vacuum — the
+    // umbrella owner polls it inside the `select_biased!` whose whole argument is
+    // that a stalled sync is a PENDING future the close and cancellation arms can
+    // win over — so three `openat`s taken inline here are a poll that never returns:
+    // neither arm ever runs, the owner wedges, and it wedges on precisely the mount
+    // that race exists to survive. The permit is moved into the job with the
+    // sampling it authorizes, so the allowance still bounds descriptors and not
+    // calls, and taking it BEFORE the spawn is what keeps a flood of first polls
+    // from queueing past the allowance onto the pool.
+    //
+    // Cancellation is what the oneshot buys, and it is total. A dropped `sync_root`
+    // drops the receiver where it stands; the job's send then fails and the
+    // sampling — pins and permit together — is dropped on the pool thread the
+    // instant its syscalls return. The caller regains control immediately and the
+    // slot comes back when the kernel is done with it, which is the same accounting
+    // a completed sampling gets. Nothing the caller or the close owns is ever
+    // waiting on an open.
     let permit = self.pins.acquire().await;
-    let admitted = match crate::driver::AdmittedDirs::read(permit, &root_path, &dir) {
-      Ok(admitted) => admitted,
+    let (sampled, sampling) = futures_channel::oneshot::channel();
+    let sample_root = root_path;
+    let sample_dir = dir.clone();
+    (self.blocking)(Box::new(move || {
+      let _ = sampled.send(crate::driver::AdmittedDirs::read(
+        permit,
+        &sample_root,
+        &sample_dir,
+      ));
+    }));
+    let admitted = match sampling.await {
+      Ok(Ok(admitted)) => admitted,
       // A pin this door could not TAKE is not a reading about the tree, and
       // answering it as one is what hid a full descriptor table behind a verdict
       // about a directory. It is reported as the write failure it is, carrying the
       // OS error the caller can act on — a definite absence, by contrast, is a
       // reading and is carried in the sampling as one.
-      Err(source) => {
+      Ok(Err(source)) => {
         return Err(SyncRootDenied::classify(
           SyncRootError::Write {
             path: dir.join(&name),
             source,
+          },
+          admission,
+        ));
+      }
+      // The job answered nothing at all: the pool refused it, or it unwound. There
+      // is no reading here either — an empty sampling would be a set of definite
+      // ABSENCES the door never read, and the write reasons from those — so it is
+      // the same fail-closed write failure a pin that could not be taken is, and
+      // the sequence is spent rather than silently admitted.
+      Err(futures_channel::oneshot::Canceled) => {
+        return Err(SyncRootDenied::classify(
+          SyncRootError::Write {
+            path: dir.join(&name),
+            source: std::io::Error::other("the sync door's sampling was lost"),
           },
           admission,
         ));
@@ -2363,6 +2429,24 @@ impl<R> Watcher<R> {
       .get(&root.scope())
       .and_then(|entry| entry.stats.as_ref())
       .map(|stats| stats.snapshot())
+  }
+
+  /// The sync door's allowance itself — for the one cell that asserts on the
+  /// SLOT rather than on what a sync did with it. A watcher whose driver has
+  /// gone answers a fresh `sync_root` from the registry, before the allowance is
+  /// ever consulted, so "the slot came back" cannot be asked through the public
+  /// door once the close it has to survive has happened.
+  ///
+  /// Its cfg is exactly the union of the cells that call it (the real-filesystem
+  /// identity module).
+  #[cfg(all(
+    test,
+    feature = "tokio",
+    not(miri),
+    any(target_os = "linux", target_os = "macos")
+  ))]
+  pub(crate) fn pin_allowance(&self) -> &crate::driver::SyncPinAllowance {
+    &self.pins
   }
 
   /// The number of registry entries — live roots only, by construction.
