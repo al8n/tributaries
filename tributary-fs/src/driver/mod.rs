@@ -7329,7 +7329,8 @@ fn cookie_dir<'a>(root: &Path, dir: &'a Path) -> &'a Path {
 /// how many syncs may be HOLDING descriptors at once.
 ///
 /// The door opens up to three directories per call ([`AdmittedDirs`]) — on the
-/// blocking pool, and before the command carrying them can reach the driver.
+/// blocking pool, one job at a time, and before the command carrying them can
+/// reach the driver.
 /// Nothing downstream bounds that: the driver's caps are counted when it READS a
 /// command, and a caller may poll thousands of `sync_root` futures together
 /// before the driver gets a turn — each of them holding its pins while its send
@@ -7337,13 +7338,15 @@ fn cookie_dir<'a>(root: &Path, dir: &'a Path) -> &'a Path {
 /// is consulted, and takes the process's unrelated I/O down with it.
 ///
 /// So admission is bounded BEFORE anything is opened. A permit is taken first and
-/// then travels inside the sampling it authorized, which makes it a bound on
-/// DESCRIPTORS rather than on calls: it is released exactly when the pins close —
-/// when the write, the refusal or the retirement drops the obligation, or when a
-/// caller drops its future before the send. A caller that walks away mid-sampling
-/// gives its slot back on the POOL thread, when the opens it is waiting on
-/// finally return; the accounting is the same, and nothing the caller owns is
-/// waiting for it.
+/// is then SHARED by everything that can be holding a descriptor it authorized —
+/// the door's own accumulating readings, and each sampling job while it is in
+/// flight — which makes it a bound on DESCRIPTORS rather than on calls. The slot
+/// comes back when the LAST of those holders drops: on the happy path with the
+/// pins, when the write, the refusal or the retirement drops the obligation; and
+/// when a caller walks away mid-sampling, the readings it had already accumulated
+/// drop with its future while the job still inside a syscall keeps the slot until
+/// that syscall returns and its own descriptor goes with it. Nothing the caller
+/// owns is waiting for any of that.
 ///
 /// It is sized by the ledger's own global cookie cap, which already bounds how
 /// many syncs one watcher may have outstanding, so the two agree by construction:
@@ -7396,6 +7399,9 @@ impl SyncPinAllowance {
   /// take one from. The slot is free by construction: the allowance is fresh and
   /// nothing else can reach it.
   ///
+  /// Shared like the door's own, so a cell hands it to
+  /// [`AdmittedDirs::held`] exactly as the door does.
+  ///
   /// Its cfg is exactly the union of the modules that call it (the real-filesystem
   /// directory-only, identity and Windows non-adoption cells).
   #[cfg(all(
@@ -7404,17 +7410,20 @@ impl SyncPinAllowance {
     not(miri),
     any(target_os = "linux", target_os = "macos", target_os = "windows")
   ))]
-  pub(crate) fn permit() -> SyncPinPermit {
+  pub(crate) fn permit() -> Arc<SyncPinPermit> {
     let allowance = Self::new(1);
     let _ = allowance.taken.try_send(());
-    SyncPinPermit {
+    Arc::new(SyncPinPermit {
       freed: allowance.freed,
-    }
+    })
   }
 }
 
-/// One slot of a [`SyncPinAllowance`], held for exactly as long as the pins it
-/// authorized ([`AdmittedDirs`] carries it, and drops it with them).
+/// One slot of a [`SyncPinAllowance`], held for exactly as long as anything that
+/// could still be holding a descriptor it authorized: the door's accumulating
+/// readings and every sampling job still in flight share one of these behind an
+/// `Arc`, and the slot returns when the last of them drops ([`AdmittedDirs`]
+/// carries it onwards, and drops it with the pins).
 #[derive(Debug)]
 pub(crate) struct SyncPinPermit {
   freed: Arc<async_channel::Receiver<()>>,
@@ -7672,13 +7681,26 @@ fn watched_root_identity(root: &Path) -> Result<AdmittedDir, std::io::Error> {
 /// starts from, the directory the sync is admitted FOR, and the reserved cookie
 /// directory inside it the marker will actually stand in.
 ///
-/// They are sampled together, at the door, because that is the instant the
-/// barrier's promise is made — and they are carried together because a write
-/// detached from that instant by a settle fence and a blocking pool can prove
-/// nothing about any of them from a pathname. Every field is a definite reading or
-/// a definite absence of one; what each absence MEANS is stated at the sampler
-/// that produced it ([`watched_root_identity`], [`cookie_target_identity`],
+/// They are sampled at the door, because that is the instant the barrier's promise
+/// is made — and they are carried together because a write detached from that
+/// instant by a settle fence and a blocking pool can prove nothing about any of
+/// them from a pathname. Every field is a definite reading or a definite absence of
+/// one; what each absence MEANS is stated at the sampler that produced it
+/// ([`watched_root_identity`], [`cookie_target_identity`],
 /// [`reserved_cookie_dir_identity`]).
+///
+/// # Three readings, taken one at a time
+///
+/// The three are sampled by three SEPARATE pool jobs the door runs and awaits in
+/// sequence ([`read_one`](Self::read_one)), and this value is assembled from their
+/// answers only once all three are in ([`held`](Self::held)). One job per open is
+/// what keeps a completed pin from being held hostage by the next one: an `openat`
+/// against a mount that never answers is a job that never returns, and a closure
+/// that had already opened the ROOT would keep that descriptor — deferring the
+/// kernel's own deletion notice for the watched root — for as long as the hang
+/// lasted. Held by the DOOR instead, every completed pin drops the moment the
+/// caller's future does, and only the reading still inside a syscall keeps what it
+/// has not yet handed back.
 ///
 /// # The objects are held for the sync's duration, and no longer
 ///
@@ -7695,37 +7717,47 @@ pub(crate) struct AdmittedDirs {
   target: AdmittedDir,
   cookies: AdmittedDir,
   /// The door's allowance slot this sampling was taken under, released when the
-  /// pins are ([`SyncPinAllowance`]).
+  /// last thing holding a descriptor it authorized lets go ([`SyncPinAllowance`]).
   ///
-  /// It rides HERE rather than beside the future that took it because what has
-  /// to be bounded is the descriptors, and these are the descriptors: a sampling
-  /// that reached the driver keeps its slot until the obligation carrying it
-  /// writes, refuses or retires, and one whose caller dropped the future before
-  /// the send gives its slot back with the pins it opened. `None` is a sampling
-  /// that holds nothing at all — the default the driver's own suites admit
-  /// through, and every platform that pins no object.
+  /// It rides HERE rather than beside the future that took it because what has to
+  /// be bounded is the descriptors, and these are the descriptors: a sampling that
+  /// reached the driver keeps its slot until the obligation carrying it writes,
+  /// refuses or retires. `None` is a sampling that holds nothing at all — the
+  /// default the driver's own suites admit through, and every platform that pins no
+  /// object.
+  ///
+  /// SHARED, because the sampling is taken in three jobs and any of them may still
+  /// be inside a syscall when the door walks away. Each job holds a clone for its
+  /// own duration and the door holds one for the readings it has accumulated, so
+  /// the slot comes back when the LAST of them drops — with the pins on the happy
+  /// path, and with the hung job's own descriptor on a cancelled one. The bound
+  /// stays a bound on descriptors that may exist rather than on calls still being
+  /// waited for.
   #[expect(
     dead_code,
     reason = "the slot is HELD, never read: dropping this field is what gives it back"
   )]
-  permit: Option<SyncPinPermit>,
+  permit: Option<Arc<SyncPinPermit>>,
 }
 
-/// The sampling is produced ON the blocking pool and handed back to the door
-/// through a oneshot, so it crosses a thread boundary on every call. That is a
-/// property of the FIELDS — owned descriptors, an identity tuple, and the
+/// Every reading is produced ON the blocking pool and handed back to the door
+/// through a oneshot, so it crosses a thread boundary on every call — one reading
+/// at a time now, and the assembled value along with the command it travels in.
+/// That is a property of the FIELDS — owned descriptors, an identity tuple, and the
 /// allowance receiver behind an `Arc` — rather than of anything written in the
-/// door, which is why it is asserted here rather than assumed there: a field
-/// that stopped being `Send` is then a type error beside the type that lost the
+/// door, which is why it is asserted here rather than assumed there: a field that
+/// stopped being `Send` is then a type error beside the type that lost the
 /// property, not inside the caller that needed it.
 const _: () = {
   const fn crosses_threads<T: Send>() {}
+  crosses_threads::<AdmittedDir>();
   crosses_threads::<AdmittedDirs>();
 };
 
 /// A seam at the top of the door's sampling: a one-shot step, armed for ONE
-/// directory, run by the [`AdmittedDirs::read`] that samples that directory and
-/// by no other.
+/// directory AND one of the door's three points, run by the
+/// [`AdmittedDirs::read_one`] that samples that point of that directory and by no
+/// other.
 ///
 /// The window it exposes is the one the pool exists to survive: a pathname
 /// resolved against a mount that never answers. Nothing in a test can stage a
@@ -7734,13 +7766,19 @@ const _: () = {
 /// the close behind it and the allowance slot are all free of it.
 ///
 /// PROCESS-GLOBAL rather than thread-local, because the sampling runs on a pool
-/// thread that no thread-local of the test's own thread could reach. Every door
-/// in the process therefore consults this one slot, and two properties keep that
-/// from reaching past the cell that armed it: the DIRECTORY is part of the
-/// arming, so a door sampling anything else leaves the step where it is; and the
-/// door that matches TAKES the step out and runs it with the lock released, so a
-/// step that parks holds neither the next door nor a parallel cell's — and it is
-/// spent, which is what lets the arming cell sample again afterwards.
+/// thread that no thread-local of the test's own thread could reach. Every door in
+/// the process therefore consults this one list, and three properties keep that
+/// from reaching past the cell that armed it: the DIRECTORY and the POINT are both
+/// part of an arming, so a door sampling anything else walks past it; the sampler
+/// that matches TAKES its arming out and runs it with the lock released, so a step
+/// that parks holds neither the next door nor a parallel cell's — and it is spent,
+/// which is what lets the arming cell sample again afterwards; and it is a LIST, so
+/// two cells running side by side each keep their own arming instead of the later
+/// one silently replacing the earlier.
+///
+/// The point is what lets a cell park a CHOSEN step: the whole question about a
+/// cancelled sampling is what happens to the readings already taken when a LATER
+/// one hangs, and a seam that could only park the first of them could not ask it.
 ///
 /// Production compiles no call to it at all. Its cfg is exactly the union of the
 /// cells that arm it (the real-filesystem identity module).
@@ -7750,34 +7788,51 @@ const _: () = {
   not(miri),
   any(target_os = "linux", target_os = "macos")
 ))]
-pub(crate) static SYNC_DOOR_STEP: Mutex<Option<ArmedDoorStep>> = Mutex::new(None);
+pub(crate) static SYNC_DOOR_STEP: Mutex<Vec<ArmedDoorStep>> = Mutex::new(Vec::new());
 
-/// One [`SYNC_DOOR_STEP`] arming: the directory it speaks for, and the one-shot
-/// job the door that samples that directory runs.
+/// One [`SYNC_DOOR_STEP`] arming: the directory it speaks for, WHICH of the door's
+/// three samplings it stands in front of, and the one-shot job that sampler runs.
 #[cfg(all(
   test,
   feature = "tokio",
   not(miri),
   any(target_os = "linux", target_os = "macos")
 ))]
-type ArmedDoorStep = (PathBuf, Box<dyn FnOnce() + Send>);
+type ArmedDoorStep = (PathBuf, SyncDoorPoint, Box<dyn FnOnce() + Send>);
+
+/// Which of the door's three samplings is being spoken about.
+///
+/// The door opens three directories per sync, one job at a time, and every one of
+/// them is a distinct question with a distinct answer ([`watched_root_identity`],
+/// [`cookie_target_identity`], [`reserved_cookie_dir_identity`]). This names them,
+/// so the door can say which reading it is asking for and a test seam can say which
+/// one it stands in front of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SyncDoorPoint {
+  /// The watched root every descent of the write starts from.
+  Root,
+  /// The directory the sync was admitted for.
+  Target,
+  /// The reserved cookie directory inside it, where the marker will stand.
+  Cookies,
+}
 
 impl AdmittedDirs {
-  /// Samples — and holds — all three directories for a sync of `dir` under
-  /// `root`, under the `permit` that bounds how many such samplings may be held
-  /// at once.
+  /// Samples — and holds — ONE of the three directories a sync of `dir` under
+  /// `root` is judged against.
   ///
-  /// Called ON the blocking pool, never on the thread that polls the door: every
-  /// open below resolves a pathname against a mount that may never answer, and
-  /// the door's whole cancellation story rests on the polling thread being able
-  /// to walk away from one ([`Watcher::sync_root`](crate::Watcher::sync_root)).
+  /// Called ON the blocking pool, never on the thread that polls the door: the open
+  /// below resolves a pathname against a mount that may never answer, and the
+  /// door's whole cancellation story rests on the polling thread being able to walk
+  /// away from one ([`Watcher::sync_root`](crate::Watcher::sync_root)).
   ///
-  /// The permit is acquired by the DOOR, before this is called, and then travels
-  /// inside the value it authorized: nothing opens a descriptor here that the
-  /// allowance has not already made room for, and the room is given back with the
-  /// descriptors and never before them — including when the caller has walked
-  /// away, in which case this value is dropped on the pool thread the moment the
-  /// last of these calls returns.
+  /// One point per call, and one job per call, because the three opens are three
+  /// separate chances to hang and a closure that took them together would keep
+  /// whatever it had already opened for as long as the next one lasted. The door
+  /// therefore owns each answer as it arrives and assembles them with
+  /// [`held`](Self::held); the permit is held by the door and by each job in
+  /// flight, so the slot outlives whichever of them drops first (see the `permit`
+  /// field).
   ///
   /// A pin that could not be opened is one of two different facts and is reported
   /// as the one it is ([`definite_pin`]): a name nothing answered at is a definite
@@ -7785,14 +7840,15 @@ impl AdmittedDirs {
   /// failure — a full descriptor table above all — is returned, so the door
   /// refuses this sync rather than reporting an absence it never read and opening
   /// more.
-  pub(crate) fn read(
-    permit: SyncPinPermit,
+  pub(crate) fn read_one(
+    point: SyncDoorPoint,
     root: &Path,
     dir: &Path,
-  ) -> Result<Self, std::io::Error> {
-    // Taken OUT of the slot to run, and only when this is the directory it was
-    // armed for: a step that parks must hold neither the lock the next door has
-    // to take nor an arming that was never meant for it ([`SYNC_DOOR_STEP`]).
+  ) -> Result<AdmittedDir, std::io::Error> {
+    // Taken OUT of the slot to run, and only when this is the directory AND the
+    // point it was armed for: a step that parks must hold neither the lock the next
+    // sampler has to take nor an arming that was never meant for it
+    // ([`SYNC_DOOR_STEP`]).
     #[cfg(all(
       test,
       feature = "tokio",
@@ -7804,21 +7860,41 @@ impl AdmittedDirs {
         let mut armed = SYNC_DOOR_STEP
           .lock()
           .unwrap_or_else(PoisonError::into_inner);
-        match armed.as_ref() {
-          Some((armed_for, _)) if armed_for == dir => armed.take().map(|(_, step)| step),
-          _ => None,
-        }
+        armed
+          .iter()
+          .position(|(armed_for, armed_at, _)| armed_for == dir && *armed_at == point)
+          .map(|at| armed.remove(at).2)
       };
       if let Some(step) = step {
         step();
       }
     }
-    Ok(Self {
-      root: watched_root_identity(root)?,
-      target: cookie_target_identity(root, dir)?,
-      cookies: reserved_cookie_dir_identity(root, dir)?,
+    match point {
+      SyncDoorPoint::Root => watched_root_identity(root),
+      SyncDoorPoint::Target => cookie_target_identity(root, dir),
+      SyncDoorPoint::Cookies => reserved_cookie_dir_identity(root, dir),
+    }
+  }
+
+  /// The three readings, assembled — the ONLY way a complete sampling is made.
+  ///
+  /// It is a constructor rather than three assignments because a partially filled
+  /// value is not a weaker version of this one: every absent field MEANS "nothing
+  /// answered at that name when the sync was admitted", and the write reasons from
+  /// that. A sampling that reaches the driver has therefore been read in full, and
+  /// one whose door walked away mid-flight never becomes a value at all.
+  pub(crate) fn held(
+    permit: Arc<SyncPinPermit>,
+    root: AdmittedDir,
+    target: AdmittedDir,
+    cookies: AdmittedDir,
+  ) -> Self {
+    Self {
+      root,
+      target,
+      cookies,
       permit: Some(permit),
-    })
+    }
   }
 
   /// The watched root, as the door held it.

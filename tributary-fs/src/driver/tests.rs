@@ -11438,6 +11438,32 @@ mod replace {
 mod sync_cookie {
   use super::*;
 
+  /// The door's whole sampling, taken here on the test's own thread: the three
+  /// readings a real door runs as three pool jobs, assembled under one permit.
+  ///
+  /// A cell reaching straight for the write wants the VALUE a door would have
+  /// handed the driver, not the door's cancellation shape — so it takes the three
+  /// points in the door's own order through the door's own entry point
+  /// ([`AdmittedDirs::read_one`]), and a reading that fails fails the cell.
+  #[cfg(all(
+    not(miri),
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+  ))]
+  fn sample_admission(root: &Path, dir: &Path) -> crate::driver::AdmittedDirs {
+    use crate::driver::SyncDoorPoint;
+
+    let read = |point| {
+      crate::driver::AdmittedDirs::read_one(point, root, dir)
+        .expect("the staged directories are readable")
+    };
+    crate::driver::AdmittedDirs::held(
+      crate::driver::SyncPinAllowance::permit(),
+      read(SyncDoorPoint::Root),
+      read(SyncDoorPoint::Target),
+      read(SyncDoorPoint::Cookies),
+    )
+  }
+
   /// The rule the Windows marker create is re-read against, asked of names alone
   /// so every host can run it.
   ///
@@ -15989,12 +16015,7 @@ mod sync_cookie {
       let live = crate::driver::LiveRoot::for_tests(&parent);
       let pinned =
         CookieParent::open(live.identity(), &parent, &parent).expect("the scratch parent opens");
-      let admitted = crate::driver::AdmittedDirs::read(
-        crate::driver::SyncPinAllowance::permit(),
-        &parent,
-        &parent,
-      )
-      .expect("the scratch parent's directories are readable");
+      let admitted = sample_admission(&parent, &parent);
       let dir = Arc::new(
         CookieDir::open_or_create(&pinned, admitted.cookies())
           .expect("a cookie directory is minted"),
@@ -17565,8 +17586,7 @@ mod sync_cookie {
     /// the object with it. A cell about a REPLACEMENT binds it earlier instead, at
     /// the moment its sync would have been admitted.
     fn admitted(root: &Path, dir: &Path) -> crate::driver::AdmittedDirs {
-      crate::driver::AdmittedDirs::read(crate::driver::SyncPinAllowance::permit(), root, dir)
-        .expect("the staged directories are readable")
+      sample_admission(root, dir)
     }
 
     /// A cookie directory inside `parent`, reached the way a real write reaches
@@ -18599,28 +18619,54 @@ mod sync_cookie {
       (watcher, handle)
     }
 
-    /// Waits, bounded, for the descriptors naming `path` to settle at `want`,
-    /// asserting the whole way that they never pass `ceiling`.
+    /// Drives every call in `pending` to a standstill, waiting for the descriptors
+    /// naming `path` to settle at `want` and asserting the whole way that they
+    /// never pass `ceiling`.
     ///
-    /// A door's pins are opened on the blocking POOL, so "after one poll each" is
-    /// no longer "after the opens": the count these cells are about is reached by
-    /// a pool thread, and reading it the instant the polls return would be a race
-    /// the door always wins. The ceiling is what keeps the wait honest — an
-    /// over-admission is caught while it is happening rather than waited out and
-    /// then missed because the count came back down.
-    async fn pins_settle_at(path: &Path, want: usize, ceiling: usize) {
-      const ROUNDS: u32 = 2_000;
+    /// The door samples in THREE pool jobs run one after another, so "one poll
+    /// each" is nowhere near "after the opens": a call reaches its second job only
+    /// once its first has answered and the caller has polled it again. Driving is
+    /// therefore part of the wait, not something the cell did before it.
+    ///
+    /// Nothing here AWAITS, and that is load-bearing. These cells count what the
+    /// door let through BEFORE the driver had an opinion, and the driver is a task
+    /// on this same current-thread runtime: one `sleep().await` hands it the thread
+    /// and it drains the mailbox the cells are about. The sampling jobs run on real
+    /// pool threads, so they make progress across the busy wait regardless.
+    ///
+    /// The ceiling is what keeps the wait honest — an over-admission is caught
+    /// while it is happening rather than waited out and then missed because the
+    /// count came back down. And the settle is followed by `QUIET` further rounds
+    /// that must not move it: a count that reached `want` while samplings were
+    /// still landing is not a count that settled there.
+    async fn pins_settle_at<F: std::future::Future>(
+      pending: &mut [std::pin::Pin<Box<F>>],
+      path: &Path,
+      want: usize,
+      ceiling: usize,
+    ) {
+      const ROUNDS: u32 = 20_000;
+      const QUIET: u32 = 200;
 
+      let mut quiet = 0;
       for _ in 0..ROUNDS {
+        for call in pending.iter_mut() {
+          let _ = futures_util::poll!(call.as_mut());
+        }
         let held = descriptors_naming(path);
         assert!(
           held <= ceiling,
           "the door never holds more than {ceiling} pins at once, and it held {held}"
         );
         if held == want {
-          return;
+          quiet += 1;
+          if quiet == QUIET {
+            return;
+          }
+        } else {
+          quiet = 0;
         }
-        tokio::time::sleep(Duration::from_millis(1)).await;
+        std::thread::sleep(Duration::from_micros(100));
       }
       panic!(
         "the door's pins never settled at {want} — {} held",
@@ -18635,9 +18681,9 @@ mod sync_cookie {
     /// carrying them can reach the driver — and the driver's caps are counted
     /// when it reads that command. So an unbounded door is unbounded in exactly
     /// the way that matters: a caller that polls thousands of these futures
-    /// together gets every one of their samplings dispatched on the first poll,
-    /// and the sends past a sixteen-deep mailbox then sit there holding what
-    /// those samplings opened. That is `EMFILE` for the whole process — the
+    /// together gets every one of their samplings dispatched, and the sends past a
+    /// sixteen-deep mailbox then sit there holding what those samplings opened.
+    /// That is `EMFILE` for the whole process — the
     /// watcher's own reads and the application's unrelated I/O failing — reached
     /// before a single cap had an opinion. The allowance is taken BEFORE the
     /// dispatch for that reason, so the pool is bounded by it too.
@@ -18672,12 +18718,10 @@ mod sync_cookie {
           .expect("this host seeds a watcher");
         pending.push(Box::pin(watcher.sync_root(handle, &target, admission)));
       }
-      for call in &mut pending {
-        // ONE poll each, which is all a flood needs: everything up to the first
-        // pending await runs, and that is where the samplings are dispatched.
-        let _ = futures_util::poll!(call.as_mut());
-      }
-      pins_settle_at(&target, ALLOWED, ALLOWED).await;
+      // Driven to a standstill: every call is polled every round, so each one
+      // reaches its next sampling job the moment the last has answered, and the
+      // count is read once nothing is moving any more.
+      pins_settle_at(&mut pending, &target, ALLOWED, ALLOWED).await;
 
       drop(pending);
       drop(watcher);
@@ -18690,18 +18734,18 @@ mod sync_cookie {
     /// A caller that abandons a sync — its own timeout, a close winning the race —
     /// drops the future wherever it stood, and the state that has to survive that
     /// is the one between the pins and the send: the command has not been queued,
-    /// so nothing downstream will ever drop them for it. The permit is carried
-    /// INSIDE the sampling for exactly this reason, so releasing one is releasing
-    /// the other.
+    /// so nothing downstream will ever drop them for it. The readings are owned by
+    /// the door's own frame for exactly this reason, and the permit is shared with
+    /// them, so releasing the future releases both.
     ///
     /// The allowance is deliberately wider than the driver's sixteen-deep mailbox
     /// (a change to that depth is meant to fail this cell rather than pass it
     /// quietly): the callers past the mailbox are the ones parked with their pins
     /// open, and they are what this drops.
     ///
-    /// Revert witness: leak the permit or the pins past the future — hold them in
-    /// the door's frame instead of in the sampling — and the second count still
-    /// reads the allowance.
+    /// Revert witness: leak the permit or the pins past the future — hold them in a
+    /// pool closure the caller cannot reach instead of in the door's own frame —
+    /// and the second count still reads the allowance.
     #[tokio::test]
     async fn a_door_future_dropped_before_its_send_gives_back_its_pins() {
       const MAILBOX: usize = 16;
@@ -18720,18 +18764,10 @@ mod sync_cookie {
           .expect("this host seeds a watcher");
         pending.push(Box::pin(watcher.sync_root(handle, &target, admission)));
       }
-      for call in &mut pending {
-        let _ = futures_util::poll!(call.as_mut());
-      }
-      // The first poll only DISPATCHES each sampling; the allowance is full once
-      // the pool has answered the ones it made room for.
-      pins_settle_at(&target, ALLOWED, ALLOWED).await;
-      for call in &mut pending {
-        // The second poll takes each answered sampling to its send. No await
-        // separates these polls, so the driver cannot run between them and the
-        // mailbox fills to exactly its depth.
-        let _ = futures_util::poll!(call.as_mut());
-      }
+      // Driven to a standstill with no await anywhere, so the driver never gets
+      // the thread and never drains: every admitted sampling is complete, the
+      // mailbox holds what fits, and the rest are parked on a send.
+      pins_settle_at(&mut pending, &target, ALLOWED, ALLOWED).await;
       assert_eq!(
         descriptors_naming(&target),
         ALLOWED,
@@ -18740,9 +18776,16 @@ mod sync_cookie {
         ALLOWED - MAILBOX
       );
 
-      // Everything that never reached the driver: the callers parked on the send
-      // with their pins open, and the callers still waiting for a slot.
-      pending.truncate(MAILBOX);
+      // Everything that never reached the driver goes with the futures: the
+      // callers parked on the send with their pins open, and the callers still
+      // waiting for a slot. What is left is exactly the mailbox — samplings whose
+      // command has been queued, whose pins the command itself now owns, and which
+      // no abandoned caller can take back.
+      //
+      // WHICH callers those are is the pool's business, not this cell's: the
+      // samplings complete in whatever order the pool answers them, so the claim is
+      // made over the whole set rather than over an index range.
+      drop(pending);
       assert_eq!(
         descriptors_naming(&target),
         MAILBOX,
@@ -18750,7 +18793,6 @@ mod sync_cookie {
          driver is holding are left"
       );
 
-      drop(pending);
       drop(watcher);
       let _ = std::fs::remove_dir_all(&root);
     }
@@ -18758,39 +18800,41 @@ mod sync_cookie {
     /// Arms `step` to run ONCE at the top of the door's sampling of `dir`, and
     /// takes the arming back down when the returned guard drops.
     ///
-    /// One shot and one directory, for [`MidMarkerPeer`]'s reason and one more:
-    /// the slot is process-global (the sampling runs on a pool thread), so a step
-    /// that is not addressed to a directory would be run by whichever door in the
-    /// process reached it first ([`SYNC_DOOR_STEP`](crate::driver::SYNC_DOOR_STEP)).
+    /// One shot, one directory and one POINT, for [`MidMarkerPeer`]'s reason and
+    /// one more: the list is process-global (the sampling runs on a pool thread),
+    /// so a step that is not addressed to both would be run by whichever door in
+    /// the process reached it first
+    /// ([`SYNC_DOOR_STEP`](crate::driver::SYNC_DOOR_STEP)).
     struct SyncDoorStep {
       dir: PathBuf,
+      point: crate::driver::SyncDoorPoint,
     }
 
     impl SyncDoorStep {
-      fn arm(dir: &Path, step: impl FnOnce() + Send + 'static) -> Self {
-        *crate::driver::SYNC_DOOR_STEP
+      fn arm(
+        dir: &Path,
+        point: crate::driver::SyncDoorPoint,
+        step: impl FnOnce() + Send + 'static,
+      ) -> Self {
+        crate::driver::SYNC_DOOR_STEP
           .lock()
-          .unwrap_or_else(std::sync::PoisonError::into_inner) =
-          Some((dir.to_path_buf(), Box::new(step)));
+          .unwrap_or_else(std::sync::PoisonError::into_inner)
+          .push((dir.to_path_buf(), point, Box::new(step)));
         Self {
           dir: dir.to_path_buf(),
+          point,
         }
       }
     }
 
     impl Drop for SyncDoorStep {
       fn drop(&mut self) {
-        let mut armed = crate::driver::SYNC_DOOR_STEP
+        // Only THIS cell's arming: a step already spent is no longer in the list,
+        // and one another cell armed is not ours to take down.
+        crate::driver::SYNC_DOOR_STEP
           .lock()
-          .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Only THIS cell's arming: a step already spent has been replaced by
-        // nothing, and one another cell armed is not ours to take down.
-        if armed
-          .as_ref()
-          .is_some_and(|(armed_for, _)| *armed_for == self.dir)
-        {
-          *armed = None;
-        }
+          .unwrap_or_else(std::sync::PoisonError::into_inner)
+          .retain(|(armed_for, armed_at, _)| *armed_for != self.dir || *armed_at != self.point);
       }
     }
 
@@ -18840,7 +18884,10 @@ mod sync_cookie {
 
       let (entered, sampling_entered) = std::sync::mpsc::channel::<()>();
       let (release, released) = std::sync::mpsc::channel::<()>();
-      let _step = SyncDoorStep::arm(&target, move || {
+      // Parked at the FIRST of the door's three samplings, which is what this cell
+      // has always meant by "the sampling": the pool thread is inside the door's
+      // very first `openat` and will not come out.
+      let _step = SyncDoorStep::arm(&target, crate::driver::SyncDoorPoint::Root, move || {
         let _ = entered.send(());
         // Returns when the cell drops its sender, and not before: for as long as
         // this call is here, the door's I/O has not come back.
@@ -18880,6 +18927,128 @@ mod sync_cookie {
       tokio::time::timeout(Duration::from_secs(30), watcher.pin_allowance().acquire())
         .await
         .expect("the abandoned sampling gave its slot back with the descriptors it opened");
+
+      assert!(
+        fs.files_under(&root).is_empty(),
+        "and nothing was created: the command never left the door"
+      );
+      let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A sampling that hangs on its SECOND open does not hold the pin its first
+    /// one already took.
+    ///
+    /// This is what makes the door's three jobs three jobs. One closure taking all
+    /// three opens keeps whatever it has already opened for as long as the next one
+    /// hangs, and a caller that drops its future cannot reach into a pool closure to
+    /// let go of anything: the root descriptor stays open for the whole hang, which
+    /// on Linux defers the kernel's own deletion notice for the watched root, and
+    /// the slot stays consumed. Held by the DOOR instead, every completed reading
+    /// drops with the caller's future and only the job still inside a syscall keeps
+    /// what it has not yet handed back — which is the one descriptor nothing could
+    /// have taken from it anyway.
+    ///
+    /// The step parks at [`SyncDoorPoint::Target`](crate::driver::SyncDoorPoint),
+    /// so reaching it is itself the proof that the ROOT job answered: the second
+    /// sampling is not dispatched until the first one has.
+    ///
+    /// The allowance is ONE, so both slot assertions are exact — it is still taken
+    /// while a job may be holding a descriptor, and it comes back when that job
+    /// finally returns.
+    ///
+    /// Revert witness: take the three opens in one closure again and the root pin
+    /// survives the drop — the count after it reads unchanged.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_parked_later_sampling_gives_back_the_pin_already_taken() {
+      let root = scratch("door-pin-parked-target");
+      let target = root.join("a");
+      std::fs::create_dir_all(&target).expect("the directory the sync names");
+
+      let fs = FakeFs::new(1);
+      fs.put(&root, FileKind::Dir, 1);
+      let watcher = crate::Watcher::<TokioRuntime>::new_with_cookie_cap(
+        crate::WatcherOptions::new(),
+        fs.clone(),
+        1,
+      )
+      .expect("the watcher builds");
+      let handle = watcher
+        .watch(&root, crate::Interest::all())
+        .await
+        .expect("the scratch root is watchable");
+
+      let (entered, sampling_entered) = std::sync::mpsc::channel::<()>();
+      let (release, released) = std::sync::mpsc::channel::<()>();
+      let _step = SyncDoorStep::arm(&target, crate::driver::SyncDoorPoint::Target, move || {
+        let _ = entered.send(());
+        // Returns when the cell drops its sender, and not before: for as long as
+        // this call is here, the door's SECOND open has not come back.
+        let _ = released.recv();
+      });
+
+      let (admission, _ticket) = watcher
+        .mint_sync_ticket()
+        .expect("this host seeds a watcher");
+      let mut call = Box::pin(watcher.sync_root(handle, &target, admission));
+      // One job per poll: the first poll dispatches the root sampling, and the
+      // door is polled again only when that job answers. Short timeouts are what
+      // do that polling — each returns as soon as the future is pending again.
+      let mut reached = false;
+      for _ in 0..600 {
+        if tokio::time::timeout(Duration::from_millis(50), &mut call)
+          .await
+          .is_ok()
+        {
+          break;
+        }
+        if sampling_entered.try_recv().is_ok() {
+          reached = true;
+          break;
+        }
+      }
+      assert!(
+        reached,
+        "staging: the door's ROOT sampling answered and its TARGET sampling reached \
+         the parked step"
+      );
+
+      let while_parked = descriptors_naming(&root);
+      assert!(
+        while_parked >= 1,
+        "staging: the door is holding the root pin its first job handed back"
+      );
+      drop(call);
+      assert_eq!(
+        descriptors_naming(&root),
+        while_parked - 1,
+        "the pin the first job completed is the DOOR's, and it goes with the \
+         caller's future — never held hostage by the job still inside its own open"
+      );
+
+      // The slot, by contrast, is still taken: a job that may yet open a descriptor
+      // is exactly what the allowance bounds, and the bound would be a lie if the
+      // slot came back before it did.
+      assert!(
+        tokio::time::timeout(
+          Duration::from_millis(250),
+          watcher.pin_allowance().acquire()
+        )
+        .await
+        .is_err(),
+        "the parked job still holds its share of the allowance"
+      );
+
+      // ...and an orderly close does not wait for it either.
+      tokio::time::timeout(Duration::from_secs(30), watcher.close_in_place())
+        .await
+        .expect("close is not waiting on a sampling nobody is waiting for")
+        .expect("the watcher closes");
+
+      // The slot comes back on the pool thread once that job finally returns.
+      drop(release);
+      tokio::time::timeout(Duration::from_secs(30), watcher.pin_allowance().acquire())
+        .await
+        .expect("the abandoned sampling gave its slot back when its last job returned");
 
       assert!(
         fs.files_under(&root).is_empty(),
@@ -20380,8 +20549,7 @@ mod sync_cookie {
     /// the object with it. A cell about a REPLACEMENT binds it earlier instead, at
     /// the moment its sync would have been admitted.
     fn admitted(root: &Path, dir: &Path) -> crate::driver::AdmittedDirs {
-      crate::driver::AdmittedDirs::read(crate::driver::SyncPinAllowance::permit(), root, dir)
-        .expect("the staged directories are readable")
+      sample_admission(root, dir)
     }
 
     /// `parent`, opened the way a real write opens it — the handle the mint is

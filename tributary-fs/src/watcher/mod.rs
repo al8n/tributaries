@@ -1723,6 +1723,49 @@ impl<R> Watcher<R> {
     ))
   }
 
+  /// Runs ONE of the door's three samplings on the blocking pool and awaits its
+  /// answer, holding `permit` for as long as that job can be holding a descriptor.
+  ///
+  /// The oneshot is what makes the await cancellation-safe, and the job's own clone
+  /// of the permit is what keeps the accounting honest across a cancellation: a
+  /// dropped future drops the receiver where it stands, the job's send then fails,
+  /// and the reading it took is dropped on the pool thread the instant its syscall
+  /// returns — taking the last clone of the slot with it if the door has already
+  /// let go of its own.
+  ///
+  /// A job that answers NOTHING — the pool refused it, or it unwound — is a failure
+  /// to READ and is reported as one. The alternative would be to admit the sync
+  /// with an empty reading, which is not a weaker claim but a different one: an
+  /// absent pin MEANS nothing stood at that name when the sync was admitted, and
+  /// the write reasons from that.
+  async fn sample_admitted(
+    &self,
+    permit: &Arc<crate::driver::SyncPinPermit>,
+    root_path: &Path,
+    dir: &Path,
+    point: crate::driver::SyncDoorPoint,
+  ) -> Result<crate::driver::AdmittedDir, std::io::Error> {
+    let (sampled, sampling) = futures_channel::oneshot::channel();
+    let held = Arc::clone(permit);
+    let sample_root = root_path.to_path_buf();
+    let sample_dir = dir.to_path_buf();
+    (self.blocking)(Box::new(move || {
+      let reading = crate::driver::AdmittedDirs::read_one(point, &sample_root, &sample_dir);
+      // The send moves the reading to the door where the door is still there to
+      // take it, and drops it here where it is not; either way `held` outlives it,
+      // so the slot is never handed back before the descriptor it accounts for is
+      // closed.
+      let _ = sampled.send(reading);
+      drop(held);
+    }));
+    match sampling.await {
+      Ok(reading) => reading,
+      Err(futures_channel::oneshot::Canceled) => {
+        Err(std::io::Error::other("the sync door's sampling was lost"))
+      }
+    }
+  }
+
   /// Places a **sync cookie** — the kernel-mediated barrier marker — under
   /// `dir` (which must lie within `root`'s coverage) and resolves with the
   /// path it landed at, at WRITE-complete.
@@ -2040,9 +2083,10 @@ impl<R> Watcher<R> {
     // send waited behind a sixteen-deep mailbox — `EMFILE` for the whole process,
     // reached before a single cap was consulted, with the watcher's own I/O and
     // the application's going down with it. So a slot of the watcher's allowance
-    // is taken before any descriptor is, and it travels INSIDE the sampling: it
-    // comes back when the pins do, including when this future is dropped before
-    // the send below ([`SyncPinAllowance`](crate::driver::SyncPinAllowance)).
+    // is taken before any descriptor is, and it is SHARED by everything that can
+    // hold one of the descriptors it authorized — this frame, and each sampling job
+    // while it is in flight — so the slot comes back with the last of them
+    // ([`SyncPinAllowance`](crate::driver::SyncPinAllowance)).
     //
     // Then opened ON THE BLOCKING POOL, for exactly the reason the write itself is:
     // a pathname resolved against a mount that can hang must never be resolved on a
@@ -2051,55 +2095,79 @@ impl<R> Watcher<R> {
     // that a stalled sync is a PENDING future the close and cancellation arms can
     // win over — so three `openat`s taken inline here are a poll that never returns:
     // neither arm ever runs, the owner wedges, and it wedges on precisely the mount
-    // that race exists to survive. The permit is moved into the job with the
-    // sampling it authorizes, so the allowance still bounds descriptors and not
-    // calls, and taking it BEFORE the spawn is what keeps a flood of first polls
-    // from queueing past the allowance onto the pool.
+    // that race exists to survive. Taking the slot BEFORE the first spawn is what
+    // keeps a flood of first polls from queueing past the allowance onto the pool.
     //
-    // Cancellation is what the oneshot buys, and it is total. A dropped `sync_root`
-    // drops the receiver where it stands; the job's send then fails and the
-    // sampling — pins and permit together — is dropped on the pool thread the
-    // instant its syscalls return. The caller regains control immediately and the
-    // slot comes back when the kernel is done with it, which is the same accounting
-    // a completed sampling gets. Nothing the caller or the close owns is ever
-    // waiting on an open.
-    let permit = self.pins.acquire().await;
-    let (sampled, sampling) = futures_channel::oneshot::channel();
-    let sample_root = root_path;
-    let sample_dir = dir.clone();
-    (self.blocking)(Box::new(move || {
-      let _ = sampled.send(crate::driver::AdmittedDirs::read(
-        permit,
-        &sample_root,
-        &sample_dir,
-      ));
-    }));
-    let admitted = match sampling.await {
-      Ok(Ok(admitted)) => admitted,
+    // THREE jobs, run and awaited in sequence, and every completed pin owned HERE.
+    // One closure taking all three opens would hold whatever it had already opened
+    // for as long as the next one hung: a root descriptor kept across a hung target
+    // open defers the kernel's own deletion notice for the watched root, and a
+    // caller that drops this future cannot reach into the closure to let it go. Held
+    // in this frame instead, each reading drops the instant the future does — the
+    // root's above all — while only the job still inside a syscall keeps what it has
+    // not yet handed back, which is the one descriptor nothing can take away from it
+    // anyway.
+    //
+    // Cancellation is what the oneshots buy, and it is total. A dropped `sync_root`
+    // drops the receiver it is waiting on where it stands; that job's send then
+    // fails and its own reading is dropped on the pool thread the instant its
+    // syscall returns. The caller regains control immediately, and the slot comes
+    // back when the kernel is done with whatever was still open — the same
+    // accounting a completed sampling gets. Nothing the caller or the close owns is
+    // ever waiting on an open.
+    let permit = Arc::new(self.pins.acquire().await);
+    let sampled = async {
+      // In this order because it is the order the write itself descends in, and
+      // because the ROOT is the pin whose lifetime costs the most: it is taken
+      // first, so on every cancellation but one it is a pin this frame is holding
+      // and drops at once.
+      let root_pin = self
+        .sample_admitted(
+          &permit,
+          &root_path,
+          &dir,
+          crate::driver::SyncDoorPoint::Root,
+        )
+        .await?;
+      let target_pin = self
+        .sample_admitted(
+          &permit,
+          &root_path,
+          &dir,
+          crate::driver::SyncDoorPoint::Target,
+        )
+        .await?;
+      let cookies_pin = self
+        .sample_admitted(
+          &permit,
+          &root_path,
+          &dir,
+          crate::driver::SyncDoorPoint::Cookies,
+        )
+        .await?;
+      Ok::<_, std::io::Error>((root_pin, target_pin, cookies_pin))
+    }
+    .await;
+    let admitted = match sampled {
+      // The door's own clone MOVES into the finished value: from here the readings
+      // are one thing again, and nothing in this frame is holding a slot the
+      // sampling it accounts for has already given up.
+      Ok((root_pin, target_pin, cookies_pin)) => {
+        crate::driver::AdmittedDirs::held(permit, root_pin, target_pin, cookies_pin)
+      }
       // A pin this door could not TAKE is not a reading about the tree, and
       // answering it as one is what hid a full descriptor table behind a verdict
       // about a directory. It is reported as the write failure it is, carrying the
       // OS error the caller can act on — a definite absence, by contrast, is a
-      // reading and is carried in the sampling as one.
-      Ok(Err(source)) => {
+      // reading and is carried in the sampling as one. A job that answered NOTHING
+      // at all (the pool refused it, or it unwound) is the same fail-closed
+      // refusal, spelled by [`sample_admitted`]: an empty reading would be a
+      // definite ABSENCE the door never took, and the write reasons from those.
+      Err(source) => {
         return Err(SyncRootDenied::classify(
           SyncRootError::Write {
             path: dir.join(&name),
             source,
-          },
-          admission,
-        ));
-      }
-      // The job answered nothing at all: the pool refused it, or it unwound. There
-      // is no reading here either — an empty sampling would be a set of definite
-      // ABSENCES the door never read, and the write reasons from those — so it is
-      // the same fail-closed write failure a pin that could not be taken is, and
-      // the sequence is spent rather than silently admitted.
-      Err(futures_channel::oneshot::Canceled) => {
-        return Err(SyncRootDenied::classify(
-          SyncRootError::Write {
-            path: dir.join(&name),
-            source: std::io::Error::other("the sync door's sampling was lost"),
           },
           admission,
         ));

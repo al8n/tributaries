@@ -670,3 +670,134 @@ async fn set_cover_root_key_cancel_re_arms_every_pruned_region() {
   );
   close_and_drain(w, &all).await;
 }
+
+/// Arms one [`SYNC_DOOR_STEP`](crate::driver::SYNC_DOOR_STEP) entry and takes it
+/// back down when the guard drops.
+///
+/// The list is process-global (the door samples on a pool thread, which no
+/// thread-local of this test's own thread could reach), so an arming names both the
+/// directory it speaks for and the point of the door's three it stands in front of;
+/// this cell's scratch root makes the pair unique to it.
+struct DoorStep {
+  dir: PathBuf,
+  point: crate::driver::SyncDoorPoint,
+}
+
+impl DoorStep {
+  fn arm(
+    dir: &Path,
+    point: crate::driver::SyncDoorPoint,
+    step: impl FnOnce() + Send + 'static,
+  ) -> Self {
+    crate::driver::SYNC_DOOR_STEP
+      .lock()
+      .unwrap_or_else(std::sync::PoisonError::into_inner)
+      .push((dir.to_path_buf(), point, Box::new(step)));
+    Self {
+      dir: dir.to_path_buf(),
+      point,
+    }
+  }
+}
+
+impl Drop for DoorStep {
+  fn drop(&mut self) {
+    crate::driver::SYNC_DOOR_STEP
+      .lock()
+      .unwrap_or_else(std::sync::PoisonError::into_inner)
+      .retain(|(armed_for, armed_at, _)| *armed_for != self.dir || *armed_at != self.point);
+  }
+}
+
+/// The kernel's own witness for the door's split sampling: a root whose death is
+/// reported WHILE a later sampling job is still parked.
+///
+/// An open descriptor on a directory holds its dentry, and `rmdir` of a directory
+/// something still holds unhashes the dentry instead of unlinking its inode — so
+/// the `IN_DELETE_SELF` a watcher's root death rests on is DEFERRED until that
+/// descriptor closes. That is what made a cancelled admission a correctness problem
+/// rather than an accounting one: the old door opened root, target and reserved
+/// directory in one pool closure, so a hang on the second open kept the root
+/// descriptor for the whole hang, and a caller that dropped its future had no way
+/// to reach into the closure and let it go. The root could then die with the
+/// watcher reporting nothing at all.
+///
+/// Here the sampling is parked at the door's SECOND point — reaching it is itself
+/// the proof that the root job answered — the caller's future is dropped, and the
+/// root is removed while the second job is still inside the parked step. The root's
+/// death must be observed on the stream within the ordinary deadline.
+///
+/// Revert witness: take the three opens in one closure again and this cell waits
+/// out its deadline — the root's death is not reported until the gate is released.
+///
+/// Real inotify, because the fact is the kernel's: no modelled tree can be asked
+/// what an open descriptor does to a `rmdir`'s notification.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_parked_sampling_never_defers_the_root_s_death() {
+  let outer = scratch_root("door-parked-rootdeath");
+  let root = outer.join("watched");
+  let target = root.join("a");
+  std::fs::create_dir_all(&target).expect("the directory the sync names");
+
+  let mut w = TokioWatcher::new(WatcherOptions::new().with_backend(Backend::Inotify))
+    .expect("build inotify watcher");
+  let handle = w.watch(&root, Interest::all()).await.expect("watch root");
+  let canonical = w.root_path(handle).expect("root path");
+
+  let (entered, sampling_entered) = std::sync::mpsc::channel::<()>();
+  let (release, released) = std::sync::mpsc::channel::<()>();
+  let _step = DoorStep::arm(&target, crate::driver::SyncDoorPoint::Target, move || {
+    let _ = entered.send(());
+    // Returns when this cell drops its sender, and not before: for as long as this
+    // call is here, the door's second open has not come back.
+    let _ = released.recv();
+  });
+
+  let (admission, _ticket) = w.mint_sync_ticket().expect("this host seeds a watcher");
+  let mut call = Box::pin(w.sync_root(handle, &target, admission));
+  // One job per poll: the first poll dispatches the ROOT sampling, and the door is
+  // polled again only once that job answers. Short timeouts are what do that
+  // polling — each returns as soon as the future is pending again.
+  let mut reached = false;
+  for _ in 0..600 {
+    if tokio::time::timeout(Duration::from_millis(50), &mut call)
+      .await
+      .is_ok()
+    {
+      break;
+    }
+    if sampling_entered.try_recv().is_ok() {
+      reached = true;
+      break;
+    }
+  }
+  assert!(
+    reached,
+    "staging: the door's ROOT sampling answered and its TARGET sampling reached the \
+     parked step"
+  );
+  // The caller walks away with every reading the door had completed — the root's
+  // above all — while the second job stays inside its own call.
+  drop(call);
+
+  std::fs::remove_dir(&target).expect("empty the root");
+  std::fs::remove_dir(&root).expect("remove the watched root");
+  let seen = wait_for(&mut w, |e| {
+    e.root() == handle && (e.is_rescan() || (e.kind().is_removed() && e.path() == canonical))
+  })
+  .await;
+  assert!(
+    seen.is_some(),
+    "the root's death is reported while a sampling job is still parked — nothing the \
+     door completed is holding the root's dentry open"
+  );
+
+  // And the watcher closes once that job finally returns.
+  drop(release);
+  tokio::time::timeout(DEADLINE, w.close())
+    .await
+    .expect("close is not waiting on a sampling nobody is waiting for")
+    .expect("the watcher closes");
+
+  let _ = std::fs::remove_dir_all(&outer);
+}
