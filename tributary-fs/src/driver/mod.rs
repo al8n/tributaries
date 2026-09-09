@@ -1006,7 +1006,12 @@ impl RootPin {
   }
 }
 
-#[cfg(test)]
+// Exactly the union of the real-filesystem cells that call this: the Unix
+// identity cell, the Windows non-adoption cell, and the directory-only cell
+// that runs on any of linux/macos/windows (all of which collapse into
+// `any(unix, windows)`), none of them under Miri. Any narrower cfg leaves a
+// configuration where this constructor compiles with no caller.
+#[cfg(all(test, not(miri), any(unix, windows)))]
 impl RootPin {
   /// The pin a spawn WOULD have opened for `root`, reading the identity off the
   /// descriptor it just opened rather than from a source's own bracket.
@@ -1082,7 +1087,10 @@ impl LiveRoot {
 
   /// The live root a cell's scratch directory stands for: the directory itself
   /// as the floor, pinned the way a spawn pins one ([`RootPin::for_tests`]).
-  #[cfg(test)]
+  ///
+  /// Same cfg as [`RootPin::for_tests`] and for the same reason: only the Unix
+  /// identity cell and the Windows non-adoption cell call this one.
+  #[cfg(all(test, not(miri), any(unix, windows)))]
   pub(crate) fn for_tests(path: &Path) -> Self {
     Self::new(
       path.to_path_buf(),
