@@ -851,6 +851,55 @@ mod root_options {
       );
     }
 
+    /// A WORD past the per-pattern length ceiling stops the seat at that word,
+    /// before it collects — and before anything the size of the word is owned.
+    ///
+    /// The seat's own bound is on the COUNT, and it cannot see this one: a single
+    /// first element is one element whatever its length. The per-pattern ceiling is
+    /// the element's own face's, measured on the bytes the format is holding, and
+    /// this is what says the seat inherits it rather than reading the list first.
+    ///
+    /// The word after it cannot compile, so the refusal proves WHERE the read
+    /// stopped: a seat that had gone on would answer with that word's syntax error
+    /// instead.
+    ///
+    /// Revert witness: deserialize each element through `String` first and the same
+    /// refusal arrives after an allocation the document decided the size of.
+    #[test]
+    fn a_seat_word_past_the_length_ceiling_is_refused_at_the_word() {
+      let over = "?".repeat(tributary_proto::glob::MAX_GLOB_LEN * 1024);
+      let err = serde_json::from_str::<RootOptions>(&std::format!(
+        r#"{{"prune": ["{over}", "[unclosed"]}}"#
+      ))
+      .expect_err("the first word is past the length ceiling");
+      let rendered = err.to_string();
+      assert!(
+        rendered.contains(&std::format!(
+          "over the {}-byte limit",
+          tributary_proto::glob::MAX_GLOB_LEN
+        )),
+        "the refusal is the WORD's length: {rendered}"
+      );
+      assert!(
+        !rendered.contains("unclosed"),
+        "and the seat never reached the word after it: {rendered}"
+      );
+      assert!(
+        rendered.len() < over.len() / 1024,
+        "nothing the size of the word survives the refusal: {rendered}"
+      );
+
+      let err = serde_json::from_str::<RootOptions>(&std::format!(r#"{{"include": ["{over}"]}}"#))
+        .expect_err("the include seat carries the same per-word ceiling");
+      assert!(
+        err.to_string().contains(&std::format!(
+          "over the {}-byte limit",
+          tributary_proto::glob::MAX_GLOB_LEN
+        )),
+        "{err}"
+      );
+    }
+
     /// A document naming ONE key leaves every other knob at the value `new()`
     /// gives it — the struct-level `#[serde(default)]`.
     #[test]

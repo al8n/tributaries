@@ -465,6 +465,28 @@ impl serde::Serialize for Glob {
   }
 }
 
+/// A pattern is read through a STRING VISITOR, so [`MAX_GLOB_LEN`] is judged on the
+/// bytes the format is already holding rather than after a `String` of the
+/// document's own choosing has been built.
+///
+/// The distinction is the whole point of that ceiling. A pattern is a
+/// configuration value from an untrusted document, and asking the format for an
+/// owned `String` first hands the document control of one allocation per rejected
+/// pattern — a first word of a few hundred megabytes costs exactly that before the
+/// bound it is about to fail is ever consulted. The visitor takes the borrowed
+/// text, and [`Glob::new`] measures it before it copies or compiles anything, so a
+/// refusal costs the bounded typed error ([`GlobError`], whose over-length arm
+/// keeps only a short prefix) and nothing proportional to the input.
+///
+/// What that does NOT do is bound the FORMAT's own reading. A format that must
+/// allocate to hand over a string — one unescaping `\u0041`, or reading from a
+/// stream rather than a slice — still allocates the source once, and it does so
+/// before any visitor is called. That is the format's contract rather than
+/// something a `Deserialize` implementation can decline; a document whose SIZE
+/// must be bounded is bounded by a limited reader on the caller's side.
+/// [`visit_string`](serde::de::Visitor::visit_string) is the case where that has
+/// already happened, and the bound is still checked before the pattern is
+/// compiled.
 #[cfg(feature = "serde")]
 #[cfg_attr(docsrs, doc(cfg(all(feature = "glob", feature = "serde"))))]
 impl<'de> serde::Deserialize<'de> for Glob {
@@ -472,10 +494,32 @@ impl<'de> serde::Deserialize<'de> for Glob {
   where
     D: serde::Deserializer<'de>,
   {
-    use serde::de::Error as _;
+    struct Pattern;
 
-    let pattern = std::string::String::deserialize(deserializer)?;
-    Self::new(&pattern).map_err(D::Error::custom)
+    impl serde::de::Visitor<'_> for Pattern {
+      type Value = Glob;
+
+      fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "a glob pattern of at most {MAX_GLOB_LEN} bytes")
+      }
+
+      /// The one door, and the one every other arm reaches. `visit_borrowed_str`
+      /// and `visit_string` are serde's own forwards to it, so text the format
+      /// borrows out of its input is measured without being copied at all, and
+      /// text the format already owns is measured before it is compiled.
+      fn visit_str<E>(self, pattern: &str) -> Result<Self::Value, E>
+      where
+        E: serde::de::Error,
+      {
+        Glob::new(pattern).map_err(E::custom)
+      }
+    }
+
+    // `deserialize_str` rather than `deserialize_string`: this face needs to READ
+    // the text, not to own it, and the hint is what lets a format borrow straight
+    // out of its input instead of allocating a copy it would only be measured
+    // against.
+    deserializer.deserialize_str(Pattern)
   }
 }
 

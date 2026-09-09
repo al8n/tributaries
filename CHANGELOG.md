@@ -476,6 +476,22 @@ All notable changes to this workspace are documented here. The format is based o
   uncovered cookie directory, and a fresh sync is admitted for whatever now stands at
   the name.
 
+- **`tributary-proto`** — `Glob`'s `serde` face reads through a string VISITOR, so
+  `MAX_GLOB_LEN` is judged on the bytes the format is already holding rather than after
+  an owned `String` has been built. Deserializing through `String` first handed an
+  untrusted document one allocation of its own choosing per rejected pattern, paid in
+  full before the ceiling that pattern was about to fail was consulted at all: a first
+  word of a few hundred megabytes cost exactly that, and a streaming document could
+  spend the process's memory on patterns that could only ever be refused. The refusal is
+  the same typed one, bounded as it always was (the over-length arm keeps a short
+  preview, never a copy of the word), and the accepted inputs are unchanged up to and
+  including the ceiling. Both glob seats of `tributary_fs::RootOptions`, `RootGlobs` and
+  `WatchOptions` inherit it, so an over-long word now stops a seat at that word rather
+  than after the list. What a `Deserialize` cannot decline is the FORMAT's own reading —
+  one that must allocate while unescaping still allocates the source once, and a
+  document whose size must be bounded is bounded by a limited reader on the caller's
+  side.
+
 - **`tributaries`** — **BREAKING for a custom `Source`**: `Source::arm` and
   `LocalSource::arm` take the per-root `&RootGlobs` as a third argument
   (`arm(&mut self, key: &[C], globs: &RootGlobs)`). An out-of-tree source must accept

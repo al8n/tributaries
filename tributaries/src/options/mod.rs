@@ -193,6 +193,14 @@ const fn check_seats(prune: usize, include: Option<usize>) -> Result<(), Options
 /// Reads ONE glob seat, refusing the element past
 /// [`RootGlobs::MAX_SEAT_PATTERNS`] rather than the list after it.
 ///
+/// Each ELEMENT is read through [`Glob`]'s own face, which measures a pattern
+/// against [`MAX_GLOB_LEN`](tributary_proto::glob::MAX_GLOB_LEN) on the bytes the
+/// format is holding — before the pattern is copied or compiled, and so before
+/// this seat ever takes it. The two bounds are therefore both enforced mid-stream:
+/// an over-long word refuses at the word, an over-long list at the element past
+/// the ceiling, and neither waits for a document that a caller controls the length
+/// of to end.
+///
 /// The refusal has to happen mid-sequence to mean anything: a document is an
 /// untrusted length, and collecting it whole so the count can be checked
 /// afterwards has already built — and kept — every pattern the bound exists to
