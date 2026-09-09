@@ -1127,6 +1127,123 @@ mod clap_face {
     assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
   }
 
+  /// `--include` spells ALL THREE of the seat's states, on both households that carry it.
+  ///
+  /// The seat is `Option<Vec<Glob>>` and its three states mean three different policies:
+  /// absent delivers every file, engaged-and-EMPTY delivers none (directories and `Rescan`s
+  /// only), and engaged with patterns delivers what they name. A plain repeatable flag
+  /// requires a value per occurrence, so the middle one — a documented policy the serde face
+  /// and the programmatic builder can both express — had NO spelling at all here: omitting
+  /// the flag gave the absent seat, `--include` with no value was a parse error, and every
+  /// successful occurrence produced a non-empty list. `num_args = 0..=1` is what closes that,
+  /// and appending is unchanged, so a bare `--include` is the empty seat while
+  /// `--include a --include b` still carries both.
+  ///
+  /// An UPDATE keeps the command-line-only rule: the seat a command line did not name is left
+  /// as it stood, and a bare `--include` on an update SETS the empty seat rather than reading
+  /// as "nothing given".
+  ///
+  /// Revert witness: drop `num_args` and the bare rows below fail at the parse itself.
+  #[test]
+  fn the_include_flag_spells_all_three_seat_states() {
+    let globs = |rest: &[&str]| GlobsCli::parse_from(args(rest)).globs;
+    let watch = |rest: &[&str]| WatchCli::parse_from(args(rest)).options;
+
+    // ABSENT — every file.
+    assert_eq!(globs(&[]).include(), None);
+    assert_eq!(watch(&[]).include(), None);
+
+    // EMPTY — no file; directories and Rescans only.
+    assert_eq!(
+      globs(&["--include"]).include().map(texts),
+      Some(std::vec![]),
+      "a bare --include is the engaged-but-EMPTY seat, not the absent one"
+    );
+    assert_eq!(
+      watch(&["--include"]).include().map(texts),
+      Some(std::vec![])
+    );
+
+    // NON-EMPTY — occurrences still append, in order.
+    assert_eq!(
+      globs(&["--include", "*.mp4", "--include", "*.mov"])
+        .include()
+        .map(texts),
+      Some(std::vec!["*.mp4", "*.mov"])
+    );
+    assert_eq!(
+      watch(&["--include", "*.mp4", "--include", "*.mov"])
+        .include()
+        .map(texts),
+      Some(std::vec!["*.mp4", "*.mov"])
+    );
+
+    // The empty seat is engaged ground, not the unengaged household.
+    assert!(
+      !globs(&["--include"]).is_unengaged(),
+      "an empty include seat is a policy the household carries, not the absence of one"
+    );
+
+    // UPDATE — the command-line-only rule, in all three directions.
+    let mut kept = RootGlobs::new().with_include([glob("*.mp4")]);
+    kept
+      .update_from_arg_matches(&update_matches::<RootGlobs>(&["--prune", "**/.git"]))
+      .expect("the update applies");
+    assert_eq!(
+      kept.include().map(texts),
+      Some(std::vec!["*.mp4"]),
+      "an unrelated flag leaves the seat exactly as it stood"
+    );
+
+    let mut emptied = RootGlobs::new().with_include([glob("*.mp4")]);
+    emptied
+      .update_from_arg_matches(&update_matches::<RootGlobs>(&["--include"]))
+      .expect("the update applies");
+    assert_eq!(
+      emptied.include().map(texts),
+      Some(std::vec![]),
+      "a bare --include on an update SETS the empty seat"
+    );
+
+    let mut watch_emptied = WatchOptions::<OsString>::new().with_include([glob("*.mp4")]);
+    watch_emptied
+      .update_from_arg_matches(&update_matches::<WatchOptions<OsString>>(&["--include"]))
+      .expect("the update applies");
+    assert_eq!(watch_emptied.include().map(texts), Some(std::vec![]));
+
+    // OPTIONAL FLATTEN — a bare --include is a value source, so the household is present.
+    #[derive(clap::Parser)]
+    struct OptionalGlobsCli {
+      #[command(flatten)]
+      globs: Option<RootGlobs>,
+    }
+
+    #[derive(clap::Parser)]
+    struct OptionalWatchCli {
+      #[command(flatten)]
+      watch: Option<WatchOptions<OsString>>,
+    }
+
+    OptionalGlobsCli::command().debug_assert();
+    OptionalWatchCli::command().debug_assert();
+    assert_eq!(
+      OptionalGlobsCli::parse_from(args(&["--include"]))
+        .globs
+        .expect("a bare --include makes the optional household present")
+        .include()
+        .map(texts),
+      Some(std::vec![])
+    );
+    assert_eq!(
+      OptionalWatchCli::parse_from(args(&["--include"]))
+        .watch
+        .expect("a bare --include makes the optional household present")
+        .include()
+        .map(texts),
+      Some(std::vec![])
+    );
+  }
+
   /// Every household composes as an OPTIONAL flatten, which is the one shape that
   /// needs a real arg group underneath it.
   ///

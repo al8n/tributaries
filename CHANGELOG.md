@@ -59,7 +59,8 @@ All notable changes to this workspace are documented here. The format is based o
   filesystem name (and back). They live behind `tributary-proto`'s new `glob`
   feature, which `tributary-fs` and `tributaries` enable unconditionally; both
   faces carry them (serde: lists of plain strings; clap: repeatable `--prune` /
-  `--include` flags, an absent `--include` being the absent seat).
+  `--include` flags, where `--include` spells all three of the seat's states —
+  absent, given with no value for the empty seat, and given with patterns).
 
   `Watcher::replace_root` keeps the root's words and RE-BASES them onto the new
   root — they are root-relative — so a depth-anchored `prune` pattern means
@@ -368,6 +369,18 @@ All notable changes to this workspace are documented here. The format is based o
   `WatchError::as_fs`. It is a caller-configuration verdict: not `Capacity`, the one
   kind the umbrella retries, and not `Unsupported`, which is read as a verdict on the
   platform.
+
+- **`tributary-fs`**, **`tributaries`** — the `clap` `--include` flag takes zero or one
+  value (`num_args = 0..=1`), so a command line can spell every state the seat has.
+  `include` is `Option<Vec<Glob>>` and its three states are three different policies:
+  absent delivers every file, engaged-and-EMPTY delivers none (directories and `Rescan`s
+  only), and engaged with patterns delivers what they name. A flag requiring a value per
+  occurrence could reach only two of them — a bare `--include` was a parse error and every
+  successful occurrence produced a non-empty list — so `tributary_fs::RootOptions`,
+  `RootGlobs` and `WatchOptions` could not parse or update to the documented
+  directories-and-`Rescan`s-only policy at all. Occurrences still append, so
+  `--include a --include b` is unchanged, and an update still applies only what the
+  command line carried.
 
 - **`tributary-fs`** — **BREAKING**: `Watcher::sync_root(root, dir, admission)` no longer
   takes a cookie name, and `Watcher::mint_sync_ticket` returns

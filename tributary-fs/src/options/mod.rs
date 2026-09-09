@@ -1062,12 +1062,14 @@ impl Default for WatcherOptions {
 /// ```
 ///
 /// With the `clap` feature it is a `clap::Args` group whose `--prune` and
-/// `--include` flags repeat, once per pattern. `--include` given no times at all
-/// is [`None`] (deliver everything) — which is what makes the seat's absence
-/// expressible from a command line at all.
+/// `--include` flags repeat, once per pattern. `--include` spells all THREE of the
+/// seat's states: given no times at all it is [`None`] (deliver everything); given
+/// once with NO VALUE it is the engaged-but-empty seat (deliver no file —
+/// directories and `Rescan`s only); given with values it carries them.
 ///
 /// ```text
 /// $ app --prune '**/node_modules' --prune '**/.git' --include '**/*.mp4'
+/// $ app --include                       # directories and Rescans only
 /// ```
 ///
 /// The interest flags are `--created`, `--removed`, `--modified`, `--moved`,
@@ -1224,7 +1226,15 @@ struct RootOptionsArgs {
   interest: RootInterestArgs,
   #[arg(long)]
   prune: Vec<Glob>,
-  #[arg(long)]
+  /// `num_args = 0..=1` is what gives the seat all THREE of its states a command
+  /// line can otherwise only spell two of. The seat is `Option<Vec<Glob>>`: absent
+  /// (deliver every file), engaged-and-EMPTY (deliver no file — directories and
+  /// `Rescan`s only), or engaged with patterns. A plain repeatable flag requires a
+  /// value per occurrence, so the empty seat — a legitimate, documented policy
+  /// every other face can express — had no spelling at all here, and no parse could
+  /// produce it. Taking zero values makes a bare `--include` exactly that seat,
+  /// while occurrences still append, so `--include a --include b` is unchanged.
+  #[arg(long, num_args = 0..=1)]
   include: Option<Vec<Glob>>,
 }
 

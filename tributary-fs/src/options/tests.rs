@@ -834,6 +834,89 @@ mod root_options {
       );
     }
 
+    /// `--include` spells ALL THREE of the seat's states.
+    ///
+    /// The seat is `Option<Vec<Glob>>` and its three states mean three different
+    /// policies: absent delivers every file, engaged-and-EMPTY delivers none
+    /// (directories and `Rescan`s only), and engaged with patterns delivers what
+    /// they name. A plain repeatable flag requires a value per occurrence, so the
+    /// middle one — a documented policy the serde face and the programmatic builder
+    /// can both express — had NO spelling at all here: omitting the flag gave the
+    /// absent seat, `--include` with no value was a parse error, and every
+    /// successful occurrence produced a non-empty list. `num_args = 0..=1` closes
+    /// that, and appending is unchanged.
+    ///
+    /// An UPDATE keeps the command-line-only rule: a seat the command line did not
+    /// name is left as it stood, and a bare `--include` SETS the empty seat rather
+    /// than reading as "nothing given".
+    ///
+    /// Revert witness: drop `num_args` and the bare rows below fail at the parse.
+    #[test]
+    fn the_include_flag_spells_all_three_seat_states() {
+      // ABSENT — every file.
+      assert_eq!(parse(&[]).include(), None);
+
+      // EMPTY — no file; directories and Rescans only.
+      assert_eq!(
+        parse(&["--include"]).include().map(patterns),
+        Some(std::vec![]),
+        "a bare --include is the engaged-but-EMPTY seat, not the absent one"
+      );
+
+      // NON-EMPTY — occurrences still append, in order.
+      assert_eq!(
+        parse(&["--include", "*.mp4", "--include", "*.mov"])
+          .include()
+          .map(patterns),
+        Some(std::vec!["*.mp4", "*.mov"])
+      );
+
+      // UPDATE — the command-line-only rule, in both directions.
+      let matches = |rest: &[&str]| {
+        <RootOptions as clap::Args>::augment_args_for_update(clap::Command::new("app"))
+          .get_matches_from(std::iter::once("app").chain(rest.iter().copied()))
+      };
+      let mut kept = RootOptions::new().with_include([glob("*.mp4")]);
+      clap::FromArgMatches::update_from_arg_matches(&mut kept, &matches(&["--prune", "**/.git"]))
+        .expect("the update applies");
+      assert_eq!(
+        kept.include().map(patterns),
+        Some(std::vec!["*.mp4"]),
+        "an unrelated flag leaves the seat exactly as it stood"
+      );
+
+      let mut emptied = RootOptions::new().with_include([glob("*.mp4")]);
+      clap::FromArgMatches::update_from_arg_matches(&mut emptied, &matches(&["--include"]))
+        .expect("the update applies");
+      assert_eq!(
+        emptied.include().map(patterns),
+        Some(std::vec![]),
+        "a bare --include on an update SETS the empty seat"
+      );
+
+      // OPTIONAL FLATTEN — a bare --include is a value source, so the household is
+      // present.
+      #[derive(Debug, clap::Parser)]
+      struct OptionalCli {
+        #[command(flatten)]
+        options: Option<RootOptions>,
+      }
+
+      <OptionalCli as clap::CommandFactory>::command().debug_assert();
+      assert_eq!(
+        OptionalCli::parse_from(["app", "--include"])
+          .options
+          .expect("a bare --include makes the optional household present")
+          .include()
+          .map(patterns),
+        Some(std::vec![])
+      );
+      assert!(
+        OptionalCli::parse_from(["app"]).options.is_none(),
+        "and nothing spelled is still no household"
+      );
+    }
+
     /// A FLAGLESS command line is the default household — the same value
     /// `RootOptions::new()` and an absent serde document hand back.
     ///

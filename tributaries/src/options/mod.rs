@@ -294,7 +294,15 @@ where
 struct SeatArgs {
   #[arg(long)]
   prune: Vec<Glob>,
-  #[arg(long)]
+  /// `num_args = 0..=1` is what gives the seat all THREE of its states a command
+  /// line can otherwise only spell two of. The seat is `Option<Vec<Glob>>`: absent
+  /// (deliver every file), engaged-and-EMPTY (deliver no file — directories and
+  /// `Rescan`s only), or engaged with patterns. A plain repeatable flag requires a
+  /// value per occurrence, so the empty seat — a legitimate, documented policy
+  /// every other face can express — had no spelling at all here, and no parse could
+  /// produce it. Taking zero values makes a bare `--include` exactly that seat,
+  /// while occurrences still append, so `--include a --include b` is unchanged.
+  #[arg(long, num_args = 0..=1)]
   include: Option<Vec<Glob>>,
 }
 
@@ -1254,11 +1262,14 @@ impl Default for TributariesOptions {
 /// ```
 ///
 /// With the `clap` feature it is a `clap::Args` group whose `--prune` and
-/// `--include` repeat, once per pattern; `--include` given no times at all is
-/// again the absent seat.
+/// `--include` repeat, once per pattern. `--include` spells all THREE of the seat's
+/// states there: given no times at all it is again the ABSENT seat (deliver every
+/// file); given once with NO VALUE it is the engaged-but-empty seat (deliver no
+/// file — directories and `Rescan`s only); given with values it carries them.
 ///
 /// ```text
 /// $ app --prune '**/node_modules' --prune '**/.git' --include '**/*.mp4'
+/// $ app --include                       # directories and Rescans only
 /// ```
 ///
 /// Those are the SAME flag names [`WatchOptions`] carries, deliberately — one
@@ -1555,14 +1566,16 @@ impl RootGlobs {
 /// [`with_filter`](Self::with_filter). Neither face constrains `C`.
 ///
 /// With the `clap` feature it is a `clap::Args` group of [`Interest`]'s own flags plus
-/// a repeatable `--prune` and `--include`, once per pattern; `--include` given no times
-/// at all is [`None`] (deliver every file), which is what makes the seat's ABSENCE
-/// expressible from a command line. The [`Debounce`] posture is skipped there:
-/// [`Debounce::Custom`] carries a whole [`DebounceConfig`], which one flag cannot name
-/// (see [`Debounce`]).
+/// a repeatable `--prune` and `--include`, once per pattern. `--include` spells all
+/// THREE of the seat's states: given no times at all it is [`None`] (deliver every
+/// file); given once with NO VALUE it is the engaged-but-empty seat (deliver no file —
+/// directories and `Rescan`s only); given with values it carries them. The
+/// [`Debounce`] posture is skipped there: [`Debounce::Custom`] carries a whole
+/// [`DebounceConfig`], which one flag cannot name (see [`Debounce`]).
 ///
 /// ```text
 /// $ app --moved=false --removed=false --prune '**/node_modules' --include '**/*.mp4'
+/// $ app --include                       # directories and Rescans only
 /// ```
 ///
 /// An UPDATE (`clap::FromArgMatches::update_from_arg_matches`) changes only what
