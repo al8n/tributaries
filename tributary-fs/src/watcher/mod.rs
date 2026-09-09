@@ -337,8 +337,8 @@ impl SyncRootDenied {
   /// shape as `DirPruned`: the verdict needs the object only the write's own
   /// descent can reach, so it too is admitted and then retired — and re-minting is
   /// what re-reads the directory that now stands at the name),
-  /// `DirCrossesMount` (the same shape again, taken on the reserved cookie
-  /// directory's own descriptor), `Retired` (a
+  /// `DirCrossesMount` (the same shape again, taken on the descriptors the write's
+  /// own descent holds), `Retired` (a
   /// post-admission terminal), and `Closed`.
   pub(crate) fn classify(error: SyncRootError, admission: SyncAdmission) -> Self {
     let admission = if matches!(
@@ -1812,11 +1812,14 @@ impl<R> Watcher<R> {
   /// never armed on that object, wait out its caller's timeout rather than
   /// resolve; no ordering is ever falsely certified by it.
   ///
-  /// A directory reached either way must live on the parent's own device: a mount
-  /// standing at the reserved name is ground no crawl of this root descends into,
-  /// and is refused as
-  /// [`DirCrossesMount`](SyncRootError::DirCrossesMount). Ownership and mode are
-  /// still checked, and are still only ever grounds to REFUSE: no directory is
+  /// Every directory on the chain from the watched root to the marker — each
+  /// component the descent takes, and the reserved directory reached either way —
+  /// must stand in the ROOT's own mount frame: ground beyond a mount is ground no
+  /// crawl of this root descends into, and it is refused as
+  /// [`DirCrossesMount`](SyncRootError::DirCrossesMount). The frame rather than the
+  /// device, because a same-superblock bind mount shares its parent's device
+  /// exactly and only a differing mount id marks it a boundary. Ownership and mode
+  /// are still checked, and are still only ever grounds to REFUSE: no directory is
   /// entered because its bits look right.
   ///
   /// # The judged objects are held for the sync's duration
@@ -1904,9 +1907,10 @@ impl<R> Watcher<R> {
   /// object that was judged — or when the reserved cookie directory inside it is
   /// not the object the admission read there, or is one this write created and
   /// something besides its own marker turns out to be standing in;
-  /// [`DirCrossesMount`](SyncRootError::DirCrossesMount) when a directory already
-  /// standing at that reserved name lies on another device, which is ground this
-  /// root's crawl never descends into;
+  /// [`DirCrossesMount`](SyncRootError::DirCrossesMount) when a directory on the
+  /// chain from the watched root to the marker — a component of the descent, or the
+  /// directory already standing at that reserved name — lies outside the root's
+  /// mount frame, which is ground this root's crawl never descends into;
   /// [`Write`](SyncRootError::Write) when the
   /// create fails (a read-only tree surfaces as `PermissionDenied`), and when this
   /// call cannot HOLD the directories the sync is judged against — a descriptor

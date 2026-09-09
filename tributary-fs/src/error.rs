@@ -379,23 +379,31 @@ pub enum SyncRootError {
     /// at, as the descriptor answered it.
     dir: PathBuf,
   },
-  /// A directory was already standing at the reserved cookie-directory name — the
-  /// private directory this watcher's markers go in, one level inside the
-  /// directory the sync named — on a DEVICE other than its parent's: a mount
-  /// boundary.
+  /// A directory on the chain from the watched root down to the marker stands
+  /// across a MOUNT BOUNDARY: either a component of the descent from the root to
+  /// the directory the sync named, or the reserved cookie-directory name itself —
+  /// the private directory this watcher's markers go in, one level inside the
+  /// directory the sync named.
   ///
-  /// A root's crawl does not descend across a mount, so the reserved directory
-  /// beyond one is never enumerated and no watch is ever armed inside it. A marker
-  /// created there is unreportable however it is ordered, and the barrier waiting
-  /// on its event could only time out — so the write is refused with nothing
-  /// created, exactly as [`DirPruned`](Self::DirPruned) and
-  /// [`DirExcluded`](Self::DirExcluded) are, and for the same reason: a barrier no
-  /// source can report is not a barrier.
+  /// The rule is the mount FRAME, not the device. A `mount --bind` of a
+  /// same-superblock directory shares its parent's device exactly, so a device
+  /// comparison cannot see one at all, while the root's crawl — which fences its
+  /// descent on the mount id — treats it as a boundary and never enumerates
+  /// anything beneath it. Where no mount id can be read (Linux below 5.8, and
+  /// macOS, which has no bind mounts and gives every mount its own device) the
+  /// device is the whole of the rule, which is the same honest degrade the crawl
+  /// takes.
+  ///
+  /// A root's crawl does not descend across a mount, so ground beyond one is never
+  /// enumerated and no watch is ever armed inside it. A marker created there is
+  /// unreportable however it is ordered, and the barrier waiting on its event could
+  /// only time out — so the write is refused with nothing created, exactly as
+  /// [`DirPruned`](Self::DirPruned) and [`DirExcluded`](Self::DirExcluded) are, and
+  /// for the same reason: a barrier no source can report is not a barrier.
   ///
   /// Unlike those two this is not a configuration word but the shape of the tree,
   /// and it is not transient either — a retry finds the same mount. Sync a
-  /// directory on the root's own mount instead, or take the mount off the reserved
-  /// name.
+  /// directory on the root's own mount instead, or take the mount off the name.
   ///
   /// The admission's sequence is SPENT: the verdict needs the object only the
   /// write's own descriptor walk can reach, so it is taken after the sync was
@@ -403,8 +411,10 @@ pub enum SyncRootError {
   /// [`mint_sync_ticket`](crate::Watcher::mint_sync_ticket) to retry.
   #[error("cookie directory {} lies across a mount boundary", dir.display())]
   DirCrossesMount {
-    /// The reserved cookie directory the write reached — the name the mount
-    /// stands at, as the descriptor answered it.
+    /// The directory that crossed, as the descriptor holding it answered its name:
+    /// the FIRST component of the descent to stand outside the root's mount frame,
+    /// or — when the whole descent stayed inside it — the reserved cookie directory
+    /// standing at the reserved name.
     dir: PathBuf,
   },
   /// The cookie name is not a single normal filename component — it holds a

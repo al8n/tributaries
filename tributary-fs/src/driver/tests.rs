@@ -18956,8 +18956,10 @@ mod sync_cookie {
     /// descend across a mount, and no per-directory watch is armed beyond one, so
     /// a marker created there produces no event at all — the barrier would wait
     /// out its whole deadline for something that was never going to be reported.
-    /// The parent's own device is what tells the two apart, and the refusal is its
-    /// own verdict rather than the replacement one: nothing was replaced.
+    /// The parent's own MOUNT FRAME is what tells the two apart — the bind below
+    /// shares the parent's device exactly, which is why a device comparison could
+    /// not — and the refusal is its own verdict rather than the replacement one:
+    /// nothing was replaced.
     ///
     /// Linux-only and privileged — a bind mount is the one way to stand a mount at
     /// an arbitrary in-root name, and the integration suites' own bind fixtures are

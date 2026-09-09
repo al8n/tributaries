@@ -1296,6 +1296,16 @@ struct CookieParent {
   /// is the same absence [`cookie_target_identity`] answers there — the comparison
   /// then narrows nothing, exactly as the root's own does.
   identity: Option<RootIdentity>,
+  /// The mount frame this value's own descriptor stands in — and, because the walk
+  /// refuses the first component that leaves it, the VERIFIED ROOT's frame.
+  ///
+  /// It is carried for the reason `floor` is: the reserved directory's own frame
+  /// has to be compared against something read the same way, off a descriptor this
+  /// write is holding, and re-deriving it from a name would ask about a world that
+  /// can have changed since the walk. See [`leaves_mount_frame`] for the rule and
+  /// why it is the crawl's.
+  #[cfg(any(target_os = "linux", target_os = "macos"))]
+  frame: MountFrame,
   /// Every create runs against this, never against `path`.
   #[cfg(any(target_os = "linux", target_os = "macos"))]
   fd: std::os::fd::OwnedFd,
@@ -1314,6 +1324,13 @@ impl CookieParent {
   /// reading of the cookie directory is compared against.
   fn identity(&self) -> Option<RootIdentity> {
     self.identity
+  }
+
+  /// The mount frame the walk ended in, which is the verified root's — what the
+  /// reserved directory standing at the cookie name is measured against.
+  #[cfg(any(target_os = "linux", target_os = "macos"))]
+  fn frame(&self) -> &MountFrame {
+    &self.frame
   }
 
   /// The watched root's name in [`path`](Self::path)'s own form — the floor those
@@ -1480,7 +1497,16 @@ impl CookieParent {
   ///
   /// `dir` must lie under `root` (the caller's lexical preflight has already
   /// said so); anything else is a seam bug and refused rather than walked.
-  fn open(identity: RootIdentity, root: &Path, dir: &Path) -> Result<Self, std::io::Error> {
+  ///
+  /// Every descriptor the descent takes must stand in the ROOT's own mount frame,
+  /// and the first one that does not refuses the walk right there
+  /// ([`CookieDirRefusal::CrossesMount`], naming that component). The containment
+  /// test above it cannot see this: a `mount --bind` of a same-superblock directory
+  /// at an in-root name is a perfectly contained, perfectly ordinary-looking child,
+  /// and it is ground the crawl deliberately does not descend into — so a marker
+  /// placed anywhere beneath it is unreportable and the caller's barrier could only
+  /// time out. The rule is the crawl's own, stated at [`leaves_mount_frame`].
+  fn open(identity: RootIdentity, root: &Path, dir: &Path) -> Result<Self, CookieDirRefusal> {
     use std::os::fd::OwnedFd;
 
     let relative = dir.strip_prefix(root).map_err(|_| {
@@ -1496,16 +1522,32 @@ impl CookieParent {
     // resolution scheme, which is the only way the comparison means anything (the
     // Windows arm draws the same line for the same reason).
     let floor = current_path_of_dir(&fd)?;
+    // ...and the FRAME, off that same descriptor and once: every component below is
+    // measured against the root's, never against the one before it. A chain of
+    // binds each sharing its own parent's frame would otherwise walk itself back
+    // inside the scope one step at a time, while the crawl — which fences every
+    // enumerated directory on the SCOPE ROOT's frame — descended into none of them.
+    let frame = frame_of_dir(&fd)?;
     for component in relative.components() {
       let std::path::Component::Normal(name) = component else {
         // A canonical path yields nothing else, so this is a seam bug — and it
         // is the one shape that could climb out of the walk. Refuse it rather
         // than resolve it.
-        return Err(std::io::Error::other(
-          "the cookie directory's path is not a plain descent from the watched root",
-        ));
+        return Err(
+          std::io::Error::other(
+            "the cookie directory's path is not a plain descent from the watched root",
+          )
+          .into(),
+        );
       };
       fd = OwnedFd::from(open_dir_at(&fd, name)?);
+      // Asked of the component the walk has just taken, before the next `openat`
+      // descends any further into it. The name it is refused under is the one the
+      // OS answers for THAT descriptor, so the caller is told which object it must
+      // move off rather than a spelling assembled from the components asked for.
+      if leaves_mount_frame(&frame, &frame_of_dir(&fd)?) {
+        return Err(CookieDirRefusal::CrossesMount(current_path_of_dir(&fd)?));
+      }
       #[cfg(all(
         test,
         feature = "tokio",
@@ -1549,9 +1591,116 @@ impl CookieParent {
       path,
       floor,
       identity,
+      frame,
       fd,
     })
   }
+}
+
+/// The MOUNT FRAME of one open directory descriptor, and the device it sits on —
+/// one sample of that descriptor, so the two facts are always the same object's.
+///
+/// The pair is what a boundary verdict needs, because neither half alone is a
+/// boundary rule. A device says which SUPERBLOCK an object lives on and cannot see
+/// a `mount --bind` of a same-superblock directory, which shares it exactly; a
+/// mount id sees precisely that, and is only there to be read from Linux 5.8 on.
+/// Carrying both lets the comparison be the crawl's own
+/// (`core::crosses_mount_boundary`) rather than a
+/// second rule that happens to agree in the cases anyone tested.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, Copy)]
+struct MountFrame {
+  /// The device the sample reported.
+  dev: u64,
+  /// The mount id, `Some` only where the sample reported one — Linux 5.8 and up,
+  /// with the `STATX_MNT_ID` mask bit actually set. `None` everywhere else (an
+  /// older kernel, and macOS, which has no bind mounts to detect and gives every
+  /// mount its own device), and the comparison then rests on the device alone.
+  mnt_id: Option<u64>,
+}
+
+/// The mount frame of an open DIRECTORY descriptor, read THROUGH that descriptor —
+/// `statx(fd, "", AT_EMPTY_PATH, ...)`, the fd-addressed twin of the crawl's own
+/// [`stat_sample`], which reads the same two facts about a path.
+///
+/// It resolves no pathname at all, which is what makes it usable inside the cookie
+/// walk: every descriptor the walk holds was reached by a proven `openat`, and a
+/// second resolution of its name would be a question about a different world.
+///
+/// A mask miss declines only the mount id (`None`); a `statx` that FAILS is
+/// returned, because a walk that cannot say which mount it is standing in cannot
+/// say the marker it is about to place is reportable — the same fail-closed shape
+/// [`identity_of_dir`] takes beside it.
+#[cfg(all(target_os = "linux", not(miri)))]
+fn frame_of_dir(fd: &std::os::fd::OwnedFd) -> Result<MountFrame, std::io::Error> {
+  use rustix::fs::{AtFlags, StatxFlags, makedev, statx};
+
+  let stx = loop {
+    match statx(
+      fd,
+      c"",
+      AtFlags::EMPTY_PATH,
+      StatxFlags::BASIC_STATS.union(StatxFlags::MNT_ID),
+    ) {
+      Ok(stx) => break stx,
+      // A signal cutting the call short is not a fact about the tree, exactly as
+      // it is not one in [`stat_sample`].
+      Err(rustix::io::Errno::INTR) => continue,
+      Err(err) => return Err(err.into()),
+    }
+  };
+  Ok(MountFrame {
+    dev: makedev(stx.stx_dev_major, stx.stx_dev_minor),
+    mnt_id: (stx.stx_mask & StatxFlags::MNT_ID.bits() != 0).then_some(stx.stx_mnt_id),
+  })
+}
+
+/// The same reading where there is no `statx` to take it with: the device off an
+/// `fstat` of the held descriptor, and no mount id at all.
+///
+/// macOS gives every mount its own device and has no bind mounts, so the device IS
+/// the frame there. Under Miri the interpreter executes no `statx`, and the degrade
+/// is the same honest one the core takes below Linux 5.8.
+#[cfg(any(target_os = "macos", all(target_os = "linux", miri)))]
+fn frame_of_dir(fd: &std::os::fd::OwnedFd) -> Result<MountFrame, std::io::Error> {
+  use std::os::unix::fs::MetadataExt;
+
+  let meta = std::fs::File::from(fd.try_clone()?).metadata()?;
+  Ok(MountFrame {
+    dev: meta.dev(),
+    mnt_id: None,
+  })
+}
+
+/// Whether `standing` sits outside the mount frame `root` was read in — THE
+/// boundary rule for the whole cookie chain, and deliberately the crawl's own
+/// (`core::crosses_mount_boundary`) rather than a
+/// second one beside it.
+///
+/// A directory the crawl would not descend into is a directory no watch of this
+/// scope is ever armed inside, so a marker created there is unreportable however it
+/// is ordered and the caller's barrier could only time out. The two fences must
+/// therefore answer the same question, or the write places markers on ground the
+/// source has already decided it will never look at.
+///
+/// Both halves fire:
+///
+/// - **the device belt** — a differing device is a boundary whether or not either
+///   side reported a mount id. It is the sole fence when one does not, and it is
+///   what fences a btrfs subvolume, which the kernel gives its own anonymous device
+///   while leaving it inside its parent's mount.
+/// - **the mount fence** — a differing mount id, when BOTH sides reported one. This
+///   is the half the device cannot supply: a `mount --bind` of a same-superblock
+///   directory shares the device exactly, so nothing but the mount id marks it a
+///   boundary.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn leaves_mount_frame(root: &MountFrame, standing: &MountFrame) -> bool {
+  let device_boundary = root.dev != standing.dev;
+  let mount_boundary = matches!(
+    (root.mnt_id, standing.mnt_id),
+    (Some(root), Some(standing)) if root != standing
+  );
+  device_boundary || mount_boundary
 }
 
 /// The identity of an open DIRECTORY descriptor — the `fstat` twin of
@@ -1639,7 +1788,7 @@ impl CookieParent {
   /// inside a REPLACEMENT standing at the old name is refused here — which is
   /// precisely the escape a pathname-to-pathname comparison cannot see, both
   /// spellings being perfectly contained.
-  fn open(identity: RootIdentity, root: &Path, dir: &Path) -> Result<Self, std::io::Error> {
+  fn open(identity: RootIdentity, root: &Path, dir: &Path) -> Result<Self, CookieDirRefusal> {
     use std::os::windows::io::AsHandle;
 
     use crate::os::windows::ffi;
@@ -1648,9 +1797,10 @@ impl CookieParent {
     let handle = ffi::open_cookie_parent(dir)?;
     let path = ffi::final_path_of(handle.as_handle())?;
     if !path.starts_with(&floor) {
-      return Err(std::io::Error::other(
-        "the cookie directory does not lie under the watched root object",
-      ));
+      return Err(
+        std::io::Error::other("the cookie directory does not lie under the watched root object")
+          .into(),
+      );
     }
     // The object behind that handle, read the same way the admission read the
     // directory it was given ([`cookie_target_identity`]): a duplicate of this
@@ -1675,12 +1825,15 @@ impl CookieParent {
   /// The same refusal [`CookieDir::open_or_create`] answers on this platform,
   /// taken one step earlier so nothing is opened at all — not even the root this
   /// platform has no way to descend from.
-  fn open(identity: RootIdentity, root: &Path, dir: &Path) -> Result<Self, std::io::Error> {
+  fn open(identity: RootIdentity, root: &Path, dir: &Path) -> Result<Self, CookieDirRefusal> {
     let _ = (identity, root, dir);
-    Err(std::io::Error::new(
-      std::io::ErrorKind::Unsupported,
-      "this platform has no way to bind a cookie's removal to the object created",
-    ))
+    Err(
+      std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "this platform has no way to bind a cookie's removal to the object created",
+      )
+      .into(),
+    )
   }
 }
 
@@ -1933,9 +2086,17 @@ enum CookieDirRefusal {
     )
   )]
   Replaced(PathBuf),
-  /// A directory stood at the reserved name on a device other than its parent's:
-  /// a mount boundary the crawl does not descend, so a marker inside it is
-  /// unreportable. Carries the name it stands at.
+  /// A directory on the chain from the verified root to the marker stands OUTSIDE
+  /// the root's mount frame: a mount boundary the crawl does not descend, so a
+  /// marker beneath it is unreportable. Carries the name that directory stands at —
+  /// the first component of the descent that crossed, or the reserved cookie
+  /// directory itself.
+  ///
+  /// The rule is the mount FRAME and not the device, because a device cannot see
+  /// the case that matters: a `mount --bind` of a same-superblock directory shares
+  /// its parent's device exactly, so only a differing mount id marks it a boundary
+  /// ([`leaves_mount_frame`], which also states the degrade where no mount id can
+  /// be read).
   #[cfg_attr(
     not(any(target_os = "linux", target_os = "macos")),
     allow(
@@ -2009,13 +2170,18 @@ impl CookieDir {
   ///   non-dot entry, and otherwise withdrawing it again ([`withdraw_marker`]) so
   ///   nothing of the write is left on disk.
   ///
-  /// A directory reached on EITHER arm must live on the PARENT's own device. A
-  /// mount standing at the reserved name is ground the crawl does not descend
-  /// into, so the marker's create is unreportable there whatever its ordering — a
-  /// refusal rather than a barrier that can only time out. It is asked of the
-  /// created arm too: an exchanged object can be a mount point as easily as a
-  /// prepared directory, and the create arm has no admitted reading to have caught
-  /// it with.
+  /// A directory reached on EITHER arm must stand in the PARENT's own mount frame,
+  /// which the walk has already proven to be the verified root's. A mount standing
+  /// at the reserved name is ground the crawl does not descend into, so the
+  /// marker's create is unreportable there whatever its ordering — a refusal rather
+  /// than a barrier that can only time out. It is asked of the created arm too: an
+  /// exchanged object can be a mount point as easily as a prepared directory, and
+  /// the create arm has no admitted reading to have caught it with.
+  ///
+  /// The frame, not the device: a `mount --bind` of a same-superblock directory
+  /// standing at the reserved name shares its parent's device exactly, so a device
+  /// rule admits it while the crawl — which fences on the mount id — arms nothing
+  /// inside it ([`leaves_mount_frame`]).
   ///
   /// The uid and mode checks below stay, and stay REFUSALS: they can only ever
   /// narrow what is accepted. Neither is a licence — a directory is entered
@@ -2068,15 +2234,19 @@ impl CookieDir {
     if !minted && admitted != Some(standing) {
       return Err(CookieDirRefusal::Replaced(path));
     }
-    // The parent's device, off the identity the walk already read for the
-    // descriptor it ended holding — never a fresh lookup. It narrows nothing
-    // where the platform has no identity to give, which on this arm is a case
-    // that cannot arise: a walk whose own `fstat` failed refused long before
-    // this call.
-    if parent
-      .identity()
-      .is_some_and(|parent| parent.dev() != standing.dev())
-    {
+    // The parent's own MOUNT FRAME, read off the descriptor the walk ended holding
+    // and carried since — never a fresh lookup — against this directory's, read off
+    // the descriptor just opened. The walk has already refused any component that
+    // left the root's frame, so the parent's frame IS the root's and this is the
+    // last link of one chain measured against one origin.
+    //
+    // It replaces a device comparison, which could not see the case that matters: a
+    // `mount --bind` of a same-superblock directory standing at the reserved name
+    // shares its parent's device exactly, so a device rule admitted it, the marker
+    // was created inside ground the crawl never descends into, and the barrier
+    // waited out its deadline for an event that could not be reported. The rule and
+    // its degrade are stated at [`leaves_mount_frame`].
+    if leaves_mount_frame(parent.frame(), &frame_of_dir(&opened)?) {
       return Err(CookieDirRefusal::CrossesMount(path));
     }
     // SAFETY: `geteuid` reads no memory, takes no arguments, and cannot fail.
@@ -3235,15 +3405,20 @@ pub(crate) struct CookieWriteError {
   /// the marker was created and answered only once that marker has been withdrawn
   /// ([`withdraw_marker`]). Boxed for the reason `pruned` and `excluded` are.
   pub(crate) replaced: Option<Box<PathBuf>>,
-  /// Set when the write refused because the reserved cookie directory standing at
-  /// its name lies on a DEVICE other than its parent's — a mount boundary, which
-  /// is ground no crawl of this root descends into, so a marker created inside it
-  /// could never be reported however it was ordered. Carries the name the mount
-  /// stands at.
+  /// Set when the write refused because a directory on the chain from the verified
+  /// root to the marker stands outside the ROOT's mount frame — a mount boundary,
+  /// which is ground no crawl of this root descends into, so a marker beneath it
+  /// could never be reported however it was ordered. Carries the name that
+  /// directory stands at: the first component of the descent that crossed, or the
+  /// reserved cookie directory itself.
+  ///
+  /// The frame rather than the device, because a device cannot see a `mount --bind`
+  /// of a same-superblock directory — it shares its parent's device exactly, and
+  /// only a differing mount id marks it a boundary.
   ///
   /// Always a clean failure with no residue beside it, and for the same reason
-  /// `replaced` is: the verdict is taken on the descriptor the create returned for
-  /// a directory that was ALREADY there, so this write has made nothing.
+  /// `replaced` is: every one of those verdicts is taken on a descriptor of a
+  /// directory that was ALREADY there, so this write has made nothing.
   pub(crate) crossed: Option<Box<PathBuf>>,
 }
 
@@ -3324,10 +3499,10 @@ impl CookieWriteError {
     }
   }
 
-  /// The mount refusal: a directory was already standing at the reserved cookie
-  /// name on another device, so nothing of this write is on disk and the caller
-  /// learns which name it would have had to write across a boundary its own crawl
-  /// never descends.
+  /// The mount refusal: a directory on the chain from the verified root to the
+  /// marker stands outside the root's mount frame, so nothing of this write is on
+  /// disk and the caller learns which name it would have had to write across a
+  /// boundary its own crawl never descends.
   pub(crate) fn crosses_mount(dir: PathBuf) -> Self {
     Self {
       source: std::io::Error::other("the cookie directory lies across a mount boundary"),
@@ -8251,8 +8426,24 @@ impl FsOps for RealFs {
     // scope reads. So the walk's first descriptor is opened by name and then
     // PROVEN against the identity the scope was armed on, and a mismatch refuses
     // the write outright rather than descending into whatever answered.
-    let parent = CookieParent::open(root.identity(), canonical_root, &canonical_dir)
-      .map_err(CookieWriteError::clean)?;
+    //
+    // And the descent is fenced on the root's MOUNT FRAME as well as on its object:
+    // a component that is itself a mount inside the root is ground no crawl of this
+    // scope descends into, so a marker under it is unreportable exactly as one
+    // inside a mounted reserved directory is, and it is refused the same way and
+    // under the same word ([`CookieParent::open`]).
+    let parent =
+      CookieParent::open(root.identity(), canonical_root, &canonical_dir).map_err(|refusal| {
+        match refusal {
+          CookieDirRefusal::Io(err) => CookieWriteError::clean(err),
+          CookieDirRefusal::CrossesMount(dir) => CookieWriteError::crosses_mount(dir),
+          // The walk answers no replacement verdict — it has no admitted reading of
+          // an intermediate component to compare one against — so this arm exists to
+          // keep the mapping total rather than to be reached, and reports the refusal
+          // it was handed rather than flattening it into a bare write error.
+          CookieDirRefusal::Replaced(dir) => CookieWriteError::replaced(dir),
+        }
+      })?;
     // And that object is compared against the one the ADMISSION judged.
     //
     // The walk above proves the descent started at the scope's root OBJECT, which
