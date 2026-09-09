@@ -938,6 +938,7 @@ impl LiveRoot {
   /// caller.
   #[cfg(all(
     test,
+    feature = "tokio",
     not(miri),
     any(target_os = "linux", target_os = "macos", target_os = "windows")
   ))]
