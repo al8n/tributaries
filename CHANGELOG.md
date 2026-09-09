@@ -492,6 +492,29 @@ All notable changes to this workspace are documented here. The format is based o
   document whose size must be bounded is bounded by a limited reader on the caller's
   side.
 
+- **`tributary-fs`** — the identity proof now reaches the object a marker is actually
+  born in: the RESERVED COOKIE DIRECTORY the watcher keeps inside the directory a sync
+  names. A `mkdirat` that succeeds is its own proof — the directory is new, empty, named
+  by nobody else, and its create is kernel-ordered after the cut that proved its parent —
+  but one that reports `EEXIST` is now adopted only if it is EXACTLY the object the
+  admission read at that name. Ownership and mode were the whole of that test before, and
+  a peer running as the same user could satisfy them: prepare a directory, fill it with
+  descendants, chmod it `0700`, and rename it onto the reserved name in the window the
+  settle fence and the blocking pool open. The marker then landed in a directory no crawl
+  of the scope had enumerated, so a later cold enumeration could report its create ahead
+  of descendants that were on disk before it. A replacement, or a reserved directory that
+  merely APPEARED after the cut, is now `SyncRootError::DirReplaced`; the uid and mode
+  checks remain, as grounds to refuse and never as grounds to adopt.
+
+- **`tributary-fs`**, **`tributaries`** — a reserved cookie directory standing across a
+  MOUNT BOUNDARY is the new typed `SyncRootError::DirCrossesMount` refusal. A root's
+  crawl does not descend across a mount and arms no watch beyond one, so a marker created
+  there is unreportable however it is ordered and the barrier could only time out. It is
+  refused before anything is created, and the umbrella classifies it as
+  `SyncError::CookieDirUncovered` — the same "that directory could never report the
+  cookie" the exclusion and `prune` refusals mean, and permanent in the same way (unlike
+  `DirReplaced`, a retry meets the same mount).
+
 - **`tributaries`** — **BREAKING for a custom `Source`**: `Source::arm` and
   `LocalSource::arm` take the per-root `&RootGlobs` as a third argument
   (`arm(&mut self, key: &[C], globs: &RootGlobs)`). An out-of-tree source must accept

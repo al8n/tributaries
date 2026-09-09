@@ -186,10 +186,10 @@ pub(crate) type WatchReply = futures_channel::oneshot::Sender<Result<WatchGrant,
 /// entry here exists exactly while its obligation is `Parked`.
 struct ParkedCookie {
   dir: PathBuf,
-  /// The identity the admission read for `dir` — carried so the detached write can
-  /// prove the directory it reaches is the OBJECT the barrier was promised for
-  /// ([`cookie_target_identity`]).
-  target: Option<RootIdentity>,
+  /// What the admission read about the two directories the marker's ordering
+  /// rests on — carried so the detached write can prove the objects it reaches
+  /// are the ones the barrier was promised for ([`AdmittedDirs`]).
+  admitted: AdmittedDirs,
   reply: futures_channel::oneshot::Sender<Result<PathBuf, crate::error::SyncRootError>>,
 }
 
@@ -1656,6 +1656,51 @@ fn component_c_name(name: &std::ffi::OsStr) -> Result<std::ffi::CString, std::io
   })
 }
 
+/// Why [`CookieDir::open_or_create`] would not hand back a directory.
+///
+/// It is an ordinary write failure plus the two verdicts that are ABOUT the
+/// object rather than about a syscall, and those two are kept apart from
+/// `io::Error` for the reason every other typed refusal in this module is: a
+/// caller that can only print an error cannot tell its own user that the ground
+/// under its barrier changed, and the driver reports each of them as its own
+/// [`SyncRootError`](crate::SyncRootError) variant. Every one of them is CLEAN in
+/// [`CookieWriteError::clean`]'s sense — they are all reached before anything of
+/// this write exists on disk, the directory the create may have minted included
+/// (a `mkdirat` that succeeded is never one of these).
+#[derive(Debug)]
+enum CookieDirRefusal {
+  /// The create, the open, or one of the descriptor reads failed.
+  Io(std::io::Error),
+  /// A directory stood at the reserved name and is not the object the admission
+  /// judged — replaced after the cut, or appeared after it. Carries the name it
+  /// stands at.
+  #[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos")),
+    allow(
+      dead_code,
+      reason = "only the walking arms can name the object they reached"
+    )
+  )]
+  Replaced(PathBuf),
+  /// A directory stood at the reserved name on a device other than its parent's:
+  /// a mount boundary the crawl does not descend, so a marker inside it is
+  /// unreportable. Carries the name it stands at.
+  #[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos")),
+    allow(
+      dead_code,
+      reason = "only the walking arms can name the object they reached"
+    )
+  )]
+  CrossesMount(PathBuf),
+}
+
+impl From<std::io::Error> for CookieDirRefusal {
+  fn from(source: std::io::Error) -> Self {
+    Self::Io(source)
+  }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl CookieDir {
   /// Creates (or re-opens) the cookie directory inside `parent` and verifies what
@@ -1670,7 +1715,39 @@ impl CookieDir {
   /// anywhere to redirect it to. `path` is that object's own name joined with the
   /// reserved leaf, which is what a landing is reported under — it is never
   /// resolved again.
-  fn open_or_create(parent: &CookieParent) -> Result<Self, std::io::Error> {
+  ///
+  /// `admitted` is what the admission read at this very name, and it is what
+  /// decides whether a directory ALREADY THERE may be entered at all. The two
+  /// outcomes of the create say different things and are judged differently:
+  ///
+  /// - the `mkdirat` SUCCEEDED. This write made the directory: it is new, empty by
+  ///   construction, and named by nobody else, and its own `Created` is
+  ///   kernel-ordered after the cut that proved its parent. There is no earlier
+  ///   object for it to be a replacement OF, so nothing is compared.
+  /// - the `mkdirat` reported `EEXIST`. Something stood at the reserved name
+  ///   already, and the only question worth asking is whether it is the object the
+  ///   admission judged. It must be, exactly — device and inode — or this write is
+  ///   about to place a marker inside a directory the cut never covered: a peer's
+  ///   prepared directory, moved into the reserved name after the admission,
+  ///   carries descendants older than the marker that no queue of this scope ever
+  ///   reported, so a later crawl can enumerate the marker's create ahead of them
+  ///   and the barrier would certify an ordering nobody proved. An admission that
+  ///   read NOTHING here is the same refusal: a directory that appeared after the
+  ///   cut is exactly the object this rules out.
+  ///
+  /// A pre-existing directory must also live on the PARENT's own device. A mount
+  /// standing at the reserved name is ground the crawl does not descend into, so
+  /// the marker's create is unreportable there whatever its ordering — a refusal
+  /// rather than a barrier that can only time out.
+  ///
+  /// The uid and mode checks below stay, and stay REFUSALS: they can only ever
+  /// narrow what is accepted. Neither is a licence — a directory is entered
+  /// because this write made it or because it is the admitted object, never
+  /// because its ownership bits look agreeable.
+  fn open_or_create(
+    parent: &CookieParent,
+    admitted: Option<RootIdentity>,
+  ) -> Result<Self, CookieDirRefusal> {
     use std::os::unix::fs::MetadataExt;
 
     let name = cookie_dir_name();
@@ -1678,31 +1755,57 @@ impl CookieDir {
     // `0o700` is the mode the whole argument rests on. A umask can only clear
     // bits, so the created directory is never more permissive than asked; the
     // verification below re-reads what was actually made either way.
-    match make_dir_at(&parent.fd, &name) {
-      Ok(()) => {}
-      // Already there — from an earlier sync, or from a previous run of this
-      // process. Verified below like any other pre-existing directory.
-      Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
-      Err(err) => return Err(err),
-    }
+    let minted = match make_dir_at(&parent.fd, &name) {
+      Ok(()) => true,
+      // Already there — from an earlier sync, from a previous run of this process,
+      // or from a peer that stood it there. Which of those it is, is exactly what
+      // the identity below answers.
+      Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => false,
+      Err(err) => return Err(err.into()),
+    };
     // `O_DIRECTORY` refuses anything that is not a directory and `O_NOFOLLOW`
     // refuses a symlink standing at the name, so what this descriptor refers to
     // cannot have been redirected elsewhere.
     let opened = open_dir_at(&parent.fd, std::ffi::OsStr::new(&name))?;
     let meta = opened.metadata()?;
+    if !minted {
+      // The object this descriptor holds, read off the descriptor itself — the
+      // same reading, of the same shape, the admission took at this name.
+      let standing = RootIdentity::new(meta.dev(), meta.ino().into());
+      if admitted != Some(standing) {
+        return Err(CookieDirRefusal::Replaced(path));
+      }
+      // The parent's device, off the identity the walk already read for the
+      // descriptor it ended holding — never a fresh lookup. It narrows nothing
+      // where the platform has no identity to give, which on this arm is a case
+      // that cannot arise: a walk whose own `fstat` failed refused long before
+      // this call.
+      if parent
+        .identity()
+        .is_some_and(|parent| parent.dev() != standing.dev())
+      {
+        return Err(CookieDirRefusal::CrossesMount(path));
+      }
+    }
     // SAFETY: `geteuid` reads no memory, takes no arguments, and cannot fail.
     let euid = unsafe { libc::geteuid() };
     if meta.uid() != euid {
-      return Err(std::io::Error::new(
-        std::io::ErrorKind::PermissionDenied,
-        "the cookie directory is owned by another user",
-      ));
+      return Err(
+        std::io::Error::new(
+          std::io::ErrorKind::PermissionDenied,
+          "the cookie directory is owned by another user",
+        )
+        .into(),
+      );
     }
     if meta.mode() & 0o077 != 0 {
-      return Err(std::io::Error::new(
-        std::io::ErrorKind::PermissionDenied,
-        "the cookie directory grants access beyond its owner",
-      ));
+      return Err(
+        std::io::Error::new(
+          std::io::ErrorKind::PermissionDenied,
+          "the cookie directory grants access beyond its owner",
+        )
+        .into(),
+      );
     }
     Ok(Self {
       path,
@@ -1852,8 +1955,18 @@ impl CookieDir {
   /// never unwinds strands whatever was outstanding; see [`CookieDir`] for the two
   /// mechanisms and [`Drop`](CookieDir::drop) for what the residue costs and where it
   /// is tracked.
-  fn open_or_create(parent: &CookieParent) -> Result<Self, std::io::Error> {
-    Self::minted(parent, &mut mint_cookie_dir_token)
+  ///
+  /// `admitted` is unread here, and is the one platform where that is the whole
+  /// truth rather than a shortcut: this arm never adopts a directory at all. The
+  /// name it creates under is minted per obligation inside the create itself, so
+  /// there is no reserved name for an admission to have sampled and nothing
+  /// standing at one for this call to judge.
+  fn open_or_create(
+    parent: &CookieParent,
+    admitted: Option<RootIdentity>,
+  ) -> Result<Self, CookieDirRefusal> {
+    let _ = admitted;
+    Ok(Self::minted(parent, &mut mint_cookie_dir_token)?)
   }
 
   /// The body of [`open_or_create`](Self::open_or_create), with the candidate
@@ -2128,11 +2241,17 @@ fn marker_stands_in(dir: &Path, marker: &Path, name: &str) -> bool {
   all(target_os = "windows", not(miri))
 )))]
 impl CookieDir {
-  fn open_or_create(_parent: &CookieParent) -> Result<Self, std::io::Error> {
-    Err(std::io::Error::new(
-      std::io::ErrorKind::Unsupported,
-      "this platform has no way to bind a cookie's removal to the object created",
-    ))
+  fn open_or_create(
+    _parent: &CookieParent,
+    _admitted: Option<RootIdentity>,
+  ) -> Result<Self, CookieDirRefusal> {
+    Err(
+      std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "this platform has no way to bind a cookie's removal to the object created",
+      )
+      .into(),
+    )
   }
 
   fn create(&self, _name: &str) -> Result<std::fs::File, std::io::Error> {
@@ -2813,6 +2932,16 @@ pub(crate) struct CookieWriteError {
   /// walk's own descriptor, before anything at all is created. Boxed for the
   /// reason `pruned` and `excluded` are.
   pub(crate) replaced: Option<Box<PathBuf>>,
+  /// Set when the write refused because the reserved cookie directory standing at
+  /// its name lies on a DEVICE other than its parent's — a mount boundary, which
+  /// is ground no crawl of this root descends into, so a marker created inside it
+  /// could never be reported however it was ordered. Carries the name the mount
+  /// stands at.
+  ///
+  /// Always a clean failure with no residue beside it, and for the same reason
+  /// `replaced` is: the verdict is taken on the descriptor the create returned for
+  /// a directory that was ALREADY there, so this write has made nothing.
+  pub(crate) crossed: Option<Box<PathBuf>>,
 }
 
 /// The prune verdict a cookie write refused on: the canonical directory it
@@ -2851,6 +2980,7 @@ impl CookieWriteError {
       pruned: None,
       excluded: None,
       replaced: None,
+      crossed: None,
     }
   }
 
@@ -2866,6 +2996,22 @@ impl CookieWriteError {
       pruned: None,
       excluded: None,
       replaced: Some(Box::new(dir)),
+      crossed: None,
+    }
+  }
+
+  /// The mount refusal: a directory was already standing at the reserved cookie
+  /// name on another device, so nothing of this write is on disk and the caller
+  /// learns which name it would have had to write across a boundary its own crawl
+  /// never descends.
+  pub(crate) fn crosses_mount(dir: PathBuf) -> Self {
+    Self {
+      source: std::io::Error::other("the cookie directory lies across a mount boundary"),
+      residue: None,
+      pruned: None,
+      excluded: None,
+      replaced: None,
+      crossed: Some(Box::new(dir)),
     }
   }
 
@@ -2880,6 +3026,7 @@ impl CookieWriteError {
       pruned: Some(Box::new(PrunedCookieDir { dir, pattern })),
       excluded: None,
       replaced: None,
+      crossed: None,
     }
   }
 
@@ -2895,6 +3042,7 @@ impl CookieWriteError {
       pruned: None,
       excluded: Some(Box::new(ExcludedCookieDir { dir, exclusion })),
       replaced: None,
+      crossed: None,
     }
   }
 }
@@ -4658,12 +4806,12 @@ pub(crate) enum Command {
     scope: ScopeId,
     /// The directory to place it in (validated inside the root by the watcher).
     dir: PathBuf,
-    /// The identity `dir` answered at the admission door, read there because that
-    /// is the moment the barrier's promise is made — the write is detached from it
-    /// by a settle fence and a blocking pool, and only this says whether the
-    /// directory it reaches is still the object that was judged
-    /// ([`cookie_target_identity`]).
-    target: Option<RootIdentity>,
+    /// What `dir` and the reserved cookie directory inside it answered at the
+    /// admission door, read there because that is the moment the barrier's promise
+    /// is made — the write is detached from it by a settle fence and a blocking
+    /// pool, and only these say whether the objects it reaches are still the ones
+    /// that were judged ([`AdmittedDirs`]).
+    admitted: AdmittedDirs,
     /// The minted cookie name (the caller owns the reserved namespace).
     name: String,
     /// The watcher-minted ticket keying this admission — the `by_ticket` address a
@@ -5006,8 +5154,12 @@ where
       let ops = ops.clone();
       let tx = op_tx.clone();
       R::spawn_blocking_detach(move || {
-        let ParkedCookie { dir, target, reply } = cookie;
-        match ops.write_cookie(&root, &dir, target, &name, &prune, &exclusions) {
+        let ParkedCookie {
+          dir,
+          admitted,
+          reply,
+        } = cookie;
+        match ops.write_cookie(&root, &dir, admitted, &name, &prune, &exclusions) {
           Ok(file) => {
             // Hand the cookie to the registry — the path the write ACTUALLY
             // landed at (which only the write knows: a covered FILE
@@ -5058,6 +5210,22 @@ where
             // handed a barrier that certifies nothing.
             lock_ledger(&guard.ledger).retire(guard.id, Reaped::NeverCreated);
             let _ = reply.send(Err(crate::error::SyncRootError::DirReplaced { dir: *dir }));
+          }
+          Err(CookieWriteError {
+            crossed: Some(dir), ..
+          }) => {
+            // A directory was already standing at the reserved cookie name, on
+            // another device: a mount. The crawl that covers this root does not
+            // descend across one, so nothing created under it is ever enumerated
+            // and no watch of this scope is armed inside it — a marker there is
+            // unreportable whatever its ordering, and the barrier could only time
+            // out. Refused with nothing created, on the same pre-physical terminal
+            // the other ground refusals reach, and naming the directory whose
+            // ground the caller must move off.
+            lock_ledger(&guard.ledger).retire(guard.id, Reaped::NeverCreated);
+            let _ = reply.send(Err(crate::error::SyncRootError::DirCrossesMount {
+              dir: *dir,
+            }));
           }
           Err(CookieWriteError {
             excluded: Some(excluded),
@@ -5756,21 +5924,31 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
   /// so a marker the fence will suppress is a barrier that can only time out;
   /// success here means the marker was observable ground when this write last
   /// could ask.
-  /// `target` is the identity the ADMISSION read for the directory this cookie was
-  /// admitted for ([`cookie_target_identity`]). A barrier certifies an ordering for
-  /// the directory OBJECT that existed at admission and for no other, so an
-  /// implementation that can name the object it reached must compare the two and,
-  /// on a mismatch, create NOTHING and answer [`CookieWriteError::replaced`] —
-  /// which the caller reports as
+  /// `admitted` is what the ADMISSION read about the two directories this marker's
+  /// ordering rests on ([`AdmittedDirs`]). A barrier certifies an ordering for the
+  /// directory OBJECTS that existed at admission and for no others, so an
+  /// implementation that can name the objects it reached must compare both and, on
+  /// a mismatch, create NOTHING and answer [`CookieWriteError::replaced`] — which
+  /// the caller reports as
   /// [`SyncRootError::DirReplaced`](crate::SyncRootError::DirReplaced). A
-  /// replacement standing at the name is a directory whose coverage this scope has
-  /// not yet armed, so a marker born inside it rides no ordering the caller's
+  /// replacement standing at either name is a directory whose coverage this scope
+  /// has not yet armed, so a marker born inside it rides no ordering the caller's
   /// stream reads.
+  ///
+  /// The reserved cookie directory is the one of the two an implementation may also
+  /// CREATE, and creating it is the case that needs no comparison: a directory this
+  /// write made is new, empty, and named by nobody else, and its own create is
+  /// kernel-ordered after the cut that covered its parent. One that was already
+  /// there must equal the admitted reading exactly, and must live on the parent's
+  /// own device — a reserved name standing across a mount boundary is ground no
+  /// crawl of this root descends into, and the refusal for it is
+  /// [`CookieWriteError::crosses_mount`]
+  /// ([`SyncRootError::DirCrossesMount`](crate::SyncRootError::DirCrossesMount)).
   fn write_cookie(
     &self,
     root: &LiveRoot,
     dir: &Path,
-    target: Option<RootIdentity>,
+    admitted: AdmittedDirs,
     name: &str,
     prune: &Globs,
     exclusions: &[PathBuf],
@@ -6701,6 +6879,82 @@ pub(crate) fn cookie_target_identity(root: &Path, dir: &Path) -> Option<RootIden
   }
 }
 
+/// The identity of the RESERVED COOKIE DIRECTORY at the moment a sync is
+/// admitted, where one already stands there — the second object the marker's
+/// ordering rests on, and the last one the cut has to prove.
+///
+/// The marker is not born in the directory the caller named: it is born one level
+/// down, in `<target>/.tributaries-sync-cookies-<uid>`, and that is the object
+/// whose coverage carries the marker's own create. The target's identity
+/// ([`cookie_target_identity`]) says the write reached the directory the barrier
+/// was promised for; it says nothing about what stands at the reserved name
+/// INSIDE it, which a peer may swap for a prepared directory of its own in the
+/// same window — a directory no crawl of this scope has enumerated, holding
+/// descendants older than the marker that the queue never carried.
+///
+/// `None` is a definite absence and is read as one on the platforms that keep a
+/// stable reserved name: nothing stood there when the sync was admitted. That is
+/// not the harmless case it looks like — a directory that then EXISTS at write
+/// time is one that appeared after the cut, so the write must have created it
+/// itself or refuse (see [`CookieDir::open_or_create`]). It is also what every
+/// other platform answers: Windows mints a fresh directory per obligation inside
+/// the call that creates it, so there is no name to sample in advance, and its
+/// cookie path is fenced as a whole
+/// (<https://github.com/al8n/tributaries/issues/134>).
+///
+/// One `stat`, on the caller's own thread, beside the target's own.
+fn reserved_cookie_dir_identity(root: &Path, dir: &Path) -> Option<RootIdentity> {
+  #[cfg(any(target_os = "linux", target_os = "macos"))]
+  {
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = std::fs::metadata(cookie_dir(root, dir).join(cookie_dir_name())).ok()?;
+    Some(RootIdentity::new(meta.dev(), meta.ino().into()))
+  }
+  #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+  {
+    let _ = (root, dir);
+    None
+  }
+}
+
+/// What the admission door read about the two directories one sync's ordering
+/// rests on: the directory the sync is admitted FOR, and the reserved cookie
+/// directory inside it the marker will actually stand in.
+///
+/// They are sampled together, at the door, because that is the instant the
+/// barrier's promise is made — and they are carried together because a write
+/// detached from that instant by a settle fence and a blocking pool can prove
+/// nothing about either from a pathname. Every field is a definite reading or a
+/// definite absence of one; what each absence MEANS is stated at the sampler that
+/// produced it ([`cookie_target_identity`],
+/// [`reserved_cookie_dir_identity`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AdmittedDirs {
+  target: Option<RootIdentity>,
+  cookies: Option<RootIdentity>,
+}
+
+impl AdmittedDirs {
+  /// Samples both directories for a sync of `dir` under `root`.
+  pub(crate) fn read(root: &Path, dir: &Path) -> Self {
+    Self {
+      target: cookie_target_identity(root, dir),
+      cookies: reserved_cookie_dir_identity(root, dir),
+    }
+  }
+
+  /// The directory the sync was admitted for.
+  pub(crate) fn target(&self) -> Option<RootIdentity> {
+    self.target
+  }
+
+  /// The reserved cookie directory, when one already stood at that name.
+  pub(crate) fn cookies(&self) -> Option<RootIdentity> {
+    self.cookies
+  }
+}
+
 /// The longest cookie leaf this driver will carry, in bytes — `NAME_MAX` on
 /// every filesystem the supported platforms mount, so a longer name is one no
 /// create could ever land anyway.
@@ -7145,7 +7399,7 @@ impl FsOps for RealFs {
     &self,
     root: &LiveRoot,
     dir: &Path,
-    target: Option<RootIdentity>,
+    admitted: AdmittedDirs,
     name: &str,
     prune: &Globs,
     exclusions: &[PathBuf],
@@ -7218,7 +7472,7 @@ impl FsOps for RealFs {
     // directions — an admission that could read no identity where this write can
     // read one is an admission that judged no object at all — and narrows nothing
     // on a platform where neither side has an identity to give.
-    if parent.identity() != target {
+    if parent.identity() != admitted.target() {
       return Err(CookieWriteError::replaced(parent.path().to_path_buf()));
     }
     // The seat verdict, taken on that opened object rather than on the spelling
@@ -7291,7 +7545,25 @@ impl FsOps for RealFs {
     // directory, which is the one operation there that resolves `path` and can
     // destroy nothing; a peer able to write the parent can interpose on it, and that
     // is a filed defect rather than a claim made here.
-    let cookies = Arc::new(CookieDir::open_or_create(&parent).map_err(CookieWriteError::clean)?);
+    //
+    // And the same object-shaped promise covers the DIRECTORY this call opens, not
+    // only its parent: the marker is born one level below the judged object, and a
+    // reserved name a peer prepared and moved into place after the cut is a
+    // directory whose descendants no queue of this scope carried. The admission's
+    // own reading of that name is what the create is judged against
+    // ([`CookieDir::open_or_create`] states each arm), and each of its two typed
+    // verdicts is reported as the refusal that names what happened rather than as
+    // a bare write error.
+    let cookies = Arc::new(
+      match CookieDir::open_or_create(&parent, admitted.cookies()) {
+        Ok(cookies) => cookies,
+        Err(CookieDirRefusal::Io(err)) => return Err(CookieWriteError::clean(err)),
+        Err(CookieDirRefusal::Replaced(dir)) => return Err(CookieWriteError::replaced(dir)),
+        Err(CookieDirRefusal::CrossesMount(dir)) => {
+          return Err(CookieWriteError::crosses_mount(dir));
+        }
+      },
+    );
     // From HERE this write has a physical fact to answer for wherever the
     // directory is minted per obligation: `clean` would claim the filesystem is
     // exactly as this write found it, and it is not. Every failure below therefore
@@ -7901,6 +8173,7 @@ fn destroy_unidentified(
       pruned: None,
       excluded: None,
       replaced: None,
+      crossed: None,
     },
   }
 }
@@ -7956,6 +8229,7 @@ fn withdraw_marker(
       pruned: None,
       excluded: None,
       replaced: None,
+      crossed: None,
     },
   }
 }
@@ -7993,6 +8267,7 @@ fn post_mint_failure(dir: &Arc<CookieDir>, name: &str, source: std::io::Error) -
       pruned: None,
       excluded: None,
       replaced: None,
+      crossed: None,
     },
     None => CookieWriteError::clean(source),
   }
@@ -10295,7 +10570,7 @@ pub(crate) async fn run<R, F>(
         Ok(Command::SyncRoot {
           scope,
           dir,
-          target,
+          admitted,
           name,
           ticket,
           reply,
@@ -10449,7 +10724,7 @@ pub(crate) async fn run<R, F>(
                 // it belongs to, and removed in the same step it leaves `Parked` —
                 // the lockstep that keeps this local from ever being a second
                 // opinion about which syncs are parked.
-                parked_cookies.insert(fence, ParkedCookie { dir, target, reply });
+                parked_cookies.insert(fence, ParkedCookie { dir, admitted, reply });
               }
             }
           }

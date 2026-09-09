@@ -299,7 +299,8 @@ impl SyncAdmission {
 /// ambiguous — the write was admitted then retired
 /// ([`Write`](SyncRootError::Write), [`DirPruned`](SyncRootError::DirPruned),
 /// [`DirExcluded`](SyncRootError::DirExcluded),
-/// [`DirReplaced`](SyncRootError::DirReplaced)), the
+/// [`DirReplaced`](SyncRootError::DirReplaced),
+/// [`DirCrossesMount`](SyncRootError::DirCrossesMount)), the
 /// sync reached a post-birth terminal ([`Retired`](SyncRootError::Retired)), or the
 /// watcher is [`Closed`](SyncRootError::Closed) — so a retry must re-mint through
 /// [`mint_sync_ticket`](Watcher::mint_sync_ticket).
@@ -330,7 +331,9 @@ impl SyncRootDenied {
   /// the two apart, so the post-birth reading governs), `DirReplaced` (the same
   /// shape as `DirPruned`: the verdict needs the object only the write's own
   /// descent can reach, so it too is admitted and then retired — and re-minting is
-  /// what re-reads the directory that now stands at the name), `Retired` (a
+  /// what re-reads the directory that now stands at the name),
+  /// `DirCrossesMount` (the same shape again, taken on the reserved cookie
+  /// directory's own descriptor), `Retired` (a
   /// post-admission terminal), and `Closed`.
   pub(crate) fn classify(error: SyncRootError, admission: SyncAdmission) -> Self {
     let admission = if matches!(
@@ -1704,6 +1707,25 @@ impl<R> Watcher<R> {
   /// sequence is spent by it — the verdict needs the object only the write can
   /// reach — so a retry re-mints, which re-reads whatever now stands at the name.
   ///
+  /// The same promise reaches one level FURTHER DOWN, to the object the marker is
+  /// actually born in. A marker does not go in `dir` itself but in the private
+  /// reserved directory the watcher keeps inside it, and that name is as swappable
+  /// as its parent's: a peer that prepares a directory of its own — same owner,
+  /// same mode, descendants already inside it — and moves it into the reserved name
+  /// after the admission would otherwise be adopted on those looks alone. So the
+  /// reserved name is sampled at admission too, and the write's own create decides
+  /// between two cases and no others. A create that SUCCEEDS made the directory:
+  /// it is new, empty, named by nobody else, and its create is kernel-ordered
+  /// after the cut that proved its parent. A create that finds a directory already
+  /// there adopts it only if it is EXACTLY the object the admission read — device
+  /// and inode — and refuses otherwise ([`DirReplaced`](SyncRootError::DirReplaced)
+  /// again, including for a reserved directory that appeared after the cut). A
+  /// pre-existing one on another device is a mount, which no crawl of this root
+  /// descends into, and is refused as
+  /// [`DirCrossesMount`](SyncRootError::DirCrossesMount). Ownership and mode are
+  /// still checked, and are still only ever grounds to REFUSE: no directory is
+  /// entered because its bits look right.
+  ///
   /// # The leaf is minted, never chosen
   ///
   /// This call takes no name. The leaf is drawn by
@@ -1766,7 +1788,11 @@ impl<R> Watcher<R> {
   /// [`DirReplaced`](SyncRootError::DirReplaced) when the directory the write's
   /// own descent reaches is not the object `dir` named at admission — a peer
   /// replaced it in the meantime, and the barrier promises an ordering for the
-  /// object that was judged;
+  /// object that was judged — or when the reserved cookie directory inside it is
+  /// not the object the admission read there;
+  /// [`DirCrossesMount`](SyncRootError::DirCrossesMount) when a directory already
+  /// standing at that reserved name lies on another device, which is ground this
+  /// root's crawl never descends into;
   /// [`Write`](SyncRootError::Write) when the
   /// create fails (a read-only tree surfaces as `PermissionDenied`);
   /// [`WriteInFlight`](SyncRootError::WriteInFlight) when a physical write for this
@@ -1785,6 +1811,7 @@ impl<R> Watcher<R> {
   /// [`DirPruned`](SyncRootError::DirPruned),
   /// [`DirExcluded`](SyncRootError::DirExcluded),
   /// [`DirReplaced`](SyncRootError::DirReplaced),
+  /// [`DirCrossesMount`](SyncRootError::DirCrossesMount),
   /// [`Retired`](SyncRootError::Retired),
   /// and [`Closed`](SyncRootError::Closed), whose sequence is spent — re-mint to
   /// retry those.
@@ -1872,18 +1899,21 @@ impl<R> Watcher<R> {
         admission,
       ));
     }
-    // The OBJECT this sync is admitted for, sampled here because here is where the
+    // The OBJECTS this sync is admitted for, sampled here because here is where the
     // barrier's promise is made: what a sync certifies is an ordering for the
-    // directory that existed at admission, and the write is detached from this
+    // directories that existed at admission, and the write is detached from this
     // instant by the coverage-settle fence and the blocking pool. A peer that
-    // renames the directory aside and stands a replacement at its name inside that
+    // renames one of them aside and stands a replacement at its name inside that
     // window leaves every pathname the write resolves valid and every one of them
-    // about the wrong object; this reading is what the write compares what it
+    // about the wrong object; these readings are what the write compares what it
     // reached against before it creates anything ([`SyncRootError::DirReplaced`]).
-    // One `stat` on this caller's own thread, in [`watch`](Self::watch)'s mold —
-    // never on the driver's owner loop, which must not resolve a pathname against
-    // a mount that can hang.
-    let target = crate::driver::cookie_target_identity(&root_path, &dir);
+    // Two of them, because the marker is not born in the directory the caller
+    // named but in the reserved cookie directory one level inside it, and a
+    // replacement THERE is a directory whose coverage the cut never proved just as
+    // surely. Two `stat`s on this caller's own thread, in [`watch`](Self::watch)'s
+    // mold — never on the driver's owner loop, which must not resolve a pathname
+    // against a mount that can hang.
+    let admitted = crate::driver::AdmittedDirs::read(&root_path, &dir);
 
     // The wire is UNCHANGED: build the seq-bearing ticket the driver still keys
     // `by_ticket` on FROM the admission (a plain read of its two fields, no move),
@@ -1897,7 +1927,7 @@ impl<R> Watcher<R> {
       .send(Command::SyncRoot {
         scope: root.scope(),
         dir,
-        target,
+        admitted,
         name,
         ticket,
         reply,

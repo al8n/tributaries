@@ -221,7 +221,8 @@ fn sync_error_from_fs_classifies_a_refused_cookie_honestly() {
 
   use crate::error::{FaultKind, SyncError};
 
-  // The three shapes of "that directory could never report the cookie".
+  // The four shapes of "that directory could never report the cookie" — three
+  // configuration words and one the tree itself decides.
   let uncovered = [
     SyncRootError::DirOutsideRoot {
       dir: PathBuf::from("/elsewhere"),
@@ -234,6 +235,12 @@ fn sync_error_from_fs_classifies_a_refused_cookie_honestly() {
     SyncRootError::DirPruned {
       dir: PathBuf::from("/root/.cache"),
       pattern: "**/.cache".parse().expect("a valid pattern compiles"),
+    },
+    // A mount at the reserved cookie directory's name: no crawl of the root descends across
+    // it, so nothing inside it is ever enumerated or armed. Permanent, unlike `DirReplaced`
+    // below — a retry meets the same mount — so it is an uncovered directory and not `Busy`.
+    SyncRootError::DirCrossesMount {
+      dir: PathBuf::from("/root/a/.tributaries-sync-cookies-501"),
     },
   ];
   for err in uncovered {

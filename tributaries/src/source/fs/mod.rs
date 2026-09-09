@@ -973,13 +973,15 @@ fn watch_error_from_fs(err: WatchRootError) -> WatchError {
 ///
 /// The line it draws is between a barrier that FAILED and one that could never have been met:
 ///
-/// - **the cookie directory is not covered** — outside the root, under a watcher exclusion, or
-///   under this root's own `prune` seat. All three are refused before any write, and all three
-///   mean the same thing to the caller: a cookie written there would produce no event on this
-///   subscription's stream, so the barrier would wait for something that cannot arrive. The
-///   glob-shaped one ([`DirPruned`](SyncRootError::DirPruned)) is the newest of the three and no
-///   different in kind — reported as a write failure it read as "your filesystem refused this",
-///   which is neither true nor actionable.
+/// - **the cookie directory is not covered** — outside the root, under a watcher exclusion, under
+///   this root's own `prune` seat, or across a mount boundary at the reserved cookie directory's
+///   own name. All four are refused before any write, and all four mean the same thing to the
+///   caller: a cookie written there would produce no event on this subscription's stream, so the
+///   barrier would wait for something that cannot arrive. The glob-shaped one
+///   ([`DirPruned`](SyncRootError::DirPruned)) and the mount-shaped one
+///   ([`DirCrossesMount`](SyncRootError::DirCrossesMount)) are no different in kind — reported as
+///   write failures they read as "your filesystem refused this", which is neither true nor
+///   actionable.
 /// - **transient** ([`Busy`](SyncError::Busy)) — a write already in flight for this root, or a
 ///   cookie-cleanup backlog. Nothing was written; ask again.
 /// - **a genuine write failure**, carrying the concrete `io::Error` behind an honest
@@ -991,8 +993,15 @@ fn watch_error_from_fs(err: WatchRootError) -> WatchError {
 fn sync_error_from_fs(error: SyncRootError) -> SyncError {
   match error {
     SyncRootError::UnknownRoot | SyncRootError::Retired => SyncError::Retired,
+    // The fourth of the uncovered shapes, and the only one the TREE decides rather
+    // than a configuration word: a mount standing at the reserved cookie
+    // directory's name. No crawl of the root descends across it, so a marker there
+    // produces no event on this subscription's stream — the same "the barrier could
+    // never be met" the other three mean, and just as permanent, so it is not the
+    // retryable `Busy` its sibling `DirReplaced` is.
     SyncRootError::DirOutsideRoot { .. }
     | SyncRootError::DirExcluded { .. }
+    | SyncRootError::DirCrossesMount { .. }
     | SyncRootError::DirPruned { .. } => SyncError::CookieDirUncovered,
     SyncRootError::Write { source, .. } => {
       let kind = match source.kind() {

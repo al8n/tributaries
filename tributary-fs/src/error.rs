@@ -368,6 +368,34 @@ pub enum SyncRootError {
     /// at, as the descriptor answered it.
     dir: PathBuf,
   },
+  /// A directory was already standing at the reserved cookie-directory name — the
+  /// private directory this watcher's markers go in, one level inside the
+  /// directory the sync named — on a DEVICE other than its parent's: a mount
+  /// boundary.
+  ///
+  /// A root's crawl does not descend across a mount, so the reserved directory
+  /// beyond one is never enumerated and no watch is ever armed inside it. A marker
+  /// created there is unreportable however it is ordered, and the barrier waiting
+  /// on its event could only time out — so the write is refused with nothing
+  /// created, exactly as [`DirPruned`](Self::DirPruned) and
+  /// [`DirExcluded`](Self::DirExcluded) are, and for the same reason: a barrier no
+  /// source can report is not a barrier.
+  ///
+  /// Unlike those two this is not a configuration word but the shape of the tree,
+  /// and it is not transient either — a retry finds the same mount. Sync a
+  /// directory on the root's own mount instead, or take the mount off the reserved
+  /// name.
+  ///
+  /// The admission's sequence is SPENT: the verdict needs the object only the
+  /// write's own descriptor walk can reach, so it is taken after the sync was
+  /// admitted. Re-mint through
+  /// [`mint_sync_ticket`](crate::Watcher::mint_sync_ticket) to retry.
+  #[error("cookie directory {} lies across a mount boundary", dir.display())]
+  DirCrossesMount {
+    /// The reserved cookie directory the write reached — the name the mount
+    /// stands at, as the descriptor answered it.
+    dir: PathBuf,
+  },
   /// The cookie name is not a single normal filename component — it holds a
   /// path separator, a `.`/`..`, is absolute or empty, or is longer than 255
   /// bytes (`NAME_MAX` on every supported filesystem, so a longer leaf names

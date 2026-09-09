@@ -533,7 +533,9 @@ async fn sync_root_refuses_a_foreign_ticket_at_the_door() {
 /// admission (its sequence is preserved), so a retry keeps the sequence and its paired cancel
 /// ticket. A post-birth or ambiguous outcome — `Write` (admitted then retired), `DirPruned` and
 /// `DirExcluded` (whose verdicts need the directory only the write resolves, so they are admitted
-/// and then retired too), `Retired`, `Closed`, and, by the `_ => None` default, any future variant
+/// and then retired too), `DirReplaced` and `DirCrossesMount` (whose verdicts need the OBJECTS only
+/// the write's own descent reaches), `Retired`, `Closed`, and, by the `_ => None` default, any
+/// future variant
 /// — consumes it (`None`), the fail-safe direction that forces a re-mint rather than re-presenting
 /// a spent sequence.
 ///
@@ -583,8 +585,9 @@ async fn sync_root_denied_classifies_each_variant_pre_or_post_birth() {
   // consumed and a retry must re-mint. `Write` retires its record before replying (the sequence is
   // burned), `DirPruned` and `DirExcluded` are the same shape — the verdict is taken on the
   // directory the WRITE resolves, which the admission's lexical spelling cannot name, so the sync
-  // is admitted and then retired — `Retired` is a post-admission terminal, and `Closed` is
-  // fail-safe.
+  // is admitted and then retired — `DirReplaced` and `DirCrossesMount` are that shape again, taken
+  // on objects only the write's descent can reach, `Retired` is a post-admission terminal, and
+  // `Closed` is fail-safe.
   let post_birth = [
     SyncRootError::Write {
       path: PathBuf::from("/r/.tributaries-sync-x"),
@@ -597,6 +600,12 @@ async fn sync_root_denied_classifies_each_variant_pre_or_post_birth() {
     SyncRootError::DirExcluded {
       dir: PathBuf::from("/r/hidden"),
       exclusion: PathBuf::from("/r/hidden"),
+    },
+    SyncRootError::DirReplaced {
+      dir: PathBuf::from("/r/a"),
+    },
+    SyncRootError::DirCrossesMount {
+      dir: PathBuf::from("/r/a/.tributaries-sync-cookies-501"),
     },
     SyncRootError::Retired,
     SyncRootError::Closed,
