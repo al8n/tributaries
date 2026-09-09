@@ -308,10 +308,13 @@ where
 struct SeatArgs {
   /// Held as the STRINGS the command line carried, not as compiled patterns, and
   /// compiled only once the count has been judged ([`compile_seat`]). A
-  /// `value_parser` builds one automaton per occurrence as the parse walks the
-  /// arguments, so a `parse_from` handed an arbitrarily long iterator has compiled
-  /// — and is holding — every one of them before any household can count them,
-  /// which is exactly the work [`RootGlobs::MAX_SEAT_PATTERNS`] exists to bound.
+  /// `value_parser` would build one automaton per occurrence as the parse walks
+  /// the arguments, so a `parse_from` handed an arbitrarily long iterator would
+  /// have compiled — and would be holding — every one of them before any
+  /// household could count them, which is exactly the work
+  /// [`RootGlobs::MAX_SEAT_PATTERNS`] exists to bound. Strings cost what the
+  /// caller's own argv already cost; automata are the crate's own, and none is
+  /// built until the count has passed.
   #[arg(long)]
   prune: Vec<String>,
   /// `num_args = 0..=1` is what gives the seat all THREE of its states a command
@@ -323,7 +326,8 @@ struct SeatArgs {
   /// produce it. Taking zero values makes a bare `--include` exactly that seat,
   /// while occurrences still append, so `--include a --include b` is unchanged.
   ///
-  /// Raw strings for `prune`'s reason, and bounded the same way.
+  /// Raw strings for `prune`'s reason, and bounded — on the same terms, over the
+  /// same thing — the same way ([`compile_seat`]).
   #[arg(long, num_args = 0..=1)]
   include: Option<Vec<String>>,
 }
@@ -369,6 +373,24 @@ impl SeatArgs {
 /// A pattern the matcher cannot compile is still the flag's own refusal, carrying
 /// the type's message, so the value a person mistyped is the one they are told
 /// about.
+///
+/// # What this bounds, and what nothing here can
+///
+/// It bounds what the CRATE owns: the compiled seat — one automaton per pattern,
+/// asked of every candidate for the life of the root — and the household's own
+/// `Vec<Glob>`. None of that is paid until the count has passed, which is the
+/// whole of what [`RootGlobs::MAX_SEAT_PATTERNS`] is a ceiling on.
+///
+/// It does NOT bound clap's own retention of the argv, and no face of this kind
+/// can. clap 4 has no per-argument occurrence cap, and an [`Args`](clap::Args)
+/// implementation never sees the raw iterator — only the caller's own
+/// [`Command`](clap::Command) does — so the `Vec<String>` this is handed already
+/// holds every occurrence the caller supplied. For a real command line that is
+/// bounded by the operating system (`ARG_MAX`); for a programmatic
+/// [`parse_from`](clap::Parser::parse_from) it is the caller's own memory, spent
+/// by the caller, before this crate is reached. The same is true of the serde and
+/// builder faces' inputs; only the STREAMING deserializer ([`deserialize_seat`])
+/// can refuse a seat before its own reader has taken the values in, and it does.
 #[cfg(feature = "clap")]
 fn compile_seat(patterns: Vec<String>, flag: &str) -> Result<Vec<Glob>, clap::Error> {
   if patterns.len() > RootGlobs::MAX_SEAT_PATTERNS {
