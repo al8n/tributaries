@@ -369,6 +369,50 @@ All notable changes to this workspace are documented here. The format is based o
   kind the umbrella retries, and not `Unsupported`, which is read as a verdict on the
   platform.
 
+- **`tributary-fs`** — **BREAKING**: `Watcher::sync_root(root, dir, admission)` no longer
+  takes a cookie name, and `Watcher::mint_sync_ticket` returns
+  `Option<(SyncAdmission, SyncTicket)>`. The marker LEAF is minted with the admission —
+  the watcher's own brand, this process's id, the mint sequence and a word off a
+  ChaCha20 stream the watcher seeded from the OS — and read back through the new
+  `SyncTicket::leaf()`. `None` from the mint means the watcher never got an entropy seed
+  and can admit no sync at all, which today is only `wasm32-unknown-unknown`.
+
+  A caller-chosen leaf was unsound, not merely redundant: admitting a sync ARMS an
+  exemption on the marker's leaf, so that for as long as the sync is live a change whose
+  last segment is that leaf clears both per-root seats wherever it stands — which is what
+  keeps the barrier resolvable when a peer renames the reserved directory out from under
+  the marker. With a name the caller picked, an ORDINARY file of that name, changing
+  anywhere in the scope, took the same exemption and could be recorded as the barrier's
+  observation ahead of the marker's own create. The mint closes that: no other writer
+  under the tree can name the file.
+
+  `SyncRootError::BadCookieName` and `SyncRootError::NameInUse` are no longer reachable
+  from `sync_root` and survive as the driver's own fail-closed invariants. The
+  reserved-leaf grammar is exported as `tributary_fs::is_sync_cookie_name`, beside the
+  existing `is_sync_cookie_dir_name`, so the layer that decides what reaches a consumer
+  classifies with the minter's own rule rather than a copy of it.
+
+- **`tributaries`** — the fs binding no longer renders a cookie name from `SyncToken`; it
+  places the leaf `tributary_fs::Watcher` minted and correlates the barrier on that. A
+  custom `Source` is unaffected in signature, and `Source::begin_sync`'s contract now
+  states both ways to discharge the unpredictability obligation: render the token's
+  `nonce` into the marker's identity, or take an identity a lower layer mints
+  unpredictably itself. A binding built directly on `tributary_fs::Watcher` must take the
+  second route — that watcher's leaf is no longer choosable.
+
+- **`tributary-fs`** — on Unix a sync cookie's containment, exclusion and `prune` verdicts
+  are taken on the path the OS answers for the descriptor the write ENDED HOLDING, not on
+  the components the descent was handed. Each `openat` is descriptor-relative and so
+  correct on its own, but a peer that renames an already-opened ancestor moves the rest of
+  the descent with it while every remaining step still succeeds: a sync naming `<root>/a/x`
+  whose `<root>/a` was renamed into excluded ground mid-walk used to be judged as
+  `<root>/a/x`, pass, and create the marker where the source had been told never to report
+  from — the write reporting success while the caller's barrier waited out its whole
+  deadline. Such a descent is now refused before anything is created, with the same typed
+  `DirExcluded` / `DirPruned` verdicts. Creation stays descriptor-relative, and the
+  reported landing keeps its documented meaning: the spelling at write time, for reaping,
+  never the marker's address.
+
 - **`tributaries`** — **BREAKING for a custom `Source`**: `Source::arm` and
   `LocalSource::arm` take the per-root `&RootGlobs` as a third argument
   (`arm(&mut self, key: &[C], globs: &RootGlobs)`). An out-of-tree source must accept

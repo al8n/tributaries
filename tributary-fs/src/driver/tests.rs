@@ -173,7 +173,9 @@ fn removed() -> FsEventFlags {
 /// incarnation; a cell that needs a reused ticket binds one and passes it twice.
 fn ticket() -> SyncTicket {
   static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-  SyncTicket::new(1, SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+  let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+  // The nonce rides along only so the leaf renders; the driver keys nothing on it.
+  SyncTicket::new(1, seq, seq)
 }
 
 fn renamed() -> FsEventFlags {
@@ -17773,6 +17775,192 @@ mod sync_cookie {
         !present,
         "and the marker is gone from where it actually was"
       );
+    }
+
+    /// Arms `peer` to run ONCE, between two steps of the next descriptor walk on
+    /// this thread, and disarms it again when the returned guard drops.
+    ///
+    /// One shot is the whole point: the peer must act while the walk holds an
+    /// ancestor and has not yet opened the component below it, and it must not
+    /// act again on the walk's remaining steps or on any later walk this cell
+    /// makes.
+    struct MidWalkPeer;
+
+    impl MidWalkPeer {
+      fn arm(peer: impl FnOnce() + 'static) -> Self {
+        let mut peer = Some(peer);
+        crate::driver::COOKIE_WALK_STEP.with_borrow_mut(|slot| {
+          *slot = Some(Box::new(move || {
+            if let Some(peer) = peer.take() {
+              peer();
+            }
+          }));
+        });
+        Self
+      }
+    }
+
+    impl Drop for MidWalkPeer {
+      fn drop(&mut self) {
+        crate::driver::COOKIE_WALK_STEP.with_borrow_mut(|slot| *slot = None);
+      }
+    }
+
+    /// A peer that renames an ALREADY-OPENED ancestor into EXCLUDED ground, in the
+    /// window before the walk opens the component below it, is refused — and
+    /// nothing is created.
+    ///
+    /// This is the sequence a descriptor-relative walk cannot see from inside. The
+    /// sync names `<root>/a/x`; the walk opens `a`; the peer renames `<root>/a` to
+    /// `<root>/hidden/a`; the walk's next `openat` is descriptor-relative and so
+    /// correctly lands on the very same `x` — which now sits inside the excluded
+    /// subtree. A verdict spelled from the components the walk was HANDED still
+    /// reads `<root>/a/x`, clears the exclusion, and puts the marker where the
+    /// source has been told never to report from: the write returns success and
+    /// the caller's barrier waits out its whole deadline over a source doing
+    /// exactly what it was asked. The rename completed before the check ran, so it
+    /// is not the documented post-check residue.
+    ///
+    /// The verdict is therefore taken on the name the OS answers for the FINAL
+    /// descriptor. Real syscalls, because what a descriptor still refers to after
+    /// its ancestor's name moved is a question no modelled tree can be asked.
+    ///
+    /// Revert witness: spell `CookieParent::path` from the walked components again
+    /// and the write returns `Ok`, having created a marker under
+    /// `<root>/hidden/a/x`.
+    #[test]
+    fn an_ancestor_renamed_into_excluded_ground_mid_walk_is_refused() {
+      let root = scratch("mid-walk-excluded");
+      let judged = root.join("a").join("x");
+      std::fs::create_dir_all(&judged).expect("the directory the sync names");
+      let hidden = root.join("hidden");
+      std::fs::create_dir_all(&hidden).expect("the excluded subtree");
+
+      let live = crate::driver::LiveRoot::for_tests(&root);
+      let (from, to) = (root.join("a"), hidden.join("a"));
+      let peer = MidWalkPeer::arm(move || {
+        std::fs::rename(&from, &to).expect("the peer moves the opened ancestor");
+      });
+      let written = RealFs::new().write_cookie(
+        &live,
+        &judged,
+        ".tributaries-sync-1-2-3-000000000000000a",
+        &tributary_proto::glob::Globs::default(),
+        std::slice::from_ref(&hidden),
+      );
+      drop(peer);
+
+      let excluded = written
+        .expect_err("a marker under an exclusion is a marker no delivery can carry")
+        .excluded
+        .expect("the refusal names the exclusion it was taken on");
+      assert_eq!(
+        excluded.dir,
+        hidden.join("a").join("x"),
+        "the verdict is taken on where the descriptor ACTUALLY is, not on the \
+         components the walk was handed"
+      );
+      assert_eq!(excluded.exclusion, hidden, "and it names the covering seat");
+      assert!(
+        !cookie_dir_landed(&hidden.join("a").join("x")),
+        "the refusal precedes every create: nothing of this write is on disk"
+      );
+
+      // Non-vacuity: with no peer to move it, the very same descent writes.
+      let unmoved = root.join("b");
+      std::fs::create_dir_all(&unmoved).expect("an unmoved directory");
+      RealFs::new()
+        .write_cookie(
+          &live,
+          &unmoved,
+          ".tributaries-sync-1-2-4-000000000000000b",
+          &tributary_proto::glob::Globs::default(),
+          std::slice::from_ref(&hidden),
+        )
+        .expect("an unmoved parent outside every exclusion still writes");
+
+      let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The `prune` twin of the cell above, through the OTHER seat: an ancestor
+    /// renamed mid-walk into ground the root's own `prune` seat covers is refused
+    /// before anything is created, and the refusal names the pattern that did it.
+    ///
+    /// Both seats have to be asked on the same name for the same reason — a
+    /// pruned marker's create event is fenced by the very word that asked for the
+    /// fencing, so the barrier waits on an event that can never arrive — and
+    /// asking only one of them leaves the other's hole exactly as it was.
+    ///
+    /// Revert witness: spell `CookieParent::path` from the walked components again
+    /// and the write returns `Ok`, having created a marker under pruned ground.
+    #[test]
+    fn an_ancestor_renamed_into_pruned_ground_mid_walk_is_refused() {
+      let root = scratch("mid-walk-pruned");
+      let judged = root.join("a").join("x");
+      std::fs::create_dir_all(&judged).expect("the directory the sync names");
+      let cache = root.join("cache");
+      std::fs::create_dir_all(&cache).expect("the pruned subtree");
+      let prune = tributary_proto::glob::Globs::new([
+        tributary_proto::glob::Glob::new("**/cache").expect("a valid pattern compiles")
+      ])
+      .expect("a one-pattern seat compiles");
+
+      let live = crate::driver::LiveRoot::for_tests(&root);
+      let (from, to) = (root.join("a"), cache.join("a"));
+      let peer = MidWalkPeer::arm(move || {
+        std::fs::rename(&from, &to).expect("the peer moves the opened ancestor");
+      });
+      let written = RealFs::new().write_cookie(
+        &live,
+        &judged,
+        ".tributaries-sync-1-2-5-000000000000000c",
+        &prune,
+        &[],
+      );
+      drop(peer);
+
+      let pruned = written
+        .expect_err("a marker under a prune word is a marker the fence suppresses")
+        .pruned
+        .expect("the refusal names the pattern it was taken on");
+      assert_eq!(
+        pruned.dir,
+        cache.join("a").join("x"),
+        "the verdict is taken on where the descriptor ACTUALLY is"
+      );
+      assert_eq!(
+        pruned.pattern.as_str(),
+        "**/cache",
+        "and it names the word that closed it"
+      );
+      assert!(
+        !cookie_dir_landed(&cache.join("a").join("x")),
+        "the refusal precedes every create: nothing of this write is on disk"
+      );
+
+      // Non-vacuity: with no peer to move it, the very same descent writes.
+      let unmoved = root.join("b");
+      std::fs::create_dir_all(&unmoved).expect("an unmoved directory");
+      RealFs::new()
+        .write_cookie(
+          &live,
+          &unmoved,
+          ".tributaries-sync-1-2-6-000000000000000d",
+          &prune,
+          &[],
+        )
+        .expect("an unmoved parent outside every prune word still writes");
+
+      let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Whether this driver's own cookie directory stands inside `dir`.
+    fn cookie_dir_landed(dir: &std::path::Path) -> bool {
+      std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries
+          .filter_map(Result::ok)
+          .any(|entry| crate::is_sync_cookie_dir_name(&entry.file_name().to_string_lossy()))
+      })
     }
 
     /// The replacement's contents, so the survivor is proven by what it HOLDS and

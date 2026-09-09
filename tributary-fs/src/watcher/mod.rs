@@ -6,7 +6,7 @@ use std::{
   path::{Path, PathBuf},
   pin::Pin,
   sync::{
-    Arc, PoisonError, RwLock,
+    Arc, Mutex, PoisonError, RwLock,
     atomic::{AtomicU64, Ordering},
   },
   task::{Context, Poll},
@@ -14,6 +14,10 @@ use std::{
 
 use agnostic_lite::RuntimeLite;
 use futures_core::Stream;
+use rand_chacha::{
+  ChaCha20Rng,
+  rand_core::{RngCore, SeedableRng},
+};
 use tributary_proto::{Change, Interest, ScopeId};
 
 use crate::{
@@ -38,6 +42,46 @@ mod linux_kernel_tests;
 
 /// Mints one id per [`Watcher`], branding its handles (see [`RootHandle`]).
 static WATCHER_INSTANCES: AtomicU64 = AtomicU64::new(1);
+
+/// Seeds a watcher's marker-nonce generator — the ONE entropy draw in that
+/// watcher's life, taken while it is assembled and never repeated.
+///
+/// `None` when no seed could be taken, which the watcher carries as "no generator"
+/// for the rest of its life: [`Watcher::mint_sync_ticket`] then mints nothing, so
+/// no sync is ever admitted under a leaf a peer could compute. The stream this
+/// hands back lives on the [`Watcher`], where what the construction does and does
+/// not claim is written down (see its `nonces` field).
+fn sync_nonce_generator() -> Option<ChaCha20Rng> {
+  sync_nonce_seed().map(ChaCha20Rng::from_seed)
+}
+
+/// The 32 bytes [`sync_nonce_generator`] builds a watcher's stream from, read
+/// straight out of the platform's entropy interface.
+///
+/// There is no fallback, because a seed something else could compute would make
+/// every nonce derived from it computable too — and the nonce is the whole of what
+/// keeps a co-user of the tree from pre-creating the marker name a barrier is
+/// about to wait on.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+fn sync_nonce_seed() -> Option<[u8; 32]> {
+  let mut seed = [0u8; 32];
+  getrandom::fill(&mut seed).ok()?;
+  Some(seed)
+}
+
+/// `wasm32-unknown-unknown` has no entropy source of its own — the backend is the
+/// embedder's choice, and a library cannot make it for them.
+///
+/// So no seed is ever taken there, the watcher holds no generator, and
+/// [`Watcher::mint_sync_ticket`] answers [`None`] rather than minting a leaf
+/// something else can compute. That costs the sync path nothing at runtime: it is
+/// a `None` the watcher has carried since it was built, not work done per call. It
+/// is also the platform that has no filesystem backend at all, so nothing is lost
+/// there that was ever reachable.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+fn sync_nonce_seed() -> Option<[u8; 32]> {
+  None
+}
 
 /// An opaque handle to one watched root of a [`Watcher`].
 ///
@@ -92,10 +136,16 @@ impl RootHandle {
 /// but the successor holds a DIFFERENT ticket, so a delayed cancel through this one
 /// resolves the retired sync (a true no-op), never the successor.
 ///
-/// Opaque: its fields are the minting watcher's brand and the mint sequence, both
-/// private. It carries no path and no server-side state until the sync it keys is
-/// admitted, so minting one — even in a flood — retains nothing. Exported like
-/// [`RootHandle`].
+/// It also CARRIES THE MARKER LEAF the sync will write
+/// ([`leaf`](Self::leaf)) — the one name that identifies this sync's marker on the
+/// stream. The leaf is minted here rather than accepted from the caller, because
+/// the filtering the marker depends on (the active-marker exemption both seats
+/// grant it) is only sound for a name no other writer under the tree can guess.
+///
+/// Opaque: its fields are the minting watcher's brand, the mint sequence and the
+/// leaf's nonce, all private. It carries no path and no server-side state until
+/// the sync it keys is admitted, so minting one — even in a flood — retains
+/// nothing. Exported like [`RootHandle`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SyncTicket {
   /// The minting watcher's brand — a ticket presented to a DIFFERENT watcher is
@@ -106,12 +156,21 @@ pub struct SyncTicket {
   /// The per-watcher monotonic mint sequence, never re-minted, so the ticket maps
   /// to one incarnation across all time — the ledger's `by_ticket` key.
   seq: u64,
+  /// The unguessable word this ticket's marker leaf is rendered with, drawn at
+  /// mint off the watcher's cryptographic stream. Carried rather than the
+  /// rendered string so the ticket stays `Copy` and allocation-free.
+  nonce: u64,
 }
 
 impl SyncTicket {
-  /// Brands a mint sequence under the issuing watcher.
-  pub(crate) const fn new(instance: u64, seq: u64) -> Self {
-    Self { instance, seq }
+  /// Brands a mint sequence, and the leaf nonce drawn with it, under the issuing
+  /// watcher.
+  pub(crate) const fn new(instance: u64, seq: u64, nonce: u64) -> Self {
+    Self {
+      instance,
+      seq,
+      nonce,
+    }
   }
 
   /// The issuing watcher's brand.
@@ -122,6 +181,27 @@ impl SyncTicket {
   /// The per-watcher mint sequence — the ledger's `by_ticket` key.
   pub(crate) const fn seq(&self) -> u64 {
     self.seq
+  }
+
+  /// The LEAF the sync this ticket admits writes its marker under — the name that
+  /// identifies the marker on the stream, whatever path its parent has by the time
+  /// the create is reported.
+  ///
+  /// A caller correlates its barrier on this: the marker's own create event is the
+  /// one that rides the root's ordered queue behind every change the backend
+  /// reported before the write, and the last segment is what names it. The landing
+  /// PATH [`sync_root`](Watcher::sync_root) returns is the spelling at write time
+  /// and is for reaping, not for correlation (see that method).
+  ///
+  /// Minted, never chosen: the four fields are the issuing watcher's brand, this
+  /// process's id, the mint sequence and a word off a cryptographic stream the
+  /// watcher seeded from the OS. The first three are computable from any marker
+  /// already lying under the tree, so it is the last that keeps a co-user of the
+  /// tree from pre-creating the name a barrier is about to wait on. Rendering
+  /// allocates; the ticket itself stays `Copy`.
+  #[must_use]
+  pub fn leaf(&self) -> String {
+    crate::driver::sync_cookie_name(self.instance, std::process::id(), self.seq, self.nonce)
   }
 }
 
@@ -156,14 +236,23 @@ pub struct SyncAdmission {
   /// move-only — admitted at most once: the wire ticket
   /// [`sync_root`](Watcher::sync_root) builds and the ledger's `by_ticket` key.
   seq: u64,
+  /// The leaf nonce drawn with this sequence, carried so
+  /// [`sync_root`](Watcher::sync_root) renders the SAME leaf the paired
+  /// [`SyncTicket`] answers — one draw, one name, whichever half is asked.
+  nonce: u64,
 }
 
 impl SyncAdmission {
-  /// Mints an admission under the issuing watcher's brand and sequence. The sole
-  /// constructor, called only by [`mint_sync_ticket`](Watcher::mint_sync_ticket),
-  /// which mints the paired [`SyncTicket`] from the same brand and sequence.
-  pub(crate) const fn new(instance: u64, seq: u64) -> Self {
-    Self { instance, seq }
+  /// Mints an admission under the issuing watcher's brand, sequence and leaf
+  /// nonce. The sole constructor, called only by
+  /// [`mint_sync_ticket`](Watcher::mint_sync_ticket), which mints the paired
+  /// [`SyncTicket`] from the same three.
+  pub(crate) const fn new(instance: u64, seq: u64, nonce: u64) -> Self {
+    Self {
+      instance,
+      seq,
+      nonce,
+    }
   }
 
   /// The issuing watcher's brand.
@@ -175,6 +264,19 @@ impl SyncAdmission {
   /// [`sync_root`](Watcher::sync_root) builds and the ledger's `by_ticket` key.
   pub(crate) const fn seq(&self) -> u64 {
     self.seq
+  }
+
+  /// The leaf nonce this admission was minted with — the wire ticket
+  /// [`sync_root`](Watcher::sync_root) builds carries it, and the leaf both halves
+  /// render is the same string.
+  pub(crate) const fn nonce(&self) -> u64 {
+    self.nonce
+  }
+
+  /// The marker LEAF this admission's sync writes — the same string the paired
+  /// [`SyncTicket::leaf`] answers, rendered from the same three fields.
+  pub(crate) fn leaf(&self) -> String {
+    crate::driver::sync_cookie_name(self.instance, std::process::id(), self.seq, self.nonce)
   }
 }
 
@@ -918,7 +1020,25 @@ pub struct Watcher<R> {
   /// (uniqueness, not ordering, is all a ticket needs). `u64` and driver-lifetime,
   /// so it never wraps — the same non-exhaustion argument the cookie id mint
   /// stands on.
+  ///
+  /// It starts at 1 rather than 0 because the sequence is also the `seq` FIELD of
+  /// the marker leaf the mint renders, and the reserved namespace's grammar
+  /// refuses 0 there ([`is_sync_cookie_name`](crate::is_sync_cookie_name)): a leaf
+  /// the classifier rejects is a genuine marker republished on every consumer
+  /// stream as a user create.
   sync_tickets: Arc<AtomicU64>,
+  /// The marker-leaf nonce stream: ONE cryptographic generator per watcher, seeded
+  /// from the OS while the watcher is built and never re-seeded. Each
+  /// [`mint_sync_ticket`](Self::mint_sync_ticket) draws one word off it, which is
+  /// arithmetic under a short lock rather than an OS call — the single entropy read
+  /// was paid once, on the constructing thread.
+  ///
+  /// `None` means no seed could be taken, which the watcher carries for the rest
+  /// of its life: it then mints no admission at all rather than handing out a leaf
+  /// something else could compute. Behind an `Arc<Mutex<_>>` for the same reason
+  /// the sequence is behind an `Arc`: clones of one watcher must draw from ONE
+  /// stream, never from two copies that would publish the same words twice.
+  nonces: Option<Arc<Mutex<ChaCha20Rng>>>,
   events: EventStream,
   roots: Arc<RwLock<RootSet>>,
   // `fn() -> R`, not `R`: the watcher holds no runtime value, so its auto
@@ -991,7 +1111,8 @@ impl<R: RuntimeLite> Watcher<R> {
       instance: WATCHER_INSTANCES.fetch_add(1, Ordering::Relaxed),
       commands: command_tx,
       cleanup,
-      sync_tickets: Arc::new(AtomicU64::new(0)),
+      sync_tickets: Arc::new(AtomicU64::new(1)),
+      nonces: sync_nonce_generator().map(|generator| Arc::new(Mutex::new(generator))),
       events: Box::pin(event_rx),
       roots,
       _runtime: PhantomData,
@@ -1485,19 +1606,45 @@ impl<R> Watcher<R> {
   /// carry the SAME mint sequence, so the ticket cancels exactly the incarnation
   /// the admission admits.
   ///
-  /// Pure memory: one `Relaxed` atomic increment, no channel, no allocation.
-  /// Neither half has server-side state until the sync the admission admits is
-  /// born, so minting a flood that is never used retains nothing. The mint is
-  /// monotonic and driver-lifetime, so a sequence is never re-minted — and, the
-  /// admission being move-only, that sequence is admitted at most once: the two
-  /// facts that make a cancel through the ticket address at most one incarnation,
-  /// ever.
-  pub fn mint_sync_ticket(&self) -> (SyncAdmission, SyncTicket) {
+  /// The mint also draws the sync's MARKER LEAF — the name
+  /// [`sync_root`](Self::sync_root) writes and [`SyncTicket::leaf`] answers. The
+  /// leaf is minted here rather than taken from the caller because everything that
+  /// rests on it rests on its being unguessable: both per-root seats grant an
+  /// active marker's leaf an exemption wherever it stands, so a leaf a peer under
+  /// the tree could predict would let an ordinary file of that name take the
+  /// exemption — and be recorded as the barrier's observation — ahead of the
+  /// marker's own create.
+  ///
+  /// Pure memory: one `Relaxed` atomic increment and one word off this watcher's
+  /// own cryptographic stream, under a lock held for that draw alone — no channel,
+  /// no allocation, no OS call (the single entropy read that keyed the stream was
+  /// paid once, when the watcher was built). Neither half has server-side state
+  /// until the sync the admission admits is born, so minting a flood that is never
+  /// used retains nothing. The mint is monotonic and driver-lifetime, so a sequence
+  /// is never re-minted — and, the admission being move-only, that sequence is
+  /// admitted at most once: the two facts that make a cancel through the ticket
+  /// address at most one incarnation, ever.
+  ///
+  /// # `None`
+  ///
+  /// The watcher never got an entropy seed, so it has no unpredictable leaf to
+  /// mint. It answers `None` for the rest of its life, and no sync can be admitted
+  /// through it — deliberately, because a barrier standing on a name something
+  /// else can compute is not a barrier. Today that is only
+  /// `wasm32-unknown-unknown`, which supplies no entropy interface and no
+  /// filesystem backend either.
+  #[must_use]
+  pub fn mint_sync_ticket(&self) -> Option<(SyncAdmission, SyncTicket)> {
+    let nonce = {
+      let nonces = self.nonces.as_ref()?;
+      let mut nonces = nonces.lock().unwrap_or_else(PoisonError::into_inner);
+      nonces.next_u64()
+    };
     let seq = self.sync_tickets.fetch_add(1, Ordering::Relaxed);
-    (
-      SyncAdmission::new(self.instance, seq),
-      SyncTicket::new(self.instance, seq),
-    )
+    Some((
+      SyncAdmission::new(self.instance, seq, nonce),
+      SyncTicket::new(self.instance, seq, nonce),
+    ))
   }
 
   /// Places a **sync cookie** — the kernel-mediated barrier marker — under
@@ -1514,23 +1661,40 @@ impl<R> Watcher<R> {
   ///
   /// # The returned path is the only authority on where the cookie is
   ///
-  /// The cookie does NOT land at `dir.join(name)`. It lands one level deeper, in
+  /// The cookie does NOT land at `dir.join(leaf)`. It lands one level deeper, in
   /// a reserved-namespace directory the watcher creates and owns inside `dir`,
   /// because a cookie's removal must be anchored to a directory nobody else may
   /// write — a name in a directory the watched tree owns can be rebound between
   /// the removal's proof and its unlink, and no amount of re-checking closes
-  /// that. Reap what this call RETURNED; a path re-derived from `dir` and `name`
+  /// that. Reap what this call RETURNED; a path re-derived from `dir` and the leaf
   /// names nothing.
   ///
-  /// That path is the spelling at WRITE time: it is built from the names the write
-  /// walked through, and a peer that renames one of those directories between the
-  /// walk and the create leaves the cookie under the new name while this reply
-  /// keeps the old one. Nothing is broken by that — the removal is anchored to the
-  /// directory the create was made through, and a reap of this path resolves the
+  /// That path is the spelling at WRITE time: it is the name the write's own parent
+  /// descriptor answered to, and a peer that renames one of the traversed
+  /// directories after that reading leaves the cookie under the new name while this
+  /// reply keeps the old one. Nothing is broken by that — the removal is anchored to
+  /// the directory the create was made through, and a reap of this path resolves the
   /// same record it was published under — but a caller must not treat the returned
   /// path as the marker's ADDRESS. What identifies the marker on the stream is its
-  /// last component: the `name` given here, minted unpredictable per sync, whose
-  /// create event arrives under whatever path the marker's parent has by then.
+  /// last component: [`SyncTicket::leaf`], minted with the admission, whose create
+  /// event arrives under whatever path the marker's parent has by then.
+  ///
+  /// # The leaf is minted, never chosen
+  ///
+  /// This call takes no name. The leaf is drawn by
+  /// [`mint_sync_ticket`](Self::mint_sync_ticket) together with the admission and
+  /// read back off the paired [`SyncTicket`], and it carries a word off a
+  /// cryptographic stream the watcher seeded from the OS.
+  ///
+  /// That is a correctness property, not a convenience. Admitting a sync ARMS an
+  /// exemption on the marker's leaf: for as long as the sync is live, a change
+  /// whose last segment is that leaf passes both per-root seats wherever it stands,
+  /// so the barrier stays resolvable even when a peer renames the reserved
+  /// directory out from under the marker between the write's descriptor walk and
+  /// its create. With a caller-chosen leaf that exemption is a hole — an ordinary
+  /// file of the same name, changing anywhere in the scope, takes it and can be
+  /// recorded as the barrier's observation ahead of the marker's own create. A
+  /// minted leaf closes it: no other writer under the tree can name the file.
   ///
   /// The write is parked on the scope's coverage-settle fence: under a
   /// descending backend, a change inside a subtree whose per-directory watch
@@ -1549,7 +1713,7 @@ impl<R> Watcher<R> {
   ///
   /// `admission` is the move-only [`SyncAdmission`] half of a fresh
   /// [`mint_sync_ticket`](Self::mint_sync_ticket) pair, consumed BY VALUE to admit
-  /// THIS sync. The type system thus forbids presenting one admission — one mint
+  /// THIS sync and to supply the marker leaf it writes. The type system thus forbids presenting one admission — one mint
   /// sequence — to two syncs, so a later cancel through the paired ticket can never
   /// alias a second incarnation. A pre-birth refusal hands the admission back in
   /// [`SyncRootDenied`] for a same-sequence retry (a refusal burns nothing); see
@@ -1562,8 +1726,7 @@ impl<R> Watcher<R> {
   /// [`SyncAdmission`] to retry under the same sequence:
   /// [`SyncRootError::UnknownRoot`] for a foreign or dead handle;
   /// [`ForeignTicket`](SyncRootError::ForeignTicket) when `admission` was minted by
-  /// a different watcher; [`BadCookieName`](SyncRootError::BadCookieName) when
-  /// `name` is not a single normal component;
+  /// a different watcher;
   /// [`DirOutsideRoot`](SyncRootError::DirOutsideRoot) when `dir` is not inside the
   /// root (including via `..` traversal);
   /// [`DirExcluded`](SyncRootError::DirExcluded) when `dir` is inside the root but
@@ -1578,14 +1741,17 @@ impl<R> Watcher<R> {
   /// [`Write`](SyncRootError::Write) when the
   /// create fails (a read-only tree surfaces as `PermissionDenied`);
   /// [`WriteInFlight`](SyncRootError::WriteInFlight) when a physical write for this
-  /// root is already in flight; [`NameInUse`](SyncRootError::NameInUse) when a live
-  /// sync of this watcher already holds `name`;
+  /// root is already in flight;
   /// [`TicketInUse`](SyncRootError::TicketInUse) when a live sync of this watcher
   /// already holds this admission's sequence;
   /// [`CleanupBacklog`](SyncRootError::CleanupBacklog) when the root's cookie
   /// cleanup backlog cap is reached; [`Retired`](SyncRootError::Retired) when the
   /// root died while the write was parked; [`Closed`](SyncRootError::Closed) once
-  /// the watcher is closed. The admission is returned (retryable) for every refusal
+  /// the watcher is closed. [`BadCookieName`](SyncRootError::BadCookieName) and
+  /// [`NameInUse`](SyncRootError::NameInUse) are not reachable from here — the leaf
+  /// is minted, so it is a single normal component by construction and unique to
+  /// one live sync — and survive only as the driver's own fail-closed invariants.
+  /// The admission is returned (retryable) for every refusal
   /// except [`Write`](SyncRootError::Write),
   /// [`DirPruned`](SyncRootError::DirPruned),
   /// [`DirExcluded`](SyncRootError::DirExcluded),
@@ -1595,13 +1761,16 @@ impl<R> Watcher<R> {
   ///
   /// # Platform notes
   ///
-  /// A directory renamed INTO excluded ground between the write's descriptor walk
-  /// and its create leaves the marker where the walk put it, under a parent the
-  /// exclusion now covers; the exclusion is the SOURCE's contract, so that
-  /// delivery is suppressed exactly as any other excluded one is and the barrier
-  /// waits out its deadline. Refusing the write cannot close that window — no
-  /// check precedes a rename that happens after it — and the outcome is the
-  /// exclusions' documented semantics rather than a hole in this call.
+  /// The exclusion and `prune` verdicts are taken on the name the OS answers for
+  /// the descriptor the write ended holding, so a directory renamed INTO excluded
+  /// or pruned ground at any point up to that reading — including mid-descent,
+  /// which the descriptor-relative walk itself cannot notice — is refused before
+  /// anything is created. A rename that lands AFTER the reading leaves the marker
+  /// where the create put it, under a parent the exclusion now covers; the
+  /// exclusion is the SOURCE's contract, so that delivery is suppressed exactly as
+  /// any other excluded one is and the barrier waits out its deadline. No check
+  /// precedes a rename that happens after it, and that residue is the exclusions'
+  /// documented semantics rather than a hole in this call.
   ///
   /// On Windows this write's cookie path is still path-addressed at three
   /// points (opening the cookie parent by pathname after the root identity check;
@@ -1616,7 +1785,6 @@ impl<R> Watcher<R> {
     &self,
     root: RootHandle,
     dir: impl Into<PathBuf>,
-    name: impl Into<String>,
     admission: SyncAdmission,
   ) -> Result<PathBuf, SyncRootDenied> {
     if root.instance() != self.instance {
@@ -1636,15 +1804,13 @@ impl<R> Watcher<R> {
       ));
     }
     let dir = dir.into();
-    let name = name.into();
-    // The name the caller supplies must be a single normal component — a
-    // separator, `..`, or absolute name would escape the directory on a join.
-    if !crate::driver::is_normal_cookie_name(&name) {
-      return Err(SyncRootDenied::classify(
-        SyncRootError::BadCookieName { name },
-        admission,
-      ));
-    }
+    // The marker's LEAF, rendered from the admission this call consumes — never
+    // taken from the caller. It is one normal component by construction (the
+    // reserved stem, three decimal fields and sixteen hex digits), so the driver's
+    // own check of that is an internal invariant rather than a door the caller can
+    // knock on; and it is unpredictable, which is what the active-marker exemption
+    // the write arms rests on.
+    let name = admission.leaf();
     // The cookie must be reportable on THIS root's stream: a directory outside
     // its coverage could never mint an event the caller will see. Containment is
     // checked on LEXICALLY NORMALIZED components — a plain `starts_with` accepts
@@ -1669,7 +1835,7 @@ impl<R> Watcher<R> {
     // `by_ticket` on FROM the admission (a plain read of its two fields, no move),
     // so the affine admission stays in this frame across the await — "returning" it
     // on a refusal is then a local move, never a trip across the channel.
-    let ticket = SyncTicket::new(admission.instance(), admission.seq());
+    let ticket = SyncTicket::new(admission.instance(), admission.seq(), admission.nonce());
 
     let (reply, response) = futures_channel::oneshot::channel();
     if self

@@ -552,6 +552,135 @@ fn is_minted_uid(field: &str) -> bool {
     && field.parse::<u32>().is_ok_and(|uid| uid != u32::MAX)
 }
 
+/// The reserved-namespace stem every sync MARKER leaf carries. (Watchman's
+/// `.watchman-cookie-` precedent.) The prefix alone does not make a leaf a
+/// marker: [`is_sync_cookie_name`] holds the grammar that does.
+const COOKIE_NAME_PREFIX: &str = ".tributaries-sync-";
+
+/// The nonce's rendered width: `{:016x}` on a `u64`, so exactly sixteen lowercase
+/// hex digits, zero-padded — never fewer, never more, whatever the value.
+const COOKIE_NONCE_DIGITS: usize = 16;
+
+/// Renders the leaf ONE sync marker stands under.
+///
+/// This is the workspace's only minter of a marker name, and
+/// [`Watcher::mint_sync_ticket`](crate::Watcher::mint_sync_ticket) is its only
+/// caller: no layer above chooses a marker leaf, so no layer above can weaken
+/// what the four fields buy.
+///
+/// The name is unique across concurrent syncs of one watcher (`seq`), across the
+/// watchers of one process (`instance`) and across processes (`pid`, so a crashed
+/// prior process's leftovers collide with nothing) — and UNPREDICTABLE to any
+/// other writer under the tree (`nonce`).
+///
+/// **All four fields are rendered, and the last is the load-bearing one.**
+/// `(instance, pid, seq)` is computable from any marker already lying under the
+/// tree, so a name built from those three alone would ANNOUNCE the next one: a
+/// peer could create-then-delete it and leave a stale event that the next sync
+/// matches, resolving a barrier ahead of a change that really did precede the
+/// call. The nonce is a word off a cryptographic stream the watcher seeded from
+/// the OS, so the published names reveal nothing about the words still to come.
+///
+/// [`is_sync_cookie_name`] is the classifier that must accept exactly what this
+/// renders; the two are changed together, and a cell pins that they agree.
+pub(crate) fn sync_cookie_name(instance: u64, pid: u32, seq: u64, nonce: u64) -> String {
+  format!(
+    "{COOKIE_NAME_PREFIX}{instance}-{pid}-{seq}-{nonce:0width$x}",
+    width = COOKIE_NONCE_DIGITS,
+  )
+}
+
+/// Whether `leaf` is a sync marker's name as SOME release of this workspace minted
+/// it: the reserved prefix, then `instance-pid-seq` rendered decimal — each inside
+/// the range its own minter can produce, never merely well-formed — then, for the
+/// shape minted today, a `nonce` of sixteen lowercase hex digits.
+///
+/// # Why the older shape is accepted too
+///
+/// A marker may outlive the process that wrote it, so a crash leftover on disk was
+/// named by whichever release was running then rather than by the one that later
+/// watches the tree. The three-field form is what this workspace minted before the
+/// name carried a nonce; dropping it would make the first watch after an upgrade
+/// report every stale marker as a user create.
+///
+/// # Why the grammar is checked rather than the prefix alone
+///
+/// Whatever this admits is SUPPRESSED from every consumer stream, so a bare prefix
+/// test would swallow any user file whose name happens to begin with the reserved
+/// stem — silently, with no `Rescan` and no diagnostic, for the life of the watch.
+/// These names are minted by this crate, so their shapes are knowable exactly.
+///
+/// Every decimal field is bounded to EXACTLY what its minter can render. Too wide
+/// swallows a user file; too narrow republishes a GENUINE marker's create (and its
+/// unlink) as user changes, which is the worse direction, so no bound below is a
+/// guess about a field's range:
+///
+/// - `instance` — the watcher brand, drawn from a process-global counter that
+///   starts at 1 (`WATCHER_INSTANCES`), so 0 is not mintable. The release that
+///   minted the three-field shape rendered this field from the umbrella's
+///   `InstanceId`, a `NonZeroU64`, so the same floor holds for both shapes.
+/// - `pid` — `std::process::id()`, a `u32`, which is where the ceiling comes from.
+///   Its FLOOR is the one bound here resting on OS semantics rather than on this
+///   workspace's own source: pid 0 is the scheduler on Unix and the System Idle
+///   pseudo-process on Windows, never a process that can execute this code. It is
+///   therefore the first bound to drop should that evidence ever be questioned.
+/// - `seq` — the watcher's sync-ticket sequence, which starts at 1 for exactly
+///   this reason (see `Watcher::mint_sync_ticket`), so no sync ever renders 0. The
+///   three-field release rendered a pre-incremented per-owner counter, which
+///   likewise began at 1.
+///
+/// The `nonce` deliberately gets NO value bound: it is a word off a stream
+/// generator, so every `u64` including 0 is mintable, and its
+/// sixteen-lowercase-hex shape is the whole of what can be checked.
+///
+/// Exported for the same reason [`is_sync_cookie_dir_name`] is: the layer that
+/// decides what reaches a consumer sits above this one, while the name is minted
+/// here — a caller-side grammar would drift the moment this crate changes the
+/// shape, and a caller-side prefix test would erase every user leaf sharing the
+/// stem.
+#[must_use]
+pub fn is_sync_cookie_name(leaf: &str) -> bool {
+  let Some(rest) = leaf.strip_prefix(COOKIE_NAME_PREFIX) else {
+    return false;
+  };
+  let mut fields = rest.split('-');
+  let (Some(instance), Some(pid), Some(seq)) = (fields.next(), fields.next(), fields.next()) else {
+    return false;
+  };
+  if !(is_minted_decimal(instance, 1, u64::MAX)
+    && is_minted_decimal(pid, 1, u64::from(u32::MAX))
+    && is_minted_decimal(seq, 1, u64::MAX))
+  {
+    return false;
+  }
+  match fields.next() {
+    // The historical three-field shape, exhausted.
+    None => true,
+    // Today's shape: the nonce, and nothing after it.
+    Some(nonce) => {
+      fields.next().is_none()
+        && nonce.len() == COOKIE_NONCE_DIGITS
+        && nonce
+          .bytes()
+          .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase() && b <= b'f')
+    }
+  }
+}
+
+/// Whether `field` is exactly what `format!("{n}")` renders for some `n` in
+/// `min..=max`: decimal digits, no sign, and no redundant leading zero (`0` itself
+/// is the one-digit case).
+///
+/// The range is the caller's to justify from the field's minter — see the
+/// per-field derivation in [`is_sync_cookie_name`], the only caller.
+fn is_minted_decimal(field: &str, min: u64, max: u64) -> bool {
+  field.bytes().all(|b| b.is_ascii_digit())
+    && (field.len() == 1 || !field.starts_with('0'))
+    && field
+      .parse::<u64>()
+      .is_ok_and(|value| (min..=max).contains(&value))
+}
+
 /// The directory a cookie is created inside, held OPEN for as long as any cookie
 /// created through it is outstanding.
 ///
@@ -1082,25 +1211,30 @@ fn open_root_object(root: &Path) -> Result<std::fs::File, std::io::Error> {
 /// landed. Judging a name and then creating at a name is two questions; judging
 /// an OPEN OBJECT and creating relative to it is one.
 ///
-/// [`path`](Self::path) is that object's own name AT THE MOMENT OF THE WALK, and
-/// it is what the containment and `prune` verdicts are taken on — never the
-/// caller's spelling, and never a path the write resolved earlier and hopes still
-/// holds. It is a spelling, not a binding: a peer that renames one of the
-/// traversed directories after the walk has passed through it leaves this path
-/// naming ground the cookie is no longer under, and nothing the write does
-/// afterwards resolves it again (see [`CookieFile::path`], which reports it and
-/// says what does and does not rest on it).
+/// [`path`](Self::path) is that object's own name AS THE OS ANSWERS IT FOR THE
+/// FINAL DESCRIPTOR, and it is what the containment, exclusion and `prune`
+/// verdicts are taken on — never the caller's spelling, never the components the
+/// walk was asked to traverse, and never a path the write resolved earlier and
+/// hopes still holds. It is a spelling, not a binding: a peer that renames one of
+/// the traversed directories after that reading leaves this path naming ground the
+/// cookie is no longer under, and nothing the write does afterwards resolves it
+/// again (see [`CookieFile::path`], which reports it and says what does and does
+/// not rest on it).
 ///
 /// # What each platform binds, and what it leaves open
 ///
 /// **Unix** walks from the watched ROOT's descriptor down, one `openat` per
 /// component, each with `O_DIRECTORY | O_NOFOLLOW` — the discipline the fanotify
 /// walk's pinned opens already run under. No component is followed through a
-/// symlink and none can climb above the descriptor it started from, so the
-/// root-relative name this walk spells IS a true name of the object it ends
-/// holding, and the seat is judged on the components it actually traversed. The
-/// ROOT the walk starts from is opened by pathname once and PROVEN to be the
-/// object the scope was armed on before a single component is descended
+/// symlink and none can climb above the descriptor it started from, so the descent
+/// lands on the objects the caller's spelling named and on no others. Where those
+/// objects ARE is a second question, and the walk does not answer it: a peer that
+/// renames an already-opened ancestor aside moves the whole remaining descent with
+/// it while every `openat` still succeeds. So the seat is judged on the name the
+/// OS answers for the FINAL descriptor ([`current_path_of_dir`]), measured against
+/// the name it answers for the root's, and not on the components the walk was
+/// handed. The ROOT the walk starts from is opened by pathname once and PROVEN to
+/// be the object the scope was armed on before a single component is descended
 /// ([`open_verified_root`]), so a root renamed aside and replaced is refused
 /// rather than walked into.
 ///
@@ -1117,16 +1251,18 @@ fn open_root_object(root: &Path) -> Result<std::fs::File, std::io::Error> {
 /// **Everything else** cannot bind a cookie's removal to the object created (see
 /// the third [`CookieDir::open_or_create`] arm) and so never opens one.
 struct CookieParent {
-  /// The opened object's OWN name — the string every verdict is taken on, and
-  /// the prefix a cookie's landing path is reported under.
+  /// The opened object's OWN current name, read off the descriptor — the string
+  /// every verdict is taken on, and the prefix a cookie's landing path is reported
+  /// under.
   path: PathBuf,
   /// The WATCHED ROOT's name in the same form `path` is spelled in — the floor
   /// every verdict about `path` is measured against.
   ///
   /// It is carried rather than re-derived because the two names have to come from
-  /// one resolution scheme or the containment test compares nothing. On the
-  /// walking platforms that is trivially the spelling the walk descended in, so
-  /// this is the caller's canonical root verbatim. On Windows it is the name the
+  /// one resolution scheme or the containment test compares nothing. On every
+  /// platform it is now the name an OPEN OBJECT answers to rather than a path the
+  /// caller supplied: on the walking platforms the verified root descriptor's own
+  /// current path, read through the same call the parent's is. On Windows it is the name the
   /// VERIFIED ROOT HANDLE answers, read through the same API and flags as the
   /// parent's own — never the path the scope recorded, which may be a perfectly
   /// good spelling of the same directory (a short `TEMP` name, a mapped drive)
@@ -1154,6 +1290,29 @@ impl CookieParent {
   }
 }
 
+#[cfg(all(
+  test,
+  feature = "tokio",
+  not(miri),
+  any(target_os = "linux", target_os = "macos")
+))]
+thread_local! {
+  /// A seam inside the descent, called once for every component the walk opens.
+  ///
+  /// The window it exposes is the one the walk cannot observe from inside. Each
+  /// `openat` is descriptor-relative and therefore correct on its own, so a peer
+  /// that renames an ALREADY-OPENED ancestor moves the rest of the descent with
+  /// it while every remaining step still succeeds — and staging that
+  /// deterministically means acting BETWEEN two steps, which nothing outside the
+  /// loop can do.
+  ///
+  /// Thread-local, so parallel cells cannot see each other's peer; production
+  /// compiles no call to it at all. Its cfg is exactly the union of the cells
+  /// that arm it (the real-filesystem identity module).
+  pub(crate) static COOKIE_WALK_STEP: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+    const { std::cell::RefCell::new(None) };
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl CookieParent {
   /// Walks from the VERIFIED root down to `dir`, one pinned `openat` per
@@ -1178,7 +1337,12 @@ impl CookieParent {
     // zero-component descent (the cookie goes in the root itself) simply ends
     // holding the very root the verification opened.
     let mut fd = OwnedFd::from(open_verified_root(root, identity)?);
-    let mut path = root.to_path_buf();
+    // The FLOOR is read off the verified ROOT's own descriptor, through the same
+    // call the parent's name comes from below — never the spelling the caller
+    // canonicalized. Both sides of the containment test then come from one
+    // resolution scheme, which is the only way the comparison means anything (the
+    // Windows arm draws the same line for the same reason).
+    let floor = current_path_of_dir(&fd)?;
     for component in relative.components() {
       let std::path::Component::Normal(name) = component else {
         // A canonical path yields nothing else, so this is a seam bug — and it
@@ -1189,14 +1353,99 @@ impl CookieParent {
         ));
       };
       fd = OwnedFd::from(open_dir_at(&fd, name)?);
-      path.push(name);
+      #[cfg(all(
+        test,
+        feature = "tokio",
+        not(miri),
+        any(target_os = "linux", target_os = "macos")
+      ))]
+      COOKIE_WALK_STEP.with_borrow_mut(|peer| {
+        if let Some(peer) = peer.as_mut() {
+          peer();
+        }
+      });
     }
-    Ok(Self {
-      path,
-      floor: root.to_path_buf(),
-      fd,
-    })
+    // The name the OS answers for the descriptor the walk ENDED HOLDING — asked
+    // once, after the last component is open, and never assembled from the
+    // components the walk was asked to traverse.
+    //
+    // The two are not the same string, and the difference is a hole. A peer that
+    // renames an already-opened ancestor — `<root>/a` into `<root>/excluded/a` —
+    // does not disturb the descent: the remaining `openat`s are descriptor-relative
+    // and correctly land on the same objects. What moves is where those objects
+    // ARE. A name spelled from the walked components still reads `<root>/a/x`, so
+    // the exclusion and `prune` verdicts below are taken about ground the marker is
+    // no longer under, the write reports success, and the source — doing exactly
+    // what the exclusion told it — never reports the create the caller's barrier is
+    // waiting on. Reading the descriptor's CURRENT path instead judges where the
+    // marker will actually land, and a descent that has been moved under excluded
+    // or pruned ground is refused before anything is created.
+    //
+    // It is still a spelling and not a binding: a rename that lands AFTER this read
+    // leaves this path naming ground the cookie is no longer under, and nothing the
+    // write does afterwards resolves it again (see [`CookieFile::path`]). What this
+    // closes is the window the descent itself opens, which is the one a check
+    // against the walked components can never see.
+    let path = current_path_of_dir(&fd)?;
+    Ok(Self { path, floor, fd })
   }
+}
+
+/// The path the kernel currently answers for an open DIRECTORY descriptor.
+///
+/// This is the Unix counterpart of `ffi::final_path_of` on Windows, and it exists
+/// for the same reason: a verdict about where a marker lands has to be a verdict
+/// about the OBJECT the write is holding, and the only name that describes an
+/// object rather than a resolution is the one the OS reads back off the descriptor
+/// itself.
+///
+/// Linux answers it through `/proc/self/fd/N`, which this crate's inotify arm
+/// already depends on for object-pinned re-opens; macOS answers it through
+/// `fcntl(F_GETPATH)`. Both hand back an absolute path, and both describe the
+/// object's CURRENT location — an ancestor renamed since the descriptor was opened
+/// is reflected, which is exactly what the caller is asking about.
+///
+/// Neither is a binding. A directory unlinked out of the tree still answers a name
+/// (Linux marks it `" (deleted)"`), and a rename that lands after the read is not
+/// reflected in a string already returned. The caller's own creation is
+/// descriptor-relative and so cannot follow either drift; what this buys is that
+/// the verdict is taken about where the object is at the moment of the read rather
+/// than about where the walk was asked to go.
+#[cfg(target_os = "linux")]
+fn current_path_of_dir(fd: &std::os::fd::OwnedFd) -> Result<PathBuf, std::io::Error> {
+  use std::os::fd::AsRawFd;
+
+  std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+}
+
+#[cfg(target_os = "macos")]
+fn current_path_of_dir(fd: &std::os::fd::OwnedFd) -> Result<PathBuf, std::io::Error> {
+  use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
+
+  // `F_GETPATH` writes a NUL-terminated path into the caller's buffer and Apple
+  // documents the requirement as at least `MAXPATHLEN` bytes, which is what
+  // `libc::PATH_MAX` is on this platform. Sized here so the call can never be the
+  // one that decides how much it may write.
+  let mut buffer = [0_u8; libc::PATH_MAX as usize];
+  // SAFETY: `fd` is an open descriptor owned by the caller and live for the call,
+  // and `buffer` is a live, writable allocation of exactly the `MAXPATHLEN` bytes
+  // `F_GETPATH` is documented to require. The pointer is cast only from `u8` to
+  // `c_char` (both one byte, no alignment change), and nothing is read out of the
+  // buffer unless the call reported success.
+  let rc = unsafe {
+    libc::fcntl(
+      fd.as_raw_fd(),
+      libc::F_GETPATH,
+      buffer.as_mut_ptr().cast::<libc::c_char>(),
+    )
+  };
+  if rc < 0 {
+    return Err(std::io::Error::last_os_error());
+  }
+  // The kernel NUL-terminates what it wrote; anything past that terminator is the
+  // zero fill this buffer started as.
+  let end = buffer.iter().position(|&byte| byte == 0).unwrap_or(0);
+  Ok(PathBuf::from(std::ffi::OsStr::from_bytes(&buffer[..end])))
 }
 
 #[cfg(all(target_os = "windows", not(miri)))]
@@ -6251,23 +6500,27 @@ fn cookie_dir<'a>(root: &Path, dir: &'a Path) -> &'a Path {
 /// every filesystem the supported platforms mount, so a longer name is one no
 /// create could ever land anyway.
 ///
-/// The bound is a MEMORY bound, not a convenience: the leaf is the only
-/// caller-supplied, unbounded-length value the cookie machinery retains, and it
-/// is retained in several places at once (the obligation, the `by_name` index,
-/// the core's active-marker set, the release queue). The ledger's caps count
-/// RECORDS, so without a length bound a caller could hold a few hundred megabytes
-/// per record — the entry-count caps would still be honoured while the process
-/// died of allocation. Refusing at admission, before the name is stored anywhere,
-/// is what turns the record caps into real memory caps.
+/// The bound is a MEMORY bound, not a convenience: the leaf is retained in several
+/// places at once (the obligation, the `by_name` index, the core's active-marker
+/// set, the release queue), and the ledger's caps count RECORDS, so without a
+/// length bound a name could hold a few hundred megabytes per record — the
+/// entry-count caps still honoured while the process died of allocation. Every
+/// leaf is minted now ([`sync_cookie_name`]) and is far inside this bound by
+/// construction, so the check is a fail-closed invariant rather than a door;
+/// keeping it is what makes the record caps real memory caps even if the mint's
+/// shape ever changes.
 pub(crate) const MAX_COOKIE_NAME_LEN: usize = 255;
 
 /// Whether a minted cookie NAME is exactly one normal filename component — no
 /// separators, no `.`/`..`, not absolute, not empty — and no longer than
-/// [`MAX_COOKIE_NAME_LEN`] bytes. The umbrella mints `.tributaries-sync-…`,
-/// always normal and far inside the bound; anything else is a contract violation
-/// that must be refused BEFORE it reaches a path join, where an absolute or
-/// `..` name would escape the directory the barrier was validated for — and
-/// before it is stored, where an unbounded one would defeat the ledger's caps.
+/// [`MAX_COOKIE_NAME_LEN`] bytes.
+///
+/// [`sync_cookie_name`] is the only minter, and everything it renders is normal
+/// and far inside the bound, so this is an INVARIANT rather than a door: no caller
+/// supplies a name any more. It is kept, and kept fail-closed, because what it
+/// guards is unforgiving — an absolute or `..` name escapes the directory the
+/// barrier was validated for the moment it reaches a path join, and an unbounded
+/// one defeats the ledger's caps the moment it is stored.
 pub(crate) fn is_normal_cookie_name(name: &str) -> bool {
   if name.len() > MAX_COOKIE_NAME_LEN {
     return false;
@@ -6630,13 +6883,15 @@ impl FsOps for RealFs {
       // The containment question again, asked of the OBJECT rather than of the
       // spelling that reached it — and measured against the floor that OPEN was
       // proven under ([`CookieParent::floor`]), never against the path the scope
-      // recorded. The two names must come from one resolution scheme: on Windows
-      // both are normalized final paths read off open handles, and comparing one
-      // of them against a recorded string refuses every root whose recorded
-      // spelling is merely a different good name for the same directory. On the
-      // walking platforms the floor IS the canonical root, so this cannot fail —
-      // the walk descends from the root's own descriptor through normal
-      // components alone — and on Windows it is the whole confinement.
+      // recorded. The two names must come from one resolution scheme: both are
+      // read off open objects — the parent's off the descriptor or handle the open
+      // ended holding, the root's off the descriptor the identity was proven on —
+      // and comparing either against a recorded string refuses every root whose
+      // recorded spelling is merely a different good name for the same directory.
+      // It is a live test on every platform: a descent whose ancestor was renamed
+      // OUT of the watched tree while the walk held it lands under a name that no
+      // longer begins with the root's, and a marker there rides no queue this scope
+      // reads.
       return Err(CookieWriteError::clean(std::io::Error::other(
         "the cookie directory resolves outside the watched root",
       )));
@@ -9635,11 +9890,14 @@ pub(crate) async fn run<R, F>(
               let _ = reply.send(Err(crate::error::SyncRootError::UnknownRoot));
             }
             Some(root) => {
-              // The cookie NAME is one normal component (the umbrella mints
-              // `.tributaries-sync-…`); a separator, `..`, or absolute name is a
-              // contract violation refused before it can escape on a join. The
-              // DIRECTORY must lie within the root once `.`/`..` are folded — the
-              // containment a plain `starts_with` misses for `<root>/../out`.
+              // The cookie NAME is one normal component. Nothing on this path can
+              // make it anything else — the watcher renders it from the admission
+              // it consumes, and there is no caller-facing name to violate the
+              // contract with — so this is the invariant's fail-closed statement
+              // rather than a door: a separator, `..`, or absolute name would
+              // escape on a join. The DIRECTORY must lie within the root once
+              // `.`/`..` are folded — the containment a plain `starts_with` misses
+              // for `<root>/../out`.
               if !is_normal_cookie_name(&name) {
                 let _ = reply.send(Err(crate::error::SyncRootError::BadCookieName { name }));
               } else if !cookie_dir_within_root(&root, &dir) {
@@ -9673,9 +9931,10 @@ pub(crate) async fn run<R, F>(
                 // `by_path` displacement the physical machinery must never face.
                 // Refuse before birth: with no two live same-name obligations, one
                 // cookie file has one live owner. The name frees at the holder's
-                // typed terminal, so sequential reuse admits; concurrent syncs need
-                // distinct names (the umbrella mints per-sync-unique names, so it
-                // never trips this).
+                // typed terminal, so sequential reuse admits. Every leaf is minted
+                // from its own admission's nonce, so nothing reaching this door can
+                // collide — it is the invariant's fail-closed statement, not a case
+                // a caller can drive.
                 //
                 // Ordered AFTER `WriteInFlight` so a same-scope retry while the
                 // predecessor is still `Parked`/`InPool` keeps reading the transient

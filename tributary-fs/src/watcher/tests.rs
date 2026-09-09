@@ -24,7 +24,8 @@ fn manual_watcher() -> (Watcher<TokioRuntime>, async_channel::Receiver<Command>)
       instance: WATCHER_INSTANCES.fetch_add(1, Ordering::Relaxed),
       commands: command_tx,
       cleanup,
-      sync_tickets: Arc::new(AtomicU64::new(0)),
+      sync_tickets: Arc::new(AtomicU64::new(1)),
+      nonces: super::sync_nonce_generator().map(|generator| Arc::new(Mutex::new(generator))),
       events: Box::pin(event_rx),
       roots: Arc::new(RwLock::new(RootSet::default())),
       _runtime: PhantomData,
@@ -382,6 +383,101 @@ async fn request_set_cover_is_reply_less_and_reports_channel_capacity() {
   );
 }
 
+/// The marker leaf a sync writes is MINTED, never chosen — the property the active-marker
+/// exemption rests on.
+///
+/// Admitting a sync ARMS an exemption on its marker's leaf: while the sync is live, a change whose
+/// last segment is that leaf clears both per-root seats wherever it stands, which is what keeps the
+/// barrier resolvable when a peer renames the reserved directory out from under the marker. That is
+/// sound only while the leaf names nothing but this watcher's own artifact. `sync_root` used to take
+/// the name from its caller, and a caller that chose `ready` armed the exemption on every file
+/// called `ready` in the scope: an ordinary one, changing in an already-covered sibling, cleared
+/// both seats and could be recorded as the barrier's observation ahead of the marker's own create.
+///
+/// There is no name left to choose — `sync_root` takes none — and this cell pins what the mint puts
+/// there instead: the reserved grammar the suppression rule recognizes, one normal component inside
+/// the leaf bound, a `seq` field the grammar's floor accepts, and a leaf distinct across mints and
+/// across watchers whose difference is the NONCE and not the countable fields. An impostor at
+/// another path would have to be created under a name drawn from a keystream the peer cannot read.
+///
+/// Fail-on-revert: start `sync_tickets` at 0 again and the first mint's leaf stops being a name the
+/// classifier recognizes — every marker this watcher writes would reach consumers as a user create.
+#[test]
+fn a_minted_marker_leaf_is_never_a_name_a_caller_could_have_chosen() {
+  let (watcher, _commands) = manual_watcher();
+  let (other, _other_commands) = manual_watcher();
+
+  let (_, first) = watcher
+    .mint_sync_ticket()
+    .expect("this host seeds a watcher");
+  assert_eq!(
+    first.seq(),
+    1,
+    "the sequence starts at 1: it is the leaf's `seq` field, and the reserved grammar's floor \
+     refuses 0 there"
+  );
+
+  let mut leaves = std::collections::BTreeSet::new();
+  let mut nonces = std::collections::BTreeSet::new();
+  let mut mint = |watcher: &Watcher<TokioRuntime>| {
+    let (_, ticket) = watcher
+      .mint_sync_ticket()
+      .expect("this host seeds a watcher");
+    let leaf = ticket.leaf();
+    assert!(
+      crate::is_sync_cookie_name(&leaf),
+      "the mint and the classifier that suppresses it must agree on {leaf}"
+    );
+    assert!(
+      crate::driver::is_normal_cookie_name(&leaf),
+      "{leaf} is one normal component inside the leaf bound, so the driver's own invariant holds \
+       without a caller-facing door"
+    );
+    assert!(
+      leaf.starts_with(".tributaries-sync-"),
+      "{leaf} stands in the reserved namespace"
+    );
+    nonces.insert(
+      leaf
+        .rsplit('-')
+        .next()
+        .expect("the rendered leaf carries a trailing nonce field")
+        .to_owned(),
+    );
+    assert!(leaves.insert(leaf.clone()), "{leaf} was minted twice");
+    leaf
+  };
+
+  let mine: Vec<String> = (0..64).map(|_| mint(&watcher)).collect();
+  let theirs: Vec<String> = (0..64).map(|_| mint(&other)).collect();
+
+  assert!(
+    nonces.len() > 1,
+    "the nonce varies per mint: a constant word would make the whole leaf a function of \
+     (instance, pid, seq), every one of which is computable from a marker already on disk"
+  );
+  assert_eq!(
+    leaves.len(),
+    mine.len() + theirs.len(),
+    "no two mints, of one watcher or of two, ever name the same marker"
+  );
+
+  // Names a caller might reasonably have chosen, including ones wearing the reserved stem: none of
+  // them is reachable through this API, because the API has no seat to put them in.
+  for chosen in [
+    "ready",
+    "sync",
+    "cookie",
+    ".tributaries-sync-ready",
+    ".tributaries-sync-1-2-3-000000000000000a",
+  ] {
+    assert!(
+      !leaves.contains(chosen),
+      "{chosen} is a name a caller could have picked, and no mint may land on it"
+    );
+  }
+}
+
 /// A [`SyncAdmission`] minted by a DIFFERENT watcher is refused by `sync_root` synchronously —
 /// before any command is sent — in the foreign-handle door idiom: a foreign admission's sequence is
 /// unrelated to this watcher's numbering, so honoring it could alias one of this watcher's
@@ -396,12 +492,10 @@ async fn sync_root_refuses_a_foreign_ticket_at_the_door() {
 
   // An admission minted by the OTHER watcher — a foreign brand — is refused ForeignTicket, and the
   // pre-birth refusal hands the admission back.
-  let (foreign, _foreign_ticket) = other.mint_sync_ticket();
+  let (foreign, _foreign_ticket) = other.mint_sync_ticket().expect("this host seeds a watcher");
   assert!(
     matches!(
-      watcher
-        .sync_root(handle, "/r", ".tributaries-sync-foreign", foreign)
-        .await,
+      watcher.sync_root(handle, "/r", foreign).await,
       Err(SyncRootDenied {
         error: SyncRootError::ForeignTicket,
         admission: Some(_)
@@ -418,12 +512,12 @@ async fn sync_root_refuses_a_foreign_ticket_at_the_door() {
   // (which this manual watcher has no live root for), so the answer is UnknownRoot, never
   // ForeignTicket — the brand, not all admissions, is what ForeignTicket refuses. UnknownRoot is
   // pre-birth too, so its admission also comes back.
-  let (own, _own_ticket) = watcher.mint_sync_ticket();
+  let (own, _own_ticket) = watcher
+    .mint_sync_ticket()
+    .expect("this host seeds a watcher");
   assert!(
     matches!(
-      watcher
-        .sync_root(handle, "/r", ".tributaries-sync-own", own)
-        .await,
+      watcher.sync_root(handle, "/r", own).await,
       Err(SyncRootDenied {
         error: SyncRootError::UnknownRoot,
         admission: Some(_)
@@ -466,7 +560,9 @@ async fn sync_root_denied_classifies_each_variant_pre_or_post_birth() {
     SyncRootError::CleanupBacklog,
   ];
   for error in pre_birth {
-    let (admission, ticket) = watcher.mint_sync_ticket();
+    let (admission, ticket) = watcher
+      .mint_sync_ticket()
+      .expect("this host seeds a watcher");
     let seq = ticket.seq();
     let denied = SyncRootDenied::classify(error, admission);
     let returned = denied.admission.unwrap_or_else(|| {
@@ -506,7 +602,9 @@ async fn sync_root_denied_classifies_each_variant_pre_or_post_birth() {
     SyncRootError::Closed,
   ];
   for error in post_birth {
-    let (admission, _ticket) = watcher.mint_sync_ticket();
+    let (admission, _ticket) = watcher
+      .mint_sync_ticket()
+      .expect("this host seeds a watcher");
     let denied = SyncRootDenied::classify(error, admission);
     assert!(
       denied.admission.is_none(),
@@ -516,7 +614,8 @@ async fn sync_root_denied_classifies_each_variant_pre_or_post_birth() {
   }
 }
 
-/// [`SyncAdmission`] is plain `Send + Sync` data (two `u64`s), so it holds across `sync_root`'s await
+/// [`SyncAdmission`] is plain `Send + Sync` data (three integer words), so it holds across
+/// `sync_root`'s await
 /// without perturbing the future's `Send` — the seam the umbrella's owner-send asserts depend on.
 #[allow(dead_code)]
 fn _assert_sync_admission_is_send_sync() {
@@ -1712,7 +1811,9 @@ mod lifecycle {
     //
     // One reused ticket is the duplicate-target half of the vector: the old lane
     // queued each duplicate, because it deduplicated only after dequeue.
-    let (_, dup) = watcher.mint_sync_ticket();
+    let (_, dup) = watcher
+      .mint_sync_ticket()
+      .expect("this host seeds a watcher");
     // A hundred thousand rounds is a VOLUME argument, and volume is the one thing
     // an interpreter cannot carry: a round is four ingress calls with a format and
     // an allocation in them, which interpreted costs milliseconds rather than
@@ -1729,7 +1830,12 @@ mod lifecycle {
       watcher.request_remove_cookie(PathBuf::from(format!("/r/.tributaries-sync-{i}")));
       // A freshly minted, never-admitted ticket resolves nothing — it addresses no
       // record this watcher ever admitted, so the flood retains nothing through it.
-      watcher.request_cancel_sync(watcher.mint_sync_ticket().1);
+      watcher.request_cancel_sync(
+        watcher
+          .mint_sync_ticket()
+          .expect("this host seeds a watcher")
+          .1,
+      );
       watcher.request_remove_cookie(PathBuf::from("/r/.tributaries-sync-dup"));
       watcher.request_cancel_sync(dup);
     }
@@ -1757,10 +1863,15 @@ mod lifecycle {
 
   /// The returned-admission retry contract, end to end over the real driver: a pre-birth refusal
   /// hands the admission back, and re-presenting it retries under the SAME sequence — a refusal
-  /// burns nothing. A admits under `name`; a second sync under the same `name` with a FRESH
-  /// admission is refused `NameInUse` (A's write already completed, so it is the name gate, not
-  /// single-flight) and that refusal returns the admission; once A is reaped and the name frees,
-  /// the returned admission admits under its original sequence.
+  /// burns nothing. The admission is first presented against a handle this watcher never issued a
+  /// root for, which is refused `UnknownRoot` at the registry lookup (pre-birth: nothing was sent
+  /// to the driver, so nothing was created); the SAME admission then admits against the live root
+  /// and writes its marker.
+  ///
+  /// The refusal used to be `NameInUse`, driven by presenting one caller-chosen cookie name twice.
+  /// No caller chooses a name any more — the leaf is minted with the admission and carries that
+  /// admission's own nonce — so two live syncs cannot collide on one leaf and that door is
+  /// unreachable from here. What the cell pins is unchanged: the sequence survives a refusal.
   ///
   /// Fail-on-old: neuter `SyncRootDenied::classify` to always-`None` and the `expect` on the
   /// returned admission fails FAST — there is nothing to retry with, and the move-only admission
@@ -1777,72 +1888,45 @@ mod lifecycle {
       .await
       .expect("watch the root");
 
-    let name = ".tributaries-sync-admission-retry";
+    let (admission, ticket) = watcher
+      .mint_sync_ticket()
+      .expect("this host seeds a watcher");
+    let seq = ticket.seq();
 
-    // A admits under `name` and writes its cookie (the reply resolves at write-complete).
-    let (a1, _t1) = watcher.mint_sync_ticket();
-    let path_a = watcher
-      .sync_root(handle, &canonical, name, a1)
-      .await
-      .expect("A admits and writes its cookie");
-
-    // A second sync under the SAME name, with a FRESH admission, is refused NameInUse — a pre-birth
-    // refusal that hands the admission back for a same-sequence retry.
-    let (a2, t2) = watcher.mint_sync_ticket();
-    let seq2 = t2.seq();
+    // A handle branded by THIS watcher but naming a scope it never registered: the brand door
+    // passes, the registry lookup does not, and the refusal is pre-birth.
+    let unknown = RootHandle::new(watcher.instance, ScopeId::new(9_999.try_into().unwrap()));
     let denied = watcher
-      .sync_root(handle, &canonical, name, a2)
+      .sync_root(unknown, &canonical, admission)
       .await
-      .expect_err("a second sync under a live name is refused");
+      .expect_err("a handle this watcher never issued is refused");
     assert!(
-      matches!(denied.error, SyncRootError::NameInUse { .. }),
-      "the second same-name sync is refused NameInUse, got {:?}",
+      matches!(denied.error, SyncRootError::UnknownRoot),
+      "an unregistered scope is refused UnknownRoot, got {:?}",
       denied.error
     );
-    let mut admission = denied
+    let admission = denied
       .admission
-      .expect("a pre-birth NameInUse refusal returns the admission for a same-sequence retry");
+      .expect("a pre-birth UnknownRoot refusal returns the admission for a same-sequence retry");
     assert_eq!(
       admission.seq(),
-      seq2,
+      seq,
       "the returned admission keeps its original sequence"
     );
 
-    // Reap A to free the name, then RETRY with the returned admission. Each NameInUse hands it back
-    // (the contract), so the SAME sequence is re-presented without a re-mint until A retires and the
-    // name frees — then it admits under seq2. Bounded so a wedged reap fails the cell, never hangs.
-    watcher.request_remove_cookie(path_a.clone());
-    let mut attempts = 0;
-    let path_b = loop {
-      attempts += 1;
-      assert!(attempts <= 500, "A did not retire within the retry budget");
-      match watcher.sync_root(handle, &canonical, name, admission).await {
-        Ok(path) => break path,
-        Err(denied) => {
-          assert!(
-            matches!(denied.error, SyncRootError::NameInUse { .. }),
-            "while A drains the only expected refusal is NameInUse, got {:?}",
-            denied.error
-          );
-          admission = denied
-            .admission
-            .expect("every NameInUse hands the admission back for retry");
-          assert_eq!(
-            admission.seq(),
-            seq2,
-            "the sequence is preserved across every retry"
-          );
-          tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-      }
-    };
+    // The SAME admission — never re-minted — admits against the live root and writes the marker
+    // its own ticket names.
+    let path = watcher
+      .sync_root(handle, &canonical, admission)
+      .await
+      .expect("the returned admission admits under its original sequence");
     assert_eq!(
-      path_b, path_a,
-      "the retry admits under the same name — the returned admission burned nothing"
+      path.file_name().and_then(|leaf| leaf.to_str()),
+      Some(ticket.leaf().as_str()),
+      "the marker lands under the leaf the ticket answers"
     );
 
-    // Close proves every cookie this watcher wrote (A's, then the retry's incarnation under seq2)
-    // was confirmed removed.
+    // Close proves the cookie this watcher wrote under seq was confirmed removed.
     watcher.close().await.expect("close removes every cookie");
     let _ = std::fs::remove_dir_all(&dir);
   }

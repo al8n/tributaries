@@ -350,9 +350,13 @@ pub enum SyncRootError {
   /// nothing that could ever be created). A name like this would escape the
   /// directory the barrier was validated for, so it is refused before any write
   /// — and before it is stored, so an unbounded one cannot be retained by a
-  /// bookkeeping that counts records rather than bytes. The umbrella mints names
-  /// that never trip this; a caller that hits it violated the reserved-namespace
-  /// contract.
+  /// bookkeeping that counts records rather than bytes.
+  ///
+  /// **Not reachable through [`Watcher::sync_root`](crate::Watcher::sync_root).**
+  /// That call takes no name: the leaf is minted with the admission
+  /// ([`SyncTicket::leaf`](crate::SyncTicket::leaf)) and is one normal component
+  /// by construction. The variant survives as the driver's own fail-closed
+  /// invariant, and as a stable spelling of what that invariant guards.
   #[error("cookie name {name:?} is not a single normal filename component")]
   BadCookieName {
     /// The offending name as supplied.
@@ -385,8 +389,12 @@ pub enum SyncRootError {
   /// admitting a second would make cancel-by-name ambiguous and could target
   /// another root's sync. The name is freed when the holding obligation reaches
   /// its terminal (its cookie confirmed removed, or the sync retired), so
-  /// sequential reuse of a name admits; concurrent syncs need distinct names
-  /// (the umbrella's minted names are always distinct).
+  /// sequential reuse of a name admits.
+  ///
+  /// **Not reachable through [`Watcher::sync_root`](crate::Watcher::sync_root).**
+  /// Every leaf is minted from its own admission and carries that admission's
+  /// nonce, so two live syncs of one watcher cannot collide on a name. The variant
+  /// survives as the driver's own fail-closed invariant.
   #[error("cookie name {name:?} is already held by a live sync of this watcher")]
   NameInUse {
     /// The contested name as supplied.

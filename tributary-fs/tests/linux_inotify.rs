@@ -1063,16 +1063,11 @@ async fn a_degraded_cover_settles_behind_its_ordering_proof() {
 
   // The grow and a sync admitted onto the SAME window: two fences on one entry,
   // one ordering proof between them, and both owed an answer.
-  let (admission, _ticket) = w.mint_sync_ticket();
+  let (admission, _ticket) = w.mint_sync_ticket().expect("this host seeds a watcher");
   let (grown, cookie) = tokio::time::timeout(scaled(DEADLINE), async {
     tokio::join!(
       w.set_cover(handle, vec![keep.clone(), dropped.clone()]),
-      w.sync_root(
-        handle,
-        root.clone(),
-        ".tributaries-sync-degraded",
-        admission
-      )
+      w.sync_root(handle, root.clone(), admission)
     )
   })
   .await
@@ -1278,9 +1273,9 @@ async fn a_sync_barrier_across_a_widen_resolves_by_delivery() {
   // is tolerated because it IS the domination signal, not a false Delivered. The
   // one dishonest ending — the cookie reached with `pre` NEITHER delivered NOR
   // dominated — is a false Delivered and fails the assertion below.
-  let (admission, _ticket) = w.mint_sync_ticket();
+  let (admission, _ticket) = w.mint_sync_ticket().expect("this host seeds a watcher");
   let cookie = w
-    .sync_root(handle, root.clone(), ".tributaries-sync-widen", admission)
+    .sync_root(handle, root.clone(), admission)
     .await
     .expect("the cookie writes");
   let barrier_honest = tokio::time::timeout(scaled(DEADLINE), async {
@@ -1431,16 +1426,8 @@ async fn a_widen_racing_an_excursion_never_certifies_a_dark_interval() {
     return;
   }
 
-  let (admission, _ticket) = w.mint_sync_ticket();
-  let Ok(cookie) = w
-    .sync_root(
-      handle,
-      root.clone(),
-      ".tributaries-sync-excursion",
-      admission,
-    )
-    .await
-  else {
+  let (admission, _ticket) = w.mint_sync_ticket().expect("this host seeds a watcher");
+  let Ok(cookie) = w.sync_root(handle, root.clone(), admission).await else {
     // A denied sync answers its caller; it certifies nothing, so it cannot lie.
     eprintln!("NOTE: this round's sync was denied, so no barrier was consulted");
     let _ = w.close().await;
@@ -1561,15 +1548,10 @@ async fn a_sync_cookie_never_overtakes_a_parked_move_out() {
   let marker = root.join("after-the-move.txt");
   std::fs::write(&marker, b"x").expect("write the stream marker");
 
-  let (admission, _ticket) = w.mint_sync_ticket();
+  let (admission, _ticket) = w.mint_sync_ticket().expect("this host seeds a watcher");
   let cookie = tokio::time::timeout(
     scaled(DEADLINE),
-    w.sync_root(
-      handle,
-      root.clone(),
-      ".tributaries-sync-move-out",
-      admission,
-    ),
+    w.sync_root(handle, root.clone(), admission),
   )
   .await
   .expect(
@@ -5173,17 +5155,9 @@ async fn overflow_swallowed_unmount_rebinds_or_dies_loudly() {
       // fence the binding re-proof is supposed to release: a barrier that never
       // resolves is precisely the defect under test, and an unbounded await
       // would wedge this single-threaded binary instead of reporting it.
-      let (admission, _ticket) = w.mint_sync_ticket();
-      let synced = tokio::time::timeout(
-        scaled(DEADLINE),
-        w.sync_root(
-          handle,
-          &mount,
-          format!(".tributaries-sync-w1-{round}"),
-          admission,
-        ),
-      )
-      .await;
+      let (admission, _ticket) = w.mint_sync_ticket().expect("this host seeds a watcher");
+      let synced =
+        tokio::time::timeout(scaled(DEADLINE), w.sync_root(handle, &mount, admission)).await;
       let cookie = match synced {
         Ok(Ok(cookie)) => cookie,
         Ok(Err(denied)) => panic!(
@@ -5811,14 +5785,11 @@ async fn descriptor_renewal_keeps_the_tree_watched() {
   // A barrier over the renewed tree resolves: the cookie write parks on the
   // coverage-settle fence, so resolving here proves the re-proof settled and
   // released it.
-  let (admission, _ticket) = w.mint_sync_ticket();
-  let cookie = tokio::time::timeout(
-    scaled(DEADLINE),
-    w.sync_root(handle, &root, ".tributaries-renewal-sync", admission),
-  )
-  .await
-  .expect("the barrier resolves once the renewal's re-proof settles")
-  .expect("the sync admits and writes its cookie");
+  let (admission, _ticket) = w.mint_sync_ticket().expect("this host seeds a watcher");
+  let cookie = tokio::time::timeout(scaled(DEADLINE), w.sync_root(handle, &root, admission))
+    .await
+    .expect("the barrier resolves once the renewal's re-proof settles")
+    .expect("the sync admits and writes its cookie");
   let _ = std::fs::remove_file(&cookie);
 }
 

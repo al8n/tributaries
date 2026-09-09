@@ -1703,7 +1703,10 @@ mod integration {
     // tokenB — mirroring what `begin_sync` leaves behind for an abandoned in-flight sync.
     let token_a = SyncToken::new(1, 1, 1, 0xA);
     let token_b = SyncToken::new(1, 1, 2, 0xB);
-    let (_, ticket_b) = source.watcher.mint_sync_ticket();
+    let (_, ticket_b) = source
+      .watcher
+      .mint_sync_ticket()
+      .expect("this host seeds a watcher");
     source.pending_syncs.insert(handle, (token_b, ticket_b));
 
     // A STALE cancel for the OLD incarnation (tokenA != tokenB): must be a pure no-op. Against the
@@ -1734,24 +1737,26 @@ mod integration {
   }
 }
 
-/// The reserved namespace is the binding's business: it renders a cookie's
-/// name from the owner's token and classifies EVERY leaf matching a shape this
-/// binding has minted as an artifact — ours, another instance's, or a crashed
-/// process's leftover from an earlier release — while an ordinary file (or a
-/// name merely containing the prefix deeper in the path) is never one.
+/// The reserved namespace is the binding's business to APPLY, and the lower crate's to define:
+/// this binding renders no cookie name of its own — `tributary_fs::Watcher` mints the leaf as
+/// part of a sync's admission — so classification delegates to that crate's exported grammar.
+/// EVERY leaf matching a shape this workspace has minted is an artifact — ours, another
+/// watcher's, or a crashed process's leftover from an earlier release — while an ordinary file
+/// (or a name merely containing the prefix deeper in the path) is never one.
 ///
 /// # A disclosed correction
 ///
 /// This cell used to assert `.tributaries-sync-0-1-0-0000000000000000`,
 /// `.tributaries-sync-0-1-0` and the round-trip of `SyncToken::new(0, 0, 0, 0)` as
-/// ARTIFACTS. No release of this binding can mint an `instance` of 0 (the field comes
-/// from a `NonZeroU64` [`InstanceId`](crate::subscription::InstanceId)) or a `seq` of 0
-/// (`Owner::sync_seq` is pre-incremented before the mint), so those three inputs pinned
-/// the very over-acceptance the classifier's bounds now close: names the minter cannot
-/// produce, suppressed off every consumer stream as though it could. The two literals
-/// moved to the negative list below and the round-trip token became
-/// `SyncToken::new(1, 1, 1, 0)` — the minimum of each bounded field, and a `nonce` of 0,
-/// which unlike the others IS genuinely mintable and must stay covered here.
+/// ARTIFACTS. No release of this workspace can mint an `instance` of 0 (the watcher brand counter
+/// starts at 1, and the release that minted the three-field shape rendered a `NonZeroU64`
+/// [`InstanceId`](crate::subscription::InstanceId)) or a `seq` of 0 (the watcher's ticket
+/// sequence starts at 1 for exactly this reason, and the older release pre-incremented its own
+/// counter), so those three inputs pinned the very over-acceptance the classifier's bounds now
+/// close: names the minter cannot produce, suppressed off every consumer stream as though it
+/// could. The two literals moved to the negative list below, and the round-trip fell to the
+/// minimum of each bounded field with a `nonce` of 0 — which unlike the others IS genuinely
+/// mintable and must stay covered here.
 #[tokio::test]
 async fn the_reserved_namespace_classifies_every_cookie_and_only_cookies() {
   use std::ffi::OsString;
@@ -1759,24 +1764,20 @@ async fn the_reserved_namespace_classifies_every_cookie_and_only_cookies() {
   use agnostic_lite::tokio::TokioRuntime;
   use tributary_fs::WatcherOptions;
 
-  use crate::{Source, SyncToken, source::FsSource};
+  use crate::{Source, source::FsSource};
 
   let source = FsSource::<TokioRuntime>::new(WatcherOptions::new()).expect("build");
   let key =
     |parts: &[&str]| -> Vec<OsString> { parts.iter().map(|p| OsString::from(*p)).collect() };
 
-  // Our own cookie, rendered from a token.
-  let name = super::cookie_name(SyncToken::new(7, 42, 3, 0xdead_beef));
-  assert_eq!(name, ".tributaries-sync-7-42-3-00000000deadbeef");
-  // The trailing nonce is what an external writer cannot predict — but
-  // classification keys on the SHAPE, not on the value, so a cookie is a cookie
-  // whatever its nonce.
+  // A cookie in the shape the lower watcher mints. The trailing nonce is what an external
+  // writer cannot predict — but classification keys on the SHAPE, not on the value, so a cookie
+  // is a cookie whatever its nonce.
   assert!(source.is_sync_artifact(&key(&[
     "/",
     "r",
     ".tributaries-sync-7-42-3-00000000deadbeef"
   ])));
-  assert!(source.is_sync_artifact(&key(&["/", "r", &name])));
 
   // A FOREIGN instance's cookie, and a crashed process's leftover: both are
   // suppressed too — the namespace is total over the grammar, never
@@ -1811,14 +1812,13 @@ async fn the_reserved_namespace_classifies_every_cookie_and_only_cookies() {
   // recognized by the classifier that has to suppress them. The low end is each
   // field's true minimum — 1 for the bounded decimals, 0 for the nonce, whose
   // minter is a stream generator and can genuinely render it.
-  for token in [
-    SyncToken::new(1, 1, 1, 0),
-    SyncToken::new(u64::MAX, u32::MAX, u64::MAX, u64::MAX),
-    SyncToken::new(1, 1, 1, 1),
+  for minted in [
+    ".tributaries-sync-1-1-1-0000000000000000",
+    ".tributaries-sync-18446744073709551615-4294967295-18446744073709551615-ffffffffffffffff",
+    ".tributaries-sync-1-1-1-0000000000000001",
   ] {
-    let minted = super::cookie_name(token);
     assert!(
-      source.is_sync_artifact(&key(&["/", "r", &minted])),
+      source.is_sync_artifact(&key(&["/", "r", minted])),
       "the minter and the classifier must agree on {minted}"
     );
   }
@@ -1877,20 +1877,19 @@ async fn the_reserved_namespace_classifies_every_cookie_and_only_cookies() {
   }
 }
 
-/// A leaf whose `instance` field is 0 is a USER file, not a cookie. `Owner::on_sync`
-/// renders that field from `sub.instance().get()`, and an
+/// A leaf whose `instance` field is 0 is a USER file, not a cookie. Today's minter renders that
+/// field from the lower watcher's brand, drawn off a process-global counter that starts at 1; the
+/// three-field release rendered it from `sub.instance().get()`, and an
 /// [`InstanceId`](crate::subscription::InstanceId) is a `NonZeroU64` minted as
-/// `fetch_add(1) + 1`: the first owner in a process brands 1, and 0 is not representable at
-/// all — in today's four-field shape and in the three-field shape the pre-nonce release
-/// minted alike, since both render the field from that same type.
+/// `fetch_add(1) + 1`. Neither can produce 0, in either shape.
 ///
 /// Suppression removes a change from every consumer stream with no `Rescan` and no
 /// diagnostic, so a name no release can mint has to stay a user change:
 /// `.tributaries-sync-0-123-1` is a name a caller may legitimately choose, and accepting it
 /// erased that file from every stream for the life of the watch.
 ///
-/// FAIL-ON-REVERT: restore the unbounded floor — `is_minted_decimal(instance, 0, ..)` — and
-/// both assertions read `true`.
+/// FAIL-ON-REVERT: restore the unbounded floor — `is_minted_decimal(instance, 0, ..)` in
+/// `tributary_fs` — and both assertions read `true`.
 #[test]
 fn an_instance_field_of_zero_is_a_user_file_not_a_cookie() {
   for user_leaf in [
@@ -1899,25 +1898,24 @@ fn an_instance_field_of_zero_is_a_user_file_not_a_cookie() {
     ".tributaries-sync-0-123-1-00000000deadbeef",
   ] {
     assert!(
-      !super::is_cookie_name(user_leaf),
+      !tributary_fs::is_sync_cookie_name(user_leaf),
       "{user_leaf} carries an instance no InstanceId brand can render — suppressing it \
        erases a user file"
     );
   }
 }
 
-/// A leaf whose `pid` field is 0 is a USER file, not a cookie. `Owner::on_sync` renders that
-/// field from `std::process::id()`, and pid 0 is the scheduler on Unix and the System Idle
+/// A leaf whose `pid` field is 0 is a USER file, not a cookie. Every release renders that field
+/// from `std::process::id()`, and pid 0 is the scheduler on Unix and the System Idle
 /// pseudo-process on Windows — never a process that can execute this code, on any target
-/// this workspace supports, and equally so for the three-field release, which called the
-/// same function.
+/// this workspace supports.
 ///
 /// This is the one field bound whose floor rests on OS semantics rather than on this
 /// workspace's own source, which is why it is the first to drop if that evidence is ever
-/// questioned — see the derivation beside `is_cookie_name`.
+/// questioned — see the derivation beside `tributary_fs::is_sync_cookie_name`.
 ///
-/// FAIL-ON-REVERT: restore the unbounded floor — `is_minted_decimal(pid, 0, ..)` — and both
-/// assertions read `true`.
+/// FAIL-ON-REVERT: restore the unbounded floor — `is_minted_decimal(pid, 0, ..)` in
+/// `tributary_fs` — and both assertions read `true`.
 #[test]
 fn a_pid_field_of_zero_is_a_user_file_not_a_cookie() {
   for user_leaf in [
@@ -1925,23 +1923,20 @@ fn a_pid_field_of_zero_is_a_user_file_not_a_cookie() {
     ".tributaries-sync-1-0-1-00000000deadbeef",
   ] {
     assert!(
-      !super::is_cookie_name(user_leaf),
+      !tributary_fs::is_sync_cookie_name(user_leaf),
       "{user_leaf} carries a pid no live process can have — suppressing it erases a user file"
     );
   }
 }
 
-/// A leaf whose `seq` field is 0 is a USER file, not a cookie. `Owner::sync_seq` starts at 0
-/// and `on_sync` PRE-increments it before minting the token, so the first sync of every
-/// owner renders 1 and no sync has ever rendered 0 — in today's shape and in the three-field
-/// release, which pre-incremented identically.
+/// A leaf whose `seq` field is 0 is a USER file, not a cookie. Today's minter renders that field
+/// from the lower watcher's ticket sequence, which starts at 1 for exactly this reason; the
+/// three-field release rendered `Owner::sync_seq`, pre-incremented before the mint, so its first
+/// sync rendered 1 too. No sync has ever rendered 0, in either shape.
 ///
-/// The lower crate's `sync_tickets` genuinely does start at 0, but that sequence brands a
-/// [`SyncTicket`](tributary_fs::SyncTicket) — an in-memory cancel address — and never
-/// reaches a file name, so it constrains nothing here.
-///
-/// FAIL-ON-REVERT: restore the unbounded floor — `is_minted_decimal(seq, 0, ..)` — and both
-/// assertions read `true`.
+/// FAIL-ON-REVERT: start `tributary_fs`'s `sync_tickets` at 0 again, or restore the unbounded
+/// floor — `is_minted_decimal(seq, 0, ..)` — and the first marker of every watcher stops being
+/// classified as one.
 #[test]
 fn a_seq_field_of_zero_is_a_user_file_not_a_cookie() {
   for user_leaf in [
@@ -1949,7 +1944,7 @@ fn a_seq_field_of_zero_is_a_user_file_not_a_cookie() {
     ".tributaries-sync-1-123-0-00000000deadbeef",
   ] {
     assert!(
-      !super::is_cookie_name(user_leaf),
+      !tributary_fs::is_sync_cookie_name(user_leaf),
       "{user_leaf} carries a seq the pre-incremented counter never renders — suppressing it \
        erases a user file"
     );
@@ -1962,56 +1957,54 @@ fn a_seq_field_of_zero_is_a_user_file_not_a_cookie() {
 /// its unlink) on every consumer stream as user changes, which is strictly worse than the
 /// over-acceptance the floors exist to close.
 ///
-/// Every coordinate here is derived from its own minter rather than chosen: `instance` 1 is
-/// the first `InstanceId::mint` (`fetch_add(1) + 1`); `seq` 1 is `Owner::sync_seq` after the
-/// pre-increment that runs before the mint, so 1 — never 0 — is the first value any cookie
-/// name has carried, in this shape and in the three-field one; the `pid` is this very
-/// process's, so the pid floor is proven against a live pid rather than a constant; and the
-/// `nonce` is 0, a generator word's genuine minimum, which is exactly why that field carries no
-/// value bound at all.
+/// The name is taken from the ACTUAL minter rather than retyped: this binding renders none, so
+/// the cell mints a real `SyncTicket` off a real watcher and asks the classifier about the leaf
+/// that ticket answers — the very string `sync_root` will place. A minter and a classifier that
+/// disagree cannot both be right, and this is the seam where the disagreement would show.
 ///
-/// `driver::tests::the_first_sync_an_owner_admits_mints_seq_one` is this cell's other half:
-/// it drives a real `on_sync` and pins the seq the minter hands over, so a release that
-/// changes the counter's discipline fails at that seam instead of leaking silently here.
+/// The one coordinate still spelled here is the legacy first-sync name, whose minter is gone:
+/// `instance` 1 is the first `InstanceId::mint` (`fetch_add(1) + 1`), `seq` 1 is `Owner::sync_seq`
+/// after the pre-increment that ran before the mint, and the `pid` is this very process's, so the
+/// pid floor is proven against a live pid rather than a constant.
 ///
-/// FAIL-ON-REVERT: tighten the seq floor past its minter — `is_minted_decimal(seq, 2, ..)` —
-/// and the first cookie of every owner stops being recognized.
-#[test]
-fn the_classifier_accepts_the_name_the_first_sync_of_an_owner_mints() {
-  use crate::SyncToken;
+/// FAIL-ON-REVERT: tighten the seq floor past its minter — `is_minted_decimal(seq, 2, ..)` — and
+/// the first marker of every watcher stops being recognized.
+#[tokio::test]
+async fn the_classifier_accepts_the_name_the_first_sync_of_an_owner_mints() {
+  use agnostic_lite::tokio::TokioRuntime;
+  use tributary_fs::{Watcher, WatcherOptions};
 
-  let pid = std::process::id();
-  let minted = super::cookie_name(SyncToken::new(1, pid, 1, 0));
-  assert_eq!(
-    minted,
-    format!(".tributaries-sync-1-{pid}-1-0000000000000000"),
-    "the first sync's rendered name"
-  );
+  let watcher = Watcher::<TokioRuntime>::new(WatcherOptions::new()).expect("build a watcher");
+  let (_admission, ticket) = watcher
+    .mint_sync_ticket()
+    .expect("this host seeds a watcher");
+  let minted = ticket.leaf();
   assert!(
-    super::is_cookie_name(&minted),
-    "{minted} is the name this binding mints for an owner's first sync — refusing it would \
-     republish a genuine cookie as a user create"
+    tributary_fs::is_sync_cookie_name(&minted),
+    "{minted} is the leaf the lower watcher will place for this sync — refusing it would \
+     republish a genuine marker as a user create"
   );
-  // The same first-sync coordinates under the three-field shape the pre-nonce release
-  // rendered, so a crash leftover from that release is still suppressed after an upgrade.
+  watcher.close().await.expect("close");
+
+  // The first-sync coordinates under the three-field shape the pre-nonce release rendered, so a
+  // crash leftover from that release is still suppressed after an upgrade.
+  let pid = std::process::id();
   let legacy = format!(".tributaries-sync-1-{pid}-1");
   assert!(
-    super::is_cookie_name(&legacy),
+    tributary_fs::is_sync_cookie_name(&legacy),
     "{legacy} is the first-sync name the three-field release minted"
   );
 }
 
-/// The cookie leaf that reaches this classifier is NOT always one this crate minted:
-/// [`tributary_fs::Watcher::sync_root`] takes the cookie's name from its own caller and
-/// accepts any normal component, so a second consumer of `tributary-fs` watching the same
-/// tree writes cookies whose names this crate cannot predict at all. What identifies
-/// those is the directory they land in — the fs driver's own `0o700` cookie directory —
-/// so an immediate child of one is an artifact whatever its leaf.
+/// A leaf that reaches this classifier need not carry the minted grammar at all. A marker is
+/// renamed by a peer, a leftover was written by a release whose shape is gone, or the directory
+/// simply holds something nobody here wrote — and each of those is still inside the fs driver's
+/// own `0o700` cookie directory, whose whole contents are this binding's ground rather than the
+/// caller's. So an immediate child of one is an artifact whatever its leaf.
 ///
 /// Getting this wrong is worse than the over-broad prefix test it replaced: a leaf
-/// grammar alone republishes another watcher's GENUINE cookie create and unlink as user
-/// changes on every consumer stream, which is precisely the leak the reserved namespace
-/// exists to close.
+/// grammar alone republishes such a marker's create and unlink as user changes on every
+/// consumer stream, which is precisely the leak the reserved namespace exists to close.
 ///
 /// Fail-on-old: with a leaf-only grammar, every name below except the last is a normal
 /// filename with no reserved shape, so each assertion reads `false` and the cell fails on

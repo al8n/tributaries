@@ -204,105 +204,18 @@ impl<R: RuntimeLite> IndexerSource<R> {
   }
 }
 
-/// The reserved marker namespace this binding mints in — its OWN, deliberately not the fs
-/// binding's `.tributaries-sync-`: a custom source owns its marker namespace exactly as it owns
-/// its path shapes, and the umbrella knows neither.
-const MARKER_PREFIX: &str = ".indexer-sync-";
-
-/// The nonce's rendered width: `{:016x}` on a `u64`, so exactly sixteen lowercase hex digits,
-/// zero-padded — never fewer, never more, whatever the value.
-const MARKER_NONCE_DIGITS: usize = 16;
-
-/// Renders a barrier marker's leaf from the owner's token — the binding half of the
-/// [`Source::begin_sync`] contract, and the ONE place this source turns a [`SyncToken`] into an
-/// identity.
+/// Whether `leaf` is a barrier marker's name.
 ///
-/// **All four fields are rendered, and the last one is the load-bearing one.** The umbrella
-/// resolves a barrier by MATCHING the marker's NAME under its root and nothing else, and
-/// `(instance, pid, seq)` is fully computable from any marker already lying under the watched
-/// tree — so a rendering of
-/// those three alone hands a co-user the NEXT marker's name, which is enough to create-and-remove
-/// it ahead of time and leave a stale matching event that resolves the barrier before the
-/// caller's own pre-call changes have drained. `nonce` is the one field an observer cannot
-/// compute, so it is the one this identity cannot afford to drop.
+/// This binding renders NO marker name of its own. `tributary_fs::Watcher` mints the leaf as part
+/// of a sync's admission and answers it on the paired ticket, so the reserved namespace here is
+/// the lower watcher's own — and the classifier is the one that crate exports, never a second
+/// grammar that could drift from the minter.
 ///
-/// [`a_marker_identity_changes_with_the_token_nonce`] holds this function to exactly that, by
-/// decoding the rendered nonce field back out and requiring the whole word.
-fn marker_leaf(token: SyncToken) -> String {
-  format!(
-    "{MARKER_PREFIX}{}-{}-{}-{:0width$x}",
-    token.instance(),
-    token.pid(),
-    token.seq(),
-    token.nonce(),
-    width = MARKER_NONCE_DIGITS,
-  )
-}
-
-/// Whether `leaf` is a marker [`marker_leaf`] minted: the reserved prefix, then three decimal
-/// fields, then the sixteen-lowercase-hex nonce, and nothing after it.
-///
-/// The GRAMMAR is checked rather than the prefix alone, for the reason the fs binding gives:
-/// suppression removes a change from every consumer stream, so a bare prefix test would swallow
-/// any user file whose name merely begins with the reserved stem — silently, for the life of the
-/// watch. This is the classifier half of [`marker_leaf`]; the two are changed together.
+/// The GRAMMAR is checked rather than the prefix alone: suppression removes a change from every
+/// consumer stream, so a bare prefix test would swallow any user file whose name merely begins
+/// with the reserved stem — silently, for the life of the watch.
 fn is_marker_leaf(leaf: &str) -> bool {
-  let Some(rest) = leaf.strip_prefix(MARKER_PREFIX) else {
-    return false;
-  };
-  let mut fields = rest.split('-');
-  let (Some(instance), Some(pid), Some(seq), Some(nonce), None) = (
-    fields.next(),
-    fields.next(),
-    fields.next(),
-    fields.next(),
-    fields.next(),
-  ) else {
-    return false;
-  };
-  [instance, pid, seq]
-    .iter()
-    .all(|field| !field.is_empty() && field.bytes().all(|b| b.is_ascii_digit()))
-    && nonce.len() == MARKER_NONCE_DIGITS
-    && nonce
-      .bytes()
-      .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-}
-
-/// Reads a rendered marker identity's nonce back out as the `u64` that went in: the fourth
-/// `-`-separated field after the reserved prefix, all sixteen hex digits of it.
-///
-/// This is [`marker_leaf`]'s exact inverse on that field, and the exactness is the whole value.
-/// Comparing what it returns against the token's own [`nonce`](SyncToken::nonce) admits ONE
-/// rendering and rejects every reduction of it — a truncation, a fold, a digest — because a
-/// rendering that discards any bit decodes to a different word. Counting distinct identities over
-/// a set of probe nonces cannot do that job: it asks only that the rendering be injective ON THAT
-/// SET, which `nonce & 0xff` in the same sixteen zero-padded digits satisfies for any probes with
-/// distinct low bytes, while leaving the next marker's name one of 256 guesses.
-fn rendered_nonce(leaf: &str) -> Result<u64, String> {
-  let Some(rest) = leaf.strip_prefix(MARKER_PREFIX) else {
-    return Err(format!("{leaf:?} is not in the reserved marker namespace"));
-  };
-  let mut fields = rest.split('-');
-  let (Some(_), Some(_), Some(_), Some(nonce), None) = (
-    fields.next(),
-    fields.next(),
-    fields.next(),
-    fields.next(),
-    fields.next(),
-  ) else {
-    return Err(format!(
-      "{leaf:?} does not render exactly four fields, so it carries no nonce field to decode"
-    ));
-  };
-  if nonce.len() != MARKER_NONCE_DIGITS {
-    return Err(format!(
-      "{leaf:?} renders a {}-digit nonce field; a whole `u64` needs all {MARKER_NONCE_DIGITS}",
-      nonce.len()
-    ));
-  }
-  u64::from_str_radix(nonce, 16)
-    .map_err(|e| format!("{leaf:?} nonce field {nonce:?} is not a hex `u64`: {e}"))
+  tributary_fs::is_sync_cookie_name(leaf)
 }
 
 impl<R: RuntimeLite> Source<Comp> for IndexerSource<R> {
@@ -489,9 +402,12 @@ impl<R: RuntimeLite> Source<Comp> for IndexerSource<R> {
   /// event arrives through the [`next`](Source::next) pump the umbrella would otherwise be
   /// blocking), and returns the key it landed at.
   ///
-  /// The identity comes from [`marker_leaf`], which renders the WHOLE token — nonce included, as
-  /// the seam requires. The lower watcher places the file inside its own per-root cookie
-  /// directory, so the returned key is `[Volume(v), Seg(<cookie dir>), Seg(<marker leaf>)]`, and
+  /// The identity is the LOWER WATCHER's, not this binding's: `mint_sync_ticket` draws the marker
+  /// leaf off its own cryptographic stream and `sync_root` writes exactly that, which is the
+  /// second of the two routes [`Source::begin_sync`] allows for discharging the unpredictability
+  /// obligation — and the reason `token`'s own nonce is not rendered here. The lower watcher
+  /// places the file inside its own per-root cookie directory, so the returned key is
+  /// `[Volume(v), Seg(<cookie dir>), Seg(<marker leaf>)]`, and
   /// [`is_sync_artifact`](Source::is_sync_artifact) below answers `true` for it — without that the
   /// umbrella would never classify the marker's event and the barrier could not resolve at all.
   async fn begin_sync(
@@ -506,12 +422,14 @@ impl<R: RuntimeLite> Source<Comp> for IndexerSource<R> {
     // Mint the cancel address and record it BEFORE the await: a future dropped mid-write (the
     // caller timed out, or a close won the umbrella's race) deliberately leaves this entry for
     // `cancel_sync` to consume, because the umbrella never learned the marker's key.
-    let (admission, ticket) = self.watcher.mint_sync_ticket();
+    // A watcher with no entropy seed mints nothing: there is no unpredictable leaf to place, and
+    // a barrier standing on a name something else can compute is not a barrier. Nothing has
+    // reached the filesystem, so the refusal leaves no marker behind.
+    let Some((admission, ticket)) = self.watcher.mint_sync_ticket() else {
+      return Err(SyncError::Entropy);
+    };
     self.pending_syncs.insert(handle, (token, ticket));
-    let placed = self
-      .watcher
-      .sync_root(handle, dir, marker_leaf(token), admission)
-      .await;
+    let placed = self.watcher.sync_root(handle, dir, admission).await;
     // A NORMAL return (either way) means the write resolved, so the in-flight entry goes here;
     // only the dropped-future path above leaves it behind.
     self.pending_syncs.remove(&handle);
@@ -570,8 +488,8 @@ impl<R: RuntimeLite> Source<Comp> for IndexerSource<R> {
   /// Whether `key` names an artifact of the barrier machinery — the reserved namespace the
   /// umbrella suppresses from every consumer stream and resolves pending barriers on.
   ///
-  /// Two grounds, mirroring the fs binding's: the leaf is a marker [`marker_leaf`] minted, or the
-  /// leaf is the lower watcher's own per-root cookie DIRECTORY, whose create is this binding's
+  /// Two grounds, mirroring the fs binding's: the leaf is a marker the lower watcher minted, or
+  /// the leaf is that watcher's own per-root cookie DIRECTORY, whose create is this binding's
   /// artifact and never a user change. Neither reads any deeper component, so a user file merely
   /// living under an ancestor that shares the stem stays a user change.
   fn is_sync_artifact(&self, key: &[Comp]) -> bool {
@@ -1405,85 +1323,67 @@ async fn deleted_root_delivers_terminal_rescan_and_is_retired() {
 }
 
 /// (j.1) The [`Source::begin_sync`] contract's UNPREDICTABILITY clause, held against this
-/// suite's own binding: the rendered marker identity must carry the token's
-/// [`nonce`](SyncToken::nonce) — the WHOLE word, and no fewer bits of it.
+/// suite's own binding — which discharges it by the second of the two routes the seam allows:
+/// it renders no identity at all and places the leaf `tributary_fs::Watcher` minted.
 ///
 /// This is the cell a downstream binding fails by following the seam's prose and rendering the
-/// identity fields it can name — `(instance, pid, seq)` — while ignoring the one it cannot
-/// compute. Such a binding compiles, satisfies every other clause of the seam, suppresses its own
-/// markers correctly, and still breaks the barrier: the umbrella resolves a barrier by MATCHING
-/// the marker's NAME under its root and nothing else, so a co-user under the watched tree can
-/// read one marker, compute the NEXT one, create-and-remove it ahead of time, and leave a stale
-/// matching event that resolves a later barrier before the caller's own pre-call changes have
-/// drained.
+/// identity fields it can name — `(instance, pid, seq)` — while ignoring the one it cannot. The
+/// three countable fields are computable from any marker already lying under the watched tree, so
+/// an identity built from them alone hands a co-user the NEXT marker's name, which is enough to
+/// create-and-remove it ahead of time and leave a stale matching event that resolves the barrier
+/// before the caller's own pre-call changes have drained.
 ///
-/// # Why the assertion is a decode, not a count
+/// # What is asserted, now that the identity is not rendered here
 ///
-/// The load-bearing check here is [`rendered_nonce`]: the identity's nonce field is read back out
-/// and must EQUAL the `u64` that went in. That equality is what "carries the whole word" means
-/// operationally, and only an exact decode means it. A count of distinct identities over a set of
-/// probe nonces — which this cell used to make, over 256 probes — proves nothing of the kind: it
-/// asks only that the rendering be injective ON THOSE PROBES. A renderer emitting `nonce & 0xff`
-/// in the same sixteen zero-padded digits is injective on any 256 probes with distinct low bytes,
-/// keeps the mint/classify grammars agreeing, and passes the barrier's end-to-end cell (which has
-/// no stale-marker adversary) — while leaving only 256 possible names for the next predictable
-/// `(instance, pid, seq)`, few enough for a co-user to pre-create and remove every one. Picking
-/// different probes only moves that blind spot; decoding removes it, for every reduction at once.
-///
-/// Dropping `token.nonce()` from [`marker_leaf`], or narrowing it to any part of the word, fails
-/// this cell — which is the whole point: no signature checks the rendering, so a test has to.
-#[test]
-fn a_marker_identity_changes_with_the_token_nonce() {
-  // Nonces the reductions differ on: both extremes, a pair agreeing in the low byte and nowhere
-  // else, a pair agreeing in the high half, one carrying only the top bit, and one distinct in
-  // every byte. The decode below is exact, so this list documents the failure modes rather than
-  // carrying the proof — which is why widening or narrowing it cannot weaken the cell.
-  const NONCES: [u64; 8] = [
-    0,
-    u64::MAX,
-    0x0123_4567_89ab_cdef,
-    0xfedc_ba98_7654_3210,
-    0x0000_0000_0000_00ff,
-    0xffff_ffff_ffff_ff00,
-    0x8000_0000_0000_0000,
-    0x0102_0304_0506_0708,
-  ];
+/// The exactness of the old decode belongs to the minter, and the minter moved: `tributary-fs`
+/// pins that its leaf carries a whole keystream word. What THIS binding must still hold is that
+/// the identity it places is the minted one and nothing of its own — so the assertions are that
+/// the leaf a mint answers is recognized by the very grammar this binding SUPPRESSES on, that no
+/// two mints ever name the same marker, and that what separates two mints is the field an
+/// observer cannot compute rather than only the countable ones. A binding that quietly rendered
+/// its own `(instance, pid, seq)` name again would fail the first of those, and the barrier's own
+/// end-to-end cell below would then never resolve.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_marker_identity_changes_with_the_token_nonce() {
+  let watcher = tributary_fs::Watcher::<TokioRuntime>::new(tributary_fs::WatcherOptions::new())
+    .expect("build a watcher");
+  let mut leaves = HashSet::new();
+  let mut nonces = HashSet::new();
 
-  for nonce in NONCES {
-    let leaf = marker_leaf(SyncToken::new(9, 4242, 7, nonce));
+  for _ in 0..64 {
+    let (_admission, ticket) = watcher
+      .mint_sync_ticket()
+      .expect("this host seeds a watcher");
+    let leaf = ticket.leaf();
 
-    // THE assertion: the whole word reads back out of the identity, so the identity carries the
-    // whole word. Any rendering that loses a bit of it — a truncation, a fold, a digest —
-    // decodes to something else and fails right here.
-    assert_eq!(
-      rendered_nonce(&leaf),
-      Ok(nonce),
-      "the marker identity {leaf:?} does not carry SyncToken::nonce {nonce:#018x} intact: a \
-       rendering that drops the word, or keeps only part of it, narrows the next marker's name \
-       to a guessable set, and the barrier's unpredictability rests on that word alone"
-    );
-
-    // The grammar this binding SUPPRESSES on is the grammar it MINTS. Drift between the two would
-    // strand a marker's own event outside the reserved namespace, where nothing resolves the
-    // barrier it belongs to and nothing hides it from consumers.
+    // The grammar this binding SUPPRESSES on is the grammar the marker is MINTED under. Drift
+    // between the two would strand a marker's own event outside the reserved namespace, where
+    // nothing resolves the barrier it belongs to and nothing hides it from consumers.
     assert!(
       is_marker_leaf(&leaf),
-      "the binding minted a marker its own is_sync_artifact grammar does not recognize: {leaf:?}"
+      "the leaf this binding will place is not one its own is_sync_artifact grammar recognizes: \
+       {leaf:?}"
+    );
+    nonces.insert(
+      leaf
+        .rsplit('-')
+        .next()
+        .expect("the minted leaf carries a trailing nonce field")
+        .to_owned(),
+    );
+    assert!(
+      leaves.insert(leaf.clone()),
+      "two mints named the same marker: {leaf:?}"
     );
   }
 
-  // Two barriers identical in every field a marker already lying under the tree would reveal,
-  // differing only in the field an observer cannot compute, must not render alike. The decode
-  // above already implies this; it is kept because it names the failure a nonce-blind binding
-  // actually produces.
-  let observed = SyncToken::new(9, 4242, 7, 0x0123_4567_89ab_cdef);
-  let next = SyncToken::new(9, 4242, 7, 0xfedc_ba98_7654_3210);
-  assert_ne!(
-    marker_leaf(observed),
-    marker_leaf(next),
-    "two barriers differing ONLY in nonce rendered the same marker identity: this binding \
-     ignores SyncToken::nonce, so the next marker's name is computable from a previous one"
+  assert!(
+    nonces.len() > 1,
+    "every mint rendered the same trailing word, so the whole identity is a function of the \
+     fields a marker already on disk reveals — the next marker's name is then computable"
   );
+
+  watcher.close().await.expect("close");
 }
 
 /// (j.2) The barrier end to end over this custom binding: once `sync` resolves, every change made
@@ -1491,12 +1391,12 @@ fn a_marker_identity_changes_with_the_token_nonce() {
 /// polling — and no barrier artifact ever surfaces on a consumer stream.
 ///
 /// It is what makes (j.1) a claim about the LIVE path rather than about a decorative helper: the
-/// identity this barrier resolves on is the one [`marker_leaf`] rendered, classified by the
+/// identity this barrier resolves on is the one the lower watcher minted, classified by the
 /// [`is_marker_leaf`] grammar, through the same [`Source`] seam a downstream consumer implements.
 ///
 /// It does NOT test unpredictability: there is no co-user here racing a predicted marker, so this
-/// cell resolves the same way over a rendering that keeps only part of the nonce. That property is
-/// (j.1)'s alone, and (j.1) holds it by decode rather than by observing a barrier fooled.
+/// cell resolves the same way over a weaker identity. That property is (j.1)'s alone, and the
+/// exactness of the word behind it is the minting crate's own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sync_barrier_resolves_over_the_custom_binding() {
   let Rig {

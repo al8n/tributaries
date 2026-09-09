@@ -598,22 +598,30 @@ pub trait LocalSource<C> {
   ///
   /// `token` identifies the sync — [`instance`](SyncToken::instance), [`pid`](SyncToken::pid),
   /// [`seq`](SyncToken::seq) and an unpredictable [`nonce`](SyncToken::nonce) — and the binding
-  /// renders it into whatever a marker is called in its namespace. TWO obligations bind that
-  /// rendering: the marker's identity MUST incorporate [`nonce`](SyncToken::nonce) (or a
-  /// representation of it that is no easier to predict), and
+  /// turns it into whatever a marker is called in its namespace. TWO obligations bind that
+  /// name: the marker's identity MUST be UNPREDICTABLE to anything else watching the tree, and
   /// [`is_sync_artifact`](Self::is_sync_artifact) MUST answer `true` for the key it returns.
   ///
-  /// The nonce is load-bearing, not decoration. The owner resolves a barrier by MATCHING the
-  /// marker's NAME — the last component of the key this returns — under the root the sync was
-  /// begun on, and nothing else: the ancestor path is a spelling the write reported, which an
-  /// in-flight rename can invalidate, so it cannot be part of the identity. A marker name a
+  /// Unpredictability is load-bearing, not decoration. The owner resolves a barrier by MATCHING
+  /// the marker's NAME — the last component of the key this returns — under the root the sync
+  /// was begun on, and nothing else: the ancestor path is a spelling the write reported, which
+  /// an in-flight rename can invalidate, so it cannot be part of the identity. A marker name a
   /// co-user under the watched tree can predict therefore lets that co-user create-and-remove
   /// the NEXT one ahead of time and leave a stale matching event behind — one that resolves the
   /// barrier before the caller's own pre-call changes have drained, which is the one thing the
   /// barrier promises. `(instance, pid, seq)` is fully computable from any marker already
-  /// observed, so a binding that renders those three and drops the nonce satisfies every other
-  /// clause here and still breaks the barrier, silently.
-  /// (The fs binding renders all four: `.tributaries-sync-<instance>-<pid>-<seq>-<nonce>`.)
+  /// observed, so a name built from those three alone satisfies every other clause here and
+  /// still breaks the barrier, silently.
+  ///
+  /// A binding discharges the obligation one of two ways, and the second is the stronger:
+  /// render [`nonce`](SyncToken::nonce) into the name (or a representation of it that is no
+  /// easier to predict), or take the name from a layer that mints it unpredictably itself and
+  /// tells the binding what it minted. The fs binding does the latter — it renders no name at
+  /// all: `tributary_fs::Watcher` draws the leaf off its own cryptographic stream as part of
+  /// the sync's admission (`.tributaries-sync-<instance>-<pid>-<seq>-<nonce>`), so the one name
+  /// a barrier stands on is minted at exactly one site, below every caller that could weaken
+  /// it. A binding taking that route ignores `token`'s nonce for the NAME, and the owner's
+  /// correlation then runs on the leaf the lower layer handed back.
   ///
   /// A source that must park the write behind its own coverage-settle machinery does so INSIDE
   /// this await (the fs binding parks on the per-directory re-arm fence), which is exactly why the
@@ -943,22 +951,30 @@ pub trait Source<C> {
   ///
   /// `token` identifies the sync — [`instance`](SyncToken::instance), [`pid`](SyncToken::pid),
   /// [`seq`](SyncToken::seq) and an unpredictable [`nonce`](SyncToken::nonce) — and the binding
-  /// renders it into whatever a marker is called in its namespace. TWO obligations bind that
-  /// rendering: the marker's identity MUST incorporate [`nonce`](SyncToken::nonce) (or a
-  /// representation of it that is no easier to predict), and
+  /// turns it into whatever a marker is called in its namespace. TWO obligations bind that
+  /// name: the marker's identity MUST be UNPREDICTABLE to anything else watching the tree, and
   /// [`is_sync_artifact`](Self::is_sync_artifact) MUST answer `true` for the key it returns.
   ///
-  /// The nonce is load-bearing, not decoration. The owner resolves a barrier by MATCHING the
-  /// marker's NAME — the last component of the key this returns — under the root the sync was
-  /// begun on, and nothing else: the ancestor path is a spelling the write reported, which an
-  /// in-flight rename can invalidate, so it cannot be part of the identity. A marker name a
+  /// Unpredictability is load-bearing, not decoration. The owner resolves a barrier by MATCHING
+  /// the marker's NAME — the last component of the key this returns — under the root the sync
+  /// was begun on, and nothing else: the ancestor path is a spelling the write reported, which
+  /// an in-flight rename can invalidate, so it cannot be part of the identity. A marker name a
   /// co-user under the watched tree can predict therefore lets that co-user create-and-remove
   /// the NEXT one ahead of time and leave a stale matching event behind — one that resolves the
   /// barrier before the caller's own pre-call changes have drained, which is the one thing the
   /// barrier promises. `(instance, pid, seq)` is fully computable from any marker already
-  /// observed, so a binding that renders those three and drops the nonce satisfies every other
-  /// clause here and still breaks the barrier, silently.
-  /// (The fs binding renders all four: `.tributaries-sync-<instance>-<pid>-<seq>-<nonce>`.)
+  /// observed, so a name built from those three alone satisfies every other clause here and
+  /// still breaks the barrier, silently.
+  ///
+  /// A binding discharges the obligation one of two ways, and the second is the stronger:
+  /// render [`nonce`](SyncToken::nonce) into the name (or a representation of it that is no
+  /// easier to predict), or take the name from a layer that mints it unpredictably itself and
+  /// tells the binding what it minted. The fs binding does the latter — it renders no name at
+  /// all: `tributary_fs::Watcher` draws the leaf off its own cryptographic stream as part of
+  /// the sync's admission (`.tributaries-sync-<instance>-<pid>-<seq>-<nonce>`), so the one name
+  /// a barrier stands on is minted at exactly one site, below every caller that could weaken
+  /// it. A binding taking that route ignores `token`'s nonce for the NAME, and the owner's
+  /// correlation then runs on the leaf the lower layer handed back.
   ///
   /// A source that must park the write behind its own coverage-settle machinery does so INSIDE
   /// this await (the fs binding parks on the per-directory re-arm fence), which is exactly why the
@@ -1172,14 +1188,18 @@ impl<C, T: Source<C>> LocalSource<C> for T {
 /// cannot supply, UNPREDICTABLE to anything else watching the tree (`nonce`).
 ///
 /// The umbrella is generic over the key component `C` and cannot know what a
-/// path looks like, so it hands this token to the binding and the BINDING
-/// renders the cookie's name from it (the fs binding:
-/// `.tributaries-sync-<instance>-<pid>-<seq>-<nonce>`). That keeps the reserved
-/// namespace — and its suppression rule — at the layer that owns path shapes.
+/// path looks like, so it hands this token to the binding and the BINDING decides
+/// what the marker is called. That keeps the reserved namespace — and its
+/// suppression rule — at the layer that owns path shapes.
 ///
-/// A rendering that leaves [`nonce`](Self::nonce) out is not a shorter name but
-/// a broken barrier: [`Source::begin_sync`] states the obligation it fails, and
-/// what a co-user does with a marker identity it can predict.
+/// A binding that renders the name itself must render [`nonce`](Self::nonce) into
+/// it: a rendering that leaves it out is not a shorter name but a broken barrier.
+/// A binding whose lower layer mints the marker name unpredictably on its own
+/// takes THAT name instead and ignores this nonce — which is what the fs binding
+/// does, `tributary_fs::Watcher` drawing the leaf
+/// (`.tributaries-sync-<instance>-<pid>-<seq>-<nonce>`) as part of the sync's
+/// admission. [`Source::begin_sync`] states both routes, the obligation they
+/// discharge, and what a co-user does with a marker identity it can predict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SyncToken {
   instance: u64,
