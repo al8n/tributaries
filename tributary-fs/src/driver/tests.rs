@@ -18278,6 +18278,121 @@ mod sync_cookie {
       let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Arms the next reading of a minted directory at `point` to FAIL, and
+    /// disarms whatever is left of the arming when the returned guard drops.
+    ///
+    /// One shot, for [`MidMarkerPeer`]'s reason: the cell's second write must see
+    /// the real filesystem, so a fault that outlived the call it was armed for
+    /// would refuse a write that was doing nothing wrong.
+    struct ProofFault;
+
+    impl ProofFault {
+      fn arm(point: crate::driver::CookieProofPoint) -> Self {
+        crate::driver::COOKIE_PROOF_FAULT.set(Some(point));
+        Self
+      }
+    }
+
+    impl Drop for ProofFault {
+      fn drop(&mut self) {
+        crate::driver::COOKIE_PROOF_FAULT.set(None);
+      }
+    }
+
+    /// A post-marker reading that FAILS answers the unproven-directory refusal —
+    /// the retryable one, with the marker withdrawn — and never a write failure.
+    ///
+    /// The distinction is the caller's whole decision. `replaced` is typed
+    /// [`SyncRootError::DirReplaced`] by the driver, which the umbrella classifies
+    /// `Busy`: nothing was created, re-mint and try again. A bare `source` is typed
+    /// `Write`, which the umbrella classifies `CookieWrite` — the shape a caller
+    /// reads as terminal and abandons the sync over. A `readdir` that failed once,
+    /// or a name that could not be read back off a descriptor, is transient, and
+    /// classifying it terminal loses a barrier that would have resolved on the next
+    /// attempt.
+    ///
+    /// Both readings are taken through a descriptor this write is already holding,
+    /// so their failures cannot be provoked by arranging a real tree — a seam is
+    /// the only way to reach the arm at all, and the arm is exactly what the
+    /// classification lives in.
+    ///
+    /// Revert witness: answer either arm with the clean write failure and the
+    /// refusal carries no `replaced` name, so the driver types it `Write` and the
+    /// umbrella hands the caller a terminal-looking `CookieWrite`.
+    #[test]
+    fn an_unreadable_minted_directory_is_refused_as_unproven() {
+      for (point, tag, seq) in [
+        (crate::driver::CookieProofPoint::HoldsOnly, "holds-only", 51),
+        (crate::driver::CookieProofPoint::Landing, "landing", 52),
+      ] {
+        let root = scratch(&std::format!("marker-proof-{tag}"));
+        let target = root.join("a");
+        std::fs::create_dir_all(&target).expect("the directory the sync names");
+        let fs = RealFs::new();
+        let live = crate::driver::LiveRoot::for_tests(&root);
+        let reserved = target.join(cookie_dir_name());
+
+        let fault = ProofFault::arm(point);
+        let written = fs.write_cookie(
+          &live,
+          &target,
+          admitted(&root, &target),
+          &std::format!(".tributaries-sync-1-2-{seq}-00000000000000{seq}"),
+          &tributary_proto::glob::Globs::default(),
+          &[],
+        );
+        drop(fault);
+
+        let refusal =
+          written.expect_err("a directory whose proof could not be read is not one to write in");
+        assert_eq!(
+          refusal.replaced.as_deref(),
+          Some(&reserved),
+          "the {tag} reading refuses as UNPROVEN, naming the directory the marker \
+           went in — which is what the driver types `DirReplaced` on: {refusal:?}"
+        );
+        assert!(
+          refusal.residue.is_none(),
+          "the marker was withdrawn, so this write owes nothing: {refusal:?}"
+        );
+        assert!(
+          refusal.source.to_string().contains("could not be read"),
+          "and it carries the READING's own failure rather than the manufactured \
+           message the object-changed verdict renders: {refusal:?}"
+        );
+        assert!(
+          leaves_in(&reserved).is_empty(),
+          "and nothing of this write is left on disk: {:?}",
+          leaves_in(&reserved)
+        );
+
+        // The fault was one shot, so the retry the refusal invites reads the real
+        // filesystem and writes — which is the whole point of classifying it
+        // retryable.
+        let name = std::format!(
+          ".tributaries-sync-1-2-{}-00000000000000{}",
+          seq + 10,
+          seq + 10
+        );
+        fs.write_cookie(
+          &live,
+          &target,
+          admitted(&root, &target),
+          &name,
+          &tributary_proto::glob::Globs::default(),
+          &[],
+        )
+        .expect("the retry the refusal invites succeeds");
+        assert_eq!(
+          leaves_in(&reserved),
+          vec![name],
+          "and the marker is the only thing in the directory"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+      }
+    }
+
     /// The inode number the admission's identity is taken on cannot be handed to
     /// another object while the sync is in flight, because the admission is
     /// HOLDING the object rather than remembering its number.

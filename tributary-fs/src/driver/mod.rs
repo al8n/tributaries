@@ -1417,6 +1417,53 @@ thread_local! {
   /// arm it (the real-filesystem identity module).
   pub(crate) static COOKIE_MARKER_STEP: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
     const { std::cell::RefCell::new(None) };
+
+  /// The next reading of the minted directory to FAIL rather than answer, armed
+  /// for one call and spent by it.
+  ///
+  /// Both proofs the created arm owes are taken through a descriptor this write
+  /// is already holding, so the failures they have to answer for — a `try_clone`,
+  /// an `fdopendir`, a `readdir`, a name read back off the descriptor — are ones
+  /// no arrangement of a real tree can provoke on demand. What they classify is
+  /// the part a caller can act on, so it is worth a seam rather than an argument.
+  ///
+  /// Thread-local, like the marker step above and for the same reason: the cells
+  /// that arm it call the write on their own thread.
+  pub(crate) static COOKIE_PROOF_FAULT: std::cell::Cell<Option<CookieProofPoint>> =
+    const { std::cell::Cell::new(None) };
+}
+
+/// Which of the created arm's two post-marker readings a [`COOKIE_PROOF_FAULT`]
+/// arming stands in front of.
+#[cfg(all(
+  test,
+  feature = "tokio",
+  not(miri),
+  any(target_os = "linux", target_os = "macos")
+))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CookieProofPoint {
+  /// The enumeration proving the minted directory holds nothing but the marker.
+  HoldsOnly,
+  /// The re-reading of the name that directory now answers to.
+  Landing,
+}
+
+/// The armed failure for `point`, if one is armed — and it is spent by this call,
+/// so a write's retry reads the real filesystem.
+#[cfg(all(
+  test,
+  feature = "tokio",
+  not(miri),
+  any(target_os = "linux", target_os = "macos")
+))]
+fn armed_proof_fault(point: CookieProofPoint) -> Option<std::io::Error> {
+  COOKIE_PROOF_FAULT.with(|armed| {
+    (armed.get() == Some(point)).then(|| {
+      armed.set(None);
+      std::io::Error::other("the minted directory could not be read")
+    })
+  })
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -3174,9 +3221,19 @@ pub(crate) struct CookieWriteError {
   /// admission and this write. Carries the name the replacement stands at, as the
   /// descriptor answered it.
   ///
-  /// Always a clean failure with no residue beside it: the verdict is taken on the
-  /// walk's own descriptor, before anything at all is created. Boxed for the
-  /// reason `pruned` and `excluded` are.
+  /// It is also set for a directory the write could not READ after its marker was
+  /// created — its content, or its current name. That is the same UNPROVEN object:
+  /// a write that cannot say what the directory holds cannot say the marker is the
+  /// youngest thing in it, and one that cannot say where the directory is cannot
+  /// say the marker is reportable. Neither is a fact about the caller's request, so
+  /// both are refused the same retryable way, with the marker withdrawn and nothing
+  /// of the write left on disk — the alternative types a transient `readdir` failure
+  /// as a write error the caller reads as terminal and abandons the sync over.
+  ///
+  /// Always a clean failure with no residue beside it: the verdict is either taken
+  /// on the walk's own descriptor before anything at all is created, or taken after
+  /// the marker was created and answered only once that marker has been withdrawn
+  /// ([`withdraw_marker`]). Boxed for the reason `pruned` and `excluded` are.
   pub(crate) replaced: Option<Box<PathBuf>>,
   /// Set when the write refused because the reserved cookie directory standing at
   /// its name lies on a DEVICE other than its parent's — a mount boundary, which
@@ -3238,6 +3295,27 @@ impl CookieWriteError {
       source: std::io::Error::other(
         "the cookie directory was replaced after the sync was admitted",
       ),
+      residue: None,
+      pruned: None,
+      excluded: None,
+      replaced: Some(Box::new(dir)),
+      crossed: None,
+    }
+  }
+
+  /// The unproven-directory refusal: the marker exists, and the reading that would
+  /// have proved the directory it stands in — what it holds, or where it now is —
+  /// could not be taken. Carries that reading's own `source` so the caller learns
+  /// which OS failure it was, and the same `replaced` name the object-changed
+  /// verdict carries, because it is the same unproven object and is refused the
+  /// same retryable way.
+  ///
+  /// Nothing of this write is on disk when it is answered: every site is behind
+  /// [`withdraw_marker`], which destroys the marker through the anchors that
+  /// created it before the refusal is returned.
+  pub(crate) fn unproven(dir: PathBuf, source: std::io::Error) -> Self {
+    Self {
+      source,
       residue: None,
       pruned: None,
       excluded: None,
@@ -7959,6 +8037,15 @@ fn reserved_cookie_dir(parent: &CookieParent) -> Option<PathBuf> {
 /// back, and the remaining targets mint no cookie directory at all.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn current_cookie_dir_path(dir: &CookieDir) -> Option<Result<PathBuf, std::io::Error>> {
+  #[cfg(all(
+    test,
+    feature = "tokio",
+    not(miri),
+    any(target_os = "linux", target_os = "macos")
+  ))]
+  if let Some(err) = armed_proof_fault(CookieProofPoint::Landing) {
+    return Some(Err(err));
+  }
   Some(current_path_of_dir(&dir.fd))
 }
 
@@ -8007,6 +8094,17 @@ fn minted_dir_holds_only_marker(
   dir: &CookieDir,
   name: &str,
 ) -> Option<Result<bool, std::io::Error>> {
+  #[cfg(all(
+    test,
+    feature = "tokio",
+    not(miri),
+    any(target_os = "linux", target_os = "macos")
+  ))]
+  if dir.minted
+    && let Some(err) = armed_proof_fault(CookieProofPoint::HoldsOnly)
+  {
+    return Some(Err(err));
+  }
   dir.minted.then(|| dir_holds_only(&dir.fd, name))
 }
 
@@ -8311,7 +8409,11 @@ impl FsOps for RealFs {
     // marker ended up in is not an object the cut can certify. A failure to READ
     // the directory is fail-closed for the reason every unreadable fact here is —
     // a write that cannot say what the directory holds cannot say the marker is
-    // the youngest thing in it.
+    // the youngest thing in it — and it answers the SAME refusal, because it is
+    // the same unproven object: an enumeration that failed says nothing about the
+    // caller's request, and typing it as a write error is what turns a transient
+    // `readdir` into a terminal-looking `CookieWrite` the caller stops retrying,
+    // where the honest answer re-mints and tries again.
     match minted_dir_holds_only_marker(&cookies, name) {
       Some(Ok(true)) | None => {}
       Some(Ok(false)) => {
@@ -8324,11 +8426,12 @@ impl FsOps for RealFs {
         ));
       }
       Some(Err(err)) => {
+        let landing = cookies.path().to_path_buf();
         return Err(withdraw_marker(
           cookies,
           name,
           created,
-          CookieWriteError::clean(err),
+          CookieWriteError::unproven(landing, err),
         ));
       }
     }
@@ -8352,7 +8455,11 @@ impl FsOps for RealFs {
     // the seat that closed the ground.
     //
     // A failure to READ that name is fail-closed for the same reason: a write that
-    // cannot say where its marker is cannot promise the marker is reportable.
+    // cannot say where its marker is cannot promise the marker is reportable. It
+    // answers the unproven-directory refusal the enumeration above does, and for
+    // the same reason — a name that could not be read is not a verdict about the
+    // caller's directory, and the retryable refusal is the one that leaves a
+    // caller able to act on it.
     match current_cookie_dir_path(&cookies) {
       Some(Ok(landing)) => {
         if let Some(refusal) = cookie_ground_refusal(parent.floor(), &landing, prune, exclusions) {
@@ -8360,11 +8467,12 @@ impl FsOps for RealFs {
         }
       }
       Some(Err(err)) => {
+        let landing = cookies.path().to_path_buf();
         return Err(withdraw_marker(
           cookies,
           name,
           created,
-          CookieWriteError::clean(err),
+          CookieWriteError::unproven(landing, err),
         ));
       }
       None => {}
