@@ -1496,6 +1496,29 @@ struct ScopeState {
   /// OPEN, because a folder the consumer never hears about is a hole in its view
   /// while an extra event is one it can drop.
   include: Option<Globs>,
+  /// The LEAF names of this scope's sync markers that are still pending — armed
+  /// when a `sync` is admitted ([`DriverCore::arm_sync_marker`]) and released
+  /// when its obligation reaches its typed terminal
+  /// ([`DriverCore::release_sync_markers`]).
+  ///
+  /// The set is what makes the marker exemption an IDENTITY rather than a claim
+  /// about its parent's spelling. Both seats exempt this driver's own cookie
+  /// artifact POSITIONALLY ([`crate::driver::is_sync_cookie_artifact_segment`]:
+  /// the reserved directory, and the marker standing directly in it), and that
+  /// reading is only as stable as the names above the marker. A peer that renames
+  /// the cookie directory — or any directory on the way to it — between the
+  /// descriptor walk and the create leaves the marker exactly where the walk put
+  /// it, wearing a parent the classifier no longer recognizes; a peer that renames
+  /// one into pruned ground does the same to the prune half. The seat then takes
+  /// the one file a barrier waits on, and the sync waits out its caller's deadline
+  /// over a source that did everything right.
+  ///
+  /// The leaf cannot be mistaken for anybody else's: the name carries the sync's
+  /// unpredictable nonce, so a member of this set names THIS watcher's own
+  /// in-flight artifact under this root and nothing else. Bounded by the cookie
+  /// ledger's own admission caps — one entry per live obligation of this scope —
+  /// and EMPTY for every scope that never syncs, which short-circuits both seats.
+  markers: BTreeSet<String>,
 }
 
 /// What the common-layer fence makes of one planned Monitor input
@@ -1850,13 +1873,18 @@ impl DriverCore {
   /// it: an exclusion is a literal subtree, so it covers a file inside it exactly
   /// as it covers the directory holding it.
   fn is_fenced(&self, state: &ScopeState, exclusions: bool, directory: bool, path: &Path) -> bool {
-    if exclusions
+    self.excludes(exclusions, path) || Self::is_pruned(state, directory, path)
+  }
+
+  /// The EXCLUSION half of [`is_fenced`](Self::is_fenced) alone, for the one
+  /// caller that must answer the two halves separately: the record arm of
+  /// [`fenced`](Self::fenced), whose marker exemption and rename cover belong to
+  /// the prune half and must not reach inside a subtree the caller took out of
+  /// the reported world.
+  fn excludes(&self, exclusions: bool, path: &Path) -> bool {
+    exclusions
       && !self.exclusions.is_empty()
       && crate::driver::cookie_dir_excluded(&self.exclusions, path).is_some()
-    {
-      return true;
-    }
-    Self::is_pruned(state, directory, path)
   }
 
   /// Where one watch of `state`'s scope IS: the scope root's canonical path
@@ -2059,6 +2087,7 @@ impl DriverCore {
         pending_widen: None,
         prune,
         include,
+        markers: BTreeSet::new(),
       },
     );
     self.watch_scopes.insert(watch, scope);
@@ -2365,6 +2394,39 @@ impl DriverCore {
     let fence = FenceId(self.fence_seq);
     self.cover_fences.entry(scope).or_default().open(fence);
     fence
+  }
+
+  /// Arms `name` as an ACTIVE sync marker of `scope`: from here until it is
+  /// released, no seat of that scope may take a change whose object wears it
+  /// ([`markers`](ScopeState::markers)).
+  ///
+  /// Called at the sync's ADMISSION — the same step that births its cookie
+  /// obligation — so the exemption is standing before any write can be
+  /// dispatched, let alone land. A name armed for a scope that is not registered
+  /// is dropped: there is no state to exempt anything on, and the sync's own
+  /// admission refuses a scope with no live stream.
+  pub(crate) fn arm_sync_marker(&mut self, scope: ScopeId, name: String) {
+    if let Some(state) = self.scopes.get_mut(&scope) {
+      state.markers.insert(name);
+    }
+  }
+
+  /// Releases marker names whose obligations have retired — the ledger's typed
+  /// terminals, drained into the core by the driver loop.
+  ///
+  /// The release runs on the far side of the barrier it protects: an obligation
+  /// retires when its cookie is confirmed gone (the umbrella reaps it only after
+  /// the delivery it was waiting for) or when nothing was ever created, so a
+  /// marker leaves this set only once no change can still be owed for it.
+  pub(crate) fn release_sync_markers(
+    &mut self,
+    released: impl IntoIterator<Item = (ScopeId, String)>,
+  ) {
+    for (scope, name) in released {
+      if let Some(state) = self.scopes.get_mut(&scope) {
+        state.markers.remove(&name);
+      }
+    }
   }
 
   /// How many acknowledged reconciles `scope` currently holds pending on its
@@ -5063,6 +5125,24 @@ impl DriverCore {
   /// The EXCLUSION half never widens. An exclusion is a literal subtree the
   /// caller took out of the reported world, so an over-signal inside one is
   /// dropped exactly as it was.
+  ///
+  /// # A record has two more ways out of the prune half
+  ///
+  /// - an ACTIVE sync marker ([`markers`](ScopeState::markers)) STANDS wherever
+  ///   it is. The marker is this watcher's own artifact, minted with the sync's
+  ///   own nonce, and the barrier waiting on it cannot be resolved by anything
+  ///   else; a word that took it would turn a peer's rename of some directory on
+  ///   the way to the cookie — which the anchored create correctly follows — into
+  ///   the caller's timeout. Its ancestors' words are beside the point for the
+  ///   same reason the reserved directory's own exemption is;
+  /// - a directory rename INTO pruned ground is COVERED rather than dropped
+  ///   ([`unpruned_cover`](Self::unpruned_cover)). The pair's source half lies in
+  ///   the reported tree and is kept, so the consumer is told the subtree left —
+  ///   but the destination is where anything that lands next will be, and every
+  ///   later change there is silent by the seat's own rule. One `Rescan` at the
+  ///   destination's nearest unpruned parent is the instruction that covers it,
+  ///   and it dominates any barrier still waiting under the moved subtree, which
+  ///   a bare drop left waiting for its deadline.
   fn fenced(
     &self,
     state: &ScopeState,
@@ -5072,17 +5152,35 @@ impl DriverCore {
   ) -> Fenced {
     match planned {
       Planned::Rec(rec) => {
-        let fenced = !rec.kind().is_self_event()
-          && self
-            .anchored_path(state, rec.watch(), rec.target())
-            .is_some_and(|path| {
-              self.is_fenced(state, exclusions, rec.is_dir() == Some(true), &path)
-            });
-        if fenced {
-          Fenced::Dropped
-        } else {
-          Fenced::Stands
+        if rec.kind().is_self_event() {
+          return Fenced::Stands;
         }
+        let Some(path) = self.anchored_path(state, rec.watch(), rec.target()) else {
+          return Fenced::Stands;
+        };
+        // The EXCLUSION half, asked first and answering alone: a sync whose
+        // cookie directory lies inside an exclusion is refused at BIRTH, so no
+        // marker of this scope can stand in one, and a subtree the caller took
+        // out of the reported world is owed no covering `Rescan` either.
+        if self.excludes(exclusions, &path) {
+          return Fenced::Dropped;
+        }
+        if Self::names_active_marker(state, rec.target()) {
+          return Fenced::Stands;
+        }
+        let directory = rec.is_dir() == Some(true);
+        if !Self::is_pruned(state, directory, &path) {
+          return Fenced::Stands;
+        }
+        // A rename whose destination the seat covers. Judged on the same
+        // class rule [`revealed`](Self::revealed) uses — a PROVEN file
+        // relocates no subtree and reveals nothing, while an unproven class is
+        // read as a directory, because the profiles that report the fewest
+        // classes are exactly the ones that move whole subtrees silently.
+        if matches!(rec.kind(), RecordKind::MovedTo) && rec.is_dir() != Some(false) {
+          return Fenced::Widened(self.unpruned_cover(state, scope, directory, &path));
+        }
+        Fenced::Dropped
       }
       Planned::Over(Scope::Subtree(sub)) => {
         let scope_wide = sub.watch() == state.watch && sub.descent().is_empty();
@@ -5118,6 +5216,52 @@ impl DriverCore {
       }
       Planned::Over(_) => Fenced::Stands,
     }
+  }
+
+  /// The covering signal a record dropped into pruned ground stands in place of:
+  /// ONE located `Rescan` at `path`'s nearest UNPRUNED ancestor, or the scope
+  /// cover when that ancestor is the root itself.
+  ///
+  /// The ancestor is derived rather than climbed one step at a time: the seat's
+  /// walk asks the root-relative directory prefixes shallowest-first
+  /// ([`crate::driver::prune_prefixes`]), so the FIRST prefix it matches is the
+  /// shallowest pruned one and its own parent is unpruned by construction —
+  /// every prefix above it was just asked and answered no. That is what makes
+  /// one derivation enough for both shapes the seat can take: a destination the
+  /// caller pruned by its own name, and one pruned by an ancestor several levels
+  /// up.
+  ///
+  /// Anchored at the SCOPE ROOT watch with a root-relative descent, which is what
+  /// lets one derivation serve both lowering profiles: a descending record
+  /// anchors at its parent's own watch and a kernel-recursive one at the root, and
+  /// only the root is an anchor every profile can name. A watched root never
+  /// moves inside its own tree, so the composition cannot go stale.
+  ///
+  /// Degrades to the scope cover whenever the derivation cannot be made — an
+  /// unbound root, an unrepresentable segment, a path outside the root: never a
+  /// quiet drop, and never a `Rescan` naming pruned ground.
+  fn unpruned_cover(
+    &self,
+    state: &ScopeState,
+    scope: ScopeId,
+    directory: bool,
+    path: &Path,
+  ) -> Planned {
+    let located_cover = || {
+      let root = state.root.as_deref()?;
+      let depth = crate::driver::pruned_ancestor_depth(root, &state.prune, directory, path)?;
+      let keep = depth.checked_sub(1).filter(|keep| *keep > 0)?;
+      let relative = path.strip_prefix(root).ok()?;
+      let mut segments = Vec::with_capacity(keep);
+      for segment in relative.iter().take(keep) {
+        segments.push(Segment::new(segment.to_str()?));
+      }
+      Some(Planned::Over(located(
+        state.watch,
+        Some(Location::from_segments(segments)),
+      )))
+    };
+    located_cover().unwrap_or(Planned::Over(Scope::Root(scope)))
   }
 
   fn settle_if_ready(
@@ -5846,11 +5990,22 @@ impl DriverCore {
   ///   like any other. The layer that owns the namespace keeps these off the
   ///   consumer's stream regardless, so admitting here widens the barrier's view
   ///   and not the caller's;
-  /// - **(e)** a last location segment that matches;
-  /// - **(f)** a [`Moved`](ChangeKind::Moved) whose SOURCE's last segment
-  ///   matches. A media file renamed to a non-media name is still reported, so
-  ///   the consumer can drop what it was holding rather than keep a name that no
-  ///   longer exists.
+  /// - **(e)** an ACTIVE sync marker of this scope, by its LEAF
+  ///   ([`markers`](ScopeState::markers)) — whatever its parent is called. Clause
+  ///   (d) reads the marker's POSITION, and a position is a statement about the
+  ///   names above it: rename the reserved directory to an ordinary one between
+  ///   the write's descriptor walk and its create (a peer may, and the anchored
+  ///   create correctly follows the descriptor) and the marker arrives under a
+  ///   parent no classifier recognizes, whereupon a seat naming the caller's own
+  ///   media takes the one file the barrier waits on. The leaf is minted with the
+  ///   sync's unpredictable nonce, so it identifies this watcher's own artifact
+  ///   with no help from its ancestry;
+  /// - **(f)** a last location segment that matches;
+  /// - **(g)** a [`Moved`](ChangeKind::Moved) whose SOURCE's last segment
+  ///   matches — the seat's own pattern, or an active marker leaf. A media file
+  ///   renamed to a non-media name is still reported, so the consumer can drop
+  ///   what it was holding rather than keep a name that no longer exists; a
+  ///   marker moved aside is still the barrier's own object.
   ///
   /// [`Interest::ondir`](tributary_proto::Interest::ondir) keeps governing directory changes
   /// exactly as it did: this seat only ever admits ON TOP of it, never instead of
@@ -5869,12 +6024,22 @@ impl DriverCore {
       return true;
     }
     let matches = |location: &Location| {
-      location
-        .segments()
-        .last()
-        .is_some_and(|segment| include.is_match(segment.as_str()))
+      location.segments().last().is_some_and(|segment| {
+        include.is_match(segment.as_str()) || state.markers.contains(segment.as_str())
+      })
     };
     matches(change.location()) || change.kind().moved_from().is_some_and(matches)
+  }
+
+  /// Whether `location`'s last segment is an ACTIVE sync marker leaf of `state`
+  /// — the identity half of the marker exemption, asked by the prune fence.
+  ///
+  /// A location with no last segment names no object and can name no marker.
+  fn names_active_marker(state: &ScopeState, location: Option<&Location>) -> bool {
+    !state.markers.is_empty()
+      && location
+        .and_then(|location| location.segments().last())
+        .is_some_and(|segment| state.markers.contains(segment.as_str()))
   }
 
   fn route_event(&mut self, change: Change) {

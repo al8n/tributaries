@@ -311,6 +311,20 @@ struct LedgerInner {
   /// record's `last_failure_seq` — so a record that keeps failing keeps moving
   /// to the BACK of the recovery selection order (`rearm_parked_batch`).
   failure_clock: u64,
+  /// Retired obligations' `(scope, name)` pairs, awaiting the driver loop's
+  /// drain into the core's per-scope active-marker sets
+  /// ([`DriverCore::release_sync_markers`](crate::core::DriverCore)).
+  ///
+  /// A queue rather than a direct call because [`retire`](Self::retire) is the
+  /// ledger's single terminal funnel and several of its callers are the blocking
+  /// pool's own write and unlink jobs, which hold this mutex and nothing else —
+  /// the core is the driver task's, and reaching it from a job would be a second
+  /// owner of the one thing the sans-I/O split exists to keep single-owned.
+  ///
+  /// Bounded by admission: an obligation retires exactly once and is only born
+  /// through the driver loop, so nothing can accrue here across a drain beyond
+  /// the ledger's own global cap.
+  released_markers: Vec<(ScopeId, String)>,
   #[cfg(all(test, feature = "tokio"))]
   census: Census,
 }
@@ -324,6 +338,7 @@ impl LedgerInner {
       by_ticket: HashMap::new(),
       next_cookie_id: 0,
       failure_clock: 0,
+      released_markers: Vec::new(),
       #[cfg(all(test, feature = "tokio"))]
       census: Census::default(),
     }
@@ -363,6 +378,11 @@ impl LedgerInner {
     if self.by_ticket.get(&ob.ticket) == Some(&id) {
       self.by_ticket.remove(&ob.ticket);
     }
+    // The core's marker exemption is released HERE, at the one terminal every
+    // reap funnels through, so the exemption's lifetime is the obligation's and
+    // no path can end a sync while leaving its leaf armed forever. Queued rather
+    // than applied: a job holds this lock, and the core belongs to the loop.
+    self.released_markers.push((ob.scope, ob.name.clone()));
     Some(ob)
   }
 
@@ -3214,6 +3234,16 @@ impl<F: FsOps> CookieRegistry<F> {
   /// no fs I/O.
   fn name_in_use(&self, name: &str) -> bool {
     lock_ledger(&self.ledger).by_name.contains_key(name)
+  }
+
+  /// Takes the marker leaves of every obligation retired since the last take —
+  /// the driver loop's drain into the core's per-scope active-marker sets.
+  ///
+  /// Empty in the steady state (one `Vec::take` of an empty vector, no
+  /// allocation), so a loop that never syncs pays a mutex acquisition and
+  /// nothing else.
+  fn take_released_markers(&self) -> Vec<(ScopeId, String)> {
+    core::mem::take(&mut lock_ledger(&self.ledger).released_markers)
   }
 
   /// Whether a LIVE obligation already holds this ticket sequence — the ticket
@@ -6313,6 +6343,29 @@ pub(crate) fn pruned_dir_by(root: &Path, prune: &Globs, dir: &Path) -> Option<Gl
   })
 }
 
+/// HOW DEEP the seat closes over `path`: the root-relative segment count of the
+/// SHALLOWEST prefix a pattern matches, or `None` where nothing does.
+///
+/// The one caller is the covering `Rescan` a directory rename into pruned ground
+/// owes, which needs the nearest ancestor still inside the reported tree — the
+/// parent of exactly this prefix. [`prune_prefixes`] asks shallowest-first and
+/// answers the first hit, so that prefix's parent is unpruned by construction and
+/// the answer needs no second walk.
+///
+/// Counted off the joined prefix rather than tracked through the walk because a
+/// path component can never contain the separator the walk joins with, so the two
+/// counts are the same number and the shared walk keeps its one signature.
+pub(crate) fn pruned_ancestor_depth(
+  root: &Path,
+  prune: &Globs,
+  directory: bool,
+  path: &Path,
+) -> Option<usize> {
+  prune_prefixes(root, prune, directory, path, |prefix| {
+    prune.is_match(prefix).then(|| prefix.split('/').count())
+  })
+}
+
 impl FsOps for RealFs {
   type Handle = SourceHandle;
 
@@ -7867,6 +7920,12 @@ pub(crate) async fn run<R, F>(
     // top so a busy loop that never parks still drives them promptly (T8) — the
     // belt-and-suspenders the timer arm below shares.
     dispatch_due_cookie_retries::<R, F>(&cookies, &op_tx, now());
+
+    // Retired obligations release their marker exemptions here, at the one place
+    // the core and the ledger are both in hand. Late costs only an over-delivery
+    // of this driver's own artifact — the exemption never narrows anything — so
+    // the drain rides the loop rather than a wake of its own.
+    core.release_sync_markers(cookies.take_released_markers());
 
     // Fairness for the cleanup ingress: the select below is command-biased (it
     // polls `commands` before the wake), so a caller that keeps the bounded
@@ -9510,6 +9569,13 @@ pub(crate) async fn run<R, F>(
                 // in-flight re-arms to quiesce, which is precisely the ordering
                 // the barrier needs.
                 let fence = core.open_cover_fence(scope);
+                // The marker's identity, armed with the obligation and released
+                // with it: from here no seat of this scope may take a change
+                // whose object wears this leaf, whatever the directories above it
+                // are called by the time the create lands. Armed BEFORE the
+                // write is dispatched — a parked sync's write can leave for the
+                // pool on the very next loop-top poll.
+                core.arm_sync_marker(scope, name.clone());
                 cookies.admit_parked(scope, name, ticket.seq(), fence);
                 // The routing half: which caller this fence answers, and where its
                 // cookie is to be written. Inserted in the same step as the record
