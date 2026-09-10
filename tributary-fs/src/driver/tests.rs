@@ -1032,7 +1032,21 @@ async fn probes_outstanding(rig: &Rig) -> usize {
 /// round trip can read.
 #[must_use]
 async fn settle_probes(rig: &Rig, target: usize) -> bool {
-  for _ in 0..interpreted_rounds(200) {
+  settle_probes_within(rig, 200, target).await
+}
+
+/// [`settle_probes`] with a caller-chosen round budget.
+///
+/// Staging a count that depends on dozens of real OS threads actually reaching
+/// a parked state costs real wall clock the shared 200-round window does not
+/// promise — [`SETTLE_ROUND_SLICE`] is scaled for a slow (sanitizer)
+/// instrument, but the round COUNT is not, so a cell whose target is
+/// `MAX_LIVENESS_PROBES`-sized threads needs its own wider budget the same way
+/// [`settle_within`] widens [`settle`]. The condition is eventually-true either
+/// way, so a wider budget can only prevent a spurious failure, never mask one.
+#[must_use]
+async fn settle_probes_within(rig: &Rig, rounds: usize, target: usize) -> bool {
+  for _ in 0..interpreted_rounds(rounds) {
     if probes_outstanding(rig).await == target {
       return true;
     }
@@ -1263,8 +1277,16 @@ async fn a_tick_at_the_probe_budget_dispatches_nothing_and_retries_later() {
   let gate = rig.fs.hold_refreshes();
   rig.fs.set_root_liveness(RootLiveness::Missing);
 
+  // Widened past the shared 200-round window: this stages sixty-four real OS
+  // threads actually reaching a parked state inside the fake's refresh, and
+  // under a slow (sanitizer-instrumented) binary that outruns the round
+  // count's fixed budget well before it outruns wall-clock patience. The
+  // round count is what has to grow here — see `settle_probes_within` — the
+  // same reasoning `interpreted_rounds` documents for an interpreter, applied
+  // to a different kind of slow binary. Mirrors this same test's own final
+  // assertion, which already spends this wider budget.
   assert!(
-    settle_probes(&rig, MAX_LIVENESS_PROBES).await,
+    settle_probes_within(&rig, 400, MAX_LIVENESS_PROBES).await,
     "staging: the budget fills"
   );
   assert!(
