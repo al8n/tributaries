@@ -168,6 +168,59 @@ pub(crate) fn derive_move_window(move_window: Duration, latency: Duration) -> Du
     .min(MAX_MOVE_WINDOW)
 }
 
+/// The ONE range rule behind every face of [`WatcherOptions::latency`]: a builder
+/// is checked by [`validate`](WatcherOptions::validate) at construction, a document
+/// by its deserializer, a flag by its parser — and all three ask this, so no door
+/// can admit what another refuses.
+///
+/// A face that only PARSES an out-of-range value defers the refusal to
+/// [`Watcher::new`](crate::Watcher::new), which means an application cannot read a
+/// successful parse as acceptance: the configuration layer reports the document as
+/// loaded and the watcher refuses it afterwards, with nothing left pointing at the
+/// key that was wrong. Each checker below closes that gap for one knob.
+const fn check_latency(latency: Duration) -> Result<Duration, OptionsError> {
+  if latency.as_nanos() > WatcherOptions::MAX_LATENCY.as_nanos() {
+    return Err(OptionsError::LatencyTooLarge { supplied: latency });
+  }
+  Ok(latency)
+}
+
+/// The same one rule for [`WatcherOptions::event_capacity`].
+const fn check_event_capacity(capacity: NonZeroUsize) -> Result<NonZeroUsize, OptionsError> {
+  if capacity.get() > WatcherOptions::MAX_EVENT_CAPACITY.get() {
+    return Err(OptionsError::EventCapacityTooLarge { supplied: capacity });
+  }
+  Ok(capacity)
+}
+
+/// The same one rule for [`WatcherOptions::os_batch_capacity`].
+const fn check_os_batch_capacity(capacity: NonZeroUsize) -> Result<NonZeroUsize, OptionsError> {
+  if capacity.get() > WatcherOptions::MAX_OS_BATCH_CAPACITY.get() {
+    return Err(OptionsError::OsBatchCapacityTooLarge { supplied: capacity });
+  }
+  Ok(capacity)
+}
+
+/// The same one rule for [`WatcherOptions::os_buffer_bytes`] — a RANGE rather than
+/// a ceiling, so a buffer too small for one kernel record is refused at the same
+/// door as one too large to allocate per root.
+const fn check_os_buffer_bytes(bytes: NonZeroU32) -> Result<NonZeroU32, OptionsError> {
+  if bytes.get() < WatcherOptions::MIN_OS_BUFFER_BYTES.get()
+    || bytes.get() > WatcherOptions::MAX_OS_BUFFER_BYTES.get()
+  {
+    return Err(OptionsError::OsBufferBytesOutOfRange { supplied: bytes });
+  }
+  Ok(bytes)
+}
+
+/// The same one rule for [`WatcherOptions::root_liveness_interval`].
+const fn check_root_liveness_interval(interval: Duration) -> Result<Duration, OptionsError> {
+  if interval.as_nanos() > WatcherOptions::MAX_ROOT_LIVENESS_INTERVAL.as_nanos() {
+    return Err(OptionsError::RootLivenessIntervalTooLarge { supplied: interval });
+  }
+  Ok(interval)
+}
+
 /// Configuration for a [`Watcher`](crate::Watcher).
 ///
 /// [`new`](Self::new) returns the defaults; every knob has a `with_*` builder,
@@ -181,6 +234,16 @@ pub(crate) fn derive_move_window(move_window: Duration, latency: Duration) -> Du
 /// Each ceiling names a value no downstream use site can carry — an eager
 /// channel allocation, a native buffer length, a cadence that would never come
 /// round — and a typed refusal at construction is the only honest answer to one.
+///
+/// A knob that is PARSED is judged where it is written rather than at the
+/// watcher: every bounded field's `serde` key and `clap` flag ask the same range
+/// rule [`validate`](Self::validate) asks, so a document or a command line that
+/// parses is a household that constructs. Deferring the refusal would leave an
+/// application unable to read a successful parse as acceptance — the
+/// configuration layer would report the document loaded and the watcher would
+/// refuse it afterwards, with nothing left pointing at the key that was wrong.
+/// ([`move_window`](Self::move_window) is the one unbounded knob, for the reason
+/// [`validate`](Self::validate) gives.)
 ///
 /// # Configuration faces
 ///
@@ -260,17 +323,35 @@ pub(crate) fn derive_move_window(move_window: Duration, latency: Duration) -> Du
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(default))]
 pub struct WatcherOptions {
-  #[cfg_attr(feature = "serde", serde(with = "humantime_serde"))]
+  // The bounded durations keep humantime's SERIALIZER and take a deserializer
+  // that reads the same text and then asks the shared range rule — `with` would
+  // replace both halves, and the text form is not what is changing here.
+  #[cfg_attr(
+    feature = "serde",
+    serde(
+      serialize_with = "humantime_serde::serialize",
+      deserialize_with = "de_latency"
+    )
+  )]
   latency: Duration,
   #[cfg_attr(feature = "serde", serde(with = "humantime_serde"))]
   move_window: Duration,
+  #[cfg_attr(feature = "serde", serde(deserialize_with = "de_event_capacity"))]
   event_capacity: NonZeroUsize,
+  #[cfg_attr(feature = "serde", serde(deserialize_with = "de_os_batch_capacity"))]
   os_batch_capacity: NonZeroUsize,
+  #[cfg_attr(feature = "serde", serde(deserialize_with = "de_os_buffer_bytes"))]
   os_buffer_bytes: NonZeroU32,
   #[cfg_attr(feature = "serde", serde(deserialize_with = "deserialize_exclusions"))]
   exclusions: Vec<PathBuf>,
   backend: Backend,
-  #[cfg_attr(feature = "serde", serde(with = "humantime_serde"))]
+  #[cfg_attr(
+    feature = "serde",
+    serde(
+      serialize_with = "humantime_serde::serialize",
+      deserialize_with = "de_root_liveness_interval"
+    )
+  )]
   root_liveness_interval: Duration,
   max_map_directories: Option<usize>,
 }
@@ -469,6 +550,108 @@ fn bounded_exclusion() -> impl clap::builder::TypedValueParser<Value = PathBuf> 
 /// [`parse_from`](clap::Parser::parse_from). For a real command line that is
 /// bounded by the operating system (`ARG_MAX`); for a programmatic iterator it is
 /// the caller's own memory, spent by the caller, before this crate is reached.
+/// The `latency` key: a document is refused where the key is READ, with the same
+/// verdict the builders get from [`WatcherOptions::validate`]. The humantime text
+/// is parsed first (it is the key's spelling), then measured.
+#[cfg(feature = "serde")]
+fn de_latency<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+where
+  D: serde::Deserializer<'de>,
+{
+  use serde::de::Error as _;
+
+  check_latency(humantime_serde::deserialize(deserializer)?).map_err(D::Error::custom)
+}
+
+/// The same, for the `root_liveness_interval` key.
+#[cfg(feature = "serde")]
+fn de_root_liveness_interval<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+where
+  D: serde::Deserializer<'de>,
+{
+  use serde::de::Error as _;
+
+  check_root_liveness_interval(humantime_serde::deserialize(deserializer)?)
+    .map_err(D::Error::custom)
+}
+
+/// The same, for the `event_capacity` key.
+#[cfg(feature = "serde")]
+fn de_event_capacity<'de, D>(deserializer: D) -> Result<NonZeroUsize, D::Error>
+where
+  D: serde::Deserializer<'de>,
+{
+  use serde::{Deserialize as _, de::Error as _};
+
+  check_event_capacity(NonZeroUsize::deserialize(deserializer)?).map_err(D::Error::custom)
+}
+
+/// The same, for the `os_batch_capacity` key.
+#[cfg(feature = "serde")]
+fn de_os_batch_capacity<'de, D>(deserializer: D) -> Result<NonZeroUsize, D::Error>
+where
+  D: serde::Deserializer<'de>,
+{
+  use serde::{Deserialize as _, de::Error as _};
+
+  check_os_batch_capacity(NonZeroUsize::deserialize(deserializer)?).map_err(D::Error::custom)
+}
+
+/// The same, for the `os_buffer_bytes` key.
+#[cfg(feature = "serde")]
+fn de_os_buffer_bytes<'de, D>(deserializer: D) -> Result<NonZeroU32, D::Error>
+where
+  D: serde::Deserializer<'de>,
+{
+  use serde::{Deserialize as _, de::Error as _};
+
+  check_os_buffer_bytes(NonZeroU32::deserialize(deserializer)?).map_err(D::Error::custom)
+}
+
+/// The `--latency` parser: the flag refuses out of range what
+/// [`WatcherOptions::validate`] refuses at construction, so a command line hears
+/// the ceiling where the value is written rather than at the watcher. The refusal
+/// is the flag's own [`ValueValidation`](clap::error::ErrorKind::ValueValidation),
+/// naming the argument that carried it.
+#[cfg(feature = "clap")]
+fn parse_latency(text: &str) -> Result<Duration, Box<dyn core::error::Error + Send + Sync>> {
+  Ok(check_latency(humantime::parse_duration(text)?)?)
+}
+
+/// The same, for `--root-liveness-interval`.
+#[cfg(feature = "clap")]
+fn parse_root_liveness_interval(
+  text: &str,
+) -> Result<Duration, Box<dyn core::error::Error + Send + Sync>> {
+  Ok(check_root_liveness_interval(humantime::parse_duration(
+    text,
+  )?)?)
+}
+
+/// The same, for `--watcher-event-capacity`.
+#[cfg(feature = "clap")]
+fn parse_event_capacity(
+  text: &str,
+) -> Result<NonZeroUsize, Box<dyn core::error::Error + Send + Sync>> {
+  Ok(check_event_capacity(text.parse()?)?)
+}
+
+/// The same, for `--os-batch-capacity`.
+#[cfg(feature = "clap")]
+fn parse_os_batch_capacity(
+  text: &str,
+) -> Result<NonZeroUsize, Box<dyn core::error::Error + Send + Sync>> {
+  Ok(check_os_batch_capacity(text.parse()?)?)
+}
+
+/// The same, for `--os-buffer-bytes`.
+#[cfg(feature = "clap")]
+fn parse_os_buffer_bytes(
+  text: &str,
+) -> Result<NonZeroU32, Box<dyn core::error::Error + Send + Sync>> {
+  Ok(check_os_buffer_bytes(text.parse()?)?)
+}
+
 #[cfg(feature = "clap")]
 fn refuse_over_full_exclusions(matches: &clap::ArgMatches) -> Result<(), clap::Error> {
   let supplied = matches
@@ -496,7 +679,7 @@ fn refuse_over_full_exclusions(matches: &clap::ArgMatches) -> Result<(), clap::E
 struct WatcherOptionsArgs {
   #[arg(
     long,
-    value_parser = humantime::parse_duration,
+    value_parser = parse_latency,
     default_value = clap_duration_default(WatcherOptions::DEFAULT_LATENCY),
   )]
   latency: Duration,
@@ -512,12 +695,21 @@ struct WatcherOptionsArgs {
   #[arg(
     id = "watcher_event_capacity",
     long = "watcher-event-capacity",
+    value_parser = parse_event_capacity,
     default_value_t = WatcherOptions::DEFAULT_EVENT_CAPACITY,
   )]
   event_capacity: NonZeroUsize,
-  #[arg(long, default_value_t = WatcherOptions::DEFAULT_OS_BATCH_CAPACITY)]
+  #[arg(
+    long,
+    value_parser = parse_os_batch_capacity,
+    default_value_t = WatcherOptions::DEFAULT_OS_BATCH_CAPACITY,
+  )]
   os_batch_capacity: NonZeroUsize,
-  #[arg(long, default_value_t = WatcherOptions::DEFAULT_OS_BUFFER_BYTES)]
+  #[arg(
+    long,
+    value_parser = parse_os_buffer_bytes,
+    default_value_t = WatcherOptions::DEFAULT_OS_BUFFER_BYTES,
+  )]
   os_buffer_bytes: NonZeroU32,
   #[arg(long, value_parser = bounded_exclusion())]
   exclusions: Vec<PathBuf>,
@@ -525,7 +717,7 @@ struct WatcherOptionsArgs {
   backend: Backend,
   #[arg(
     long,
-    value_parser = humantime::parse_duration,
+    value_parser = parse_root_liveness_interval,
     default_value = clap_duration_default(WatcherOptions::DEFAULT_ROOT_LIVENESS_INTERVAL),
   )]
   root_liveness_interval: Duration,
@@ -829,7 +1021,10 @@ impl WatcherOptions {
   /// [`Watcher::new`](crate::Watcher::new) runs this before it allocates or
   /// spawns anything, so a caller normally never calls it; it is public so a
   /// configuration layer can reject a bad setting where the setting is read,
-  /// with the same verdict the watcher would give.
+  /// with the same verdict the watcher would give. A household that came from a
+  /// document or a command line has already been judged by these very rules —
+  /// each face asks the shared checker below — so this is a re-check there and
+  /// the first check only for a programmatic builder.
   ///
   /// [`move_window`](Self::move_window) is deliberately absent: its derivation
   /// saturates and caps for EVERY input (see
@@ -854,33 +1049,15 @@ impl WatcherOptions {
         supplied: exclusion.as_os_str().len(),
       });
     }
-    if self.latency > Self::MAX_LATENCY {
-      return Err(OptionsError::LatencyTooLarge {
-        supplied: self.latency,
-      });
-    }
-    if self.event_capacity > Self::MAX_EVENT_CAPACITY {
-      return Err(OptionsError::EventCapacityTooLarge {
-        supplied: self.event_capacity,
-      });
-    }
-    if self.os_batch_capacity > Self::MAX_OS_BATCH_CAPACITY {
-      return Err(OptionsError::OsBatchCapacityTooLarge {
-        supplied: self.os_batch_capacity,
-      });
-    }
-    if self.os_buffer_bytes < Self::MIN_OS_BUFFER_BYTES
-      || self.os_buffer_bytes > Self::MAX_OS_BUFFER_BYTES
-    {
-      return Err(OptionsError::OsBufferBytesOutOfRange {
-        supplied: self.os_buffer_bytes,
-      });
-    }
-    if self.root_liveness_interval > Self::MAX_ROOT_LIVENESS_INTERVAL {
-      return Err(OptionsError::RootLivenessIntervalTooLarge {
-        supplied: self.root_liveness_interval,
-      });
-    }
+    // Each range rule is asked of the SHARED checker, which the serde
+    // deserializers and the clap value parsers ask too — so a document or a
+    // command line is refused where the value is written, and this validation and
+    // those faces can never come to mean different things by the same number.
+    check_latency(self.latency)?;
+    check_event_capacity(self.event_capacity)?;
+    check_os_batch_capacity(self.os_batch_capacity)?;
+    check_os_buffer_bytes(self.os_buffer_bytes)?;
+    check_root_liveness_interval(self.root_liveness_interval)?;
     Ok(())
   }
 
