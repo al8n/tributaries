@@ -19524,6 +19524,66 @@ mod sync_cookie {
       let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A watcher carrying the DEFAULT cookie cap admits no more samplings than
+    /// the sampling ceiling — the cap does not raise the door.
+    ///
+    /// The cookie cap counts RECORDS, and a record is not a descriptor: each
+    /// admitted sampling retains three (the root every descent starts from, the
+    /// directory the sync names, and the reserved directory), plus a transient
+    /// duplicate per open on macOS. A door sized to 128 records therefore holds
+    /// up to 384 descriptors before the driver has read a single command —
+    /// already past macOS's 256 soft limit, with every other watcher in the
+    /// process holding an allowance of its own on top. So the door is sized by
+    /// the sampling ceiling, and a wider record cap leaves it exactly where it
+    /// is.
+    ///
+    /// Exactly ONE descriptor per admitted sampling names the target, so the
+    /// count read here IS the number of samplings the door let through.
+    ///
+    /// Revert witness: size the allowance by the cookie cap again and the
+    /// ceiling inside the wait catches the count climbing past the transient
+    /// headroom on its way to the cap.
+    #[tokio::test]
+    async fn a_wide_cookie_cap_admits_no_more_than_the_sampling_ceiling() {
+      const CAP: usize = crate::driver::DriverConfig::DEFAULT_COOKIE_GLOBAL_CAP;
+      const CEILING: usize = crate::driver::MAX_SYNC_SAMPLINGS;
+      // Enough callers that a door sized to the CAP would be visibly wider than
+      // the transient headroom below — the reverted allowance holds all of them.
+      const CALLERS: usize = 96;
+      // What a descriptor COUNT may legitimately read while the ramp is running:
+      // an admitted sampling holds one descriptor naming the target, and reads
+      // that object's identity through a `try_clone` of it, so a sampling caught
+      // mid-read shows two. Every admitted sampling can be inside that window at
+      // once, so twice the ceiling is the honest instantaneous bound — still far
+      // below what a door sized by the record cap would hold.
+      const TRANSIENT: usize = 2 * CEILING;
+
+      // Both the cap under test and the caller count must be wide enough for an
+      // unbounded door to breach the transient headroom, or the ceiling inside the
+      // wait would have nothing to catch.
+      const { assert!(CAP > TRANSIENT && CALLERS > TRANSIENT) };
+
+      let root = scratch("door-pin-ceiling");
+      let target = root.join("a");
+      std::fs::create_dir_all(&target).expect("the directory the syncs name");
+      let (watcher, handle) = doored_watcher(&root, CAP).await;
+
+      let mut pending = Vec::new();
+      for _ in 0..CALLERS {
+        let (admission, _ticket) = watcher
+          .mint_sync_ticket()
+          .expect("this host seeds a watcher");
+        pending.push(Box::pin(watcher.sync_root(handle, &target, admission)));
+      }
+      // Driven to a standstill with no await anywhere, so the driver never gets
+      // the thread: what settles here is what the door let through on its own.
+      pins_settle_at(&mut pending, &target, CEILING, TRANSIENT).await;
+
+      drop(pending);
+      drop(watcher);
+      let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Arms `step` to run ONCE at the top of the door's sampling of `dir`, and
     /// takes the arming back down when the returned guard drops.
     ///

@@ -7453,11 +7453,12 @@ fn cookie_dir<'a>(root: &Path, dir: &'a Path) -> &'a Path {
 /// that syscall returns and its own descriptor goes with it. Nothing the caller
 /// owns is waiting for any of that.
 ///
-/// It is sized by the ledger's own global cookie cap, which already bounds how
-/// many syncs one watcher may have outstanding, so the two agree by construction:
-/// pins in flight ≤ 3 × cap. A door that has to wait for a slot is a door under
-/// exactly the pressure that cap describes, and waiting is what a caller can act
-/// on — its own timeout, or dropping the future — where an exhausted descriptor
+/// It is sized by [`MAX_SYNC_SAMPLINGS`] rather than by the ledger's cookie cap,
+/// because a permit is not a RECORD: one permit authorizes three descriptors,
+/// so a cap counted in records is three times too generous read as a descriptor
+/// bound. A door that has to wait for a slot is a door under exactly the
+/// pressure that ceiling describes, and waiting is what a caller can act on —
+/// its own timeout, or dropping the future — where an exhausted descriptor
 /// table is not.
 ///
 /// A permit is a message occupying a slot of a bounded channel: acquiring one is
@@ -7469,6 +7470,29 @@ fn cookie_dir<'a>(root: &Path, dir: &'a Path) -> &'a Path {
 /// and is therefore not `Unpin`, and a `Watcher` that held one directly would not
 /// be either. The `Arc` is what a permit carries anyway — one allowance, shared
 /// by every clone of one watcher and by every permit outstanding against it.
+/// The most samplings one watcher's sync door admits at once — the ceiling its
+/// [`SyncPinAllowance`] is sized to.
+///
+/// This is a DESCRIPTOR bound wearing a sampling's clothes, and it is deliberately
+/// not the ledger's cookie cap. Each admitted sampling retains three descriptors —
+/// the root every descent starts from, the directory the sync names, and the
+/// reserved directory — and macOS duplicates one more per open for as long as the
+/// sample lasts. At 32 that is 96 retained plus at most one transient duplicate in
+/// flight (the door samples one directory at a time, on one pool job), comfortably
+/// inside macOS's 256 soft limit with room left for the watcher's own sources,
+/// its event channel and the application's unrelated I/O. The cookie cap read as a
+/// descriptor bound gives 3 × 128 = 384, which is past that limit before a single
+/// cap has an opinion — and every watcher in the process has an allowance of its
+/// own, so the peak multiplies.
+///
+/// Thirty-two is not a throughput compromise. A sampling is three opens and a
+/// send, all of it microseconds of syscalls; the driver single-flights a scope's
+/// physical writes anyway, so a wider door would only queue more callers deeper
+/// inside the same funnel; and a caller waiting at the door holds NOTHING — no
+/// descriptor, no ledger record, no place in the mailbox — so the wait costs
+/// latency and never a resource.
+pub(crate) const MAX_SYNC_SAMPLINGS: usize = 32;
+
 #[derive(Debug, Clone)]
 pub(crate) struct SyncPinAllowance {
   taken: async_channel::Sender<()>,
