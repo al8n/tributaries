@@ -3695,11 +3695,12 @@ enum Reaped {
 /// key, and its lifecycle phase.
 struct Obligation {
   scope: ScopeId,
-  /// The directory the sync named — the ground its marker is going to land in,
-  /// held for as long as the obligation is PRE-TERMINAL so a set-cover can widen
-  /// its retained cover by it ([`CookieRegistry::live_sync_dirs`]). Nothing else
-  /// reads it: the write addresses its own pinned descriptors, and every removal
-  /// goes through the residue's landing.
+  /// The directory the sync named — the ground its marker lands in, held for as
+  /// long as the record lives so a set-cover can widen its retained cover by it
+  /// ([`CookieRegistry::live_sync_dirs`]), in EVERY phase and not merely while
+  /// the write is still in flight. Nothing else reads it: the write addresses its
+  /// own pinned descriptors, and every removal goes through the residue's
+  /// landing.
   ///
   /// One path per record, so the ledger's caps bound it exactly as they bound the
   /// name beside it.
@@ -4289,7 +4290,7 @@ impl<F: FsOps> CookieRegistry<F> {
   /// `ticket` is the caller's [`SyncTicket`] sequence — the `by_ticket` key an
   /// incarnation-precise cancel resolves through, and `dir` the directory the
   /// sync was admitted for — recorded so a later set-cover can keep the ground
-  /// this obligation is still going to write in
+  /// this obligation depends on, for as long as the record lives
   /// ([`live_sync_dirs`](Self::live_sync_dirs)).
   ///
   /// Called only AFTER every admission refusal has passed: a refused sync must
@@ -4448,26 +4449,40 @@ impl<F: FsOps> CookieRegistry<F> {
       .any(|ob| ob.scope == scope && matches!(ob.phase, Phase::Parked { .. } | Phase::InPool))
   }
 
-  /// The directories `scope`'s IN-FLIGHT syncs are still going to write in —
-  /// every obligation parked on its settle fence or dispatched into the pool.
+  /// The ground `scope`'s LIVE syncs depend on — every obligation of that scope,
+  /// in every phase, from its admission to its retirement.
   ///
   /// A set-cover widens its retained cover by these before the core reconciles
   /// ([`DriverCore::on_set_cover`]). The admission proved the ground covered when
   /// it let the sync through, and nothing binds the obligation to the cover it
-  /// was admitted under — so a shrink arriving between admission and landing
-  /// would drop the very watches the marker's create has to come off, and the
-  /// caller's barrier could only time out over a write that succeeded.
+  /// was admitted under — so a shrink arriving inside that window would drop the
+  /// very watches the marker's create has to come off, and the caller's barrier
+  /// could only time out over a write that succeeded.
   ///
-  /// The phases are exactly [`has_pending_write`](Self::has_pending_write)'s,
-  /// and for the same reason: from the CLAIM onward the marker exists and its
-  /// delivery has already been decided, so a cover narrowing past it takes
-  /// nothing the sync still needs. One O(ledger) walk, which the global cap
-  /// bounds — as it bounds the number of directories this can return.
+  /// The window does NOT close at the claim, and that is the whole of why the
+  /// filter is the record's EXISTENCE rather than a phase. `sync_root` answers
+  /// the instant the file exists, while everything that gives the marker its
+  /// meaning happens strictly after: the barrier still has to OBSERVE the create
+  /// through that directory's watch, the cleanup still has to prove its unlink
+  /// against the same ground, and a failed unlink still has to be retried there.
+  /// A cover narrowing past a claimed obligation disarms the watch while the
+  /// create is merely QUEUED — a reader takes its control traffic first, and the
+  /// disarm empties the attribution the queued create would have been read
+  /// against — so the create is discarded and the successful write becomes
+  /// unobservable. The residue phases are kept for the same reason: a record
+  /// whose unlink is still failing keeps its directory armed, which is what makes
+  /// its retry observable.
+  ///
+  /// A record exists exactly until its typed terminal ([`retire`]), so "not
+  /// retired" is read off the map itself. One O(ledger) walk, which the global
+  /// cap bounds — as it bounds the number of directories this can return.
+  ///
+  /// [`retire`]: LedgerInner::retire
   fn live_sync_dirs(&self, scope: ScopeId) -> Vec<PathBuf> {
     lock_ledger(&self.ledger)
       .obligations
       .values()
-      .filter(|ob| ob.scope == scope && matches!(ob.phase, Phase::Parked { .. } | Phase::InPool))
+      .filter(|ob| ob.scope == scope)
       .map(|ob| ob.dir.clone())
       .collect()
   }
@@ -12693,21 +12708,27 @@ pub(crate) async fn run<R, F>(
             let _ = reply.send(CoverOutcome::Skipped(SkipReason::Backlogged));
             continue;
           }
-          // A shrink may not take the ground an ADMITTED sync is still going to
-          // write in. The admission proved that ground covered, but nothing binds
-          // the obligation to the cover it was admitted under: a cover arriving
-          // between the admission and the marker's create would prune the watches
-          // the create has to come off, and the caller would then wait out its
-          // barrier over a write that reported success. So every in-flight sync's
-          // target directory joins the retained cover here — one term per parked
-          // or in-pool obligation of this scope, bounded by the cookie caps — and
-          // the R24 reserved-directory exemption keeps the marker's own directory
-          // with it, that directory's parent now being retained.
+          // A shrink may not take the ground an ADMITTED sync depends on. The
+          // admission proved that ground covered, but nothing binds the
+          // obligation to the cover it was admitted under: a cover arriving
+          // inside that window would prune the watches the marker's create has to
+          // come off, and the caller would then wait out its barrier over a write
+          // that reported success. So every LIVE obligation's directory joins the
+          // retained cover here — one term per unretired obligation of this
+          // scope, bounded by the cookie caps — and the R24 reserved-directory
+          // exemption keeps the marker's own directory with it, that directory's
+          // parent now being retained.
+          //
+          // The cover is held to the obligation's RETIREMENT, not to its claim:
+          // the write returns the moment the file exists, while the barrier's
+          // observation, the cleanup's proof and any retry all happen after that
+          // — a claimed marker whose create is still queued is exactly the case a
+          // disarm makes unobservable ([`CookieRegistry::live_sync_dirs`]).
           //
           // Widening only ever ADDS coverage, so it cannot lose an event; what it
           // costs is that the applied cover is briefly a superset of the one the
           // caller asked for, until the next `set_cover` — by which time these
-          // syncs have reached their terminal and named nothing.
+          // obligations have retired and name nothing.
           retained.extend(cookies.live_sync_dirs(scope));
           match core.on_set_cover(scope, &retained) {
             CoverReconcile::Reconciling => {

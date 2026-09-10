@@ -765,6 +765,108 @@ async fn set_cover_keeps_a_covered_directory_s_reserved_sync_directory_armed() {
   let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A live obligation keeps its ground covered until it RETIRES — asked on the far
+/// side of the write's own return.
+///
+/// `sync_root` answers the instant the marker exists, and the barrier's
+/// observation happens strictly after: the create sits in the kernel queue while
+/// the reader takes its control traffic first, so a cover narrowed past the
+/// marker's own directory disarms the watch that queued create would have been
+/// attributed to and the create is discarded — a write that reported success
+/// with nothing left that can report it.
+///
+/// Real inotify, because what the cell rests on is the kernel's. The sibling the
+/// cover names nothing for really loses its watch descriptor, the marker's
+/// directory really keeps its own, and the second sync's marker really has
+/// nothing but that surviving watch to come off: its reserved directory already
+/// exists, so no directory create reaches the parent's watch this time.
+///
+/// Revert witness: filter `live_sync_dirs` back to the parked and in-pool phases
+/// and the shrink takes `<root>/a` along with the sibling — its watch count drops
+/// to zero and the second sync is refused `DirUncovered` instead of placing a
+/// marker at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_cover_keeps_the_ground_an_owned_marker_is_still_unread_in() {
+  let root = scratch_root("cover-owned-marker");
+  std::fs::create_dir_all(root.join("a")).expect("the ground the sync writes in");
+  std::fs::create_dir_all(root.join("b")).expect("the ground the cover keeps");
+  std::fs::create_dir_all(root.join("c")).expect("the ground the cut takes");
+
+  let mut w = TokioWatcher::new(WatcherOptions::new().with_backend(Backend::Inotify))
+    .expect("build inotify watcher");
+  let handle = w.watch(&root, Interest::all()).await.expect("watch root");
+  let canonical = w.root_path(handle).expect("root path");
+  let target = canonical.join("a");
+
+  let (admission, _ticket) = w.mint_sync_ticket().expect("this host seeds a watcher");
+  let first = w
+    .sync_root(handle, &target, admission)
+    .await
+    .expect("the sync admits and writes its marker");
+  assert!(
+    wait_for(&mut w, |e| names(e, &first)).await.is_some(),
+    "staging: the marker is reported, so its reserved directory is armed"
+  );
+  let reserved = first
+    .parent()
+    .expect("a marker stands inside the reserved directory")
+    .to_path_buf();
+
+  let target_object = objects_of(&[target.clone()]);
+  let reserved_object = objects_of(&[reserved.clone()]);
+  let cut_object = objects_of(&[canonical.join("c")]);
+  let all = objects_of(&[
+    canonical.clone(),
+    target.clone(),
+    reserved.clone(),
+    canonical.join("b"),
+    canonical.join("c"),
+  ]);
+
+  // The obligation is OWNED and unreaped — nothing has removed its marker — and
+  // the cover the caller now asks for names neither it nor the sibling beside it.
+  w.set_cover(handle, vec![canonical.join("b")])
+    .await
+    .expect("set_cover shrink");
+  assert!(
+    converge(|| wds_watching(&cut_object) == 0).await,
+    "the sibling the cover named nothing for loses its watch — the cut really ran"
+  );
+  assert_eq!(
+    wds_watching(&target_object),
+    1,
+    "while the owned marker's own directory keeps its watch"
+  );
+  assert_eq!(
+    wds_watching(&reserved_object),
+    1,
+    "and so does the reserved directory the marker stands in"
+  );
+
+  // The second sync reuses the reserved directory the first one made, so nothing
+  // is created for the parent's watch to report: only the surviving watch can
+  // carry this marker.
+  let (admission, _ticket) = w.mint_sync_ticket().expect("this host seeds a watcher");
+  let second = w
+    .sync_root(handle, &target, admission)
+    .await
+    .expect("a sync of the ground the widening kept still admits");
+  assert_eq!(
+    second.parent(),
+    Some(reserved.as_path()),
+    "staging: the second marker reuses the reserved directory the first one made"
+  );
+  assert!(
+    wait_for(&mut w, |e| names(e, &second)).await.is_some(),
+    "the marker is reported — the barrier a successful write promised can still resolve"
+  );
+
+  let _ = std::fs::remove_file(&first);
+  let _ = std::fs::remove_file(&second);
+  close_and_drain(w, &all).await;
+  let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A sync whose caller-supplied directory is covered but whose RESOLVED landing
 /// is not is refused, and refused by the landing's name.
 ///

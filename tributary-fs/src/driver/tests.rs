@@ -4146,6 +4146,91 @@ mod descending {
       );
     }
 
+    /// And the promise outlives the WRITE: an obligation whose marker is already
+    /// on disk keeps its ground covered until that obligation RETIRES.
+    ///
+    /// `sync_root` answers the instant the file exists. Everything that gives the
+    /// file its meaning happens strictly afterwards — the barrier still has to
+    /// see the create come off the directory's own watch — and in between the
+    /// create is merely QUEUED. A reader takes its control traffic first, so a
+    /// shrink landing there disarms the watch, empties the attribution the queued
+    /// create would have been read against, and the create is discarded: a write
+    /// that reported success, with nothing left that can report it.
+    ///
+    /// Staged in exactly that order — write to completion, shrink, and only then
+    /// inject the create — because the order IS the defect. The marker's create
+    /// is read off the consumer's stream as a DELTA against a stream this cell
+    /// empties after the write.
+    ///
+    /// Revert witness: restore the `Parked | InPool` filter to `live_sync_dirs`
+    /// and the shrink reclaims `/r/a`'s watch, so the create is attributed to a
+    /// dead anchor and never reaches the consumer at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_shrink_keeps_the_ground_an_owned_marker_is_still_unread_in() {
+      const MARKER: &str = ".tributaries-sync-7-8-9";
+      let (rig, scope) = covered_rig(&[("/r/a", 11), ("/r/b", 12)]).await;
+      let ack = send_set_cover(&rig, scope, &["/r/a"]).await;
+      assert_eq!(
+        resolved(ack).await,
+        CoverOutcome::Applied,
+        "staging: the sync below is admitted onto ground the cover holds"
+      );
+      let armed = live_watch_at(&rig, "/r/a").expect("staging: /r/a holds a watch");
+
+      // The write runs to completion: the file exists, the obligation OWNS it,
+      // and nothing has reaped it — the phase the old filter excluded.
+      let path = sync_dir(&rig, scope, "/r/a", MARKER)
+        .await
+        .expect("the sync completes");
+      assert_eq!(path, PathBuf::from("/r/a/.tributaries-sync-7-8-9"));
+      assert_eq!(
+        cookie_count(&rig).await,
+        1,
+        "staging: the obligation owns its marker and has not retired"
+      );
+
+      // The baseline for the delta below: whatever the staging said is spent, so
+      // the create read after the shrink came from the injection and nowhere else.
+      while rig.events.try_recv().is_ok() {}
+
+      let _shrink = send_set_cover(&rig, scope, &["/r/b"]).await;
+      for _ in 0..interpreted_rounds(40) {
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+      }
+      assert_eq!(
+        live_watch_at(&rig, "/r/a"),
+        Some(armed),
+        "the owned marker's ground keeps the very watch its create has to be \
+         attributed to (disarms: {:?})",
+        rig.fs.disarms()
+      );
+
+      // The queued create, delivered now — off the watch the shrink had to keep.
+      rig.fs.send_inotify_batch(
+        "/r",
+        vec![attributed(&[armed], IN_CREATE, MARKER.as_bytes())],
+      );
+      let mut delivered = false;
+      for _ in 0..interpreted_rounds(200) {
+        while let Ok((_, _, change)) = rig.events.try_recv() {
+          if change.location() == &loc(&["a", MARKER]) {
+            delivered = true;
+          }
+        }
+        if delivered {
+          break;
+        }
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+      }
+      assert!(
+        delivered,
+        "and the marker's create reaches the consumer after the shrink — the \
+         barrier a successful write promised can still resolve"
+      );
+    }
+
     /// THE PUBLIC CONTRACT END TO END for the one loss that arrives with no cover
     /// of its own: an awaited reply over a standing classification stat reports
     /// `Degraded`, and the covering `Rescan` that verdict names is on the

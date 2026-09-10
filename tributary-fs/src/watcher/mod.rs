@@ -395,8 +395,9 @@ pub enum RequestOutcome {
 /// no code path can resolve them early.
 ///
 /// Whatever the outcome, the cover the watcher APPLIED is the requested one widened
-/// by the target directory of every sync of that root still in flight — a coverage
-/// superset that keeps an admitted marker observable and lasts only until the next
+/// by the target directory of every sync of that root that has not yet retired — a
+/// coverage superset that keeps an admitted marker observable, and its removal
+/// provable, for as long as the obligation lives, and that lasts only until the next
 /// reconcile (see [`Watcher::set_cover`]). No variant here reports it: a superset
 /// loses nothing a caller could act on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2355,17 +2356,22 @@ impl<R> Watcher<R> {
   /// `retained` are the watcher's own canonical coordinates (as
   /// [`root_path`](Self::root_path) reports), so they line up with the watches' addressing.
   ///
-  /// # The applied cover is widened by the syncs in flight
+  /// # The applied cover is widened by the syncs still live
   ///
-  /// A [`sync_root`](Self::sync_root) that has been admitted but whose marker has not yet
-  /// landed holds a promise about ground the caller's new cover may no longer name. The
-  /// watcher therefore applies `retained` **plus the target directory of every in-flight sync
-  /// of this root**, so a shrink can never prune the watches that marker has to be reported
-  /// through — the caller's barrier would otherwise wait out its deadline over a write that
-  /// reported success. The widening is a coverage **superset**, so it loses nothing; it is
-  /// bounded by the watcher's sync-obligation caps, and it lasts only until the next
-  /// `set_cover`, by which time those syncs have reached their terminals. The acknowledgement
-  /// reports the reconcile exactly as it would without it.
+  /// A [`sync_root`](Self::sync_root) that has been admitted holds a promise about ground the
+  /// caller's new cover may no longer name. The watcher therefore applies `retained` **plus
+  /// the target directory of every sync of this root that has not yet retired**, so a shrink
+  /// can never prune the watches that marker has to be reported through — the caller's barrier
+  /// would otherwise wait out its deadline over a write that reported success.
+  ///
+  /// The promise outlives the write's own return. `sync_root` answers as soon as the marker
+  /// exists, and only afterwards is the create OBSERVED through the directory's watch, the
+  /// marker's removal proved against the same ground, and a failed removal retried there — so
+  /// the widening lasts until the obligation retires, not until the write returns. The
+  /// widening is a coverage **superset**, so it loses nothing; it is bounded by the watcher's
+  /// sync-obligation caps, and it lasts only until the next `set_cover`, by which time those
+  /// obligations have retired. The acknowledgement reports the reconcile exactly as it would
+  /// without it.
   ///
   /// # The acknowledgement is an effect-completion fence
   ///
@@ -2474,8 +2480,8 @@ impl<R> Watcher<R> {
   /// or the watcher is closed — so the caller must drop the intent rather than retry. Never blocks
   /// and never panics.
   ///
-  /// The applied cover is widened by the target directory of every in-flight
-  /// [`sync_root`](Self::sync_root) of this root, exactly as it is for the awaited
+  /// The applied cover is widened by the target directory of every not-yet-retired
+  /// [`sync_root`](Self::sync_root) obligation of this root, exactly as it is for the awaited
   /// [`set_cover`](Self::set_cover) — see that method for what the widening costs and why it
   /// can never lose an event.
   pub fn request_set_cover(&self, root: RootHandle, retained: Vec<PathBuf>) -> RequestOutcome {
