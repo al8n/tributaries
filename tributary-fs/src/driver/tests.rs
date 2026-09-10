@@ -1253,9 +1253,19 @@ async fn a_retired_scope_s_probe_stays_counted_until_its_thread_exits() {
 /// tries again.
 ///
 /// Every root here is unmounted under the held gate, so the observation is a
-/// death count: nothing dies while the probes are parked, and once they are
-/// released EVERY scope dies — including the one the budget turned away, which
-/// can only have died by ticking again.
+/// death count: no PARKED scope dies while its probe is parked, and once the
+/// gate opens EVERY scope dies — including the one the budget turned away,
+/// which ticks again once its probe can be dispatched.
+///
+/// Post-c5a1a68: the scope whose tick FINDS the budget full is not itself
+/// parked on this gate — its decline is routed through the loss funnel
+/// (`on_overflow(Scope::Root)`), and the covering `Rescan` that decline arms
+/// samples the root through the crawl's own path, not through `hold_refreshes`.
+/// It is told its coverage is unproven, and with the root already `Missing` it
+/// may legitimately die from that recovery before the gate ever releases —
+/// natively the decline usually lands after the staging assertion below, but
+/// under a slower binary it can land before. So the staging assertion bounds
+/// only the parked population, not that scope.
 ///
 /// not(miri): the claim needs `MAX_LIVENESS_PROBES` real parked threads, and
 /// sixty-four of them under an interpreter is a shard timeout rather than a test.
@@ -1293,9 +1303,17 @@ async fn a_tick_at_the_probe_budget_dispatches_nothing_and_retries_later() {
     probes_hold_at(&rig, MAX_LIVENESS_PROBES).await,
     "and it holds: the scope whose tick found the budget full dispatched nothing"
   );
+  // No PARKED scope can die while its probe is parked, but the one scope whose
+  // tick finds the budget full (which of the `ticked` roots that is is a race,
+  // not fixed) is never parked on this gate at all: its decline is routed
+  // through the loss funnel's covering Rescan (c5a1a68), sampled through the
+  // crawl's own path, so with the root already Missing it may legitimately die
+  // from that recovery before this gate ever releases. That declined scope is
+  // the only candidate; every other (parked) scope must still be alive.
   assert!(
-    registry.dead().is_empty(),
-    "nothing can die while every probe is parked"
+    registry.dead().len() <= 1,
+    "no scope with a parked probe can die while every probe is parked (dead: {:?})",
+    registry.dead()
   );
 
   // One more root, registered while the budget is full, so it is its BIRTH
@@ -1334,6 +1352,10 @@ async fn a_tick_at_the_probe_budget_dispatches_nothing_and_retries_later() {
 
 /// Empties the event stream and waits for it to STAY empty — the baseline a
 /// delta-shaped event assertion is read against.
+///
+/// not(miri): its only caller is the probe-budget cell below, which is itself
+/// `#[cfg(not(miri))]` — real parked threads, not an interpreter.
+#[cfg(not(miri))]
 async fn drain_events(rig: &Rig) {
   let mut quiet = 0;
   for _ in 0..interpreted_rounds(400) {
