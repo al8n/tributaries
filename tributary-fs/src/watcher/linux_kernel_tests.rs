@@ -671,6 +671,100 @@ async fn set_cover_root_key_cancel_re_arms_every_pruned_region() {
   close_and_drain(w, &all).await;
 }
 
+/// A set-cover that narrows a root down to a FILE keeps the reserved cookie
+/// directory of the covered ground armed, so a SECOND sync there is still
+/// observable.
+///
+/// The whole failure needs a real kernel to exist. The reserved directory is a
+/// sibling of whatever the cover retained, so a cover naming a file marks it
+/// strictly outside; drop its watch and the next sync into that directory finds
+/// the reserved directory already standing, takes the `EEXIST` arm, and creates
+/// its marker with no directory create anywhere for a parent watch to re-arm
+/// from. inotify is non-recursive: no watch, no event, and the caller's barrier
+/// can only time out while `sync_root` reported success.
+///
+/// Staged so the second sync is the one that matters: the FIRST sync creates the
+/// reserved directory (and arms it through the root's own watch), the cover then
+/// shrinks past it, and only then does the second sync run.
+///
+/// Revert witness: drop the reserved-directory arm from the core's set-cover
+/// prune filter and the second sync's marker never arrives — the wait below burns
+/// its whole deadline while the pruned sibling assertion still passes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_cover_keeps_a_covered_directory_s_reserved_sync_directory_armed() {
+  let root = scratch_root("cover-cookie-dir");
+  std::fs::create_dir_all(root.join("drop")).expect("a plain sibling directory");
+  std::fs::write(root.join("kept.txt"), b"x").expect("the file the cover retains");
+
+  let mut w = TokioWatcher::new(WatcherOptions::new().with_backend(Backend::Inotify))
+    .expect("build inotify watcher");
+  let handle = w.watch(&root, Interest::all()).await.expect("watch root");
+  let canonical = w.root_path(handle).expect("root path");
+
+  // First sync: the reserved directory is CREATED, so the root's own watch sees
+  // its create and arms it. This is the arm the cover must not take away.
+  let (admission, _ticket) = w.mint_sync_ticket().expect("this host seeds a watcher");
+  let first = w
+    .sync_root(handle, &canonical, admission)
+    .await
+    .expect("the first sync admits and writes its cookie");
+  assert!(
+    wait_for(&mut w, |e| names(e, &first)).await.is_some(),
+    "staging: the first sync's marker is reported, so its reserved directory is armed"
+  );
+  let reserved = first
+    .parent()
+    .expect("a marker stands inside the reserved directory")
+    .to_path_buf();
+  let reserved_object = objects_of(&[reserved.clone()]);
+  let pruned_object = objects_of(&[canonical.join("drop")]);
+  let all = objects_of(&[canonical.clone(), reserved.clone(), canonical.join("drop")]);
+  assert_eq!(
+    wds_watching(&reserved_object),
+    1,
+    "staging: the reserved directory holds its own kernel watch before the cut"
+  );
+
+  // The caller keeps ONE file subscription. Every sibling of that file is
+  // strictly outside the cover — the plain directory and the reserved directory
+  // alike.
+  w.set_cover(handle, vec![canonical.join("kept.txt")])
+    .await
+    .expect("set_cover shrink");
+  assert!(
+    converge(|| wds_watching(&pruned_object) == 0).await,
+    "the plain sibling's watch descriptor is reclaimed — the cut really ran"
+  );
+  assert_eq!(
+    wds_watching(&reserved_object),
+    1,
+    "and the reserved directory's watch survives it"
+  );
+
+  // Second sync: the reserved directory already exists, so nothing is created
+  // for the root's watch to report and only the surviving watch can carry the
+  // marker.
+  let (admission, _ticket) = w.mint_sync_ticket().expect("this host seeds a watcher");
+  let second = w
+    .sync_root(handle, &canonical, admission)
+    .await
+    .expect("the second sync admits and writes its cookie");
+  assert_eq!(
+    second.parent(),
+    Some(reserved.as_path()),
+    "staging: the second marker reuses the reserved directory the first one made"
+  );
+  assert!(
+    wait_for(&mut w, |e| names(e, &second)).await.is_some(),
+    "the second sync's marker is reported — the barrier the caller is waiting on can be met"
+  );
+
+  let _ = std::fs::remove_file(&first);
+  let _ = std::fs::remove_file(&second);
+  close_and_drain(w, &all).await;
+  let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Arms one [`SYNC_DOOR_STEP`](crate::driver::SYNC_DOOR_STEP) entry and takes it
 /// back down when the guard drops.
 ///

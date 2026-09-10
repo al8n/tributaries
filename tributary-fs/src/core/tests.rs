@@ -4969,6 +4969,67 @@ mod descending {
     (core, scope, root_watch)
   }
 
+  /// A set-cover never takes the reserved cookie directory of a directory it
+  /// still covers.
+  ///
+  /// The cover speaks for the caller's SUBSCRIPTIONS, and no caller can name the
+  /// watcher's reserved directory — so a cover retaining a file under `/r` marks
+  /// that directory's sibling reserved directory strictly outside and would prune
+  /// it. Nothing re-arms it afterwards: the next sync into `/r` finds the reserved
+  /// directory already standing (the EEXIST arm), so no directory create reaches
+  /// the root's watch, the marker is born in unarmed ground, and the barrier can
+  /// only time out.
+  ///
+  /// Non-vacuity in both directions. A plain sibling directory IS pruned, so the
+  /// exemption is the NAME's and not the shrink standing down; and a reserved
+  /// directory whose PARENT the cover genuinely narrowed away goes with that
+  /// parent, so the exemption is the parent's coverage too — no sync of an
+  /// uncovered directory is admitted, so nothing will ever land there.
+  ///
+  /// Revert witness: drop the reserved-directory arm from the prune filter and
+  /// `/r/<reserved>` leaves coverage with the sibling.
+  #[test]
+  fn a_set_cover_keeps_the_reserved_cookie_directory_of_a_covered_directory() {
+    const COOKIE_DIR: &str = ".tributaries-sync-cookies-0";
+    let (mut core, scope, req, _root) = live_descending();
+    core.on_enumerated(
+      req,
+      listed(vec![
+        entry(COOKIE_DIR, FileKind::Dir, 1, 11),
+        entry("g", FileKind::Dir, 1, 12),
+      ]),
+    );
+    run_cascade(
+      &mut core,
+      &BTreeMap::from([("/r/g", vec![entry(COOKIE_DIR, FileKind::Dir, 1, 13)])]),
+    );
+    assert_eq!(
+      core.covered_paths(),
+      vec![
+        p("/r"),
+        p(&format!("/r/{COOKIE_DIR}")),
+        p("/r/g"),
+        p(&format!("/r/g/{COOKIE_DIR}")),
+      ],
+      "cold discovery armed both reserved directories and the sibling"
+    );
+
+    // The caller keeps one FILE subscription. `/r` stays covered (it is the
+    // retained path's ancestor); `/r/g` and everything under it does not.
+    assert_eq!(
+      core.on_set_cover(scope, &[p("/r/f")]),
+      CoverReconcile::Reconciling
+    );
+    let _ = drain(&mut core);
+
+    assert_eq!(
+      core.covered_paths(),
+      vec![p("/r"), p(&format!("/r/{COOKIE_DIR}"))],
+      "the covered directory's reserved directory survives; the plain sibling \
+       and the reserved directory under it do not"
+    );
+  }
+
   /// [`root_listing`] plus one entry no kind could be read for — the
   /// `DT_UNKNOWN` shape. The crawl reconciles nothing for `mystery`: it books
   /// the slot as darkness and asks the driver for a kind.

@@ -2275,10 +2275,35 @@ impl DriverCore {
       .filter(|(watch, watch_scope)| **watch_scope == scope && **watch != root_watch)
       .filter_map(|(watch, _)| {
         let path = self.path_of(state, *watch)?;
-        let strictly_outside = retained
-          .iter()
-          .all(|r| !path.starts_with(r) && !r.starts_with(path.as_path()));
-        strictly_outside.then(|| (path.components().count(), *watch))
+        // The reserved cookie directory of a COVERED directory is not dropped, however far
+        // outside the cover its own name lies. It is a sibling of whatever the cover
+        // retained, so a cover naming a file subscription marks it strictly outside and
+        // takes it — and the next sync into that directory reuses the reserved directory
+        // already standing (the EEXIST arm), so no directory create ever reaches the
+        // parent's watch to re-arm it. On a descending backend the marker is then born in
+        // unarmed ground, no source event exists at all, and the barrier can only time out.
+        //
+        // The exemption is the NAME's and the PARENT's together: the marker's landing
+        // directory is coverage the sync barrier depends on and the cover — which speaks
+        // for the caller's subscriptions — cannot know to name. It keeps at most one watch
+        // per covered directory that already carries a reserved directory, so it is bounded
+        // by what was already armed. A reserved directory under ground the cover genuinely
+        // narrowed away goes with that ground: a sync of an uncovered directory is refused
+        // before birth, so nothing will ever land there. The root needs no case of its own —
+        // it is an ancestor of every retained prefix, so it is never strictly outside.
+        //
+        // This is the set-cover's half of the rule the prune seat already states for
+        // patterns: the marker exemption keeps the record reportable, this keeps it
+        // observable.
+        let reserved_cookie_dir = path
+          .file_name()
+          .and_then(std::ffi::OsStr::to_str)
+          .is_some_and(crate::is_sync_cookie_dir_name)
+          && path
+            .parent()
+            .is_some_and(|parent| !strictly_outside(retained, parent));
+        let outside = strictly_outside(retained, &path) && !reserved_cookie_dir;
+        outside.then(|| (path.components().count(), *watch))
       })
       .collect();
     outside.sort_unstable_by_key(|(depth, _)| *depth);
@@ -3645,6 +3670,40 @@ impl DriverCore {
       .scopes
       .get(&scope)
       .map_or_else(Globs::default, |state| state.prune.clone())
+  }
+
+  /// Whether `dir` is inside the coverage this scope's applied set-cover still claims —
+  /// the sync admission's membership test, answered lexically because the cover is a
+  /// lexical statement about paths.
+  ///
+  /// `true` whenever there is nothing to be outside of, which is every case but a
+  /// descending scope a caller narrowed:
+  ///
+  /// - an **unknown scope** — the admission's own live-root gate speaks for that, and
+  ///   fail-open is the direction every coverage test here takes;
+  /// - a scope with **no applied cover** (`None`) — never narrowed, so the root's whole
+  ///   subtree is covered. A kernel-recursive scope is permanently here: `on_set_cover`
+  ///   refuses it before recording anything, because a whole-subtree stream has no
+  ///   per-directory coverage to narrow;
+  /// - a scope whose applied cover is **empty** — the degraded claim a standing `Rescan`
+  ///   leaves behind (see [`ScopeState::applied_cover`]). It claims no narrowing at all
+  ///   and is being re-armed from the root, so it fences nothing; reading it as the
+  ///   literal cover would mark every path outside, vacuously.
+  ///
+  /// Otherwise `dir` must be an ancestor or a descendant of some retained prefix. A
+  /// directory strictly outside is ground the caller's own cover asked this scope to stop
+  /// watching, so a marker written there could never be observed — the admission refuses
+  /// it before birth ([`DirUncovered`](crate::error::SyncRootError::DirUncovered)).
+  pub(crate) fn covers(&self, scope: ScopeId, dir: &Path) -> bool {
+    let Some(cover) = self
+      .scopes
+      .get(&scope)
+      .and_then(|state| state.applied_cover.as_deref())
+      .filter(|cover| !cover.is_empty())
+    else {
+      return true;
+    };
+    !strictly_outside(cover, dir)
   }
 
   /// A live scope's mount frame `(root_dev, root_mnt_id)` — the same-frame
@@ -6389,6 +6448,20 @@ fn crosses_mount_boundary(state: &ScopeState, entry: &RawDirEntry) -> bool {
     (Some(root_mnt), Some(entry_mnt)) if root_mnt != entry_mnt
   );
   device_boundary || mount_boundary
+}
+
+/// Whether `path` lies STRICTLY OUTSIDE `retained` — neither a descendant of a retained
+/// prefix (its coverage was asked for) nor an ancestor of one (it connects the root to
+/// coverage that was). The set-cover's prune predicate, and the membership test the sync
+/// admission asks the applied cover; lexical, exactly as the cover itself is.
+///
+/// An EMPTY `retained` marks every path outside, vacuously — which is why the empty cover
+/// is never applied as a narrowing (`on_set_cover` refuses it) and never read as one (see
+/// [`DriverCore::covers`]).
+fn strictly_outside(retained: &[PathBuf], path: &Path) -> bool {
+  retained
+    .iter()
+    .all(|r| !path.starts_with(r) && !r.starts_with(path))
 }
 
 /// The retained prefixes in `new` the PREVIOUS applied cover `prev` did not already cover —

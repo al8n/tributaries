@@ -3353,6 +3353,85 @@ mod descending {
       );
     }
 
+    /// Sends one `SyncRoot` and returns the driver's verdict verbatim — no
+    /// retry, no unwrap, because these cells are about the REFUSAL.
+    async fn sync_dir(
+      rig: &Rig,
+      scope: ScopeId,
+      dir: &str,
+      name: &str,
+    ) -> Result<PathBuf, crate::error::SyncRootError> {
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::SyncRoot {
+          scope,
+          dir: PathBuf::from(dir),
+          admitted: Default::default(),
+          name: name.to_owned(),
+          ticket: ticket(),
+          reply,
+        })
+        .await
+        .unwrap();
+      on_reply.await.expect("the driver replies")
+    }
+
+    /// A sync of a directory the applied cover no longer holds is refused BEFORE
+    /// birth, and refused the same way every time.
+    ///
+    /// The cut is what makes it unobservable: `/r/drop`'s watch is gone, so a
+    /// marker created under it reaches no source and the caller's barrier could
+    /// only time out. Reporting success and letting the wait expire is the one
+    /// answer the sync must never give, so the admission judges cover membership
+    /// with the other pre-birth ground refusals.
+    ///
+    /// Pre-birth is the second half, and the repeat is how it is read: an
+    /// admitted sync holds the scope's single-flight gate, so a refusal that had
+    /// minted an obligation would answer the SECOND call `WriteInFlight` instead.
+    /// Two identical `DirUncovered`s and a ledger still at zero say nothing was
+    /// created either time.
+    ///
+    /// Non-vacuity: the retained side of the very same cover still syncs, so the
+    /// refusal is the COVER's verdict and not a sync path that stopped working.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sync_outside_the_applied_cover_is_refused_before_birth() {
+      let (rig, scope) = covered_rig(&[("/r/keep", 11), ("/r/drop", 12)]).await;
+      shrunk_to_keep(&rig, scope).await;
+
+      for attempt in 1..=2 {
+        assert!(
+          matches!(
+            sync_dir(&rig, scope, "/r/drop", ".tributaries-sync-1-2-3").await,
+            Err(crate::error::SyncRootError::DirUncovered { ref dir })
+              if dir == std::path::Path::new("/r/drop")
+          ),
+          "attempt {attempt}: a sync of pruned ground is refused as uncovered"
+        );
+        let (reply, on_reply) = futures_channel::oneshot::channel();
+        rig
+          .commands
+          .send(Command::DebugCookieCount { reply })
+          .await
+          .unwrap();
+        assert_eq!(
+          on_reply.await.expect("the driver replies"),
+          0,
+          "attempt {attempt}: the refusal minted no obligation"
+        );
+      }
+      assert!(
+        rig.fs.cookie_writes().is_empty(),
+        "and nothing was ever written"
+      );
+
+      // The retained half of the same cover is untouched.
+      let path = sync_dir(&rig, scope, "/r/keep", ".tributaries-sync-4-5-6")
+        .await
+        .expect("a sync inside the applied cover still admits");
+      assert_eq!(path, PathBuf::from("/r/keep/.tributaries-sync-4-5-6"));
+    }
+
     /// THE PUBLIC CONTRACT END TO END for the one loss that arrives with no cover
     /// of its own: an awaited reply over a standing classification stat reports
     /// `Degraded`, and the covering `Rescan` that verdict names is on the

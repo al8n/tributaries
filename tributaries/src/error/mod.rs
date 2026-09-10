@@ -660,6 +660,14 @@ pub enum SyncError {
   /// The resolved cookie directory lies outside the subscription's root, or
   /// outside the coverage its root actually retains — a cookie written there
   /// could never be reported on this subscription's stream.
+  ///
+  /// The coverage a root retains is narrowed by an exclusion, by the root's own
+  /// prune seat, by a mount standing between the root and the directory, and by
+  /// the set-cover the indexer applies as subscriptions come and go. The last of
+  /// those is the one that can change under a caller whose spelling never did:
+  /// a directory covered for one sync is uncovered for the next once the only
+  /// subscription that kept it is dropped. Re-subscribe to the ground the sync
+  /// names, or sync a directory the coverage still holds.
   #[error("the sync cookie directory is not inside the subscription's coverage")]
   CookieDirUncovered,
   /// The subscription was unwatched by its caller while the sync was pending.

@@ -294,7 +294,8 @@ impl SyncAdmission {
 /// [`CleanupBacklog`](SyncRootError::CleanupBacklog), and the reply-borne
 /// [`UnknownRoot`](SyncRootError::UnknownRoot) /
 /// [`BadCookieName`](SyncRootError::BadCookieName) /
-/// [`DirOutsideRoot`](SyncRootError::DirOutsideRoot)). Such a refusal burns
+/// [`DirOutsideRoot`](SyncRootError::DirOutsideRoot) /
+/// [`DirUncovered`](SyncRootError::DirUncovered)). Such a refusal burns
 /// nothing, so re-present the returned admission to
 /// [`sync_root`](Watcher::sync_root) to retry under the SAME sequence — the paired
 /// [`SyncTicket`] stays valid. `None` means the sequence is spent or its fate is
@@ -347,6 +348,7 @@ impl SyncRootDenied {
         | SyncRootError::ForeignTicket
         | SyncRootError::BadCookieName { .. }
         | SyncRootError::DirOutsideRoot { .. }
+        | SyncRootError::DirUncovered { .. }
         | SyncRootError::WriteInFlight
         | SyncRootError::NameInUse { .. }
         | SyncRootError::TicketInUse {}
@@ -1953,6 +1955,12 @@ impl<R> Watcher<R> {
   /// [`prune`](crate::RootOptions::prune) seat covers the CANONICAL directory the
   /// write resolves for `dir`, for the same reason and carrying the pattern that did
   /// it;
+  /// [`DirUncovered`](SyncRootError::DirUncovered) when a
+  /// [`set_cover`](Self::set_cover) has narrowed this root's coverage past `dir` —
+  /// the third way the caller's own words can leave the marker's ground unwatched,
+  /// refused before birth like the two above (the watcher's reserved cookie
+  /// directory inside a covered `dir` is exempt from the cut, so a second sync of
+  /// that directory stays observable);
   /// [`DirReplaced`](SyncRootError::DirReplaced) when the directory the write's
   /// own descent reaches is not the object `dir` named at admission — a peer
   /// replaced it in the meantime, and the barrier promises an ordering for the

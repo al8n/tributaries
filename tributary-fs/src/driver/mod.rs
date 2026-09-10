@@ -12503,6 +12503,26 @@ pub(crate) async fn run<R, F>(
                   dir,
                   exclusion,
                 }));
+              } else if !core.covers(scope, &dir) {
+                // Inside the root, outside the root's own APPLIED COVER: a
+                // `set_cover` narrowed this scope's per-directory coverage past
+                // this directory, so the ground the marker would land in holds no
+                // watch and its create reaches no source. The third word with the
+                // same shape as the two above — an exclusion, a prune pattern, and
+                // now a cover — and refused for the same reason, before birth.
+                //
+                // Read off the cover the core APPLIED, not the one the caller last
+                // requested: a refused or superseded request narrowed nothing, and
+                // a scope whose cover degraded to the empty claim is being re-armed
+                // from the root and fences nothing ([`DriverCore::covers`]).
+                //
+                // Only the caller's own subscriptions are its business here. The
+                // watcher's reserved cookie directory one level inside `dir` is
+                // NOT: no cover can name it, so the core keeps its watch armed
+                // across the cut instead — which is what makes a covered
+                // directory's SECOND sync (the one that reuses the reserved
+                // directory and so provokes no directory create) observable at all.
+                let _ = reply.send(Err(crate::error::SyncRootError::DirUncovered { dir }));
               } else if let Some(refusal) = admitted_ground_refusal(
                 &root,
                 &admitted,
