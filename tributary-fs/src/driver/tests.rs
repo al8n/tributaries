@@ -18600,6 +18600,101 @@ mod sync_cookie {
       let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A reserved directory already read to its END is walked again from the
+    /// START — and so is the walk after that.
+    ///
+    /// One descriptor serves an obligation for its whole life, and more than one
+    /// walk runs through it: the sole-entry proof reads it to the end at the
+    /// create, and every later locate-by-identity reads it again. A read POSITION
+    /// belongs to the open file description rather than to the descriptor, so a
+    /// `dup` of a directory the proof has already finished hands `fdopendir` a
+    /// stream that is ALREADY at the end — it enumerates nothing, the locate
+    /// reports no match, and the retry that follows inherits the very same position
+    /// and reports the very same nothing. The obligation then parks over a marker
+    /// sitting in that directory the whole time, plainly visible to anything that
+    /// opened it fresh.
+    ///
+    /// Opening `.` relative to the held descriptor is what makes each walk its own:
+    /// the same object, no path resolved, a position of its own at zero.
+    ///
+    /// Two hunts, because one proves only that a single walk survives the proof's
+    /// position. The second is what a driver actually does when a peer moves a
+    /// marker twice, and a position carried forward would leave it blind exactly as
+    /// it left the first.
+    ///
+    /// Revert witness: hand `fdopendir` a `try_clone` of the held descriptor again
+    /// and the first removal below fails — the duplicate opens at the proof's
+    /// end-of-directory and the renamed marker is never found.
+    #[test]
+    fn a_finished_walk_does_not_leave_the_next_one_at_the_end() {
+      let root = scratch("walk-restarts");
+      let target = root.join("a");
+      std::fs::create_dir_all(&target).expect("the directory the sync names");
+      let fs = RealFs::new();
+      let live = crate::driver::LiveRoot::for_tests(&root);
+      let reserved = target.join(cookie_dir_name());
+      let name = ".tributaries-sync-1-2-63-0000000000000063";
+
+      // The write mints the reserved directory and proves it holds nothing but this
+      // marker — an enumeration that runs to the END of the very descriptor the
+      // record keeps for every walk after it.
+      let cookie = fs
+        .write_cookie(
+          &live,
+          &target,
+          admitted(&root, &target),
+          name,
+          &tributary_proto::glob::Globs::default(),
+          &[],
+        )
+        .expect("a directory holding nothing but this write's marker is entered");
+      assert_eq!(
+        leaves_in(&reserved),
+        vec![name.to_owned()],
+        "staging: the proof ran, so the directory has been read to its end"
+      );
+
+      // A peer renames the marker aside. Its own name is empty now, so the only
+      // thing that can still reach it is a walk of that same descriptor.
+      std::fs::rename(reserved.join(name), reserved.join("stolen"))
+        .expect("the peer renames the marker aside");
+      assert_eq!(
+        fs.remove_cookie(&cookie)
+          .expect("the removal walks the directory again and finds the marker"),
+        CookieRemoval::Unlinked,
+        "the walk started over, so the renamed marker was there to be found"
+      );
+      assert!(
+        leaves_in(&reserved).is_empty(),
+        "and it is gone: {:?}",
+        leaves_in(&reserved)
+      );
+
+      // And the walk AFTER that one starts over too. A fresh object in the same
+      // directory, hunted through the same descriptor the two finished walks ran
+      // on.
+      let anchor = cookie
+        .dir
+        .as_deref()
+        .expect("the record is anchored to the reserved directory");
+      let planted = std::fs::File::create(reserved.join("planted"))
+        .expect("a second object inside the reserved directory");
+      let identity = identity_of_handle(&planted)
+        .expect("its identity reads off the descriptor")
+        .expect("this platform answers one");
+      assert!(
+        unlink_entry_by_identity(anchor, identity).expect("the second hunt walks the directory"),
+        "the third walk started over as well, so it found the planted object"
+      );
+      assert!(
+        leaves_in(&reserved).is_empty(),
+        "and unlinked it: {:?}",
+        leaves_in(&reserved)
+      );
+
+      let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The inode number the admission's identity is taken on cannot be handed to
     /// another object while the sync is in flight, because the admission is
     /// HOLDING the object rather than remembering its number.

@@ -2023,6 +2023,23 @@ fn dir_holds_only(fd: &std::os::fd::OwnedFd, marker: &str) -> Result<bool, std::
 /// It reads one entry at a time and retains none of them, so a caller's bound is
 /// its own: `visit` sees each name while the walk holds it and decides then
 /// whether to keep anything.
+///
+/// # Every walk starts at the beginning
+///
+/// The caller's descriptor is held for the life of a sync and walked more than
+/// once — the sole-entry proof reads it to the end, and a later removal hunts
+/// through it for an object whose name moved. A read POSITION is a property of the
+/// open file description, not of the descriptor, and `dup` gives out another
+/// descriptor onto the SAME description: a duplicate of a directory already read to
+/// the end starts at the end, so `fdopendir` on it enumerates nothing and every
+/// walk after the first reports an empty directory. A retry inherits the same
+/// position and reports the same nothing, so a removal that depends on this walk
+/// never converges.
+///
+/// So the walk opens `.` RELATIVE to the held descriptor instead. That is a fresh
+/// open file description of the very object the caller is holding — its own
+/// position, at zero — and it resolves no component of any path, so a directory
+/// renamed or replaced under this driver's feet still cannot redirect it.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn walk_dir_entries<T>(
   fd: &std::os::fd::OwnedFd,
@@ -2031,21 +2048,22 @@ fn walk_dir_entries<T>(
   use std::os::fd::IntoRawFd;
 
   // `fdopendir` takes OWNERSHIP of the descriptor it is given and `closedir`
-  // closes it, so it is handed a DUPLICATE: the caller's own descriptor is
-  // neither consumed nor closed, and every check taken after this one is taken on
-  // that same object.
-  let duplicate = fd.try_clone()?.into_raw_fd();
-  // SAFETY: `duplicate` is a fresh, open directory descriptor owned by nobody
-  // else, which is exactly what `fdopendir` requires and takes over.
-  let dir = unsafe { libc::fdopendir(duplicate) };
+  // closes it, so it is handed a descriptor OF ITS OWN: the caller's is neither
+  // consumed nor closed, and every check taken after this one is taken on that
+  // same object. It is a fresh OPEN of `.` rather than a duplicate because a
+  // duplicate would share the caller's read position and a fresh open does not
+  // (see this function's own paragraph on it).
+  let own = open_dir_at(fd, std::ffi::OsStr::new("."))?.into_raw_fd();
+  // SAFETY: `own` is a fresh, open directory descriptor owned by nobody else,
+  // which is exactly what `fdopendir` requires and takes over.
+  let dir = unsafe { libc::fdopendir(own) };
   if dir.is_null() {
     let failure = std::io::Error::last_os_error();
-    // `fdopendir` took no ownership on failure, so the duplicate is still this
+    // `fdopendir` took no ownership on failure, so the descriptor is still this
     // frame's to close.
     //
-    // SAFETY: `duplicate` is still open, is owned here, and nothing else holds
-    // it.
-    unsafe { libc::close(duplicate) };
+    // SAFETY: `own` is still open, is owned here, and nothing else holds it.
+    unsafe { libc::close(own) };
     return Err(failure);
   }
   let mut stopped = None;
@@ -10029,8 +10047,9 @@ fn remove_anchored(
 /// that stopped at the empty name would report success over a live file.
 ///
 /// Everything about it stays inside the anchoring rule. The enumeration runs
-/// through the directory's OWN descriptor ([`walk_dir_entries`], the same
-/// `fdopendir`-on-a-duplicate shape the sole-entry proof uses), each candidate is
+/// through the directory's OWN descriptor ([`walk_dir_entries`], the same walk the
+/// sole-entry proof uses — and it starts at the beginning however many times that
+/// proof has already read this directory to the end), each candidate is
 /// classified by an `openat` of that same descriptor, and the unlink addresses an
 /// entry of it — no component of any path is resolved at any step, so a directory
 /// renamed or replaced under this driver's feet changes nothing about where the
