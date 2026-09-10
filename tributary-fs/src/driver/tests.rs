@@ -1332,6 +1332,143 @@ async fn a_tick_at_the_probe_budget_dispatches_nothing_and_retries_later() {
   );
 }
 
+/// Empties the event stream and waits for it to STAY empty — the baseline a
+/// delta-shaped event assertion is read against.
+async fn drain_events(rig: &Rig) {
+  let mut quiet = 0;
+  for _ in 0..interpreted_rounds(400) {
+    let mut took = false;
+    while rig.events.try_recv().is_ok() {
+      took = true;
+    }
+    quiet = if took { 0 } else { quiet + 1 };
+    if quiet >= 10 {
+      return;
+    }
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+  }
+}
+
+/// A scope the probe budget turns away is told its coverage is UNPROVEN, and
+/// told once.
+///
+/// A declined tick that only withdrew the core's pending mark left the scope
+/// falsely live and silent. At the budget there is no probe of this scope to
+/// coalesce onto and none is coming: every slot is held by a call that may never
+/// return, and on a descending backend the in-tree death notice can itself be
+/// postponed without bound by a descriptor a stalled write is holding. So the
+/// root can die and the subscriber would never hear — no `Rescan`, no terminal,
+/// a coverage claim nobody is checking.
+///
+/// Sixty-five ticking scopes fill sixty-four slots; the one left over is the
+/// scope the budget turned away, and it stays turned away for as long as the
+/// gate holds. Its covering `Rescan` is the observable, and it is read as a
+/// DELTA — the registrations' own closing covers are drained first — while the
+/// budget is still full, never at the release.
+///
+/// ONCE is the second half. The fact does not become more true each interval,
+/// and a `Rescan` per tick against a wedged filesystem is a re-enumeration storm
+/// the subscriber pays for. The window below spans many intervals, so a per-tick
+/// signal would be counted as such.
+///
+/// Revert witness: drop the loss funnel from the budget arm of
+/// `on_refresh_declined` and no `Rescan` arrives at all until the gate opens;
+/// drop the once-per-episode latch and the count runs with the intervals.
+///
+/// not(miri): the claim needs `MAX_LIVENESS_PROBES` real parked threads, exactly
+/// as its sibling above.
+#[cfg(not(miri))]
+#[tokio::test]
+async fn a_probe_declined_at_the_budget_reports_the_scope_unproven_once() {
+  let ticked = MAX_LIVENESS_PROBES + 1;
+  let registry = RecordingRegistry::default();
+  let roots: Vec<String> = (0..ticked).map(|index| format!("/r{index}")).collect();
+  let rig = ticking_rig_over(Duration::from_millis(20), registry.clone(), &roots);
+  for root in &roots {
+    let _ = watch(&rig, root).await;
+  }
+  // The baseline: every registration window's closing `Rescan` is spent, so what
+  // the window below counts came from the decline and from nothing else.
+  drain_events(&rig).await;
+
+  // Every root vanishes, and every probe from here parks before it can say so.
+  let gate = rig.fs.hold_refreshes();
+  rig.fs.set_root_liveness(RootLiveness::Missing);
+  assert!(
+    settle_probes_within(&rig, 400, MAX_LIVENESS_PROBES).await,
+    "staging: the budget fills"
+  );
+  assert!(
+    probes_hold_at(&rig, MAX_LIVENESS_PROBES).await,
+    "and it holds: one scope is left with no slot at all"
+  );
+  assert!(
+    registry.dead().is_empty(),
+    "staging: nothing can die while every probe is parked"
+  );
+
+  // FIRST: the turned-away scope's covering `Rescan` arrives while the budget is
+  // still full — a delta against the stream this cell emptied, not a count of
+  // everything the rig ever said.
+  let mut opened = 0usize;
+  for _ in 0..interpreted_rounds(400) {
+    while let Ok((_, _, change)) = rig.events.try_recv() {
+      if change.kind().is_rescan() {
+        opened += 1;
+      }
+    }
+    if opened > 0 {
+      break;
+    }
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+  }
+  assert!(
+    opened >= 1,
+    "a scope the budget turned away says its coverage is unproven, while the \
+     budget is still full — not at the release"
+  );
+  assert!(
+    registry.dead().is_empty(),
+    "and it is a degradation, not a terminal — nothing died"
+  );
+
+  // THEN: nothing more, across many further intervals of the same episode. The
+  // budget is stable (every slot is parked, so no scope can free one and no new
+  // scope can be turned away), so a second cover here could only be the same
+  // fact restated — a re-enumeration storm on top of a wedged filesystem.
+  drain_events(&rig).await;
+  let mut repeats = 0usize;
+  for _ in 0..interpreted_rounds(120) {
+    while let Ok((_, _, change)) = rig.events.try_recv() {
+      if change.kind().is_rescan() {
+        repeats += 1;
+      }
+    }
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+  }
+  assert_eq!(
+    repeats, 0,
+    "the episode is reported once: every later declined tick of the same budget \
+     adds nothing"
+  );
+
+  // The budget frees: every parked probe answers, the turned-away scope ticks
+  // again, and every root's death is finally observed.
+  gate.release();
+  let expected = ticked;
+  assert!(
+    settle_within(interpreted_rounds(400), || registry.dead().len()
+      == expected)
+    .await,
+    "every scope dies once the probes answer — the one the budget turned away \
+     ticked again and got a probe of its own (dead: {}, expected {expected})",
+    registry.dead().len()
+  );
+}
+
 /// The refresh samples the root's identity AND its mount frame from ONE object, so
 /// a replaced/re-mounted root can never pair the OLD identity's verdict with a NEW
 /// object's frame (the mixed sample the atomic `statx` restructure closes). The fake

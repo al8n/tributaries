@@ -48,9 +48,9 @@ use tributary_proto::{
 
 use crate::{
   core::{
-    CoverNoop, CoverReconcile, CoverSettle, Delivery, DriverCore, Effect, ExpectedObject, FenceId,
-    MountRefresh, ProbeId, ProbeOutcome, RawDirEntry, RawEnumerate, RootLiveness, SettlePass,
-    WidenCommit, WidenTaint,
+    CoverNoop, CoverReconcile, CoverSettle, DeclineReason, Delivery, DriverCore, Effect,
+    ExpectedObject, FenceId, MountRefresh, ProbeId, ProbeOutcome, RawDirEntry, RawEnumerate,
+    RootLiveness, SettlePass, WidenCommit, WidenTaint,
   },
   error::WatchRootError,
   os::{
@@ -10509,13 +10509,21 @@ enum ControlBatchEnd {
 /// process.
 ///
 /// At the budget a tick dispatches nothing and tells the core so
-/// ([`DriverCore::on_refresh_declined`]), which drops the scope's pending mark so
-/// the next interval re-arms. What degrades is exactly what already degrades for
-/// a scope whose own probe never answers: its death is observed when the mount
-/// finally answers, or through the mount table the next successful probe reads.
-/// Nothing is logged and nothing is refused — a hung root is a hung mount, and a
-/// watcher whose roots are all wedged has a filesystem problem the watcher cannot
-/// out-thread.
+/// ([`DriverCore::on_refresh_declined`] with
+/// [`BudgetFull`](crate::core::DeclineReason::BudgetFull)), which drops the
+/// scope's pending mark so the next interval re-arms.
+///
+/// What a SATURATED budget means, said in one place: the scope it turned away is
+/// being watched for death by nothing at all — not by a probe of its own, and not
+/// by an in-tree notice a stalled write's descriptor can postpone without bound.
+/// So it degrades to a LOCATED `RESCAN`, not to silence: the turned-away scope
+/// goes through the core's loss funnel once per budget episode and its subscriber
+/// is told its coverage is unproven, which it answers by re-enumerating. The
+/// retry deadline is kept, so the scope recovers on its own the moment a slot
+/// frees. Nothing is logged and nothing is refused — a hung root is a hung mount,
+/// and a watcher whose roots are all wedged has a filesystem problem the watcher
+/// cannot out-thread; what it must never do is keep reporting those roots alive on
+/// no evidence.
 pub(crate) const MAX_LIVENESS_PROBES: usize = 64;
 
 /// The root-liveness probes this driver has dispatched and not yet heard back
@@ -10584,23 +10592,25 @@ impl LivenessProbes {
   }
 
   /// Claims a slot for one probe of `scope`, returning the tag to dispatch it
-  /// under. `None` refuses, for one of two reasons the caller must tell apart:
-  /// the scope already has a probe outstanding under this tag (a hung root — a
-  /// second thread on it proves nothing), or the watcher is at
-  /// [`MAX_LIVENESS_PROBES`].
-  fn claim(&mut self, scope: ScopeId) -> Option<u64> {
+  /// under — or the REASON it was refused, which the core acts on differently
+  /// ([`DeclineReason`]): the scope already has a probe outstanding under this tag
+  /// (a hung root — a second thread on it proves nothing), or the watcher is at
+  /// [`MAX_LIVENESS_PROBES`] and nothing at all is going to prove this root.
+  ///
+  /// The per-scope test comes FIRST and is reported as itself even when the budget
+  /// is also full: a scope with its own probe still running has a proof in flight,
+  /// whatever the rest of the watcher is doing, so it is not the scope the budget
+  /// left unwatched.
+  fn claim(&mut self, scope: ScopeId) -> Result<u64, DeclineReason> {
     let tag = *self.generation.entry(scope).or_default();
-    if self.in_flight.contains(&(scope, tag)) || self.outstanding() >= MAX_LIVENESS_PROBES {
-      return None;
+    if self.in_flight.contains(&(scope, tag)) {
+      return Err(DeclineReason::ScopeBusy);
+    }
+    if self.outstanding() >= MAX_LIVENESS_PROBES {
+      return Err(DeclineReason::BudgetFull);
     }
     self.in_flight.insert((scope, tag));
-    Some(tag)
-  }
-
-  /// Whether the watcher is at its probe budget — the refusal a tick must report
-  /// to the core, as distinct from the per-scope coalescing skip.
-  fn at_budget(&self) -> bool {
-    self.outstanding() >= MAX_LIVENESS_PROBES
+    Ok(tag)
   }
 
   /// Books one probe's answer: its thread has exited, so the slot comes back
@@ -16126,7 +16136,10 @@ fn execute_effects<R, F>(
         // a wedged tree retires scopes whose threads live on. At
         // [`MAX_LIVENESS_PROBES`] this dispatches nothing and TELLS the core, so
         // the scope's pending mark drops and its next tick re-arms rather than
-        // coalescing onto a probe that was never sent.
+        // coalescing onto a probe that was never sent — and, because a scope the
+        // budget turned away has no proof of liveness at all, the core routes it
+        // through its loss funnel once per episode instead of leaving it falsely
+        // live and silent.
         //
         // The TAG is what makes a replacement root independent of the retiring
         // one: a replace commit retires the scope's tag, so the replacement's own
@@ -16139,11 +16152,15 @@ fn execute_effects<R, F>(
         if torn_down.contains(&scope) {
           continue;
         }
-        let Some(generation) = probes.claim(scope) else {
-          if probes.at_budget() {
-            core.on_refresh_declined(scope, now());
+        let generation = match probes.claim(scope) {
+          Ok(generation) => generation,
+          // The core is TOLD which refusal this was: a coalescing skip over a
+          // running probe and a budget that left this root unwatched degrade to
+          // different things ([`DriverCore::on_refresh_declined`]).
+          Err(reason) => {
+            core.on_refresh_declined(scope, now(), reason);
+            continue;
           }
-          continue;
         };
         let ops = ops.clone();
         let tx = op_tx.clone();

@@ -347,6 +347,28 @@ pub(crate) enum CoverNoop {
   RefusedCover,
 }
 
+/// Why the driver did NOT dispatch a mount refresh the core had armed
+/// ([`on_refresh_declined`](DriverCore::on_refresh_declined)).
+///
+/// The two are not the same fact, and the core answers them differently. One is
+/// a coalescing skip over a probe that IS running; the other is a probe that was
+/// never sent, so nothing is going to prove this root's liveness — and a scope
+/// whose liveness cannot be proven has to say so rather than keep a coverage
+/// claim nobody is checking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeclineReason {
+  /// This scope already has a probe outstanding. A second thread on a root that
+  /// has not answered proves nothing, and the running probe's own completion is
+  /// the answer that clears the mark — so the tick costs one interval and
+  /// nothing else.
+  ScopeBusy,
+  /// The watcher is at its liveness-probe budget
+  /// ([`MAX_LIVENESS_PROBES`](crate::driver::MAX_LIVENESS_PROBES)): every slot is
+  /// held by a probe inside a call that may never return, so THIS scope's root is
+  /// being watched for death by nothing at all.
+  BudgetFull,
+}
+
 /// How one settled set-cover fence reports its window.
 ///
 /// # What a clean settle certifies, and what it cannot
@@ -1389,6 +1411,18 @@ struct ScopeState {
   /// predate the newly-lost window, so its result is discarded and one more
   /// refresh re-arms.
   refresh_stale: bool,
+  /// This scope is inside a probe-BUDGET episode: a refresh it armed was
+  /// declined because every liveness-probe slot in the watcher was held
+  /// ([`DeclineReason::BudgetFull`]), and the covering `Rescan` that says so has
+  /// already been routed.
+  ///
+  /// It is an EPISODE latch, not a counter: the loss is "this root's liveness is
+  /// unproven", one fact that stays true for as long as the budget stays full,
+  /// and a subscriber that re-enumerates on the first `Rescan` learns nothing
+  /// from a second one every interval. Cleared by the next refresh of this scope
+  /// that actually completes — the moment a probe answers, the liveness claim is
+  /// proven again and a later episode is a new fact.
+  budget_lossy: bool,
   /// A root REPLACE committed while a refresh was in flight: that snapshot
   /// describes the replaced world, so EVERYTHING it carries — the liveness
   /// verdict included — is about an object this scope no longer watches.
@@ -2108,6 +2142,7 @@ impl DriverCore {
         mounts_authoritative: false,
         refresh_pending: false,
         refresh_stale: false,
+        budget_lossy: false,
         refresh_world_stale: false,
         lag: LagState::Normal,
         park: Park::default(),
@@ -4080,8 +4115,8 @@ impl DriverCore {
   }
 
   /// Withdraws the refresh `scope` has pending because the driver DECLINED to
-  /// dispatch it — the watcher is at its liveness-probe budget
-  /// ([`MAX_LIVENESS_PROBES`](crate::driver::MAX_LIVENESS_PROBES)).
+  /// dispatch it, and — where the decline means nothing is proving this root's
+  /// liveness — says so on the scope's own stream.
   ///
   /// Coalescing is right only onto a probe that is actually running. A pending
   /// mark standing for a probe nobody sent would swallow every later arming for
@@ -4094,13 +4129,57 @@ impl DriverCore {
   /// deadline is seeded by a completing refresh, so a scope whose BIRTH refresh is
   /// the one declined has no deadline yet and would never tick again — the
   /// silently permanent hole a budget must not open.
-  pub(crate) fn on_refresh_declined(&mut self, scope: ScopeId, now: Instant) {
+  ///
+  /// # A declined probe is a lost PROOF, and [`BudgetFull`](DeclineReason::BudgetFull)
+  /// says so
+  ///
+  /// Dropping the mark and re-arming the deadline is the whole answer for
+  /// [`ScopeBusy`](DeclineReason::ScopeBusy): a probe of this scope is running,
+  /// and its completion is the proof. At the BUDGET there is no such probe. Every
+  /// slot is held by a call that may never return, so this root's death — which
+  /// on a descending backend can be postponed indefinitely by a descriptor a
+  /// stalled write is holding — has nothing left to detect it, and the next tick
+  /// will be declined for the same reason. Withdrawing the mark alone would leave
+  /// the scope FALSELY LIVE and silent: the subscriber keeps a coverage claim
+  /// nobody is checking and is never told.
+  ///
+  /// So the scope goes through the loss funnel the rest of the core already uses
+  /// — the Monitor turns it into an epoch-bumped covering `Rescan` — and the
+  /// subscriber learns that its coverage is UNPROVEN and must re-enumerate,
+  /// rather than being told a root is alive on no evidence. The retry deadline is
+  /// kept: this is a degradation, not a terminal.
+  ///
+  /// ONCE per episode ([`budget_lossy`](ScopeState::budget_lossy)). The fact is
+  /// "this root's liveness is unproven", which does not become more true each
+  /// interval, and a `Rescan` per tick against a saturated budget would be a
+  /// re-enumeration storm on top of a filesystem that is already wedged. The
+  /// latch clears at the next completing refresh of this scope, so a LATER
+  /// episode reports again.
+  ///
+  /// Deliberately NOT the full [`on_root_overflow`](Self::on_root_overflow)
+  /// treatment: device trust is left alone, because closing it arms another
+  /// refresh — the very effect the budget cannot dispatch — and parked work is
+  /// left alone, because nothing here says a window was dropped.
+  pub(crate) fn on_refresh_declined(
+    &mut self,
+    scope: ScopeId,
+    now: Instant,
+    reason: DeclineReason,
+  ) {
     let interval = self.root_liveness_interval;
     let Some(state) = self.scopes.get_mut(&scope) else {
       return;
     };
     state.refresh_pending = false;
     Self::arm_liveness(state, interval, now);
+    let unproven = match reason {
+      DeclineReason::ScopeBusy => false,
+      DeclineReason::BudgetFull => !std::mem::replace(&mut state.budget_lossy, true),
+    };
+    if unproven {
+      self.monitor.on_overflow(Scope::Root(scope), now);
+      self.drain_monitor();
+    }
   }
 
   /// (Re)arms the periodic root-liveness deadline for a tick-armed scope whose
@@ -4137,6 +4216,11 @@ impl DriverCore {
     let Some(state) = self.scopes.get_mut(&scope) else {
       return;
     };
+    // A probe of this scope answered, whatever it answered: the budget episode
+    // that left its liveness unproven is over, so a LATER one is a fresh fact and
+    // reports again ([`on_refresh_declined`]). Cleared ahead of every gate below,
+    // since each of them is a completion too.
+    state.budget_lossy = false;
     // The cross-world gate precedes even the death gate: this completion was
     // addressed to a root this scope REPLACED, so its liveness verdict is
     // about the old object — evidence for a world that ended at the commit,
