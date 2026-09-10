@@ -103,7 +103,9 @@ pub enum OptionsError {
     RootOptions::MAX_SEAT_PATTERNS
   )]
   TooManyPrunePatterns {
-    /// How many patterns the seat carried.
+    /// How many patterns the seat carried — which a programmatic setter bounds
+    /// at [`RootOptions::MAX_SEAT_PATTERNS`] + 1, so it is the length
+    /// held rather than the length of whatever iterator was handed in.
     supplied: usize,
   },
   /// The per-root [`include`](RootOptions::include) seat carries more patterns
@@ -113,7 +115,9 @@ pub enum OptionsError {
     RootOptions::MAX_SEAT_PATTERNS
   )]
   TooManyIncludePatterns {
-    /// How many patterns the seat carried.
+    /// How many patterns the seat carried — which a programmatic setter bounds
+    /// at [`RootOptions::MAX_SEAT_PATTERNS`] + 1, so it is the length
+    /// held rather than the length of whatever iterator was handed in.
     supplied: usize,
   },
 }
@@ -1332,8 +1336,12 @@ impl Default for WatcherOptions {
 /// [`watch_with`](crate::Watcher::watch_with) refuses on before any coverage
 /// exists. The `serde` face refuses an over-full seat mid-document and the `clap`
 /// face at the occurrence past the ceiling, so on neither of them does a list past
-/// it ever compile; and beneath every one of those the matcher's own constructor
-/// carries the same bound, so a seat this household never saw is bounded too.
+/// it ever compile; the programmatic setters keep the same list bounded AT
+/// COLLECTION — they retain one pattern past the ceiling and no more, whatever the
+/// iterator handed to them goes on to yield, so `validate` is always reachable and
+/// always sees the over-cap witness; and beneath every one of those the matcher's
+/// own constructor carries the same bound, so a seat this household never saw is
+/// bounded too.
 ///
 /// With the `serde` feature the household is one object keyed by the field
 /// names, every key optional and defaulted from [`new`](Self::new); the two glob
@@ -1537,6 +1545,36 @@ struct RootOptionsArgs {
   /// Raw strings for `prune`'s reason, and bounded the same way.
   #[arg(long, num_args = 0..=1)]
   include: Option<Vec<String>>,
+}
+
+/// Collects ONE glob seat from a caller's iterator, taking at most
+/// [`RootOptions::MAX_SEAT_PATTERNS`] + 1 items — the door every programmatic
+/// setter of this household goes through.
+///
+/// The setters are infallible, and that is a statement about their SIGNATURE, not
+/// a licence to do unbounded work on the way to one: `impl IntoIterator` is a
+/// caller's own iterator, which need not terminate, and a plain `collect` grows
+/// the crate-owned `Vec` for as long as it yields — so the ceiling this type
+/// documents is reached by nothing, [`validate`](RootOptions::validate) is never
+/// asked, and the process dies holding a seat nobody ever validated.
+///
+/// Taking ONE item past the ceiling is what keeps the refusal exact rather than
+/// merely bounded: a seat that fills the ceiling is legal and survives intact,
+/// and the extra item is the over-cap witness `validate` refuses on — the same
+/// verdict, in the same place, a finite over-cap list has always got. What a
+/// non-terminating iterator loses is only the true count in the refusal's
+/// `supplied`, which is a number nobody could have read without doing the
+/// unbounded work.
+///
+/// The shape is [`Globs::new`](tributary_proto::Globs::new)'s, deliberately: that
+/// constructor is the floor beneath every seat, and a household bounded by a
+/// different rule than the matcher below it would be a second opinion about one
+/// number.
+fn collect_seat(patterns: impl IntoIterator<Item = Glob>) -> Vec<Glob> {
+  patterns
+    .into_iter()
+    .take(RootOptions::MAX_SEAT_PATTERNS + 1)
+    .collect()
 }
 
 /// Compiles ONE glob seat off the command line, refusing a list longer than
@@ -1850,17 +1888,25 @@ impl RootOptions {
   }
 
   /// Returns these options with the pruned subtrees set.
+  ///
+  /// Retains at most [`MAX_SEAT_PATTERNS`](Self::MAX_SEAT_PATTERNS) + 1 patterns,
+  /// whatever the iterator goes on to yield; a seat that reaches that length is
+  /// refused by [`validate`](Self::validate).
   #[inline]
   #[must_use]
   pub fn with_prune(mut self, prune: impl IntoIterator<Item = Glob>) -> Self {
-    self.prune = prune.into_iter().collect();
+    self.prune = collect_seat(prune);
     self
   }
 
   /// Sets the pruned subtrees.
+  ///
+  /// Retains at most [`MAX_SEAT_PATTERNS`](Self::MAX_SEAT_PATTERNS) + 1 patterns,
+  /// whatever the iterator goes on to yield; a seat that reaches that length is
+  /// refused by [`validate`](Self::validate).
   #[inline]
   pub fn set_prune(&mut self, prune: impl IntoIterator<Item = Glob>) -> &mut Self {
-    self.prune = prune.into_iter().collect();
+    self.prune = collect_seat(prune);
     self
   }
 
@@ -1875,17 +1921,25 @@ impl RootOptions {
   }
 
   /// Returns these options with delivery narrowed to the given file patterns.
+  ///
+  /// Retains at most [`MAX_SEAT_PATTERNS`](Self::MAX_SEAT_PATTERNS) + 1 patterns,
+  /// whatever the iterator goes on to yield; a seat that reaches that length is
+  /// refused by [`validate`](Self::validate).
   #[inline]
   #[must_use]
   pub fn with_include(mut self, include: impl IntoIterator<Item = Glob>) -> Self {
-    self.include = Some(include.into_iter().collect());
+    self.include = Some(collect_seat(include));
     self
   }
 
   /// Sets the file patterns delivery is narrowed to.
+  ///
+  /// Retains at most [`MAX_SEAT_PATTERNS`](Self::MAX_SEAT_PATTERNS) + 1 patterns,
+  /// whatever the iterator goes on to yield; a seat that reaches that length is
+  /// refused by [`validate`](Self::validate).
   #[inline]
   pub fn set_include(&mut self, include: impl IntoIterator<Item = Glob>) -> &mut Self {
-    self.include = Some(include.into_iter().collect());
+    self.include = Some(collect_seat(include));
     self
   }
 

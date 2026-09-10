@@ -902,6 +902,75 @@ mod root_options {
     assert!(RootOptions::new().validate().is_ok());
   }
 
+  /// The programmatic face's own bound.
+  ///
+  /// The setters take `impl IntoIterator`, which is a caller's own iterator and
+  /// need not terminate — so the ceiling cannot be enforced by measuring the seat
+  /// after collecting it: `std::iter::repeat` would grow the crate-owned `Vec`
+  /// until the process died, with `validate` never reached and the documented cap
+  /// protecting nothing on the one face that has no document to refuse mid-read.
+  ///
+  /// So the setters take one item past the ceiling and stop. The three shapes that
+  /// pins: the ceiling itself survives whole and validates; a finite over-cap list
+  /// is refused exactly as before; and a non-terminating iterator RETURNS,
+  /// retaining the same over-cap witness and earning the same refusal.
+  ///
+  /// Revert witness: collect the iterator plainly and the `repeat` legs never
+  /// return.
+  #[test]
+  fn a_programmatic_seat_is_bounded_at_collection() {
+    let cap = RootOptions::MAX_SEAT_PATTERNS;
+    let many = |count: usize| {
+      (0..count)
+        .map(|n| glob(&std::format!("**/w{n}")))
+        .collect::<std::vec::Vec<_>>()
+    };
+    let over = || std::iter::repeat(glob("**/w"));
+
+    // The ceiling itself: kept whole, and legal.
+    let full = RootOptions::new().with_prune(many(cap));
+    assert_eq!(full.prune().len(), cap);
+    assert_eq!(full.validate(), Ok(()), "the ceiling itself is honoured");
+
+    // A finite list one past it: the refusal it always had.
+    assert_eq!(
+      RootOptions::new().with_prune(many(cap + 1)).validate(),
+      Err(OptionsError::TooManyPrunePatterns { supplied: cap + 1 })
+    );
+    assert_eq!(
+      RootOptions::new().with_include(many(cap + 1)).validate(),
+      Err(OptionsError::TooManyIncludePatterns { supplied: cap + 1 })
+    );
+
+    // And an iterator that never ends: the setter RETURNS, holding one pattern
+    // past the ceiling — the witness the same refusal is taken on.
+    for (seat, options) in [
+      ("prune", RootOptions::new().with_prune(over())),
+      ("prune/set", {
+        let mut options = RootOptions::new();
+        options.set_prune(over());
+        options
+      }),
+      ("include", RootOptions::new().with_include(over())),
+      ("include/set", {
+        let mut options = RootOptions::new();
+        options.set_include(over());
+        options
+      }),
+    ] {
+      assert!(
+        options.prune().len() <= cap + 1
+          && options.include().is_none_or(|seat| seat.len() <= cap + 1),
+        "{seat}: the seat is bounded whatever the iterator yields"
+      );
+      assert!(
+        options.validate().is_err(),
+        "{seat}: and the over-cap witness is refused where every other over-cap \
+         seat is"
+      );
+    }
+  }
+
   /// The `serde` face: one object keyed by the field names, the seats lists of
   /// plain strings, every key optional.
   #[cfg(feature = "serde")]
