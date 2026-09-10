@@ -94,12 +94,14 @@ pub(crate) struct DriverConfig {
   /// Ignored on macOS. The Monitor profile above is provisional until this
   /// resolves.
   pub(crate) backend: Backend,
-  /// The periodic root-liveness deadline for the one signal-silent-on-unmount
-  /// backend (fanotify): the driver re-stats such a root on this cadence so a
-  /// quiet unmount — which emits no kernel signal and no loss — is still
-  /// detected. Every other backend, including both Windows ones, surfaces an
-  /// unmount as its own fatal source error instead of going quiet, so none of
-  /// them arm this tick. [`Duration::ZERO`] disables it.
+  /// The periodic root-liveness deadline for the two Linux backends: the driver
+  /// re-stats such a root on this cadence so a fanotify root's quiet unmount —
+  /// which emits no kernel signal and no loss — is still detected, and so an
+  /// inotify root's removal is detected even while a descriptor this driver
+  /// holds (a sync's admission pins above all) postpones the kernel's own
+  /// `IN_DELETE_SELF`. FSEvents and both Windows backends surface a dead root
+  /// through their own streams with nothing of ours able to hold it back, so
+  /// none of them arm this tick. [`Duration::ZERO`] disables it.
   pub(crate) root_liveness_interval: Duration,
   /// The admission-map directory cap (design §4.9); `None` = uncapped.
   /// Threaded into each fanotify and USN journal spawn's `SourceConfig`;
@@ -6629,9 +6631,11 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
 
   /// Re-reads the live mount table strictly under `root` AND re-stats the root
   /// itself (blocking): the mount prefixes, whether the read was authoritative,
-  /// and the root's liveness. The root re-stat rides the mount refresh so a
-  /// kernel-recursive backend's root death (unmount/replace — no in-tree signal)
-  /// is caught at the refresh cadence without any new timer or effect.
+  /// and the root's liveness. The root re-stat rides the mount refresh so a root
+  /// death no in-band signal will report in time — a kernel-recursive backend's
+  /// unmount/replace, or a descending one's removal while a held descriptor
+  /// postpones its notice — is caught at the refresh cadence without any new
+  /// timer or effect.
   fn refresh_mounts(&self, root: &Path) -> MountRefresh;
 
   /// Attaches the arm/disarm port of `scope`'s freshly spawned source under
@@ -8087,6 +8091,40 @@ pub(crate) static SYNC_DOOR_STEP: Mutex<Vec<ArmedDoorStep>> = Mutex::new(Vec::ne
 ))]
 type ArmedDoorStep = (PathBuf, SyncDoorPoint, Box<dyn FnOnce() + Send>);
 
+/// The same seam one phase later: a one-shot step at the top of the real cookie
+/// WRITE, armed for ONE directory and run by the [`FsOps::write_cookie`] of that
+/// directory alone.
+///
+/// The window it exposes is the write's own: the detached job owns the
+/// admission's pins for the whole of its run, and every syscall it makes can
+/// stall on a mount that never answers. A step that parks here stands in for
+/// that stall, and what the cell then asks is whether anything the driver owes
+/// — a removed root's death above all — still arrives while it lasts.
+///
+/// PROCESS-GLOBAL for the reason [`SYNC_DOOR_STEP`] is: the write runs on a pool
+/// thread no thread-local of the arming cell could reach. The directory keys it,
+/// the running writer TAKES its arming out and runs it with the lock released,
+/// and it is a LIST so parallel cells keep their own.
+///
+/// Production compiles no call to it at all.
+#[cfg(all(
+  test,
+  feature = "tokio",
+  not(miri),
+  any(target_os = "linux", target_os = "macos")
+))]
+pub(crate) static COOKIE_WRITE_STEP: Mutex<Vec<ArmedWriteStep>> = Mutex::new(Vec::new());
+
+/// One [`COOKIE_WRITE_STEP`] arming: the directory it speaks for, and the
+/// one-shot job that directory's writer runs.
+#[cfg(all(
+  test,
+  feature = "tokio",
+  not(miri),
+  any(target_os = "linux", target_os = "macos")
+))]
+type ArmedWriteStep = (PathBuf, Box<dyn FnOnce() + Send>);
+
 /// Which of the door's three samplings is being spoken about.
 ///
 /// The door opens three directories per sync, one job at a time, and every one of
@@ -8854,6 +8892,29 @@ impl FsOps for RealFs {
     prune: &Globs,
     exclusions: &[PathBuf],
   ) -> Result<CookieFile, CookieWriteError> {
+    // Taken OUT of the slot to run, and only when this is the directory it was
+    // armed for, so a step that parks holds neither the lock nor a parallel
+    // cell's arming ([`COOKIE_WRITE_STEP`]).
+    #[cfg(all(
+      test,
+      feature = "tokio",
+      not(miri),
+      any(target_os = "linux", target_os = "macos")
+    ))]
+    {
+      let step = {
+        let mut armed = COOKIE_WRITE_STEP
+          .lock()
+          .unwrap_or_else(PoisonError::into_inner);
+        armed
+          .iter()
+          .position(|(armed_for, _)| armed_for == dir)
+          .map(|at| armed.remove(at).1)
+      };
+      if let Some(step) = step {
+        step();
+      }
+    }
     // The root's canonical path, as the SPAWN resolved it — recorded together
     // with the object below and replaced together with it, so the two can never
     // describe different trees. Re-canonicalizing the root here would be a second

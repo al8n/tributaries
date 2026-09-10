@@ -32,9 +32,9 @@ fn config() -> DriverConfig {
     exclusions: Vec::new(),
     profile: BackendKind::FsEvents,
     backend: Backend::Auto,
-    // Inert for the FSEvents/inotify driver suites (only fanotify arms the
-    // tick, and the fake spawns never resolve fanotify); a fanotify-specific
-    // driver test overrides it.
+    // Inert for the FSEvents driver suites, and far past every Linux suite's
+    // own run (the two Linux profiles arm the tick, but 30 s outlives them);
+    // a tick-specific driver test overrides it.
     root_liveness_interval: Duration::from_secs(30),
     // Inert for the fake spawns (no fanotify admission map); a real fanotify
     // spawn threads this into its SourceConfig.

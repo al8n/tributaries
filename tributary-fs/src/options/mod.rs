@@ -776,12 +776,13 @@ impl WatcherOptions {
   pub const DEFAULT_BACKEND: Backend = Backend::Auto;
 
   /// The default periodic root-liveness interval (30 s) — the detection-latency
-  /// bound for a signal-silent unmount. A `FAN_MARK_FILESYSTEM`-watched
-  /// superblock unmounted out from under the watch emits NO kernel signal (the
-  /// L4.1 finding), so a periodic root re-stat is its only unmount detection;
-  /// every other backend (inotify's `IN_UNMOUNT`/`IN_IGNORED`, FSEvents'
-  /// `RootChanged`, and both Windows backends' own fatal-source-error report on
-  /// a lost root or volume) signals root death in-band and ignores this knob.
+  /// bound for a root death no in-band signal reports in time. A
+  /// `FAN_MARK_FILESYSTEM`-watched superblock unmounted out from under the watch
+  /// emits NO kernel signal (the L4.1 finding), and an inotify root's
+  /// `IN_DELETE_SELF` is queued only once the last reference to it drops, so a
+  /// periodic root re-stat is what bounds both. FSEvents' `RootChanged` and both
+  /// Windows backends' own fatal-source-error report on a lost root or volume
+  /// arrive regardless of anything this crate holds, so those ignore this knob.
   /// See [`root_liveness_interval`](Self::root_liveness_interval).
   pub const DEFAULT_ROOT_LIVENESS_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -789,8 +790,9 @@ impl WatcherOptions {
   ///
   /// The interval is armed as a deadline (`now + interval`) whose arithmetic
   /// SATURATES, so an enormous one does not crash — it silently arms a deadline
-  /// that never fires, disabling fanotify's only unmount detector while looking
-  /// configured. [`Duration::ZERO`](Duration::ZERO) is how a caller says
+  /// that never fires, disabling the Linux profiles' out-of-band root-death
+  /// detector while looking configured. [`Duration::ZERO`](Duration::ZERO) is
+  /// how a caller says
   /// "disabled"; anything past a day is the accidental spelling of it, and gets
   /// a typed refusal instead. One day is also the ceiling
   /// [`effective_move_window`](Self::effective_move_window) stands on: deadline
@@ -1128,27 +1130,34 @@ impl WatcherOptions {
   }
 
   /// The periodic root-liveness interval — the detection-latency bound for a
-  /// signal-silent root unmount.
+  /// root death the backend's own signal does not report in time.
   ///
-  /// A fanotify (`FAN_MARK_FILESYSTEM`) root unmounted out from under the watch
-  /// delivers no kernel signal (the mark holds the superblock alive and the fd
-  /// goes quiet — the L4.1 finding), so the driver re-stats such a root on this
-  /// cadence and lowers its death (a terminal
-  /// [`Rescan`](crate::EventKind::Rescan) and registry reclamation) when the
-  /// path no longer names the watched object. This is the WORST-CASE latency:
-  /// an unmount is also caught immediately by any loss signal (which already
-  /// re-reads the mount table), so the tick only bounds the quiet case.
+  /// The driver re-stats such a root on this cadence and lowers its death (a
+  /// terminal [`Rescan`](crate::EventKind::Rescan) and registry reclamation)
+  /// when the path no longer names the watched object. This is the WORST-CASE
+  /// latency: a death is also caught immediately by any loss signal (which
+  /// already re-reads the mount table), so the tick only bounds the quiet case.
   ///
-  /// Only signal-silent-on-unmount backends consult it — fanotify. inotify
-  /// (`IN_UNMOUNT`/`IN_IGNORED`), FSEvents (`RootChanged`), and both Windows
-  /// backends (a fatal source error the moment the root or its volume is gone)
-  /// surface root death in-band and never arm this tick, so the knob is inert
-  /// for them.
+  /// Both Linux backends consult it, for two different reasons:
   ///
-  /// [`Duration::ZERO`] DISABLES the tick: a quiet unmount is then observed only
-  /// at the next loss-triggered refresh (or never, if none occurs) — the
-  /// pre-L4.2 behavior, quiet-but-alive with the root observably gone on
-  /// re-access.
+  /// - **fanotify** (`FAN_MARK_FILESYSTEM`) unmounted out from under the watch
+  ///   delivers no kernel signal at all — the mark holds the superblock alive
+  ///   and the fd goes quiet (the L4.1 finding).
+  /// - **inotify**'s `IN_DELETE_SELF` for a removed root is queued only once the
+  ///   last reference to it drops, and this crate itself holds references: a
+  ///   [`sync`](crate::Watcher::sync_root)'s admission pins the objects it
+  ///   ordered against for as long as the write that owns them takes, which on a
+  ///   stalled filesystem has no bound. The tick is the observation that does not
+  ///   wait on them.
+  ///
+  /// FSEvents (`RootChanged`) and both Windows backends (a fatal source error the
+  /// moment the root or its volume is gone) report root death through their own
+  /// streams, with nothing this crate holds able to postpone it, so they never
+  /// arm the tick and the knob is inert for them.
+  ///
+  /// [`Duration::ZERO`] DISABLES the tick: such a death is then observed only at
+  /// the next loss-triggered refresh (or never, if none occurs) — the pre-L4.2
+  /// behavior, quiet-but-alive with the root observably gone on re-access.
   #[inline]
   pub const fn root_liveness_interval(&self) -> Duration {
     self.root_liveness_interval
