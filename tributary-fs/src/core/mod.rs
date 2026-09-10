@@ -3598,6 +3598,16 @@ impl DriverCore {
     // cross-world so its completion (liveness verdict included) is discarded
     // rather than judging the new identity by the old object.
     state.refresh_world_stale = state.refresh_pending;
+    // And DISOWN it. Coalescing onto an outstanding refresh is right within one
+    // world and wrong across a commit: the old root's probe may be inside a
+    // `stat` on a wedged mount and never come back, and the replacement would
+    // then wait for it — no refresh of its own, so no mount authority and, worse,
+    // no root-liveness check at all, leaving an unmounted replacement reading
+    // live forever. The arm below therefore issues a REAL refresh rather than
+    // setting the stale bit, and the driver retires the scope's probe tag at the
+    // same commit so the old root's late answer is dropped instead of applied.
+    state.refresh_pending = false;
+    state.refresh_stale = false;
     // A replace commit ends any witnessed widen window outright: the fallback
     // route lands here with the tainted (or refused) window still recorded,
     // and the replacement's own spawn barrier re-established the binding from
@@ -3967,6 +3977,11 @@ impl DriverCore {
     state.identity = Some(meta.identity);
     state.mounts = meta.mounts;
     state.refresh_world_stale = state.refresh_pending;
+    // Disowned for the reason the stream replace disowns it: a widened root is a
+    // different object, and its first refresh must not be one the OLD root's
+    // possibly-wedged probe still owes (see [`Self::on_root_replaced`]).
+    state.refresh_pending = false;
+    state.refresh_stale = false;
     // The witnessed window is CONSUMED by the commit (INV-ROOT): it was clean
     // through the taint gate above, the splice landed, and from here the
     // reserved id is a KNOWN root — its death records run the ordinary
@@ -4062,6 +4077,30 @@ impl DriverCore {
     };
     state.refresh_pending = true;
     effects.push_back(Effect::RefreshMounts { scope, root });
+  }
+
+  /// Withdraws the refresh `scope` has pending because the driver DECLINED to
+  /// dispatch it — the watcher is at its liveness-probe budget
+  /// ([`MAX_LIVENESS_PROBES`](crate::driver::MAX_LIVENESS_PROBES)).
+  ///
+  /// Coalescing is right only onto a probe that is actually running. A pending
+  /// mark standing for a probe nobody sent would swallow every later arming for
+  /// this scope — `arm_refresh` would set the stale bit and return — and nothing
+  /// would ever clear it, because the completion that clears it is the one that
+  /// was never dispatched. Dropping the mark costs one interval and lets the next
+  /// tick try again, which is exactly what a saturated budget should degrade to.
+  ///
+  /// The liveness deadline is re-armed here too, and that is not decoration: the
+  /// deadline is seeded by a completing refresh, so a scope whose BIRTH refresh is
+  /// the one declined has no deadline yet and would never tick again — the
+  /// silently permanent hole a budget must not open.
+  pub(crate) fn on_refresh_declined(&mut self, scope: ScopeId, now: Instant) {
+    let interval = self.root_liveness_interval;
+    let Some(state) = self.scopes.get_mut(&scope) else {
+      return;
+    };
+    state.refresh_pending = false;
+    Self::arm_liveness(state, interval, now);
   }
 
   /// (Re)arms the periodic root-liveness deadline for a tick-armed scope whose

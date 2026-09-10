@@ -942,20 +942,29 @@ fn a_liveness_probe_answers_while_the_blocking_pool_stays_occupied() {
 /// A probe that has not answered is a hung root; a second thread against the
 /// same path proves nothing and would let a wall-clock tick mint one thread per
 /// interval for as long as the mount stays wedged. One outstanding probe per
-/// scope is the bound, and the tick simply re-arms its deadline.
+/// scope and generation is the bound, and the tick simply re-arms its deadline.
+///
+/// Every claim here is a DELTA against the moment the gate captured its probe,
+/// never an absolute count. The rig ticks on the wall clock, so how many probes
+/// have already completed before the gate is installed is a property of how fast
+/// the host runs this cell — nine of them under an interpreter, one natively —
+/// and asserting the absolute number pins the interpreter's speed rather than the
+/// driver's behaviour.
 #[tokio::test]
 async fn a_second_liveness_tick_dispatches_no_second_probe() {
   let registry = RecordingRegistry::default();
   let rig = ticking_descending_rig(Duration::from_millis(20), registry.clone());
   let scope = watch(&rig, "/r").await;
 
-  // The birth refresh is already behind us, so this gate captures the first
-  // TICKED probe and holds it there.
+  // This gate captures the next ticked probe and holds it there. One probe per
+  // scope is outstanding at a time, so a captured probe is the ONLY one in
+  // flight and the completion count is stable from here.
   let hold = rig.fs.hold_refreshes();
   assert!(
     settle(|| hold.captured() == 1).await,
     "staging: one ticked probe is parked inside the refresh"
   );
+  let completed = rig.fs.refreshes();
 
   // Many further intervals elapse against that parked probe. The settle
   // EXPIRING is the claim: no second dispatch ever happens.
@@ -969,12 +978,336 @@ async fn a_second_liveness_tick_dispatches_no_second_probe() {
   );
   assert_eq!(
     rig.fs.refreshes(),
-    1,
-    "only the birth refresh ever completed"
+    completed,
+    "and none completed either — the parked probe is still the only one"
   );
 
   hold.release();
   let _ = scope;
+}
+
+/// A ticking descending rig over `roots`, all on one fake filesystem.
+fn ticking_rig_over(interval: Duration, registry: RecordingRegistry, roots: &[String]) -> Rig {
+  let fs = FakeFs::new(1);
+  for (index, root) in roots.iter().enumerate() {
+    fs.put(root, FileKind::Dir, 1 + index as u64);
+  }
+  fs.spawn_backend(BackendKind::Inotify);
+  let (cmd_tx, cmd_rx) = async_channel::bounded(16);
+  let (cleanup, cookie_wake) = cookie_ingress();
+  let (ev_tx, ev_rx) = async_channel::bounded(1024);
+  tokio::spawn(run::<TokioRuntime, FakeFs>(
+    DriverConfig {
+      profile: BackendKind::Inotify,
+      root_liveness_interval: interval,
+      ..config()
+    },
+    fs.clone(),
+    cmd_rx,
+    cookie_wake,
+    ev_tx,
+    registry,
+  ));
+  Rig {
+    fs,
+    commands: cmd_tx,
+    cleanup,
+    events: ev_rx,
+  }
+}
+
+/// The probe threads the driver has dispatched and not yet heard back from.
+async fn probes_outstanding(rig: &Rig) -> usize {
+  let (reply, on_reply) = futures_channel::oneshot::channel();
+  rig
+    .commands
+    .send(Command::DebugProbesOutstanding { reply })
+    .await
+    .unwrap();
+  on_reply.await.expect("the driver replies")
+}
+
+/// Settles until the outstanding-probe count reaches `target`, reporting whether
+/// it got there — the async analogue of [`settle`] for a count only a `Command`
+/// round trip can read.
+#[must_use]
+async fn settle_probes(rig: &Rig, target: usize) -> bool {
+  for _ in 0..interpreted_rounds(200) {
+    if probes_outstanding(rig).await == target {
+      return true;
+    }
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    std::thread::sleep(settle_round_slice());
+  }
+  probes_outstanding(rig).await == target
+}
+
+/// Whether the outstanding-probe count HOLDS at `target` for a whole window — the
+/// negative form, where the window elapsing without a change is the observation.
+#[must_use]
+async fn probes_hold_at(rig: &Rig, target: usize) -> bool {
+  for _ in 0..interpreted_rounds(60) {
+    if probes_outstanding(rig).await != target {
+      return false;
+    }
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    std::thread::sleep(settle_round_slice());
+  }
+  true
+}
+
+/// Sends one `Replace` and returns the driver's verdict.
+async fn replace_root(
+  rig: &Rig,
+  scope: ScopeId,
+  new_root: &str,
+) -> Result<(), crate::error::ReplaceRootError> {
+  let (reply, on_reply) = futures_channel::oneshot::channel();
+  rig
+    .commands
+    .send(Command::Replace {
+      scope,
+      root: PathBuf::from(new_root),
+      reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from(new_root)),
+      reply,
+    })
+    .await
+    .unwrap();
+  on_reply.await.expect("the driver replies")
+}
+
+/// A replacement root is probed immediately, and the retiring root's late answer
+/// is DROPPED rather than read as the replacement's verdict.
+///
+/// Both halves are the same defect. Keyed by scope alone, the retiring root's
+/// outstanding probe held the scope's only seat AND left the core's refresh
+/// pending, so the replacement got no probe until a `stat` that may be inside a
+/// wedged mount forever came back — and when it did come back, its verdict was
+/// about an object this scope no longer watches. A replacement standing on a
+/// filesystem that has since been unmounted could then read live for as long as
+/// the OLD root stayed hung, and the answer that finally arrived could kill it
+/// for the old root's death.
+///
+/// Two gates, so neither half rests on which answer the runtime happens to
+/// deliver first: the retiring root's probe parks on the first gate and stays
+/// there while the whole rest of the cell runs, and the replacement's own probes
+/// ride the second.
+///
+/// Revert witnesses, one per half. Leave the core's `refresh_pending` set across
+/// the replace commit — or stop retiring the scope's probe tag there; either
+/// alone starves the replacement — and the second gate never captures anything.
+/// Forward a probe's answer without checking its tag and the last release below
+/// kills the live replacement.
+#[tokio::test]
+async fn a_replacement_root_is_probed_while_the_retiring_root_s_probe_is_parked() {
+  let registry = RecordingRegistry::default();
+  // Disjoint roots, so the replacement takes the general STREAM replace — the
+  // path the two probes must be independent across — rather than the
+  // same-transport widen an `old ⊂ new` pair would take.
+  let rig = ticking_rig_over(
+    Duration::from_millis(20),
+    registry.clone(),
+    &["/old".to_owned(), "/new".to_owned()],
+  );
+  let scope = watch(&rig, "/old").await;
+
+  // The retiring root's probe parks here and never leaves until the very end.
+  let old_gate = rig.fs.hold_refreshes();
+  assert!(
+    settle(|| old_gate.captured() == 1).await,
+    "staging: /old's probe is parked inside the refresh"
+  );
+
+  // Everything dispatched from now on rides a gate of its own, so the two roots'
+  // probes are separable.
+  let new_gate = rig.fs.hold_refreshes();
+  replace_root(&rig, scope, "/new")
+    .await
+    .expect("the replacement commits");
+
+  // THE FIRST HALF: the replacement is probed while the old root's probe is
+  // still inside its call.
+  assert!(
+    settle(|| new_gate.captured() >= 1).await,
+    "the replacement root gets a probe of its own without waiting for the \
+     retiring root's"
+  );
+  assert_eq!(
+    old_gate.captured(),
+    1,
+    "and the retiring root's probe is still parked where it was"
+  );
+
+  // The old root's path vanishes: its probe, whenever it answers, now carries
+  // death evidence — for an object this scope replaced.
+  rig.fs.remove("/old");
+
+  // Let the replacement's own probes run to completion, so the core has spent
+  // every gate a cross-world answer could hide behind and the only thing left
+  // outstanding is the retiring root's parked probe.
+  new_gate.release();
+  assert!(
+    settle_probes(&rig, 1).await,
+    "the replacement's probes answer and leave only the parked one outstanding"
+  );
+  assert!(
+    registry.dead().is_empty(),
+    "staging: the live replacement is alive at this point"
+  );
+
+  // THE SECOND HALF: the retiring root's answer finally arrives, reporting the
+  // old root gone. It is addressed to a tag this scope has left behind, so it is
+  // dropped — the replacement is not killed by the death of the root it replaced.
+  old_gate.release();
+  assert!(
+    settle_probes(&rig, 0).await,
+    "every probe thread has exited"
+  );
+  assert!(
+    !settle(|| !registry.dead().is_empty()).await,
+    "the retiring root's late answer is dropped, not read as the replacement's death"
+  );
+}
+
+/// A probe stays COUNTED until its thread exits, whatever happens to the scope it
+/// was dispatched for.
+///
+/// The budget bounds threads, and a thread is not gone because its scope is: a
+/// `stat` inside a wedged mount cannot be cancelled or joined, so a teardown that
+/// forgot its probe left the thread alive and the count wrong. Repeat that under
+/// watch/tick/unwatch churn and the driver spends one thread and one stack per
+/// retired scope with nothing bounding the total — and once spawning starts
+/// failing, every probe falls back onto the blocking pool whose stall the thread
+/// existed to escape.
+///
+/// Revert witness: drop the scope's entry at teardown instead of retiring its tag
+/// and the count falls to zero at the unwatch, while three threads are still
+/// parked inside the filesystem.
+#[tokio::test]
+async fn a_retired_scope_s_probe_stays_counted_until_its_thread_exits() {
+  const SCOPES: usize = 3;
+  let registry = RecordingRegistry::default();
+  let roots: Vec<String> = (0..SCOPES).map(|index| format!("/r{index}")).collect();
+  let rig = ticking_rig_over(Duration::from_millis(20), registry.clone(), &roots);
+  let mut scopes = Vec::new();
+  for root in &roots {
+    scopes.push(watch(&rig, root).await);
+  }
+
+  let gate = rig.fs.hold_refreshes();
+  assert!(
+    settle_probes(&rig, SCOPES).await,
+    "staging: every scope has a probe parked inside the refresh"
+  );
+
+  for scope in &scopes {
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Unwatch {
+        scope: *scope,
+        reply: Some(reply),
+      })
+      .await
+      .unwrap();
+    let _ = tokio::time::timeout(interpreted_secs(10), on_reply).await;
+  }
+
+  assert!(
+    probes_hold_at(&rig, SCOPES).await,
+    "every retired scope's probe is still counted — the threads are still parked"
+  );
+
+  gate.release();
+  assert!(
+    settle_probes(&rig, 0).await,
+    "and the count returns to zero exactly when the threads leave"
+  );
+}
+
+/// At the probe budget a tick dispatches NOTHING, and the scope it turned away
+/// ticks again once the budget frees.
+///
+/// The budget is the only real bound on threads the driver cannot reclaim: scope
+/// ids are never reused, so the per-scope rule bounds nothing across churn. What
+/// it must not do is turn a scope away permanently — a declined tick that left
+/// the core's refresh pending would coalesce every later arming onto a probe
+/// nobody sent, and that scope's death would never be observed again. So the
+/// decline drops the pending mark and re-arms the deadline, and the next interval
+/// tries again.
+///
+/// Every root here is unmounted under the held gate, so the observation is a
+/// death count: nothing dies while the probes are parked, and once they are
+/// released EVERY scope dies — including the one the budget turned away, which
+/// can only have died by ticking again.
+///
+/// not(miri): the claim needs `MAX_LIVENESS_PROBES` real parked threads, and
+/// sixty-four of them under an interpreter is a shard timeout rather than a test.
+/// The arithmetic the budget performs is ordinary counting Miri has nothing to
+/// say about; what it bounds is threads, which is a native fact.
+#[cfg(not(miri))]
+#[tokio::test]
+async fn a_tick_at_the_probe_budget_dispatches_nothing_and_retries_later() {
+  let ticked = MAX_LIVENESS_PROBES + 1;
+  let registry = RecordingRegistry::default();
+  let mut roots: Vec<String> = (0..ticked).map(|index| format!("/r{index}")).collect();
+  roots.push("/late".to_owned());
+  let rig = ticking_rig_over(Duration::from_millis(20), registry.clone(), &roots);
+  for root in &roots[..ticked] {
+    let _ = watch(&rig, root).await;
+  }
+
+  // Every root vanishes, and every probe from here parks before it can say so.
+  let gate = rig.fs.hold_refreshes();
+  rig.fs.set_root_liveness(RootLiveness::Missing);
+
+  assert!(
+    settle_probes(&rig, MAX_LIVENESS_PROBES).await,
+    "staging: the budget fills"
+  );
+  assert!(
+    probes_hold_at(&rig, MAX_LIVENESS_PROBES).await,
+    "and it holds: the scope whose tick found the budget full dispatched nothing"
+  );
+  assert!(
+    registry.dead().is_empty(),
+    "nothing can die while every probe is parked"
+  );
+
+  // One more root, registered while the budget is full, so it is its BIRTH
+  // refresh that is declined. A completing refresh is what SEEDS the liveness
+  // deadline, so this scope has none: without the decline arming one, it would
+  // never tick and its death would never be observed at all. Registered by hand
+  // because the shared helper waits for the birth refresh this cell is
+  // deliberately preventing.
+  let (reply, on_reply) = futures_channel::oneshot::channel();
+  rig
+    .commands
+    .send(Command::Watch {
+      root: PathBuf::from("/late"),
+      options: crate::options::RootOptions::new(),
+      reply,
+    })
+    .await
+    .unwrap();
+  let grant = on_reply
+    .await
+    .unwrap()
+    .expect("a root registers even with every probe parked");
+  grant.defuse();
+
+  gate.release();
+  let expected = ticked + 1;
+  assert!(
+    settle_within(interpreted_rounds(400), || registry.dead().len()
+      == expected)
+    .await,
+    "every scope dies once the probes answer — the scopes the budget turned away \
+     ticked again and got probes of their own (dead: {}, expected {expected})",
+    registry.dead().len()
+  );
 }
 
 /// The refresh samples the root's identity AND its mount frame from ONE object, so
@@ -9922,7 +10255,7 @@ mod descending {
       let mut deferred_grants: BTreeMap<ScopeId, DeferredGrant> = BTreeMap::new();
       let mut pending_control: crate::driver::PendingControl = BTreeMap::new();
       let mut control_inflight: crate::driver::ControlInflight = BTreeMap::new();
-      let mut probes_in_flight: BTreeSet<ScopeId> = BTreeSet::new();
+      let mut probes = crate::driver::LivenessProbes::default();
       let registry = NullRegistry;
       let now = || Instant::from_origin(Duration::from_millis(5));
       let reaper = crate::driver::TeardownReaper::new().expect("the reaper secures its thread");
@@ -9944,7 +10277,7 @@ mod descending {
         &mut deferred_grants,
         &mut pending_control,
         &mut control_inflight,
-        &mut probes_in_flight,
+        &mut probes,
         &mut cookies,
         &registry,
         &now,
