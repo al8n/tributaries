@@ -2880,6 +2880,24 @@ fn cookie_dir_name() -> String {
   cookie_dir_name_for(euid)
 }
 
+/// The ONE directory leaf this process reserves, handed to the core at
+/// construction so its set-cover shrink can exempt exactly that name
+/// ([`DriverCore::reserved_cookie_dir`](crate::core::DriverCore)).
+///
+/// `None` on the platforms that reserve no stable leaf: Windows mints a fresh
+/// directory per obligation and never looks one up, so there is no single name to
+/// exempt — and answering with the bare stem would hand the core the legacy name
+/// the classifier keeps suppressed.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn reserved_cookie_dir_leaf() -> Option<Arc<str>> {
+  Some(Arc::from(cookie_dir_name()))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn reserved_cookie_dir_leaf() -> Option<Arc<str>> {
+  None
+}
+
 /// How many candidate names one [`CookieDir::open_or_create`] will mint before
 /// it gives up.
 ///
@@ -10896,6 +10914,7 @@ pub(crate) async fn run<R, F>(
   let mut core = DriverCore::new(
     config.effective_move_window(),
     config.root_liveness_interval,
+    reserved_cookie_dir_leaf(),
   )
   .with_exclusions(config.exclusions.clone());
   let origin = R::now();

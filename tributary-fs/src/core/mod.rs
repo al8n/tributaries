@@ -1839,13 +1839,38 @@ pub(crate) struct DriverCore {
   /// record, the two places a directory can enter coverage from. Nothing here
   /// refuses an arm, so nothing here can produce that rescan.
   exclusions: Vec<PathBuf>,
+  /// The EXACT directory leaf this process reserves for its sync cookies — the
+  /// one name [`on_set_cover`](Self::on_set_cover) exempts from the shrink.
+  ///
+  /// It is the exact leaf rather than the classifier
+  /// ([`is_sync_cookie_dir_name`](crate::is_sync_cookie_dir_name)) because the
+  /// classifier recognizes a whole NAME SPACE — the bare stem and every canonical
+  /// `u32` qualifier — and any peer that can create directories under the watched
+  /// tree can fill it. Exempting the space would let a covered directory
+  /// populated with `…-0`, `…-1`, `…-2` keep one watch descriptor per forged
+  /// sibling across every shrink, so the set-cover could be defeated as a
+  /// reclamation mechanism until the watch table ran out. Exempting the one leaf
+  /// this process would actually write into keeps the bound the exemption claims:
+  /// at most ONE extra watch per covered directory, by construction.
+  ///
+  /// `None` where the platform reserves no stable leaf — Windows mints a fresh
+  /// directory name per obligation and never looks one up, so there is no name to
+  /// exempt (and its backend is kernel-recursive, which `on_set_cover` refuses
+  /// before the rule is ever reached).
+  reserved_cookie_dir: Option<Arc<str>>,
 }
 
 impl DriverCore {
-  /// Builds a core whose Monitor pairs renames within `move_window` and re-stats
+  /// Builds a core whose Monitor pairs renames within `move_window`, re-stats
   /// each tick-armed scope's root every `root_liveness_interval`
-  /// (`Duration::ZERO` disables that tick).
-  pub(crate) fn new(move_window: Duration, root_liveness_interval: Duration) -> Self {
+  /// (`Duration::ZERO` disables that tick), and exempts exactly
+  /// `reserved_cookie_dir` from a set-cover shrink (see that field for why it is
+  /// one leaf and not the reserved name space).
+  pub(crate) fn new(
+    move_window: Duration,
+    root_liveness_interval: Duration,
+    reserved_cookie_dir: Option<Arc<str>>,
+  ) -> Self {
     let mut monitor = Monitor::new(caps_for(BackendKind::FsEvents));
     monitor.set_move_window(move_window);
     Self {
@@ -1866,6 +1891,7 @@ impl DriverCore {
       cookie_seq: 0,
       root_liveness_interval,
       exclusions: Vec::new(),
+      reserved_cookie_dir,
     }
   }
 
@@ -2298,6 +2324,8 @@ impl DriverCore {
     // The cover the previous reconcile settled on: the grow keys its re-arm on the delta
     // against THIS, not on which watches survive.
     let prev_cover = state.applied_cover.clone();
+    // The one exempt leaf, taken out of `self` before the walk borrows it.
+    let reserved = self.reserved_cookie_dir.clone();
 
     // --- PRUNE (the shrink half): drop every descended watch strictly OUTSIDE the cover ---
     // This scope's descended (non-root) watches strictly OUTSIDE every retained prefix,
@@ -2330,10 +2358,18 @@ impl DriverCore {
         // This is the set-cover's half of the rule the prune seat already states for
         // patterns: the marker exemption keeps the record reportable, this keeps it
         // observable.
+        //
+        // The name is matched for EQUALITY against the one leaf this process
+        // reserves, never against the classifier's whole name space
+        // ([`reserved_cookie_dir`](Self::reserved_cookie_dir)): the space is
+        // predictable and unowned, so any peer could fill a covered directory with
+        // reserved-shaped siblings and keep a watch descriptor per forged name
+        // across every shrink. Equality is what makes "one extra watch per covered
+        // directory" a construction rather than a hope.
         let reserved_cookie_dir = path
           .file_name()
           .and_then(std::ffi::OsStr::to_str)
-          .is_some_and(crate::is_sync_cookie_dir_name)
+          .is_some_and(|leaf| reserved.as_deref() == Some(leaf))
           && path
             .parent()
             .is_some_and(|parent| !strictly_outside(retained, parent));

@@ -9828,7 +9828,7 @@ mod descending {
       use tributary_proto::RecordKind;
 
       fn live_core_at(root: &str) -> (DriverCore, ScopeId) {
-        let mut core = DriverCore::new(Duration::from_millis(100), Duration::ZERO);
+        let mut core = DriverCore::new(Duration::from_millis(100), Duration::ZERO, None);
         let scope = core
           .on_watch(
             PathBuf::from(root),
@@ -10314,7 +10314,7 @@ mod descending {
       use tributary_proto::RecordKind;
 
       fn unit_core_at(root: &str) -> (DriverCore, ScopeId, tributary_proto::WatchId) {
-        let mut core = DriverCore::new(Duration::from_millis(100), Duration::ZERO);
+        let mut core = DriverCore::new(Duration::from_millis(100), Duration::ZERO, None);
         let scope = core
           .on_watch(
             PathBuf::from(root),
@@ -10525,7 +10525,7 @@ mod descending {
       }
       let at = || Instant::from_origin(Duration::from_millis(5));
 
-      let mut core = DriverCore::new(Duration::from_millis(100), Duration::ZERO);
+      let mut core = DriverCore::new(Duration::from_millis(100), Duration::ZERO, None);
       // The scope that dies in the drain: root plus one armed child, so a lost
       // child binding mints a real `RemoveWatch` ahead of the root death.
       let (dead, dead_root) = spawn_root(&mut core, "/r", 1);
@@ -10685,7 +10685,7 @@ mod descending {
       assert_eq!(rx.len(), 3, "the snapshot reads the queued prefix length");
 
       // (b) The decrement: one prefix message consumed per iteration, saturating.
-      let mut core = DriverCore::new(Duration::from_millis(100), Duration::ZERO);
+      let mut core = DriverCore::new(Duration::from_millis(100), Duration::ZERO, None);
       let reserved = core.reserve_watch_id();
       let mut phase = crate::driver::SameFdPhase::CatchUp {
         reserved,
@@ -12789,7 +12789,7 @@ mod sync_cookie {
   /// admissions park on — these cells build a ledger state by hand, with no driver
   /// loop to settle anything.
   fn fence_source() -> DriverCore {
-    DriverCore::new(Duration::from_millis(1), Duration::from_secs(30))
+    DriverCore::new(Duration::from_millis(1), Duration::from_secs(30), None)
   }
 
   /// A registry over a ledger nothing else holds — the cells that drive the
