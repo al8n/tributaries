@@ -168,6 +168,110 @@ impl clap::Args for Interest {
 #[cfg(feature = "serde")]
 const KIND_NAMES: [&str; 4] = ["created", "modified", "removed", "moved"];
 
+/// The longest name in [`KIND_NAMES`], in bytes — the ceiling a tag is measured
+/// against before anything is done with it. Derived from the vocabulary itself, so
+/// a renamed or added kind moves it rather than leaving a stale literal behind.
+#[cfg(feature = "serde")]
+const MAX_KIND_NAME_LEN: usize = {
+  let mut longest = 0;
+  let mut index = 0;
+  while index < KIND_NAMES.len() {
+    if KIND_NAMES[index].len() > longest {
+      longest = KIND_NAMES[index].len();
+    }
+    index += 1;
+  }
+  longest
+};
+
+/// Which bit one tag names — the seed's answer, so the `visit_seq` loop below sets
+/// bits and this door does nothing but read names.
+#[cfg(feature = "serde")]
+enum KindBit {
+  Created,
+  Modified,
+  Removed,
+  Moved,
+}
+
+/// One tag, read as BORROWED text and measured before it is copied, compared or
+/// echoed — in the mold of [`Glob`](crate::Glob)'s own pattern visitor.
+///
+/// A tag is a configuration value from an untrusted document, and this vocabulary
+/// is four names of at most [`MAX_KIND_NAME_LEN`] bytes. Asking the format for an
+/// owned `String` (a `Cow<'_, str>` is one: serde's blanket implementation always
+/// builds the owned half) hands the document one allocation per tag before the
+/// vocabulary it is about to fail is ever consulted — and formatting the tag into
+/// an `unknown_variant` error then hands it a second one of the same size, live at
+/// the same instant. A single megabyte-long unknown tag is therefore two megabytes
+/// of live allocation to say "that is not one of four words".
+///
+/// So the ceiling is judged first, on the bytes the format is already holding, and
+/// a tag past it is refused with a FIXED message naming the bound and the length —
+/// never the value. What reaches `unknown_variant` is by construction at most
+/// [`MAX_KIND_NAME_LEN`] bytes, so the echo it formats is bounded too.
+///
+/// What this does not bound is the FORMAT's own reading: a format that must
+/// allocate to hand over a string — one unescaping `\u0041`, or reading from a
+/// stream rather than a slice — allocates before any visitor is called, which is
+/// its contract rather than something a `Deserialize` implementation can decline.
+/// A document whose SIZE must be bounded is bounded by a limited reader on the
+/// caller's side.
+#[cfg(feature = "serde")]
+struct KindName;
+
+#[cfg(feature = "serde")]
+impl<'de> serde::de::DeserializeSeed<'de> for KindName {
+  type Value = KindBit;
+
+  /// `deserialize_str` rather than `deserialize_string`: this door needs to READ
+  /// the tag, not to own it, and the hint is what lets a format borrow straight out
+  /// of its input instead of allocating a copy it would only be measured against.
+  fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+  where
+    D: serde::Deserializer<'de>,
+  {
+    deserializer.deserialize_str(self)
+  }
+}
+
+#[cfg(feature = "serde")]
+impl serde::de::Visitor<'_> for KindName {
+  type Value = KindBit;
+
+  fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    write!(
+      f,
+      "a delivery-kind name of at most {MAX_KIND_NAME_LEN} bytes"
+    )
+  }
+
+  /// The one door, and the one every other arm reaches: `visit_borrowed_str` and
+  /// `visit_string` are serde's own forwards to it, so text the format borrows out
+  /// of its input is measured without being copied at all, and text the format
+  /// already owns is measured before this face does anything with it.
+  fn visit_str<E>(self, name: &str) -> Result<Self::Value, E>
+  where
+    E: serde::de::Error,
+  {
+    if name.len() > MAX_KIND_NAME_LEN {
+      // The length, never the value: an over-long tag is exactly the input whose
+      // echo is the hazard.
+      return Err(E::custom(format_args!(
+        "a delivery-kind name is at most {MAX_KIND_NAME_LEN} bytes, and this one is {}",
+        name.len()
+      )));
+    }
+    match name {
+      "created" => Ok(KindBit::Created),
+      "modified" => Ok(KindBit::Modified),
+      "removed" => Ok(KindBit::Removed),
+      "moved" => Ok(KindBit::Moved),
+      other => Err(E::unknown_variant(other, &KIND_NAMES)),
+    }
+  }
+}
+
 #[cfg(feature = "serde")]
 impl serde::Serialize for Interest {
   /// The list of admitted kind names (see the type docs) — a set as a set.
@@ -192,6 +296,13 @@ impl serde::Serialize for Interest {
 impl<'de> serde::Deserialize<'de> for Interest {
   /// A list of kind names, exhaustively: every kind it does not name is gated away.
   /// A name outside the vocabulary is refused rather than ignored.
+  ///
+  /// Each tag is read through a bounded borrowed-string visitor, which measures it
+  /// against the longest name in the vocabulary on the bytes the format is already
+  /// holding — before the tag is copied and before any error formats it. So an
+  /// unknown tag costs a fixed message and nothing proportional to its size, and the
+  /// `unknown_variant` echo this face does emit is over a value bounded by that
+  /// ceiling.
   fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
   where
     D: serde::Deserializer<'de>,
@@ -210,13 +321,16 @@ impl<'de> serde::Deserialize<'de> for Interest {
         A: serde::de::SeqAccess<'de>,
       {
         let mut interest = Interest::none();
-        while let Some(name) = seq.next_element::<std::borrow::Cow<'_, str>>()? {
-          match name.as_ref() {
-            "created" => interest.set_created(),
-            "modified" => interest.set_modified(),
-            "removed" => interest.set_removed(),
-            "moved" => interest.set_moved(),
-            other => return Err(serde::de::Error::unknown_variant(other, &KIND_NAMES)),
+        // `next_element_seed` rather than `next_element`: the seed is what carries
+        // the bounded string visitor into the element, where `next_element` would
+        // pick a `Deserialize` implementation (a `Cow<'_, str>`'s always owns) and
+        // copy the tag before this face could measure it. See [`KindName`].
+        while let Some(bit) = seq.next_element_seed(KindName)? {
+          match bit {
+            KindBit::Created => interest.set_created(),
+            KindBit::Modified => interest.set_modified(),
+            KindBit::Removed => interest.set_removed(),
+            KindBit::Moved => interest.set_moved(),
           };
         }
         Ok(interest)
