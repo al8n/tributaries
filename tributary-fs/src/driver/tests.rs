@@ -18413,6 +18413,193 @@ mod sync_cookie {
       }
     }
 
+    /// Arms `peer` to run ONCE in the window between a post-create refusal and
+    /// the withdrawal that answers it, and disarms it again when the returned
+    /// guard drops.
+    ///
+    /// One shot, for [`MidMarkerPeer`]'s reason: the peer must act in that one
+    /// window and on no later withdrawal this cell provokes.
+    struct MidWithdrawalPeer;
+
+    impl MidWithdrawalPeer {
+      fn arm(peer: impl FnOnce() + 'static) -> Self {
+        let mut peer = Some(peer);
+        crate::driver::COOKIE_WITHDRAW_STEP.with_borrow_mut(|slot| {
+          *slot = Some(Box::new(move || {
+            if let Some(peer) = peer.take() {
+              peer();
+            }
+          }));
+        });
+        Self
+      }
+    }
+
+    impl Drop for MidWithdrawalPeer {
+      fn drop(&mut self) {
+        crate::driver::COOKIE_WITHDRAW_STEP.with_borrow_mut(|slot| *slot = None);
+      }
+    }
+
+    /// The file half of a refusal's residue, for the cells that then run the
+    /// driver's own retry against it. Panics on a refusal that claims to owe
+    /// nothing, because that claim is exactly what those cells are about.
+    fn owed_file(refusal: crate::driver::CookieWriteError) -> crate::driver::CookieResidue {
+      match refusal.residue {
+        Some(residue) => *residue,
+        None => panic!(
+          "this write left a file on disk and must hand it back as a counted \
+           residue: {refusal:?}"
+        ),
+      }
+    }
+
+    /// A marker RENAMED between the post-create refusal and the withdrawal is
+    /// still owed — and the driver's own retry finds it again by IDENTITY.
+    ///
+    /// The window is narrow and entirely real: the marker exists, a post-create
+    /// proof has refused, and the write is about to destroy what it made. A trusted
+    /// same-uid peer that renames the marker to another leaf inside that window
+    /// makes the destroy's `unlinkat` answer `ENOENT` — for a file that is still
+    /// perfectly linked. Reading that as "the object is gone" retires the
+    /// obligation as never-created, releases its marker exemption and frees the cap
+    /// slot that was supposed to bound exactly this, while the file sits in the
+    /// reserved directory outside every ledger cap; repeat it and the residue
+    /// accumulates with nothing counting it.
+    ///
+    /// So the held descriptor decides, not the name. The link count says the object
+    /// is still named somewhere, the refusal comes back carrying the file, and the
+    /// retry — the very call [`reap_residue`] makes — enumerates the reserved
+    /// directory through its own descriptor and unlinks the entry whose object IS
+    /// this one. The record retires only once that is done.
+    ///
+    /// Revert witness: answer the destroy's `NotFound` with the clean refusal and
+    /// this cell's first assertion fails — the write reports owing nothing while
+    /// the renamed marker is still on disk.
+    #[test]
+    fn a_marker_renamed_before_its_withdrawal_is_owed_and_reaped_by_identity() {
+      let root = scratch("marker-renamed-withdraw");
+      let target = root.join("a");
+      std::fs::create_dir_all(&target).expect("the directory the sync names");
+      let fs = RealFs::new();
+      let live = crate::driver::LiveRoot::for_tests(&root);
+      let reserved = target.join(cookie_dir_name());
+      let name = ".tributaries-sync-1-2-61-0000000000000061";
+
+      // The refusal that sends the write to the withdrawal, and the peer that acts
+      // in the window that withdrawal opens: one rename, inside the reserved
+      // directory, onto a leaf nothing recorded.
+      let fault = ProofFault::arm(crate::driver::CookieProofPoint::HoldsOnly);
+      let (minted, renamed) = (reserved.join(name), reserved.join("stolen"));
+      let peer = MidWithdrawalPeer::arm(move || {
+        std::fs::rename(&minted, &renamed).expect("the peer renames the marker aside");
+      });
+      let written = fs.write_cookie(
+        &live,
+        &target,
+        admitted(&root, &target),
+        name,
+        &tributary_proto::glob::Globs::default(),
+        &[],
+      );
+      drop(peer);
+      drop(fault);
+
+      let refusal = written.expect_err("the armed proof refuses this write");
+      assert_eq!(
+        leaves_in(&reserved),
+        vec!["stolen".to_owned()],
+        "staging: the peer's rename landed, so the destroy found nothing at the \
+         marker's own name"
+      );
+      let mut residue = owed_file(refusal);
+      assert!(
+        matches!(residue, crate::driver::CookieResidue::File(_)),
+        "an entry gone at the name is not an object gone: the write still owes the \
+         FILE it created, pin and all"
+      );
+
+      // The driver's own retry, run exactly as `reap_residue` runs it. The name the
+      // record carries is empty now, so the only thing that can find this object is
+      // its identity.
+      crate::driver::reap_residue(&fs, &mut residue)
+        .expect("the retry removes the renamed marker by identity");
+      assert!(
+        leaves_in(&reserved).is_empty(),
+        "and the reserved directory ends empty: {:?}",
+        leaves_in(&reserved)
+      );
+
+      let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The same rename, but OUT of the reserved directory: the record does not
+    /// retire, because nothing this driver may unlink names the object any more.
+    ///
+    /// The removal is anchored to one directory by design — it addresses entries of
+    /// the descriptor the create was made through and resolves no path — so an
+    /// object linked outside that directory is one it must not delete. What it must
+    /// also not do is claim to have. The honest outcome is the FAILED removal a
+    /// refused unlink already produces: the record stays counted, the ledger's
+    /// attempt budget carries it, and close reports it under a typed terminal
+    /// instead of retiring it as never-created over a file still on disk.
+    ///
+    /// Revert witness: answer the empty name `AlreadyGone` and the retry below
+    /// succeeds while the escaped marker is still in the target.
+    #[test]
+    fn a_marker_renamed_out_of_the_reserved_directory_never_retires_as_gone() {
+      let root = scratch("marker-escaped-withdraw");
+      let target = root.join("a");
+      std::fs::create_dir_all(&target).expect("the directory the sync names");
+      let fs = RealFs::new();
+      let live = crate::driver::LiveRoot::for_tests(&root);
+      let reserved = target.join(cookie_dir_name());
+      let name = ".tributaries-sync-1-2-62-0000000000000062";
+      let escaped = target.join("escaped");
+
+      let fault = ProofFault::arm(crate::driver::CookieProofPoint::HoldsOnly);
+      let (minted, out) = (reserved.join(name), escaped.clone());
+      let peer = MidWithdrawalPeer::arm(move || {
+        std::fs::rename(&minted, &out).expect("the peer renames the marker out of reach");
+      });
+      let written = fs.write_cookie(
+        &live,
+        &target,
+        admitted(&root, &target),
+        name,
+        &tributary_proto::glob::Globs::default(),
+        &[],
+      );
+      drop(peer);
+      drop(fault);
+
+      let refusal = written.expect_err("the armed proof refuses this write");
+      assert!(
+        escaped.exists(),
+        "staging: the peer's rename put the marker outside the anchored directory"
+      );
+      let mut residue = owed_file(refusal);
+
+      let failed = crate::driver::reap_residue(&fs, &mut residue).expect_err(
+        "a removal that cannot reach the object reports a FAILURE, so the record \
+         stays counted rather than retiring over a live file",
+      );
+      assert!(
+        failed.to_string().contains("still linked"),
+        "and the failure names what happened: {failed}"
+      );
+      assert!(
+        escaped.exists(),
+        "the file is still there — nothing outside the anchored directory was touched"
+      );
+      assert!(
+        leaves_in(&reserved).is_empty(),
+        "and nothing of this write remains inside it either"
+      );
+
+      let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The inode number the admission's identity is taken on cannot be handed to
     /// another object while the sync is in flight, because the admission is
     /// HOLDING the object rather than remembering its number.

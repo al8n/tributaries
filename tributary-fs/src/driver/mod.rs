@@ -1448,6 +1448,22 @@ thread_local! {
   /// that arm it call the write on their own thread.
   pub(crate) static COOKIE_PROOF_FAULT: std::cell::Cell<Option<CookieProofPoint>> =
     const { std::cell::Cell::new(None) };
+
+  /// A peer that acts in the window between a post-create refusal and the
+  /// WITHDRAWAL that answers it.
+  ///
+  /// The window is real and narrow: the marker exists, one of the post-create
+  /// proofs has refused, and the write is about to destroy what it made. A same-uid
+  /// peer that renames the marker inside it leaves the entry absent and the object
+  /// linked — the one arrangement under which "nothing at the name" and "nothing on
+  /// disk" part company, and the whole of what [`withdraw_marker`] has to tell
+  /// apart. No arrangement of a real tree can hit that window on demand, so a cell
+  /// stands in it.
+  ///
+  /// Thread-local, like the two steps above and for their reason: the cells that
+  /// arm it call the write on their own thread.
+  pub(crate) static COOKIE_WITHDRAW_STEP: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+    const { std::cell::RefCell::new(None) };
 }
 
 /// Which of the created arm's two post-marker readings a [`COOKIE_PROOF_FAULT`]
@@ -1978,6 +1994,40 @@ fn errno_slot() -> *mut libc::c_int {
 /// way.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn dir_holds_only(fd: &std::os::fd::OwnedFd, marker: &str) -> Result<bool, std::io::Error> {
+  let mut marker_found = false;
+  // One stranger is the whole answer, so the walk stops at the first — which is
+  // what the `Break` below is: the walker returns it and reads no further.
+  let stranger = walk_dir_entries(fd, |name| {
+    if name == marker.as_bytes() {
+      marker_found = true;
+      return std::ops::ControlFlow::Continue(());
+    }
+    std::ops::ControlFlow::Break(())
+  })?;
+  Ok(marker_found && stranger.is_none())
+}
+
+/// Walks the entries of the directory `fd` refers to, handing each non-dot name
+/// to `visit` and stopping the moment it answers `Break` — whose value is
+/// returned, `None` meaning the walk reached the end.
+///
+/// Through the DESCRIPTOR, never through a name, for the reason every reading on
+/// this path is: the caller is asking about the object it is holding, and a
+/// second lookup of a name would answer about whatever stands there now.
+///
+/// The name is handed over as raw BYTES. A directory entry is bytes on both these
+/// platforms, and a peer that can bind a name in the directory can bind one that
+/// is not UTF-8; a walker that lost those entries would leave exactly the objects
+/// a caller is hunting for invisible to it.
+///
+/// It reads one entry at a time and retains none of them, so a caller's bound is
+/// its own: `visit` sees each name while the walk holds it and decides then
+/// whether to keep anything.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn walk_dir_entries<T>(
+  fd: &std::os::fd::OwnedFd,
+  mut visit: impl FnMut(&[u8]) -> std::ops::ControlFlow<T>,
+) -> Result<Option<T>, std::io::Error> {
   use std::os::fd::IntoRawFd;
 
   // `fdopendir` takes OWNERSHIP of the descriptor it is given and `closedir`
@@ -1998,8 +2048,7 @@ fn dir_holds_only(fd: &std::os::fd::OwnedFd, marker: &str) -> Result<bool, std::
     unsafe { libc::close(duplicate) };
     return Err(failure);
   }
-  let mut marker_found = false;
-  let mut stranger = false;
+  let mut stopped = None;
   let mut failure = None;
   loop {
     // SAFETY: the slot is this thread's own `errno` location, valid for the
@@ -2025,20 +2074,17 @@ fn dir_holds_only(fd: &std::os::fd::OwnedFd, marker: &str) -> Result<bool, std::
     if name == b"." || name == b".." {
       continue;
     }
-    if name == marker.as_bytes() {
-      marker_found = true;
-      continue;
+    if let std::ops::ControlFlow::Break(answer) = visit(name) {
+      stopped = Some(answer);
+      break;
     }
-    // One stranger is the whole answer, so the walk stops at the first.
-    stranger = true;
-    break;
   }
   // SAFETY: `dir` is the live `DIR` this frame owns and is not used again; the
   // descriptor it took over is closed with it.
   unsafe { libc::closedir(dir) };
   match failure {
     Some(err) => Err(err),
-    None => Ok(marker_found && !stranger),
+    None => Ok(stopped),
   }
 }
 
@@ -2291,7 +2337,7 @@ impl CookieDir {
   /// the directory holding it.
   fn create(&self, name: &str) -> Result<std::fs::File, std::io::Error> {
     self.open_at(
-      name,
+      std::ffi::OsStr::new(name),
       libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
       0o600,
     )
@@ -2308,7 +2354,14 @@ impl CookieDir {
   /// `O_PATH` would be tighter still on Linux, but it does not exist on macOS and
   /// `fstat` of an `O_PATH` descriptor is not answerable on every kernel, so one
   /// portable form that is known to work everywhere is preferred to two.
-  fn open_for_classification(&self, name: &str) -> Result<std::fs::File, std::io::Error> {
+  ///
+  /// The name is an [`OsStr`](std::ffi::OsStr) rather than a `&str` because a
+  /// removal does not always start from a name this driver minted: a marker a peer
+  /// renamed is found by ENUMERATION, and an entry of a directory is bytes.
+  fn open_for_classification(
+    &self,
+    name: &std::ffi::OsStr,
+  ) -> Result<std::fs::File, std::io::Error> {
     self.open_at(
       name,
       libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
@@ -2318,11 +2371,12 @@ impl CookieDir {
 
   /// Unlinks `name` from THIS directory. No component of any path is resolved, so
   /// the entry removed is an entry of the directory this descriptor refers to and
-  /// of no other.
-  fn unlink(&self, name: &str) -> Result<(), std::io::Error> {
+  /// of no other. Bytes rather than a `&str`, for
+  /// [`open_for_classification`](Self::open_for_classification)'s reason.
+  fn unlink(&self, name: &std::ffi::OsStr) -> Result<(), std::io::Error> {
     use std::os::fd::AsRawFd;
 
-    let name = cookie_c_name(name)?;
+    let name = component_c_name(name)?;
     // SAFETY: `fd` is an open directory descriptor owned by `self`, `name` is a
     // live NUL-terminated C string for the call, and `0` is a valid flag word for
     // `unlinkat` (remove a non-directory entry).
@@ -2347,7 +2401,7 @@ impl CookieDir {
   /// long as the caller holds it, which is what lets a FAILED destroy come back as
   /// a residue whose identity can still be promoted later.
   fn destroy_created(&self, name: &str, _created: &std::fs::File) -> Result<(), std::io::Error> {
-    self.unlink(name)
+    self.unlink(std::ffi::OsStr::new(name))
   }
 
   /// NOTHING is owed for this directory, ever. This platform keeps ONE cookie
@@ -2377,13 +2431,13 @@ impl CookieDir {
 
   fn open_at(
     &self,
-    name: &str,
+    name: &std::ffi::OsStr,
     flags: libc::c_int,
     mode: libc::c_uint,
   ) -> Result<std::fs::File, std::io::Error> {
     use std::os::fd::{AsRawFd, FromRawFd};
 
-    let name = cookie_c_name(name)?;
+    let name = component_c_name(name)?;
     // SAFETY: `fd` is an open directory descriptor owned by `self`, `name` is a
     // live NUL-terminated C string for the call, and `mode` is only consulted when
     // `flags` carries `O_CREAT`.
@@ -9571,6 +9625,42 @@ fn identity_of_handle(file: &std::fs::File) -> Result<Option<RootIdentity>, std:
   }
 }
 
+/// Whether the object `handle` refers to still has a NAME somewhere — its link
+/// count, read off the descriptor this driver has held since the create.
+///
+/// # An entry gone is not an object gone
+///
+/// A removal addressed by name answers `ENOENT` for two different worlds: the
+/// object was unlinked, and the object was RENAMED. They demand opposite
+/// responses. The first means nothing of this write survives, so the write may
+/// report a clean refusal and retire having created nothing. The second means a
+/// file this driver created is still on disk under a leaf nothing recorded — and a
+/// clean refusal there releases the marker exemption, frees the cap slot that was
+/// supposed to bound exactly this, and lets close report a quiescent tree with the
+/// marker still in it.
+///
+/// The name cannot tell them apart, and nothing that resolves a name ever could.
+/// The HELD descriptor can: it follows the object, and an object with no remaining
+/// directory entry reports a link count of zero. That is the whole rule.
+///
+/// A read that FAILS answers `true`, which is the fail-closed direction here: a
+/// caller that cannot prove the object is gone must keep owing it. On Windows a
+/// destroy is a disposition set on this very handle rather than a name resolution,
+/// so its `NotFound` already IS the object's own and there is nothing for a link
+/// count to add.
+#[cfg(unix)]
+fn handle_still_named(handle: &std::fs::File) -> bool {
+  use std::os::unix::fs::MetadataExt;
+
+  handle.metadata().map_or(true, |meta| meta.nlink() > 0)
+}
+
+#[cfg(not(unix))]
+fn handle_still_named(handle: &std::fs::File) -> bool {
+  let _ = handle;
+  false
+}
+
 /// Destroys the cookie `handle` refers to after its identity could not be read,
 /// and reports the write's failure — together with the FILE, if the destroy could
 /// not be completed.
@@ -9657,6 +9747,24 @@ fn destroy_unidentified(
 /// the file on the floor — and the refusal's own message rides the residue's
 /// `source`.
 ///
+/// # An entry gone at the name is not an object gone
+///
+/// A destroy that answers `NotFound` has proved something about a NAME, and the
+/// question this function has to settle is about an OBJECT. A same-uid peer that
+/// renames the marker from its minted leaf to another leaf between the post-create
+/// refusal and this call leaves the entry absent and the file perfectly linked —
+/// and a clean refusal for it retires the obligation as never-created, releases
+/// its marker exemption, and lets close report a quiescent tree with a file this
+/// driver made still sitting in it, outside every ledger cap. Repeat that across
+/// targets and the residue accumulates with nothing counting it.
+///
+/// So the HELD descriptor decides ([`handle_still_named`]), never the name: a link
+/// count of zero is the object gone and the clean refusal stands, and anything
+/// else is answered exactly as a FAILED destroy is — the residue-carrying refusal,
+/// counted, retried and reported. The retry can find the renamed object again
+/// because the anchored removal locates by identity when the name is empty (see
+/// [`remove_anchored`]).
+///
 /// It is the platforms whose cookie directory is SHARED that reach this, and the
 /// destroy-succeeded arm relies on it: where a directory is a per-obligation debt,
 /// a clean typed refusal is not a true statement about the write (see
@@ -9668,14 +9776,31 @@ fn withdraw_marker(
   handle: std::fs::File,
   refusal: CookieWriteError,
 ) -> CookieWriteError {
+  #[cfg(all(
+    test,
+    feature = "tokio",
+    not(miri),
+    any(target_os = "linux", target_os = "macos")
+  ))]
+  COOKIE_WITHDRAW_STEP.with_borrow_mut(|peer| {
+    if let Some(peer) = peer.as_mut() {
+      peer();
+    }
+  });
   // Held across the destroy for the reason `destroy_unidentified` holds it: the
   // entry goes away, the object does not, so its identity slot stays out of the
   // allocator's reach for as long as a residue below might need it.
   match dir.destroy_created(name, &handle) {
     Ok(()) => refusal,
-    // Already gone — a peer swept it, or the directory it was in went with the
-    // rename. Either way no file of this write survives, so the refusal stands.
-    Err(gone) if gone.kind() == std::io::ErrorKind::NotFound => refusal,
+    // Nothing at the name, and the object gone with it — a peer swept it, or the
+    // directory it was in went with the rename. No file of this write survives, so
+    // the refusal stands.
+    Err(gone) if gone.kind() == std::io::ErrorKind::NotFound && !handle_still_named(&handle) => {
+      refusal
+    }
+    // Anything else leaves a file this write created on disk: a destroy that
+    // failed outright, or a name that answered empty while the object it named is
+    // still linked somewhere. Both are the same debt and are handed back as one.
     Err(_) => CookieWriteError {
       source: refusal.source,
       residue: Some(Box::new(CookieResidue::File(CookieFile::anchored(
@@ -9784,6 +9909,29 @@ fn post_mint_failure(dir: &Arc<CookieDir>, name: &str, source: std::io::Error) -
 /// cannot be promoted the removal FAILS CLOSED — the record survives, close
 /// reports the residue, and no name is touched.
 ///
+/// # An empty name is not a settled cookie
+///
+/// Nothing standing at the cookie's name reads as the idempotent success this
+/// contract promises, and it is one — but only once the OBJECT is gone. A trusted
+/// same-uid peer can rename this cookie to another leaf, which empties the name
+/// while leaving the file linked; answering `AlreadyGone` for that retires the
+/// record, spends its pin and releases its cap slot over a file still on disk,
+/// which is the untracked residue this whole design refuses.
+///
+/// So the held descriptor decides ([`handle_still_named`]): a link count of zero
+/// is the object gone and the verdict stands, and a live one sends the removal
+/// hunting for the object BY IDENTITY through the directory's own descriptor
+/// ([`unlink_entry_by_identity`]) — bounded by the reserved directory this driver
+/// owns, resolving no path, and comparing the same identity every other removal
+/// here compares. Found and unlinked is [`Unlinked`](CookieRemoval::Unlinked); not
+/// found means the object is linked somewhere this removal may not reach, and it
+/// is reported as the FAILURE it is, so the record stays counted and retried
+/// rather than retiring over a live file.
+///
+/// A record whose pin is already spent has no link count to read and keeps the
+/// verdict it always had: the pin is what held the object's identity slot out of
+/// the allocator's reach, so without it there is nothing here to hunt for.
+///
 /// [`Displaced`]: CookieRemoval::Displaced
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn remove_anchored(
@@ -9815,11 +9963,35 @@ fn remove_anchored(
       }
     }
   };
-  let standing = match dir.open_for_classification(name) {
+  let standing = match dir.open_for_classification(std::ffi::OsStr::new(name)) {
     Ok(file) => file,
-    // Idempotent by contract: an already-gone cookie is success.
+    // Nothing at the name. That is the idempotent success this contract promises
+    // — but only once the OBJECT is known gone, which the name cannot say and the
+    // held descriptor can: a peer that renamed this cookie to another leaf leaves
+    // the name empty and the file linked, and answering `AlreadyGone` for it
+    // retires the record over a file still on disk. With a live link count the
+    // object is hunted down by identity instead ([`unlink_entry_by_identity`]).
     Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-      return Ok(CookieRemoval::AlreadyGone);
+      return match pin {
+        Some(created) if handle_still_named(created) => {
+          if unlink_entry_by_identity(dir, identity)? {
+            Ok(CookieRemoval::Unlinked)
+          } else {
+            // The object is linked, and no entry of this directory names it: it
+            // was renamed OUT of the one place this driver may unlink from, or
+            // renamed again while the walk was reading. So the removal FAILED —
+            // the same outcome a refused unlink produces, and the one the ledger's
+            // retry budget and typed terminal already carry. Settling any verdict
+            // here would retire a record whose file is still on disk, which is
+            // precisely what the link count refused to pretend.
+            Err(std::io::Error::other(
+              "the cookie is still linked but no entry of the directory it was created \
+               in names it, and this driver may unlink only from that directory",
+            ))
+          }
+        }
+        _ => Ok(CookieRemoval::AlreadyGone),
+      };
     }
     // A symlink standing at the name: `O_NOFOLLOW` refuses it, and a cookie is
     // never a symlink (its own create refused one too), so this is a
@@ -9839,11 +10011,77 @@ fn remove_anchored(
   if identity_of_handle(&standing)? != Some(identity) {
     return Ok(CookieRemoval::Displaced);
   }
-  match dir.unlink(name) {
+  match dir.unlink(std::ffi::OsStr::new(name)) {
     Ok(()) => Ok(CookieRemoval::Unlinked),
     Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(CookieRemoval::AlreadyGone),
     // A transient failure (a hung mount, a flipped permission) is reported, not
     // swallowed, so the record survives for a later sweep to retry.
+    Err(err) => Err(err),
+  }
+}
+
+/// Finds the entry of `dir` whose object IS `identity` and unlinks it, answering
+/// whether one was found.
+///
+/// It is the fallback [`remove_anchored`] takes when the cookie's own name is
+/// empty and its held descriptor still reports a link: the object exists, it is
+/// this driver's, and the only thing that moved is which leaf names it. A removal
+/// that stopped at the empty name would report success over a live file.
+///
+/// Everything about it stays inside the anchoring rule. The enumeration runs
+/// through the directory's OWN descriptor ([`walk_dir_entries`], the same
+/// `fdopendir`-on-a-duplicate shape the sole-entry proof uses), each candidate is
+/// classified by an `openat` of that same descriptor, and the unlink addresses an
+/// entry of it — no component of any path is resolved at any step, so a directory
+/// renamed or replaced under this driver's feet changes nothing about where the
+/// removal lands.
+///
+/// The comparison is the removal's own: the identity is read off the CANDIDATE's
+/// descriptor and matched against the identity the record carries — which is
+/// itself read off the create's retained handle, not off a name. So the entry
+/// unlinked is the entry that names the object this write made, and the
+/// same-uid-trusted contract [`remove_anchored`] states covers the gap between the
+/// comparison and the unlink here exactly as it does there.
+///
+/// # What bounds it
+///
+/// The reserved directory, and nothing more. It is created `0o700` under a name
+/// this crate mints, verified for owner and mode on open, and holds markers; the
+/// walk visits its entries once, retains none, and stops at the first match. An
+/// entry that cannot be classified is SKIPPED rather than propagated — a stranger
+/// this driver has no business opening, a name whose object vanished mid-walk —
+/// because a candidate that could not be read is not the object being hunted, and
+/// failing the whole removal over one would strand a marker that is sitting two
+/// entries further on. A `readdir` that fails IS propagated: the walk then covered
+/// an unknown part of the directory, and "not found" would be a claim it never
+/// earned.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn unlink_entry_by_identity(
+  dir: &CookieDir,
+  identity: RootIdentity,
+) -> Result<bool, std::io::Error> {
+  use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+  let found = walk_dir_entries(&dir.fd, |name| {
+    let name = OsStr::from_bytes(name);
+    match dir.open_for_classification(name) {
+      Ok(standing) if identity_of_handle(&standing).ok().flatten() == Some(identity) => {
+        std::ops::ControlFlow::Break(name.to_os_string())
+      }
+      _ => std::ops::ControlFlow::Continue(()),
+    }
+  })?;
+  let Some(found) = found else {
+    return Ok(false);
+  };
+  match dir.unlink(&found) {
+    Ok(()) => Ok(true),
+    // The entry went away between the match and the unlink — a peer renamed the
+    // object again inside the same window this whole fallback exists for. Not
+    // found is the honest answer: the caller keeps the record, and the retry walks
+    // a directory that now spells the object differently. It converges because the
+    // ledger's attempt budget bounds it either way.
+    Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
     Err(err) => Err(err),
   }
 }
