@@ -3669,13 +3669,23 @@ enum Reaped {
   AbnormalResidual,
 }
 
-/// One cookie obligation's ledger record: the scope it belongs to, its rendered
-/// name (kept so retiring the record can also drop its `by_name` index without
-/// recomputation), the ticket sequence keying it (kept for the same reason on the
-/// `by_ticket` index), its immutable incarnation identity, the path it landed at,
-/// the reap mark, its LRU re-arm key, and its lifecycle phase.
+/// One cookie obligation's ledger record: the scope it belongs to, the directory
+/// its sync was admitted for, its rendered name (kept so retiring the record can
+/// also drop its `by_name` index without recomputation), the ticket sequence
+/// keying it (kept for the same reason on the `by_ticket` index), its immutable
+/// incarnation identity, the path it landed at, the reap mark, its LRU re-arm
+/// key, and its lifecycle phase.
 struct Obligation {
   scope: ScopeId,
+  /// The directory the sync named — the ground its marker is going to land in,
+  /// held for as long as the obligation is PRE-TERMINAL so a set-cover can widen
+  /// its retained cover by it ([`CookieRegistry::live_sync_dirs`]). Nothing else
+  /// reads it: the write addresses its own pinned descriptors, and every removal
+  /// goes through the residue's landing.
+  ///
+  /// One path per record, so the ledger's caps bound it exactly as they bound the
+  /// name beside it.
+  dir: PathBuf,
   /// The rendered cookie LEAF, shared as an `Arc<str>` with the `by_name` index,
   /// the core's active-marker set and the release queue rather than copied into
   /// each — one validated, length-bounded allocation per obligation
@@ -4259,13 +4269,17 @@ impl<F: FsOps> CookieRegistry<F> {
   ///   with it and is unique by construction.
   ///
   /// `ticket` is the caller's [`SyncTicket`] sequence — the `by_ticket` key an
-  /// incarnation-precise cancel resolves through.
+  /// incarnation-precise cancel resolves through, and `dir` the directory the
+  /// sync was admitted for — recorded so a later set-cover can keep the ground
+  /// this obligation is still going to write in
+  /// ([`live_sync_dirs`](Self::live_sync_dirs)).
   ///
   /// Called only AFTER every admission refusal has passed: a refused sync must
   /// create nothing at all.
   fn admit_parked(
     &mut self,
     scope: ScopeId,
+    dir: PathBuf,
     name: Arc<str>,
     ticket: u64,
     fence: FenceId,
@@ -4277,6 +4291,7 @@ impl<F: FsOps> CookieRegistry<F> {
       id,
       Obligation {
         scope,
+        dir,
         name: Arc::clone(&name),
         ticket,
         id,
@@ -4413,6 +4428,30 @@ impl<F: FsOps> CookieRegistry<F> {
       .obligations
       .values()
       .any(|ob| ob.scope == scope && matches!(ob.phase, Phase::Parked { .. } | Phase::InPool))
+  }
+
+  /// The directories `scope`'s IN-FLIGHT syncs are still going to write in —
+  /// every obligation parked on its settle fence or dispatched into the pool.
+  ///
+  /// A set-cover widens its retained cover by these before the core reconciles
+  /// ([`DriverCore::on_set_cover`]). The admission proved the ground covered when
+  /// it let the sync through, and nothing binds the obligation to the cover it
+  /// was admitted under — so a shrink arriving between admission and landing
+  /// would drop the very watches the marker's create has to come off, and the
+  /// caller's barrier could only time out over a write that succeeded.
+  ///
+  /// The phases are exactly [`has_pending_write`](Self::has_pending_write)'s,
+  /// and for the same reason: from the CLAIM onward the marker exists and its
+  /// delivery has already been decided, so a cover narrowing past it takes
+  /// nothing the sync still needs. One O(ledger) walk, which the global cap
+  /// bounds — as it bounds the number of directories this can return.
+  fn live_sync_dirs(&self, scope: ScopeId) -> Vec<PathBuf> {
+    lock_ledger(&self.ledger)
+      .obligations
+      .values()
+      .filter(|ob| ob.scope == scope && matches!(ob.phase, Phase::Parked { .. } | Phase::InPool))
+      .map(|ob| ob.dir.clone())
+      .collect()
   }
 
   /// Whether a LIVE obligation already holds this rendered cookie name — the
@@ -8685,11 +8724,22 @@ fn cookie_ground_refusal(
 /// landing is where the caller's directory actually is — the same choice the
 /// write's own refusals make, and the only one a caller can act on when an
 /// intermediate symlink is what made the two differ.
+///
+/// # The applied cover is the fourth fact, and it is asked HERE
+///
+/// The admission's own cover test runs on the caller's spelling, which is not a
+/// location: an intermediate symlink under retained ground resolving into a
+/// subtree the cut stopped watching passes it, and the write then follows the
+/// link. So the cover is asked again, of the pins — `covers` is the applied
+/// cover's membership test ([`DriverCore::covers`]), passed in because it is the
+/// core's fact and this runs beside the core rather than inside it, and it is as
+/// lexical as everything else here.
 fn admitted_ground_refusal(
   root: &Path,
   admitted: &AdmittedDirs,
   prune: &Globs,
   exclusions: &[PathBuf],
+  covers: &dyn Fn(&Path) -> bool,
 ) -> Option<crate::error::SyncRootError> {
   #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
   if let Some(reference) = admitted.root_frame() {
@@ -8707,6 +8757,33 @@ fn admitted_ground_refusal(
         });
       }
     }
+  }
+  // The cover, taken after the frame and before the floor: a landing outside the
+  // applied cover holds no watch, so the marker's create reaches no source and the
+  // caller's barrier could only time out — the same "no source can report this"
+  // fact the exclusion and prune words state, arriving from the third seat.
+  if let Some(landing) = admitted.target_landing()
+    && !covers(landing)
+  {
+    return Some(crate::error::SyncRootError::DirUncovered {
+      dir: landing.to_path_buf(),
+    });
+  }
+  // The reserved directory is asked of its PARENT, which is the rule the cut
+  // itself keeps: no cover can name the watcher's own reserved leaf, so the
+  // set-cover keeps that leaf's watch armed exactly while the directory HOLDING
+  // it stays covered. Asking the leaf directly would instead refuse every second
+  // sync of a directory a cover narrowed to one file — the very case that
+  // exemption exists for, since a cover naming a file marks the reserved sibling
+  // strictly outside. Asking the parent refuses what it must: a reserved name
+  // that is itself a link out of covered ground, whose marker would land where
+  // nothing is armed.
+  if let Some(landing) = admitted.cookies_landing()
+    && landing.parent().is_some_and(|parent| !covers(parent))
+  {
+    return Some(crate::error::SyncRootError::DirUncovered {
+      dir: landing.to_path_buf(),
+    });
   }
   // The target first and the reserved directory second, in the order the write
   // descends and asks: the shallower ground is the one a caller moves off.
@@ -12560,7 +12637,7 @@ pub(crate) async fn run<R, F>(
             let _ = reply.send(admitted_verdict(&unproven_scopes, scope, UnwatchAck::Unknown));
           }
         }
-        Ok(Command::SetCover { scope, retained, mut reply }) => {
+        Ok(Command::SetCover { scope, mut retained, mut reply }) => {
           // In-place bidirectional coverage reconcile. The core is the authority on whether
           // a reconcile ran: every refusal — unknown scope, not yet publicly live,
           // kernel-recursive profile, refused cover — comes back as a typed `Noop` and is
@@ -12587,6 +12664,22 @@ pub(crate) async fn run<R, F>(
             let _ = reply.send(CoverOutcome::Skipped(SkipReason::Backlogged));
             continue;
           }
+          // A shrink may not take the ground an ADMITTED sync is still going to
+          // write in. The admission proved that ground covered, but nothing binds
+          // the obligation to the cover it was admitted under: a cover arriving
+          // between the admission and the marker's create would prune the watches
+          // the create has to come off, and the caller would then wait out its
+          // barrier over a write that reported success. So every in-flight sync's
+          // target directory joins the retained cover here — one term per parked
+          // or in-pool obligation of this scope, bounded by the cookie caps — and
+          // the R24 reserved-directory exemption keeps the marker's own directory
+          // with it, that directory's parent now being retained.
+          //
+          // Widening only ever ADDS coverage, so it cannot lose an event; what it
+          // costs is that the applied cover is briefly a superset of the one the
+          // caller asked for, until the next `set_cover` — by which time these
+          // syncs have reached their terminal and named nothing.
+          retained.extend(cookies.live_sync_dirs(scope));
           match core.on_set_cover(scope, &retained) {
             CoverReconcile::Reconciling => {
               if let Some(reply) = reply {
@@ -12663,12 +12756,20 @@ pub(crate) async fn run<R, F>(
                 // across the cut instead — which is what makes a covered
                 // directory's SECOND sync (the one that reuses the reserved
                 // directory and so provokes no directory create) observable at all.
+                //
+                // This is a SPELLING test and cannot be the whole answer: a
+                // resolved landing under an intermediate symlink is judged again
+                // against the same cover, off the pins ([`admitted_ground_refusal`]).
+                // Kept here because it is cheap and pre-pin: a caller naming
+                // uncovered ground outright is turned away before the door opens a
+                // descriptor.
                 let _ = reply.send(Err(crate::error::SyncRootError::DirUncovered { dir }));
               } else if let Some(refusal) = admitted_ground_refusal(
                 &root,
                 &admitted,
                 &core.scope_prune(scope),
                 &config.exclusions,
+                &|landing| core.covers(scope, landing),
               ) {
                 // Every check above judged the caller's SPELLING, which is not a
                 // location. This judges where the door's pinned objects actually
@@ -12793,7 +12894,8 @@ pub(crate) async fn run<R, F>(
                 // admission, and it costs nothing: both run in this one command
                 // step, and the release drain is the loop top's, so no release can
                 // be applied in between.
-                let id = cookies.admit_parked(scope, Arc::clone(&name), ticket.seq(), fence);
+                let id =
+                  cookies.admit_parked(scope, dir.clone(), Arc::clone(&name), ticket.seq(), fence);
                 core.arm_sync_marker(scope, name, id);
                 // The routing half: which caller this fence answers, and where its
                 // cookie is to be written. Inserted in the same step as the record

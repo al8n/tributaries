@@ -3787,6 +3787,206 @@ mod descending {
       assert_eq!(path, PathBuf::from("/r/keep/.tributaries-sync-4-5-6"));
     }
 
+    /// The watch `path` currently holds, if any: the most recent arm of that path
+    /// the fake has not since reclaimed. Re-arms mint a fresh id, so the LAST one
+    /// is the live binding.
+    fn live_watch_at(rig: &Rig, path: &str) -> Option<WatchId> {
+      let live = rig.fs.live_watches();
+      rig
+        .fs
+        .arms()
+        .into_iter()
+        .rev()
+        .find(|(watch, armed)| armed == std::path::Path::new(path) && live.contains(watch))
+        .map(|(watch, _)| watch)
+    }
+
+    /// The obligations the driver owns right now.
+    async fn cookie_count(rig: &Rig) -> usize {
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::DebugCookieCount { reply })
+        .await
+        .unwrap();
+      on_reply.await.expect("the driver replies")
+    }
+
+    /// Settles until the driver owns `target` obligations, reporting whether it
+    /// got there — the async analogue of [`settle`] for a count only a `Command`
+    /// round trip can read.
+    #[must_use = "an expired budget means the obligation never appeared, which is a staging failure"]
+    async fn settle_cookies(rig: &Rig, target: usize) -> bool {
+      for _ in 0..interpreted_rounds(200) {
+        if cookie_count(rig).await == target {
+          return true;
+        }
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        std::thread::sleep(settle_round_slice());
+      }
+      cookie_count(rig).await == target
+    }
+
+    /// Sends one `SyncRoot` for `dir` and hands back the caller's half of the
+    /// reply — the cells below race a cover against a sync that has been admitted
+    /// and has not yet answered.
+    async fn begin_sync(
+      rig: &Rig,
+      scope: ScopeId,
+      dir: &str,
+      name: &str,
+    ) -> futures_channel::oneshot::Receiver<Result<PathBuf, crate::error::SyncRootError>> {
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::SyncRoot {
+          scope,
+          dir: PathBuf::from(dir),
+          admitted: Default::default(),
+          name: name.to_owned(),
+          ticket: ticket(),
+          reply,
+        })
+        .await
+        .unwrap();
+      on_reply
+    }
+
+    /// A shrink does not take the ground a PARKED sync is still going to write in.
+    ///
+    /// The admission proved `/r/a` covered and let the sync through; nothing binds
+    /// the obligation to that cover. A cover arriving while the write is still
+    /// parked on its settle fence would mark `/r/a` strictly outside and reclaim
+    /// its watch — and the marker, when the fence finally settles, would be born
+    /// in ground no watch reports. `sync_root` would answer with a path while the
+    /// caller's barrier could only time out.
+    ///
+    /// So the driver widens the requested cover by every in-flight sync's target
+    /// before the core reconciles, and the watch is the observable: `/r/a`'s
+    /// binding survives a cover that names only `/r/b`, and the sync still
+    /// completes at its own path once the fence settles.
+    ///
+    /// Revert witness: drop the widening from the `SetCover` handler and `/r/a`'s
+    /// watch is reclaimed by the shrink while the write is still parked.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_shrink_keeps_the_ground_a_parked_sync_will_write_in() {
+      let (rig, scope) = covered_rig(&[("/r/a", 11), ("/r/b", 12)]).await;
+      let ack = send_set_cover(&rig, scope, &["/r/a"]).await;
+      assert_eq!(
+        resolved(ack).await,
+        CoverOutcome::Applied,
+        "staging: the sync below is admitted onto ground the cover holds"
+      );
+      let armed = live_watch_at(&rig, "/r/a").expect("staging: /r/a holds a watch");
+
+      // Stall the grow so the sync's own settle fence never settles: its
+      // obligation stays PARKED — admitted, counted, and pre-physical.
+      let hold = rig.fs.hold_arms();
+      let _grow = send_set_cover(&rig, scope, &["/r/a", "/r/b"]).await;
+      let mut on_sync = begin_sync(&rig, scope, "/r/a", ".tributaries-sync-7-8-9").await;
+      assert!(
+        settle_cookies(&rig, 1).await,
+        "staging: the sync is admitted and its write is parked on the fence"
+      );
+      assert!(
+        futures_util::poll!(&mut on_sync).is_pending(),
+        "staging: the parked write has not answered"
+      );
+      assert!(
+        rig.fs.cookie_writes().is_empty(),
+        "staging: and nothing is on disk for it yet"
+      );
+
+      // The cover the caller now asks for names only /r/b. The widening is what
+      // keeps /r/a with it.
+      let _shrink = send_set_cover(&rig, scope, &["/r/b"]).await;
+      for _ in 0..interpreted_rounds(40) {
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+      }
+      assert_eq!(
+        live_watch_at(&rig, "/r/a"),
+        Some(armed),
+        "the parked sync's ground keeps the very watch it was admitted under \
+         (disarms: {:?})",
+        rig.fs.disarms()
+      );
+
+      hold.release();
+      let path = on_sync
+        .await
+        .expect("the driver replies")
+        .expect("the parked write lands once the coverage settles");
+      assert_eq!(path, PathBuf::from("/r/a/.tributaries-sync-7-8-9"));
+      assert_eq!(
+        live_watch_at(&rig, "/r/a"),
+        Some(armed),
+        "and it was the SAME binding throughout — nothing was reclaimed and re-armed"
+      );
+    }
+
+    /// The same promise for a write already IN THE POOL: the obligation has left
+    /// its fence and its `write_cookie` is running, so the marker may land at any
+    /// instant — into ground a shrink would otherwise have stopped watching.
+    ///
+    /// The in-pool phase is the sharper half of the two. A parked write can still
+    /// be reasoned about as "nothing exists yet"; here the create is in flight,
+    /// and the watch that has to carry it must survive a cover that lands
+    /// mid-syscall.
+    ///
+    /// Revert witness: drop the widening from the `SetCover` handler and the
+    /// shrink reclaims `/r/a`'s watch while the write is inside the pool.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_shrink_keeps_the_ground_an_in_pool_write_is_landing_in() {
+      let (rig, scope) = covered_rig(&[("/r/a", 11), ("/r/b", 12)]).await;
+      let ack = send_set_cover(&rig, scope, &["/r/a"]).await;
+      assert_eq!(
+        resolved(ack).await,
+        CoverOutcome::Applied,
+        "staging: the sync below is admitted onto ground the cover holds"
+      );
+      let armed = live_watch_at(&rig, "/r/a").expect("staging: /r/a holds a watch");
+
+      // The write reaches the pool (a prune-only cover settles at the next loop
+      // top, so the fence is not what holds it) and parks inside its syscall.
+      let writes = rig.fs.hold_cookie_writes();
+      let mut on_sync = begin_sync(&rig, scope, "/r/a", ".tributaries-sync-7-8-9").await;
+      assert!(
+        settle(|| writes.captured() >= 1).await,
+        "staging: the write left the fence and is inside the pool"
+      );
+      assert!(
+        futures_util::poll!(&mut on_sync).is_pending(),
+        "staging: and it has not answered"
+      );
+
+      let _shrink = send_set_cover(&rig, scope, &["/r/b"]).await;
+      for _ in 0..interpreted_rounds(40) {
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+      }
+      assert_eq!(
+        live_watch_at(&rig, "/r/a"),
+        Some(armed),
+        "the in-pool write's ground keeps the watch its marker has to be \
+         reported through (disarms: {:?})",
+        rig.fs.disarms()
+      );
+
+      writes.release();
+      let path = on_sync
+        .await
+        .expect("the driver replies")
+        .expect("the write lands");
+      assert_eq!(path, PathBuf::from("/r/a/.tributaries-sync-7-8-9"));
+      assert_eq!(
+        live_watch_at(&rig, "/r/a"),
+        Some(armed),
+        "and it was the SAME binding throughout"
+      );
+    }
+
     /// THE PUBLIC CONTRACT END TO END for the one loss that arrives with no cover
     /// of its own: an awaited reply over a standing classification stat reports
     /// `Degraded`, and the covering `Rescan` that verdict names is on the
@@ -12496,7 +12696,7 @@ mod sync_cookie {
     ticket: u64,
   ) -> CookieGuard {
     let fence = core.open_cover_fence(scope);
-    let id = reg.admit_parked(scope, Arc::from(name), ticket, fence);
+    let id = reg.admit_parked(scope, PathBuf::from("/r"), Arc::from(name), ticket, fence);
     reg
       .dispatch_guard(scope, id)
       .expect("a freshly admitted obligation dispatches")
@@ -13236,7 +13436,13 @@ mod sync_cookie {
     let fence = core.open_cover_fence(scope);
 
     let name: Arc<str> = Arc::from(".tributaries-sync-shared-leaf");
-    let id = reg.admit_parked(scope, Arc::clone(&name), ticket().seq(), fence);
+    let id = reg.admit_parked(
+      scope,
+      PathBuf::from("/r"),
+      Arc::clone(&name),
+      ticket().seq(),
+      fence,
+    );
     lock_ledger(&reg.ledger).retire(id, Reaped::NeverCreated);
 
     let released = reg.take_released_markers();
@@ -16400,6 +16606,7 @@ mod sync_cookie {
         m,
         Obligation {
           scope,
+          dir: PathBuf::from("/r"),
           name: Arc::from(name),
           ticket: m.0,
           id: m,
@@ -16472,6 +16679,7 @@ mod sync_cookie {
         m,
         Obligation {
           scope,
+          dir: PathBuf::from("/r"),
           name: Arc::from("n"),
           ticket: m.0,
           id: m,
@@ -16544,6 +16752,7 @@ mod sync_cookie {
         f,
         Obligation {
           scope,
+          dir: PathBuf::from("/r"),
           name: Arc::from("n2"),
           ticket: f.0,
           id: f,
@@ -16974,6 +17183,7 @@ mod sync_cookie {
         id,
         Obligation {
           scope,
+          dir: PathBuf::from("/r"),
           name: Arc::from(name),
           ticket: id.0,
           id,
@@ -17797,7 +18007,7 @@ mod sync_cookie {
       let name = ".tributaries-sync-phase-parked";
       let t = ticket();
       let fence = core.open_cover_fence(scope);
-      let id = reg.admit_parked(scope, Arc::from(name), t.seq(), fence);
+      let id = reg.admit_parked(scope, PathBuf::from("/r"), Arc::from(name), t.seq(), fence);
       cleanup.request_cancel(t);
       assert!(
         reg.dispatch_guard(scope, id).is_none(),
@@ -20647,7 +20857,7 @@ mod sync_cookie {
         )
       };
       let verdict = |admitted: &crate::driver::AdmittedDirs| {
-        crate::driver::admitted_ground_refusal(&root, admitted, &quiet, &[])
+        crate::driver::admitted_ground_refusal(&root, admitted, &quiet, &[], &|_| true)
       };
 
       // The bind exactly: same device, different mount, contained landing.
@@ -20700,11 +20910,120 @@ mod sync_cookie {
             &judged((40, Some(12)), (40, Some(12))),
             &pruned,
             &[],
+            &|_| true,
           ),
           Some(crate::SyncRootError::DirCrossesMount { .. })
         ),
         "the mount verdict is taken first, so a bind is never reported as a seat \
          the caller could retract"
+      );
+    }
+
+    /// The APPLIED COVER is asked of the landings, and the reserved directory is
+    /// asked of its PARENT.
+    ///
+    /// The admission's own cover test runs on the caller's spelling, and a
+    /// spelling is not a location: an intermediate symlink under retained ground
+    /// resolves into the subtree a cut took, so the landing is the only reading
+    /// that sees it. Refusing there is what keeps `sync_root` from answering `Ok`
+    /// over a marker no watch can report.
+    ///
+    /// The reserved directory's rule is the one this cell is really for, because
+    /// getting it wrong breaks the exemption the cut itself keeps: no cover can
+    /// name the watcher's reserved leaf, so a cover naming a FILE marks that leaf
+    /// strictly outside while `on_set_cover` deliberately keeps its watch. Judging
+    /// the leaf directly would refuse every second sync of such a directory — the
+    /// exact case the exemption exists for. Judging its PARENT refuses only what
+    /// must be refused: a reserved name that is itself a link out of covered
+    /// ground.
+    ///
+    /// Asked of the rule rather than of a tree because the rule is pure — the
+    /// landings are values the door already read, and the cover is a lexical
+    /// statement about paths. The kernel cell in `watcher::linux_kernel_tests`
+    /// stages the symlink for real.
+    ///
+    /// Revert witnesses, one per arm: drop the landing check and the first arm
+    /// answers `None`; judge the reserved LEAF instead of its parent and the last
+    /// arm refuses a sync the cut deliberately kept observable.
+    #[test]
+    fn the_applied_cover_is_asked_of_the_landings_and_of_the_reserved_parent() {
+      // Names only: nothing here is resolved and nothing needs to exist.
+      let root = PathBuf::from("/watched");
+      let quiet = tributary_proto::glob::Globs::default();
+      let frame = 40;
+      let judged = |target: &Path, cookies: &Path| {
+        crate::driver::AdmittedDirs::held(
+          crate::driver::SyncPinAllowance::permit(),
+          crate::driver::AdmittedDir::framed_at(None, frame, Some(11)),
+          crate::driver::AdmittedDir::framed_at(Some(target.to_path_buf()), frame, Some(11)),
+          crate::driver::AdmittedDir::framed_at(Some(cookies.to_path_buf()), frame, Some(11)),
+        )
+      };
+      // The applied cover, as the core answers it: a path is covered iff it is an
+      // ancestor or a descendant of some retained prefix.
+      let covering = |retained: Vec<PathBuf>| {
+        move |path: &Path| {
+          retained
+            .iter()
+            .any(|kept| path.starts_with(kept) || kept.starts_with(path))
+        }
+      };
+      let reserved_leaf = cookie_dir_name();
+
+      // A cover of `<root>/keep`, and a target that RESOLVED into the subtree the
+      // cut took. The caller's spelling never appears here — the verdict is the
+      // landing's.
+      let landing = root.join("drop").join("sub");
+      let cover = covering(vec![root.join("keep")]);
+      match crate::driver::admitted_ground_refusal(
+        &root,
+        &judged(&landing, &landing.join(&reserved_leaf)),
+        &quiet,
+        &[],
+        &cover,
+      ) {
+        Some(crate::SyncRootError::DirUncovered { dir }) => assert_eq!(
+          dir, landing,
+          "the refusal names the landing, which is where the caller's directory is"
+        ),
+        other => panic!("a landing the cut took is uncovered ground: {other:?}"),
+      }
+
+      // The target is covered and only the RESERVED name is a link out: the
+      // parent rule is what catches it, and the reply names the reserved
+      // directory rather than the directory holding it.
+      let kept = root.join("keep");
+      let strayed = root.join("drop").join(&reserved_leaf);
+      match crate::driver::admitted_ground_refusal(
+        &root,
+        &judged(&kept, &strayed),
+        &quiet,
+        &[],
+        &cover,
+      ) {
+        Some(crate::SyncRootError::DirUncovered { dir }) => assert_eq!(
+          dir, strayed,
+          "each pinned object is judged where it stood, not just the shallowest"
+        ),
+        other => panic!("a reserved directory outside the cover is uncovered: {other:?}"),
+      }
+
+      // THE EXEMPTION, which this rule must not break: the cover names a FILE, so
+      // the reserved directory beside it is strictly outside every retained prefix
+      // — and the cut keeps its watch anyway. Judging the leaf would refuse this
+      // sync; judging its parent admits it.
+      let file_cover = covering(vec![root.join("keep").join("f.txt")]);
+      assert!(
+        crate::driver::admitted_ground_refusal(
+          &root,
+          &judged(&kept, &kept.join(&reserved_leaf)),
+          &quiet,
+          &[],
+          &file_cover,
+        )
+        .is_none(),
+        "a covered directory's own reserved directory is admitted, however the \
+         cover spelled the coverage"
       );
     }
 

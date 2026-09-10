@@ -393,6 +393,12 @@ pub enum RequestOutcome {
 /// queued. The settled verdicts ([`Applied`](Self::Applied) /
 /// [`Degraded`](Self::Degraded)) are constructed only by that settlement, so
 /// no code path can resolve them early.
+///
+/// Whatever the outcome, the cover the watcher APPLIED is the requested one widened
+/// by the target directory of every sync of that root still in flight — a coverage
+/// superset that keeps an admitted marker observable and lasts only until the next
+/// reconcile (see [`Watcher::set_cover`]). No variant here reports it: a superset
+/// loses nothing a caller could act on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CoverOutcome {
@@ -2349,6 +2355,18 @@ impl<R> Watcher<R> {
   /// `retained` are the watcher's own canonical coordinates (as
   /// [`root_path`](Self::root_path) reports), so they line up with the watches' addressing.
   ///
+  /// # The applied cover is widened by the syncs in flight
+  ///
+  /// A [`sync_root`](Self::sync_root) that has been admitted but whose marker has not yet
+  /// landed holds a promise about ground the caller's new cover may no longer name. The
+  /// watcher therefore applies `retained` **plus the target directory of every in-flight sync
+  /// of this root**, so a shrink can never prune the watches that marker has to be reported
+  /// through — the caller's barrier would otherwise wait out its deadline over a write that
+  /// reported success. The widening is a coverage **superset**, so it loses nothing; it is
+  /// bounded by the watcher's sync-obligation caps, and it lasts only until the next
+  /// `set_cover`, by which time those syncs have reached their terminals. The acknowledgement
+  /// reports the reconcile exactly as it would without it.
+  ///
   /// # The acknowledgement is an effect-completion fence
   ///
   /// The returned future resolves when the reconcile has **settled** — every re-arm the grow
@@ -2455,6 +2473,11 @@ impl<R> Watcher<R> {
   /// when the request can NEVER be enqueued — `root` is a foreign handle (another watcher's brand)
   /// or the watcher is closed — so the caller must drop the intent rather than retry. Never blocks
   /// and never panics.
+  ///
+  /// The applied cover is widened by the target directory of every in-flight
+  /// [`sync_root`](Self::sync_root) of this root, exactly as it is for the awaited
+  /// [`set_cover`](Self::set_cover) — see that method for what the widening costs and why it
+  /// can never lose an event.
   pub fn request_set_cover(&self, root: RootHandle, retained: Vec<PathBuf>) -> RequestOutcome {
     // A foreign handle's scope number can name THIS watcher's unrelated root — reject it (never
     // retryable) before touching the channel, exactly as the awaited `set_cover` does.
