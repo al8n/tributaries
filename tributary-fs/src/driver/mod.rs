@@ -10771,6 +10771,14 @@ pub(crate) async fn run<R, F>(
   let mut cut_token_seq: u64 = 0;
   let mut pending_control: PendingControl = BTreeMap::new();
   let mut control_inflight: ControlInflight = BTreeMap::new();
+  // The scopes with a ROOT-LIVENESS PROBE outstanding. A probe runs on a thread
+  // of its own rather than on the blocking pool — see the `RefreshMounts`
+  // dispatch for why the pool is the one executor it must not share — and this
+  // set is what keeps a wall-clock tick from minting a second thread against a
+  // root the first has not come back from. Entries are removed when the probe's
+  // `MountsRefreshed` lands and at scope teardown, so the set is bounded by live
+  // scopes.
+  let mut probes_in_flight: BTreeSet<ScopeId> = BTreeSet::new();
   // Awaited unwatch replies parked until the scope is fully quiescent, each
   // paired with the verdict to send then: `true` for a live scope this
   // unwatch tears down, `false` (UnknownRoot) for a scope whose root already
@@ -10835,6 +10843,7 @@ pub(crate) async fn run<R, F>(
       &mut deferred_grants,
       &mut pending_control,
       &mut control_inflight,
+      &mut probes_in_flight,
       &mut cookies,
       &registry,
       &now,
@@ -10888,6 +10897,7 @@ pub(crate) async fn run<R, F>(
         &mut deferred_grants,
         &mut pending_control,
         &mut control_inflight,
+        &mut probes_in_flight,
         &mut cookies,
         &registry,
         &now,
@@ -11628,6 +11638,10 @@ pub(crate) async fn run<R, F>(
           }},
           OpResult::Probed { probe, outcome } => core.on_probe_result(probe, outcome, now()),
           OpResult::MountsRefreshed { scope, refresh } => {
+            // The probe's thread is done with this scope: its seat comes back
+            // here, in lockstep with the core clearing its own pending mark, so
+            // the next tick may dispatch again.
+            probes_in_flight.remove(&scope);
             core.on_mounts_refreshed(scope, refresh, now())
           }
           OpResult::WatchInstalled {
@@ -12825,6 +12839,7 @@ pub(crate) async fn run<R, F>(
           }
           Ok(OpResult::Enumerated { req, raw }) => core.on_enumerated(req, raw),
           Ok(OpResult::MountsRefreshed { scope, refresh }) => {
+            probes_in_flight.remove(&scope);
             core.on_mounts_refreshed(scope, refresh, now())
           }
           // A spawn that raced the close: the stream is live but has no owner —
@@ -12951,6 +12966,7 @@ pub(crate) async fn run<R, F>(
     &mut deferred_grants,
     &mut pending_control,
     &mut control_inflight,
+    &mut probes_in_flight,
     &mut cookies,
     &registry,
     &now,
@@ -15586,6 +15602,7 @@ fn execute_effects<R, F>(
   deferred_grants: &mut BTreeMap<ScopeId, DeferredGrant>,
   pending_control: &mut PendingControl,
   control_inflight: &mut ControlInflight,
+  probes_in_flight: &mut BTreeSet<ScopeId>,
   cookies: &mut CookieRegistry<F>,
   registry: &impl ScopeRegistry,
   now: &impl Fn() -> Instant,
@@ -15657,6 +15674,12 @@ fn execute_effects<R, F>(
         // not only across later ones.
         pending_control.remove(&scope);
         control_inflight.remove(&scope);
+        // The liveness probe's seat goes with the scope for the same reason:
+        // scope ids are never reused, so an entry left behind by a probe whose
+        // answer arrives after the teardown (or never, on a hung root) would
+        // grow this set unbounded under watch/unwatch churn. A late answer for
+        // a gone scope is inert on both sides — the core has no state to feed.
+        probes_in_flight.remove(&scope);
         torn_down.insert(scope);
         // The lane's drain tap dies with the lane — a clone kept past this
         // point would grow the map unbounded under watch/unwatch churn.
@@ -15758,12 +15781,55 @@ fn execute_effects<R, F>(
         });
       }
       Effect::RefreshMounts { scope, root } => {
+        // A liveness probe NEVER rides the blocking pool. The pool is where the
+        // very thing this probe exists to outlive is stalled: a sync's cookie
+        // write holding the only worker of a legal one-worker pool starves the
+        // probe forever, and a root that died under that write then stays
+        // falsely live with no terminal `Rescan` ever emitted. The probe is
+        // this scope's death detector, so it gets execution capacity that the
+        // stalled write cannot occupy — its own OS thread.
+        //
+        // ONE outstanding probe per scope. A probe that has not answered is a
+        // hung root; a second thread on the same path proves nothing and would
+        // let a wall-clock tick mint a thread per interval against a mount that
+        // never returns. The core re-arms the scope's deadline either way, so a
+        // skipped tick costs one interval and nothing else. (The core's own
+        // `refresh_pending` already coalesces at the source; this set is the
+        // belt on the executor side, and it can only fire if the two ever
+        // diverge — in which case the outstanding probe's own answer still
+        // clears the core's flag.)
+        //
+        // Threads are bounded by LIVE SCOPES, not by ticks: at most one per
+        // scope, released when the probe answers or the scope tears down. A
+        // scope torn down earlier in this same drain is skipped outright — the
+        // core has already dropped its state, so the answer would be inert, and
+        // dispatching would leave a set entry nothing removes.
+        if torn_down.contains(&scope) || !probes_in_flight.insert(scope) {
+          continue;
+        }
         let ops = ops.clone();
         let tx = op_tx.clone();
-        R::spawn_blocking_detach(move || {
-          let refresh = ops.refresh_mounts(&root);
-          let _ = tx.try_send(OpResult::MountsRefreshed { scope, refresh });
-        });
+        let pooled_ops = ops.clone();
+        let pooled_tx = tx.clone();
+        let pooled_root = Arc::clone(&root);
+        if std::thread::Builder::new()
+          .name("tributary-liveness".to_owned())
+          .spawn(move || {
+            let refresh = ops.refresh_mounts(&root);
+            let _ = tx.try_send(OpResult::MountsRefreshed { scope, refresh });
+          })
+          .is_err()
+        {
+          // The OS refused a thread (`EAGAIN`). Fall back to the pool for this
+          // one probe rather than dropping it: progress is then the pool's,
+          // which is exactly what it was before, and the scope keeps its set
+          // entry until the probe answers — so nothing is lost and nothing is
+          // dispatched twice.
+          R::spawn_blocking_detach(move || {
+            let refresh = pooled_ops.refresh_mounts(&pooled_root);
+            let _ = pooled_tx.try_send(OpResult::MountsRefreshed { scope, refresh });
+          });
+        }
       }
       Effect::Emit {
         scope,
