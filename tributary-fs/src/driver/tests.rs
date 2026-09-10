@@ -32,10 +32,13 @@ fn config() -> DriverConfig {
     exclusions: Vec::new(),
     profile: BackendKind::FsEvents,
     backend: Backend::Auto,
-    // Inert for the FSEvents driver suites, and far past every Linux suite's
-    // own run (the two Linux profiles arm the tick, but 30 s outlives them);
-    // a tick-specific driver test overrides it.
-    root_liveness_interval: Duration::from_secs(30),
+    // The tick is wall-clock and now covers every Linux profile (the FSEvents
+    // suites here were always immune). A rig that ticks by default makes a
+    // slow (Miri) run of a long-staging cell observe liveness probes its
+    // assertions never modeled, so the tick is OFF here; a cell that wants it
+    // opts in with its own non-zero interval (`DriverCore::arm_liveness`
+    // disables the tick entirely for a zero interval).
+    root_liveness_interval: Duration::ZERO,
     // Inert for the fake spawns (no fanotify admission map); a real fanotify
     // spawn threads this into its SourceConfig.
     max_map_directories: None,
