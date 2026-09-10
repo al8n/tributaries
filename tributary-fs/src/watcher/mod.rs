@@ -2025,7 +2025,11 @@ impl<R> Watcher<R> {
   /// beside it). The pinned objects are held by descriptor, identity and mount frame
   /// are re-verified at the write, a minted directory is proved to hold only its
   /// marker, and every cleanup is decided terminal by the pinned object's link
-  /// count; a different uid cannot reach the 0700 reserved directory at all. What
+  /// count; the reserved directory's owner-only mode is the boundary the watcher
+  /// enforces, and owner and mode are verified on every open. On macOS an
+  /// inheritable ACL on an ancestor that grants other users write rights is
+  /// inherited by the reserved directory and extends the trusted set by the tree
+  /// owner's own configuration — the watcher does not inspect ACLs. What
   /// remains outside the contract is an adversary holding the watcher's own
   /// credentials, which can always win one more race against a pathname-based
   /// filesystem API — this call is not a security boundary against its own uid.

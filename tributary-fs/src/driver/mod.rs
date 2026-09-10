@@ -2260,6 +2260,15 @@ impl CookieDir {
   /// because it is the admitted object, or because it demonstrably holds nothing
   /// the marker could be ordered against, never because its ownership bits look
   /// agreeable.
+  ///
+  /// What the owner-only mode below is, and is not: it is the boundary this
+  /// verifier enforces, re-read off the descriptor on every open — but on macOS a
+  /// directory created under a parent carrying inheritable ACEs inherits them, so
+  /// an ACL an ancestor's owner configured can grant another user write rights
+  /// while the BSD bits still read `0o700`. Those ACLs are not inspected: an
+  /// inheritable ACE is the tree owner's own extension of the trusted set, stated
+  /// as an environment assumption at
+  /// <https://github.com/al8n/tributaries/issues/135>.
   fn open_or_create(
     parent: &CookieParent,
     admitted: Option<RootIdentity>,
