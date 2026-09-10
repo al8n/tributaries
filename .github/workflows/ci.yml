@@ -449,7 +449,7 @@ jobs:
           exit 1
         fi
 
-        # The eight cells that exist only under CAP_SYS_ADMIN, each gated by the
+        # The nine cells that exist only under CAP_SYS_ADMIN, each gated by the
         # suite's own `privileged_or_skip` probe.
         privileged_only='
           queue_overflow_surfaces_as_rescan
@@ -457,6 +457,7 @@ jobs:
           bind_mount_inside_root_is_a_boundary
           a_bound_cookie_directory_refuses_the_sync_before_any_marker
           a_bound_sync_target_refuses_the_sync_before_any_marker
+          a_bound_alias_of_outside_ground_refuses_the_sync_at_the_admission
           widen_over_unmount_rebind_is_never_silently_certified
           overflow_swallowed_unmount_rebinds_or_dies_loudly
           overflow_swallowed_recreate_rebinds_the_midtree_watch

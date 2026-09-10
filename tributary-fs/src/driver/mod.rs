@@ -7505,6 +7505,24 @@ pub(crate) struct AdmittedDir {
   /// the other two are measured against rather than something measured against it.
   #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
   landing: Option<PathBuf>,
+  /// The MOUNT FRAME the pinned object stood in, read off that same descriptor
+  /// beside the landing — the one fact about a location that a pathname cannot
+  /// carry.
+  ///
+  /// A landing says where the object was SPELLED; it does not say which mount that
+  /// spelling names. A `mount --bind` of a same-superblock directory standing
+  /// inside the root is lexically contained, clears every seat, and preserves
+  /// `(dev, ino)` through the alias — while being exactly the ground the crawl
+  /// fences its descent on and never arms a watch inside. So the landing and the
+  /// seats can all say yes about a place no queue of this scope reads, and only
+  /// the frame says otherwise.
+  ///
+  /// `None` is an absent pin: there is no object to have stood in any mount. A
+  /// frame that could not be READ is not `None` — it is a failed sampling, and the
+  /// door refuses the sync rather than admit one over a boundary it never read
+  /// ([`pinned_where_it_stands`]).
+  #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+  frame: Option<MountFrame>,
   /// The identity the door read where nothing can be held open for it.
   #[cfg(not(all(any(target_os = "linux", target_os = "macos"), not(miri))))]
   identity: Option<RootIdentity>,
@@ -7532,6 +7550,38 @@ impl AdmittedDir {
   /// Where the door found this object, as the descriptor answered it at the cut.
   fn landing(&self) -> Option<&Path> {
     self.landing.as_deref()
+  }
+
+  /// Which mount the door found this object standing in, read off the same
+  /// descriptor as the landing beside it.
+  fn frame(&self) -> Option<&MountFrame> {
+    self.frame.as_ref()
+  }
+}
+
+/// A reading with a chosen LOCATION and no object behind it, for the cells that
+/// ask what the admission's verdict makes of a given landing-and-frame pair.
+///
+/// It exists because the pair the verdict turns on cannot be staged with a real
+/// tree on an unprivileged host: a same-superblock bind mount needs
+/// `CAP_SYS_ADMIN`, and macOS has no bind mounts at all. The privileged
+/// integration cell stages the real thing; this one asks the rule itself.
+///
+/// No pin, because nothing here compares identities — the verdict reads only
+/// where the objects stood and which mount they stood in.
+#[cfg(all(
+  test,
+  feature = "tokio",
+  not(miri),
+  any(target_os = "linux", target_os = "macos")
+))]
+impl AdmittedDir {
+  pub(crate) fn framed_at(landing: Option<PathBuf>, dev: u64, mnt_id: Option<u64>) -> Self {
+    Self {
+      pin: None,
+      landing,
+      frame: Some(MountFrame { dev, mnt_id }),
+    }
   }
 }
 
@@ -7648,18 +7698,23 @@ fn definite_pin(
   }
 }
 
-/// A sampling of a directory the ADMISSION judges on ground: the pin, and the
-/// place the OS says that pin stands, taken one after the other on the same pool
-/// job.
+/// A sampling of a directory the ADMISSION judges on ground: the pin, the place
+/// the OS says that pin stands, and the mount that place is in — taken one after
+/// the other on the same pool job.
 ///
-/// The two readings belong to one instant and are taken in one, because that is
-/// what the pair is FOR: the identity carries the object across the window, and
-/// the landing says the object was somewhere this scope reports when the window
-/// opened. A landing sampled later would describe a world the cut never covered,
-/// and a landing sampled on the owner loop would resolve a pathname on the one
-/// thread that must never wait for a mount.
+/// The readings belong to one instant and are taken in one, because that is what
+/// they are FOR: the identity carries the object across the window, and the
+/// location says the object was somewhere this scope reports when the window
+/// opened. A location sampled later would describe a world the cut never covered,
+/// and one sampled on the owner loop would resolve a pathname on the one thread
+/// that must never wait for a mount.
 ///
-/// A landing the OS will not answer is a failed SAMPLING, not an admissible
+/// The location is TWO facts, and the second is not derivable from the first. A
+/// landing is a name, and a name inside the root can still be a bind alias of
+/// ground the crawl fences its descent on; the frame is what says so. Both are
+/// read off the same descriptor so the pair can only ever describe one object.
+///
+/// A reading the OS will not answer is a failed SAMPLING, not an admissible
 /// silence, and it is returned as one — the same fail-closed direction
 /// [`definite_pin`] takes for every failure that is not a definite absence. A pin
 /// that is absent has nothing to have a location; that is a reading, and it
@@ -7670,7 +7725,12 @@ fn pinned_where_it_stands(
 ) -> Result<AdmittedDir, std::io::Error> {
   let pin = definite_pin(opened)?;
   let landing = pin.as_ref().map(current_path_of_dir).transpose()?;
-  Ok(AdmittedDir { pin, landing })
+  let frame = pin.as_ref().map(frame_of_dir).transpose()?;
+  Ok(AdmittedDir {
+    pin,
+    landing,
+    frame,
+  })
 }
 
 /// The RESERVED COOKIE DIRECTORY at the moment a sync is admitted, where one
@@ -7739,12 +7799,21 @@ fn reserved_cookie_dir_identity(root: &Path, dir: &Path) -> Result<AdmittedDir, 
 /// root that is no longer where the scope recorded it is answered by the
 /// containment gate the caller's own spelling already meets, and by the identity
 /// this pin keeps alive.
+///
+/// Its FRAME is read, and for the mirror reason: the root is the REFERENCE mount
+/// the other two are measured against, exactly as it is the reference the crawl
+/// fences its own descent on. A frame the OS will not answer is a failed sampling
+/// here too — a door that cannot say which mount the root is in cannot say
+/// anything about whether the objects beneath it share one.
 fn watched_root_identity(root: &Path) -> Result<AdmittedDir, std::io::Error> {
   #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
   {
+    let pin = definite_pin(open_dir_no_follow(root))?;
+    let frame = pin.as_ref().map(frame_of_dir).transpose()?;
     Ok(AdmittedDir {
-      pin: definite_pin(open_dir_no_follow(root))?,
+      pin,
       landing: None,
+      frame,
     })
   }
   #[cfg(not(all(any(target_os = "linux", target_os = "macos"), not(miri))))]
@@ -7786,10 +7855,9 @@ fn watched_root_identity(root: &Path) -> Result<AdmittedDir, std::io::Error> {
 ///
 /// - the PINS say the objects the write reached are the objects the cut was taken
 ///   over;
-/// - the LANDINGS say those objects stood in reportable ground WHEN the cut was
+/// - the LOCATIONS say those objects stood in reportable ground WHEN the cut was
 ///   taken — read off the pins themselves on the pool, judged at the admission
-///   against the same rule the write uses ([`cookie_ground_refusal`]) before the
-///   coverage fence is ever opened;
+///   before the coverage fence is ever opened ([`admitted_ground_refusal`]);
 /// - the write's own verdict says they still do, at the moment the marker is
 ///   created.
 ///
@@ -7797,6 +7865,23 @@ fn watched_root_identity(root: &Path) -> Result<AdmittedDir, std::io::Error> {
 /// move between two covered places is itself an event this scope reports, so
 /// everything under the object has been carried by a queue of this scope or by the
 /// crawl that armed it. Any one of the three alone certifies nothing.
+///
+/// # Reportable ground is THREE questions, asked at the cut and at the write
+///
+/// "Covered" is not one test. Ground a queue of this scope reads is ground that is
+/// contained under the floor, that no seat closes, AND that stands in the root's
+/// own mount frame — and the last is not implied by the first two. A
+/// same-superblock `mount --bind` of outside ground, mounted inside the root, is
+/// lexically contained, named by no seat, and preserves `(dev, ino)` through the
+/// alias; the crawl still fences its descent on it and arms nothing inside, so a
+/// marker there is unreportable however it is ordered.
+///
+/// So the admission carries all three facts and asks all three
+/// ([`admitted_ground_refusal`]), and the write asks the same three of the objects
+/// its own descent reaches — containment and seats in [`cookie_ground_refusal`],
+/// the frame on every descriptor of the chain ([`leaves_mount_frame`]). A verdict
+/// that dropped any one of them at either end would admit exactly the sequence the
+/// other two were introduced to close.
 ///
 /// # Three readings, taken one at a time
 ///
@@ -8032,6 +8117,33 @@ impl AdmittedDirs {
   /// ground the marker's own create would have come off at the cut.
   pub(crate) fn cookies_landing(&self) -> Option<&Path> {
     self.cookies.landing()
+  }
+}
+
+/// The mount each pin stood in at the cut — the half of a location no pathname
+/// carries, and the REFERENCE the other two are measured against.
+///
+/// Only the arm that holds objects can answer them: a frame is read off a held
+/// descriptor, and every other arm keeps a tuple. Those arms therefore ask no
+/// frame question at all, which is the same silence they already keep about
+/// landings and about the write's own read-backs.
+#[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+impl AdmittedDirs {
+  /// The watched root's mount — the frame every other reading is judged against,
+  /// exactly as it is the frame the crawl fences its own descent on.
+  fn root_frame(&self) -> Option<&MountFrame> {
+    self.root.frame()
+  }
+
+  /// The mount the sync's target directory stood in.
+  fn target_frame(&self) -> Option<&MountFrame> {
+    self.target.frame()
+  }
+
+  /// The mount the reserved cookie directory stood in — the one the marker's own
+  /// create would have come off at the cut.
+  fn cookies_frame(&self) -> Option<&MountFrame> {
+    self.cookies.frame()
   }
 }
 
@@ -8368,9 +8480,9 @@ fn cookie_ground_refusal(
 }
 
 /// THE verdict on where the door's PINNED objects stood when the coverage cut was
-/// taken: the same three questions [`cookie_ground_refusal`] asks of the write,
-/// asked at admission of the locations the door read off the pins themselves
-/// ([`AdmittedDirs`]).
+/// taken: the same questions the write asks of the objects its own descent
+/// reaches, asked at admission of the locations the door read off the pins
+/// themselves ([`AdmittedDirs`]).
 ///
 /// It is the fact the pins cannot supply. An identity travels with its object, so
 /// a target and a reserved cookie directory prepared under never-armed ground and
@@ -8380,14 +8492,31 @@ fn cookie_ground_refusal(
 /// create ahead of them. Covered at the cut AND covered at the write is what rules
 /// that out, and this is the first half.
 ///
+/// # The frame is asked FIRST, because it is the only fact that can name a bind
+///
+/// A bind alias is lexically inside the root, is covered by no seat, and carries
+/// the very `(dev, ino)` the pins compare — so every question below it answers
+/// yes. What it is NOT is ground the crawl descends: the descent is fenced on the
+/// mount, so nothing beneath the alias is ever armed. Worse, the alias's ORIGIN
+/// may then be moved into ordinary covered ground before the write, which puts the
+/// write on the non-mount path where its own frame checks pass honestly. The
+/// admission is where that sequence has to be refused, and the frame is the only
+/// reading that sees it — so it is taken before the landings, on the same rule the
+/// write and the crawl both use ([`leaves_mount_frame`]).
+///
+/// Where either side has no frame there is nothing to compare and the reading is
+/// silent; the arms that hold tuples instead of objects have none at all, which is
+/// the same silence they keep about landings.
+///
 /// The floor is the LIVE root's recorded canonical path, which is the form a
 /// landing comes in — both are answers the OS gave about resolved objects — so the
 /// containment test compares two names from one resolution scheme, exactly as the
 /// write's own does against its verified-root descriptor.
 ///
-/// Purely LEXICAL: prefix tests and glob matches over paths already read, so it
-/// runs on the driver's owner loop without resolving a single pathname. The reads
-/// were paid on the blocking pool, beside the pins.
+/// Purely LEXICAL and arithmetic: prefix tests, glob matches and two integer
+/// comparisons over readings already taken, so it runs on the driver's owner loop
+/// without resolving a single pathname. The reads were paid on the blocking pool,
+/// beside the pins.
 ///
 /// The reply names the LANDING rather than the caller's spelling, because the
 /// landing is where the caller's directory actually is — the same choice the
@@ -8399,6 +8528,23 @@ fn admitted_ground_refusal(
   prune: &Globs,
   exclusions: &[PathBuf],
 ) -> Option<crate::error::SyncRootError> {
+  #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+  if let Some(reference) = admitted.root_frame() {
+    // Same order as the landings below, and for the same reason: the shallower
+    // object is the one a caller can act on.
+    for (frame, landing) in [
+      (admitted.target_frame(), admitted.target_landing()),
+      (admitted.cookies_frame(), admitted.cookies_landing()),
+    ] {
+      if let (Some(frame), Some(landing)) = (frame, landing)
+        && leaves_mount_frame(reference, frame)
+      {
+        return Some(crate::error::SyncRootError::DirCrossesMount {
+          dir: landing.to_path_buf(),
+        });
+      }
+    }
+  }
   // The target first and the reserved directory second, in the order the write
   // descends and asks: the shallower ground is the one a caller moves off.
   [admitted.target_landing(), admitted.cookies_landing()]
@@ -11930,14 +12076,15 @@ pub(crate) async fn run<R, F>(
               ) {
                 // Every check above judged the caller's SPELLING, which is not a
                 // location. This judges where the door's pinned objects actually
-                // stood when it took them — read off the pins on the pool, so
-                // nothing here resolves a pathname — against the same ground rule
-                // the write applies at the create. A subtree prepared under
-                // never-armed ground and reached through an in-root symlink clears
-                // every lexical test there is, and the pins that follow it into
-                // reportable ground after the cut would then certify an ordering
-                // for entries no queue of this scope ever carried
-                // ([`admitted_ground_refusal`]).
+                // stood when it took them — the landing AND the mount, read off the
+                // pins on the pool, so nothing here resolves a pathname — against
+                // the same ground rules the write applies at the create. A subtree
+                // prepared under never-armed ground and reached through an in-root
+                // symlink clears every lexical test there is, and the pins that
+                // follow it into reportable ground after the cut would then certify
+                // an ordering for entries no queue of this scope ever carried; a
+                // bind alias of outside ground clears the lexical tests AND the
+                // landing, and only the frame names it ([`admitted_ground_refusal`]).
                 //
                 // Before the single-flight gate and before the fence, so a refused
                 // sync is a sync that mints nothing at all: no obligation, no

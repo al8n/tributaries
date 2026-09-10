@@ -419,16 +419,28 @@ pub enum SyncRootError {
   /// and it is not transient either — a retry finds the same mount. Sync a
   /// directory on the root's own mount instead, or take the mount off the name.
   ///
-  /// The admission's sequence is SPENT: the verdict needs the object only the
-  /// write's own descriptor walk can reach, so it is taken after the sync was
-  /// admitted. Re-mint through
-  /// [`mint_sync_ticket`](crate::Watcher::mint_sync_ticket) to retry.
+  /// # Two origins, and one of them precedes the sync's own sequence
+  ///
+  /// The verdict is reached at the WRITE, on the objects that write's descriptor
+  /// walk reaches, and at the ADMISSION, on the mounts the door read off the pins
+  /// it took — the same rule at both ends, for the reason every ground verdict is
+  /// asked twice: the objects must stand in reportable ground when the coverage cut
+  /// is taken AND when the marker is created. The admission's reading is what
+  /// refuses a bind alias of outside ground standing inside the root, which is
+  /// lexically contained, covered by no seat, and identical to its origin through
+  /// the alias — so nothing else the door can read names it.
+  ///
+  /// Either way the admission's sequence is SPENT, so a retry re-mints through
+  /// [`mint_sync_ticket`](crate::Watcher::mint_sync_ticket). A refusal from the
+  /// admission is taken before any coverage window opens and creates nothing at
+  /// all; a refusal from the write leaves nothing on disk either.
   #[error("cookie directory {} lies across a mount boundary", dir.display())]
   DirCrossesMount {
     /// The directory that crossed, as the descriptor holding it answered its name:
     /// the FIRST component of the descent to stand outside the root's mount frame,
-    /// or — when the whole descent stayed inside it — the reserved cookie directory
-    /// standing at the reserved name.
+    /// the reserved cookie directory standing at the reserved name when the whole
+    /// descent stayed inside it, or — from the admission — the place the pinned
+    /// target or reserved directory was standing when the door sampled it.
     dir: PathBuf,
   },
   /// The cookie name is not a single normal filename component — it holds a

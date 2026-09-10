@@ -5,7 +5,7 @@
 //! extra events — coalesced kinds, additional `Rescan`s — are always legal.
 //!
 //! The privileged cells (queue overflow, watch-limit exhaustion, the bind-mount
-//! scope fence and the two bind-mount sync-cookie refusals) self-probe and skip
+//! scope fence and the three bind-mount sync-cookie refusals) self-probe and skip
 //! loudly without `CAP_SYS_ADMIN`; the
 //! `inotify-priv` suite of `ci/linux-verify.sh` (or `sudo -E` in CI) unlocks
 //! them.
@@ -1138,6 +1138,97 @@ async fn a_bound_sync_target_refuses_the_sync_before_any_marker() {
       dir.display()
     );
   }
+
+  drop(bind);
+  let _ = w.close().await;
+  let _ = std::fs::remove_dir_all(&root);
+  let _ = std::fs::remove_dir_all(&origin);
+}
+
+/// Suite 7 (privileged): a same-superblock BIND ALIAS of ground outside the root,
+/// mounted inside it, is refused at the ADMISSION — before the coverage window
+/// this sync would have opened.
+///
+/// This is the sequence every other fence on the cookie path lets through. The
+/// alias is a real directory at a perfectly contained in-root name; the caller
+/// reaches it through an in-root symlink, so the spelling clears every lexical
+/// test; the location the door reads off its own pin is contained too, and no
+/// seat names it; and a bind preserves `(dev, ino)` exactly, so the write's
+/// identity comparisons match whatever happens next. What the alias is NOT is
+/// ground the crawl descends: the descent is fenced on the mount, so nothing
+/// beneath it is ever armed and the marker's own create could never be reported.
+///
+/// And the write cannot be the one to catch it. Once the sync is admitted the
+/// origin can be moved into ordinary covered ground and the link repointed, which
+/// puts the write on the non-mount path where every frame check it takes passes
+/// honestly — over a subtree holding entries (`deep/old` below) that no queue of
+/// this scope ever carried. So the only reading that sees it is the frame taken
+/// at the CUT, off the pin, and the refusal has to come from the admission.
+///
+/// The origin is enumerated rather than the mount point: the two names reach one
+/// object, and an assertion over the mount point alone would be satisfied by a
+/// lazy unmount as much as by a refusal.
+#[tokio::test]
+async fn a_bound_alias_of_outside_ground_refuses_the_sync_at_the_admission() {
+  const CELL: &str = "a_bound_alias_of_outside_ground_refuses_the_sync_at_the_admission";
+  if !privileged_or_skip(CELL) {
+    return;
+  }
+
+  let root = scratch_root("cookie-bind-admission");
+  // The subtree prepared OUTSIDE the root: a target, the reserved cookie
+  // directory already standing inside it, and an entry under THAT — the
+  // descendants no queue of this scope ever reported.
+  let origin = scratch_root("cookie-bind-admission-origin");
+  let reserved_name = reserved_cookie_dir_name(&root);
+  let hidden = origin.join("T");
+  let reserved = hidden.join(&reserved_name);
+  std::fs::create_dir_all(reserved.join("deep").join("old"))
+    .expect("the hidden target, its reserved directory and an older entry inside it");
+
+  let mounted = root.join("mounted");
+  std::fs::create_dir(&mounted).expect("the in-root mount point");
+  let Some(bind) = common::bind_mount(&origin, &mounted) else {
+    common::skip_notice(format_args!("{CELL}: bind mount refused"));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&origin);
+    return;
+  };
+  // The spelling the caller passes: an in-root symlink onto the alias, so nothing
+  // the caller says ever mentions a mount.
+  std::os::unix::fs::symlink(&mounted, root.join("link")).expect("the in-root symlink");
+  let spelling = root.join("link").join("T");
+  let landing = mounted.join("T");
+
+  let w = watcher();
+  let handle = w.watch(&root, Interest::all()).await.expect("watch");
+  let (admission, _ticket) = w.mint_sync_ticket().expect("this host seeds a watcher");
+  let denied = tokio::time::timeout(scaled(DEADLINE), w.sync_root(handle, &spelling, admission))
+    .await
+    .expect("the sync answers its caller rather than parking")
+    .expect_err("a pin taken inside a bind alias is not an admissible sync");
+  match &denied.error {
+    SyncRootError::DirCrossesMount { dir } => assert_eq!(
+      dir, &landing,
+      "the refusal names WHERE the pinned object stood — the alias's own in-root \
+       name — not the symlink spelling it was reached by"
+    ),
+    other => panic!("a bind alias of outside ground is a mount crossing, got {other:?}"),
+  }
+
+  // Nothing was created anywhere under the ORIGIN, which is the one object both
+  // names reach: the refusal is taken before the fence, so no write was ever
+  // dispatched and the reserved directory still holds only what was staged in it.
+  assert_eq!(
+    entries_of(&reserved),
+    vec![reserved.join("deep")],
+    "no marker stands beside the entries this scope never carried"
+  );
+  assert_eq!(
+    entries_of(&hidden),
+    vec![hidden.join(&reserved_name)],
+    "and nothing was minted beside the reserved directory either"
+  );
 
   drop(bind);
   let _ = w.close().await;

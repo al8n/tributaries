@@ -19382,6 +19382,111 @@ mod sync_cookie {
       let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The admission's own ground verdict refuses a pin standing in a DIFFERENT
+    /// MOUNT — the one fact about a location that neither the spelling, the
+    /// landing, nor the identity can carry.
+    ///
+    /// The sequence this closes. A same-superblock `mount --bind` of ground
+    /// outside the root, mounted at an in-root name, is reached by a perfectly
+    /// contained spelling, lands at a perfectly contained path, is covered by no
+    /// seat, and preserves `(dev, ino)` through the alias — so the pins match and
+    /// every landing test passes. The crawl still fences its descent on the mount
+    /// and arms nothing inside it. And the origin can then be moved into ordinary
+    /// covered ground before the write, which puts the write on the non-mount path
+    /// where its own frame checks pass honestly. Only a frame read at the CUT sees
+    /// it, and only if the admission asks.
+    ///
+    /// Asked here of the rule itself rather than of a tree, because the tree that
+    /// stages it needs `CAP_SYS_ADMIN` and a platform that has bind mounts:
+    /// `tests/linux_inotify.rs` stages the real one under privilege, and this cell
+    /// pins the verdict on every host, in both of the fence's halves — the mount
+    /// id, which is the only thing that sees a bind, and the device belt, which is
+    /// the whole of the rule where no mount id can be read.
+    ///
+    /// Revert witness: drop the frames from the admission's verdict and the first
+    /// three arms answer `None` — a sync admitted onto ground no queue of this
+    /// scope reads.
+    #[test]
+    fn a_pin_standing_in_another_mount_is_refused_at_the_admission() {
+      // Names only: no path here is ever resolved and none needs to exist. The
+      // verdict is lexical over the landings and arithmetic over the frames.
+      let root = PathBuf::from("/watched");
+      let landing = root.join("mounted").join("T");
+      let reserved = landing.join(cookie_dir_name());
+      let quiet = tributary_proto::glob::Globs::default();
+
+      // The root's own frame, and the readings the door would have handed back for
+      // a target and a reserved directory standing wherever the arm says.
+      let judged = |target: (u64, Option<u64>), cookies: (u64, Option<u64>)| {
+        crate::driver::AdmittedDirs::held(
+          crate::driver::SyncPinAllowance::permit(),
+          crate::driver::AdmittedDir::framed_at(None, 40, Some(11)),
+          crate::driver::AdmittedDir::framed_at(Some(landing.clone()), target.0, target.1),
+          crate::driver::AdmittedDir::framed_at(Some(reserved.clone()), cookies.0, cookies.1),
+        )
+      };
+      let verdict = |admitted: &crate::driver::AdmittedDirs| {
+        crate::driver::admitted_ground_refusal(&root, admitted, &quiet, &[])
+      };
+
+      // The bind exactly: same device, different mount, contained landing.
+      match verdict(&judged((40, Some(12)), (40, Some(12)))) {
+        Some(crate::SyncRootError::DirCrossesMount { dir }) => assert_eq!(
+          dir, landing,
+          "the refusal names WHERE the pinned target stood, which is the alias's \
+           own in-root name"
+        ),
+        other => panic!("a bind alias of outside ground is a mount crossing: {other:?}"),
+      }
+
+      // One level down: the target is on the root's mount and only the RESERVED
+      // directory — the object the marker's own create comes off — is bound.
+      match verdict(&judged((40, Some(11)), (40, Some(12)))) {
+        Some(crate::SyncRootError::DirCrossesMount { dir }) => assert_eq!(
+          dir, reserved,
+          "the verdict is taken on each pinned object, not on the shallowest one"
+        ),
+        other => panic!("a bound reserved directory is a mount crossing: {other:?}"),
+      }
+
+      // The degrade, and the whole of the rule on a host that reports no mount id:
+      // a differing device is a boundary whether or not either side named a mount.
+      match verdict(&judged((41, None), (41, None))) {
+        Some(crate::SyncRootError::DirCrossesMount { dir }) => assert_eq!(dir, landing),
+        other => panic!("a differing device is a boundary on its own: {other:?}"),
+      }
+
+      // And the contrast that keeps it a verdict: one frame, no refusal. The
+      // landings are contained and no seat names them, so nothing is left to
+      // refuse.
+      assert!(
+        verdict(&judged((40, Some(11)), (40, Some(11)))).is_none(),
+        "pins that stood in the root's own mount, on covered ground, are admitted"
+      );
+
+      // The frame is asked BEFORE the landings, and this is what that order buys:
+      // an alias whose landing ALSO trips a seat still answers the mount, which is
+      // the fact a retry cannot change. A caller told `DirPruned` about a bind
+      // would take the word off its seat and find the sync refused again.
+      let pruned = tributary_proto::glob::Globs::new([
+        tributary_proto::glob::Glob::new("mounted").expect("a valid pattern compiles")
+      ])
+      .expect("a one-word seat compiles");
+      assert!(
+        matches!(
+          crate::driver::admitted_ground_refusal(
+            &root,
+            &judged((40, Some(12)), (40, Some(12))),
+            &pruned,
+            &[],
+          ),
+          Some(crate::SyncRootError::DirCrossesMount { .. })
+        ),
+        "the mount verdict is taken first, so a bind is never reported as a seat \
+         the caller could retract"
+      );
+    }
+
     /// A reserved directory standing across a MOUNT BOUNDARY is refused, even
     /// where its identity is the one the admission read.
     ///
