@@ -3695,16 +3695,31 @@ enum Reaped {
 /// key, and its lifecycle phase.
 struct Obligation {
   scope: ScopeId,
-  /// The directory the sync named — the ground its marker lands in, held for as
-  /// long as the record lives so a set-cover can widen its retained cover by it
-  /// ([`CookieRegistry::live_sync_dirs`]), in EVERY phase and not merely while
-  /// the write is still in flight. Nothing else reads it: the write addresses its
-  /// own pinned descriptors, and every removal goes through the residue's
-  /// landing.
+  /// WHERE this obligation's marker actually lands: the admission's PINNED
+  /// target landing when the door read one, and the caller's lexical directory
+  /// only when it could not. Held for as long as the record lives so a set-cover
+  /// can widen its retained cover by it ([`CookieRegistry::live_sync_dirs`]), in
+  /// EVERY phase and not merely while the write is still in flight. Nothing else
+  /// reads it: the write addresses its own pinned descriptors, and every removal
+  /// goes through the residue's landing.
+  ///
+  /// The landing rather than the spelling, because the two differ exactly where
+  /// it matters. A sync of `/r/alias/sub` under an intermediate `alias →
+  /// /r/actual` writes at `/r/actual/sub`; that is where the core's watches are
+  /// addressed and where the marker's create comes off, while the spelling names
+  /// ground no watch of this marker stands on. Widening by the spelling would
+  /// retain the wrong subtree and prune the right one — the very ground the
+  /// admission's own landing test ([`admitted_ground_refusal`]) had just proved
+  /// this sync was inside of.
+  ///
+  /// The fallback is not a weakening: it applies on the arms that hold TUPLES
+  /// rather than descriptors — Windows, Miri, the unsupported platforms — where
+  /// the door reads no landing at all and the write is path-addressed anyway, so
+  /// the spelling IS the coordinate.
   ///
   /// One path per record, so the ledger's caps bound it exactly as they bound the
   /// name beside it.
-  dir: PathBuf,
+  cover_dir: PathBuf,
   /// The rendered cookie LEAF, shared as an `Arc<str>` with the `by_name` index,
   /// the core's active-marker set and the release queue rather than copied into
   /// each — one validated, length-bounded allocation per obligation
@@ -4288,10 +4303,14 @@ impl<F: FsOps> CookieRegistry<F> {
   ///   with it and is unique by construction.
   ///
   /// `ticket` is the caller's [`SyncTicket`] sequence — the `by_ticket` key an
-  /// incarnation-precise cancel resolves through, and `dir` the directory the
-  /// sync was admitted for — recorded so a later set-cover can keep the ground
-  /// this obligation depends on, for as long as the record lives
-  /// ([`live_sync_dirs`](Self::live_sync_dirs)).
+  /// incarnation-precise cancel resolves through. `dir` is the directory the
+  /// caller SPELLED and `landing` is where the door's pin found it; the record
+  /// keeps the second in preference to the first, because a later set-cover has
+  /// to keep the ground this obligation depends on for as long as the record
+  /// lives, and that ground is where the marker lands rather than how the caller
+  /// wrote it ([`Obligation::cover_dir`],
+  /// [`live_sync_dirs`](Self::live_sync_dirs)). `None` is the platforms with no
+  /// landing to read, where the spelling is the coordinate.
   ///
   /// Called only AFTER every admission refusal has passed: a refused sync must
   /// create nothing at all.
@@ -4299,6 +4318,7 @@ impl<F: FsOps> CookieRegistry<F> {
     &mut self,
     scope: ScopeId,
     dir: PathBuf,
+    landing: Option<&Path>,
     name: Arc<str>,
     ticket: u64,
     fence: FenceId,
@@ -4310,7 +4330,7 @@ impl<F: FsOps> CookieRegistry<F> {
       id,
       Obligation {
         scope,
-        dir,
+        cover_dir: landing.map_or(dir, Path::to_path_buf),
         name: Arc::clone(&name),
         ticket,
         id,
@@ -4450,7 +4470,9 @@ impl<F: FsOps> CookieRegistry<F> {
   }
 
   /// The ground `scope`'s LIVE syncs depend on — every obligation of that scope,
-  /// in every phase, from its admission to its retirement.
+  /// in every phase, from its admission to its retirement, each named by the
+  /// coordinate its marker actually lands at ([`Obligation::cover_dir`]) rather
+  /// than by the spelling its caller used.
   ///
   /// A set-cover widens its retained cover by these before the core reconciles
   /// ([`DriverCore::on_set_cover`]). The admission proved the ground covered when
@@ -4483,7 +4505,7 @@ impl<F: FsOps> CookieRegistry<F> {
       .obligations
       .values()
       .filter(|ob| ob.scope == scope)
-      .map(|ob| ob.dir.clone())
+      .map(|ob| ob.cover_dir.clone())
       .collect()
   }
 
@@ -7611,8 +7633,9 @@ impl SyncPinAllowance {
   /// Shared like the door's own, so a cell hands it to
   /// [`AdmittedDirs::held`] exactly as the door does.
   ///
-  /// Its cfg is exactly the union of the modules that call it (the real-filesystem
-  /// directory-only, identity and Windows non-adoption cells).
+  /// Its cfg is exactly the union of the modules that call it (the cover-fence
+  /// cells, and the real-filesystem directory-only, identity and Windows
+  /// non-adoption cells).
   #[cfg(all(
     test,
     feature = "tokio",
@@ -12713,11 +12736,13 @@ pub(crate) async fn run<R, F>(
           // obligation to the cover it was admitted under: a cover arriving
           // inside that window would prune the watches the marker's create has to
           // come off, and the caller would then wait out its barrier over a write
-          // that reported success. So every LIVE obligation's directory joins the
+          // that reported success. So every LIVE obligation's LANDING joins the
           // retained cover here — one term per unretired obligation of this
           // scope, bounded by the cookie caps — and the R24 reserved-directory
           // exemption keeps the marker's own directory with it, that directory's
-          // parent now being retained.
+          // parent now being retained. The landing and not the caller's spelling,
+          // because an intermediate symlink puts the marker — and the watch that
+          // has to report it — somewhere the spelling does not name.
           //
           // The cover is held to the obligation's RETIREMENT, not to its claim:
           // the write returns the moment the file exists, while the barrier's
@@ -12944,8 +12969,14 @@ pub(crate) async fn run<R, F>(
                 // admission, and it costs nothing: both run in this one command
                 // step, and the release drain is the loop top's, so no release can
                 // be applied in between.
-                let id =
-                  cookies.admit_parked(scope, dir.clone(), Arc::clone(&name), ticket.seq(), fence);
+                let id = cookies.admit_parked(
+                  scope,
+                  dir.clone(),
+                  admitted.target_landing(),
+                  Arc::clone(&name),
+                  ticket.seq(),
+                  fence,
+                );
                 core.arm_sync_marker(scope, name, id);
                 // The routing half: which caller this fence answers, and where its
                 // cookie is to be written. Inserted in the same step as the record

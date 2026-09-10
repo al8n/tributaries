@@ -2362,7 +2362,9 @@ impl<R> Watcher<R> {
   /// caller's new cover may no longer name. The watcher therefore applies `retained` **plus
   /// the target directory of every sync of this root that has not yet retired**, so a shrink
   /// can never prune the watches that marker has to be reported through — the caller's barrier
-  /// would otherwise wait out its deadline over a write that reported success.
+  /// would otherwise wait out its deadline over a write that reported success. The directory
+  /// is the one the sync's target RESOLVED to when it was admitted, so an intermediate symlink
+  /// widens the cover where the marker really lands rather than where it was spelled.
   ///
   /// The promise outlives the write's own return. `sync_root` answers as soon as the marker
   /// exists, and only afterwards is the create OBSERVED through the directory's watch, the

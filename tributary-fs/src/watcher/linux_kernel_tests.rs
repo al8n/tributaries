@@ -867,6 +867,115 @@ async fn set_cover_keeps_the_ground_an_owned_marker_is_still_unread_in() {
   let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The widening's coordinate is the LANDING the admission pinned, not the
+/// spelling its caller passed.
+///
+/// `<root>/alias` is an intermediate symlink to `<root>/actual`, so a sync of
+/// `<root>/alias/sub` pins, validates and writes at `<root>/actual/sub`. That is
+/// also where the kernel's watch descriptor is: a crawl arms OBJECTS and never
+/// follows a link, so no watch of this root stands at the spelling. A cover
+/// widened by the caller's directory therefore retains a path nothing is armed at
+/// while pruning the one thing that could report the marker, and `sync_root`
+/// answers `Ok` over a barrier that can only time out.
+///
+/// Real inotify and a real symlink, because both halves of that are the kernel's:
+/// the resolution really follows the link, and the watch descriptors really sit
+/// on the resolved objects.
+///
+/// Revert witness: widen with the caller's directory and `<root>/actual/sub`'s
+/// watch is reclaimed by the shrink; the second sync is then refused
+/// `DirUncovered`, naming the landing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_cover_keeps_the_landing_a_live_alias_sync_wrote_in() {
+  let root = scratch_root("cover-alias-landing");
+  let actual = root.join("actual");
+  std::fs::create_dir_all(actual.join("sub")).expect("the ground the sync really writes in");
+  std::fs::create_dir_all(root.join("keep")).expect("the ground the cover keeps");
+  std::fs::create_dir_all(root.join("cut")).expect("the ground the cut takes");
+  // A pre-existing link, standing before the watch: nothing here needs it created
+  // live.
+  std::os::unix::fs::symlink(&actual, root.join("alias")).expect("the intermediate link");
+
+  let mut w = TokioWatcher::new(WatcherOptions::new().with_backend(Backend::Inotify))
+    .expect("build inotify watcher");
+  let handle = w.watch(&root, Interest::all()).await.expect("watch root");
+  let canonical = w.root_path(handle).expect("root path");
+  let spelled = canonical.join("alias").join("sub");
+  let landing = canonical.join("actual").join("sub");
+
+  let (admission, _ticket) = w.mint_sync_ticket().expect("this host seeds a watcher");
+  let first = w
+    .sync_root(handle, &spelled, admission)
+    .await
+    .expect("a sync through the link admits");
+  assert!(
+    first.starts_with(&landing),
+    "staging: the marker landed where the link RESOLVES ({}), not where it was \
+     spelled",
+    first.display()
+  );
+  assert!(
+    wait_for(&mut w, |e| names(e, &first)).await.is_some(),
+    "staging: the marker is reported, so the landing's reserved directory is armed"
+  );
+  let reserved = first
+    .parent()
+    .expect("a marker stands inside the reserved directory")
+    .to_path_buf();
+
+  let landing_object = objects_of(&[landing.clone()]);
+  let reserved_object = objects_of(&[reserved.clone()]);
+  let cut_object = objects_of(&[canonical.join("cut")]);
+  let all = objects_of(&[
+    canonical.clone(),
+    actual.clone(),
+    landing.clone(),
+    reserved.clone(),
+    canonical.join("keep"),
+    canonical.join("cut"),
+  ]);
+
+  w.set_cover(handle, vec![canonical.join("keep")])
+    .await
+    .expect("set_cover shrink");
+  assert!(
+    converge(|| wds_watching(&cut_object) == 0).await,
+    "the sibling the cover named nothing for loses its watch — the cut really ran"
+  );
+  assert_eq!(
+    wds_watching(&landing_object),
+    1,
+    "while the LANDING keeps the watch the marker's create comes off"
+  );
+  assert_eq!(
+    wds_watching(&reserved_object),
+    1,
+    "and so does the reserved directory standing inside it"
+  );
+
+  // Asked again through the same spelling: the widening kept the landing, so the
+  // admission's own landing test still passes and the marker is still reportable.
+  let (admission, _ticket) = w.mint_sync_ticket().expect("this host seeds a watcher");
+  let second = w
+    .sync_root(handle, &spelled, admission)
+    .await
+    .expect("a sync onto the landing the widening kept still admits");
+  assert_eq!(
+    second.parent(),
+    Some(reserved.as_path()),
+    "staging: the second marker reuses the reserved directory the first one made"
+  );
+  assert!(
+    wait_for(&mut w, |e| names(e, &second)).await.is_some(),
+    "the marker is reported — the widening kept the ground the write resolves to"
+  );
+
+  let _ = std::fs::remove_file(&first);
+  let _ = std::fs::remove_file(&second);
+  close_and_drain(w, &all).await;
+  let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A sync whose caller-supplied directory is covered but whose RESOLVED landing
 /// is not is refused, and refused by the landing's name.
 ///

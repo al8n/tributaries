@@ -4231,6 +4231,240 @@ mod descending {
       );
     }
 
+    /// The alias tree the two cells below shrink against: `/r/alias/sub` is the
+    /// caller's spelling and `/r/actual/sub` is where it lands, with `/r/other`
+    /// as the ground a shrink keeps.
+    ///
+    /// The fake holds no symlink targets, so the link is expressed the way it
+    /// expresses one everywhere else in this suite — a canonical mapping the
+    /// write resolves through ([`FakeFs::resolve_cookie_dir_to`]). Both spellings
+    /// are real directories here, which is what lets the cells read the two
+    /// coordinates apart: only one of them may keep its watch.
+    ///
+    /// `cfg`: its consumers' union — a landing is a reading only the arms that
+    /// hold DESCRIPTORS take, and the tuple arms have none.
+    #[cfg(all(not(miri), any(target_os = "linux", target_os = "macos")))]
+    async fn alias_rig() -> (Rig, ScopeId) {
+      let (rig, scope) = covered_rig(&[
+        ("/r/actual", 11),
+        ("/r/actual/sub", 13),
+        ("/r/alias", 14),
+        ("/r/alias/sub", 15),
+        ("/r/other", 12),
+      ])
+      .await;
+      rig
+        .fs
+        .resolve_cookie_dir_to("/r/alias/sub", "/r/actual/sub");
+      (rig, scope)
+    }
+
+    /// Sends one `SyncRoot` whose door PINNED a landing the caller's spelling
+    /// does not name, and hands back the caller's half of the reply.
+    ///
+    /// The readings are assembled exactly as the door assembles them — the root's
+    /// frame, the target's landing and frame, and the reserved directory's — so
+    /// the admission takes its real verdict over them
+    /// ([`admitted_ground_refusal`]) rather than over the empty sampling the
+    /// other cells here pass.
+    ///
+    /// `cfg`: its consumers' union, and [`AdmittedDir::framed_at`]'s.
+    #[cfg(all(not(miri), any(target_os = "linux", target_os = "macos")))]
+    async fn begin_landed_sync(
+      rig: &Rig,
+      scope: ScopeId,
+      dir: &str,
+      landing: &str,
+      name: &str,
+    ) -> futures_channel::oneshot::Receiver<Result<PathBuf, crate::error::SyncRootError>> {
+      let landing = PathBuf::from(landing);
+      let reserved = landing.join(cookie_dir_name());
+      // One device, one mount: the frame is not what these cells are about, and a
+      // mismatch here would refuse the sync before the cover was ever consulted.
+      let admitted = crate::driver::AdmittedDirs::held(
+        crate::driver::SyncPinAllowance::permit(),
+        crate::driver::AdmittedDir::framed_at(None, 1, Some(11)),
+        crate::driver::AdmittedDir::framed_at(Some(landing), 1, Some(11)),
+        crate::driver::AdmittedDir::framed_at(Some(reserved), 1, Some(11)),
+      );
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::SyncRoot {
+          scope,
+          dir: PathBuf::from(dir),
+          admitted,
+          name: name.to_owned(),
+          ticket: ticket(),
+          reply,
+        })
+        .await
+        .unwrap();
+      on_reply
+    }
+
+    /// The widening's coordinate is the LANDING the admission pinned, not the
+    /// spelling the caller passed — proved while the write is still PARKED.
+    ///
+    /// A spelling is not a location, and the admission already knows it: the
+    /// cover is asked of the pins precisely because an intermediate symlink
+    /// resolves somewhere else. The widening has to be asked of the same reading,
+    /// or a shrink retains the ground the caller wrote down while pruning the
+    /// ground the marker lands in — and the core's watches are addressed at the
+    /// second. `sync_root` would then answer `Ok` over a marker no watch of this
+    /// root can report.
+    ///
+    /// Both spellings are armed before the shrink, so the two coordinates are
+    /// told apart rather than merely both surviving: exactly one of them may keep
+    /// its watch, and it must be the landing.
+    ///
+    /// Revert witness: widen with `ob.dir` and the assertions invert — the
+    /// spelling keeps its watch and the landing loses it, over a sync that still
+    /// reports success.
+    #[cfg(all(not(miri), any(target_os = "linux", target_os = "macos")))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_shrink_keeps_the_landing_a_parked_alias_sync_will_write_in() {
+      let (rig, scope) = alias_rig().await;
+      let ack = send_set_cover(&rig, scope, &["/r/actual", "/r/alias"]).await;
+      assert_eq!(
+        resolved(ack).await,
+        CoverOutcome::Applied,
+        "staging: the sync below is admitted onto ground the cover holds, by both names"
+      );
+      let landed = live_watch_at(&rig, "/r/actual/sub").expect("staging: the landing is armed");
+      assert!(
+        live_watch_at(&rig, "/r/alias/sub").is_some(),
+        "staging: and so is the spelling, so the shrink can tell them apart"
+      );
+
+      // Stall the grow so the sync's own settle fence never settles: its
+      // obligation stays PARKED — admitted, counted, and pre-physical.
+      let hold = rig.fs.hold_arms();
+      let _grow = send_set_cover(&rig, scope, &["/r/actual", "/r/alias", "/r/other"]).await;
+      let mut on_sync = begin_landed_sync(
+        &rig,
+        scope,
+        "/r/alias/sub",
+        "/r/actual/sub",
+        ".tributaries-sync-2-4-6",
+      )
+      .await;
+      assert!(
+        settle_cookies(&rig, 1).await,
+        "staging: the sync is admitted and its write is parked on the fence"
+      );
+      assert!(
+        futures_util::poll!(&mut on_sync).is_pending(),
+        "staging: the parked write has not answered"
+      );
+
+      let _shrink = send_set_cover(&rig, scope, &["/r/other"]).await;
+      for _ in 0..interpreted_rounds(40) {
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+      }
+      assert_eq!(
+        live_watch_at(&rig, "/r/actual/sub"),
+        Some(landed),
+        "the LANDING keeps the very watch the marker's create has to come off \
+         (disarms: {:?})",
+        rig.fs.disarms()
+      );
+
+      hold.release();
+      let path = on_sync
+        .await
+        .expect("the driver replies")
+        .expect("the parked write lands once the coverage settles");
+      assert_eq!(
+        path,
+        PathBuf::from("/r/actual/sub/.tributaries-sync-2-4-6"),
+        "and the marker really did land at the landing"
+      );
+
+      // The grow's held re-arm was what kept the shrink's own prune from
+      // executing, so the two coordinates are told apart on the far side of the
+      // release — where the prune has run and has taken exactly one of them.
+      assert!(
+        settle(|| live_watch_at(&rig, "/r/alias/sub").is_none()).await,
+        "the shrink reclaims the ground the caller only SPELLED — the widening \
+         keeps nothing for it (disarms: {:?})",
+        rig.fs.disarms()
+      );
+      assert_eq!(
+        live_watch_at(&rig, "/r/actual/sub"),
+        Some(landed),
+        "while the landing keeps the SAME binding throughout: the coordinate is \
+         where the write resolves, not how it was written"
+      );
+    }
+
+    /// The same coordinate, one phase later: the write is already IN THE POOL, so
+    /// the marker may land at any instant — into ground the shrink would
+    /// otherwise have stopped watching, under a name the shrink never saw.
+    ///
+    /// Revert witness: widen with `ob.dir` and the shrink reclaims the landing's
+    /// watch while the create is inside the pool, keeping the spelling's instead.
+    #[cfg(all(not(miri), any(target_os = "linux", target_os = "macos")))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_shrink_keeps_the_landing_an_in_pool_alias_write_is_landing_in() {
+      let (rig, scope) = alias_rig().await;
+      let landed = live_watch_at(&rig, "/r/actual/sub").expect("staging: the landing is armed");
+      assert!(
+        live_watch_at(&rig, "/r/alias/sub").is_some(),
+        "staging: and so is the spelling, so the shrink can tell them apart"
+      );
+
+      // The write reaches the pool (a prune-only cover settles at the next loop
+      // top, so the fence is not what holds it) and parks inside its syscall.
+      let writes = rig.fs.hold_cookie_writes();
+      let mut on_sync = begin_landed_sync(
+        &rig,
+        scope,
+        "/r/alias/sub",
+        "/r/actual/sub",
+        ".tributaries-sync-3-6-9",
+      )
+      .await;
+      assert!(
+        settle(|| writes.captured() >= 1).await,
+        "staging: the write left the fence and is inside the pool"
+      );
+      assert!(
+        futures_util::poll!(&mut on_sync).is_pending(),
+        "staging: and it has not answered"
+      );
+
+      let _shrink = send_set_cover(&rig, scope, &["/r/other"]).await;
+      for _ in 0..interpreted_rounds(40) {
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+      }
+      assert_eq!(
+        live_watch_at(&rig, "/r/actual/sub"),
+        Some(landed),
+        "the in-pool write's LANDING keeps the watch its marker has to be \
+         reported through (disarms: {:?})",
+        rig.fs.disarms()
+      );
+      assert_eq!(
+        live_watch_at(&rig, "/r/alias/sub"),
+        None,
+        "and the caller's spelling does not"
+      );
+
+      writes.release();
+      let path = on_sync
+        .await
+        .expect("the driver replies")
+        .expect("the write lands");
+      assert_eq!(
+        path,
+        PathBuf::from("/r/actual/sub/.tributaries-sync-3-6-9"),
+        "and the marker really did land at the landing"
+      );
+    }
+
     /// THE PUBLIC CONTRACT END TO END for the one loss that arrives with no cover
     /// of its own: an awaited reply over a standing classification stat reports
     /// `Degraded`, and the covering `Rescan` that verdict names is on the
@@ -12940,7 +13174,14 @@ mod sync_cookie {
     ticket: u64,
   ) -> CookieGuard {
     let fence = core.open_cover_fence(scope);
-    let id = reg.admit_parked(scope, PathBuf::from("/r"), Arc::from(name), ticket, fence);
+    let id = reg.admit_parked(
+      scope,
+      PathBuf::from("/r"),
+      None,
+      Arc::from(name),
+      ticket,
+      fence,
+    );
     reg
       .dispatch_guard(scope, id)
       .expect("a freshly admitted obligation dispatches")
@@ -13683,6 +13924,7 @@ mod sync_cookie {
     let id = reg.admit_parked(
       scope,
       PathBuf::from("/r"),
+      None,
       Arc::clone(&name),
       ticket().seq(),
       fence,
@@ -16850,7 +17092,7 @@ mod sync_cookie {
         m,
         Obligation {
           scope,
-          dir: PathBuf::from("/r"),
+          cover_dir: PathBuf::from("/r"),
           name: Arc::from(name),
           ticket: m.0,
           id: m,
@@ -16923,7 +17165,7 @@ mod sync_cookie {
         m,
         Obligation {
           scope,
-          dir: PathBuf::from("/r"),
+          cover_dir: PathBuf::from("/r"),
           name: Arc::from("n"),
           ticket: m.0,
           id: m,
@@ -16996,7 +17238,7 @@ mod sync_cookie {
         f,
         Obligation {
           scope,
-          dir: PathBuf::from("/r"),
+          cover_dir: PathBuf::from("/r"),
           name: Arc::from("n2"),
           ticket: f.0,
           id: f,
@@ -17427,7 +17669,7 @@ mod sync_cookie {
         id,
         Obligation {
           scope,
-          dir: PathBuf::from("/r"),
+          cover_dir: PathBuf::from("/r"),
           name: Arc::from(name),
           ticket: id.0,
           id,
@@ -18251,7 +18493,14 @@ mod sync_cookie {
       let name = ".tributaries-sync-phase-parked";
       let t = ticket();
       let fence = core.open_cover_fence(scope);
-      let id = reg.admit_parked(scope, PathBuf::from("/r"), Arc::from(name), t.seq(), fence);
+      let id = reg.admit_parked(
+        scope,
+        PathBuf::from("/r"),
+        None,
+        Arc::from(name),
+        t.seq(),
+        fence,
+      );
       cleanup.request_cancel(t);
       assert!(
         reg.dispatch_guard(scope, id).is_none(),
