@@ -3398,14 +3398,26 @@ impl CookieResidue {
 )]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CookieRemoval {
-  /// The name still denoted this cookie, and it is now unlinked.
+  /// The cookie is unlinked: the name still denoted it, or — where the record
+  /// kept its pin — an entry that did was found and removed.
   Unlinked,
   /// Nothing is at the name: a cookie already reaped (a crash leftover someone
   /// else swept, a racing sync). The idempotence contract.
+  ///
+  /// Where the record still holds its PIN this is answered only once the object
+  /// itself is gone, never merely because the name is empty. A peer that renamed
+  /// the cookie aside leaves exactly that name empty over a live file, and the
+  /// removal hunts the object down or FAILS rather than settling here (see
+  /// [`remove_anchored`]).
   AlreadyGone,
   /// The name denotes a DIFFERENT object. This sync's cookie is gone from it and
   /// a stranger holds it now, so nothing is unlinked — deleting it would destroy
   /// data this driver never created and cannot restore.
+  ///
+  /// Where the record still holds its PIN this carries the same condition
+  /// `AlreadyGone` does, and for the same peer: standing a file or a symlink at
+  /// the leaf a renamed cookie came from produces this verdict over an object that
+  /// is still linked, and the removal answers it only once that object is gone.
   ///
   /// UNIX-ONLY, and by construction rather than by accident. It is the verdict a
   /// removal reaches by comparing an identity against whatever a second lookup of
@@ -9668,9 +9680,21 @@ fn identity_of_handle(file: &std::fs::File) -> Result<Option<RootIdentity>, std:
 /// count to add.
 #[cfg(unix)]
 fn handle_still_named(handle: &std::fs::File) -> bool {
+  links_of_handle(handle).is_none_or(|links| links > 0)
+}
+
+/// How MANY names the object `handle` refers to has, or `None` where the count
+/// could not be read.
+///
+/// The same reading [`handle_still_named`] reduces to a yes-or-no, kept whole for
+/// the one caller that needs the number: a removal hunting an object down entry by
+/// entry has to stop, and the count of links left is exactly how many entries there
+/// are still to remove ([`remove_anchored`]).
+#[cfg(unix)]
+fn links_of_handle(handle: &std::fs::File) -> Option<u64> {
   use std::os::unix::fs::MetadataExt;
 
-  handle.metadata().map_or(true, |meta| meta.nlink() > 0)
+  handle.metadata().ok().map(|meta| meta.nlink())
 }
 
 #[cfg(not(unix))]
@@ -9765,23 +9789,26 @@ fn destroy_unidentified(
 /// the file on the floor — and the refusal's own message rides the residue's
 /// `source`.
 ///
-/// # An entry gone at the name is not an object gone
+/// # A settled entry is not a settled object
 ///
-/// A destroy that answers `NotFound` has proved something about a NAME, and the
-/// question this function has to settle is about an OBJECT. A same-uid peer that
-/// renames the marker from its minted leaf to another leaf between the post-create
-/// refusal and this call leaves the entry absent and the file perfectly linked —
-/// and a clean refusal for it retires the obligation as never-created, releases
-/// its marker exemption, and lets close report a quiescent tree with a file this
-/// driver made still sitting in it, outside every ledger cap. Repeat that across
-/// targets and the residue accumulates with nothing counting it.
+/// A destroy settles a NAME — it unlinked one, or it found nothing at one — and
+/// the question this function has to answer is about an OBJECT. A same-uid peer
+/// that renames the marker from its minted leaf to another leaf between the
+/// post-create refusal and this call leaves the entry absent and the file
+/// perfectly linked; one that HARD-LINKS it to a second leaf leaves the destroy
+/// succeeding and the file just as linked. A clean refusal for either retires the
+/// obligation as never-created, releases its marker exemption, and lets close
+/// report a quiescent tree with a file this driver made still sitting in it,
+/// outside every ledger cap. Repeat that across targets and the residue
+/// accumulates with nothing counting it.
 ///
-/// So the HELD descriptor decides ([`handle_still_named`]), never the name: a link
-/// count of zero is the object gone and the clean refusal stands, and anything
-/// else is answered exactly as a FAILED destroy is — the residue-carrying refusal,
-/// counted, retried and reported. The retry can find the renamed object again
-/// because the anchored removal locates by identity when the name is empty (see
-/// [`remove_anchored`]).
+/// So the HELD descriptor decides ([`handle_still_named`]), never the entry: a
+/// link count of zero is the object gone and the clean refusal stands, and
+/// anything else — a `NotFound` over a live file, a destroy that succeeded over
+/// one — is answered exactly as a FAILED destroy is, with the residue-carrying
+/// refusal, counted, retried and reported. The retry finds the object again
+/// wherever it is inside the reserved directory, because the anchored removal
+/// hunts by identity until the link count reaches zero (see [`remove_anchored`]).
 ///
 /// It is the platforms whose cookie directory is SHARED that reach this, and the
 /// destroy-succeeded arm relies on it: where a directory is a per-obligation debt,
@@ -9807,31 +9834,35 @@ fn withdraw_marker(
   });
   // Held across the destroy for the reason `destroy_unidentified` holds it: the
   // entry goes away, the object does not, so its identity slot stays out of the
-  // allocator's reach for as long as a residue below might need it.
-  match dir.destroy_created(name, &handle) {
-    Ok(()) => refusal,
-    // Nothing at the name, and the object gone with it — a peer swept it, or the
-    // directory it was in went with the rename. No file of this write survives, so
-    // the refusal stands.
-    Err(gone) if gone.kind() == std::io::ErrorKind::NotFound && !handle_still_named(&handle) => {
-      refusal
-    }
-    // Anything else leaves a file this write created on disk: a destroy that
-    // failed outright, or a name that answered empty while the object it named is
-    // still linked somewhere. Both are the same debt and are handed back as one.
-    Err(_) => CookieWriteError {
-      source: refusal.source,
-      residue: Some(Box::new(CookieResidue::File(CookieFile::anchored(
-        dir,
-        name,
-        CookieProof::Anchor,
-        handle,
-      )))),
-      pruned: None,
-      excluded: None,
-      replaced: None,
-      crossed: None,
-    },
+  // allocator's reach for as long as a residue below might need it — and it is
+  // what the link count below is read off.
+  let destroyed = dir.destroy_created(name, &handle);
+  // The entry is settled either way — unlinked, or empty when the destroy reached
+  // it. Whether the OBJECT is settled with it is the descriptor's answer alone: a
+  // peer's rename empties the name over a live file, and a peer's hard link
+  // survives the unlink of one.
+  let nothing_survives = match &destroyed {
+    Ok(()) => !handle_still_named(&handle),
+    Err(gone) => gone.kind() == std::io::ErrorKind::NotFound && !handle_still_named(&handle),
+  };
+  if nothing_survives {
+    return refusal;
+  }
+  // Anything else leaves a file this write created on disk: a destroy that failed
+  // outright, or a settled entry over an object still linked somewhere. All of
+  // them are the same debt and are handed back as one.
+  CookieWriteError {
+    source: refusal.source,
+    residue: Some(Box::new(CookieResidue::File(CookieFile::anchored(
+      dir,
+      name,
+      CookieProof::Anchor,
+      handle,
+    )))),
+    pruned: None,
+    excluded: None,
+    replaced: None,
+    crossed: None,
   }
 }
 
@@ -9927,27 +9958,45 @@ fn post_mint_failure(dir: &Arc<CookieDir>, name: &str, source: std::io::Error) -
 /// cannot be promoted the removal FAILS CLOSED — the record survives, close
 /// reports the residue, and no name is touched.
 ///
-/// # An empty name is not a settled cookie
+/// # The pinned object's link count is the terminal, not the name's verdict
 ///
-/// Nothing standing at the cookie's name reads as the idempotent success this
-/// contract promises, and it is one — but only once the OBJECT is gone. A trusted
-/// same-uid peer can rename this cookie to another leaf, which empties the name
-/// while leaving the file linked; answering `AlreadyGone` for that retires the
-/// record, spends its pin and releases its cap slot over a file still on disk,
-/// which is the untracked residue this whole design refuses.
+/// Every verdict a NAME can yield is a statement about that one leaf, and each of
+/// the three retires the obligation. None of them is a statement about the OBJECT.
+/// A trusted same-uid peer can rename this cookie to another leaf and stand
+/// something else — a file, a symlink — at the leaf it came from, and then the
+/// name answers `AlreadyGone` or `Displaced` while the cookie is perfectly linked
+/// two entries away; it can hard-link the cookie to a second leaf, and then even a
+/// successful unlink of the recorded name leaves the object behind. Each of those
+/// retires the record, spends its pin, releases the marker exemption and frees the
+/// cap slot that was supposed to bound exactly this, over a file still on disk —
+/// and close then reports a quiescent tree with it in there, suppressed by the
+/// reserved namespace and counted by nothing. Repeat the sequence and the leftovers
+/// accumulate outside every ledger bound.
 ///
-/// So the held descriptor decides ([`handle_still_named`]): a link count of zero
-/// is the object gone and the verdict stands, and a live one sends the removal
-/// hunting for the object BY IDENTITY through the directory's own descriptor
-/// ([`unlink_entry_by_identity`]) — bounded by the reserved directory this driver
-/// owns, resolving no path, and comparing the same identity every other removal
-/// here compares. Found and unlinked is [`Unlinked`](CookieRemoval::Unlinked); not
-/// found means the object is linked somewhere this removal may not reach, and it
-/// is reported as the FAILURE it is, so the record stays counted and retried
-/// rather than retiring over a live file.
+/// So where the pin survives, the held descriptor decides
+/// ([`handle_still_named`]) and the name's verdict is only the first half. While
+/// the object is still linked the removal hunts it BY IDENTITY through the
+/// directory's own descriptor ([`unlink_entry_by_identity`]) — bounded by the
+/// reserved directory this driver owns, resolving no path, comparing the same
+/// identity every other removal here compares — and it hunts once per remaining
+/// link, that count being exactly how many entries there are left to drop.
+///
+/// What the loop ends on is the whole answer:
+///
+/// - Link count ZERO. The object is gone. [`Unlinked`](CookieRemoval::Unlinked)
+///   where this call removed any of its entries, and otherwise the name's own
+///   verdict — which is now a TRUE statement, an `AlreadyGone` or a `Displaced`
+///   about an object that is not there any more.
+/// - Link count still NON-ZERO. The cookie is linked somewhere this driver may not
+///   unlink from: renamed or hard-linked out of the one directory it is anchored
+///   to, or moved again while the walk was reading. That is a FAILED removal — the
+///   same outcome a refused unlink produces, and the one the ledger's attempt
+///   budget and typed terminal already carry — because the alternative is retiring
+///   a record whose file is still there, which is precisely what the link count
+///   refused to pretend.
 ///
 /// A record whose pin is already spent has no link count to read and keeps the
-/// verdict it always had: the pin is what held the object's identity slot out of
+/// verdict the name gives: the pin is what held the object's identity slot out of
 /// the allocator's reach, so without it there is nothing here to hunt for.
 ///
 /// [`Displaced`]: CookieRemoval::Displaced
@@ -9981,35 +10030,56 @@ fn remove_anchored(
       }
     }
   };
+  let named = remove_at_name(dir, name, identity)?;
+  let Some(pinned) = pin else {
+    return Ok(named);
+  };
+  let mut unlinked = named == CookieRemoval::Unlinked;
+  // One hunt per link the object has left. Each success drops the count by one, so
+  // the count IS the bound and the loop cannot outrun the entries there are to
+  // remove; a count that will not READ leaves it at zero, which sends this removal
+  // to the failure below — the fail-closed direction [`handle_still_named`] takes
+  // for the same reading.
+  let mut hunts = links_of_handle(pinned).unwrap_or(0);
+  while handle_still_named(pinned) {
+    if hunts == 0 || !unlink_entry_by_identity(dir, identity)? {
+      break;
+    }
+    hunts -= 1;
+    unlinked = true;
+  }
+  if handle_still_named(pinned) {
+    return Err(std::io::Error::other(
+      "the cookie is still linked but no entry of the directory it was created \
+       in names it, and this driver may unlink only from that directory",
+    ));
+  }
+  Ok(if unlinked {
+    CookieRemoval::Unlinked
+  } else {
+    named
+  })
+}
+
+/// What the cookie's own NAME says: it denotes the recorded object and is now
+/// unlinked, it denotes something else, or it denotes nothing.
+///
+/// The first half of [`remove_anchored`], kept apart from the link-count terminal
+/// that judges it — because a verdict about one leaf is never by itself a verdict
+/// about the object, and reading this answer as one is the whole defect that
+/// section describes.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn remove_at_name(
+  dir: &CookieDir,
+  name: &str,
+  identity: RootIdentity,
+) -> Result<CookieRemoval, std::io::Error> {
   let standing = match dir.open_for_classification(std::ffi::OsStr::new(name)) {
     Ok(file) => file,
-    // Nothing at the name. That is the idempotent success this contract promises
-    // — but only once the OBJECT is known gone, which the name cannot say and the
-    // held descriptor can: a peer that renamed this cookie to another leaf leaves
-    // the name empty and the file linked, and answering `AlreadyGone` for it
-    // retires the record over a file still on disk. With a live link count the
-    // object is hunted down by identity instead ([`unlink_entry_by_identity`]).
+    // Nothing at the name — the idempotent case, as far as the name can speak to
+    // it.
     Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-      return match pin {
-        Some(created) if handle_still_named(created) => {
-          if unlink_entry_by_identity(dir, identity)? {
-            Ok(CookieRemoval::Unlinked)
-          } else {
-            // The object is linked, and no entry of this directory names it: it
-            // was renamed OUT of the one place this driver may unlink from, or
-            // renamed again while the walk was reading. So the removal FAILED —
-            // the same outcome a refused unlink produces, and the one the ledger's
-            // retry budget and typed terminal already carry. Settling any verdict
-            // here would retire a record whose file is still on disk, which is
-            // precisely what the link count refused to pretend.
-            Err(std::io::Error::other(
-              "the cookie is still linked but no entry of the directory it was created \
-               in names it, and this driver may unlink only from that directory",
-            ))
-          }
-        }
-        _ => Ok(CookieRemoval::AlreadyGone),
-      };
+      return Ok(CookieRemoval::AlreadyGone);
     }
     // A symlink standing at the name: `O_NOFOLLOW` refuses it, and a cookie is
     // never a symlink (its own create refused one too), so this is a

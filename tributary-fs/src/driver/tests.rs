@@ -18695,6 +18695,285 @@ mod sync_cookie {
       let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A marker this write really created, in a reserved directory this write
+    /// really minted, recorded exactly as the ledger records one — the staging the
+    /// cleanup cells below all start from, so what they then provoke is provoked
+    /// against a real record and not a synthesized stand-in.
+    fn landed_marker(fs: &RealFs, root: &Path, target: &Path, name: &str) -> CookieFile {
+      let live = crate::driver::LiveRoot::for_tests(root);
+      fs.write_cookie(
+        &live,
+        target,
+        admitted(root, target),
+        name,
+        &tributary_proto::glob::Globs::default(),
+        &[],
+      )
+      .expect("a directory holding nothing but this write's marker is entered")
+    }
+
+    /// A marker RENAMED aside with a peer's own file left standing at its leaf is
+    /// still unlinked — the name says displaced, and the name is not what settles
+    /// this.
+    ///
+    /// `Displaced` is a true and useful verdict about a leaf: something that is not
+    /// this cookie is at the name, and deleting it would destroy data this driver
+    /// never made. What it is NOT is a verdict about the cookie. A trusted same-uid
+    /// peer that renames the marker to another leaf and drops an ordinary file at
+    /// the one it came from produces exactly this reading over a marker that is
+    /// sitting in the same directory, fully linked — and answering the obligation
+    /// with it retires the record `ConfirmedGone`, spends the pin, releases the
+    /// marker exemption and frees the cap slot that was supposed to bound this very
+    /// thing. Close then reports a quiescent tree over a file the reserved
+    /// namespace suppresses and nothing counts, and repeating the sequence piles
+    /// them up outside every ledger bound.
+    ///
+    /// The pin's LINK COUNT is what the terminal is taken on instead: still linked
+    /// means still owed, so the removal hunts the object down by identity through
+    /// the directory it is anchored to and answers only once nothing names it.
+    ///
+    /// Revert witness: settle the name's verdict without consulting the pin and
+    /// this cell's removal answers `Displaced` with the renamed marker still on
+    /// disk.
+    #[test]
+    fn a_marker_renamed_under_a_peers_file_is_still_unlinked_by_identity() {
+      let root = scratch("marker-renamed-under-file");
+      let target = root.join("a");
+      std::fs::create_dir_all(&target).expect("the directory the sync names");
+      let fs = RealFs::new();
+      let reserved = target.join(cookie_dir_name());
+      let name = ".tributaries-sync-1-2-64-0000000000000064";
+      let cookie = landed_marker(&fs, &root, &target, name);
+
+      // The peer moves the marker aside and stands a file of its OWN at the leaf it
+      // came from, so the name now denotes an ordinary object this driver neither
+      // created nor may delete.
+      std::fs::rename(reserved.join(name), reserved.join("stolen"))
+        .expect("the peer renames the marker aside");
+      std::fs::write(reserved.join(name), STRANGER)
+        .expect("and stands a file of its own at the leaf");
+
+      assert_eq!(
+        fs.remove_cookie(&cookie)
+          .expect("the cleanup settles rather than failing"),
+        CookieRemoval::Unlinked,
+        "the marker was found by identity and unlinked, whatever the name said"
+      );
+      assert_eq!(
+        leaves_in(&reserved),
+        vec![name.to_owned()],
+        "and the peer's own file is all that is left — untouched, at its own name"
+      );
+
+      let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The same rename with a SYMLINK at the leaf: the arm that never opens
+    /// anything is gated on the pin exactly as the mismatch arm is.
+    ///
+    /// A symlink at the name is refused by `O_NOFOLLOW` before any identity is
+    /// read, so this displacement is reached by an `ELOOP` rather than by a
+    /// comparison — a different arm, the same false claim about the object. It is
+    /// the cheapest displacement for a peer to stage, needing no file of its own,
+    /// and the link count answers it the same way.
+    ///
+    /// Revert witness: return `Displaced` straight off the `ELOOP` and the renamed
+    /// marker survives the cleanup that reported success over it.
+    #[test]
+    fn a_marker_renamed_under_a_peers_symlink_is_still_unlinked_by_identity() {
+      let root = scratch("marker-renamed-under-symlink");
+      let target = root.join("a");
+      std::fs::create_dir_all(&target).expect("the directory the sync names");
+      let fs = RealFs::new();
+      let reserved = target.join(cookie_dir_name());
+      let name = ".tributaries-sync-1-2-65-0000000000000065";
+      let cookie = landed_marker(&fs, &root, &target, name);
+
+      std::fs::rename(reserved.join(name), reserved.join("stolen"))
+        .expect("the peer renames the marker aside");
+      std::os::unix::fs::symlink("elsewhere", reserved.join(name))
+        .expect("and hangs a symlink at the leaf");
+
+      assert_eq!(
+        fs.remove_cookie(&cookie)
+          .expect("the cleanup settles rather than failing"),
+        CookieRemoval::Unlinked,
+        "the marker was found by identity and unlinked, whatever the name said"
+      );
+      assert_eq!(
+        leaves_in(&reserved),
+        vec![name.to_owned()],
+        "and the peer's symlink is all that is left"
+      );
+      assert!(
+        std::fs::symlink_metadata(reserved.join(name))
+          .expect("the symlink is readable")
+          .file_type()
+          .is_symlink(),
+        "still a symlink — nothing followed it and nothing replaced it"
+      );
+
+      let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A marker a peer gave a SECOND name to inside the reserved directory is
+    /// removed from both leaves, because one successful unlink is not one object
+    /// gone.
+    ///
+    /// This is the case no comparison at the name can catch: the name still denotes
+    /// the marker, the identity matches, the unlink succeeds — and the object is
+    /// still there, under the leaf the peer added. Retiring on that verdict leaves
+    /// a file this driver created on disk with its record spent, which is the same
+    /// untracked residue the rename cases leave by a different route.
+    ///
+    /// The loop is bounded by the count itself: each remaining link is one entry,
+    /// each hunt that succeeds drops the count by one, so the removal cannot run
+    /// longer than there are entries to remove.
+    ///
+    /// Revert witness: answer `Unlinked` as soon as the name's unlink succeeds and
+    /// the peer's second leaf survives a cleanup that called itself done.
+    #[test]
+    fn a_hard_linked_marker_is_removed_from_every_leaf_of_its_own_directory() {
+      let root = scratch("marker-hardlinked-inside");
+      let target = root.join("a");
+      std::fs::create_dir_all(&target).expect("the directory the sync names");
+      let fs = RealFs::new();
+      let reserved = target.join(cookie_dir_name());
+      let name = ".tributaries-sync-1-2-66-0000000000000066";
+      let cookie = landed_marker(&fs, &root, &target, name);
+
+      std::fs::hard_link(reserved.join(name), reserved.join("twin"))
+        .expect("the peer gives the marker a second name in the same directory");
+
+      assert_eq!(
+        fs.remove_cookie(&cookie)
+          .expect("the cleanup settles rather than failing"),
+        CookieRemoval::Unlinked,
+        "and it means the OBJECT, not the one entry it started with"
+      );
+      assert!(
+        leaves_in(&reserved).is_empty(),
+        "so both leaves are gone: {:?}",
+        leaves_in(&reserved)
+      );
+
+      let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A marker hard-linked OUTSIDE the reserved directory never settles: the
+    /// removal fails, the record stays counted, and the link nobody anchored is
+    /// left alone.
+    ///
+    /// The removal is confined to one directory by design — it addresses entries of
+    /// the descriptor the create was made through and resolves no path — so a link
+    /// outside it is one this driver must not delete. What it must also not do is
+    /// claim the object is gone. The honest outcome is the FAILED removal a refused
+    /// unlink already produces: the ledger's attempt budget carries the record and
+    /// close reports it under a typed terminal, rather than retiring it over a file
+    /// still on disk.
+    ///
+    /// Revert witness: answer `Unlinked` off the name's own unlink and this cell's
+    /// removal reports success while the outside link is still there.
+    #[test]
+    fn a_marker_hard_linked_outside_the_reserved_directory_never_settles() {
+      let root = scratch("marker-hardlinked-outside");
+      let target = root.join("a");
+      std::fs::create_dir_all(&target).expect("the directory the sync names");
+      let fs = RealFs::new();
+      let reserved = target.join(cookie_dir_name());
+      let name = ".tributaries-sync-1-2-67-0000000000000067";
+      let cookie = landed_marker(&fs, &root, &target, name);
+
+      let outside = target.join("twin");
+      std::fs::hard_link(reserved.join(name), &outside)
+        .expect("the peer gives the marker a name outside the reserved directory");
+
+      let failed = fs.remove_cookie(&cookie).expect_err(
+        "a removal that cannot reach every link of the object reports a FAILURE, so \
+         the record stays counted rather than retiring over a live file",
+      );
+      assert!(
+        failed.to_string().contains("still linked"),
+        "and the failure names what happened: {failed}"
+      );
+      assert!(
+        outside.exists(),
+        "the outside link is still there — nothing beyond the anchored directory was \
+         touched"
+      );
+      assert!(
+        leaves_in(&reserved).is_empty(),
+        "and the entry inside it did go: {:?}",
+        leaves_in(&reserved)
+      );
+
+      let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A marker HARD-LINKED between the post-create refusal and the withdrawal is
+    /// still owed — a destroy that succeeded is not an object gone either.
+    ///
+    /// The rename case makes the withdrawal's `unlinkat` answer `ENOENT` over a live
+    /// file; this one lets it SUCCEED over a live file, which is the arm that used
+    /// to be read as proof that nothing of this write survived. It does not prove
+    /// that: an unlink removes one entry, and the peer added a second. Reporting the
+    /// clean refusal there retires the obligation as never-created and releases the
+    /// exemption and the cap slot while the marker sits in the reserved directory
+    /// under the peer's leaf.
+    ///
+    /// So the same descriptor decides here as everywhere else, and the residue it
+    /// hands back is reaped the same way — by identity, until nothing names the
+    /// object.
+    ///
+    /// Revert witness: answer the successful destroy with the clean refusal and this
+    /// cell's first assertion fails: the write reports owing nothing while the twin
+    /// leaf still holds the marker.
+    #[test]
+    fn a_marker_hard_linked_before_its_withdrawal_is_owed_and_reaped_from_both_leaves() {
+      let root = scratch("marker-hardlinked-withdraw");
+      let target = root.join("a");
+      std::fs::create_dir_all(&target).expect("the directory the sync names");
+      let fs = RealFs::new();
+      let live = crate::driver::LiveRoot::for_tests(&root);
+      let reserved = target.join(cookie_dir_name());
+      let name = ".tributaries-sync-1-2-68-0000000000000068";
+
+      let fault = ProofFault::arm(crate::driver::CookieProofPoint::HoldsOnly);
+      let (minted, twin) = (reserved.join(name), reserved.join("twin"));
+      let peer = MidWithdrawalPeer::arm(move || {
+        std::fs::hard_link(&minted, &twin).expect("the peer gives the marker a second name");
+      });
+      let written = fs.write_cookie(
+        &live,
+        &target,
+        admitted(&root, &target),
+        name,
+        &tributary_proto::glob::Globs::default(),
+        &[],
+      );
+      drop(peer);
+      drop(fault);
+
+      let refusal = written.expect_err("the armed proof refuses this write");
+      assert_eq!(
+        leaves_in(&reserved),
+        vec!["twin".to_owned()],
+        "staging: the destroy took the minted leaf and the peer's second one \
+         outlived it"
+      );
+      let mut residue = owed_file(refusal);
+
+      crate::driver::reap_residue(&fs, &mut residue)
+        .expect("the retry removes the surviving link by identity");
+      assert!(
+        leaves_in(&reserved).is_empty(),
+        "and the reserved directory ends empty: {:?}",
+        leaves_in(&reserved)
+      );
+
+      let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The inode number the admission's identity is taken on cannot be handed to
     /// another object while the sync is in flight, because the admission is
     /// HOLDING the object rather than remembering its number.
