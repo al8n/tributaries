@@ -547,6 +547,22 @@ All notable changes to this workspace are documented here. The format is based o
   resolving or reporting a definite refusal. Tracked as
   [#134](https://github.com/al8n/tributaries/issues/134).
 
+- **`tributary-fs`**, **`tributaries`** — on Linux and macOS, the ordering certificate a
+  sync returns assumes that no process running with the watcher's OWN uid rewrites,
+  between the sync's admission and the observation of its marker, either the ancestry
+  chain from the watched root to the sync target (renaming or replacing a component,
+  aliasing it through a same-superblock bind mount, or moving the pinned objects across
+  pruned, excluded or mount-frame boundaries) or the reserved cookie directory's entries
+  (renaming, hard-linking or replacing the marker, or planting entries beside it). The
+  watcher pins the admitted objects with held descriptors, re-verifies identity, mount
+  frame and ground at the write, proves a minted directory holds only its marker, and
+  decides every cleanup terminal by the pinned object's link count; a different uid
+  cannot reach the 0700 reserved directory at all. What remains outside the contract is
+  an adversary holding the watcher's own credentials, which can always win one more race
+  against a pathname-based filesystem API — the watcher is not a security boundary
+  against its own uid. Tracked as [#135](https://github.com/al8n/tributaries/issues/135),
+  companion of [#134](https://github.com/al8n/tributaries/issues/134).
+
 ## [0.1.0]
 
 ### Added

@@ -2014,6 +2014,23 @@ impl<R> Watcher<R> {
   /// barrier unresolved until it times out, rather than resolving or
   /// reporting a definite refusal. Tracked as
   /// <https://github.com/al8n/tributaries/issues/134>.
+  ///
+  /// On Linux and macOS, the ordering certificate this call returns assumes that no
+  /// process running with the watcher's OWN uid rewrites, between this call's
+  /// admission and the observation of its marker, either the ancestry chain from
+  /// `root` to the sync target (renaming or replacing a component, aliasing it
+  /// through a same-superblock bind mount, or moving the pinned objects across
+  /// pruned, excluded or mount-frame boundaries) or the reserved cookie directory's
+  /// entries (renaming, hard-linking or replacing the marker, or planting entries
+  /// beside it). The pinned objects are held by descriptor, identity and mount frame
+  /// are re-verified at the write, a minted directory is proved to hold only its
+  /// marker, and every cleanup is decided terminal by the pinned object's link
+  /// count; a different uid cannot reach the 0700 reserved directory at all. What
+  /// remains outside the contract is an adversary holding the watcher's own
+  /// credentials, which can always win one more race against a pathname-based
+  /// filesystem API — this call is not a security boundary against its own uid.
+  /// Tracked as <https://github.com/al8n/tributaries/issues/135>, companion of
+  /// <https://github.com/al8n/tributaries/issues/134>.
   pub async fn sync_root(
     &self,
     root: RootHandle,
