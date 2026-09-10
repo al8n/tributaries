@@ -1077,10 +1077,12 @@ mod root_options {
   /// supplied so a person can act on it.
   #[test]
   fn a_seat_past_the_pattern_cap_is_a_typed_refusal() {
+    // One compiled pattern, cloned: the ceiling counts entries, not distinct
+    // automatons, and cloning is an `Arc` pointer copy — 257 SEPARATELY
+    // compiled globs cross 32-bit Miri's address-space limit.
     let many = |count: usize| {
-      (0..count)
-        .map(|n| glob(&std::format!("**/w{n}")))
-        .collect::<std::vec::Vec<_>>()
+      let pattern = glob("**/w");
+      std::iter::repeat_n(pattern, count).collect::<std::vec::Vec<_>>()
     };
     let cap = RootOptions::MAX_SEAT_PATTERNS;
 
@@ -1128,10 +1130,12 @@ mod root_options {
   #[test]
   fn a_programmatic_seat_is_bounded_at_collection() {
     let cap = RootOptions::MAX_SEAT_PATTERNS;
+    // One compiled pattern, cloned: the ceiling counts entries, not distinct
+    // automatons, and cloning is an `Arc` pointer copy — 257 SEPARATELY
+    // compiled globs cross 32-bit Miri's address-space limit.
     let many = |count: usize| {
-      (0..count)
-        .map(|n| glob(&std::format!("**/w{n}")))
-        .collect::<std::vec::Vec<_>>()
+      let pattern = glob("**/w");
+      std::iter::repeat_n(pattern, count).collect::<std::vec::Vec<_>>()
     };
     let over = || std::iter::repeat(glob("**/w"));
 

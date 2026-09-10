@@ -1377,11 +1377,12 @@ mod lifecycle {
     let watcher =
       Watcher::<TokioRuntime>::new_with(WatcherOptions::new(), fs.clone()).expect("build");
 
-    let over_full = crate::options::RootOptions::new().with_prune(
-      (0..=crate::options::RootOptions::MAX_SEAT_PATTERNS).map(|n| {
-        tributary_proto::glob::Glob::new(&format!("**/w{n}")).expect("a valid pattern compiles")
-      }),
-    );
+    // One compiled pattern, cloned: the door judges the COUNT, not distinctness,
+    // and `Glob` clones an `Arc` pointer rather than recompiling — 257 SEPARATELY
+    // compiled automatons cross 32-bit Miri's address-space limit.
+    let pattern = tributary_proto::glob::Glob::new("**/w").expect("a valid pattern compiles");
+    let over_full = crate::options::RootOptions::new()
+      .with_prune((0..=crate::options::RootOptions::MAX_SEAT_PATTERNS).map(|_| pattern.clone()));
     let err = watcher
       .watch_with("/no/such/root", over_full)
       .await

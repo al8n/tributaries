@@ -9212,7 +9212,10 @@ async fn an_over_full_seat_is_refused_before_the_source_is_entered() {
       .expect("the default capacities are in range");
 
   let cap = WatchOptions::<OsString>::MAX_SEAT_PATTERNS;
-  let words = |count: usize| (0..count).map(|n| glob(&std::format!("**/w{n}")));
+  // One compiled pattern, cloned: the ceiling counts entries, not distinct
+  // automatons, and cloning is an `Arc` pointer copy — 257 SEPARATELY compiled
+  // globs (times two seats) cross 32-bit Miri's address-space limit.
+  let words = |count: usize| std::iter::repeat_n(glob("**/w"), count);
 
   for options in [
     WatchOptions::new().with_prune(words(cap + 1)),
