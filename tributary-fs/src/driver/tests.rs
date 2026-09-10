@@ -1433,21 +1433,28 @@ async fn a_probe_declined_at_the_budget_reports_the_scope_unproven_once() {
   // FIRST: the turned-away scope's covering `Rescan` arrives while the budget is
   // still full — a delta against the stream this cell emptied, not a count of
   // everything the rig ever said.
+  //
+  // An EVENTUAL claim on the shared wait rather than a window of its own. What it
+  // waits on is a TICK: the scope the budget turned away is told nothing until
+  // its next interval comes round, and with sixty-five scopes ticking against
+  // sixty-four parked threads, when that interval lands is the runner's business
+  // and not this cell's. A hosted runner reached it later than a hand-rolled
+  // window allowed, and a fixed short window is the wrong shape for a fact that
+  // is eventually true: it can only fail spuriously, never catch a defect
+  // earlier. The loop returns the instant the cover arrives, so the wider budget
+  // costs a passing run nothing — the same reasoning [`settle_within`] documents.
   let mut opened = 0usize;
-  for _ in 0..interpreted_rounds(400) {
+  let unproven = settle_within(interpreted_rounds(400), || {
     while let Ok((_, _, change)) = rig.events.try_recv() {
       if change.kind().is_rescan() {
         opened += 1;
       }
     }
-    if opened > 0 {
-      break;
-    }
-    tokio::task::yield_now().await;
-    tokio::time::sleep(Duration::from_millis(5)).await;
-  }
+    opened > 0
+  })
+  .await;
   assert!(
-    opened >= 1,
+    unproven,
     "a scope the budget turned away says its coverage is unproven, while the \
      budget is still full — not at the release"
   );
