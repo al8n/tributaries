@@ -271,7 +271,11 @@ pub enum SyncRootError {
   /// The cookie directory is not inside the root's coverage — a cookie
   /// written there could never be reported on this root's stream. Also raised
   /// when the directory only *appears* inside the root through `..` traversal
-  /// (`<root>/../outside`), which a lexical `starts_with` would accept.
+  /// (`<root>/../outside`), which a lexical `starts_with` would accept, and when
+  /// the directory the admission actually reached — every symlink in the
+  /// spelling followed — stands outside the root, in which case
+  /// [`dir`](Self::DirOutsideRoot::dir) is that location rather than the
+  /// spelling.
   #[error("cookie directory {} is outside root {}", dir.display(), root.display())]
   DirOutsideRoot {
     /// The requested cookie directory.
@@ -290,16 +294,19 @@ pub enum SyncRootError {
   /// same everywhere — it does not depend on which backend resolved, and it is
   /// made before the write rather than discovered by waiting.
   ///
-  /// The verdict is taken TWICE, because a spelling is not a location. The
-  /// admission judges `dir` as supplied, which costs nothing and refuses the
-  /// common case synchronously; the write then judges the directory it actually
-  /// resolved — every symlink on the way followed, and the
-  /// cookie-goes-beside-a-file rule applied — because only that one is where the
-  /// marker would land. A link whose spelling clears every exclusion and whose
-  /// target sits inside one is refused by the second check, with
-  /// [`dir`](Self::DirExcluded::dir) naming the resolved directory rather than
-  /// the spelling. Since the caller cannot tell which check refused, the
-  /// admission's sequence is treated as spent for both — re-mint to retry.
+  /// The verdict is taken THREE times, because a spelling is not a location and
+  /// a location is not a history. The admission judges `dir` as supplied, which
+  /// costs nothing and refuses the common case synchronously; it then judges
+  /// where the directory it opened for this sync actually STOOD when the
+  /// barrier's coverage was cut — every symlink in the spelling followed, and
+  /// the cookie-goes-beside-a-file rule applied — because a directory that was
+  /// unreportable then carries descendants no stream of this root ever reported;
+  /// and the write judges the directory it resolves at the moment it creates,
+  /// because that is where the marker lands. A link whose spelling clears every
+  /// exclusion and whose target sits inside one is refused by the second check,
+  /// with [`dir`](Self::DirExcluded::dir) naming the resolved directory rather
+  /// than the spelling. Since the caller cannot tell which check refused, the
+  /// admission's sequence is treated as spent for all three — re-mint to retry.
   #[error(
     "cookie directory {} is under excluded directory {}",
     dir.display(),
@@ -334,6 +341,13 @@ pub enum SyncRootError {
   /// speaks for directories, and the file's parent is what the cookie goes in).
   /// The refusal is taken there, before anything is created — which is also why
   /// the admission's sequence is spent by it.
+  ///
+  /// It is taken at the ADMISSION too, on the same resolved form: where the
+  /// directory opened for this sync stood at the moment the barrier's coverage
+  /// was cut. Ground the seat covered then is ground whose descendants no stream
+  /// of this root ever reported, so a marker placed among them could be ordered
+  /// ahead of changes that truly preceded it — a refusal, and one taken before
+  /// any coverage window is opened.
   ///
   /// Unlike the exclusions this is per ROOT, so the same directory may be
   /// perfectly writable for a sync on another root of the same watcher.

@@ -19117,6 +19117,271 @@ mod sync_cookie {
       let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A watcher over the fake platform whose REAL scratch `root` is watched
+    /// under `options`, with `exclusions` in force watcher-wide.
+    ///
+    /// The split is what the cut-time ground cells need: the tree is real, so the
+    /// door's pins and the landings read off them are real answers about real
+    /// symlinks and real directories, while a write that ever reached the pool
+    /// would land in the model — so a refusal is provably the admission's, and a
+    /// model holding nothing proves no write was dispatched at all.
+    async fn grounded_watcher(
+      root: &Path,
+      exclusions: Vec<PathBuf>,
+      options: crate::options::RootOptions,
+    ) -> (FakeFs, crate::Watcher<TokioRuntime>, crate::RootHandle) {
+      let fs = FakeFs::new(1);
+      fs.put(root, FileKind::Dir, 1);
+      let watcher = crate::Watcher::<TokioRuntime>::new_with(
+        crate::WatcherOptions::new().with_exclusions(exclusions),
+        fs.clone(),
+      )
+      .expect("the watcher builds");
+      let handle = watcher
+        .watch_with(root, options)
+        .await
+        .expect("the scratch root is watchable");
+      (fs, watcher, handle)
+    }
+
+    /// The subtree a cut-time ground cell hides under `ground`: a target `T`, the
+    /// reserved cookie directory standing inside it, and an entry `deep/old`
+    /// inside THAT — the descendants no queue of this scope ever carried — plus an
+    /// in-root symlink `link` naming `ground` so the caller's own spelling reaches
+    /// `T` without ever mentioning it.
+    ///
+    /// Returns the spelling a caller passes and the location the door's pins
+    /// actually answer for.
+    fn stage_hidden_target(root: &Path, ground: &str) -> (PathBuf, PathBuf) {
+      let landing = root.join(ground).join("T");
+      std::fs::create_dir_all(landing.join(cookie_dir_name()).join("deep").join("old"))
+        .expect("the hidden target, its reserved directory and an older entry inside it");
+      std::os::unix::fs::symlink(root.join(ground), root.join("link"))
+        .expect("the in-root symlink the caller's spelling goes through");
+      (root.join("link").join("T"), landing)
+    }
+
+    /// What stands in the reserved cookie directory of `landing`, by name.
+    fn reserved_entries(landing: &Path) -> Vec<String> {
+      let mut names: Vec<String> = std::fs::read_dir(landing.join(cookie_dir_name()))
+        .expect("the reserved directory is readable")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+      names.sort();
+      names
+    }
+
+    /// A sync whose pinned objects stood in PRUNED ground when the cut was taken
+    /// is refused at the admission, before any fence opens.
+    ///
+    /// The escape this closes. A pin proves object SAMENESS across the sync's
+    /// window and nothing else, and it carries the object through a move — so a
+    /// peer could prepare a target and its reserved cookie directory under
+    /// never-armed ground, hold descendants in them that no queue of this scope
+    /// ever reported, and let the caller reach them through an in-root symlink
+    /// whose spelling clears every lexical test the admission had. After the
+    /// coverage cut it moves that same subtree into unpruned ground and repoints
+    /// the link: the identities still match, the write's own ground verdicts now
+    /// pass, and the EEXIST arm owes no sole-entry proof because the directory was
+    /// not minted. The marker lands beside `deep/old`, and the cold enumeration
+    /// the move-in triggers may deliver it FIRST — a barrier certifying an
+    /// ordering nobody proved.
+    ///
+    /// So the door reads WHERE each pin stands, on the pool beside the pin, and the
+    /// admission judges that location against the scope's own prune seat before it
+    /// opens anything. The move never gets a window, because the sync it would have
+    /// exploited was never admitted.
+    ///
+    /// The second call is what proves nothing was minted: a refusal taken before
+    /// the single-flight gate leaves no obligation standing, so the next caller
+    /// reads the same ground verdict rather than `WriteInFlight`.
+    ///
+    /// Revert witness: drop the landing from the admission (or judge it only at the
+    /// write) and the sync is admitted, its fence opens, and the refusal — if any —
+    /// arrives from the pool after the window the move needs has already been
+    /// handed out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_target_pinned_in_pruned_ground_is_refused_at_the_admission() {
+      let root = scratch("cut-ground-pruned");
+      let (spelling, landing) = stage_hidden_target(&root, "blocked");
+      let prune = tributary_proto::glob::Globs::new([
+        tributary_proto::glob::Glob::new("blocked").expect("a valid pattern compiles")
+      ])
+      .expect("a one-word seat compiles");
+      assert!(
+        crate::driver::pruned_dir_by(&root, &prune, &spelling).is_none(),
+        "staging: the caller's spelling names no pruned prefix — {spelling:?}"
+      );
+      assert!(
+        crate::driver::pruned_dir_by(&root, &prune, &landing).is_some(),
+        "staging: the object it reaches stands squarely in pruned ground"
+      );
+
+      let (fs, watcher, handle) = grounded_watcher(
+        &root,
+        Vec::new(),
+        crate::options::RootOptions::new()
+          .with_prune([
+            tributary_proto::glob::Glob::new("blocked").expect("a valid pattern compiles")
+          ]),
+      )
+      .await;
+
+      for attempt in 0..2 {
+        let (admission, _ticket) = watcher
+          .mint_sync_ticket()
+          .expect("this host seeds a watcher");
+        let denied = watcher
+          .sync_root(handle, &spelling, admission)
+          .await
+          .expect_err("a pin taken in pruned ground is not an admissible sync");
+        match denied.error {
+          crate::SyncRootError::DirPruned { dir, pattern } => {
+            assert_eq!(
+              dir, landing,
+              "the refusal names WHERE the pinned object stood, not the spelling it \
+               was reached by"
+            );
+            assert_eq!(pattern.as_str(), "blocked");
+          }
+          other => panic!("attempt {attempt}: the ground verdict is the prune seat's: {other:?}"),
+        }
+      }
+
+      assert!(
+        fs.files_under(&root).is_empty(),
+        "nothing was written: the refusal is taken before the fence, so no write \
+         was ever dispatched"
+      );
+      assert_eq!(
+        reserved_entries(&landing),
+        vec!["deep".to_owned()],
+        "and no marker stands anywhere under the pruned ground"
+      );
+
+      watcher.close().await.expect("the watcher closes");
+      let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The exclusions' twin, through the other seat: a pin taken inside an
+    /// EXCLUDED subtree is refused from its landing, though the caller's spelling
+    /// is excluded by nothing.
+    ///
+    /// One rule, two seats, and the same reason at both — a marker under either is
+    /// a marker the source is instructed never to report, so a barrier placed
+    /// there could only time out. What this cell adds over the prune one is that
+    /// the LEXICAL exclusion check the admission has always taken passes here: the
+    /// spelling goes nowhere near `blocked`, and only the location read off the
+    /// pin says otherwise.
+    ///
+    /// Revert witness: the same as its prune twin — judge the spelling alone and
+    /// the sync is admitted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_target_pinned_in_excluded_ground_is_refused_at_the_admission() {
+      let root = scratch("cut-ground-excluded");
+      let (spelling, landing) = stage_hidden_target(&root, "blocked");
+      let exclusion = root.join("blocked");
+      assert!(
+        crate::driver::cookie_dir_excluded(std::slice::from_ref(&exclusion), &spelling).is_none(),
+        "staging: the caller's spelling clears the lexical exclusion check — {spelling:?}"
+      );
+
+      let (fs, watcher, handle) = grounded_watcher(
+        &root,
+        vec![exclusion.clone()],
+        crate::options::RootOptions::new(),
+      )
+      .await;
+
+      for attempt in 0..2 {
+        let (admission, _ticket) = watcher
+          .mint_sync_ticket()
+          .expect("this host seeds a watcher");
+        let denied = watcher
+          .sync_root(handle, &spelling, admission)
+          .await
+          .expect_err("a pin taken inside an exclusion is not an admissible sync");
+        match denied.error {
+          crate::SyncRootError::DirExcluded {
+            dir,
+            exclusion: covered,
+          } => {
+            assert_eq!(
+              dir, landing,
+              "the refusal names WHERE the pinned object stood, not the spelling it \
+               was reached by"
+            );
+            assert_eq!(covered, exclusion);
+          }
+          other => panic!("attempt {attempt}: the ground verdict is the exclusions': {other:?}"),
+        }
+      }
+
+      assert!(
+        fs.files_under(&root).is_empty(),
+        "nothing was written: the refusal is taken before the fence"
+      );
+      assert_eq!(
+        reserved_entries(&landing),
+        vec!["deep".to_owned()],
+        "and no marker stands anywhere under the excluded ground"
+      );
+
+      watcher.close().await.expect("the watcher closes");
+      let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The contrast that keeps the verdict a verdict: a symlink into COVERED
+    /// ground still syncs, reserved directory and all.
+    ///
+    /// The staging is the refusing cells' exactly — the same in-root symlink, the
+    /// same standing reserved cookie directory with an older entry inside it — with
+    /// the one difference that decides the question: the ground the pins land in is
+    /// ground this scope reports. A landing check that answered on the SPELLING, or
+    /// that refused a symlink for being one, would fail here; only "where the object
+    /// stood, judged by the scope's own seats" passes both cells.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_symlink_into_covered_ground_still_syncs() {
+      let root = scratch("cut-ground-covered");
+      let (spelling, landing) = stage_hidden_target(&root, "open");
+
+      let (fs, watcher, handle) = grounded_watcher(
+        &root,
+        Vec::new(),
+        crate::options::RootOptions::new()
+          .with_prune([
+            tributary_proto::glob::Glob::new("blocked").expect("a valid pattern compiles")
+          ]),
+      )
+      .await;
+      // The modelled twin of the directory the caller names: the write is the
+      // fake's, so this is where its marker goes once the admission lets it
+      // through.
+      fs.put(&spelling, FileKind::Dir, 2);
+
+      let (admission, ticket) = watcher
+        .mint_sync_ticket()
+        .expect("this host seeds a watcher");
+      let placed = watcher
+        .sync_root(handle, &spelling, admission)
+        .await
+        .expect("a pin taken in covered ground is an admissible sync");
+      assert_eq!(
+        placed.file_name().and_then(|leaf| leaf.to_str()),
+        Some(ticket.leaf().as_str()),
+        "the marker lands under the leaf the ticket answers"
+      );
+      assert_eq!(
+        reserved_entries(&landing),
+        vec!["deep".to_owned()],
+        "and the real reserved directory is untouched — the write was the fake's"
+      );
+
+      watcher.close().await.expect("the watcher closes");
+      let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A reserved directory standing across a MOUNT BOUNDARY is refused, even
     /// where its identity is the one the admission read.
     ///

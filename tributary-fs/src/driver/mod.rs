@@ -2148,6 +2148,14 @@ impl CookieDir {
   ///   and the barrier would certify an ordering nobody proved. An admission that
   ///   read NOTHING here is the same refusal: a directory that appeared after the
   ///   cut is exactly the object this rules out.
+  ///
+  ///   Sameness is all this arm asks, and all it can ask — it holds a descriptor,
+  ///   not a history. That the object it matches stood in ground this scope
+  ///   reports when the cut was taken is proven at the admission instead, against
+  ///   the location the door read off the very pin compared here, because an
+  ///   identity travels with its object through a move and a directory carried
+  ///   out of never-armed ground after the cut would satisfy this equality
+  ///   perfectly ([`AdmittedDirs`]). Neither statement is a barrier on its own.
   /// - the `mkdirat` SUCCEEDED. This write bound the name to a new, empty
   ///   directory, and there is no earlier object for it to be a replacement OF —
   ///   but there is no admitted reading to prove the descriptor against either,
@@ -7479,6 +7487,24 @@ pub(crate) struct AdmittedDir {
   /// is no object here for a later reading to be equal to.
   #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
   pin: Option<std::os::fd::OwnedFd>,
+  /// WHERE the pinned object stood when the door took it, read off that same
+  /// descriptor in the same breath — a location the OS answered, never a spelling
+  /// a caller supplied.
+  ///
+  /// An identity says the write reached the same OBJECT the cut was taken over. It
+  /// says nothing about whether that object stood in ground this scope reports
+  /// WHEN the cut was taken, and a pin carries an object through a move: a peer
+  /// that moves the pinned subtree out of pruned ground after the cut leaves every
+  /// identity matching and every write-time ground verdict passing, over a
+  /// directory whose descendants no queue of this scope ever carried. This is the
+  /// fact that closes that, and it is read where the pin is because reading it
+  /// anywhere else would resolve a pathname on a thread that must not.
+  ///
+  /// `None` is an absent pin — there is no object to have stood anywhere — or a
+  /// sampling that is not judged on ground at all: the watched ROOT is the floor
+  /// the other two are measured against rather than something measured against it.
+  #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+  landing: Option<PathBuf>,
   /// The identity the door read where nothing can be held open for it.
   #[cfg(not(all(any(target_os = "linux", target_os = "macos"), not(miri))))]
   identity: Option<RootIdentity>,
@@ -7502,6 +7528,11 @@ impl AdmittedDir {
       .as_ref()
       .and_then(|pin| identity_of_dir(pin).ok().flatten())
   }
+
+  /// Where the door found this object, as the descriptor answered it at the cut.
+  fn landing(&self) -> Option<&Path> {
+    self.landing.as_deref()
+  }
 }
 
 #[cfg(not(all(any(target_os = "linux", target_os = "macos"), not(miri))))]
@@ -7510,6 +7541,12 @@ impl AdmittedDir {
   /// re-read it from.
   fn identity(&self) -> Option<RootIdentity> {
     self.identity
+  }
+
+  /// No landing, because there is no held descriptor to have read one off — the
+  /// same silence these arms keep about the write's own read-backs.
+  fn landing(&self) -> Option<&Path> {
+    None
   }
 }
 
@@ -7541,7 +7578,13 @@ impl AdmittedDir {
 /// answered at this name when the sync was admitted, so a write that later walks
 /// into one has walked into an object the admission never judged.
 ///
-/// One open on the caller's own thread, in the [`watch`](crate::Watcher::watch)
+/// The object is not the whole of what the cut has to prove, and the LANDING read
+/// beside it is the rest: an identity carries through a move, so a peer that moves
+/// this pinned directory out of unreportable ground after the cut satisfies every
+/// identity the write can take. Where it stood when the door held it is read here
+/// and judged at the admission ([`AdmittedDirs`]).
+///
+/// One open per job on the blocking POOL, in the [`watch`](crate::Watcher::watch)
 /// door's mold — never on the driver's owner loop, which must not resolve a
 /// pathname against a mount that can hang.
 pub(crate) fn cookie_target_identity(
@@ -7550,9 +7593,7 @@ pub(crate) fn cookie_target_identity(
 ) -> Result<AdmittedDir, std::io::Error> {
   #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
   {
-    Ok(AdmittedDir {
-      pin: definite_pin(open_dir_pin(cookie_dir(root, dir)))?,
-    })
+    pinned_where_it_stands(open_dir_pin(cookie_dir(root, dir)))
   }
   #[cfg(all(
     unix,
@@ -7607,6 +7648,31 @@ fn definite_pin(
   }
 }
 
+/// A sampling of a directory the ADMISSION judges on ground: the pin, and the
+/// place the OS says that pin stands, taken one after the other on the same pool
+/// job.
+///
+/// The two readings belong to one instant and are taken in one, because that is
+/// what the pair is FOR: the identity carries the object across the window, and
+/// the landing says the object was somewhere this scope reports when the window
+/// opened. A landing sampled later would describe a world the cut never covered,
+/// and a landing sampled on the owner loop would resolve a pathname on the one
+/// thread that must never wait for a mount.
+///
+/// A landing the OS will not answer is a failed SAMPLING, not an admissible
+/// silence, and it is returned as one — the same fail-closed direction
+/// [`definite_pin`] takes for every failure that is not a definite absence. A pin
+/// that is absent has nothing to have a location; that is a reading, and it
+/// carries `None`.
+#[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+fn pinned_where_it_stands(
+  opened: Result<std::fs::File, std::io::Error>,
+) -> Result<AdmittedDir, std::io::Error> {
+  let pin = definite_pin(opened)?;
+  let landing = pin.as_ref().map(current_path_of_dir).transpose()?;
+  Ok(AdmittedDir { pin, landing })
+}
+
 /// The RESERVED COOKIE DIRECTORY at the moment a sync is admitted, where one
 /// already stands there — the second object the marker's ordering rests on, and
 /// the last one the cut has to prove.
@@ -7634,14 +7700,18 @@ fn definite_pin(
 /// The open refuses a symlink at that last component, because the write's own
 /// `openat` of this name does: a name the write can only fail on is a name the
 /// door has no object to hold at.
+///
+/// Its LANDING is read beside the pin for the target's reason and one of its own:
+/// this is the directory the marker's own create comes off, so it is the one whose
+/// cut-time ground the barrier's ordering actually rests on — and an exclusion or a
+/// prune word naming the reserved directory itself leaves the target above it
+/// perfectly reportable.
 fn reserved_cookie_dir_identity(root: &Path, dir: &Path) -> Result<AdmittedDir, std::io::Error> {
   #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
   {
-    Ok(AdmittedDir {
-      pin: definite_pin(open_dir_no_follow(
-        &cookie_dir(root, dir).join(cookie_dir_name()),
-      ))?,
-    })
+    pinned_where_it_stands(open_dir_no_follow(
+      &cookie_dir(root, dir).join(cookie_dir_name()),
+    ))
   }
   #[cfg(not(all(any(target_os = "linux", target_os = "macos"), not(miri))))]
   {
@@ -7663,11 +7733,18 @@ fn reserved_cookie_dir_identity(root: &Path, dir: &Path) -> Result<AdmittedDir, 
 /// The open refuses a symlink at the last component, exactly as
 /// [`open_root_object`] does — the door and the write must be holding the same
 /// kind of thing or the lifetime proves nothing about what the write reached.
+///
+/// No landing is read here, and the absence is the point: the root is the FLOOR
+/// every ground verdict is taken against, not a directory measured against one. A
+/// root that is no longer where the scope recorded it is answered by the
+/// containment gate the caller's own spelling already meets, and by the identity
+/// this pin keeps alive.
 fn watched_root_identity(root: &Path) -> Result<AdmittedDir, std::io::Error> {
   #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
   {
     Ok(AdmittedDir {
       pin: definite_pin(open_dir_no_follow(root))?,
+      landing: None,
     })
   }
   #[cfg(not(all(any(target_os = "linux", target_os = "macos"), not(miri))))]
@@ -7688,6 +7765,38 @@ fn watched_root_identity(root: &Path) -> Result<AdmittedDir, std::io::Error> {
 /// one; what each absence MEANS is stated at the sampler that produced it
 /// ([`watched_root_identity`], [`cookie_target_identity`],
 /// [`reserved_cookie_dir_identity`]).
+///
+/// # Sameness is not coverage: three facts, and none of them enough alone
+///
+/// A pin proves the write reached the SAME OBJECT the cut was taken over. It does
+/// not prove that object stood anywhere a queue of this scope reads, and it
+/// travels with the object through a move — which is the whole of the hole an
+/// identity-only acceptance left open. The shape: a subtree prepared under
+/// never-armed ground (pruned, or excluded), reached through an in-root symlink so
+/// the caller's spelling clears every lexical test; the door pins the target and
+/// the reserved cookie directory standing in it; after the cut a peer moves that
+/// same subtree into reportable ground and repoints the link. Every identity
+/// matches, every write-time ground verdict passes, the EEXIST arm owes no
+/// sole-entry proof because the directory was not minted — and the marker lands
+/// beside descendants no queue of this scope ever carried, which the move-in's own
+/// cold enumeration may deliver AFTER it.
+///
+/// So three separate facts stand between an admission and a certificate, and the
+/// ordering rests on all three:
+///
+/// - the PINS say the objects the write reached are the objects the cut was taken
+///   over;
+/// - the LANDINGS say those objects stood in reportable ground WHEN the cut was
+///   taken — read off the pins themselves on the pool, judged at the admission
+///   against the same rule the write uses ([`cookie_ground_refusal`]) before the
+///   coverage fence is ever opened;
+/// - the write's own verdict says they still do, at the moment the marker is
+///   created.
+///
+/// Covered at the cut and covered at the write is what makes the middle safe: a
+/// move between two covered places is itself an event this scope reports, so
+/// everything under the object has been carried by a queue of this scope or by the
+/// crawl that armed it. Any one of the three alone certifies nothing.
 ///
 /// # Three readings, taken one at a time
 ///
@@ -7910,6 +8019,19 @@ impl AdmittedDirs {
   /// The reserved cookie directory, when one already stood at that name.
   pub(crate) fn cookies(&self) -> Option<RootIdentity> {
     self.cookies.identity()
+  }
+
+  /// WHERE the sync's target directory stood when the door pinned it, as its own
+  /// descriptor answered. `None` where nothing was pinned, or where the platform
+  /// holds tuples rather than objects.
+  pub(crate) fn target_landing(&self) -> Option<&Path> {
+    self.target.landing()
+  }
+
+  /// WHERE the reserved cookie directory stood when the door pinned it — the
+  /// ground the marker's own create would have come off at the cut.
+  pub(crate) fn cookies_landing(&self) -> Option<&Path> {
+    self.cookies.landing()
   }
 }
 
@@ -8243,6 +8365,66 @@ fn cookie_ground_refusal(
     return Some(CookieWriteError::pruned(dir.to_path_buf(), pattern));
   }
   None
+}
+
+/// THE verdict on where the door's PINNED objects stood when the coverage cut was
+/// taken: the same three questions [`cookie_ground_refusal`] asks of the write,
+/// asked at admission of the locations the door read off the pins themselves
+/// ([`AdmittedDirs`]).
+///
+/// It is the fact the pins cannot supply. An identity travels with its object, so
+/// a target and a reserved cookie directory prepared under never-armed ground and
+/// moved into reportable ground after the cut satisfy every comparison the write
+/// takes — while the entries beneath them were never carried by any queue of this
+/// scope, and the enumeration the move-in triggers may order the marker's own
+/// create ahead of them. Covered at the cut AND covered at the write is what rules
+/// that out, and this is the first half.
+///
+/// The floor is the LIVE root's recorded canonical path, which is the form a
+/// landing comes in — both are answers the OS gave about resolved objects — so the
+/// containment test compares two names from one resolution scheme, exactly as the
+/// write's own does against its verified-root descriptor.
+///
+/// Purely LEXICAL: prefix tests and glob matches over paths already read, so it
+/// runs on the driver's owner loop without resolving a single pathname. The reads
+/// were paid on the blocking pool, beside the pins.
+///
+/// The reply names the LANDING rather than the caller's spelling, because the
+/// landing is where the caller's directory actually is — the same choice the
+/// write's own refusals make, and the only one a caller can act on when an
+/// intermediate symlink is what made the two differ.
+fn admitted_ground_refusal(
+  root: &Path,
+  admitted: &AdmittedDirs,
+  prune: &Globs,
+  exclusions: &[PathBuf],
+) -> Option<crate::error::SyncRootError> {
+  // The target first and the reserved directory second, in the order the write
+  // descends and asks: the shallower ground is the one a caller moves off.
+  [admitted.target_landing(), admitted.cookies_landing()]
+    .into_iter()
+    .flatten()
+    .find_map(|landing| {
+      let refusal = cookie_ground_refusal(root, landing, prune, exclusions)?;
+      Some(if let Some(excluded) = refusal.excluded {
+        let ExcludedCookieDir { dir, exclusion } = *excluded;
+        crate::error::SyncRootError::DirExcluded { dir, exclusion }
+      } else if let Some(pruned) = refusal.pruned {
+        let PrunedCookieDir { dir, pattern } = *pruned;
+        crate::error::SyncRootError::DirPruned { dir, pattern }
+      } else {
+        // The containment refusal, which the shared rule states as a bare clean
+        // failure because a write has no typed variant to hand back for it. The
+        // admission does: a pinned object standing outside the floor is the same
+        // fact the caller's own spelling is refused for, so it is answered in the
+        // same words — with the landing as the directory, since that is where the
+        // object it named actually is.
+        crate::error::SyncRootError::DirOutsideRoot {
+          dir: landing.to_path_buf(),
+          root: root.to_path_buf(),
+        }
+      })
+    })
 }
 
 /// Where this write's marker directory WILL stand, on the platforms whose cookie
@@ -11740,6 +11922,27 @@ pub(crate) async fn run<R, F>(
                   dir,
                   exclusion,
                 }));
+              } else if let Some(refusal) = admitted_ground_refusal(
+                &root,
+                &admitted,
+                &core.scope_prune(scope),
+                &config.exclusions,
+              ) {
+                // Every check above judged the caller's SPELLING, which is not a
+                // location. This judges where the door's pinned objects actually
+                // stood when it took them — read off the pins on the pool, so
+                // nothing here resolves a pathname — against the same ground rule
+                // the write applies at the create. A subtree prepared under
+                // never-armed ground and reached through an in-root symlink clears
+                // every lexical test there is, and the pins that follow it into
+                // reportable ground after the cut would then certify an ordering
+                // for entries no queue of this scope ever carried
+                // ([`admitted_ground_refusal`]).
+                //
+                // Before the single-flight gate and before the fence, so a refused
+                // sync is a sync that mints nothing at all: no obligation, no
+                // coverage window, no gate for the next caller to trip over.
+                let _ = reply.send(Err(refusal));
               } else if cookies.has_pending_write(scope) {
                 // Single-flight per scope: refuse a second sync while one for
                 // this scope is anywhere in the pipeline — still PARKED on its
