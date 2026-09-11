@@ -52,9 +52,18 @@ pub use driver::SmolTributaries;
 /// Only the two fs-binding types surface here (with the default `fs` feature):
 /// [`RootHandle`] is the [`FsSource`] armed-root token ([`Source::Handle`]), and
 /// [`WatcherOptions`] configures the underlying filesystem watcher it drives.
+///
+/// [`Backend`] and [`BackendKind`] ride beside them because A KNOB'S TYPE HAS TO
+/// BE NAMEABLE BY WHOEVER NAMES THE HOUSEHOLD: [`WatcherOptions::backend`] is a
+/// `Backend`, so a consumer that reaches this crate for the household and not for
+/// the fs binding under it — a configuration layer holding a [`WatcherOptions`],
+/// anything restating its knobs — had no path to that field's type at all, and
+/// could not spell the value for a setter this crate already gives it. The two
+/// are one question and its RESOLVED answer: `Backend` is what a deployment ASKS
+/// for (`Auto` included) and `BackendKind` is what a watcher actually armed.
 #[cfg(feature = "fs")]
 #[cfg_attr(docsrs, doc(cfg(feature = "fs")))]
-pub use tributary_fs::{RootHandle, WatcherOptions};
+pub use tributary_fs::{Backend, BackendKind, RootHandle, WatcherOptions};
 
 /// The identity/coordinate primitives — change id, epoch, location — and the glob
 /// vocabulary the per-root seats ([`RootGlobs`]) are spelled in are owned by
