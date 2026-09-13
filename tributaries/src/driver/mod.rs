@@ -57,7 +57,7 @@ use crate::{
   interest::Interest,
   options::{Debounce, DebounceConfig, OptionsError, RootGlobs, TributariesOptions, WatchOptions},
   route::{ReservedEndpoints, RoutableEvent},
-  source::{Armed, LocalSource, Source, SourceEvent, SyncOutcome, SyncToken},
+  source::{Armed, Begun, LocalSource, Source, SourceEvent, SyncOutcome, SyncToken},
   subscription::Subscription,
   subsume::{Salvage, Subsumer, UnwatchOutcome, WatchOutcome},
   view::WatchView,
@@ -986,6 +986,31 @@ where
   /// wait. The owner reaps the abandoned cookie, whose events are suppressed
   /// by the reserved namespace regardless.
   ///
+  /// # A barrier certifies delivery only within one coverage epoch
+  ///
+  /// A barrier certifies delivery only within one coverage epoch; any change to the
+  /// root's coverage on the barrier's ground while it is in flight resolves it as
+  /// dominated by a rescan. A watch armed or dropped beneath the marker's ground, a
+  /// cover shrunk over it, a root replaced or overflowed: each is a coverage
+  /// transition, each stands a located
+  /// [`Rescan`](crate::EventKind::Rescan), and a barrier whose ground one of them
+  /// touches is retired by it — [`Dominated`](SyncOutcome::Dominated) — rather than
+  /// certified past it.
+  ///
+  /// It is not a refusal and never costs the caller a round trip. A transition that
+  /// arrives before the marker is installed answers this call at once; one that arrives
+  /// while the barrier waits on its marker is resolved by the located `Rescan` at once
+  /// too, never at the timeout. Either way the obligation is the one
+  /// `Dominated` always carries: re-read the ground the `Rescan` names. A busy tree
+  /// whose watch set is stable dominates nothing, and a transition deep in the tree
+  /// dominates only barriers standing on that ground.
+  ///
+  /// The rule bites where the kernel gives per-directory watch lifecycle — Linux's
+  /// inotify. On a kernel-recursive backend (FSEvents, fanotify,
+  /// `ReadDirectoryChangesW`, the USN journal) one whole-subtree stream holds the only
+  /// watch there is, so no transition below the root exists to raise, and the barrier
+  /// rests on the held descriptors described under Platform notes instead.
+  ///
   /// # The cookie nonce costs this call nothing
   ///
   /// The unpredictable field of the cookie's name is one word out of a ChaCha20
@@ -1034,26 +1059,46 @@ where
   /// than resolving or reporting a definite refusal. Tracked as
   /// <https://github.com/al8n/tributaries/issues/134>.
   ///
-  /// On Linux and macOS, the ordering certificate this barrier returns assumes
-  /// that no process running with the watcher's OWN uid rewrites, between this
-  /// call's admission and the observation of its marker, either the ancestry
-  /// chain from the watched root to the sync target (renaming or replacing a
-  /// component, aliasing it through a same-superblock bind mount, or moving
-  /// the pinned objects across pruned, excluded or mount-frame boundaries) or
-  /// the reserved cookie directory's entries (renaming, hard-linking or
-  /// replacing the marker, or planting entries beside it). The watcher pins
-  /// the admitted objects with held descriptors, re-verifies identity, mount
-  /// frame and ground at the write, proves a minted directory holds only its
-  /// marker, and decides every cleanup terminal by the pinned object's link
-  /// count; the reserved directory's owner-only mode is the boundary the
-  /// watcher enforces, and owner and mode are verified on every open. On
-  /// macOS an inheritable ACL on an ancestor that grants other users write
-  /// rights is inherited by the reserved directory and extends the trusted
-  /// set by the tree owner's own configuration — the watcher does not inspect
-  /// ACLs. What remains outside the contract is an adversary holding the
-  /// watcher's own credentials, which can always win one more race against a
-  /// pathname-based filesystem API — this barrier is not a security boundary
-  /// against its own uid. Tracked as
+  /// On Linux and macOS the ordering certificate this barrier returns rests on
+  /// the coverage epoch above: a change to the root's coverage on the barrier's
+  /// ground while it is in flight retires the barrier, dominated by the located
+  /// `Rescan` that change stands, rather than certifying past it. Where the
+  /// kernel gives per-directory watch lifecycle (inotify) that rule carries the
+  /// substitutions this note once fenced by hand: arming a watch drops the
+  /// incumbent before it arms the arrival, so every same-name substitution on the
+  /// chain from the watched root down to the marker's landing is itself a
+  /// watch-lifecycle transition and retires the barriers standing on it. On a
+  /// kernel-recursive backend (FSEvents, fanotify) there are no per-directory
+  /// watches to transition, so the certificate rests where it always did — on the
+  /// descriptors the watcher pins for the sync target and the reserved cookie
+  /// directory for the sync's duration. The assumption below is the same one this
+  /// note always stated; it does not widen.
+  ///
+  /// Identity, mount frame and landing are re-verified at the write on every
+  /// backend, a minted reserved directory is proved to hold only its marker, every
+  /// cleanup terminal is decided by the pinned object's link count, and the
+  /// reserved directory's owner-only mode is re-read off the descriptor on every
+  /// open. Those verdicts are the belt UNDER the rule rather than a substitute for
+  /// it: an inode number is reusable, so an identity comparison alone cannot
+  /// separate the admitted object from a replacement that received its number
+  /// back. On a descending backend a barrier parked on the coverage-settle fence
+  /// holds no descriptor on the objects it was admitted against — the door samples
+  /// them and releases — so what it carries into the write is a REMEMBERED tuple,
+  /// and a replacement reusing the admitted inode inside that parked window is no
+  /// longer refused as a replaced directory. Where such a reuse is a
+  /// watch-lifecycle event the epoch retires the barrier instead; where it is not,
+  /// it is the same-uid residual this note already names.
+  ///
+  /// What remains outside the contract is therefore a process running with the
+  /// watcher's OWN uid acting BEHIND coverage that never transitions: renaming,
+  /// hard-linking or replacing the marker, or planting entries beside it, inside a
+  /// directory that stays armed throughout, between the write and the observation
+  /// of the marker. An adversary holding the watcher's own credentials can always
+  /// win one more race against a pathname-based filesystem API. On macOS an
+  /// inheritable ACL on an ancestor that grants other users write rights is
+  /// inherited by the reserved directory and extends the trusted set by the tree
+  /// owner's own configuration — the watcher does not inspect ACLs. This barrier
+  /// is not a security boundary against its own uid. Tracked as
   /// <https://github.com/al8n/tributaries/issues/135>, companion of
   /// <https://github.com/al8n/tributaries/issues/134>.
   pub async fn sync(
@@ -2666,8 +2711,10 @@ enum SyncStep<C> {
   Close(CloseReply),
   /// The caller dropped its `sync()` wait (timed out or cancelled), or every handle went away.
   Canceled,
-  /// The cookie write finished: the cookie's canonical key to park a [`PendingSync`] on, or the error.
-  Began(Result<Vec<C>, SyncError>),
+  /// The cookie write finished: the [`Begun`] the source answered — a cookie key to park a
+  /// [`PendingSync`] on, or a barrier a coverage transition retired before it could be
+  /// installed — or the error.
+  Began(Result<Begun<C>, SyncError>),
 }
 
 /// [`Owner::reconcile_watch`]'s early exit. The in-place widen's retarget
@@ -7111,8 +7158,24 @@ where
         self.abandon_sync(root, token);
         SyncAdmit::Done
       }
-      SyncStep::Began(Ok(cookie_key)) => {
+      SyncStep::Began(Ok(Begun::Installed(cookie_key))) => {
         self.admit_begun_cookie(cookie_key, sub, root, loss_gen_at_call, reply);
+        SyncAdmit::Done
+      }
+      // A coverage transition on the barrier's ground retired it before it was installed: the
+      // source stood the covering `Rescan` the terminal promises, which is exactly
+      // [`SyncOutcome::Dominated`]'s public contract, so the caller is answered HERE and the
+      // barrier is over. Not [`SyncError::Busy`]: the caller's barrier is already met by the
+      // re-enumeration instruction on its stream, and telling it to retry would livelock it
+      // against a tree churning faster than one round trip.
+      //
+      // Nothing is owed the source either. No marker exists to reap — that is what makes this a
+      // PRE-install retirement — and the write returned NORMALLY, so the by-name
+      // [`Source::cancel_sync`] the abandon arms issue would name a sync that has already
+      // resolved. No [`PendingSync`] is parked, so the loop-top prune has nothing of this
+      // barrier to reap either: the record that would have carried it was never created.
+      SyncStep::Began(Ok(Begun::Dominated)) => {
+        let _ = reply.send(Ok(SyncOutcome::Dominated));
         SyncAdmit::Done
       }
       SyncStep::Began(Err(err)) => {
@@ -7122,8 +7185,8 @@ where
     }
   }
 
-  /// Admits a COMPLETED cookie write (its `begin_sync` returned `Ok`): reaps it inline when the caller
-  /// has ALREADY gone, otherwise parks the [`PendingSync`].
+  /// Admits a COMPLETED cookie write (its `begin_sync` answered [`Begun::Installed`]): reaps it
+  /// inline when the caller has ALREADY gone, otherwise parks the [`PendingSync`].
   ///
   /// The reap path is why the write is polled first in [`on_sync`](Self::on_sync)'s race: the fs driver
   /// may buffer a successful `Ok(path)` reply just as the caller's deadline fires, and taking that ready

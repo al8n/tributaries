@@ -40,9 +40,9 @@ use agnostic_lite::{RuntimeLite, tokio::TokioRuntime};
 use futures_util::FutureExt;
 use tempfile::TempDir;
 use tributaries::{
-  Armed, DebounceConfig, Epoch, Event, EventKind, FaultKind, Glob, RootGlobs, Source, SourceEvent,
-  SourceFault, Subscription, SyncError, SyncToken, Tributaries, TributariesOptions, WatchError,
-  WatchOptions, WatchView,
+  Armed, Begun, DebounceConfig, Epoch, Event, EventKind, FaultKind, Glob, RootGlobs, Source,
+  SourceEvent, SourceFault, Subscription, SyncError, SyncToken, Tributaries, TributariesOptions,
+  WatchError, WatchOptions, WatchView,
 };
 // The fs types come from the `tributary-fs` DEV-dependency, not the umbrella: this
 // suite is the custom-source proof, compiled and run with the umbrella's `fs` feature
@@ -130,6 +130,33 @@ fn fs_fault(err: WatchRootError) -> WatchError {
     _ => FaultKind::Other,
   };
   WatchError::source(SourceFault::new(kind).with_source(err))
+}
+
+/// Maps a refused `sync_root` into the umbrella's neutral barrier vocabulary at this binding —
+/// the sync half of [`fs_fault`], and the fixture's mirror of the product binding's own
+/// `sync_error_from_fs`. Honest and conservative: a refusal this source cannot classify degrades
+/// to a write failure rather than to a silent success.
+///
+/// [`SyncRootError::Dominated`] is the one arm that is NOT an error. A coverage transition on the
+/// barrier's ground retired it before the marker could be installed, and the retirement stood the
+/// covering `Rescan` for the ground this sync named — which is exactly what
+/// `SyncOutcome::Dominated` promises a caller, so it is carried as the OUTCOME and the caller
+/// is resolved at once. Reported as a transient refusal instead it would tell a caller whose
+/// barrier is already met to retry, and a tree churning faster than one round trip would livelock
+/// it.
+fn begun_from_denial(error: SyncRootError) -> Result<Begun<Comp>, SyncError> {
+  Err(match error {
+    SyncRootError::Dominated => return Ok(Begun::Dominated),
+    SyncRootError::UnknownRoot | SyncRootError::Retired => SyncError::Retired,
+    SyncRootError::DirOutsideRoot { .. } | SyncRootError::DirUncovered { .. } => {
+      SyncError::CookieDirUncovered
+    }
+    // No physical write happened and both are retryable, so they are the dedicated
+    // transient refusal rather than a write failure a caller might read as terminal.
+    SyncRootError::WriteInFlight | SyncRootError::CleanupBacklog => SyncError::Busy,
+    SyncRootError::Closed => SyncError::Closed,
+    _ => SyncError::CookieWrite(SourceFault::new(FaultKind::Other)),
+  })
 }
 
 impl<R: RuntimeLite> IndexerSource<R> {
@@ -410,12 +437,16 @@ impl<R: RuntimeLite> Source<Comp> for IndexerSource<R> {
   /// `[Volume(v), Seg(<cookie dir>), Seg(<marker leaf>)]`, and
   /// [`is_sync_artifact`](Source::is_sync_artifact) below answers `true` for it — without that the
   /// umbrella would never classify the marker's event and the barrier could not resolve at all.
+  ///
+  /// A refusal is classified by [`begun_from_denial`], standalone for the reason the product
+  /// binding's own map is: the classification IS the contract, so it is asserted directly
+  /// rather than through a barrier that has to be provoked.
   async fn begin_sync(
     &mut self,
     handle: RootHandle,
     dir_key: &[Comp],
     token: SyncToken,
-  ) -> Result<Vec<Comp>, SyncError> {
+  ) -> Result<Begun<Comp>, SyncError> {
     let Some(dir) = self.key_to_path(dir_key) else {
       return Err(SyncError::CookieDirUncovered);
     };
@@ -438,22 +469,9 @@ impl<R: RuntimeLite> Source<Comp> for IndexerSource<R> {
         let landed = self
           .path_to_key(&path)
           .ok_or(SyncError::CookieDirUncovered)?;
-        Ok(self.report_landing(landed))
+        Ok(Begun::Installed(self.report_landing(landed)))
       }
-      // The fs-to-neutral map at this binding, the sync half of `fs_fault`: honest and
-      // conservative, with a refusal this source cannot classify degrading to a write failure
-      // rather than to a silent success.
-      Err(SyncRootDenied { error, .. }) => Err(match error {
-        SyncRootError::UnknownRoot | SyncRootError::Retired => SyncError::Retired,
-        SyncRootError::DirOutsideRoot { .. } | SyncRootError::DirUncovered { .. } => {
-          SyncError::CookieDirUncovered
-        }
-        // No physical write happened and both are retryable, so they are the dedicated
-        // transient refusal rather than a write failure a caller might read as terminal.
-        SyncRootError::WriteInFlight | SyncRootError::CleanupBacklog => SyncError::Busy,
-        SyncRootError::Closed => SyncError::Closed,
-        _ => SyncError::CookieWrite(SourceFault::new(FaultKind::Other)),
-      }),
+      Err(SyncRootDenied { error, .. }) => begun_from_denial(error),
     }
   }
 
@@ -1536,6 +1554,53 @@ async fn sync_barrier_resolves_when_the_reported_landing_is_stale() {
   );
 
   w.close().await.expect("close");
+}
+
+/// (j.4) A coverage transition that retires a barrier before its marker is installed is carried
+/// by this binding as the OUTCOME, never as a refusal — the mapping the product binding makes,
+/// mirrored here because a downstream source has to make it for itself.
+///
+/// `sync_root` answers `SyncRootError::Dominated` after standing the covering `Rescan` for the
+/// obligation's own ground, which is exactly what `SyncOutcome::Dominated` promises the caller:
+/// re-read that ground. A binding reporting it as a refusal instead breaks the promise in one of
+/// two ways — as a write failure the caller reads as terminal over a filesystem that did nothing
+/// wrong, or as the retryable `Busy` its neighbours carry, which tells a caller whose barrier is
+/// ALREADY met to ask again and livelocks it against a tree churning faster than one round trip.
+///
+/// The neighbours are asserted beside it because the arm is only meaningful as a distinction:
+/// `WriteInFlight` and `CleanupBacklog` really are transient and really do mean "ask again",
+/// and a classifier that folded all three together would pass an assertion on `Dominated` alone.
+///
+/// FAIL-ON-REVERT: drop the `Dominated` arm from [`begun_from_denial`] and the wildcard takes it
+/// — the first assertion then sees an `Err(CookieWrite)`.
+#[test]
+fn a_dominated_barrier_is_carried_as_an_outcome_not_as_a_refusal() {
+  assert!(
+    matches!(begun_from_denial(SyncRootError::Dominated), Ok(begun) if begun.is_dominated()),
+    "a barrier a coverage transition retired is MET by the covering `Rescan` the retirement \
+     stood, so it is the outcome the umbrella resolves the caller with"
+  );
+  assert!(
+    matches!(
+      begun_from_denial(SyncRootError::WriteInFlight),
+      Err(SyncError::Busy)
+    ),
+    "a write already in flight is the transient refusal it always was"
+  );
+  assert!(
+    matches!(
+      begun_from_denial(SyncRootError::CleanupBacklog),
+      Err(SyncError::Busy)
+    ),
+    "a cookie-cleanup backlog is the transient refusal it always was"
+  );
+  assert!(
+    matches!(
+      begun_from_denial(SyncRootError::Retired),
+      Err(SyncError::Retired)
+    ),
+    "a dead root is a terminal, and nothing about domination reclassifies it"
+  );
 }
 
 /// (k.1) The `prune` seat over this custom binding: the words a subscription carries reach

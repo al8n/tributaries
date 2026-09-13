@@ -340,7 +340,10 @@ impl SyncRootDenied {
   /// what re-reads the directory that now stands at the name),
   /// `DirCrossesMount` (the same shape again, taken on the descriptors the write's
   /// own descent holds), `Retired` (a
-  /// post-admission terminal), and `Closed`.
+  /// post-admission terminal), `Dominated` (the obligation was admitted and then
+  /// retired by a coverage transition on its ground, so the sequence is spent —
+  /// and re-minting is what takes a fresh cut over the ground the covering
+  /// `Rescan` names), and `Closed`.
   pub(crate) fn classify(error: SyncRootError, admission: SyncAdmission) -> Self {
     let admission = if matches!(
       error,
@@ -394,12 +397,13 @@ pub enum RequestOutcome {
 /// [`Degraded`](Self::Degraded)) are constructed only by that settlement, so
 /// no code path can resolve them early.
 ///
-/// Whatever the outcome, the cover the watcher APPLIED is the requested one widened
-/// by the target directory of every sync of that root that has not yet retired — a
-/// coverage superset that keeps an admitted marker observable, and its removal
-/// provable, for as long as the obligation lives, and that lasts only until the next
-/// reconcile (see [`Watcher::set_cover`]). No variant here reports it: a superset
-/// loses nothing a caller could act on.
+/// Whatever the outcome, the cover the watcher APPLIED is the cover that was
+/// requested. A cover change DOMINATES the barriers in flight it touches: those
+/// [`sync_root`](Watcher::sync_root) obligations are retired, each with the
+/// located `Rescan` its terminal promises, rather than the narrowing being held
+/// back for them — and a shrink touches every barrier on the root, for the reason
+/// [`Watcher::set_cover`] gives. No variant here reports it — the barrier's own
+/// caller is the one told, on its own reply or its own stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CoverOutcome {
@@ -412,7 +416,11 @@ pub enum CoverOutcome {
   /// The reconcile settled, but coverage loss was signaled since the root's
   /// last settled window (a failed re-arm, an unreadable re-arm read, an
   /// overflow, an unclassifiable directory entry the root does not yet cover,
-  /// or the root tearing down mid-fence) — the loss memory is
+  /// the root tearing down mid-fence, OR a shrink that DOMINATES a barrier
+  /// [`sync_root`](Watcher::sync_root) currently has in flight on the pruned
+  /// ground — the retirement stands its covering `Rescan` INSIDE this
+  /// reconcile's own settle window, and a `Rescan` in the window is exactly
+  /// the loss this outcome reports) — the loss memory is
   /// per-root, so a loss landing just BEFORE the reconcile degrades it too:
   /// coverage may be partial, and a covering
   /// [`Rescan`](crate::EventKind::Rescan) dominating the gap has been
@@ -1062,12 +1070,15 @@ pub struct Watcher<R> {
   nonces: Option<Arc<Mutex<ChaCha20Rng>>>,
   /// The bound on the descriptors the sync door may be HOLDING at once
   /// ([`SyncPinAllowance`](crate::driver::SyncPinAllowance), sized by
-  /// [`MAX_SYNC_SAMPLINGS`](crate::driver::MAX_SYNC_SAMPLINGS)). Every
-  /// [`sync_root`](Self::sync_root) takes a slot of it before it opens the pins
-  /// its admission is judged on, and the slot travels with those pins, so a
-  /// caller that polls a flood of syncs together waits at this door instead of
-  /// exhausting the process's descriptor table on the way to one that counts
-  /// them.
+  /// [`sync_door_allowance`](crate::driver::DriverConfig::sync_door_allowance)).
+  /// Every [`sync_root`](Self::sync_root) takes a slot of it before it opens
+  /// the pins its admission is judged on, so a caller that polls a flood of
+  /// syncs together waits at this door instead of exhausting the process's
+  /// descriptor table on the way to one that counts them. The slot's own
+  /// lifetime past that point is profile-split: on a descending profile it
+  /// comes back the moment admission finishes sampling, before the pins reach
+  /// a claim; on a kernel-recursive profile it travels with the pins all the
+  /// way to the claim.
   ///
   /// Shared across clones of one watcher, like the mint above: the bound belongs
   /// to the watcher, not to a handle.
@@ -1140,18 +1151,17 @@ impl<R: RuntimeLite> Watcher<R> {
     ops: impl crate::driver::FsOps,
   ) -> Result<Self, BuildError> {
     let (command_tx, command_rx) = async_channel::bounded(16);
-    // The sync door's descriptor bound. Sized by the SAMPLING ceiling, not by the
-    // ledger cap: one permit authorizes three descriptors, so the record cap read
-    // as a descriptor bound is three times too wide (see
-    // [`MAX_SYNC_SAMPLINGS`](crate::driver::MAX_SYNC_SAMPLINGS)). A cookie cap
-    // BELOW the ceiling still governs — a watcher that may hold ten records has no
-    // use for thirty-two doors — so the allowance is the smaller of the two. Read
-    // before the config is handed to the task, which owns it from there on.
-    let pins = crate::driver::SyncPinAllowance::new(
-      config
-        .cookie_global_cap
-        .min(crate::driver::MAX_SYNC_SAMPLINGS),
-    );
+    // The sync door's descriptor bound, made explicit per platform rather than
+    // derived from the record cap: what the door bounds is DESCRIPTORS, one
+    // permit authorizes four of them, and the budget for those is 256 on macOS
+    // against 1024 elsewhere. `min(cap, 8)` there and `min(cap, 32)` here — the
+    // cap still floors it, because a watcher that may hold ten records has no use
+    // for thirty-two doors. The arithmetic both numbers come out of is on
+    // [`DriverConfig::sync_door_allowance`]. Read before the config is handed to
+    // the task, which owns it from there on.
+    let pins = crate::driver::SyncPinAllowance::new(DriverConfig::sync_door_allowance(
+      config.cookie_global_cap,
+    ));
     // The cookie-cleanup ingress: ONE ledger, minted HERE and shared between this
     // handle and the driver task below, because a public cleanup request must
     // address the very records that driver admits. Its two halves are created
@@ -1251,7 +1261,7 @@ fn driver_config(options: &WatcherOptions, profile: crate::os::BackendKind) -> D
     cookie_retry_cap: DriverConfig::DEFAULT_COOKIE_RETRY_CAP,
     cookie_retry_budget: DriverConfig::DEFAULT_COOKIE_RETRY_BUDGET,
     cookie_backlog_cap: DriverConfig::DEFAULT_COOKIE_BACKLOG_CAP,
-    cookie_global_cap: DriverConfig::DEFAULT_COOKIE_GLOBAL_CAP,
+    cookie_global_cap: options.cookie_global_cap().get(),
   }
 }
 
@@ -1929,6 +1939,29 @@ impl<R> Watcher<R> {
   /// writes: the loss already stood a covering `Rescan` ahead of the cookie,
   /// so the barrier holds by domination.
   ///
+  /// # A barrier certifies delivery only within one coverage epoch
+  ///
+  /// A barrier certifies delivery only within one coverage epoch; any change to
+  /// this root's coverage on the barrier's ground while it is in flight resolves
+  /// it as dominated by a rescan. A child watch armed or dropped beneath the
+  /// marker's ground, a [`set_cover`](Self::set_cover) shrunk over it, a root
+  /// replaced, a trust or overflow verdict on the whole scope: each is a coverage
+  /// transition, each stands a located [`Rescan`](crate::EventKind::Rescan), and a
+  /// barrier whose ground one of them touches is retired by it rather than
+  /// certified past it. A barrier is never retired silently — the covering
+  /// `Rescan` is on the stream before the terminal is answered.
+  ///
+  /// Reaching THIS call, that is [`Dominated`](SyncRootError::Dominated): the
+  /// obligation was retired before its reply was sent. A transition that lands
+  /// after the marker exists is answered on the root's stream instead — the
+  /// located `Rescan` dominating the gap — and this call still returns the path it
+  /// wrote.
+  ///
+  /// The rule bites where the kernel gives per-directory watch lifecycle
+  /// (inotify). On a kernel-recursive backend the root's single whole-subtree
+  /// stream is the only watch there is, so only the root-wide transitions can fire
+  /// and the certificate rests on the pinned descriptors above.
+  ///
   /// Reap the cookie with [`request_remove_cookie`](Self::request_remove_cookie)
   /// once it has been observed, or cancel/reap it incarnation-precisely with
   /// [`request_cancel_sync`](Self::request_cancel_sync) through the paired
@@ -1989,7 +2022,12 @@ impl<R> Watcher<R> {
   /// already holds this admission's sequence;
   /// [`CleanupBacklog`](SyncRootError::CleanupBacklog) when the root's cookie
   /// cleanup backlog cap is reached; [`Retired`](SyncRootError::Retired) when the
-  /// root died while the write was parked; [`Closed`](SyncRootError::Closed) once
+  /// root died while the write was parked;
+  /// [`Dominated`](SyncRootError::Dominated) when a coverage transition on the
+  /// barrier's ground retired it before this reply was sent — the covering
+  /// `Rescan` is on the root's stream, so this is a barrier MET by re-enumeration
+  /// rather than a failed write, and re-reading that ground is what a caller owes
+  /// it (never an immediate retry); [`Closed`](SyncRootError::Closed) once
   /// the watcher is closed. [`BadCookieName`](SyncRootError::BadCookieName) and
   /// [`NameInUse`](SyncRootError::NameInUse) are not reachable from here — the leaf
   /// is minted, so it is a single normal component by construction and unique to
@@ -2001,6 +2039,7 @@ impl<R> Watcher<R> {
   /// [`DirReplaced`](SyncRootError::DirReplaced),
   /// [`DirCrossesMount`](SyncRootError::DirCrossesMount),
   /// [`Retired`](SyncRootError::Retired),
+  /// [`Dominated`](SyncRootError::Dominated),
   /// and [`Closed`](SyncRootError::Closed), whose sequence is spent — re-mint to
   /// retry those.
   ///
@@ -2039,24 +2078,45 @@ impl<R> Watcher<R> {
   /// reporting a definite refusal. Tracked as
   /// <https://github.com/al8n/tributaries/issues/134>.
   ///
-  /// On Linux and macOS, the ordering certificate this call returns assumes that no
-  /// process running with the watcher's OWN uid rewrites, between this call's
-  /// admission and the observation of its marker, either the ancestry chain from
-  /// `root` to the sync target (renaming or replacing a component, aliasing it
-  /// through a same-superblock bind mount, or moving the pinned objects across
-  /// pruned, excluded or mount-frame boundaries) or the reserved cookie directory's
-  /// entries (renaming, hard-linking or replacing the marker, or planting entries
-  /// beside it). The pinned objects are held by descriptor, identity and mount frame
-  /// are re-verified at the write, a minted directory is proved to hold only its
-  /// marker, and every cleanup is decided terminal by the pinned object's link
-  /// count; the reserved directory's owner-only mode is the boundary the watcher
-  /// enforces, and owner and mode are verified on every open. On macOS an
+  /// On Linux and macOS the ordering certificate this call returns rests on the
+  /// coverage epoch above: a change to this root's coverage on the barrier's ground
+  /// while it is in flight retires the barrier, dominated by the located `Rescan`
+  /// that change stands, rather than certifying past it. Where the kernel gives
+  /// per-directory watch lifecycle (inotify) that rule carries the substitutions
+  /// this note once fenced by hand: arming a watch drops the incumbent before it
+  /// arms the arrival, so every same-name substitution on the chain from `root`
+  /// down to the marker's landing is itself a watch-lifecycle transition and
+  /// retires the barriers standing on it. On a kernel-recursive backend (FSEvents,
+  /// fanotify) there are no per-directory watches to transition, so the certificate
+  /// rests where it always did — on the descriptors this call pins for `dir` and
+  /// the reserved cookie directory for the sync's duration. The assumption below is
+  /// the same one this note always stated; it does not widen.
+  ///
+  /// Identity, mount frame and landing are re-verified at the write on every
+  /// backend, a minted reserved directory is proved to hold only its marker, every
+  /// cleanup terminal is decided by the pinned object's link count, and the
+  /// reserved directory's owner-only mode is re-read off the descriptor on every
+  /// open. Those verdicts are the belt UNDER the rule rather than a substitute for
+  /// it: an inode number is reusable, so an identity comparison alone cannot
+  /// separate the admitted object from a replacement that received its number back.
+  /// On a descending backend a barrier parked on the coverage-settle fence holds no
+  /// descriptor on the objects it was admitted against — the door samples them and
+  /// releases — so what it carries into the write is a REMEMBERED tuple, and a
+  /// replacement reusing the admitted inode inside that parked window is no longer
+  /// refused [`DirReplaced`](SyncRootError::DirReplaced). Where such a reuse is a
+  /// watch-lifecycle event the epoch retires the barrier instead; where it is not,
+  /// it is the same-uid residual this note already names.
+  ///
+  /// What remains outside the contract is therefore a process running with the
+  /// watcher's OWN uid acting BEHIND coverage that never transitions: renaming,
+  /// hard-linking or replacing the marker, or planting entries beside it, inside a
+  /// directory that stays armed throughout, between the write and the observation
+  /// of the marker. An adversary holding the watcher's own credentials can always
+  /// win one more race against a pathname-based filesystem API. On macOS an
   /// inheritable ACL on an ancestor that grants other users write rights is
   /// inherited by the reserved directory and extends the trusted set by the tree
-  /// owner's own configuration — the watcher does not inspect ACLs. What
-  /// remains outside the contract is an adversary holding the watcher's own
-  /// credentials, which can always win one more race against a pathname-based
-  /// filesystem API — this call is not a security boundary against its own uid.
+  /// owner's own configuration — the watcher does not inspect ACLs. This call is
+  /// not a security boundary against its own uid.
   /// Tracked as <https://github.com/al8n/tributaries/issues/135>, companion of
   /// <https://github.com/al8n/tributaries/issues/134>.
   pub async fn sync_root(
@@ -2099,6 +2159,15 @@ impl<R> Watcher<R> {
         admission,
       ));
     };
+    // Which lowering this scope runs: the door's pins are kept only where the
+    // coverage epoch cannot see a replacement ([`AdmittedDirs::held`]). A handle
+    // that named a live root one line above but answers no backend here has just
+    // died; read as kernel-recursive, which is the arm that KEEPS its pins, so an
+    // unreadable profile can only ever hold more than it needs rather than
+    // certify on less.
+    let profile = self
+      .backend_of(root)
+      .unwrap_or(crate::os::BackendKind::FsEvents);
     if !crate::driver::cookie_dir_within_root(&root_path, &dir) {
       return Err(SyncRootDenied::classify(
         SyncRootError::DirOutsideRoot {
@@ -2198,7 +2267,7 @@ impl<R> Watcher<R> {
       // are one thing again, and nothing in this frame is holding a slot the
       // sampling it accounts for has already given up.
       Ok((root_pin, target_pin, cookies_pin)) => {
-        crate::driver::AdmittedDirs::held(permit, root_pin, target_pin, cookies_pin)
+        crate::driver::AdmittedDirs::held(permit, root_pin, target_pin, cookies_pin, profile)
       }
       // A pin this door could not TAKE is not a reading about the tree, and
       // answering it as one is what hid a full descriptor table behind a verdict
@@ -2231,7 +2300,7 @@ impl<R> Watcher<R> {
       .send(Command::SyncRoot {
         scope: root.scope(),
         dir,
-        admitted,
+        admitted: Box::new(admitted),
         name,
         ticket,
         reply,
@@ -2356,24 +2425,27 @@ impl<R> Watcher<R> {
   /// `retained` are the watcher's own canonical coordinates (as
   /// [`root_path`](Self::root_path) reports), so they line up with the watches' addressing.
   ///
-  /// # The applied cover is widened by the syncs still live
+  /// # A cover change dominates every barrier in flight on the pruned ground
   ///
   /// A [`sync_root`](Self::sync_root) that has been admitted holds a promise about ground the
-  /// caller's new cover may no longer name. The watcher therefore applies `retained` **plus
-  /// the target directory of every sync of this root that has not yet retired**, so a shrink
-  /// can never prune the watches that marker has to be reported through — the caller's barrier
-  /// would otherwise wait out its deadline over a write that reported success. The directory
-  /// is the one the sync's target RESOLVED to when it was admitted, so an intermediate symlink
-  /// widens the cover where the marker really lands rather than where it was spelled.
+  /// caller's new cover may no longer name. A shrink is a coverage transition like any other,
+  /// so the barriers it touches are RETIRED — dominated by the located `Rescan` each
+  /// retirement leaves on the caller's stream — and `retained` is applied exactly as asked.
   ///
-  /// The promise outlives the write's own return. `sync_root` answers as soon as the marker
-  /// exists, and only afterwards is the create OBSERVED through the directory's watch, the
-  /// marker's removal proved against the same ground, and a failed removal retried there — so
-  /// the widening lasts until the obligation retires, not until the write returns. The
-  /// widening is a coverage **superset**, so it loses nothing; it is bounded by the watcher's
-  /// sync-obligation caps, and it lasts only until the next `set_cover`, by which time those
-  /// obligations have retired. The acknowledgement reports the reconcile exactly as it would
-  /// without it.
+  /// A shrink currently touches EVERY barrier in flight on this root, not only those standing
+  /// on the ground it prunes. A dropped watch is reported to the coverage machinery after the
+  /// node carrying its path is already gone, so the transition cannot be placed and is taken
+  /// at its widest. The instruction each dominated caller receives stays precise regardless —
+  /// the covering `Rescan` is minted from that obligation's own ground, not from the
+  /// transition's — so the cost is an extra `Dominated` for a barrier that would have
+  /// survived a placeable drop, never a whole-tree re-enumeration for any one caller. A GROW
+  /// is placeable and does narrow, retiring only the barriers standing beneath the arm.
+  ///
+  /// The alternative — holding the pruned ground for as long as an obligation named it — made
+  /// this call answer for a cover it had not applied, and let a caller's narrowing be deferred
+  /// indefinitely by a sync it knows nothing about. A dominated caller loses nothing: its
+  /// barrier is met by re-enumeration instead of by delivery, which is what the covering
+  /// `Rescan` on its stream is.
   ///
   /// # The acknowledgement is an effect-completion fence
   ///
@@ -2482,10 +2554,10 @@ impl<R> Watcher<R> {
   /// or the watcher is closed — so the caller must drop the intent rather than retry. Never blocks
   /// and never panics.
   ///
-  /// The applied cover is widened by the target directory of every not-yet-retired
-  /// [`sync_root`](Self::sync_root) obligation of this root, exactly as it is for the awaited
-  /// [`set_cover`](Self::set_cover) — see that method for what the widening costs and why it
-  /// can never lose an event.
+  /// A cover change dominates the barriers in flight it touches, exactly as it does for the
+  /// awaited [`set_cover`](Self::set_cover) — see that method for which barriers a shrink
+  /// reaches, what a dominated [`sync_root`](Self::sync_root) caller is told, and why it
+  /// loses nothing.
   pub fn request_set_cover(&self, root: RootHandle, retained: Vec<PathBuf>) -> RequestOutcome {
     // A foreign handle's scope number can name THIS watcher's unrelated root — reject it (never
     // retryable) before touching the channel, exactly as the awaited `set_cover` does.

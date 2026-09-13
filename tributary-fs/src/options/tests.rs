@@ -38,6 +38,17 @@ fn default_delegates_to_new() {
     "the map cap is FINITE by default: registration's memory must not be a \
      function of whatever tree the caller names"
   );
+  assert_eq!(
+    opts.cookie_global_cap(),
+    WatcherOptions::DEFAULT_COOKIE_GLOBAL_CAP
+  );
+  assert_eq!(
+    opts.cookie_global_cap().get(),
+    if cfg!(target_os = "macos") { 64 } else { 128 },
+    "the sync-marker ceiling is sized against the HOST's descriptor budget: \
+     macOS defaults to a 256 soft limit and holds a target and reserved pin per \
+     barrier in flight, where a descending lowering releases both at its door"
+  );
   opts.validate().expect("the defaults are in range");
 }
 
@@ -197,6 +208,14 @@ fn every_out_of_range_value_is_a_typed_refusal() {
     "a saturating deadline that never fires would disable fanotify's only \
      unmount detector while looking configured"
   );
+  assert_eq!(
+    WatcherOptions::new()
+      .with_cookie_global_cap(huge)
+      .validate(),
+    Err(OptionsError::CookieGlobalCapTooLarge { supplied: huge }),
+    "the cap the door's own descriptor arithmetic is sized against is bounded \
+     the same way every other capacity knob is"
+  );
 }
 
 /// Each ceiling is itself admissible: the range is inclusive, so a caller can
@@ -209,6 +228,7 @@ fn the_documented_maxima_are_themselves_in_range() {
     .with_os_batch_capacity(WatcherOptions::MAX_OS_BATCH_CAPACITY)
     .with_os_buffer_bytes(WatcherOptions::MAX_OS_BUFFER_BYTES)
     .with_root_liveness_interval(WatcherOptions::MAX_ROOT_LIVENESS_INTERVAL)
+    .with_cookie_global_cap(WatcherOptions::MAX_COOKIE_GLOBAL_CAP)
     .with_exclusions(vec![
       PathBuf::from(
         "/".repeat(WatcherOptions::MAX_EXCLUSION_LEN)
@@ -235,6 +255,36 @@ mod serde_face {
     assert_eq!(
       serde_json::from_str::<WatcherOptions>(&json).unwrap(),
       WatcherOptions::new()
+    );
+  }
+
+  /// The default the SERDE face hands back for an omitted key is the host
+  /// platform's, not a number frozen into the format.
+  ///
+  /// A document names only what it overrides, so a household written on one
+  /// platform and read on another must take the reader's ceiling — the descriptor
+  /// budget the cap is sized against belongs to the host doing the watching.
+  #[test]
+  fn an_omitted_cookie_cap_takes_the_host_platform_default() {
+    let absent: WatcherOptions = serde_json::from_str("{}").unwrap();
+    assert_eq!(
+      absent.cookie_global_cap(),
+      WatcherOptions::DEFAULT_COOKIE_GLOBAL_CAP
+    );
+    assert_eq!(
+      absent.cookie_global_cap().get(),
+      if cfg!(target_os = "macos") { 64 } else { 128 }
+    );
+
+    let named: WatcherOptions = serde_json::from_str(r#"{"cookie_global_cap": 7}"#).unwrap();
+    assert_eq!(
+      named.cookie_global_cap().get(),
+      7,
+      "and a document that names it is honoured"
+    );
+    assert!(
+      serde_json::from_str::<WatcherOptions>(r#"{"cookie_global_cap": 0}"#).is_err(),
+      "zero is not a ceiling: a watcher that may hold no obligation admits no sync"
     );
   }
 
@@ -300,7 +350,7 @@ mod serde_face {
       &'static str,
     );
 
-    let cases: [Case; 6] = [
+    let cases: [Case; 7] = [
       (
         "latency",
         r#"{"latency": "60s"}"#,
@@ -341,6 +391,13 @@ mod serde_face {
         r#"{"root_liveness_interval": "24h"}"#,
         |o| o.with_root_liveness_interval(WatcherOptions::MAX_ROOT_LIVENESS_INTERVAL),
         r#"{"root_liveness_interval": "25h"}"#,
+        "exceeds",
+      ),
+      (
+        "cookie_global_cap",
+        r#"{"cookie_global_cap": 1024}"#,
+        |o| o.with_cookie_global_cap(WatcherOptions::MAX_COOKIE_GLOBAL_CAP),
+        r#"{"cookie_global_cap": 1025}"#,
         "exceeds",
       ),
     ];
@@ -623,6 +680,31 @@ mod clap_face {
     assert_eq!(parse(&[]), WatcherOptions::new());
   }
 
+  /// The default the CLAP face renders is the host platform's, taken from the
+  /// same constant the constructor uses so the flag and the builder cannot drift.
+  #[test]
+  fn the_cookie_cap_flag_defaults_to_the_host_platform() {
+    assert_eq!(
+      parse(&[]).cookie_global_cap(),
+      WatcherOptions::DEFAULT_COOKIE_GLOBAL_CAP
+    );
+    assert_eq!(
+      parse(&[]).cookie_global_cap().get(),
+      if cfg!(target_os = "macos") { 64 } else { 128 }
+    );
+    assert_eq!(
+      parse(&["--cookie-global-cap", "7"])
+        .cookie_global_cap()
+        .get(),
+      7,
+      "and the flag is honoured when given"
+    );
+    assert!(
+      Cli::try_parse_from(["app", "--cookie-global-cap", "0"]).is_err(),
+      "zero is refused at the flag, as it is in the document"
+    );
+  }
+
   /// Each long flag sets EXACTLY its own knob.
   #[test]
   fn every_flag_sets_exactly_its_own_knob() {
@@ -688,7 +770,7 @@ mod clap_face {
       &'static str,
     );
 
-    let cases: [Case; 6] = [
+    let cases: [Case; 7] = [
       (
         &["--latency", "60s"],
         |o| o.with_latency(WatcherOptions::MAX_LATENCY),
@@ -723,6 +805,12 @@ mod clap_face {
         &["--root-liveness-interval", "24h"],
         |o| o.with_root_liveness_interval(WatcherOptions::MAX_ROOT_LIVENESS_INTERVAL),
         &["--root-liveness-interval", "25h"],
+        "exceeds",
+      ),
+      (
+        &["--cookie-global-cap", "1024"],
+        |o| o.with_cookie_global_cap(WatcherOptions::MAX_COOKIE_GLOBAL_CAP),
+        &["--cookie-global-cap", "1025"],
         "exceeds",
       ),
     ];

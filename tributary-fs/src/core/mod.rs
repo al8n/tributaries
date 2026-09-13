@@ -291,6 +291,126 @@ pub(crate) enum Delivery {
   Refused,
 }
 
+/// One scope's BARRIER EPOCH: a monotone count of the coverage transitions that
+/// have passed one of the barrier funnels since the scope was born.
+///
+/// A sync barrier is dispatched under one of these and certifies delivery only
+/// within it. A coverage transition that touches the ground the barrier depends
+/// on, while the barrier is live, retires the barrier — dominated by the located
+/// `Rescan` that transition stands — never as a certificate.
+///
+/// Advanced from every funnel ([`barrier_moved`](DriverCore::barrier_moved)) and
+/// nowhere else. Anything that comes to move a scope's coverage owes its funnel a
+/// call there, or a barrier stamped with this epoch would certify over exactly
+/// the window the new transition opened.
+///
+/// NOTHING in production compares one. It is the stamp a dispatched obligation
+/// records and the witness a cell reads — a cell proves a funnel bumped by
+/// watching the stamp move — while the decision "this barrier is dominated" is
+/// carried by the [`BarrierMove`] the same funnel records, so there is one
+/// representation of that fact rather than two.
+///
+/// Opaque for the reason [`CoverageWorkEpoch`](tributary_proto::monitor::CoverageWorkEpoch)
+/// is: only [`barrier_epoch`](DriverCore::barrier_epoch) mints one and the count
+/// itself is never handed out, so the only way to name the epoch a scope reads
+/// NOW is to ask the core that owns it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct BarrierEpoch(u64);
+
+impl BarrierEpoch {
+  /// The never-bumped floor a scope is born at.
+  const BIRTH: Self = Self(0);
+
+  /// Counts one coverage transition through a funnel.
+  fn advance(&mut self) {
+    self.0 += 1;
+  }
+}
+
+/// The ground one [`BarrierMove`] touched — what decides which obligations it
+/// retires.
+///
+/// Retirement is LOCATION-SCOPED: an obligation retires when its cookie
+/// directory INTERSECTS the move's ground (either is a prefix of the other), so
+/// a `mkdir` deep in the tree retires only barriers standing on that ground and
+/// a busy tree with a stable watch set retires none. A whole-scope move is the
+/// wide answer the root transitions carry, and the honest fallback wherever a
+/// funnel cannot place its ground.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BarrierLocation {
+  /// The whole scope: every obligation of it is on this move's ground.
+  Scope,
+  /// One located ground, absolute.
+  Path(Arc<PathBuf>),
+}
+
+impl BarrierLocation {
+  /// The ground `path` names within `state`'s scope.
+  ///
+  /// A path that IS the scope root answers [`Scope`](Self::Scope): a root-located
+  /// transition already touches every obligation of the scope, and giving it one
+  /// spelling rather than two is what lets two funnels reporting the same root
+  /// ground coalesce instead of retiring the same barrier twice.
+  fn at(state: &ScopeState, path: Arc<PathBuf>) -> Self {
+    match state.root.as_deref() {
+      Some(root) if root == path.as_ref() => Self::Scope,
+      _ => Self::Path(path),
+    }
+  }
+
+  /// Whether an obligation whose marker lands in `cover_dir` stands on this
+  /// move's ground.
+  ///
+  /// Intersection in EITHER direction, not containment in one: a move at
+  /// `/r/a` touches a barrier at `/r/a/b` (the ground beneath it moved) and a
+  /// move at `/r/a/b` touches a barrier at `/r/a` (the ground beneath IT moved,
+  /// and the marker's create has to come off a watch on the descent). Testing
+  /// one direction only would spare exactly the half whose watch actually
+  /// changed. A whole-scope move is on every obligation's ground by
+  /// construction.
+  pub(crate) fn intersects(&self, cover_dir: &Path) -> bool {
+    match self {
+      Self::Scope => true,
+      Self::Path(ground) => {
+        cover_dir.starts_with(ground.as_path()) || ground.starts_with(cover_dir)
+      }
+    }
+  }
+}
+
+/// One coverage transition a funnel raised while barriers may be live.
+///
+/// Recorded in the core (sans-I/O) and drained by the driver with
+/// [`take_barrier_moves`](DriverCore::take_barrier_moves) BEFORE it executes the
+/// effect queue — not as an [`Effect`], because an effect cannot purge an emit
+/// that precedes it in the same queue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BarrierMove {
+  /// The scope whose coverage moved.
+  pub(crate) scope: ScopeId,
+  /// The ground it moved on.
+  pub(crate) location: BarrierLocation,
+  /// Whether the funnel ALREADY stood a located `Rescan` covering that ground.
+  ///
+  /// A barrier is never retired silently: `SyncOutcome::Dominated` promises the
+  /// caller a re-enumeration instruction on its stream, so a retirement under a
+  /// move that stood none has to stand one itself. Only the funnels that mint a
+  /// `Rescan` of their own report `true` — a child arm, a child drop and the
+  /// settle rewind stand nothing by construction.
+  pub(crate) rescan_stands: bool,
+}
+
+/// How many LOCATED moves one scope may queue between two drains before they
+/// fold into a single whole-scope move.
+///
+/// The queue is drained after every core input, so the ordinary occupancy is one
+/// batch's worth; this is the ceiling a burst cannot pass. Folding rather than
+/// dropping is what keeps the bound honest — a whole-scope move retires a
+/// superset of what the folded ones would have, and owes its own covering
+/// `Rescan` — so the queue is bounded by (live scopes × this) entries and never
+/// by forgetting a transition.
+const MAX_BARRIER_MOVES_PER_SCOPE: usize = 16;
+
 /// Correlates one parked set-cover acknowledgement with its settlement: the
 /// driver opens a fence via [`open_cover_fence`](DriverCore::open_cover_fence)
 /// when an acked reconcile starts, and
@@ -1567,6 +1687,9 @@ struct ScopeState {
   /// ledger's own admission caps — one entry per live obligation of this scope —
   /// and EMPTY for every scope that never syncs, which short-circuits both seats.
   markers: BTreeMap<Arc<str>, crate::driver::CookieId>,
+  /// This scope's [`BarrierEpoch`] — the stamp a sync barrier is dispatched
+  /// under, advanced by every barrier funnel and by nothing else.
+  barrier_epoch: BarrierEpoch,
 }
 
 /// What the common-layer fence makes of one planned Monitor input
@@ -1800,6 +1923,19 @@ pub(crate) struct DriverCore {
   /// that no external input will bring it back for. Read and cleared by
   /// [`take_cover_flush_due`](Self::take_cover_flush_due).
   cover_flush_due: bool,
+  /// The coverage transitions the barrier funnels have raised since the driver
+  /// last drained them ([`take_barrier_moves`](Self::take_barrier_moves)).
+  ///
+  /// NOT an [`Effect`], and that placement is the whole of the drain-order fix:
+  /// [`drain_monitor`](Self::drain_monitor) routes every change before it
+  /// processes any action, so a funnel raised from an action sits BEHIND a
+  /// marker emit produced by the same drain. An effect queued behind that emit
+  /// could never purge it; a queue the driver drains BEFORE it executes the
+  /// effects can.
+  ///
+  /// Bounded by [`MAX_BARRIER_MOVES_PER_SCOPE`] per scope, and moves naming the
+  /// same `(scope, location)` between two drains coalesce rather than stack.
+  barrier_moves: VecDeque<BarrierMove>,
   scope_seq: u64,
   probe_seq: u64,
   fence_seq: u64,
@@ -1885,6 +2021,7 @@ impl DriverCore {
       adoption_seals: BTreeMap::new(),
       settled_covers: Vec::new(),
       cover_flush_due: false,
+      barrier_moves: VecDeque::new(),
       scope_seq: 0,
       probe_seq: 0,
       fence_seq: 0,
@@ -2017,15 +2154,7 @@ impl DriverCore {
   /// than as a truncated location, which is what makes an unresolvable watch
   /// distinguishable from one sitting at the root.
   fn path_of(&self, state: &ScopeState, watch: WatchId) -> Option<PathBuf> {
-    let root = state.root.as_deref()?;
-    if watch == state.watch {
-      return Some(root.clone());
-    }
-    let mut path = root.clone();
-    for segment in self.monitor.location_of_checked(watch)?.segments() {
-      path.push(segment.as_str());
-    }
-    Some(path)
+    watch_path(&self.monitor, state, watch)
   }
 
   /// [`path_of`](Self::path_of) for a caller holding a scope ID rather than the
@@ -2181,6 +2310,7 @@ impl DriverCore {
         prune,
         include,
         markers: BTreeMap::new(),
+        barrier_epoch: BarrierEpoch::BIRTH,
       },
     );
     self.watch_scopes.insert(watch, scope);
@@ -2522,6 +2652,128 @@ impl DriverCore {
     let fence = FenceId(self.fence_seq);
     self.cover_fences.entry(scope).or_default().open(fence);
     fence
+  }
+
+  /// `scope`'s current [`BarrierEpoch`], or `None` for a scope this core does not
+  /// hold — the dispatch stamp a sync barrier records, read at the instant it is
+  /// handed to the pool.
+  ///
+  /// The stamp's reader is the cookie ledger's dispatch; the cells read it as the
+  /// witness that a funnel bumped.
+  pub(crate) fn barrier_epoch(&self, scope: ScopeId) -> Option<BarrierEpoch> {
+    self.scopes.get(&scope).map(|state| state.barrier_epoch)
+  }
+
+  /// Drains the coverage transitions the funnels have raised since the last
+  /// drain.
+  ///
+  /// The driver calls this after every core input and BEFORE it executes the
+  /// effect queue: the retirement a move drives has to purge the retired
+  /// obligation's already-queued marker emit, and an effect drained in queue
+  /// order can only ever arrive behind one.
+  pub(crate) fn take_barrier_moves(&mut self) -> Vec<BarrierMove> {
+    self.barrier_moves.drain(..).collect()
+  }
+
+  /// THE BARRIER FUNNEL: advances `scope`'s [`BarrierEpoch`] and records the
+  /// coverage transition that moved it.
+  ///
+  /// Called from the eight sites through which every coverage transition of a
+  /// scope passes — a child watch armed or dropped, a located `Rescan` fed to the
+  /// Monitor, a root replace, a real mount-refresh loss, a root overflow, a
+  /// routed `Rescan`'s cover degrade, and the settle observation's lossy rewind —
+  /// and from nowhere else. The list is short and auditable because it names
+  /// FUNNELS rather than their callers: a caller list is exactly the enumeration
+  /// discipline that the pairwise-check rounds kept defeating.
+  ///
+  /// Two foldings keep the queue bounded without ever forgetting a transition:
+  ///
+  /// - a move naming ground a queued move of the same scope already names folds
+  ///   into it. `rescan_stands` folds by AND — a fold may only claim a standing
+  ///   `Rescan` when EVERY move it absorbed stood one, since an extra covering
+  ///   `Rescan` costs a redundant re-read while a missing one is silent loss;
+  /// - a whole-scope move subsumes every located move of its scope, and past
+  ///   [`MAX_BARRIER_MOVES_PER_SCOPE`] located moves the scope's entries fold
+  ///   into one. Folding UP is the honest degrade: the whole-scope move retires a
+  ///   superset of what the folded ones would have.
+  fn barrier_moved(
+    moves: &mut VecDeque<BarrierMove>,
+    state: &mut ScopeState,
+    scope: ScopeId,
+    location: BarrierLocation,
+    rescan_stands: bool,
+  ) {
+    state.barrier_epoch.advance();
+    if matches!(location, BarrierLocation::Scope) {
+      Self::fold_barrier_moves(moves, scope, rescan_stands);
+      return;
+    }
+    let mut located = 0usize;
+    for queued in moves.iter_mut() {
+      if queued.scope != scope {
+        continue;
+      }
+      if queued.location == location || matches!(queued.location, BarrierLocation::Scope) {
+        queued.rescan_stands &= rescan_stands;
+        return;
+      }
+      located += 1;
+    }
+    if located >= MAX_BARRIER_MOVES_PER_SCOPE {
+      // The incoming move is LOCATED, so a `true` here means "a Rescan
+      // covering THIS ground stands" — a claim that is location-specific by
+      // construction (`barrier_ground` derives the location from that
+      // Rescan's own anchor and descent). Widening it to `Scope` must not
+      // carry that claim forward: no Rescan covers the whole scope, only
+      // the `MAX_BARRIER_MOVES_PER_SCOPE` grounds that were actually
+      // stood, so the fold unconditionally sets `rescan_stands = false` and
+      // the retirement stands its own covering Rescan instead of trusting
+      // one that was never scope-wide.
+      Self::fold_barrier_moves(moves, scope, false);
+      return;
+    }
+    moves.push_back(BarrierMove {
+      scope,
+      location,
+      rescan_stands,
+    });
+  }
+
+  /// Replaces every queued move of `scope` with the one whole-scope move that
+  /// subsumes them, keeping the AND of what they and the incoming move stood.
+  fn fold_barrier_moves(moves: &mut VecDeque<BarrierMove>, scope: ScopeId, rescan_stands: bool) {
+    let stands = rescan_stands
+      && moves
+        .iter()
+        .filter(|queued| queued.scope == scope)
+        .all(|queued| queued.rescan_stands);
+    moves.retain(|queued| queued.scope != scope);
+    moves.push_back(BarrierMove {
+      scope,
+      location: BarrierLocation::Scope,
+      rescan_stands: stands,
+    });
+  }
+
+  /// The ground one [`Planned::Over`] names, as the funnel records it: the whole
+  /// scope for a root (or backend-wide) overflow, the located directory for a
+  /// subtree one.
+  ///
+  /// An anchor the Monitor can no longer place answers the whole scope. That is
+  /// the fail-WIDE direction every barrier question takes: retiring more
+  /// obligations than the transition strictly touched costs a re-enumeration,
+  /// retiring fewer certifies over ground that moved.
+  fn barrier_ground(monitor: &Monitor, state: &ScopeState, target: &Scope) -> BarrierLocation {
+    let Scope::Subtree(sub) = target else {
+      return BarrierLocation::Scope;
+    };
+    let Some(mut path) = watch_path(monitor, state, sub.watch()) else {
+      return BarrierLocation::Scope;
+    };
+    for segment in sub.descent().segments() {
+      path.push(segment.as_str());
+    }
+    BarrierLocation::at(state, Arc::new(path))
   }
 
   /// Arms `name` as an ACTIVE sync marker of `scope`, OWNED by the cookie
@@ -3167,6 +3419,20 @@ impl DriverCore {
         if let Some(state) = self.scopes.get_mut(&scope) {
           if lossy {
             state.applied_cover = state.settle_floor.clone();
+            // BARRIER FUNNEL: the settle observation narrows the scope's claim
+            // to the provable under-claim, so an obligation admitted under the
+            // optimistic one can find itself outside the rewound one. It fires
+            // from the loop top on the fence entry's ACCRUED lossy memory, many
+            // passes after whatever set it, and the `Rescan` that made the
+            // window lossy need not cover this obligation's ground — so this
+            // funnel always owes its own covering `Rescan`.
+            Self::barrier_moved(
+              &mut self.barrier_moves,
+              state,
+              scope,
+              BarrierLocation::Scope,
+              false,
+            );
           } else {
             state.settle_floor = state.applied_cover.clone();
           }
@@ -3543,7 +3809,14 @@ impl DriverCore {
     let BatchPayload { events, permit, .. } = payload;
     let mut batch = self.compile(&mut state, scope, events, now);
     batch.permit = Some(permit);
-    let fed = Self::settle_if_ready(&mut self.monitor, &mut state, scope, batch, now);
+    let fed = Self::settle_if_ready(
+      &mut self.monitor,
+      &mut self.barrier_moves,
+      &mut state,
+      scope,
+      batch,
+      now,
+    );
     self.scopes.insert(scope, state);
     if fed {
       self.pump_queued(scope, now);
@@ -3602,7 +3875,14 @@ impl DriverCore {
       }
       if batch.awaiting == 0 {
         let batch = state.park.active.take().expect("just observed Some");
-        Self::settle(&mut self.monitor, &mut state, scope, batch, now);
+        Self::settle(
+          &mut self.monitor,
+          &mut self.barrier_moves,
+          &mut state,
+          scope,
+          batch,
+          now,
+        );
         fed = true;
       }
     }
@@ -3699,6 +3979,18 @@ impl DriverCore {
     // with them. A destination arriving in the NEW world under a wrapped kernel
     // cookie finds no half, is reported as the fresh directory it is, and
     // repairs nothing.
+    //
+    // BARRIER FUNNEL: the root this scope watches is a different object, so
+    // every obligation of the scope stands on ground that moved. The cut below
+    // turns the swap into the epoch-bumped covering `Rescan`, which is the
+    // instruction a retirement under this move owes.
+    Self::barrier_moved(
+      &mut self.barrier_moves,
+      state,
+      scope,
+      BarrierLocation::Scope,
+      true,
+    );
     Self::trust_lost(&mut self.effects, scope, state);
     self.probes.retain(|_, ctx| ctx.scope != scope);
     // Old-world enumerate contexts are dominated too: a descending replace's
@@ -4117,6 +4409,16 @@ impl DriverCore {
     }
     state.park.active = None;
     state.park.queued.clear();
+    // BARRIER FUNNEL: a transport-level loss may have swallowed any coverage
+    // transition at all, so it is one about the whole scope. The overflow cut
+    // below stands the covering `Rescan`.
+    Self::barrier_moved(
+      &mut self.barrier_moves,
+      state,
+      scope,
+      BarrierLocation::Scope,
+      true,
+    );
     Self::trust_lost(&mut self.effects, scope, state);
     self.probes.retain(|_, ctx| ctx.scope != scope);
     self.monitor.on_overflow(Scope::Root(scope), now);
@@ -4213,6 +4515,16 @@ impl DriverCore {
       DeclineReason::BudgetFull => !std::mem::replace(&mut state.budget_lossy, true),
     };
     if unproven {
+      // Everything this scope already queued is dominated by the Rescan being
+      // minted below (the same sentence `on_delivery`'s `Refused` arm writes):
+      // this call runs INSIDE `execute_effects` (fed back from
+      // `on_refresh_declined`'s caller), so without this purge a marker
+      // `Effect::Emit` queued behind the `RefreshMounts` effect that provoked
+      // this decline would be delivered in the SAME `poll_effect` pass, ahead
+      // of both the covering `Rescan` appended below and the next loop-top
+      // drain. Purging first closes that escape the same way `on_delivery`'s
+      // `Refused` arm closes it one screen away.
+      Self::purge_scope_emits(&mut self.effects, scope);
       self.monitor.on_overflow(Scope::Root(scope), now);
       self.drain_monitor();
     }
@@ -4266,6 +4578,17 @@ impl DriverCore {
       state.refresh_world_stale = false;
       state.refresh_pending = false;
       state.refresh_stale = false;
+      // BARRIER FUNNEL: the world this scope's mount authority described ended
+      // at the replace commit, and nothing has re-read the live one yet. Unlike
+      // the two verdicts below this path emits NO `Rescan` of its own — it only
+      // re-arms the read — so a retirement under it owes the covering one.
+      Self::barrier_moved(
+        &mut self.barrier_moves,
+        state,
+        scope,
+        BarrierLocation::Scope,
+        false,
+      );
       Self::trust_lost(&mut self.effects, scope, state);
       return;
     }
@@ -4291,6 +4614,17 @@ impl DriverCore {
       RootLiveness::Missing => Some(RecordKind::DeleteSelf),
     });
     if let Some(kind) = death {
+      // BARRIER FUNNEL: the registered path no longer names the watched object,
+      // which ends the coverage of every obligation this scope holds. The
+      // self-event below lowers it through the terminal `Rescan` path, so the
+      // covering instruction stands.
+      Self::barrier_moved(
+        &mut self.barrier_moves,
+        state,
+        scope,
+        BarrierLocation::Scope,
+        true,
+      );
       let watch = state.watch;
       self.monitor.on_os_record(OsRecord::new(watch, kind), now);
       self.drain_monitor();
@@ -4374,6 +4708,17 @@ impl DriverCore {
     // also rescans, but that rescan races AHEAD of this completion and reads the
     // pre-adoption frame; this replay reruns it once the frame is current.
     if frame_changed && !state.profile.is_kernel_recursive() {
+      // BARRIER FUNNEL: a same-object re-mount moved the root to a different
+      // mount, so every child the last enumerate classified carries the old
+      // frame's verdict — a coverage transition over the whole scope, whose
+      // replay below stands the covering `Rescan`.
+      Self::barrier_moved(
+        &mut self.barrier_moves,
+        state,
+        scope,
+        BarrierLocation::Scope,
+        true,
+      );
       self.monitor.on_overflow(Scope::Root(scope), now);
       self.drain_monitor();
     }
@@ -4937,7 +5282,15 @@ impl DriverCore {
         } else {
           None
         };
-        let outcome = Self::accept(&mut self.monitor, state, &mut kept, planned, now);
+        let outcome = Self::accept(
+          &mut self.monitor,
+          &mut self.barrier_moves,
+          state,
+          scope,
+          &mut kept,
+          planned,
+          now,
+        );
         // The repair is by construction anchored at a reported destination, so
         // it needs no fencing of its own. It follows the record it repairs, in
         // this order, on both disciplines.
@@ -4945,7 +5298,15 @@ impl DriverCore {
           && let Geometry::Repair(repair) =
             self.reparent_geometry(state, exclusions, scope, watch, target.as_ref(), &outcome)
         {
-          Self::accept(&mut self.monitor, state, &mut kept, repair, now);
+          Self::accept(
+            &mut self.monitor,
+            &mut self.barrier_moves,
+            state,
+            scope,
+            &mut kept,
+            repair,
+            now,
+          );
         }
         // The destination cover goes through the FENCE like anything else bound
         // for the Monitor. It is born after the record's own verdict was taken,
@@ -4958,7 +5319,15 @@ impl DriverCore {
         if let Some(repair) = revealed
           && let Some(repair) = self.fenced_repair(state, exclusions, scope, repair)
         {
-          Self::accept(&mut self.monitor, state, &mut kept, repair, now);
+          Self::accept(
+            &mut self.monitor,
+            &mut self.barrier_moves,
+            state,
+            scope,
+            &mut kept,
+            repair,
+            now,
+          );
         }
       }
       item.planned = kept;
@@ -5062,7 +5431,9 @@ impl DriverCore {
   /// at all.
   fn accept(
     monitor: &mut Monitor,
-    state: &ScopeState,
+    moves: &mut VecDeque<BarrierMove>,
+    state: &mut ScopeState,
+    scope: ScopeId,
     kept: &mut Vec<Planned>,
     planned: Planned,
     now: Instant,
@@ -5071,7 +5442,7 @@ impl DriverCore {
       kept.push(planned);
       return RecordOutcome::Nothing;
     }
-    Self::feed(monitor, planned, now)
+    Self::feed(monitor, moves, state, scope, planned, now)
   }
 
   /// Whether the fence's MEMBERSHIP over the subtree rooted at `path` depends on
@@ -5540,13 +5911,14 @@ impl DriverCore {
 
   fn settle_if_ready(
     monitor: &mut Monitor,
+    moves: &mut VecDeque<BarrierMove>,
     state: &mut ScopeState,
     scope: ScopeId,
     batch: PendingBatch,
     now: Instant,
   ) -> bool {
     if batch.awaiting == 0 {
-      Self::settle(monitor, state, scope, batch, now);
+      Self::settle(monitor, moves, state, scope, batch, now);
       true
     } else {
       state.park.active = Some(batch);
@@ -5567,6 +5939,7 @@ impl DriverCore {
   /// the FSEvents path — which does not feed at classify time.
   fn settle(
     monitor: &mut Monitor,
+    moves: &mut VecDeque<BarrierMove>,
     state: &mut ScopeState,
     scope: ScopeId,
     mut batch: PendingBatch,
@@ -5576,11 +5949,11 @@ impl DriverCore {
     let deferred = std::mem::take(&mut batch.deferred_unmounts);
     for item in batch.items {
       for planned in item.planned {
-        Self::feed(monitor, planned, now);
+        Self::feed(monitor, moves, state, scope, planned, now);
       }
     }
     for planned in batch.trailing {
-      Self::feed(monitor, planned, now);
+      Self::feed(monitor, moves, state, scope, planned, now);
     }
     for path in deferred {
       state.mounts.retain(|m| m != &path);
@@ -5664,11 +6037,28 @@ impl DriverCore {
   /// ([`reparent_geometry`](Self::reparent_geometry)).
   ///
   /// An overflow instruction moves no subtree, so it reports nothing.
-  fn feed(monitor: &mut Monitor, planned: Planned, now: Instant) -> RecordOutcome {
+  ///
+  /// It is also the BARRIER FUNNEL every located `Rescan` this core mints passes
+  /// through — the twenty-odd [`Planned::Over`] construction sites all drain
+  /// here — so the bump for one is raised here and at none of them.
+  fn feed(
+    monitor: &mut Monitor,
+    moves: &mut VecDeque<BarrierMove>,
+    state: &mut ScopeState,
+    scope: ScopeId,
+    planned: Planned,
+    now: Instant,
+  ) -> RecordOutcome {
     match planned {
       Planned::Rec(rec) => monitor.on_os_record(rec, now),
-      Planned::Over(scope) => {
-        monitor.on_overflow(scope, now);
+      Planned::Over(target) => {
+        // The ground is read BEFORE the overflow reshapes the watch tree the
+        // anchor is placed against. A located `Rescan` IS the covering
+        // instruction a retirement would otherwise owe, so this funnel stands
+        // one.
+        let ground = Self::barrier_ground(monitor, state, &target);
+        Self::barrier_moved(moves, state, scope, ground, true);
+        monitor.on_overflow(target, now);
         RecordOutcome::Nothing
       }
     }
@@ -5686,7 +6076,14 @@ impl DriverCore {
       };
       let mut batch = self.compile(&mut state, scope, events, now);
       batch.permit = Some(permit);
-      let fed = Self::settle_if_ready(&mut self.monitor, &mut state, scope, batch, now);
+      let fed = Self::settle_if_ready(
+        &mut self.monitor,
+        &mut self.barrier_moves,
+        &mut state,
+        scope,
+        batch,
+        now,
+      );
       self.scopes.insert(scope, state);
       if !fed {
         return;
@@ -5906,6 +6303,80 @@ impl DriverCore {
     effects.retain(|effect| !matches!(effect, Effect::Emit { scope: s, .. } if *s == scope));
   }
 
+  /// Drops every queued [`Effect::Emit`] of `scope` whose change names the
+  /// marker leaf `name`, reporting how many went.
+  ///
+  /// The narrow half of [`purge_scope_emits`](Self::purge_scope_emits), and the
+  /// close of the drain-order hole. [`drain_monitor`](Self::drain_monitor) routes
+  /// every change BEFORE it processes any action, so a marker's `Created` is
+  /// queued as an emit while the coverage transition that retires its barrier is
+  /// still an unprocessed action: the consumer would match the marker first and
+  /// read a certificate over a window whose ground moved. A retirement therefore
+  /// PURGES the marker's queued emit and stands the covering `Rescan` in its
+  /// place, both before the effect queue is executed.
+  ///
+  /// Keyed on the marker's LEAF and on the scope, never on the scope alone: a
+  /// scope-wide purge would take the emit of an obligation the location test
+  /// spared and time that barrier out. The leaf carries the sync's unpredictable
+  /// nonce, so it names this watcher's own in-flight artifact and nothing else,
+  /// and a `Moved` is matched on its source leaf too — a marker moved aside is
+  /// still the barrier's own object.
+  ///
+  /// A `Rescan` is never taken. It is the no-silent-loss escape and names a
+  /// subtree to re-read rather than an object, so no marker leaf may speak for
+  /// one.
+  pub(crate) fn purge_marker_emits(&mut self, scope: ScopeId, name: &str) -> usize {
+    let before = self.effects.len();
+    self.effects.retain(|effect| {
+      !matches!(
+        effect,
+        Effect::Emit {
+          scope: emitted,
+          change,
+          ..
+        } if *emitted == scope && !change.kind().is_rescan() && names_leaf(change, name)
+      )
+    });
+    before - self.effects.len()
+  }
+
+  /// Queues the located `Rescan` covering `at` on `scope`'s stream.
+  ///
+  /// The other half of the substitution: a retiring bump MUST leave a located
+  /// `Rescan` covering the retired obligation's ground, because
+  /// `SyncOutcome::Dominated`'s public contract promises exactly that — a
+  /// re-enumeration instruction is on the caller's stream, so its obligation is
+  /// to re-read rather than to worry. Three of the funnels stand none of their
+  /// own, and this is what those retirements call.
+  ///
+  /// It goes through [`covering_rescan`](Self::covering_rescan) and
+  /// [`feed`](Self::feed) rather than reaching for the Monitor directly, so the
+  /// instruction carries everything a `Rescan` this core mints carries — the same
+  /// clamp to the scope, the same attribution, the loss-memory mark and the
+  /// coverage degrade its routing performs. `covering_rescan` covers the PARENT
+  /// of what it is given, which subsumes `at` itself. Its own funnel bump is
+  /// idempotent: it names ground already dominated, and it stands a `Rescan`.
+  ///
+  /// The drain that follows is what puts the instruction into the effect queue
+  /// ahead of the flush the driver is about to run — the whole point of standing
+  /// it here rather than one loop pass later.
+  pub(crate) fn stand_covering_rescan(&mut self, scope: ScopeId, at: &Path, now: Instant) {
+    let Some(mut state) = self.scopes.remove(&scope) else {
+      return;
+    };
+    let planned = Self::covering_rescan(&state, scope, core::iter::once(at));
+    Self::feed(
+      &mut self.monitor,
+      &mut self.barrier_moves,
+      &mut state,
+      scope,
+      planned,
+      now,
+    );
+    self.scopes.insert(scope, state);
+    self.drain_monitor();
+  }
+
   /// Removes and returns the LAST queued `Rescan` emit for `scope` (with the
   /// root it was queued to deliver under), if any — the terminal covering
   /// change a teardown keeps retryable.
@@ -6059,6 +6530,16 @@ impl DriverCore {
             let name = child.name().clone();
             let path = Arc::new(parent_path.join(name.as_str()));
             self.watch_scopes.insert(cmd.id(), scope);
+            // BARRIER FUNNEL: a child watch armed for the scope, whatever queued
+            // it — a crawl, a cascade, a cold enumeration, a `set_cover` grow, the
+            // slot reconcile's move-in arm. The arm is the funnel every one of
+            // them passes through, so the bump is raised HERE and at none of them.
+            // It stands no `Rescan` of its own (an arm emits none), so a
+            // retirement under it owes the covering one itself.
+            if let Some(state) = self.scopes.get_mut(&scope) {
+              let ground = BarrierLocation::at(state, Arc::clone(&path));
+              Self::barrier_moved(&mut self.barrier_moves, state, scope, ground, false);
+            }
             // The object the enumerate discovered, so the arm can confirm the
             // open lands on it: the Monitor node carries the entry's identity
             // (its inode), and single-device descent means a descended child is
@@ -6095,6 +6576,31 @@ impl DriverCore {
             // no result contract, and an unreached wd dies with the stream.
             let scope = self.watch_scopes.remove(&watch);
             if let Some(scope) = scope {
+              // BARRIER FUNNEL: a child watch dropped — a prune, the reconcile's
+              // drop-before-arm, a subtree drop. Like the arm above it is the one
+              // funnel all of them pass, and it stands no `Rescan` of its own (a
+              // shrink-in-place prune emits none by construction).
+              //
+              // The ground is what the Monitor can still place the watch at.
+              // [`Monitor::drop_subtree`] ERASES a node before it queues the
+              // node's `Unwatch` (the erase and the push are in the same DFS
+              // pop, and `Action::Unwatch` has exactly one producer in the
+              // whole workspace), so a dropped watch is UNCONDITIONALLY no
+              // longer placeable today and the funnel always records the
+              // whole scope: retiring more obligations than the drop touched
+              // costs a re-enumeration, while guessing a narrower ground from
+              // a remembered path would spare a barrier standing on ground
+              // that really did stop being watched. Carrying the dropped
+              // node's path on the unwatch action, together with
+              // ancestor-coalescing in `barrier_moved`, is tracked as a
+              // follow-up: #137.
+              let ground = self.scoped_path(scope, watch);
+              if let Some(state) = self.scopes.get_mut(&scope) {
+                let ground = ground.map_or(BarrierLocation::Scope, |path| {
+                  BarrierLocation::at(state, Arc::new(path))
+                });
+                Self::barrier_moved(&mut self.barrier_moves, state, scope, ground, false);
+              }
               self.effects.push_back(Effect::RemoveWatch { scope, watch });
             }
             continue;
@@ -6386,6 +6892,30 @@ impl DriverCore {
       if state.applied_cover.is_some() {
         state.applied_cover = Some(Vec::new());
         state.settle_floor = Some(Vec::new());
+        // BARRIER FUNNEL: the scope's recorded coverage claim just changed
+        // wholesale — what "covered" means for every admission after this is a
+        // different statement. It OVERLAPS `feed`'s funnel for a `Rescan` that
+        // passed through it (idempotently: both name the same ground, and the
+        // second bump retires nothing the first did not), and it is not subsumed
+        // by it, because a Monitor-minted `Rescan` — a root invalidation, an
+        // arm-failure or stat-deficit re-signal — reaches here without passing
+        // `feed` at all. The `Rescan` being routed IS the covering instruction.
+        // Built from `state.root`, the same root `BarrierLocation::at`
+        // compares against — never `delivery_root()`, whose fallback to
+        // `state.requested` for a rootless scope would let the two
+        // canonicalizations diverge and record a root-located degrade as a
+        // located `Path` instead of `Scope`.
+        let ground = match state.root.as_deref() {
+          Some(root) => {
+            let mut ground = root.clone();
+            for segment in change.location().segments() {
+              ground.push(segment.as_str());
+            }
+            BarrierLocation::at(state, Arc::new(ground))
+          }
+          None => BarrierLocation::Scope,
+        };
+        Self::barrier_moved(&mut self.barrier_moves, state, scope, ground, true);
       }
     }
     // THE INCLUDE SEAT: the root's file-delivery narrowing, applied here and
@@ -6763,6 +7293,39 @@ fn learn_device(state: &mut ScopeState, path: &Path, dev: u64) {
   {
     state.mounts.push(path.to_path_buf());
   }
+}
+
+/// Whether `change` names the leaf `name` — the object's own last location
+/// segment, or a `Moved`'s SOURCE last segment.
+///
+/// The same two readings [`DriverCore::admits`]' marker clauses take, asked of an
+/// explicit name rather than of the scope's active set.
+fn names_leaf(change: &Change, name: &str) -> bool {
+  let names = |location: &Location| {
+    location
+      .segments()
+      .last()
+      .is_some_and(|segment| segment.as_str() == name)
+  };
+  names(change.location()) || change.kind().moved_from().is_some_and(names)
+}
+
+/// [`DriverCore::path_of`]'s derivation, reached without the core: the scope's
+/// root joined with whatever the Monitor places `watch` at.
+///
+/// Split out for the funnels that hold `monitor` and `state` as separate borrows
+/// rather than the whole core — one derivation for both, since a second
+/// implementation of it is the stored mirror `path_of` exists to have deleted.
+fn watch_path(monitor: &Monitor, state: &ScopeState, watch: WatchId) -> Option<PathBuf> {
+  let root = state.root.as_deref()?;
+  if watch == state.watch {
+    return Some(root.clone());
+  }
+  let mut path = root.clone();
+  for segment in monitor.location_of_checked(watch)?.segments() {
+    path.push(segment.as_str());
+  }
+  Some(path)
 }
 
 /// Lowers an absolute event path to its place under the scope root.

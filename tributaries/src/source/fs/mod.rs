@@ -23,7 +23,7 @@ use tributary_fs::{
 };
 use tributary_proto::Interest;
 
-use super::{Armed, Source, SourceEvent, SyncToken};
+use super::{Armed, Begun, Source, SourceEvent, SyncToken};
 use crate::{
   error::{BuildError, FaultKind, SourceCloseError, SourceFault, SyncError, WatchError},
   event::{EventKind, path_components},
@@ -673,7 +673,7 @@ impl<R> Source<OsString> for FsSource<R> {
     handle: RootHandle,
     dir_key: &[OsString],
     token: SyncToken,
-  ) -> Result<Vec<OsString>, SyncError> {
+  ) -> Result<Begun<OsString>, SyncError> {
     // Any op that touches the watcher first re-forwards deferred prunes, so a
     // stale narrower cover never trails behind this write.
     self.flush_deferred_prunes();
@@ -705,7 +705,17 @@ impl<R> Source<OsString> for FsSource<R> {
     // in-flight entry here; only the dropped-future path above leaves it behind.
     self.pending_syncs.remove(&handle);
     match result {
-      Ok(path) => Ok(path_components(&path)),
+      Ok(path) => Ok(Begun::Installed(path_components(&path))),
+      // A coverage transition on the barrier's ground retired it before the reply
+      // was sent, and the retirement stood the covering `Rescan` for the ground
+      // this sync named. That is not an error at this seam: it is
+      // `SyncOutcome::Dominated`'s own contract, so it is carried as the outcome
+      // and the caller is resolved at once. A barrier already met by
+      // re-enumeration must not be told to wait.
+      Err(SyncRootDenied {
+        error: SyncRootError::Dominated,
+        ..
+      }) => Ok(Begun::Dominated),
       // The umbrella never retries `sync_root` at this level, so a returned
       // admission is dropped; the mapping is over the carried `error`.
       Err(SyncRootDenied { error, .. }) => Err(sync_error_from_fs(error)),
@@ -987,6 +997,12 @@ fn watch_error_from_fs(err: WatchRootError) -> WatchError {
 ///   cookie-cleanup backlog. Nothing was written; ask again.
 /// - **a genuine write failure**, carrying the concrete `io::Error` behind an honest
 ///   [`FaultKind`] (a read-only tree is `PermissionDenied`).
+///
+/// [`Dominated`](SyncRootError::Dominated) is deliberately absent: a barrier a coverage
+/// transition retired is not a refused write but a met barrier, taken by `begin_sync` as
+/// [`Begun::Dominated`] before this is ever reached. Left to the wildcard it would reach a
+/// caller as a write failure, which is both untrue and un-actionable — hence this note rather
+/// than silence.
 ///
 /// The fs error type is `#[non_exhaustive]`, and the wildcard is deliberately the FAILED-write
 /// arm: a variant added later is a refused barrier until it is classified here, never a silent

@@ -22,7 +22,7 @@ use std::{
 };
 
 use super::Watcher;
-use crate::{Backend, Event, Interest, WatcherOptions};
+use crate::{Backend, Event, Interest, SyncRootDenied, WatcherOptions, error::SyncRootError};
 
 type TokioWatcher = Watcher<agnostic_lite::tokio::TokioRuntime>;
 
@@ -765,28 +765,29 @@ async fn set_cover_keeps_a_covered_directory_s_reserved_sync_directory_armed() {
   let _ = std::fs::remove_dir_all(&root);
 }
 
-/// A live obligation keeps its ground covered until it RETIRES — asked on the far
-/// side of the write's own return.
+/// A cover change DOMINATES the live obligation standing in the ground it takes
+/// — asked on the far side of the write's own return.
 ///
 /// `sync_root` answers the instant the marker exists, and the barrier's
-/// observation happens strictly after: the create sits in the kernel queue while
-/// the reader takes its control traffic first, so a cover narrowed past the
-/// marker's own directory disarms the watch that queued create would have been
-/// attributed to and the create is discarded — a write that reported success
-/// with nothing left that can report it.
+/// observation happens strictly after. Holding the pruned ground for as long as
+/// an obligation named it made `set_cover` apply a cover it had not been asked
+/// for; the barrier is retired instead, dominated by the located `Rescan` the
+/// retirement stands, and the caller's cover is the cover that applies.
 ///
-/// Real inotify, because what the cell rests on is the kernel's. The sibling the
-/// cover names nothing for really loses its watch descriptor, the marker's
-/// directory really keeps its own, and the second sync's marker really has
-/// nothing but that surviving watch to come off: its reserved directory already
-/// exists, so no directory create reaches the parent's watch this time.
+/// Real inotify, because what the cell rests on is the kernel's: the ground the
+/// cover names nothing for really loses its watch descriptors — the marker's own
+/// directory and the reserved directory inside it among them — and the marker is
+/// really unlinked from the filesystem rather than merely forgotten.
 ///
-/// Revert witness: filter `live_sync_dirs` back to the parked and in-pool phases
-/// and the shrink takes `<root>/a` along with the sibling — its watch count drops
-/// to zero and the second sync is refused `DirUncovered` instead of placing a
-/// marker at all.
+/// The second sync is the proof the cut really took that ground: `<root>/a` is
+/// outside the applied cover now, so the admission refuses it before birth
+/// instead of placing a marker nothing could report.
+///
+/// Revert witness: put `retained.extend(cookies.live_sync_dirs(scope))` back in
+/// the `SetCover` handler and `<root>/a` keeps its watch, the marker stays on
+/// disk, and the second sync is admitted — the widening this replaced.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn set_cover_keeps_the_ground_an_owned_marker_is_still_unread_in() {
+async fn set_cover_dominates_the_owned_marker_standing_in_the_ground_it_takes() {
   let root = scratch_root("cover-owned-marker");
   std::fs::create_dir_all(root.join("a")).expect("the ground the sync writes in");
   std::fs::create_dir_all(root.join("b")).expect("the ground the cover keeps");
@@ -832,61 +833,187 @@ async fn set_cover_keeps_the_ground_an_owned_marker_is_still_unread_in() {
     converge(|| wds_watching(&cut_object) == 0).await,
     "the sibling the cover named nothing for loses its watch — the cut really ran"
   );
-  assert_eq!(
-    wds_watching(&target_object),
-    1,
-    "while the owned marker's own directory keeps its watch"
-  );
-  assert_eq!(
-    wds_watching(&reserved_object),
-    1,
-    "and so does the reserved directory the marker stands in"
-  );
-
-  // The second sync reuses the reserved directory the first one made, so nothing
-  // is created for the parent's watch to report: only the surviving watch can
-  // carry this marker.
-  let (admission, _ticket) = w.mint_sync_ticket().expect("this host seeds a watcher");
-  let second = w
-    .sync_root(handle, &target, admission)
-    .await
-    .expect("a sync of the ground the widening kept still admits");
-  assert_eq!(
-    second.parent(),
-    Some(reserved.as_path()),
-    "staging: the second marker reuses the reserved directory the first one made"
+  assert!(
+    converge(|| wds_watching(&target_object) == 0).await,
+    "and so does the dominated barrier's own ground: the cover that applies is      the one the caller asked for"
   );
   assert!(
-    wait_for(&mut w, |e| names(e, &second)).await.is_some(),
-    "the marker is reported — the barrier a successful write promised can still resolve"
+    converge(|| wds_watching(&reserved_object) == 0).await,
+    "the reserved directory inside it goes with the ground holding it"
+  );
+
+  // The retirement withdrew the marker rather than leaving a file no barrier is
+  // waiting for and no cover reports.
+  assert!(
+    converge(|| !first.exists()).await,
+    "the dominated barrier's marker is withdrawn from the filesystem"
+  );
+
+  // And the ground really is outside the applied cover now: a fresh sync of it is
+  // refused before birth rather than placing a marker nothing could report.
+  let (admission, _ticket) = w.mint_sync_ticket().expect("this host seeds a watcher");
+  let refused = w.sync_root(handle, &target, admission).await;
+  assert!(
+    matches!(
+      refused,
+      Err(SyncRootDenied {
+        error: SyncRootError::DirUncovered { .. },
+        ..
+      })
+    ),
+    "a sync of ground the cover took is refused, not admitted: {refused:?}"
   );
 
   let _ = std::fs::remove_file(&first);
-  let _ = std::fs::remove_file(&second);
   close_and_drain(w, &all).await;
   let _ = std::fs::remove_dir_all(&root);
 }
 
-/// The widening's coordinate is the LANDING the admission pinned, not the
-/// spelling its caller passed.
+/// A SAME-NAME SUBSTITUTION of the ground a live sync stands on dominates its
+/// barrier — with the covering `Rescan` on the stream, never a certificate.
+///
+/// A peer renames `<root>/a` aside and moves a prepared directory onto its name
+/// while a marker is standing inside it: every identity the admission pinned
+/// still matches whatever the write reached, because the objects are real and
+/// the pin carried one of them through the rename. What separates the two
+/// worlds is COVERAGE — the reconcile drops the incumbent watch before arming
+/// the arrival — and that is exactly the transition the barrier is dispatched
+/// under an epoch to see.
+///
+/// Real inotify because the ordering the rule rests on is the kernel's: the
+/// substitution's own records precede anything the new directory produces, in one
+/// queue, which is the premise the epoch is allowed to lean on here and is not
+/// allowed to lean on under FSEvents coalescing.
+///
+/// Revert witness: raise no bump at `drain_monitor`'s child-watch ARM or DROP
+/// and the substitution passes silently — no `Rescan` covering `<root>/a`
+/// arrives, and the marker stays on disk as a certificate over a window whose
+/// ground was replaced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_same_name_substitution_under_a_live_sync_dominates_its_barrier() {
+  let root = scratch_root("substitution-dominates");
+  std::fs::create_dir_all(root.join("a")).expect("the ground the sync writes in");
+  std::fs::create_dir_all(root.join("spare")).expect("the replacement, prepared aside");
+
+  let mut w = TokioWatcher::new(WatcherOptions::new().with_backend(Backend::Inotify))
+    .expect("build inotify watcher");
+  let handle = w.watch(&root, Interest::all()).await.expect("watch root");
+  let canonical = w.root_path(handle).expect("root path");
+  let target = canonical.join("a");
+
+  let (admission, _ticket) = w.mint_sync_ticket().expect("this host seeds a watcher");
+  let first = w
+    .sync_root(handle, &target, admission)
+    .await
+    .expect("the sync admits and writes its marker");
+  assert!(
+    wait_for(&mut w, |e| names(e, &first)).await.is_some(),
+    "staging: the marker is reported, so its ground is armed"
+  );
+
+  let all = objects_of(&[
+    canonical.clone(),
+    target.clone(),
+    canonical.join("spare"),
+    canonical.join("aside"),
+  ]);
+
+  // The substitution: the judged object moves aside and a prepared directory
+  // takes its name, in the window between the write and the observation.
+  std::fs::rename(&target, canonical.join("aside")).expect("the judged ground moves aside");
+  std::fs::rename(canonical.join("spare"), &target).expect("the replacement takes its name");
+
+  assert!(
+    wait_for(&mut w, |e| covers(e, &target)).await.is_some(),
+    "the replaced ground is covered by a `Rescan`, not certified by the marker \
+     standing in the object that was carried away"
+  );
+
+  let _ = std::fs::remove_dir_all(canonical.join("aside"));
+  close_and_drain(w, &all).await;
+  let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A STABLE TREE delivers its marker and dominates nothing.
+///
+/// The negative the whole rule depends on, and the reason retirement is
+/// location-scoped rather than scope-wide: a barrier on a tree whose watch set
+/// does not move must resolve by DELIVERY. If ordinary syncs answered
+/// `Dominated`, the terminal would carry no information and every caller would
+/// re-enumerate for nothing.
+///
+/// Asserted as a delta: the marker's own event arrives, and across a window that
+/// would comfortably have carried one, no `Rescan` covering its ground follows,
+/// and the marker is still on disk — nothing withdrew it.
+///
+/// Revert witness: make `BarrierLocation::intersects` answer `true` for every
+/// located ground, or raise a bump where the funnel list deliberately raises none
+/// (a data event, a reparent within the scope, a widen commit), and the `Rescan`
+/// this cell refuses appears.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stable_tree_delivers_its_marker_and_dominates_nothing() {
+  let root = scratch_root("stable-delivers");
+  std::fs::create_dir_all(root.join("a")).expect("the ground the sync writes in");
+  std::fs::create_dir_all(root.join("b")).expect("a sibling that never moves");
+
+  let mut w = TokioWatcher::new(WatcherOptions::new().with_backend(Backend::Inotify))
+    .expect("build inotify watcher");
+  let handle = w.watch(&root, Interest::all()).await.expect("watch root");
+  let canonical = w.root_path(handle).expect("root path");
+  let target = canonical.join("a");
+
+  let (admission, _ticket) = w.mint_sync_ticket().expect("this host seeds a watcher");
+  let marker = w
+    .sync_root(handle, &target, admission)
+    .await
+    .expect("the sync admits and writes its marker");
+  assert!(
+    wait_for(&mut w, |e| names(e, &marker)).await.is_some(),
+    "the marker's OWN event is what resolves a barrier on a stable tree"
+  );
+
+  // Ordinary traffic the funnels deliberately do not bump on: data events under
+  // ground whose watches are already armed.
+  std::fs::write(canonical.join("b").join("data.txt"), b"payload").expect("an ordinary write");
+  assert!(
+    wait_for(&mut w, |e| names(e, &canonical.join("b").join("data.txt")))
+      .await
+      .is_some(),
+    "staging: the tree is live and delivering"
+  );
+
+  assert!(
+    marker.exists(),
+    "nothing withdrew the marker: no transition touched its ground"
+  );
+
+  let all = objects_of(&[canonical.clone(), target.clone(), canonical.join("b")]);
+  let _ = std::fs::remove_file(&marker);
+  close_and_drain(w, &all).await;
+  let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The obligation's coordinate is the LANDING the admission pinned, not the
+/// spelling its caller passed — which is what the domination is judged on.
 ///
 /// `<root>/alias` is an intermediate symlink to `<root>/actual`, so a sync of
 /// `<root>/alias/sub` pins, validates and writes at `<root>/actual/sub`. That is
 /// also where the kernel's watch descriptor is: a crawl arms OBJECTS and never
-/// follows a link, so no watch of this root stands at the spelling. A cover
-/// widened by the caller's directory therefore retains a path nothing is armed at
-/// while pruning the one thing that could report the marker, and `sync_root`
-/// answers `Ok` over a barrier that can only time out.
+/// follows a link, so no watch of this root stands at the spelling. The record
+/// therefore keeps the LANDING, and the retirement's covering `Rescan` is minted
+/// from it — a `Rescan` at the spelling would name ground no watch of this root
+/// stands on, telling the caller to re-read a path that reports nothing.
 ///
 /// Real inotify and a real symlink, because both halves of that are the kernel's:
 /// the resolution really follows the link, and the watch descriptors really sit
 /// on the resolved objects.
 ///
-/// Revert witness: widen with the caller's directory and `<root>/actual/sub`'s
-/// watch is reclaimed by the shrink; the second sync is then refused
-/// `DirUncovered`, naming the landing.
+/// Revert witness: record the caller's spelling as the obligation's ground
+/// instead of the landing and the `Rescan` this cell waits for names
+/// `<root>/alias/sub`, which `covers` cannot match against the landing the marker
+/// actually stood in.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn set_cover_keeps_the_landing_a_live_alias_sync_wrote_in() {
+async fn set_cover_dominates_a_live_alias_sync_at_the_landing_it_wrote_in() {
   let root = scratch_root("cover-alias-landing");
   let actual = root.join("actual");
   std::fs::create_dir_all(actual.join("sub")).expect("the ground the sync really writes in");
@@ -935,43 +1062,34 @@ async fn set_cover_keeps_the_landing_a_live_alias_sync_wrote_in() {
     canonical.join("cut"),
   ]);
 
-  w.set_cover(handle, vec![canonical.join("keep")])
-    .await
-    .expect("set_cover shrink");
+  // The covering `Rescan` the retirement stands has to name the LANDING: that is
+  // the ground the marker stood in and the only ground a watch of this root is
+  // armed at. Read before the watch assertions below, because the instruction is
+  // what the caller acts on.
+  let covered_landing = wait_for(&mut w, |e| covers(e, &landing)).await;
+  assert!(
+    covered_landing.is_some(),
+    "the retirement's covering `Rescan` names the landing, not the spelling"
+  );
+
   assert!(
     converge(|| wds_watching(&cut_object) == 0).await,
     "the sibling the cover named nothing for loses its watch — the cut really ran"
   );
-  assert_eq!(
-    wds_watching(&landing_object),
-    1,
-    "while the LANDING keeps the watch the marker's create comes off"
-  );
-  assert_eq!(
-    wds_watching(&reserved_object),
-    1,
-    "and so does the reserved directory standing inside it"
-  );
-
-  // Asked again through the same spelling: the widening kept the landing, so the
-  // admission's own landing test still passes and the marker is still reportable.
-  let (admission, _ticket) = w.mint_sync_ticket().expect("this host seeds a watcher");
-  let second = w
-    .sync_root(handle, &spelled, admission)
-    .await
-    .expect("a sync onto the landing the widening kept still admits");
-  assert_eq!(
-    second.parent(),
-    Some(reserved.as_path()),
-    "staging: the second marker reuses the reserved directory the first one made"
+  assert!(
+    converge(|| wds_watching(&landing_object) == 0).await,
+    "and the landing goes with it: the cover that applies is the caller's"
   );
   assert!(
-    wait_for(&mut w, |e| names(e, &second)).await.is_some(),
-    "the marker is reported — the widening kept the ground the write resolves to"
+    converge(|| wds_watching(&reserved_object) == 0).await,
+    "the reserved directory standing inside it goes with the ground holding it"
+  );
+  assert!(
+    converge(|| !first.exists()).await,
+    "the dominated barrier's marker is withdrawn from the landing it stood in"
   );
 
   let _ = std::fs::remove_file(&first);
-  let _ = std::fs::remove_file(&second);
   close_and_drain(w, &all).await;
   let _ = std::fs::remove_dir_all(&root);
 }
