@@ -4404,7 +4404,12 @@ impl ClaimRefused {
 /// teardown ([`retire_scope`](Self::retire_scope)), and the orderly close's
 /// [`sweep_owned`](Self::sweep_owned) — each raise their flag before taking the
 /// paths, so a write still in the blocking pool can never slip a file past the
-/// sweep that was supposed to reap it.
+/// sweep that was supposed to reap it. Both flags are published earlier still,
+/// ahead of the delivery lane each ending is about to dismantle
+/// ([`publish_retiring`](Self::publish_retiring),
+/// [`begin_shutdown`](Self::begin_shutdown)): a write released between the lane's
+/// removal and the sweep would otherwise claim, reply `Ok`, and leave its caller
+/// a barrier whose marker has no lane to arrive on.
 ///
 /// TEARDOWN is the one exception to that guarantee. This type's [`Drop`] is the
 /// ABNORMAL-path backstop only (a panic or a task cancellation, where no close
@@ -4424,8 +4429,9 @@ struct CookieRegistry<F: FsOps> {
   shutdown: Arc<AtomicBool>,
   ledger: CookieLedger,
   /// Per-scope retirement flags, cloned into each dispatched write. Raised
-  /// BEFORE a retiring scope's cookies are unlinked, so a write that lands
-  /// afterwards reaps itself instead of surviving. The entry is dropped with the
+  /// BEFORE a retiring scope's delivery lane is dismantled and before its cookies
+  /// are unlinked, so a write that lands afterwards reaps itself instead of
+  /// surviving. The entry is dropped with the
   /// scope (the write holds its own clone), so this never accrues dead scopes.
   retiring: HashMap<ScopeId, Arc<AtomicBool>>,
   /// Each live scope's LIVE ROOT: the canonical path its cookies may never be
@@ -5203,7 +5209,28 @@ impl<F: FsOps> CookieRegistry<F> {
     *retry_at = Some(now + delay);
   }
 
-  /// Retires `scope`: raise its flag FIRST — a write still in the pool then
+  /// Publishes `scope`'s retirement: the flag every dispatched write of the scope
+  /// re-reads as it hands its file over.
+  ///
+  /// Raised BEFORE the scope's delivery lane, control port, source tap, registry
+  /// entry or source go, because the interval between them is a window in which a
+  /// released write reads `shutdown = false`, `retiring = false` and an unchanged
+  /// generation, claims, publishes `Owned` and replies `Ok` — and its marker's
+  /// source message is then refused for a lane that no longer exists, leaving the
+  /// caller a successful, unsatisfiable barrier. With the flag up first the write
+  /// answers `Retired` and self-reaps, which is the truth about a stream that is
+  /// ending.
+  ///
+  /// Idempotent: the entry is taken on the first call, and the reaping sweep
+  /// ([`retire_scope`](Self::retire_scope)) opens with it so a caller that has no
+  /// interval to close still publishes before it sweeps.
+  fn publish_retiring(&mut self, scope: ScopeId) {
+    if let Some(flag) = self.retiring.remove(&scope) {
+      flag.store(true, Ordering::SeqCst);
+    }
+  }
+
+  /// Retires `scope`: publish its flag FIRST — a write still in the pool then
   /// finds its claim refused and reaps itself, rather than landing a file into a
   /// scope nothing will sweep again — then route every cookie the scope still
   /// owns through the phase machine (§2.7): `Owned` and PARKED `RemoveFailed`
@@ -5226,9 +5253,7 @@ impl<F: FsOps> CookieRegistry<F> {
   where
     R: RuntimeLite,
   {
-    if let Some(flag) = self.retiring.remove(&scope) {
-      flag.store(true, Ordering::SeqCst);
-    }
+    self.publish_retiring(scope);
     self.roots.remove(&scope);
     // The generation is per-scope and dies with it — a retired scope's writes
     // are already revoked by the flag above, so the generation has no work left.
@@ -5255,9 +5280,10 @@ impl<F: FsOps> CookieRegistry<F> {
   }
 
   /// Raises the shutdown flag WITHOUT sweeping — the orderly close's first step,
-  /// so a write landing during the close drain finds its claim refused and reaps
-  /// itself (inside its own tracked job) rather than landing a cookie owned but
-  /// unswept behind the sweep below.
+  /// taken BEFORE the close-time stream sweep, so a write landing while the
+  /// streams are being dismantled (or during the close drain) finds its claim
+  /// refused and reaps itself (inside its own tracked job) rather than landing a
+  /// cookie owned but unswept, or replying `Ok` for a marker whose lane is gone.
   fn begin_shutdown(&self) {
     self.shutdown.store(true, Ordering::SeqCst);
   }
@@ -5266,8 +5292,9 @@ impl<F: FsOps> CookieRegistry<F> {
   /// orderly close's sweep, run BEFORE the registry is dropped so the close grace
   /// COVERS the unlinks: a hung mount then makes close report `NotQuiesced`
   /// honestly rather than wedging, and each record is dropped as its unlink
-  /// confirms. Run after [`begin_shutdown`](Self::begin_shutdown), so nothing new
-  /// can land unswept behind it. Per-phase rules as
+  /// confirms. Run after [`begin_shutdown`](Self::begin_shutdown) — which the
+  /// close raises ahead of its stream sweep — so nothing new can land unswept
+  /// behind it. Per-phase rules as
   /// [`retire_scope`](Self::retire_scope) (§2.8).
   ///
   /// PARKED syncs are not this sweep's to resolve — they are pre-physical, and
@@ -5933,11 +5960,13 @@ pub(crate) enum Command {
   ///
   /// Idempotent to call on a scope whose probe is already outstanding (the
   /// ordinary `ScopeBusy` coalescing path runs, same as a real tick that finds
-  /// one in flight) and on a scope whose budget decline already latched this
-  /// episode (`on_refresh_declined`'s own once-per-episode rule applies
-  /// unchanged) — a suite that does not know which of several scopes is the
-  /// one left short a probe can drive every one of them through this command
-  /// and let the core's own idempotence sort it out.
+  /// one in flight) and on a scope whose budget decline still owes its covering
+  /// `Rescan` (`on_refresh_declined`'s own renewal rule applies unchanged: a
+  /// tick refused while that instruction is undelivered stands no second one and
+  /// recovers no watch set, recording only the window it could not prove) —
+  /// a suite that does not know which of several scopes is the one left short a
+  /// probe can drive every one of them through this command and let the core's
+  /// own idempotence sort it out.
   #[cfg(all(test, feature = "tokio", not(miri)))]
   DebugTickLiveness {
     /// The scope whose liveness deadline is forced due.
@@ -11271,8 +11300,10 @@ enum ControlBatchEnd {
 /// being watched for death by nothing at all — not by a probe of its own, and not
 /// by an in-tree notice a stalled write's descriptor can postpone without bound.
 /// So it degrades to a LOCATED `RESCAN`, not to silence: the turned-away scope
-/// goes through the core's loss funnel once per budget episode and its subscriber
-/// is told its coverage is unproven, which it answers by re-enumerating. The
+/// goes through the core's loss funnel at every refused tick — its watch set
+/// recovered once per episode, its subscriber told once per covering `Rescan`
+/// delivered — and learns that its coverage is unproven, which it answers by
+/// re-enumerating. The
 /// retry deadline is kept, so the scope recovers on its own the moment a slot
 /// frees. Nothing is logged and nothing is refused — a hung root is a hung mount,
 /// and a watcher whose roots are all wedged has a filesystem problem the watcher
@@ -12291,6 +12322,56 @@ pub(crate) async fn run<R, F>(
         item,
         &now,
       );
+      continue;
+    }
+
+    // THE LOOP ENTERS `select` ONLY WITH EMPTY QUEUES. The flush at the loop top
+    // is the whole of this pass's flushing, and the widen catch-ups and the cover
+    // settlements above run on its far side: the dispatch re-judge of a parked
+    // obligation is the proven producer — it stands the covering `Rescan` its
+    // `Dominated` terminal promises and then answers the caller — and an arm
+    // failure or any future post-flush producer is the class. Consulting ONE
+    // stat-specific flag for them was never the right question: with liveness
+    // polling disabled and no further event, command or timer, the loop parked in
+    // `select` while a promised instruction sat in the core's effect queue, and the
+    // caller had already been told it was on the stream.
+    //
+    // So re-top whenever either queue is non-empty AND nothing is ready for the
+    // select. Every producer that runs after the flush — this one and any future
+    // one — is thereby flushed before the driver sleeps, and the stat-specific flag
+    // above keeps its own purpose.
+    //
+    // The readiness leg is this gate's discharge of the BOUNDED-SERVICE INVARIANT
+    // above, which it owes exactly as the two source-drain phases do: no `continue`
+    // re-top may loop indefinitely while an internal completion, a grant unwind, a
+    // command or the deadline is pending. Read off ONE pass, the queue test bounds
+    // itself — the loop top empties both queues, and only a post-flush producer can
+    // refill them. A SEQUENCE of passes is not bounded by that: while a quiesced
+    // fence awaits its cut proof the settlement drain above ingests another batch
+    // every pass and queues its emit, so under sustained source traffic an
+    // unconditional re-top defers the very `ControlBatchDone` that settles the
+    // fence — and with it every timer, every unwind and `Close` — for as long as
+    // the traffic lasts.
+    //
+    // When service IS ready the loop falls through and the select returns at once:
+    // a ready lane never sleeps. Each disjunct of `service_ready` makes an arm ready
+    // on its first poll, this loop is the sole consumer of all three channels and
+    // the clock is monotone, so nothing between that read and the select can
+    // un-ready one; and the four service arms all outrank the cleanup wake and the
+    // source stream, so the arm taken here is never the source arm — the pass
+    // cannot ingest a further record ahead of the effects it is carrying — and the
+    // timer is never awaited to reach it. The next loop top then drains and flushes
+    // both queues before anything else, which is where a fallen-through pass's
+    // instructions go out. The two arms that do not return to that top are `Close`
+    // and a closed command channel, which leave for the orderly shutdown whose final
+    // event drain is already best-effort: an instruction outliving a close is the
+    // end of delivery, not a driver parked while its caller waits on what it was
+    // promised.
+    //
+    // The gate sits last, after both source-drain phases, so it defers nothing
+    // either of them was waiting for, and it is consulted strictly after the drain
+    // and the resolve it protects, so barrier honesty is untouched either way.
+    if !service_ready && (core.has_queued_effects() || core.has_barrier_moves()) {
       continue;
     }
 
@@ -13830,6 +13911,14 @@ pub(crate) async fn run<R, F>(
   // whole: the reclaims and the detach below are calls that can unwind, and a
   // sweep that emptied the map first would leave every stream it had not reached
   // yet with no guard at all (see [`StreamReservoir::take_live`]).
+  //
+  // The shutdown flag is raised FIRST, ahead of the sweep rather than after it: a
+  // write released while the sweep is dismantling the streams would otherwise read
+  // `shutdown = false` and a scope whose retirement no teardown effect will ever
+  // publish, claim, and reply `Ok` for a marker whose lane is already gone. Raised
+  // here it answers `Retired` and self-reaps, and the sweep of what the registry
+  // owns still runs below, after the streams are quiesced.
+  cookies.begin_shutdown();
   while let Some((scope, stream)) = streams.take_live() {
     registry.scope_dead(scope);
     // The same detachment normal `TeardownStream` performs, at the same point
@@ -13863,12 +13952,11 @@ pub(crate) async fn run<R, F>(
   // Route every cookie the registry owns through the removal state machine
   // BEFORE the grace, so a hung unlink makes close report `NotQuiesced` honestly
   // rather than wedging — never a synchronous unlink in the registry's `Drop`.
-  // Raise the shutdown flag first: a write still in the pool then finds its
-  // claim refused and self-reaps rather than landing a cookie owned but unswept
-  // behind this sweep. A straggler write's FAILED self-reap landing mid-drain
-  // re-inserts a `RemoveFailed` record — the live-ledger drain condition below
-  // cannot miss it (finding 4, closed structurally rather than by counting).
-  cookies.begin_shutdown();
+  // The shutdown flag is already up (raised ahead of the stream sweep): a write
+  // still in the pool finds its claim refused and self-reaps rather than landing
+  // a cookie owned but unswept behind this sweep. A straggler write's FAILED
+  // self-reap landing mid-drain re-inserts a `RemoveFailed` record — the
+  // live-ledger drain condition below cannot miss it.
   cookies.sweep_owned::<R>(&op_tx);
   // A sync still PARKED at close never had a write dispatched, so there is nothing
   // to sweep for it and nothing to wait on: it reaches the pre-physical terminal
@@ -16908,6 +16996,16 @@ fn execute_effects<R, F>(
         });
       }
       Effect::TeardownStream { scope } => {
+        // RETIREMENT IS PUBLISHED BEFORE THE DELIVERY LANE IS DISMANTLED. Every
+        // line below takes away something a dispatched write's marker needs to be
+        // reportable — the lane, the control port, the source tap, the registry
+        // entry, the source itself — while the write's own interlocks still read
+        // live. A write released inside that interval would create its marker,
+        // claim, publish `Owned` and reply `Ok`, and its source message would then
+        // be refused for a lane that no longer exists: a successful barrier
+        // nothing can satisfy. With the flag up first the write answers `Retired`
+        // and reaps its own file.
+        cookies.publish_retiring(scope);
         scope_backends.remove(&scope);
         // The delivery lane (the transport generation) is reclaimed with the
         // scope — scope ids are never reused, so leaving it would grow `lanes`
@@ -16975,6 +17073,7 @@ fn execute_effects<R, F>(
       }
       Effect::AddWatch {
         scope,
+        incarnation,
         watch,
         attempt,
         parent,
@@ -16982,6 +17081,19 @@ fn execute_effects<R, F>(
         path,
         expected,
       } => {
+        // EVERY QUEUED EFFECT OF A SCOPE BELONGS TO ONE INCARNATION. A commit
+        // that replaced this scope's root retired the ground this arm names, and
+        // the transport generation fences only batches already EMITTED: left
+        // standing, this one is relabelled onto the replacement's lane, passes
+        // its generation check and opens the retired root ahead of the corrective
+        // reproof — and an open that blocks on a retired mount wedges the
+        // replacement's reader, on a `Replace` that has already answered `Ok`.
+        // Dropped BEFORE the batch is collected, so no syscall of the old world
+        // is ever dispatched, and without touching the scope's pending flags: the
+        // live world's own work is queued behind this and owns them.
+        if !core.effect_is_current(scope, incarnation) {
+          continue;
+        }
         // Droppable at close, unlike spawns and teardowns: a result that
         // never lands leaves the Monitor node Arming, and the node dies with
         // its scope. The kernel watch (if the arm did install one) is not
@@ -17000,7 +17112,17 @@ fn execute_effects<R, F>(
             expected,
           });
       }
-      Effect::RemoveWatch { scope, watch } => {
+      Effect::RemoveWatch {
+        scope,
+        incarnation,
+        watch,
+      } => {
+        // The retired world's disarm, dropped for the reason its arm is: the
+        // commit rebuilt the scope's bindings, and every wd on the retired
+        // transport went with the fd it was opened on.
+        if !core.effect_is_current(scope, incarnation) {
+          continue;
+        }
         // Fire-and-forget by contract; droppable at close for the same
         // fd-reclamation reason as AddWatch. Batched with this scope's arms.
         control_batches
@@ -17008,7 +17130,19 @@ fn execute_effects<R, F>(
           .or_default()
           .push(ControlRequest::Disarm { watch });
       }
-      Effect::Enumerate { req, watch, path } => {
+      Effect::Enumerate {
+        scope,
+        incarnation,
+        req,
+        watch,
+        path,
+      } => {
+        // A listing of the world this scope no longer watches: the commit dropped
+        // its enumerate context, so the result could only be discarded, and the
+        // blocking `readdir` would run against the retired root.
+        if !core.effect_is_current(scope, incarnation) {
+          continue;
+        }
         // Droppable at close: a listing that never lands leaves the Monitor
         // node Enumerating; the scope teardown clears its pending request.
         // No OS resource is held by a readdir.
@@ -17029,7 +17163,18 @@ fn execute_effects<R, F>(
           let _ = tx.try_send(OpResult::Enumerated { req, raw });
         });
       }
-      Effect::Probe { probe, path } => {
+      Effect::Probe {
+        scope,
+        incarnation,
+        probe,
+        path,
+      } => {
+        // A stat of the world this scope no longer watches: the commit dropped
+        // its probe context, so the answer would be inert, and the `lstat` would
+        // run against the retired root.
+        if !core.effect_is_current(scope, incarnation) {
+          continue;
+        }
         let ops = ops.clone();
         let tx = op_tx.clone();
         R::spawn_blocking_detach(move || {
@@ -17037,7 +17182,11 @@ fn execute_effects<R, F>(
           let _ = tx.try_send(OpResult::Probed { probe, outcome });
         });
       }
-      Effect::RefreshMounts { scope, root } => {
+      Effect::RefreshMounts {
+        scope,
+        incarnation,
+        root,
+      } => {
         // A liveness probe NEVER rides the blocking pool. The pool is where the
         // very thing this probe exists to outlive is stalled: a sync's cookie
         // write holding the only worker of a legal one-worker pool starves the
@@ -17069,8 +17218,9 @@ fn execute_effects<R, F>(
         // the scope's pending mark drops and its next tick re-arms rather than
         // coalescing onto a probe that was never sent — and, because a scope the
         // budget turned away has no proof of liveness at all, the core routes it
-        // through its loss funnel once per episode instead of leaving it falsely
-        // live and silent.
+        // through its loss funnel once per covering `Rescan` delivered, so a root
+        // that dies under a saturation this scope cannot outlast is reported
+        // again instead of being left falsely live and silent.
         //
         // The TAG is what makes a replacement root independent of the retiring
         // one: a replace commit retires the scope's tag, so the replacement's own
@@ -17081,6 +17231,24 @@ fn execute_effects<R, F>(
         // outright: the core has already dropped its state, so the answer would
         // be inert and the thread would be spent for nothing.
         if torn_down.contains(&scope) {
+          continue;
+        }
+        // The tag fences probes already DISPATCHED. An effect still QUEUED when a
+        // replacement or a widen committed is not a probe yet, and belongs to ONE
+        // root incarnation: claiming for it would hand the OLD root's `stat` the
+        // NEW world's tag, so its answer would pass the fence and be judged
+        // against an identity it never described — a false whole-scope move, or a
+        // hung old `stat` blocking the live world's first liveness proof. The
+        // effect carries the incarnation it was armed against, so that stamp is
+        // the test. Path equality is never the test: a same-path replacement
+        // leaves the root bytes equal across a world this effect did not survive.
+        //
+        // Dropped silently — `refresh_pending` is deliberately left alone. That
+        // flag stands for the live world's own refresh, queued behind this one,
+        // which owns it and claims the fresh tag on this same pass. Reporting a
+        // decline here would withdraw that mark and raise a funnel for a window
+        // nothing is failing to prove.
+        if !core.effect_is_current(scope, incarnation) {
           continue;
         }
         let generation = match probes.claim(scope) {

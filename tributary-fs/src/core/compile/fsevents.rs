@@ -92,7 +92,12 @@ impl DriverCore {
         }),
         ItemPlan::Await { probe, path } => {
           awaiting += 1;
-          self.effects.push_back(Effect::Probe { probe, path });
+          self.effects.push_back(Effect::Probe {
+            scope,
+            incarnation: state.incarnation,
+            probe,
+            path,
+          });
           items.push(Item {
             planned: Vec::new(),
             probe: Some(probe),
@@ -107,6 +112,7 @@ impl DriverCore {
       trailing,
       deferred_unmounts,
       evidenced: BTreeMap::new(),
+      deferred_consumptions: Vec::new(),
       permit: None,
     }
   }

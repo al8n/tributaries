@@ -3190,7 +3190,7 @@ fn a_consumed_pending_move_tears_its_held_subtree_down_at_once() {
     "staging: the departure has not been reported yet"
   );
 
-  m.consume_pending_move(scope(1), cookie(1), at(11));
+  m.consume_pending_move(scope(1), cookie(1));
 
   let events = drain_events(&mut m);
   assert!(
@@ -3208,202 +3208,32 @@ fn a_consumed_pending_move_tears_its_held_subtree_down_at_once() {
   );
 }
 
-/// Consuming a cookie nothing is parked under emits nothing and queues nothing:
-/// the fence asks for every widened rename it takes, and most of them never
-/// parked a half here. What it DOES do is remember the consumption, on the
-/// deadline the half's own window would have carried.
+/// Consuming a cookie nothing is parked under emits nothing, queues nothing and
+/// REMEMBERS nothing: the fence asks for every widened rename it takes, and most
+/// of them never parked a half here.
+///
+/// The caller is the one that knows when the half it names can exist, so an
+/// absent half is an absent obligation, not a note to keep. A note would be keyed
+/// by a cookie its source draws from a finite space, and a value reused inside the
+/// move window would then be taken by an unrelated later rename.
+///
+/// Revert witness: remember the consumption and the timer below is armed on the
+/// window it stood in for.
 #[test]
-fn consuming_an_unparked_cookie_emits_nothing_and_is_remembered() {
+fn consuming_an_unparked_cookie_emits_nothing_and_remembers_nothing() {
   let mut m = per_dir();
   let _root = live_root(&mut m, scope(1));
   let _ = drain_actions(&mut m);
   let _ = drain_events(&mut m);
 
-  m.consume_pending_move(scope(1), cookie(7), at(5));
+  m.consume_pending_move(scope(1), cookie(7));
 
   assert!(drain_events(&mut m).is_empty(), "no half, no emission");
   assert!(drain_actions(&mut m).is_empty(), "and no action either");
   assert_eq!(
     m.poll_timeout(),
-    Some(at(5) + DEFAULT_MOVE_WINDOW),
-    "the consumption is remembered, on the window it stands in for"
-  );
-}
-
-/// The scope-1 tree `root/d/g`, both directories watched and every staging
-/// action and event already drained — the subtree a cookied `MovedFrom` at
-/// `root/d` detaches and holds.
-fn held_subtree(m: &mut Monitor) -> (WatchId, WatchId, WatchId) {
-  let root = live_root(m, scope(1));
-  let _ = drain_actions(m);
-  let _ = drain_events(m);
-
-  m.on_os_record(
-    OsRecord::new(root, RecordKind::Created)
-      .with_name(seg("d"))
-      .with_is_dir(true),
-    at(1),
-  );
-  let w_d = drain_actions(m)[0].as_watch().unwrap().id();
-  m.ack_watch(w_d, Ok(WatchAck::Installed));
-  let _ = drain_actions(m);
-  m.on_os_record(
-    OsRecord::new(w_d, RecordKind::Created)
-      .with_name(seg("g"))
-      .with_is_dir(true),
-    at(2),
-  );
-  let w_g = drain_actions(m)[0].as_watch().unwrap().id();
-  m.ack_watch(w_g, Ok(WatchAck::Installed));
-  let _ = drain_actions(m);
-  let _ = drain_events(m);
-  (root, w_d, w_g)
-}
-
-/// The cookied `MovedFrom` at `root/d` that parks — or, under a remembered
-/// consumption, resolves — the half.
-fn moved_from_d(m: &mut Monitor, root: WatchId, now: Instant) {
-  m.on_os_record(
-    OsRecord::new(root, RecordKind::MovedFrom)
-      .with_name(seg("d"))
-      .with_cookie(cookie(1))
-      .with_is_dir(true),
-    now,
-  );
-}
-
-/// What a consumer saw, stripped to the facts a resolution owes: the kind and the
-/// location, in order.
-fn shape(events: &[Change]) -> Vec<(ChangeKind, Location)> {
-  events
-    .iter()
-    .map(|e| (e.kind().clone(), e.location().clone()))
-    .collect()
-}
-
-/// A consumption that arrives BEFORE the half resolves that half the moment it
-/// arrives, into exactly what its window's expiry would have produced.
-///
-/// This is the ordering a batch-classifying profile always has: every fence runs
-/// ahead of every feed, so the widened destination is judged — and its
-/// consumption taken — before the settlement grants the source its cookie and
-/// feeds the `MovedFrom`. Parking that half would hold its detached subtree, and
-/// the scope's move settle with it, for a window no destination can end.
-///
-/// The two runs are the whole assertion: the same tree, the same record, the same
-/// resolution, reached once through the remembered consumption and once through
-/// the expiry, and the consumer sees the same sequence either way.
-///
-/// Revert witness: park the half instead of resolving it and the first run emits
-/// nothing at all, `poll_timeout` names the far deadline, and both watches are
-/// still armed.
-#[test]
-fn a_consumption_before_the_half_resolves_it_exactly_as_its_expiry_would() {
-  let remembered = {
-    let mut m = per_dir();
-    let (root, w_d, w_g) = held_subtree(&mut m);
-
-    m.consume_pending_move(scope(1), cookie(1), at(9));
-    moved_from_d(&mut m, root, at(10));
-
-    assert!(!m.is_watched(w_d), "the held subtree is shed on arrival");
-    assert!(!m.is_watched(w_g), "and its descendants go with it");
-    assert_eq!(
-      m.poll_timeout(),
-      None,
-      "nothing is left parked, and the memory was taken by the half it named"
-    );
-    shape(&drain_events(&mut m))
-  };
-
-  let expired = {
-    let mut m = per_dir();
-    let (root, w_d, w_g) = held_subtree(&mut m);
-
-    moved_from_d(&mut m, root, at(10));
-    assert!(
-      m.is_watched(w_d) && m.is_watched(w_g),
-      "staging: this run really did park and hold"
-    );
-    m.handle_timeout(at(10) + DEFAULT_MOVE_WINDOW);
-
-    assert!(!m.is_watched(w_d) && !m.is_watched(w_g));
-    shape(&drain_events(&mut m))
-  };
-
-  assert!(
-    !remembered.is_empty(),
-    "non-vacuity: the resolution reports the source-side departure"
-  );
-  assert_eq!(
-    remembered, expired,
-    "the same emissions, the source-side departure included"
-  );
-}
-
-/// A remembered consumption expires on the move window's own clock, in the pass
-/// that ticks the parked halves' expiries — so a half arriving after it is the
-/// ordinary unpairable one, and a cookie reused past the window parks as it
-/// always did.
-///
-/// Revert witness: drop the `consumed_moves` retain from `handle_timeout` and the
-/// late `MovedFrom` below is resolved at once instead of parking, turning a real
-/// rename's pairing into a departure.
-#[test]
-fn a_remembered_consumption_expires_on_the_move_window() {
-  let mut m = per_dir();
-  let (root, w_d, w_g) = held_subtree(&mut m);
-
-  m.consume_pending_move(scope(1), cookie(1), at(9));
-  assert_eq!(
-    m.poll_timeout(),
-    Some(at(9) + DEFAULT_MOVE_WINDOW),
-    "staging: the memory names its deadline, so the timer is armed for it"
-  );
-
-  m.handle_timeout(at(9) + DEFAULT_MOVE_WINDOW);
-  assert_eq!(m.poll_timeout(), None, "the memory expired with its window");
-
-  let late = at(9) + DEFAULT_MOVE_WINDOW + Duration::from_millis(1);
-  moved_from_d(&mut m, root, late);
-  assert!(
-    m.is_watched(w_d) && m.is_watched(w_g),
-    "a half arriving after the memory expired parks and holds, as any other does"
-  );
-  assert_eq!(
-    m.poll_timeout(),
-    Some(late + DEFAULT_MOVE_WINDOW),
-    "on a window of its own"
-  );
-}
-
-/// A remembered consumption dies with its scope: no source of a scope whose world
-/// has ended can validly arrive, so the memory has nothing left to name — and a
-/// re-registered generation of the `ScopeId` must not find it.
-///
-/// Revert witness: drop the `consumed_moves` retain from
-/// `purge_scope_pending_moves` and `poll_timeout` still names the dead scope's
-/// deadline after the unregister.
-#[test]
-fn a_remembered_consumption_is_purged_with_its_scope() {
-  let mut m = per_dir();
-  let _root = live_root(&mut m, scope(1));
-  let _ = drain_actions(&mut m);
-  let _ = drain_events(&mut m);
-
-  m.consume_pending_move(scope(1), cookie(1), at(9));
-  assert_eq!(
-    m.poll_timeout(),
-    Some(at(9) + DEFAULT_MOVE_WINDOW),
-    "staging: the memory is held"
-  );
-
-  m.unregister_root(scope(1));
-
-  assert_eq!(
-    m.poll_timeout(),
     None,
-    "the scope's memories go with the halves they shadow"
+    "and nothing is left waiting on a window"
   );
 }
 

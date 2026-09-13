@@ -203,6 +203,11 @@ pub(crate) enum Effect {
   },
   /// `lstat` one path and feed the outcome back under `probe`.
   Probe {
+    /// The scope whose ground this path names.
+    scope: ScopeId,
+    /// The root incarnation this stat belongs to
+    /// ([`incarnation`](ScopeState::incarnation)).
+    incarnation: u64,
     /// The correlation id the result must echo.
     probe: ProbeId,
     /// The absolute path to stat.
@@ -227,6 +232,9 @@ pub(crate) enum Effect {
   AddWatch {
     /// The scope whose live source executes the arm.
     scope: ScopeId,
+    /// The root incarnation this arm belongs to
+    /// ([`incarnation`](ScopeState::incarnation)).
+    incarnation: u64,
     /// The Monitor watch being armed.
     watch: WatchId,
     /// The arm ATTEMPT this effect executes, echoed back with its outcome. A
@@ -256,12 +264,20 @@ pub(crate) enum Effect {
   RemoveWatch {
     /// The scope whose live source executes the disarm.
     scope: ScopeId,
+    /// The root incarnation this disarm belongs to
+    /// ([`incarnation`](ScopeState::incarnation)).
+    incarnation: u64,
     /// The Monitor watch being disarmed.
     watch: WatchId,
   },
   /// Read one directory (blocking readdir + per-entry stat), reporting the
   /// raw listing through [`on_enumerated`](DriverCore::on_enumerated).
   Enumerate {
+    /// The scope whose ground this directory belongs to.
+    scope: ScopeId,
+    /// The root incarnation this listing belongs to
+    /// ([`incarnation`](ScopeState::incarnation)).
+    incarnation: u64,
     /// The correlation id the result must echo.
     req: ReqId,
     /// The directory's watch.
@@ -277,6 +293,12 @@ pub(crate) enum Effect {
   RefreshMounts {
     /// The scope whose device-trust table went stale.
     scope: ScopeId,
+    /// The root incarnation this refresh belongs to
+    /// ([`incarnation`](ScopeState::incarnation)). A refresh armed against a
+    /// world a commit has since retired is dropped at the poll site; path
+    /// equality is never the test, because a same-path replacement leaves the
+    /// root bytes equal ([`effect_is_current`](DriverCore::effect_is_current)).
+    incarnation: u64,
     /// The canonical root to enumerate mounts under.
     root: Arc<PathBuf>,
   },
@@ -1407,6 +1429,22 @@ struct PendingBatch {
   /// (see [`DriverCore::grant_evidenced_cookies`]), and probe completion
   /// order must not decide which partner a cover points at.
   evidenced: BTreeMap<NonZeroU64, Vec<PathBuf>>,
+  /// The move cookies whose consumption RIDES THIS BATCH: a rename whose
+  /// destination the prune seat covers, judged by the fence on a profile that
+  /// classifies the whole read before feeding any of it, so the source half the
+  /// consumption names is not parked yet and cannot be taken at the fence. They
+  /// are consumed in [`settle`](DriverCore::settle), immediately after this
+  /// batch's records have been fed — the settlement that parks the half — and
+  /// nowhere later. A profile that answers [`feeds_at_classify`] takes its halves
+  /// at the fence and leaves this empty.
+  ///
+  /// Bounded by the batch's own item count: at most one entry per widened
+  /// cookie-carrying `MovedTo`, and each compiled item plans at most one of those
+  /// (a rename item's lowering plans the `MovedFrom`/`MovedTo` pair together).
+  /// `trailing` and the late-born repairs are located instructions, which carry no
+  /// cookie at all. So the batch's transport permit bounds this exactly as it
+  /// bounds the items.
+  deferred_consumptions: Vec<MoveCookie>,
 }
 
 /// Per-root batch parking: while a batch has probes in flight, later batches
@@ -1537,6 +1575,25 @@ struct ScopeState {
   /// source's [`RootMeta`] must agree.
   profile: BackendKind,
   requested: PathBuf,
+  /// Which WORLD this scope watches now: a monotone count of the commits that
+  /// have replaced or widened its root.
+  ///
+  /// Every queued effect of a scope belongs to one incarnation. A commit that
+  /// retires the root leaves the queue holding obligations armed against ground
+  /// the scope no longer watches, and a syscall that blocks on a retired mount
+  /// wedges the replacement's reader — so each scope-bound effect that touches
+  /// the ground is stamped with this when it is queued, and the driver drops a
+  /// stale-stamped one at the poll site before any syscall, without touching the
+  /// scope's pending flags ([`effect_is_current`](DriverCore::effect_is_current)).
+  ///
+  /// The stamp is the INVARIANT at that single reader, not the load-bearing
+  /// belt: `on_root_replaced` purges the scope's queued ground-touching effects
+  /// before it queues the live world's own, and every producer that can run after
+  /// a commit is lane-, tag- or attempt-fenced, so no stale effect should reach
+  /// the poll site at all. The purge is a discipline every future world-swapping
+  /// site has to remember; this holds for a site nobody remembered, and its reach
+  /// does not end at the queue.
+  incarnation: u64,
   /// Canonicalized root bytes — known once the stream spawned. Shared so
   /// every delivery can carry it without copying.
   root: Option<Arc<PathBuf>>,
@@ -1580,26 +1637,45 @@ struct ScopeState {
   /// predate the newly-lost window, so its result is discarded and one more
   /// refresh re-arms.
   refresh_stale: bool,
-  /// This scope is inside a probe-BUDGET episode: a refresh it armed was
-  /// declined because every liveness-probe slot in the watcher was held
-  /// ([`DeclineReason::BudgetFull`]), and the covering `Rescan` that says so has
-  /// already been routed.
+  /// The ONE watch-set recovery a probe-BUDGET episode owes, already made: a
+  /// refresh this scope armed was declined because every liveness-probe slot in
+  /// the watcher was held ([`DeclineReason::BudgetFull`]), and the covering
+  /// `Rescan` for that decline was minted through the Monitor's overflow path,
+  /// which reconciles the watch set along with it.
   ///
-  /// It is an EPISODE latch, not a counter: the loss is "this root's liveness is
-  /// unproven", one fact that stays true for as long as the budget stays full,
-  /// and a subscriber that re-enumerates on the first `Rescan` learns nothing
-  /// from a second one every interval. Cleared by the next refresh of this scope
-  /// that actually completes — the moment a probe answers, the liveness claim is
-  /// proven again and a later episode is a new fact.
-  budget_lossy: bool,
-  /// A root REPLACE committed while a refresh was in flight: that snapshot
-  /// describes the replaced world, so EVERYTHING it carries — the liveness
-  /// verdict included — is about an object this scope no longer watches.
-  /// Its result is discarded whole and one refresh re-arms against the live
-  /// world. Distinct from [`refresh_stale`](Self::refresh_stale), which
-  /// gates only the table/frame: same-world death evidence must survive a
-  /// loss, but a cross-world verdict must not survive a replace.
-  refresh_world_stale: bool,
+  /// Once per EPISODE, because the reconcile is the expensive half and a decline
+  /// is not what makes it necessary. On a binding-re-proving profile it bumps
+  /// the loss generation, reinstalls the root and re-proves every retained
+  /// descendant under it; a second one per liveness interval invalidates the
+  /// generation the first is still arming under, so a large tree restarts its
+  /// reproof for as long as the saturation lasts and never settles. A declined
+  /// probe read nothing and dropped nothing: what it failed to establish is the
+  /// ROOT's liveness, which no re-add establishes either.
+  ///
+  /// Cleared by a refresh of this scope that actually completes — the moment a
+  /// probe answers, the episode is over and a later decline opens a new one.
+  budget_recovered: bool,
+  /// A probe-BUDGET report this scope has not yet handed the consumer: the
+  /// covering `Rescan` for a [`BudgetFull`](DeclineReason::BudgetFull) decline
+  /// was queued and is still owed.
+  ///
+  /// It bounds the RATE of the report, never the number of reports. An EVENT IS
+  /// NOT A STATE: a `Rescan` is a point-in-time instruction to re-enumerate,
+  /// which a subscriber discharges by re-enumerating, and nothing on this
+  /// crate's surface lets one stand for "and keep re-checking". So a root that
+  /// dies quietly after the first `Rescan` must still be reported — and under a
+  /// saturated budget it is a root whose scope can never dispatch the probe that
+  /// would prove it alive. Every later tick refused `BudgetFull` therefore
+  /// reports again, and the liveness interval — which the consumer chose — is
+  /// what bounds the rate.
+  ///
+  /// Cleared at this scope's next accepted delivery
+  /// ([`on_delivery`](DriverCore::on_delivery)), which is that covering `Rescan`
+  /// itself: the decline purges everything this scope had queued before minting
+  /// the instruction, so nothing of this scope's stands ahead of it. A `Rescan`
+  /// still queued is not doubled — the tick that finds this latch set stands no
+  /// second instruction, and records only the window it could not prove.
+  budget_report_owed: bool,
   lag: LagState,
   park: Park,
   /// The journal id counter wrapped; any minted resume token is invalid.
@@ -2370,6 +2446,7 @@ impl DriverCore {
         root_attempt: None,
         profile,
         requested: root,
+        incarnation: 0,
         root: None,
         root_dev: None,
         root_mnt_id: None,
@@ -2378,8 +2455,8 @@ impl DriverCore {
         mounts_authoritative: false,
         refresh_pending: false,
         refresh_stale: false,
-        budget_lossy: false,
-        refresh_world_stale: false,
+        budget_recovered: false,
+        budget_report_owed: false,
         lag: LagState::Normal,
         park: Park::default(),
         resume_poisoned: false,
@@ -2755,6 +2832,33 @@ impl DriverCore {
   /// order can only ever arrive behind one.
   pub(crate) fn take_barrier_moves(&mut self) -> Vec<BarrierMove> {
     self.barrier_moves.drain(..).collect()
+  }
+
+  /// Whether anything is waiting in the effect queue.
+  ///
+  /// The driver consults this immediately before it builds its timer and enters
+  /// `select`, so that it re-tops whenever a producer that ran AFTER the pass's
+  /// flush left work behind — the dispatch re-judge of a parked obligation is the
+  /// proven case, and any future post-flush producer is the class. Every such
+  /// producer is thereby flushed before the driver sleeps.
+  ///
+  /// The queue alone is the whole question at that point.
+  /// [`poll_effect`](Self::poll_effect) has two further offer sources — a lagging
+  /// scope's parked `Rescan` and a dying scope's terminal one — and both are
+  /// offered only under [`Attempt::Idle`], which the driver's own effect pass has
+  /// already taken every one of; a post-flush producer parks a change without ever
+  /// returning an attempt to `Idle`, and a REFUSED offer becomes
+  /// [`Attempt::Spent`], whose retry [`poll_timeout`](Self::poll_timeout) names
+  /// and the deadline arm serves.
+  pub(crate) fn has_queued_effects(&self) -> bool {
+    !self.effects.is_empty()
+  }
+
+  /// Whether a coverage transition is waiting to be drained — the other half of
+  /// the same question [`has_queued_effects`](Self::has_queued_effects) asks, for
+  /// the queue the driver drains ahead of every effect.
+  pub(crate) fn has_barrier_moves(&self) -> bool {
+    !self.barrier_moves.is_empty()
   }
 
   /// THE BARRIER FUNNEL: advances `scope`'s [`BarrierEpoch`] and records the
@@ -3736,8 +3840,10 @@ impl DriverCore {
               debug_assert!(false, "a spawned scope drained its root's bootstrap arm");
               return;
             };
+            let incarnation = state.incarnation;
             self.effects.push_back(Effect::AddWatch {
               scope,
+              incarnation,
               watch,
               attempt,
               parent: watch,
@@ -3830,7 +3936,16 @@ impl DriverCore {
       && let Some(state) = self.scopes.get_mut(&scope)
       && state.watch == watch
     {
-      state.publicly_live = true;
+      // The TRANSITION, not every root arm that answers `Ok`: a binding reproof
+      // re-adds this same root, and clearing the latch on one of those would
+      // discharge a report the consumer has not been handed and let the next
+      // refused tick stand a second instruction for it. On the transition the
+      // latch is already clear — nothing is owed before a scope is public
+      // ([`on_refresh_declined`](Self::on_refresh_declined)) — so this makes
+      // that bound structural rather than argued.
+      if !std::mem::replace(&mut state.publicly_live, true) {
+        state.budget_report_owed = false;
+      }
     }
     self.monitor.on_watch_result(watch, attempt, res);
     self.drain_monitor();
@@ -4006,9 +4121,15 @@ impl DriverCore {
     };
     let scope = ctx.scope;
     let resolved = Self::resolve(&mut state, ctx.purpose, outcome);
-    let resolved = self.fence_resolved(&state, scope, resolved, now);
+    // The fence has no batch in hand here — the park owns it — so a consumption it
+    // defers is collected and handed to that batch below, on the far side of the
+    // call and before the batch can settle. A resolution whose batch is already
+    // gone (a loss flush, a teardown) drops its records and its deferrals together.
+    let mut deferred = Vec::new();
+    let resolved = self.fence_resolved(&state, scope, resolved, &mut deferred);
     let mut fed = false;
     if let Some(batch) = state.park.active.as_mut() {
+      batch.deferred_consumptions.append(&mut deferred);
       if let Some((fid, partner)) = resolved.evidences {
         batch.evidenced.entry(fid).or_default().push(partner);
       }
@@ -4082,26 +4203,27 @@ impl DriverCore {
     }
 
     // The world swap — the on_stream_spawned adoption, on a live scope.
+    // Every queued effect of this scope belongs to the world it was armed
+    // against, so the incarnation moves with the root.
+    state.incarnation += 1;
     let root = Arc::new(meta.root);
     state.root = Some(root);
     state.root_dev = Some(meta.root_dev);
     state.root_mnt_id = meta.root_mnt_id;
     state.identity = Some(meta.identity);
     state.mounts = meta.mounts;
-    // The old world's authority cannot vouch for the new root's mounts:
-    // trust fails closed until the refresh this commit arms completes. A
-    // refresh already in flight was addressed to the REPLACED root — mark it
-    // cross-world so its completion (liveness verdict included) is discarded
-    // rather than judging the new identity by the old object.
-    state.refresh_world_stale = state.refresh_pending;
-    // And DISOWN it. Coalescing onto an outstanding refresh is right within one
-    // world and wrong across a commit: the old root's probe may be inside a
-    // `stat` on a wedged mount and never come back, and the replacement would
-    // then wait for it — no refresh of its own, so no mount authority and, worse,
-    // no root-liveness check at all, leaving an unmounted replacement reading
-    // live forever. The arm below therefore issues a REAL refresh rather than
-    // setting the stale bit, and the driver retires the scope's probe tag at the
-    // same commit so the old root's late answer is dropped instead of applied.
+    // The old world's authority cannot vouch for the new root's mounts: trust
+    // fails closed until the refresh this commit arms completes. A refresh
+    // already in flight is DISOWNED. Coalescing onto an outstanding refresh is
+    // right within one world and wrong across a commit: the old root's probe may
+    // be inside a `stat` on a wedged mount and never come back, and the
+    // replacement would then wait for it — no refresh of its own, so no mount
+    // authority and, worse, no root-liveness check at all, leaving an unmounted
+    // replacement reading live forever. `trust_lost` below therefore issues a
+    // REAL refresh rather than setting the stale bit, and the driver retires the
+    // scope's probe tag at the same commit — the ONE owner of the cross-world
+    // fence — so the old root's late answer is dropped before it reaches the
+    // core, and the fresh-tag completion this arms is applied on arrival.
     state.refresh_pending = false;
     state.refresh_stale = false;
     // A replace commit ends any witnessed widen window outright: the fallback
@@ -4111,7 +4233,6 @@ impl DriverCore {
     // reservation (INV-ROOT leg (i)).
     state.pending_widen = None;
     state.mounts_authoritative = false;
-    Self::arm_refresh(&mut self.effects, scope, state);
 
     // The cut: old-world parked work and probes are dominated, and the
     // Monitor turns the swap into the epoch-bumped covering Rescan.
@@ -4136,6 +4257,15 @@ impl DriverCore {
       BarrierLocation::Scope,
       true,
     );
+    // Every queued effect of this scope names the root this commit retired. The
+    // driver's generation fences probes already DISPATCHED and the transport
+    // generation fences control batches already EMITTED; an effect still QUEUED is
+    // neither yet, so at the next flush it is relabelled onto the replacement's
+    // lane and its syscall runs against the retired root ahead of the corrective
+    // work queued below — and one that blocks on a retired mount wedges the
+    // replacement's reader. Purge before re-arming, so the queue holds exactly the
+    // live world's obligations.
+    Self::purge_scope_effects(&mut self.effects, scope);
     Self::trust_lost(&mut self.effects, scope, state);
     self.probes.retain(|_, ctx| ctx.scope != scope);
     // Old-world enumerate contexts are dominated too: a descending replace's
@@ -4169,6 +4299,33 @@ impl DriverCore {
   /// widen predicate (old ⊂ new) compares against.
   pub(crate) fn root_path(&self, scope: ScopeId) -> Option<Arc<PathBuf>> {
     self.scopes.get(&scope).and_then(|state| state.root.clone())
+  }
+
+  /// Whether `incarnation` is the world `scope` watches NOW — the test the driver
+  /// applies to a queued scope-bound effect before it performs any syscall for it.
+  ///
+  /// A stale answer means the effect was armed against ground a commit has since
+  /// retired: running it would arm, list or stat the old root on the
+  /// replacement's transport, ahead of the corrective work the commit queued.
+  /// Path equality is never the test — a same-path replacement leaves the root
+  /// bytes equal across a world the effect did not survive.
+  ///
+  /// `false` for a scope this core does not hold — an obligation of a torn-down
+  /// scope describes no world at all.
+  pub(crate) fn effect_is_current(&self, scope: ScopeId, incarnation: u64) -> bool {
+    self
+      .scopes
+      .get(&scope)
+      .is_some_and(|state| state.incarnation == incarnation)
+  }
+
+  /// The incarnation a scope-bound effect queued NOW belongs to — the ONE place
+  /// a stamp is read off the scope, so every push site stamps the same way.
+  ///
+  /// An unknown scope answers the birth value: it queues no effect anyone will
+  /// poll, and the poll site refuses it on the scope's absence in any case.
+  fn incarnation_of(&self, scope: ScopeId) -> u64 {
+    self.scopes.get(&scope).map_or(0, |state| state.incarnation)
   }
 
   /// A live scope's compiled `prune` seat.
@@ -4477,17 +4634,19 @@ impl DriverCore {
 
     // The world swap — the same adoption `on_root_replaced` performs, minus
     // every cut: the new root is a different object, so mount trust fails
-    // closed until the refresh this arms completes, and an in-flight refresh
-    // was addressed to the OLD root and must be discarded on completion.
+    // closed until the refresh this arms completes.
+    state.incarnation += 1;
     state.root = Some(root);
     state.root_dev = Some(meta.root_dev);
     state.root_mnt_id = meta.root_mnt_id;
     state.identity = Some(meta.identity);
     state.mounts = meta.mounts;
-    state.refresh_world_stale = state.refresh_pending;
-    // Disowned for the reason the stream replace disowns it: a widened root is a
-    // different object, and its first refresh must not be one the OLD root's
-    // possibly-wedged probe still owes (see [`Self::on_root_replaced`]).
+    // An in-flight refresh is disowned for the reason the stream replace disowns
+    // it: a widened root is a different object, and its first refresh must not be
+    // one the OLD root's possibly-wedged probe still owes. The driver retires the
+    // scope's probe tag at this commit too, so the old root's answer is dropped
+    // before the core sees it and the refresh armed below is applied on arrival
+    // (see [`Self::on_root_replaced`]).
     state.refresh_pending = false;
     state.refresh_stale = false;
     // The witnessed window is CONSUMED by the commit (INV-ROOT): it was clean
@@ -4501,6 +4660,18 @@ impl DriverCore {
     // its loss is signalled, and neither happened — so the binding is live
     // and correctly placed NOW, with no out-of-band sample consulted.
     state.pending_widen = None;
+    // The refresh alone is superseded, and the widen purges it for the reason the
+    // stream replace does: it was armed against a different object, and the
+    // driver's generation reaches only probes already dispatched (see
+    // [`Self::on_root_replaced`]). The rest of the queue is CARRIED into the new
+    // incarnation rather than taken: a widen adopts the old root as a child of
+    // the new one, keeps the transport and every watch id, and re-queues nothing
+    // for the subtree, so its queued arms, disarms, listings and stats name ground
+    // that is still live and still owed — dropping one would leave its Monitor
+    // node arming with no arm outstanding and nothing to re-issue it.
+    let incarnation = state.incarnation;
+    Self::purge_scope_refreshes(&mut self.effects, scope);
+    Self::rebase_scope_effects(&mut self.effects, scope, incarnation);
     Self::trust_lost(&mut self.effects, scope, state);
     Self::arm_liveness(state, liveness, now);
 
@@ -4594,7 +4765,11 @@ impl DriverCore {
       return;
     };
     state.refresh_pending = true;
-    effects.push_back(Effect::RefreshMounts { scope, root });
+    effects.push_back(Effect::RefreshMounts {
+      scope,
+      incarnation: state.incarnation,
+      root,
+    });
   }
 
   /// Withdraws the refresh `scope` has pending because the driver DECLINED to
@@ -4633,12 +4808,52 @@ impl DriverCore {
   /// alive on no evidence. The retry deadline is kept: this is a degradation, not
   /// a terminal.
   ///
-  /// ONCE per episode ([`budget_lossy`](ScopeState::budget_lossy)). The fact is
-  /// "this root's liveness is unproven", which does not become more true each
-  /// interval, and a `Rescan` per tick against a saturated budget would be a
-  /// re-enumeration storm on top of a filesystem that is already wedged. The
-  /// latch clears at the next completing refresh of this scope, so a LATER
-  /// episode reports again.
+  /// TWO LATCHES, because the report and the watch-set recovery are owed on
+  /// different schedules.
+  ///
+  /// The RECOVERY ([`budget_recovered`](ScopeState::budget_recovered)) is the
+  /// reconcile the Monitor's overflow path performs along with its mint, and it
+  /// is made once per EPISODE: a declined probe read nothing and dropped
+  /// nothing, so re-proving every binding under the root answers a question
+  /// nobody asked, and repeating it every interval invalidates the generation
+  /// the previous one is still arming under. It clears at a refresh that
+  /// completes, so an episode a probe ends is over and a later one is new.
+  ///
+  /// The REPORT ([`budget_report_owed`](ScopeState::budget_report_owed)) is
+  /// RENEWABLE: once per covering `Rescan` DELIVERED. An EVENT IS NOT A STATE —
+  /// the instruction says "re-enumerate now", and a subscriber that does so has
+  /// discharged it — so a root that dies quietly after the first one would stay
+  /// falsely live for as long as the saturation lasts, and a scope the budget
+  /// starves can never dispatch the probe that would end the episode. The
+  /// liveness interval bounds the rate, and the consumer chose it.
+  ///
+  /// So every refused tick raises the whole-scope move, and then:
+  ///
+  /// - the recovery not yet made — the Monitor's overflow path, which mints the
+  ///   covering `Rescan` and reconciles the watch set;
+  /// - the recovery made and no report owed —
+  ///   [`Monitor::report_loss`](tributary_proto::Monitor::report_loss), the same
+  ///   root-located loss instruction without the reconcile;
+  /// - a report still owed — nothing but the move. The queued `Rescan` speaks
+  ///   for this window too, and it stands ahead of everything else this scope
+  ///   has queued (its own mint purged what preceded it), so there is nothing
+  ///   left to purge and nothing to stand.
+  ///
+  /// The first two purge before they mint: the instruction is appended at the
+  /// TAIL of the effect queue, which is polled front-first, so anything of this
+  /// scope queued since the last delivered instruction would otherwise reach the
+  /// consumer ahead of it.
+  ///
+  /// NOTHING IS REPORTED before the scope is
+  /// [`publicly_live`](ScopeState::publicly_live). A spawn queues the birth
+  /// refresh before a descending root arms, so a decline at a saturated budget
+  /// can land while no caller holds a handle: the never-live fence drops the
+  /// instruction, nothing can ever deliver it, and a latch set there would
+  /// silence every later public tick. So a pre-public decline makes the recovery
+  /// exactly as a public one does — its `Rescan` is fenced, which costs nothing
+  /// — and owes no report, and a pre-public tick after that recovery raises the
+  /// move and nothing else. The move is itself inert before public: admission
+  /// needs a live root, so there is no obligation in flight to retire.
   ///
   /// Deliberately NOT the full [`on_root_overflow`](Self::on_root_overflow)
   /// treatment: device trust is left alone, because closing it arms another
@@ -4659,11 +4874,19 @@ impl DriverCore {
     };
     state.refresh_pending = false;
     Self::arm_liveness(state, interval, now);
-    let unproven = match reason {
-      DeclineReason::ScopeBusy => false,
-      DeclineReason::BudgetFull => !std::mem::replace(&mut state.budget_lossy, true),
+    let recover = match reason {
+      // A probe of this scope is RUNNING, and its completion is the proof: no
+      // window goes unaccounted for, so no funnel fires and neither latch moves.
+      DeclineReason::ScopeBusy => return,
+      DeclineReason::BudgetFull => !std::mem::replace(&mut state.budget_recovered, true),
     };
-    if unproven {
+    let report = !recover && state.publicly_live && !state.budget_report_owed;
+    if state.publicly_live && (recover || report) {
+      // An instruction is about to be minted, and it is owed until the consumer
+      // has it.
+      state.budget_report_owed = true;
+    }
+    if recover || report {
       // Everything this scope already queued is dominated by the Rescan being
       // minted below (the same sentence `on_delivery`'s `Refused` arm writes):
       // this call runs INSIDE `execute_effects` (fed back from
@@ -4674,23 +4897,31 @@ impl DriverCore {
       // drain. Purging first closes that escape the same way `on_delivery`'s
       // `Refused` arm closes it one screen away.
       Self::purge_scope_emits(&mut self.effects, scope);
-      // BARRIER FUNNEL: this root's liveness is UNPROVEN, and a window nothing
-      // is proving may have carried any coverage transition at all — so it is a
-      // move about the whole scope, the same shape `on_root_overflow` has. The
-      // routed cover degrade cannot stand in for it: that funnel is gated on a
-      // recorded claim, so a never-narrowed scope — and every kernel-recursive
-      // scope, which never records one — would get no move, and an in-pool write
-      // would claim after the `Rescan` and certify across the unproven window.
-      // The overflow `Rescan` minted below is the instruction this retirement
-      // owes, so it stands one and the retirement stands none of its own.
-      Self::barrier_moved(
-        &mut self.barrier_moves,
-        state,
-        scope,
-        BarrierLocation::Scope,
-        true,
-      );
+    }
+    // BARRIER FUNNEL: this root's liveness is UNPROVEN, and a window nothing
+    // is proving may have carried any coverage transition at all — so it is a
+    // move about the whole scope, the same shape `on_root_overflow` has. The
+    // routed cover degrade cannot stand in for it: that funnel is gated on a
+    // recorded claim, so a never-narrowed scope — and every kernel-recursive
+    // scope, which never records one — would get no move, and an in-pool write
+    // would claim after the `Rescan` and certify across the unproven window.
+    // Raised on EVERY refused tick, because each interval it turns away is a
+    // fresh window this root cannot account for. The covering `Rescan` is the
+    // instruction this retirement owes — the one minted below, or the one still
+    // queued from the tick that owed it — so the retirement stands none of its
+    // own.
+    Self::barrier_moved(
+      &mut self.barrier_moves,
+      state,
+      scope,
+      BarrierLocation::Scope,
+      true,
+    );
+    if recover {
       self.monitor.on_overflow(Scope::Root(scope), now);
+      self.drain_monitor();
+    } else if report {
+      let _ = self.monitor.report_loss(scope);
       self.drain_monitor();
     }
   }
@@ -4740,6 +4971,16 @@ impl DriverCore {
   /// root's liveness (folded into the same refresh — a kernel-recursive backend
   /// gets no in-tree unmount signal, so this cadence is its root-death check).
   ///
+  /// Every completion that arrives here describes the world this scope watches
+  /// NOW. The driver's probe generation is the one owner of the cross-world
+  /// fence: it retires the scope's tag at the replace commit and at the
+  /// same-transport widen commit, and forwards only a current-generation answer,
+  /// so a refresh addressed to a root this scope has left is dropped before the
+  /// core sees it. The first refresh of a replaced or widened root therefore
+  /// carries the new generation and is applied on arrival — its alive verdict is
+  /// not re-probed, and its missing verdict is death evidence the gate below
+  /// acts on.
+  ///
   /// Publication is ordered: the root-liveness verdict acts FIRST and
   /// unconditionally (a dead root is terminal regardless of snapshot staleness);
   /// the mount table AND the descent frame (`root_mnt_id`) publish only on a
@@ -4756,33 +4997,12 @@ impl DriverCore {
       return;
     };
     // A probe of this scope answered, whatever it answered: the budget episode
-    // that left its liveness unproven is over, so a LATER one is a fresh fact and
-    // reports again ([`on_refresh_declined`]). Cleared ahead of every gate below,
-    // since each of them is a completion too.
-    state.budget_lossy = false;
-    // The cross-world gate precedes even the death gate: this completion was
-    // addressed to a root this scope REPLACED, so its liveness verdict is
-    // about the old object — evidence for a world that ended at the commit,
-    // not death evidence for the new one. Discard it whole and re-read the
-    // live world (trust is already closed since the commit).
-    if state.refresh_world_stale {
-      state.refresh_world_stale = false;
-      state.refresh_pending = false;
-      state.refresh_stale = false;
-      // BARRIER FUNNEL: the world this scope's mount authority described ended
-      // at the replace commit, and nothing has re-read the live one yet. Unlike
-      // the two verdicts below this path emits NO `Rescan` of its own — it only
-      // re-arms the read — so a retirement under it owes the covering one.
-      Self::barrier_moved(
-        &mut self.barrier_moves,
-        state,
-        scope,
-        BarrierLocation::Scope,
-        false,
-      );
-      Self::trust_lost(&mut self.effects, scope, state);
-      return;
-    }
+    // that left its liveness unproven is over, so a LATER one is a fresh episode
+    // and recovers the watch set again ([`on_refresh_declined`]). Cleared ahead
+    // of every gate below, since each of them is a completion too. The report
+    // latch is NOT cleared here: an instruction the consumer has not been handed
+    // is still owed, whatever a probe has since proven.
+    state.budget_recovered = false;
     state.refresh_pending = false;
 
     // Root-liveness FIRST, unconditionally — BEFORE the stale gate. A dead root
@@ -4952,6 +5172,20 @@ impl DriverCore {
       }
       return;
     };
+    if matches!(delivery, Delivery::Accepted) {
+      // The consumer's channel holds a change of this scope, so whatever
+      // covering `Rescan` a probe-budget decline left owed has been handed over
+      // and the next tick refused at the budget reports again
+      // ([`on_refresh_declined`](Self::on_refresh_declined)). The SCOPE names
+      // that instruction precisely enough: the decline purges everything this
+      // scope had queued before minting it, and it runs inside `execute_effects`
+      // where no emit of this scope can be in flight, so the first delivery of
+      // this scope after a decline is the instruction itself. A REFUSAL leaves
+      // it owed — the arm below stands the replacement — so the latch survives
+      // one; and a consumer that dropped its stream is reported no delivery at
+      // all, which is the one case nothing is owed to.
+      state.budget_report_owed = false;
+    }
     match (delivery, &mut state.lag) {
       (Delivery::Accepted, LagState::Lagged { parked, attempt }) => {
         let delivered_current = match (parked.as_ref(), &attempt) {
@@ -5430,6 +5664,11 @@ impl DriverCore {
     if !fence && !at_classify {
       return;
     }
+    // The consumptions this pass cannot take itself, collected beside the batch
+    // rather than into it: the walk below holds `batch.items` mutably. They are
+    // appended to the batch at the end of the pass, still ahead of every feed a
+    // batch-classifying profile makes.
+    let mut deferred: Vec<MoveCookie> = Vec::new();
     for item in &mut batch.items {
       let planned = core::mem::take(&mut item.planned);
       // Nothing is retained under feed-at-classify — each kept record leaves for
@@ -5442,7 +5681,7 @@ impl DriverCore {
       };
       for planned in planned {
         let planned = if fence {
-          match self.fenced(state, exclusions, scope, &planned, now) {
+          match self.fenced(state, exclusions, scope, &planned, &mut deferred) {
             Fenced::Stands => planned,
             Fenced::Dropped => continue,
             // The widened signal takes the dropped one's PLACE, so everything
@@ -5508,7 +5747,7 @@ impl DriverCore {
         // `Rescan` naming exactly the subtree the caller pruned — an instruction
         // to enumerate ground whose every later change stays silent.
         if let Some(repair) = revealed
-          && let Some(repair) = self.fenced_repair(state, exclusions, scope, repair, now)
+          && let Some(repair) = self.fenced_repair(state, exclusions, scope, repair, &mut deferred)
         {
           Self::accept(
             &mut self.monitor,
@@ -5524,17 +5763,19 @@ impl DriverCore {
       item.planned = kept;
     }
     if fence {
-      batch.trailing = core::mem::take(&mut batch.trailing)
+      let trailing = core::mem::take(&mut batch.trailing)
         .into_iter()
-        .filter_map(
-          |planned| match self.fenced(state, exclusions, scope, &planned, now) {
+        .filter_map(|planned| {
+          match self.fenced(state, exclusions, scope, &planned, &mut deferred) {
             Fenced::Stands => Some(planned),
             Fenced::Dropped => None,
             Fenced::Widened(widened) => Some(widened),
-          },
-        )
+          }
+        })
         .collect();
+      batch.trailing = trailing;
     }
+    batch.deferred_consumptions.append(&mut deferred);
   }
 
   /// Re-runs the live fence over one probe's resolution — the second, and last,
@@ -5558,9 +5799,10 @@ impl DriverCore {
   /// is a real crossing, and the half that lies inside the reported tree is owed
   /// its report. That surviving evidence is also how a vanished SOURCE whose only
   /// destination this fence replaced is still granted its pairing cookie at
-  /// settlement — which is why the widening arm's consumption has to be
-  /// remembered by the Monitor rather than merely attempted: the half it names is
-  /// fed after this pass, not before it.
+  /// settlement — which is why the widening arm's consumption has to RIDE THE
+  /// BATCH from here rather than be taken here: the half it names is fed after
+  /// this pass, not before it. `deferred` is the carrier, and its caller hands it
+  /// to the batch this resolution belongs to.
   ///
   /// Classifying a whole batch ahead of feeding it leaks on a profile whose
   /// records are addressed through per-directory anchors (a reparent mid-read
@@ -5574,7 +5816,7 @@ impl DriverCore {
     state: &ScopeState,
     scope: ScopeId,
     mut resolved: Resolved,
-    now: Instant,
+    deferred: &mut Vec<MoveCookie>,
   ) -> Resolved {
     let exclusions = !self.exclusions.is_empty() && !backend_enforces_exclusions(state.profile);
     if !exclusions && state.prune.is_empty() {
@@ -5584,7 +5826,7 @@ impl DriverCore {
     let before = resolved.planned.len();
     let mut kept = Vec::with_capacity(before);
     for planned in core::mem::take(&mut resolved.planned) {
-      let planned = match self.fenced(state, exclusions, scope, &planned, now) {
+      let planned = match self.fenced(state, exclusions, scope, &planned, deferred) {
         Fenced::Stands => planned,
         Fenced::Dropped => continue,
         Fenced::Widened(widened) => widened,
@@ -5604,7 +5846,7 @@ impl DriverCore {
       // its record's verdict and names ground that verdict never judged, so it
       // is the one input that could carry a `Rescan` into a pruned subtree.
       kept.extend(
-        revealed.and_then(|repair| self.fenced_repair(state, exclusions, scope, repair, now)),
+        revealed.and_then(|repair| self.fenced_repair(state, exclusions, scope, repair, deferred)),
       );
     }
     resolved.planned = kept;
@@ -5779,9 +6021,9 @@ impl DriverCore {
     exclusions: bool,
     scope: ScopeId,
     repair: Planned,
-    now: Instant,
+    deferred: &mut Vec<MoveCookie>,
   ) -> Option<Planned> {
-    match self.fenced(state, exclusions, scope, &repair, now) {
+    match self.fenced(state, exclusions, scope, &repair, deferred) {
       Fenced::Stands => Some(repair),
       Fenced::Dropped => None,
       Fenced::Widened(widened) => Some(widened),
@@ -5993,23 +6235,23 @@ impl DriverCore {
   ///   and it dominates any barrier still waiting under the moved subtree, which
   ///   a bare drop left waiting for its deadline.
   ///
-  ///   The half the Monitor parked for that rename is CONSUMED here in the same
-  ///   breath ([`Monitor::consume_pending_move`]). The destination this arm
-  ///   replaces never reaches the Monitor, so nothing is left to pair with — and
-  ///   an unpaired half holds its detached subtree, and the scope's move settle
-  ///   with it, until the pairing window elapses. Shedding it at once is what the
-  ///   prune seat asked for; waiting a day for a pairing that cannot happen is
-  ///   the opposite. Where the half is not parked yet — the batch-classifying
-  ///   profile, whose fences all run ahead of its feeds — the Monitor REMEMBERS
-  ///   the consumption and resolves the half the moment it arrives, which is the
-  ///   same shedding one ordering later.
+  ///   The half the Monitor parked for that rename is CONSUMED
+  ///   ([`Monitor::consume_pending_move`]). The destination this arm replaces
+  ///   never reaches the Monitor, so nothing is left to pair with — and an
+  ///   unpaired half holds its detached subtree, and the scope's move settle with
+  ///   it, until the pairing window elapses. Shedding it at once is what the prune
+  ///   seat asked for; waiting a day for a pairing that cannot happen is the
+  ///   opposite. Where the half cannot be parked yet — the batch-classifying
+  ///   profiles, whose fences all run ahead of their feeds — the cookie rides
+  ///   `deferred` onto the batch instead, to be consumed the moment that batch's
+  ///   records are fed.
   fn fenced(
     &mut self,
     state: &ScopeState,
     exclusions: bool,
     scope: ScopeId,
     planned: &Planned,
-    now: Instant,
+    deferred: &mut Vec<MoveCookie>,
   ) -> Fenced {
     match planned {
       Planned::Rec(rec) => {
@@ -6052,17 +6294,25 @@ impl DriverCore {
           //
           // It reaches the half directly on the discipline that FEEDS AS IT
           // CLASSIFIES ([`feeds_at_classify`]): there the source was fed — and
-          // parked — before this destination was judged. On a batch-classifying
-          // profile every fence runs ahead of every feed, so the half is not
-          // parked yet and there is nothing here to take; the consumption is
-          // REMEMBERED by the Monitor instead and the half that the settlement's
-          // cookie grant later feeds is resolved on arrival, at once, on this same
-          // expiry path. Those scopes hold no per-directory watches and so shed no
-          // subtree — what an unpaired half of theirs holds is the scope's move
-          // settle, and with it every cover fence and every new sync, for the whole
-          // window.
+          // parked — before this destination was judged, so the consumption either
+          // finds it or owes nothing, the source lying outside the scope.
+          //
+          // On a batch-classifying profile every fence runs ahead of every feed, so
+          // the half arrives only when the batch's kept records are fed, and the
+          // cookie is CARRIED ON THE BATCH to be consumed immediately after that
+          // feed. The Monitor keeps no memory of a consumption: the cookie space a
+          // source draws from is finite, so a value reused inside the move window
+          // would otherwise catch an unrelated later rename and resolve it as a
+          // departure plus a creation. Those scopes hold no per-directory watches
+          // and so shed no subtree — what an unpaired half of theirs holds is the
+          // scope's move settle, and with it every cover fence and every new sync,
+          // for the whole window.
           if let Some(cookie) = rec.cookie() {
-            self.monitor.consume_pending_move(scope, cookie, now);
+            if feeds_at_classify(state.profile) {
+              self.monitor.consume_pending_move(scope, cookie);
+            } else {
+              deferred.push(cookie);
+            }
           }
           return Fenced::Widened(widened);
         }
@@ -6173,16 +6423,24 @@ impl DriverCore {
   }
 
   /// Settles a fully-resolved batch: grants evidenced vanished-half cookies,
-  /// feeds the Monitor in item order, then applies the deferred unmount
-  /// trust-removals (the monotone rule's late edge).
+  /// feeds the Monitor in item order, takes the move consumptions the fence
+  /// deferred onto this batch, then applies the deferred unmount trust-removals
+  /// (the monotone rule's late edge).
   ///
   /// A feed-at-classify profile ([`feeds_at_classify`]) arrives here with its
   /// items already emptied by the fence, so what it settles is `trailing` alone —
   /// which is where `trailing` belongs on both disciplines, after every item. The
-  /// other two duties are the reason the split is safe to make per profile: a
-  /// cookie grant needs a `cookie_candidate` and `evidenced` partners, and a
-  /// deferred unmount needs `deferred_unmounts`, and all three are filled only by
-  /// the FSEvents path — which does not feed at classify time.
+  /// other duties are the reason the split is safe to make per profile: a cookie
+  /// grant needs a `cookie_candidate` and `evidenced` partners, a deferred unmount
+  /// needs `deferred_unmounts`, and a deferred consumption exists only where the
+  /// fence ran ahead of the feeds — and all of them are filled only by the
+  /// profiles that do not feed at classify time.
+  ///
+  /// The consumptions come IMMEDIATELY AFTER the feeds and nowhere later: this is
+  /// the settlement that grants a vanished source its pairing cookie and parks its
+  /// half, so it is the first instant at which the half the fence's widened
+  /// destination orphaned exists to be taken — and the Monitor remembers nothing,
+  /// so a call that misses its half owes nothing and takes nothing.
   fn settle(
     monitor: &mut Monitor,
     moves: &mut VecDeque<BarrierMove>,
@@ -6192,7 +6450,7 @@ impl DriverCore {
     now: Instant,
   ) {
     Self::grant_evidenced_cookies(state, scope, &mut batch);
-    let deferred = std::mem::take(&mut batch.deferred_unmounts);
+    let unmounts = std::mem::take(&mut batch.deferred_unmounts);
     for item in batch.items {
       for planned in item.planned {
         Self::feed(monitor, moves, state, scope, planned, now);
@@ -6201,7 +6459,10 @@ impl DriverCore {
     for planned in batch.trailing {
       Self::feed(monitor, moves, state, scope, planned, now);
     }
-    for path in deferred {
+    for cookie in batch.deferred_consumptions {
+      monitor.consume_pending_move(scope, cookie);
+    }
+    for path in unmounts {
       state.mounts.retain(|m| m != &path);
     }
   }
@@ -6571,6 +6832,106 @@ impl DriverCore {
     effects.retain(|effect| !matches!(effect, Effect::Emit { scope: s, .. } if *s == scope));
   }
 
+  /// Drops every queued [`Effect::RefreshMounts`] belonging to `scope`. Called by
+  /// the widen commit before it re-arms, so the queue holds exactly the live
+  /// world's refresh.
+  ///
+  /// A refresh is armed against ONE root incarnation, and a commit replaces the
+  /// world it was armed against. Unlike the emits above it is not dominated work
+  /// — the live world still owes a refresh of its own, which the re-arm queues
+  /// behind this purge.
+  fn purge_scope_refreshes(effects: &mut VecDeque<Effect>, scope: ScopeId) {
+    effects
+      .retain(|effect| !matches!(effect, Effect::RefreshMounts { scope: s, .. } if *s == scope));
+  }
+
+  /// Drops every queued effect of `scope` that would touch the ground the
+  /// replace commit just retired. Called by [`on_root_replaced`](Self::on_root_replaced)
+  /// before it queues the live world's own, so the queue holds exactly the live
+  /// world's obligations.
+  ///
+  /// The generalisation of [`purge_scope_refreshes`](Self::purge_scope_refreshes):
+  /// a queued arm, disarm, listing or stat names the OLD root as surely as a
+  /// queued refresh does, and none of them is a probe or a control batch yet — at
+  /// the next flush the arm is relabelled onto the replacement's lane, passes its
+  /// generation check and runs against the retired root ahead of the corrective
+  /// reproof, and a syscall that blocks on a retired mount wedges the
+  /// replacement's reader. The replace hook rebuilds every binding the scope owns
+  /// (the per-directory book is rebound, the overflow cut re-arms from the root)
+  /// and drops the probe and enumerate contexts, so what is taken here is dead
+  /// work the live world re-queues for itself.
+  ///
+  /// The two lifecycle effects and the deliveries are deliberately left standing.
+  /// A spawn and a teardown are obligations, never dominated — a dropped teardown
+  /// would leak the stream, its lane, its control state and its registry entry. A
+  /// delivery carries its own root and is self-describing, so an old world's
+  /// change still assembles; the covering `Rescan` this commit stands is queued
+  /// behind them, and the emits a commit really must take are the marker emits of
+  /// the barriers its whole-scope move retires, which the drain purges before any
+  /// effect leaves the queue.
+  ///
+  /// The WIDEN commit calls this on nothing. It adopts the old root as a child of
+  /// the new one, keeps the transport and every watch id, and re-queues nothing
+  /// for the subtree — so its queued arms, disarms, listings and stats name ground
+  /// that is still live and still owed, and taking them would leave their Monitor
+  /// nodes arming with no arm outstanding and no cascade to re-issue one. The
+  /// widen carries them into its new incarnation instead
+  /// ([`rebase_scope_effects`](Self::rebase_scope_effects)).
+  fn purge_scope_effects(effects: &mut VecDeque<Effect>, scope: ScopeId) {
+    effects.retain(|effect| match effect {
+      Effect::AddWatch { scope: s, .. }
+      | Effect::RemoveWatch { scope: s, .. }
+      | Effect::Enumerate { scope: s, .. }
+      | Effect::Probe { scope: s, .. }
+      | Effect::RefreshMounts { scope: s, .. } => *s != scope,
+      Effect::SpawnStream { .. } | Effect::TeardownStream { .. } | Effect::Emit { .. } => true,
+    });
+  }
+
+  /// Carries `scope`'s surviving queued effects into `incarnation`. Called by
+  /// [`on_root_widened`](Self::on_root_widened) after its own refresh purge.
+  ///
+  /// A widen adopts the ground its queued obligations name rather than retiring
+  /// it, so those obligations belong to the widened world too. Re-stamping them is
+  /// what lets the incarnation name the world the scope watches NOW without the
+  /// poll site dropping an arm whose directory the widen kept.
+  fn rebase_scope_effects(effects: &mut VecDeque<Effect>, scope: ScopeId, incarnation: u64) {
+    for effect in effects.iter_mut() {
+      match effect {
+        Effect::AddWatch {
+          scope: s,
+          incarnation: stamp,
+          ..
+        }
+        | Effect::RemoveWatch {
+          scope: s,
+          incarnation: stamp,
+          ..
+        }
+        | Effect::Enumerate {
+          scope: s,
+          incarnation: stamp,
+          ..
+        }
+        | Effect::Probe {
+          scope: s,
+          incarnation: stamp,
+          ..
+        }
+        | Effect::RefreshMounts {
+          scope: s,
+          incarnation: stamp,
+          ..
+        } => {
+          if *s == scope {
+            *stamp = incarnation;
+          }
+        }
+        Effect::SpawnStream { .. } | Effect::TeardownStream { .. } | Effect::Emit { .. } => {}
+      }
+    }
+  }
+
   /// Drops every queued [`Effect::Emit`] of `scope` whose change names the
   /// marker leaf `name`, reporting how many went.
   ///
@@ -6781,8 +7142,10 @@ impl DriverCore {
                   ino,
                 })
             });
+            let incarnation = state.incarnation;
             self.effects.push_back(Effect::AddWatch {
               scope,
+              incarnation,
               watch: cmd.id(),
               attempt: cmd.attempt(),
               parent: cmd.id(),
@@ -6867,8 +7230,10 @@ impl DriverCore {
                 .and_then(|state| state.root_dev)
                 .map(|dev| ExpectedObject { dev, ino: id.get() })
             });
+            let incarnation = self.incarnation_of(scope);
             self.effects.push_back(Effect::AddWatch {
               scope,
+              incarnation,
               watch: cmd.id(),
               attempt: cmd.attempt(),
               parent,
@@ -6915,7 +7280,12 @@ impl DriverCore {
                 });
                 Self::barrier_moved(&mut self.barrier_moves, state, scope, ground, false);
               }
-              self.effects.push_back(Effect::RemoveWatch { scope, watch });
+              let incarnation = self.incarnation_of(scope);
+              self.effects.push_back(Effect::RemoveWatch {
+                scope,
+                incarnation,
+                watch,
+              });
             }
             continue;
           }
@@ -7017,7 +7387,10 @@ impl DriverCore {
           };
           let path = Arc::new(path);
           self.enum_reqs.insert(cmd.req(), (scope, Arc::clone(&path)));
+          let incarnation = self.incarnation_of(scope);
           self.effects.push_back(Effect::Enumerate {
+            scope,
+            incarnation,
             req: cmd.req(),
             watch,
             path,
@@ -7044,7 +7417,13 @@ impl DriverCore {
           };
           let path = parent_path.join(child.name().as_str());
           let probe = self.mint_probe(scope, ProbePurpose::SlotKind { req: cmd.req() });
-          self.effects.push_back(Effect::Probe { probe, path });
+          let incarnation = self.incarnation_of(scope);
+          self.effects.push_back(Effect::Probe {
+            scope,
+            incarnation,
+            probe,
+            path,
+          });
         }
         other => {
           debug_assert!(false, "the Monitor requests no other work: {other:?}");

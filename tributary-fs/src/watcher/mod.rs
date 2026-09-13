@@ -2697,6 +2697,52 @@ impl<R> Watcher<R> {
       .len()
   }
 
+  /// Waits for `root`'s scope to hold no coverage-fence entry at all — no
+  /// pending fence AND no accrued loss memory — so the next fence a
+  /// `set_cover` opens on it inherits nothing (a fresh fence stamps its
+  /// `lossy` from the scope's own, at open).
+  ///
+  /// A public scope `Rescan` routed through the core (a registration bridge
+  /// window's closing `Rescan` among them) leaves that loss memory standing
+  /// until a settle observation first buys an ordering proof over a control
+  /// round trip. A kernel cell that issues a shrink right after a sync's
+  /// marker was delivered, and then asserts the shrink settles
+  /// [`Applied`](crate::CoverOutcome::Applied), races that window on a fast
+  /// runner: without waiting here, the shrink can open its fence inside the
+  /// gap and the product answers `Degraded` — honestly, but not what the
+  /// cell is staged to observe. Polling this probe first proves the gap has
+  /// closed before the shrink is issued.
+  ///
+  /// Reports whether it got there, for a caller that is staging.
+  ///
+  /// Gated on its one consumer's cfg rather than on the command's: the kernel
+  /// cells are the only callers, so wherever they are compiled out this probe is
+  /// dead code and `-D warnings` says so.
+  #[cfg(all(test, target_os = "linux", feature = "tokio", not(miri)))]
+  #[must_use = "an expired budget leaves the baseline lossy, which is a staging failure"]
+  pub(crate) async fn cover_fence_entry_spent(&self, root: RootHandle) -> bool {
+    for _ in 0..200 {
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      if self
+        .commands
+        .send(Command::DebugCoverFenceEntry {
+          scope: root.scope(),
+          reply,
+        })
+        .await
+        .is_err()
+      {
+        return false;
+      }
+      if !on_reply.await.expect("the driver answers a debug probe") {
+        return true;
+      }
+      tokio::task::yield_now().await;
+      tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    false
+  }
+
   /// The next event, or `None` once the watcher is closed and drained.
   #[inline]
   pub async fn next(&mut self) -> Option<Event> {

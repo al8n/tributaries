@@ -1366,39 +1366,6 @@ pub struct Monitor {
   /// stream of unpairable renames from retaining halves — and their detached
   /// subtrees — without limit.
   pending_moves: BTreeMap<PendingKey, PendingMove>,
-  /// Cookies whose half was CONSUMED before it was ever parked, with the deadline
-  /// the half's own window would have carried.
-  ///
-  /// [`consume_pending_move`](Self::consume_pending_move) exists for the
-  /// destination a caller's fence takes before it reaches this Monitor, and on a
-  /// batch-classifying profile that fence judges the destination BEFORE the batch
-  /// is fed — so the source half is parked only afterwards, when the settlement
-  /// grants it its cookie, and the consumption found nothing to consume. The half
-  /// would then wait out the whole move window for a pairing that cannot happen,
-  /// holding its detached subtree and — through
-  /// [`moves_settled`](Self::moves_settled) — every cover fence and every new sync
-  /// of the scope with it.
-  ///
-  /// So the consumption is REMEMBERED here instead, and a source half arriving
-  /// under a remembered cookie is resolved at once through the expiry's own path
-  /// rather than parked. Membership is the whole answer; the value is only the
-  /// deadline, so an entry cannot outlive the window it stands in for.
-  ///
-  /// Each scope's population is bounded by [`PENDING_MOVE_CAP`] — the same bound
-  /// [`pending_moves`](Self::pending_moves) carries, because this is a shadow of
-  /// exactly the halves that store would have held
-  /// ([`admits_consumed_move`](Self::admits_consumed_move)). A consumption past
-  /// the bound is simply not remembered, which is today's behaviour for it: the
-  /// half parks and waits out its window.
-  ///
-  /// Entries leave three ways: the half arrives and takes its own
-  /// (`on_moved_from`), the deadline elapses in the same pass `pending_moves`
-  /// expiries are ticked (`handle_timeout`), and the whole-scope
-  /// [`purge_scope_pending_moves`](Self::purge_scope_pending_moves) drops them
-  /// with the halves they shadow. A cookie the pending-move cap refused is torn
-  /// down through the unpairable-source path and never asks here at all, so its
-  /// entry simply expires.
-  consumed_moves: BTreeMap<PendingKey, Instant>,
   /// Watched-directory move sources currently detached-and-held for their pairing window
   /// (the `held` of some [`PendingMove`]). A record arriving on such a source — or any
   /// node in its still-attached subtree — would deliver at the stale PRE-move path, so it
@@ -1633,7 +1600,6 @@ impl Monitor {
       stat_losses: BTreeMap::new(),
       owed_descents: BTreeMap::new(),
       pending_moves: BTreeMap::new(),
-      consumed_moves: BTreeMap::new(),
       held_sources: BTreeSet::new(),
       dirtied_holds: BTreeSet::new(),
       dark_installs: BTreeSet::new(),
@@ -3146,26 +3112,6 @@ impl Monitor {
     self.pending_moves.contains_key(&(scope, cookie))
       || self
         .pending_moves
-        .range((scope, FIRST_COOKIE)..)
-        .take_while(|((half_scope, _), _)| *half_scope == scope)
-        .take(PENDING_MOVE_CAP)
-        .count()
-        < PENDING_MOVE_CAP
-  }
-
-  /// Whether a consumption for `(scope, cookie)` may be REMEMBERED — the same
-  /// question [`admits_pending_move`](Self::admits_pending_move) asks, of
-  /// [`consumed_moves`](Self::consumed_moves), and under the same
-  /// [`PENDING_MOVE_CAP`]: the set shadows exactly the halves that store would
-  /// have held, so one bound serves both and a scope cannot retain more of the
-  /// one than it could of the other.
-  ///
-  /// Derived from membership and short-circuiting on an entry already held, for
-  /// the reasons its twin states.
-  fn admits_consumed_move(&self, scope: ScopeId, cookie: MoveCookie) -> bool {
-    self.consumed_moves.contains_key(&(scope, cookie))
-      || self
-        .consumed_moves
         .range((scope, FIRST_COOKIE)..)
         .take_while(|((half_scope, _), _)| *half_scope == scope)
         .take(PENDING_MOVE_CAP)
@@ -5238,6 +5184,44 @@ impl Monitor {
     self.settle_bridges();
   }
 
+  /// Queues the covering root [`Rescan`](ChangeKind::Rescan) for a loss the
+  /// scope's WATCH SET did not suffer, and reconciles nothing: the instruction
+  /// and the bridge window's loss half, with no watch-set work at all.
+  ///
+  /// [`on_overflow`](Self::on_overflow) is the other door onto a scope-level
+  /// loss, and it additionally RECOVERS the watch set — which on a
+  /// [`lossy_watch_teardown`](Capabilities::lossy_watch_teardown) descending
+  /// profile means bumping the loss generation, reinstalling the root and
+  /// re-proving every retained binding under it. That is exactly right for a
+  /// dropped window, which may have carried per-watch teardown records, and
+  /// exactly wrong for a caller whose loss is a PROOF it could not take: a
+  /// liveness tick that dispatched no probe read nothing and dropped nothing, so
+  /// re-adding watches answers a question nobody asked — and repeating it every
+  /// interval invalidates the generation the previous recovery is still arming
+  /// under, so a large tree restarts its reproof instead of settling.
+  ///
+  /// The instruction carries the full LOSS flavour — the scope attribution, the
+  /// epoch bump, the dedup, and the bridge window's `saw_rescan` (the
+  /// `emit_rescan` seat) — so the routing seat treats it as the
+  /// loss it is: the cover fence is marked lossy and a narrowed claim degrades.
+  /// A DOMINATION ([`cover_domination`](Self::cover_domination)) withholds
+  /// exactly that half and is not this.
+  ///
+  /// Reports the [`ChangeId`] it queued, or [`None`] where nothing was queued:
+  /// this Monitor covers no such scope, or an identical `Rescan` already stands
+  /// undelivered at the root — whose single generation speaks for the whole
+  /// contiguous run, and which is itself still the covering instruction.
+  #[cfg_attr(not(tarpaulin), inline)]
+  pub fn report_loss(&mut self, scope: ScopeId) -> Option<ChangeId> {
+    let root = *self.roots.get(&scope)?;
+    let queued = self.emit_rescan(scope, self.location_of(root));
+    // The tail every public mutating entry point owes: this marked the window
+    // lossy, and a window that armed nothing fresh must not leak that bit into a
+    // later unrelated grow.
+    self.settle_bridges();
+    queued
+  }
+
   /// Emits the located [`Rescan`](ChangeKind::Rescan) one dominated sync barrier
   /// is retired with, and reconciles nothing itself — though for the held-subtree
   /// case below, `book_hold` schedules the pairing's own re-scan by proxy:
@@ -5675,13 +5659,6 @@ impl Monitor {
   /// Advances time, resolving move halves whose pairing window has elapsed: an
   /// unpaired source becomes a [`ChangeKind::Removed`] (a watched-directory
   /// source's subtree was already dropped when it moved away, in `on_moved_from`).
-  ///
-  /// A remembered consumption — one
-  /// [`consume_pending_move`](Self::consume_pending_move) took before its half
-  /// existed — stands in for a half that was never parked, so it expires on the
-  /// same clock in the same pass: past its deadline the half it was waiting for
-  /// could no longer have paired anyway, and a source arriving after it is the
-  /// ordinary unpairable one.
   #[cfg_attr(not(tarpaulin), inline)]
   pub fn handle_timeout(&mut self, now: Instant) {
     let expired: std::vec::Vec<PendingKey> = self
@@ -5696,9 +5673,6 @@ impl Monitor {
         self.resolve_stored_half(pending);
       }
     }
-    self
-      .consumed_moves
-      .retain(|_, deadline| !now.reached(*deadline));
     self.settle_bridges();
   }
 
@@ -5722,30 +5696,23 @@ impl Monitor {
   /// so the emissions a consumer sees are the ones an unpaired rename always
   /// produced and the liveness guards are the same.
   ///
-  /// Nothing parked under `(scope, cookie)` is a consumption that arrived BEFORE
-  /// its half, and it is REMEMBERED rather than dropped: on a batch-classifying profile
-  /// the fence judges the destination before the batch is fed, so the source half
-  /// is parked only when the settlement grants its cookie — after this call. A
-  /// half arriving under a remembered cookie is resolved at once, on this same
-  /// expiry path, instead of parking to wait out a window no destination can end.
-  /// Remembering touches nothing else, the bridge windows the resolution settles
-  /// included: there is no half yet, so there is nothing whose resolution could
-  /// close one.
+  /// NO MEMORY of a consumption is kept. Nothing parked under `(scope, cookie)` is
+  /// nothing to consume, and this returns having touched nothing at all — not even
+  /// the bridge windows the resolution settles, which a caller asking about a half
+  /// that was never parked has given no reason to close. The caller is the one that
+  /// knows when the half it names can exist, and it must call at that moment: where
+  /// it feeds as it classifies, the source is already parked when the destination is
+  /// judged; where it classifies a whole batch ahead of feeding it, the call belongs
+  /// immediately after that batch's records are fed.
   ///
-  /// The memory carries the deadline the half's own window would have carried, so
-  /// it cannot outlive the wait it replaces — [`poll_timeout`](Self::poll_timeout)
-  /// names it and [`handle_timeout`](Self::handle_timeout) expires it — and the
-  /// scope's population of it is bounded exactly as the pending store's is. Past
-  /// that bound the consumption is not remembered and the half parks as it did
-  /// before — the degrade is a wait, never a lost teardown.
+  /// Remembering the cookie instead would catch an unrelated LATER rename: the
+  /// cookie space a caller draws from is finite (32 bits on inotify) and the move
+  /// window is a day at the option's bound, so a reused value inside the window
+  /// would resolve that rename's source as a departure and its destination as a
+  /// creation, losing the atomic transition under a `Rescan` minted before it.
   #[cfg_attr(not(tarpaulin), inline)]
-  pub fn consume_pending_move(&mut self, scope: ScopeId, cookie: MoveCookie, now: Instant) {
+  pub fn consume_pending_move(&mut self, scope: ScopeId, cookie: MoveCookie) {
     let Some(pending) = self.pending_moves.remove(&(scope, cookie)) else {
-      if self.admits_consumed_move(scope, cookie) {
-        self
-          .consumed_moves
-          .insert((scope, cookie), now + self.move_window);
-      }
       return;
     };
     self.resolve_stored_half(pending);
@@ -5848,21 +5815,14 @@ impl Monitor {
   }
 
   /// The earliest instant at which [`handle_timeout`](Self::handle_timeout) has
-  /// work to do — the soonest pending-move deadline, or the soonest remembered
-  /// consumption's — or `None` if no timer is armed.
-  ///
-  /// A consumption [`consume_pending_move`](Self::consume_pending_move) remembered
-  /// is named here for the same reason a parked half is: it is a wait with an end,
-  /// and an entry left past its end would resolve a LATER half arriving under a
-  /// reused cookie at once instead of parking it, turning a real rename's pairing
-  /// into a departure.
+  /// work to do (the soonest pending-move deadline), or `None` if no timer is
+  /// armed.
   #[cfg_attr(not(tarpaulin), inline)]
   pub fn poll_timeout(&self) -> Option<Instant> {
     self
       .pending_moves
       .values()
       .map(|pending| pending.deadline)
-      .chain(self.consumed_moves.values().copied())
       .min()
   }
 
@@ -5964,22 +5924,11 @@ impl Monitor {
           evidence: rec.evidence(),
           dirty: false,
         };
-        // A consumption this cookie already took ([`consumed_moves`]) says the
-        // destination was replaced by a caller's fence before this half existed,
-        // so nothing can ever pair with it: resolve it HERE, on the expiry's own
-        // path and from exactly the state the park would have stored — the
-        // detach, the hold and the born-dirty mark above are owed to this half
-        // either way, and they are what the resolution then sheds. Parking it
-        // would hold its subtree, and the scope's move settle with it, for the
-        // whole window.
-        //
-        // Otherwise invariant (d): the cookie is namespaced by scope, so only a
-        // *same-scope* reused/colliding cookie collides on this composite key. The
-        // displaced half can no longer be paired, so it resolves on its own rather
-        // than being silently overwritten.
-        if self.consumed_moves.remove(&(scope, cookie)).is_some() {
-          self.resolve_stored_half(pending);
-        } else if let Some(displaced) = self.park_pending_move(scope, cookie, pending) {
+        // Invariant (d): the cookie is namespaced by scope, so only a *same-scope*
+        // reused/colliding cookie collides on this composite key. The displaced
+        // half can no longer be paired, so it resolves on its own rather than
+        // being silently overwritten.
+        if let Some(displaced) = self.park_pending_move(scope, cookie, pending) {
           self.resolve_stored_half(displaced);
         }
       }
@@ -6378,15 +6327,9 @@ impl Monitor {
     outcome
   }
 
-  /// Resolves a pending half into a [`ChangeKind::Removed`] — but only if its
-  /// source is still watched.
-  ///
-  /// Usually a *stored* one, taken from `pending_moves` at timeout, on
-  /// cookie-collision displacement, or as a past-window late destination. A half
-  /// arriving under a cookie whose consumption was already REMEMBERED
-  /// ([`consumed_moves`](Self::consumed_moves)) is resolved here too, from the
-  /// state the park would have stored rather than from the store — which is what
-  /// makes the two orderings of a fence and its half produce the same emissions.
+  /// Resolves a *stored* pending half (one taken from `pending_moves` — at timeout,
+  /// on cookie-collision displacement, or as a past-window late destination) into a
+  /// [`ChangeKind::Removed`] — but only if its source is still watched.
   ///
   /// A narrow subtree drop deliberately leaves a half pairable (its destination may
   /// still arrive), so a half whose `from_parent` was since torn down can linger.
@@ -7974,18 +7917,9 @@ impl Monitor {
   /// undelivered: this releases the moves conjunct of
   /// [`coverage_settled`](Self::coverage_settled) wholesale, and the barrier may only
   /// re-open on coverage no longer under discussion.
-  ///
-  /// The scope's remembered consumptions ([`consumed_moves`](Self::consumed_moves))
-  /// go with the halves they shadow: no source of this scope can validly arrive
-  /// either, so an entry left behind would only wait out its deadline against a
-  /// world that has ended — and a re-registered generation of the `ScopeId` would
-  /// find it, exactly as it would have found a surviving half.
   fn purge_scope_pending_moves(&mut self, scope: ScopeId) {
     self
       .pending_moves
-      .retain(|(half_scope, _), _| *half_scope != scope);
-    self
-      .consumed_moves
       .retain(|(half_scope, _), _| *half_scope != scope);
   }
 

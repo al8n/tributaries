@@ -730,6 +730,10 @@ async fn set_cover_keeps_a_covered_directory_s_reserved_sync_directory_armed() {
   // The caller keeps ONE file subscription. Every sibling of that file is
   // strictly outside the cover — the plain directory and the reserved directory
   // alike.
+  assert!(
+    w.cover_fence_entry_spent(handle).await,
+    "staging: the scope's loss memory is spent before the shrink, so its fence inherits nothing"
+  );
   assert_eq!(
     w.set_cover(handle, vec![canonical.join("kept.txt")])
       .await
@@ -833,6 +837,10 @@ async fn set_cover_dominates_the_owned_marker_standing_in_the_ground_it_takes() 
 
   // The obligation is OWNED and unreaped — nothing has removed its marker — and
   // the cover the caller now asks for names neither it nor the sibling beside it.
+  assert!(
+    w.cover_fence_entry_spent(handle).await,
+    "staging: the scope's loss memory is spent before the shrink, so its fence inherits nothing"
+  );
   assert_eq!(
     w.set_cover(handle, vec![canonical.join("b")])
       .await
@@ -1082,6 +1090,10 @@ async fn set_cover_dominates_a_live_alias_sync_at_the_landing_it_wrote_in() {
 
   // The cover the caller now asks for names neither the landing nor the sibling
   // beside it, so it dominates the barrier standing in the landing.
+  assert!(
+    w.cover_fence_entry_spent(handle).await,
+    "staging: the scope's loss memory is spent before the shrink, so its fence inherits nothing"
+  );
   assert_eq!(
     w.set_cover(handle, vec![canonical.join("keep")])
       .await
