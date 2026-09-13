@@ -2232,7 +2232,7 @@ pub(crate) struct DriverCore {
   /// exempt (and its backend is kernel-recursive, which `on_set_cover` refuses
   /// before the rule is ever reached).
   reserved_cookie_dir: Option<Arc<str>>,
-  /// Test-only seam for the removal-order cell (A19.1): invoked with the
+  /// Test-only seam for the removal-order cell: invoked with the
   /// scope id, whether `scopes` still holds that scope, and whether
   /// `watch_scopes` still holds its mapping, at the point between the
   /// retirement store and the two removals. No production code installs one.
@@ -4559,7 +4559,7 @@ impl DriverCore {
   // The flag is the scope's OWN terminal bookkeeping and is stored at the core's
   // removal site, which is not about syncs; with the barrier gated out the ledger
   // that binds one is gone, so nothing calls this and nothing reads the field.
-  // Keeping the removal site ungated is what A26.1 asks for, so the two are
+  // The removal site deliberately stays ungated, so the two are
   // allowed to stand unread rather than gated with their one caller.
   #[cfg_attr(not(feature = "sync"), allow(dead_code))]
   pub(crate) fn bind_retiring(&mut self, scope: ScopeId, flag: Arc<AtomicBool>) {

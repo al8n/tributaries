@@ -1785,7 +1785,7 @@ impl WatcherOptions {
   /// The default periodic root-liveness interval (30 s) — the detection-latency
   /// bound for a root death no in-band signal reports in time. A
   /// `FAN_MARK_FILESYSTEM`-watched superblock unmounted out from under the watch
-  /// emits NO kernel signal (the L4.1 finding), and an inotify root's
+  /// emits NO kernel signal, and an inotify root's
   /// `IN_DELETE_SELF` is queued only once the last reference to it drops, so a
   /// periodic root re-stat is what bounds both. FSEvents' `RootChanged` and both
   /// Windows backends' own fatal-source-error report on a lost root or volume
@@ -2227,7 +2227,7 @@ impl WatcherOptions {
   ///
   /// - **fanotify** (`FAN_MARK_FILESYSTEM`) unmounted out from under the watch
   ///   delivers no kernel signal at all — the mark holds the superblock alive
-  ///   and the fd goes quiet (the L4.1 finding).
+  ///   and the fd goes quiet.
   /// - **inotify**'s `IN_DELETE_SELF` for a removed root is queued only once the
   ///   last reference to it drops, and this crate itself holds references: a
   ///   [`sync`](crate::Watcher::sync_root)'s admission pins the objects it

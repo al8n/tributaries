@@ -169,8 +169,8 @@ run_shard() {
 # path: on CI run 34430926057 (a523620) the single `fs-rest` shard (`--skip
 # driver::`) ran 45-72 min stacked and 69-90+ min tree borrows, and
 # `miri-tb-x86_64 [fs-rest]` hit the 90-minute timeout while still inside
-# `watcher::tests` at 86 min — the shard had grown with this branch's cells
-# (options faces, glob seats, watcher lifecycle and door cells) past what one
+# `watcher::tests` at 86 min — the shard had grown with the options faces,
+# glob seats, watcher lifecycle and door cells past what one
 # process fits. Pulling `core::` and `os::` into their own shards leaves the
 # renamed `fs-rest` at just `watcher::` + `options::` + `event::` (60 cells),
 # so the module that stalled now runs early in a short shard instead of late in
