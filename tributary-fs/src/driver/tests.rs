@@ -32,10 +32,13 @@ fn config() -> DriverConfig {
     exclusions: Vec::new(),
     profile: BackendKind::FsEvents,
     backend: Backend::Auto,
-    // Inert for the FSEvents/inotify driver suites (only fanotify arms the
-    // tick, and the fake spawns never resolve fanotify); a fanotify-specific
-    // driver test overrides it.
-    root_liveness_interval: Duration::from_secs(30),
+    // The tick is wall-clock and now covers every Linux profile (the FSEvents
+    // suites here were always immune). A rig that ticks by default makes a
+    // slow (Miri) run of a long-staging cell observe liveness probes its
+    // assertions never modeled, so the tick is OFF here; a cell that wants it
+    // opts in with its own non-zero interval (`DriverCore::arm_liveness`
+    // disables the tick entirely for a zero interval).
+    root_liveness_interval: Duration::ZERO,
     // Inert for the fake spawns (no fanotify admission map); a real fanotify
     // spawn threads this into its SourceConfig.
     max_map_directories: None,
@@ -811,6 +814,167 @@ async fn refresh_finding_root_gone_dies_end_to_end() {
     1,
     "the dead root's stream was torn down"
   );
+}
+
+/// A descending rig on `runtime`'s pool, ticking its root liveness every
+/// `interval`, recording its scope transitions into `registry`.
+fn ticking_descending_rig(interval: Duration, registry: RecordingRegistry) -> Rig {
+  let fs = FakeFs::new(1);
+  fs.put("/r", FileKind::Dir, 1);
+  fs.spawn_backend(BackendKind::Inotify);
+  let (cmd_tx, cmd_rx) = async_channel::bounded(16);
+  let (cleanup, cookie_wake) = cookie_ingress();
+  let (ev_tx, ev_rx) = async_channel::bounded(64);
+  tokio::spawn(run::<TokioRuntime, FakeFs>(
+    DriverConfig {
+      profile: BackendKind::Inotify,
+      root_liveness_interval: interval,
+      ..config()
+    },
+    fs.clone(),
+    cmd_rx,
+    cookie_wake,
+    ev_tx,
+    registry,
+  ));
+  Rig {
+    fs,
+    commands: cmd_tx,
+    cleanup,
+    events: ev_rx,
+  }
+}
+
+/// The root-liveness probe reaches the filesystem even when the blocking pool is
+/// PERMANENTLY occupied by the very work it exists to outlive.
+///
+/// `max_blocking_threads(1)` is a legal Tokio configuration, and a sync's cookie
+/// write can sit inside that one worker for as long as a wedged mount takes to
+/// answer — which may be forever. A probe dispatched onto the same pool queues
+/// behind it and never runs, so a root deleted under the stall stays falsely
+/// live and its scope never emits its terminal `Rescan`: precisely the death the
+/// tick exists to detect. The probe runs on a thread of its own for that reason.
+///
+/// Single worker, parked before the root vanishes, still parked when the death
+/// lands — so the death cannot have travelled through the pool.
+///
+/// Revert witness: dispatch the refresh through `R::spawn_blocking_detach` again
+/// and the settle below expires with the registry still empty; the scope only
+/// dies after the gate opens.
+#[test]
+fn a_liveness_probe_answers_while_the_blocking_pool_stays_occupied() {
+  let runtime = tokio::runtime::Builder::new_current_thread()
+    .enable_all()
+    .max_blocking_threads(1)
+    .build()
+    .expect("a runtime whose blocking pool is one worker wide");
+  runtime.block_on(async {
+    let registry = RecordingRegistry::default();
+    let rig = ticking_descending_rig(Duration::from_millis(20), registry.clone());
+    let scope = watch(&rig, "/r").await;
+
+    // Occupy the pool's ONE worker for the rest of the cell: everything the
+    // driver dispatches onto it from here queues behind this job.
+    let gate = Arc::new((std::sync::Mutex::new(true), std::sync::Condvar::new()));
+    let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let left = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Opening the gate however this cell ends. A failing assertion unwinds
+    // through `block_on`, and dropping the runtime WAITS for its blocking pool
+    // — so a parked job left parked turns a failure into a hang, and the
+    // revert witness below could never be read.
+    struct OpenOnExit(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+    impl Drop for OpenOnExit {
+      fn drop(&mut self) {
+        let (held, waiters) = &*self.0;
+        *held
+          .lock()
+          .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+        waiters.notify_all();
+      }
+    }
+    let _open_on_exit = OpenOnExit(Arc::clone(&gate));
+    {
+      let gate = Arc::clone(&gate);
+      let entered = Arc::clone(&entered);
+      let left = Arc::clone(&left);
+      tokio::task::spawn_blocking(move || {
+        entered.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (held, waiters) = &*gate;
+        let mut parked = held.lock().unwrap();
+        while *parked {
+          parked = waiters.wait(parked).unwrap();
+        }
+        left.store(true, std::sync::atomic::Ordering::SeqCst);
+      });
+    }
+    assert!(
+      settle(|| entered.load(std::sync::atomic::Ordering::SeqCst)).await,
+      "staging: the pool's only worker is inside the parked job"
+    );
+
+    // The root vanishes under the stall. A kernel-recursive backend gets no
+    // in-tree signal for it, so the periodic probe is the only witness.
+    rig.fs.set_root_liveness(RootLiveness::Missing);
+    assert!(
+      settle(|| registry.dead() == [scope]).await,
+      "the probe ran off the pool and the dead root ended its scope"
+    );
+    assert!(
+      !left.load(std::sync::atomic::Ordering::SeqCst),
+      "and it did so while the pool's only worker was still parked"
+    );
+
+    // Open the gate and let the parked job leave, so the cell closes cleanly.
+    {
+      let (held, waiters) = &*gate;
+      *held.lock().unwrap() = false;
+      waiters.notify_all();
+    }
+    assert!(
+      settle(|| left.load(std::sync::atomic::Ordering::SeqCst)).await,
+      "the parked job leaves once its gate opens"
+    );
+  });
+}
+
+/// A tick that finds this scope's probe still outstanding dispatches NOTHING.
+///
+/// A probe that has not answered is a hung root; a second thread against the
+/// same path proves nothing and would let a wall-clock tick mint one thread per
+/// interval for as long as the mount stays wedged. One outstanding probe per
+/// scope is the bound, and the tick simply re-arms its deadline.
+#[tokio::test]
+async fn a_second_liveness_tick_dispatches_no_second_probe() {
+  let registry = RecordingRegistry::default();
+  let rig = ticking_descending_rig(Duration::from_millis(20), registry.clone());
+  let scope = watch(&rig, "/r").await;
+
+  // The birth refresh is already behind us, so this gate captures the first
+  // TICKED probe and holds it there.
+  let hold = rig.fs.hold_refreshes();
+  assert!(
+    settle(|| hold.captured() == 1).await,
+    "staging: one ticked probe is parked inside the refresh"
+  );
+
+  // Many further intervals elapse against that parked probe. The settle
+  // EXPIRING is the claim: no second dispatch ever happens.
+  assert!(
+    !settle(|| hold.captured() > 1).await,
+    "a tick that finds a probe outstanding dispatches no second one"
+  );
+  assert!(
+    registry.dead().is_empty(),
+    "and the scope is alive throughout — nothing here is a death"
+  );
+  assert_eq!(
+    rig.fs.refreshes(),
+    1,
+    "only the birth refresh ever completed"
+  );
+
+  hold.release();
+  let _ = scope;
 }
 
 /// The refresh samples the root's identity AND its mount frame from ONE object, so
@@ -9679,6 +9843,7 @@ mod descending {
       let mut deferred_grants: BTreeMap<ScopeId, DeferredGrant> = BTreeMap::new();
       let mut pending_control: crate::driver::PendingControl = BTreeMap::new();
       let mut control_inflight: crate::driver::ControlInflight = BTreeMap::new();
+      let mut probes_in_flight: BTreeSet<ScopeId> = BTreeSet::new();
       let registry = NullRegistry;
       let now = || Instant::from_origin(Duration::from_millis(5));
       let reaper = crate::driver::TeardownReaper::new().expect("the reaper secures its thread");
@@ -9700,6 +9865,7 @@ mod descending {
         &mut deferred_grants,
         &mut pending_control,
         &mut control_inflight,
+        &mut probes_in_flight,
         &mut cookies,
         &registry,
         &now,
@@ -19354,6 +19520,66 @@ mod sync_cookie {
          driver is holding are left"
       );
 
+      drop(watcher);
+      let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A watcher carrying the DEFAULT cookie cap admits no more samplings than
+    /// the sampling ceiling — the cap does not raise the door.
+    ///
+    /// The cookie cap counts RECORDS, and a record is not a descriptor: each
+    /// admitted sampling retains three (the root every descent starts from, the
+    /// directory the sync names, and the reserved directory), plus a transient
+    /// duplicate per open on macOS. A door sized to 128 records therefore holds
+    /// up to 384 descriptors before the driver has read a single command —
+    /// already past macOS's 256 soft limit, with every other watcher in the
+    /// process holding an allowance of its own on top. So the door is sized by
+    /// the sampling ceiling, and a wider record cap leaves it exactly where it
+    /// is.
+    ///
+    /// Exactly ONE descriptor per admitted sampling names the target, so the
+    /// count read here IS the number of samplings the door let through.
+    ///
+    /// Revert witness: size the allowance by the cookie cap again and the
+    /// ceiling inside the wait catches the count climbing past the transient
+    /// headroom on its way to the cap.
+    #[tokio::test]
+    async fn a_wide_cookie_cap_admits_no_more_than_the_sampling_ceiling() {
+      const CAP: usize = crate::driver::DriverConfig::DEFAULT_COOKIE_GLOBAL_CAP;
+      const CEILING: usize = crate::driver::MAX_SYNC_SAMPLINGS;
+      // Enough callers that a door sized to the CAP would be visibly wider than
+      // the transient headroom below — the reverted allowance holds all of them.
+      const CALLERS: usize = 96;
+      // What a descriptor COUNT may legitimately read while the ramp is running:
+      // an admitted sampling holds one descriptor naming the target, and reads
+      // that object's identity through a `try_clone` of it, so a sampling caught
+      // mid-read shows two. Every admitted sampling can be inside that window at
+      // once, so twice the ceiling is the honest instantaneous bound — still far
+      // below what a door sized by the record cap would hold.
+      const TRANSIENT: usize = 2 * CEILING;
+
+      // Both the cap under test and the caller count must be wide enough for an
+      // unbounded door to breach the transient headroom, or the ceiling inside the
+      // wait would have nothing to catch.
+      const { assert!(CAP > TRANSIENT && CALLERS > TRANSIENT) };
+
+      let root = scratch("door-pin-ceiling");
+      let target = root.join("a");
+      std::fs::create_dir_all(&target).expect("the directory the syncs name");
+      let (watcher, handle) = doored_watcher(&root, CAP).await;
+
+      let mut pending = Vec::new();
+      for _ in 0..CALLERS {
+        let (admission, _ticket) = watcher
+          .mint_sync_ticket()
+          .expect("this host seeds a watcher");
+        pending.push(Box::pin(watcher.sync_root(handle, &target, admission)));
+      }
+      // Driven to a standstill with no await anywhere, so the driver never gets
+      // the thread: what settles here is what the door let through on its own.
+      pins_settle_at(&mut pending, &target, CEILING, TRANSIENT).await;
+
+      drop(pending);
       drop(watcher);
       let _ = std::fs::remove_dir_all(&root);
     }

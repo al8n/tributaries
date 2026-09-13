@@ -55,23 +55,27 @@
 //! Every backend's root death — unmount, delete, or replace — must reach a
 //! trigger that runs [`on_mounts_refreshed`](DriverCore::on_mounts_refreshed)'s
 //! death mapping or the Monitor's self-event path; the trigger differs by
-//! backend, and one backend's unmount is signal-silent, which the periodic tick
-//! ([`root_liveness_interval`](DriverCore::new)) exists to cover:
+//! backend, and two of them cannot be left to their own signal alone, which is
+//! what the periodic tick ([`root_liveness_interval`](DriverCore::new)) covers:
 //!
 //! | backend | root unmount trigger | in-tree delete/replace trigger |
 //! |---|---|---|
-//! | inotify (descending) | `IN_UNMOUNT` + `IN_IGNORED` event | `IN_DELETE_SELF` / `IN_MOVE_SELF` event |
+//! | inotify (descending) | `IN_UNMOUNT` + `IN_IGNORED` event | `IN_DELETE_SELF` / `IN_MOVE_SELF` event — but the delete half is queued only once the LAST reference to the root drops, so the **periodic liveness tick** re-stats the root beside it |
 //! | FSEvents (macOS) | `RootChanged` flag → root-alive probe | `RootChanged` flag → root-alive probe |
 //! | fanotify (`FAN_MARK_FILESYSTEM`) | **SILENT** — no event, no hangup (the mark holds the sb alive; L4.1) → the **periodic liveness tick** re-stats the root | `FAN_DELETE_SELF` / `FAN_MOVE_SELF` event |
 //! | RDCW (Windows) | any terminal read completion → fatal source error → self-event | same signal; RDCW draws no in-band distinction from unmount |
 //! | USN journal (Windows) | a failed journal read → fatal source error → self-event | the root's own FRN named in a delete/rename record → `RootDeath` |
 //!
-//! Only fanotify's unmount emits nothing in-band, so only fanotify arms the
-//! tick (gated by [`liveness_ticked`](DriverCore::liveness_ticked)). Its in-tree
-//! self-events, and every other backend's death signal, already lower a
-//! terminal `Removed`/`Rescan` through the existing paths; the tick's role is
-//! solely to make the quiet unmount observable within a bounded latency — a
-//! loss-triggered refresh already catches it immediately when one occurs.
+//! So both Linux profiles arm the tick (gated by
+//! [`liveness_ticked`](DriverCore::liveness_ticked)), for two different
+//! reasons: fanotify's unmount emits nothing in band at all, and inotify's
+//! in-tree death notice is postponed by every descriptor this driver holds on
+//! the root — a sync's admission pins above all, which a stalled write keeps
+//! for as long as the stall lasts. The three remaining backends' death signals
+//! already lower a terminal `Removed`/`Rescan` through the existing paths with
+//! nothing of ours able to hold them back; the tick's role is to bound the
+//! latency of the two that cannot say so themselves — a loss-triggered refresh
+//! still catches either immediately when one occurs.
 
 use std::{
   collections::{BTreeMap, BTreeSet, VecDeque},
@@ -1409,8 +1413,9 @@ struct ScopeState {
   /// drops the Monitor's internal failure `Rescan` instead of emitting a public
   /// event for a registration no one owns.
   publicly_live: bool,
-  /// When this scope's root is next re-stat'd for liveness, for a
-  /// signal-silent-on-unmount backend (fanotify) under a non-zero interval.
+  /// When this scope's root is next re-stat'd for liveness, for a tick-armed
+  /// backend (fanotify, inotify — see [`liveness_ticked`](DriverCore::liveness_ticked))
+  /// under a non-zero interval.
   /// `None` for every other backend, before the root goes live, and while the
   /// tick is disabled — the loss-triggered refresh remains its own path. Seeded
   /// once the birth refresh confirms the root alive and re-armed by
@@ -1769,10 +1774,11 @@ pub(crate) struct DriverCore {
   /// only needs to pair the two records emitted adjacently — a fresh counter
   /// per rename suffices and never clashes across renames.
   cookie_seq: u64,
-  /// How often a signal-silent-on-unmount scope (fanotify) re-stats its root:
-  /// the composition's one timer (see the per-backend death-signal table in the
+  /// How often a tick-armed scope (fanotify, inotify) re-stats its root: the
+  /// composition's one timer (see the per-backend death-signal table in the
   /// module docs). `Duration::ZERO` disables the tick — only the loss-triggered
-  /// refresh then detects a quiet unmount. Every non-fanotify scope ignores it.
+  /// refresh then detects a quiet unmount, or a death notice a held descriptor
+  /// is postponing. Every other profile ignores it.
   root_liveness_interval: Duration,
   /// The caller's exclusion directories, applied to every scope this core owns
   /// (they are a watcher-wide option, not a per-root one). Empty is the common
@@ -1803,7 +1809,7 @@ pub(crate) struct DriverCore {
 
 impl DriverCore {
   /// Builds a core whose Monitor pairs renames within `move_window` and re-stats
-  /// each signal-silent scope's root every `root_liveness_interval`
+  /// each tick-armed scope's root every `root_liveness_interval`
   /// (`Duration::ZERO` disables that tick).
   pub(crate) fn new(move_window: Duration, root_liveness_interval: Duration) -> Self {
     let mut monitor = Monitor::new(caps_for(BackendKind::FsEvents));
@@ -1996,25 +2002,42 @@ impl DriverCore {
     Some(path)
   }
 
-  /// Whether `profile` is a backend that emits NO in-band signal when its root
-  /// is unmounted — the gate for the periodic root-liveness tick.
+  /// Whether `profile` is a backend whose root death cannot be left to its own
+  /// signal alone — the gate for the periodic root-liveness tick.
   ///
   /// The per-backend death-signal table (design §7; the module docs restate it):
   ///
   /// | backend | root unmount | root delete/replace in-tree | tick needed |
   /// |---|---|---|---|
-  /// | inotify (descending) | `IN_UNMOUNT` + `IN_IGNORED` | `IN_DELETE_SELF`/`IN_MOVE_SELF` | no |
+  /// | inotify (descending) | `IN_UNMOUNT` + `IN_IGNORED` | `IN_DELETE_SELF`/`IN_MOVE_SELF`, but the delete half is queued only when the LAST reference to the root drops | **yes** |
   /// | FSEvents (macOS) | `RootChanged` | `RootChanged` | no |
   /// | fanotify (`FAN_MARK_FILESYSTEM`) | **SILENT** (fd goes quiet, mark holds the sb alive — L4.1) | `FAN_DELETE_SELF`/`FAN_MOVE_SELF` | **yes** |
   /// | RDCW (Windows) | fatal source error on any terminal read completion | same signal | no |
   /// | USN journal (Windows) | fatal source error on a failed journal read | `RootDeath` (the root's own FRN in a delete/rename record) | no |
   ///
-  /// Only fanotify's unmount is signal-silent, so only fanotify arms the tick;
-  /// its in-tree self-events and every other backend's death signal already
-  /// reach [`on_mounts_refreshed`](Self::on_mounts_refreshed)'s death mapping
-  /// (via a loss-triggered refresh) or the Monitor's self-event path directly.
+  /// Two backends arm it, for two different reasons.
+  ///
+  /// fanotify, because its unmount emits NOTHING in band: the mark holds the
+  /// superblock alive and the fd simply goes quiet, so a re-stat is the only
+  /// observation there is.
+  ///
+  /// inotify, because its in-tree death notice is not INDEPENDENT of this
+  /// process. Linux queues a watched root's `IN_DELETE_SELF` only once the last
+  /// reference to the removed directory drops, so every descriptor this driver
+  /// holds on the root postpones it — and a sync's admission pins are held for
+  /// as long as the write that owns them takes, which on a stalled filesystem
+  /// is unbounded. Waiting on that signal would let a removed root stay
+  /// falsely live for the length of a hung syscall: no terminal `Rescan`,
+  /// syncs refused as in-flight, close reporting non-quiescence. The tick is
+  /// the observation that does not depend on it, and it bounds the delay to
+  /// one interval whatever any pin is doing.
+  ///
+  /// The other three keep their in-band signals and stay off the tick: each
+  /// reaches [`on_mounts_refreshed`](Self::on_mounts_refreshed)'s death mapping
+  /// (via a loss-triggered refresh) or the Monitor's self-event path directly,
+  /// with no reference of this driver's able to hold it back.
   const fn liveness_ticked(profile: BackendKind) -> bool {
-    matches!(profile, BackendKind::Fanotify)
+    matches!(profile, BackendKind::Fanotify | BackendKind::Inotify)
   }
 
   /// Mints the next `FAN_RENAME` pairing cookie.
@@ -3982,9 +4005,10 @@ impl DriverCore {
     effects.push_back(Effect::RefreshMounts { scope, root });
   }
 
-  /// (Re)arms the periodic root-liveness deadline for a signal-silent scope
-  /// whose root is live, or clears it when the tick does not apply (a non-
-  /// fanotify backend, `Duration::ZERO`, or a root not yet live). Called on
+  /// (Re)arms the periodic root-liveness deadline for a tick-armed scope whose
+  /// root is live, or clears it when the tick does not apply (a backend
+  /// [`liveness_ticked`](Self::liveness_ticked) refuses, `Duration::ZERO`, or a
+  /// root not yet live). Called on
   /// every alive mount-refresh completion so birth seeds it and each refresh
   /// re-seeds it, and after [`on_timeout`](Self::on_timeout) fires a tick. Takes
   /// `interval` explicitly (like [`arm_refresh`](Self::arm_refresh) takes
@@ -4213,10 +4237,11 @@ impl DriverCore {
 
   /// Advances time: resolves rename halves whose pairing window elapsed,
   /// re-arms refused parked deliveries whose retry deadline passed, and fires
-  /// the periodic root-liveness re-stat for every signal-silent scope whose
-  /// tick came due (the ONE timer the fanotify composition adds — a quiet
-  /// unmount produces neither a birth nor a loss refresh, so without this the
-  /// death would never be observed).
+  /// the periodic root-liveness re-stat for every tick-armed scope whose tick
+  /// came due (the ONE timer the Linux composition adds — a quiet unmount
+  /// produces neither a birth nor a loss refresh, and a death notice a held
+  /// descriptor is postponing produces neither either, so without this the
+  /// death would go unobserved for as long as that lasts).
   pub(crate) fn on_timeout(&mut self, now: Instant) {
     self.monitor.handle_timeout(now);
     for state in self.scopes.values_mut() {
@@ -4327,7 +4352,7 @@ impl DriverCore {
   /// - the Monitor's pending-move deadline, via [`Monitor::poll_timeout`];
   /// - [`Attempt::Spent`]'s retry, for a scope's parked delivery and for a dying
   ///   scope's terminal `Rescan`;
-  /// - [`liveness_deadline`](ScopeState::liveness_deadline), the signal-silent
+  /// - [`liveness_deadline`](ScopeState::liveness_deadline), the periodic
   ///   root re-stat.
   ///
   /// (The driver's own sync-cookie remove-retry is the other term of that

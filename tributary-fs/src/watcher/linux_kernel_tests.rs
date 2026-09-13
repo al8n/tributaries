@@ -801,3 +801,132 @@ async fn a_parked_sampling_never_defers_the_root_s_death() {
 
   let _ = std::fs::remove_dir_all(&outer);
 }
+
+/// Arms one [`COOKIE_WRITE_STEP`](crate::driver::COOKIE_WRITE_STEP) entry and
+/// takes it back down when the guard drops.
+///
+/// Keyed by the directory the sync named, which this cell's scratch root makes
+/// unique to it.
+struct WriteStep {
+  dir: PathBuf,
+}
+
+impl WriteStep {
+  fn arm(dir: &Path, step: impl FnOnce() + Send + 'static) -> Self {
+    crate::driver::COOKIE_WRITE_STEP
+      .lock()
+      .unwrap_or_else(std::sync::PoisonError::into_inner)
+      .push((dir.to_path_buf(), Box::new(step)));
+    Self {
+      dir: dir.to_path_buf(),
+    }
+  }
+}
+
+impl Drop for WriteStep {
+  fn drop(&mut self) {
+    crate::driver::COOKIE_WRITE_STEP
+      .lock()
+      .unwrap_or_else(std::sync::PoisonError::into_inner)
+      .retain(|(armed_for, _)| *armed_for != self.dir);
+  }
+}
+
+/// A stalled cookie write may not postpone an inotify root's death.
+///
+/// The door hands its completed pins to the detached WRITE, which owns them for
+/// the whole of its run — and an open descriptor on a directory holds its dentry,
+/// so `rmdir` of the root unhashes it instead of unlinking the inode and the
+/// `IN_DELETE_SELF` the death rests on is queued only once that descriptor
+/// closes. A write stalled in a syscall therefore holds the root's own death
+/// notice for exactly as long as the stall lasts, which on a mount that never
+/// answers has no bound: the scope would stay falsely live, refusing syncs as
+/// in-flight and reporting close non-quiescent, with no event to say otherwise.
+///
+/// The periodic root-liveness tick is what does not depend on that notice. Here
+/// the write is parked at its own top — reaching the step is itself the proof
+/// that the admission's pins are held by it — the root is removed while it is
+/// parked, and the death must be observed within a few liveness intervals rather
+/// than at the release. Releasing the gate afterwards must still leave a clean
+/// close.
+///
+/// Revert witness: narrow the tick's gate back to fanotify alone
+/// ([`liveness_ticked`](crate::core::DriverCore::liveness_ticked)) and this cell
+/// waits out its deadline — the death arrives only after the gate is released.
+///
+/// Real inotify, because the fact is the kernel's: no modelled tree can be asked
+/// what an open descriptor does to a `rmdir`'s notification.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_parked_cookie_write_never_defers_the_root_s_death() {
+  let outer = scratch_root("write-parked-rootdeath");
+  let root = outer.join("watched");
+  let target = root.join("a");
+  std::fs::create_dir_all(&target).expect("the directory the sync names");
+
+  // A cadence far under the observation deadline, so "within a few intervals" is
+  // a real bound rather than a restatement of the deadline.
+  let mut w = TokioWatcher::new(
+    WatcherOptions::new()
+      .with_backend(Backend::Inotify)
+      .with_root_liveness_interval(Duration::from_millis(200)),
+  )
+  .expect("build inotify watcher");
+  let handle = w.watch(&root, Interest::all()).await.expect("watch root");
+  let canonical = w.root_path(handle).expect("root path");
+
+  let (entered, write_entered) = std::sync::mpsc::channel::<()>();
+  let (release, released) = std::sync::mpsc::channel::<()>();
+  let _step = WriteStep::arm(&target, move || {
+    let _ = entered.send(());
+    // Returns when this cell drops its sender, and not before: for as long as
+    // this call is here, the write owning the admission's pins has not come back.
+    let _ = released.recv();
+  });
+
+  let (admission, _ticket) = w.mint_sync_ticket().expect("this host seeds a watcher");
+  let mut call = Box::pin(w.sync_root(handle, &target, admission));
+  // The door samples on the pool one job per poll, then the driver admits and
+  // dispatches the write; short timeouts are what keep polling across both.
+  let mut reached = false;
+  for _ in 0..600 {
+    if tokio::time::timeout(Duration::from_millis(50), &mut call)
+      .await
+      .is_ok()
+    {
+      break;
+    }
+    if write_entered.try_recv().is_ok() {
+      reached = true;
+      break;
+    }
+  }
+  assert!(
+    reached,
+    "staging: the sync was admitted and its write reached the parked step holding \
+     the admission's pins"
+  );
+  // The caller walks away. The write keeps the pins regardless — which is the
+  // whole of the problem — so the root's dentry stays held either way.
+  drop(call);
+
+  std::fs::remove_dir(&target).expect("empty the root");
+  std::fs::remove_dir(&root).expect("remove the watched root");
+  let seen = wait_for(&mut w, |e| {
+    e.root() == handle && (e.is_rescan() || (e.kind().is_removed() && e.path() == canonical))
+  })
+  .await;
+  assert!(
+    seen.is_some(),
+    "the root's death is reported while the write is still parked — the tick does \
+     not wait on a notice the write's own descriptors are deferring"
+  );
+
+  // And the watcher closes once that write finally returns.
+  drop(release);
+  tokio::time::timeout(DEADLINE, w.close())
+    .await
+    .expect("close is not waiting on a write nobody is waiting for")
+    .expect("the watcher closes");
+
+  let _ = std::fs::remove_dir_all(&outer);
+}

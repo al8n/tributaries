@@ -94,12 +94,14 @@ pub(crate) struct DriverConfig {
   /// Ignored on macOS. The Monitor profile above is provisional until this
   /// resolves.
   pub(crate) backend: Backend,
-  /// The periodic root-liveness deadline for the one signal-silent-on-unmount
-  /// backend (fanotify): the driver re-stats such a root on this cadence so a
-  /// quiet unmount — which emits no kernel signal and no loss — is still
-  /// detected. Every other backend, including both Windows ones, surfaces an
-  /// unmount as its own fatal source error instead of going quiet, so none of
-  /// them arm this tick. [`Duration::ZERO`] disables it.
+  /// The periodic root-liveness deadline for the two Linux backends: the driver
+  /// re-stats such a root on this cadence so a fanotify root's quiet unmount —
+  /// which emits no kernel signal and no loss — is still detected, and so an
+  /// inotify root's removal is detected even while a descriptor this driver
+  /// holds (a sync's admission pins above all) postpones the kernel's own
+  /// `IN_DELETE_SELF`. FSEvents and both Windows backends surface a dead root
+  /// through their own streams with nothing of ours able to hold it back, so
+  /// none of them arm this tick. [`Duration::ZERO`] disables it.
   pub(crate) root_liveness_interval: Duration,
   /// The admission-map directory cap (design §4.9); `None` = uncapped.
   /// Threaded into each fanotify and USN journal spawn's `SourceConfig`;
@@ -6629,9 +6631,11 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
 
   /// Re-reads the live mount table strictly under `root` AND re-stats the root
   /// itself (blocking): the mount prefixes, whether the read was authoritative,
-  /// and the root's liveness. The root re-stat rides the mount refresh so a
-  /// kernel-recursive backend's root death (unmount/replace — no in-tree signal)
-  /// is caught at the refresh cadence without any new timer or effect.
+  /// and the root's liveness. The root re-stat rides the mount refresh so a root
+  /// death no in-band signal will report in time — a kernel-recursive backend's
+  /// unmount/replace, or a descending one's removal while a held descriptor
+  /// postpones its notice — is caught at the refresh cadence without any new
+  /// timer or effect.
   fn refresh_mounts(&self, root: &Path) -> MountRefresh;
 
   /// Attaches the arm/disarm port of `scope`'s freshly spawned source under
@@ -7449,11 +7453,12 @@ fn cookie_dir<'a>(root: &Path, dir: &'a Path) -> &'a Path {
 /// that syscall returns and its own descriptor goes with it. Nothing the caller
 /// owns is waiting for any of that.
 ///
-/// It is sized by the ledger's own global cookie cap, which already bounds how
-/// many syncs one watcher may have outstanding, so the two agree by construction:
-/// pins in flight ≤ 3 × cap. A door that has to wait for a slot is a door under
-/// exactly the pressure that cap describes, and waiting is what a caller can act
-/// on — its own timeout, or dropping the future — where an exhausted descriptor
+/// It is sized by [`MAX_SYNC_SAMPLINGS`] rather than by the ledger's cookie cap,
+/// because a permit is not a RECORD: one permit authorizes three descriptors,
+/// so a cap counted in records is three times too generous read as a descriptor
+/// bound. A door that has to wait for a slot is a door under exactly the
+/// pressure that ceiling describes, and waiting is what a caller can act on —
+/// its own timeout, or dropping the future — where an exhausted descriptor
 /// table is not.
 ///
 /// A permit is a message occupying a slot of a bounded channel: acquiring one is
@@ -7465,6 +7470,29 @@ fn cookie_dir<'a>(root: &Path, dir: &'a Path) -> &'a Path {
 /// and is therefore not `Unpin`, and a `Watcher` that held one directly would not
 /// be either. The `Arc` is what a permit carries anyway — one allowance, shared
 /// by every clone of one watcher and by every permit outstanding against it.
+/// The most samplings one watcher's sync door admits at once — the ceiling its
+/// [`SyncPinAllowance`] is sized to.
+///
+/// This is a DESCRIPTOR bound wearing a sampling's clothes, and it is deliberately
+/// not the ledger's cookie cap. Each admitted sampling retains three descriptors —
+/// the root every descent starts from, the directory the sync names, and the
+/// reserved directory — and macOS duplicates one more per open for as long as the
+/// sample lasts. At 32 that is 96 retained plus at most one transient duplicate in
+/// flight (the door samples one directory at a time, on one pool job), comfortably
+/// inside macOS's 256 soft limit with room left for the watcher's own sources,
+/// its event channel and the application's unrelated I/O. The cookie cap read as a
+/// descriptor bound gives 3 × 128 = 384, which is past that limit before a single
+/// cap has an opinion — and every watcher in the process has an allowance of its
+/// own, so the peak multiplies.
+///
+/// Thirty-two is not a throughput compromise. A sampling is three opens and a
+/// send, all of it microseconds of syscalls; the driver single-flights a scope's
+/// physical writes anyway, so a wider door would only queue more callers deeper
+/// inside the same funnel; and a caller waiting at the door holds NOTHING — no
+/// descriptor, no ledger record, no place in the mailbox — so the wait costs
+/// latency and never a resource.
+pub(crate) const MAX_SYNC_SAMPLINGS: usize = 32;
+
 #[derive(Debug, Clone)]
 pub(crate) struct SyncPinAllowance {
   taken: async_channel::Sender<()>,
@@ -8086,6 +8114,40 @@ pub(crate) static SYNC_DOOR_STEP: Mutex<Vec<ArmedDoorStep>> = Mutex::new(Vec::ne
   any(target_os = "linux", target_os = "macos")
 ))]
 type ArmedDoorStep = (PathBuf, SyncDoorPoint, Box<dyn FnOnce() + Send>);
+
+/// The same seam one phase later: a one-shot step at the top of the real cookie
+/// WRITE, armed for ONE directory and run by the [`FsOps::write_cookie`] of that
+/// directory alone.
+///
+/// The window it exposes is the write's own: the detached job owns the
+/// admission's pins for the whole of its run, and every syscall it makes can
+/// stall on a mount that never answers. A step that parks here stands in for
+/// that stall, and what the cell then asks is whether anything the driver owes
+/// — a removed root's death above all — still arrives while it lasts.
+///
+/// PROCESS-GLOBAL for the reason [`SYNC_DOOR_STEP`] is: the write runs on a pool
+/// thread no thread-local of the arming cell could reach. The directory keys it,
+/// the running writer TAKES its arming out and runs it with the lock released,
+/// and it is a LIST so parallel cells keep their own.
+///
+/// Production compiles no call to it at all.
+#[cfg(all(
+  test,
+  feature = "tokio",
+  not(miri),
+  any(target_os = "linux", target_os = "macos")
+))]
+pub(crate) static COOKIE_WRITE_STEP: Mutex<Vec<ArmedWriteStep>> = Mutex::new(Vec::new());
+
+/// One [`COOKIE_WRITE_STEP`] arming: the directory it speaks for, and the
+/// one-shot job that directory's writer runs.
+#[cfg(all(
+  test,
+  feature = "tokio",
+  not(miri),
+  any(target_os = "linux", target_os = "macos")
+))]
+type ArmedWriteStep = (PathBuf, Box<dyn FnOnce() + Send>);
 
 /// Which of the door's three samplings is being spoken about.
 ///
@@ -8854,6 +8916,29 @@ impl FsOps for RealFs {
     prune: &Globs,
     exclusions: &[PathBuf],
   ) -> Result<CookieFile, CookieWriteError> {
+    // Taken OUT of the slot to run, and only when this is the directory it was
+    // armed for, so a step that parks holds neither the lock nor a parallel
+    // cell's arming ([`COOKIE_WRITE_STEP`]).
+    #[cfg(all(
+      test,
+      feature = "tokio",
+      not(miri),
+      any(target_os = "linux", target_os = "macos")
+    ))]
+    {
+      let step = {
+        let mut armed = COOKIE_WRITE_STEP
+          .lock()
+          .unwrap_or_else(PoisonError::into_inner);
+        armed
+          .iter()
+          .position(|(armed_for, _)| armed_for == dir)
+          .map(|at| armed.remove(at).1)
+      };
+      if let Some(step) = step {
+        step();
+      }
+    }
     // The root's canonical path, as the SPAWN resolved it — recorded together
     // with the object below and replaced together with it, so the two can never
     // describe different trees. Re-canonicalizing the root here would be a second
@@ -10710,6 +10795,14 @@ pub(crate) async fn run<R, F>(
   let mut cut_token_seq: u64 = 0;
   let mut pending_control: PendingControl = BTreeMap::new();
   let mut control_inflight: ControlInflight = BTreeMap::new();
+  // The scopes with a ROOT-LIVENESS PROBE outstanding. A probe runs on a thread
+  // of its own rather than on the blocking pool — see the `RefreshMounts`
+  // dispatch for why the pool is the one executor it must not share — and this
+  // set is what keeps a wall-clock tick from minting a second thread against a
+  // root the first has not come back from. Entries are removed when the probe's
+  // `MountsRefreshed` lands and at scope teardown, so the set is bounded by live
+  // scopes.
+  let mut probes_in_flight: BTreeSet<ScopeId> = BTreeSet::new();
   // Awaited unwatch replies parked until the scope is fully quiescent, each
   // paired with the verdict to send then: `true` for a live scope this
   // unwatch tears down, `false` (UnknownRoot) for a scope whose root already
@@ -10774,6 +10867,7 @@ pub(crate) async fn run<R, F>(
       &mut deferred_grants,
       &mut pending_control,
       &mut control_inflight,
+      &mut probes_in_flight,
       &mut cookies,
       &registry,
       &now,
@@ -10827,6 +10921,7 @@ pub(crate) async fn run<R, F>(
         &mut deferred_grants,
         &mut pending_control,
         &mut control_inflight,
+        &mut probes_in_flight,
         &mut cookies,
         &registry,
         &now,
@@ -11567,6 +11662,10 @@ pub(crate) async fn run<R, F>(
           }},
           OpResult::Probed { probe, outcome } => core.on_probe_result(probe, outcome, now()),
           OpResult::MountsRefreshed { scope, refresh } => {
+            // The probe's thread is done with this scope: its seat comes back
+            // here, in lockstep with the core clearing its own pending mark, so
+            // the next tick may dispatch again.
+            probes_in_flight.remove(&scope);
             core.on_mounts_refreshed(scope, refresh, now())
           }
           OpResult::WatchInstalled {
@@ -12764,6 +12863,7 @@ pub(crate) async fn run<R, F>(
           }
           Ok(OpResult::Enumerated { req, raw }) => core.on_enumerated(req, raw),
           Ok(OpResult::MountsRefreshed { scope, refresh }) => {
+            probes_in_flight.remove(&scope);
             core.on_mounts_refreshed(scope, refresh, now())
           }
           // A spawn that raced the close: the stream is live but has no owner —
@@ -12890,6 +12990,7 @@ pub(crate) async fn run<R, F>(
     &mut deferred_grants,
     &mut pending_control,
     &mut control_inflight,
+    &mut probes_in_flight,
     &mut cookies,
     &registry,
     &now,
@@ -15525,6 +15626,7 @@ fn execute_effects<R, F>(
   deferred_grants: &mut BTreeMap<ScopeId, DeferredGrant>,
   pending_control: &mut PendingControl,
   control_inflight: &mut ControlInflight,
+  probes_in_flight: &mut BTreeSet<ScopeId>,
   cookies: &mut CookieRegistry<F>,
   registry: &impl ScopeRegistry,
   now: &impl Fn() -> Instant,
@@ -15596,6 +15698,12 @@ fn execute_effects<R, F>(
         // not only across later ones.
         pending_control.remove(&scope);
         control_inflight.remove(&scope);
+        // The liveness probe's seat goes with the scope for the same reason:
+        // scope ids are never reused, so an entry left behind by a probe whose
+        // answer arrives after the teardown (or never, on a hung root) would
+        // grow this set unbounded under watch/unwatch churn. A late answer for
+        // a gone scope is inert on both sides — the core has no state to feed.
+        probes_in_flight.remove(&scope);
         torn_down.insert(scope);
         // The lane's drain tap dies with the lane — a clone kept past this
         // point would grow the map unbounded under watch/unwatch churn.
@@ -15697,12 +15805,55 @@ fn execute_effects<R, F>(
         });
       }
       Effect::RefreshMounts { scope, root } => {
+        // A liveness probe NEVER rides the blocking pool. The pool is where the
+        // very thing this probe exists to outlive is stalled: a sync's cookie
+        // write holding the only worker of a legal one-worker pool starves the
+        // probe forever, and a root that died under that write then stays
+        // falsely live with no terminal `Rescan` ever emitted. The probe is
+        // this scope's death detector, so it gets execution capacity that the
+        // stalled write cannot occupy — its own OS thread.
+        //
+        // ONE outstanding probe per scope. A probe that has not answered is a
+        // hung root; a second thread on the same path proves nothing and would
+        // let a wall-clock tick mint a thread per interval against a mount that
+        // never returns. The core re-arms the scope's deadline either way, so a
+        // skipped tick costs one interval and nothing else. (The core's own
+        // `refresh_pending` already coalesces at the source; this set is the
+        // belt on the executor side, and it can only fire if the two ever
+        // diverge — in which case the outstanding probe's own answer still
+        // clears the core's flag.)
+        //
+        // Threads are bounded by LIVE SCOPES, not by ticks: at most one per
+        // scope, released when the probe answers or the scope tears down. A
+        // scope torn down earlier in this same drain is skipped outright — the
+        // core has already dropped its state, so the answer would be inert, and
+        // dispatching would leave a set entry nothing removes.
+        if torn_down.contains(&scope) || !probes_in_flight.insert(scope) {
+          continue;
+        }
         let ops = ops.clone();
         let tx = op_tx.clone();
-        R::spawn_blocking_detach(move || {
-          let refresh = ops.refresh_mounts(&root);
-          let _ = tx.try_send(OpResult::MountsRefreshed { scope, refresh });
-        });
+        let pooled_ops = ops.clone();
+        let pooled_tx = tx.clone();
+        let pooled_root = Arc::clone(&root);
+        if std::thread::Builder::new()
+          .name("tributary-liveness".to_owned())
+          .spawn(move || {
+            let refresh = ops.refresh_mounts(&root);
+            let _ = tx.try_send(OpResult::MountsRefreshed { scope, refresh });
+          })
+          .is_err()
+        {
+          // The OS refused a thread (`EAGAIN`). Fall back to the pool for this
+          // one probe rather than dropping it: progress is then the pool's,
+          // which is exactly what it was before, and the scope keeps its set
+          // entry until the probe answers — so nothing is lost and nothing is
+          // dispatched twice.
+          R::spawn_blocking_detach(move || {
+            let refresh = pooled_ops.refresh_mounts(&pooled_root);
+            let _ = pooled_tx.try_send(OpResult::MountsRefreshed { scope, refresh });
+          });
+        }
       }
       Effect::Emit {
         scope,

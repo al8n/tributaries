@@ -1,7 +1,7 @@
 use core::num::NonZeroUsize;
 use std::ffi::OsString;
 
-use super::{Debounce, DebounceConfig, RootGlobs, TributariesOptions, WatchOptions};
+use super::{Debounce, DebounceConfig, OptionsError, RootGlobs, TributariesOptions, WatchOptions};
 use crate::{
   event::EventKind,
   filter::{Filter, FilterInput},
@@ -308,6 +308,105 @@ fn watch_options_clone_shares_the_filter_slot() {
     !original.filter().admits(&input),
     "a swap through the clone re-scopes the original — one shared slot"
   );
+}
+
+/// The programmatic face's own bound, on both households that carry the seats.
+///
+/// The setters take `impl IntoIterator`, which is a caller's own iterator and need
+/// not terminate — so the ceiling cannot be enforced by measuring the seat after
+/// collecting it: `std::iter::repeat` would grow the crate-owned `Vec` until the
+/// process died, with `validate` never reached and the documented cap protecting
+/// nothing on the one face that has no document to refuse mid-read.
+///
+/// So the setters take one item past the ceiling and stop. The three shapes that
+/// pins: the ceiling itself survives whole and validates; a finite over-cap list is
+/// refused exactly as before; and a non-terminating iterator RETURNS, retaining the
+/// same over-cap witness and earning the same refusal.
+///
+/// Revert witness: collect the iterator plainly and the `repeat` legs never return.
+#[test]
+fn a_programmatic_seat_is_bounded_at_collection() {
+  let cap = RootGlobs::MAX_SEAT_PATTERNS;
+  let many = |count: usize| {
+    (0..count)
+      .map(|n| glob(&std::format!("**/w{n}")))
+      .collect::<Vec<_>>()
+  };
+  let over = || std::iter::repeat(glob("**/w"));
+
+  // The ceiling itself: kept whole, and legal.
+  let full = RootGlobs::new().with_prune(many(cap));
+  assert_eq!(full.prune().len(), cap);
+  assert_eq!(full.validate(), Ok(()), "the ceiling itself is honoured");
+  let full: WatchOptions<OsString> = WatchOptions::new().with_include(many(cap));
+  assert_eq!(full.include().map(<[_]>::len), Some(cap));
+  assert_eq!(full.validate(), Ok(()), "and on the subscription household");
+
+  // A finite list one past it: the refusal it always had.
+  assert_eq!(
+    RootGlobs::new().with_prune(many(cap + 1)).validate(),
+    Err(OptionsError::TooManyPrunePatterns { supplied: cap + 1 })
+  );
+  assert_eq!(
+    WatchOptions::<OsString>::new()
+      .with_include(many(cap + 1))
+      .validate(),
+    Err(OptionsError::TooManyIncludePatterns { supplied: cap + 1 })
+  );
+
+  // And an iterator that never ends: the setter RETURNS, holding one pattern past
+  // the ceiling — the witness the same refusal is taken on.
+  for (seat, words) in [
+    ("prune", RootGlobs::new().with_prune(over())),
+    ("prune/set", {
+      let mut words = RootGlobs::new();
+      words.set_prune(over());
+      words
+    }),
+    ("include", RootGlobs::new().with_include(over())),
+    ("include/set", {
+      let mut words = RootGlobs::new();
+      words.set_include(over());
+      words
+    }),
+  ] {
+    assert!(
+      words.prune().len() <= cap + 1 && words.include().is_none_or(|seat| seat.len() <= cap + 1),
+      "{seat}: the seat is bounded whatever the iterator yields"
+    );
+    assert!(
+      words.validate().is_err(),
+      "{seat}: and the over-cap witness is refused where every other over-cap seat is"
+    );
+  }
+
+  for (seat, options) in [
+    ("prune", WatchOptions::<OsString>::new().with_prune(over())),
+    ("prune/set", {
+      let mut options = WatchOptions::<OsString>::new();
+      options.set_prune(over());
+      options
+    }),
+    (
+      "include",
+      WatchOptions::<OsString>::new().with_include(over()),
+    ),
+    ("include/set", {
+      let mut options = WatchOptions::<OsString>::new();
+      options.set_include(over());
+      options
+    }),
+  ] {
+    assert!(
+      options.prune().len() <= cap + 1
+        && options.include().is_none_or(|seat| seat.len() <= cap + 1),
+      "{seat}: the subscription seat is bounded too"
+    );
+    assert!(
+      options.validate().is_err(),
+      "{seat}: and refused the same way"
+    );
+  }
 }
 
 /// The `serde` face on the umbrella's own option households.

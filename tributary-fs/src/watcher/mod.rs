@@ -1052,7 +1052,8 @@ pub struct Watcher<R> {
   /// stream, never from two copies that would publish the same words twice.
   nonces: Option<Arc<Mutex<ChaCha20Rng>>>,
   /// The bound on the descriptors the sync door may be HOLDING at once
-  /// ([`SyncPinAllowance`](crate::driver::SyncPinAllowance)). Every
+  /// ([`SyncPinAllowance`](crate::driver::SyncPinAllowance), sized by
+  /// [`MAX_SYNC_SAMPLINGS`](crate::driver::MAX_SYNC_SAMPLINGS)). Every
   /// [`sync_root`](Self::sync_root) takes a slot of it before it opens the pins
   /// its admission is judged on, and the slot travels with those pins, so a
   /// caller that polls a flood of syncs together waits at this door instead of
@@ -1130,10 +1131,18 @@ impl<R: RuntimeLite> Watcher<R> {
     ops: impl crate::driver::FsOps,
   ) -> Result<Self, BuildError> {
     let (command_tx, command_rx) = async_channel::bounded(16);
-    // The sync door's descriptor bound, sized by the ledger cap that already
-    // bounds how many syncs this watcher may have outstanding — read before the
-    // config is handed to the task, which owns it from there on.
-    let pins = crate::driver::SyncPinAllowance::new(config.cookie_global_cap);
+    // The sync door's descriptor bound. Sized by the SAMPLING ceiling, not by the
+    // ledger cap: one permit authorizes three descriptors, so the record cap read
+    // as a descriptor bound is three times too wide (see
+    // [`MAX_SYNC_SAMPLINGS`](crate::driver::MAX_SYNC_SAMPLINGS)). A cookie cap
+    // BELOW the ceiling still governs — a watcher that may hold ten records has no
+    // use for thirty-two doors — so the allowance is the smaller of the two. Read
+    // before the config is handed to the task, which owns it from there on.
+    let pins = crate::driver::SyncPinAllowance::new(
+      config
+        .cookie_global_cap
+        .min(crate::driver::MAX_SYNC_SAMPLINGS),
+    );
     // The cookie-cleanup ingress: ONE ledger, minted HERE and shared between this
     // handle and the driver task below, because a public cleanup request must
     // address the very records that driver admits. Its two halves are created
