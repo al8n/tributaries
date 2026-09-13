@@ -2760,11 +2760,13 @@ impl DriverCore {
   /// THE BARRIER FUNNEL: advances `scope`'s [`BarrierEpoch`] and records the
   /// coverage transition that moved it.
   ///
-  /// Called from the eight sites through which every coverage transition of a
+  /// Called from the nine sites through which every coverage transition of a
   /// scope passes — a child watch armed or dropped, a located `Rescan` fed to the
   /// Monitor, a root replace, a real mount-refresh loss, a root overflow, a
-  /// routed `Rescan`'s cover degrade, and the settle observation's lossy rewind —
-  /// and from nowhere else. The list is short and auditable because it names
+  /// routed `Rescan`'s cover degrade, the settle observation's lossy rewind, and
+  /// a probe-budget loss — and from nowhere else. The probe-budget loss is the
+  /// NINTH and last so the eight that precede it keep the numbers every seat in
+  /// this crate already cites. The list is short and auditable because it names
   /// FUNNELS rather than their callers: a caller list is exactly the enumeration
   /// discipline that the pairwise-check rounds kept defeating.
   ///
@@ -4004,7 +4006,7 @@ impl DriverCore {
     };
     let scope = ctx.scope;
     let resolved = Self::resolve(&mut state, ctx.purpose, outcome);
-    let resolved = self.fence_resolved(&state, scope, resolved);
+    let resolved = self.fence_resolved(&state, scope, resolved, now);
     let mut fed = false;
     if let Some(batch) = state.park.active.as_mut() {
       if let Some((fid, partner)) = resolved.evidences {
@@ -4625,10 +4627,11 @@ impl DriverCore {
   /// nobody is checking and is never told.
   ///
   /// So the scope goes through the loss funnel the rest of the core already uses
-  /// — the Monitor turns it into an epoch-bumped covering `Rescan` — and the
-  /// subscriber learns that its coverage is UNPROVEN and must re-enumerate,
-  /// rather than being told a root is alive on no evidence. The retry deadline is
-  /// kept: this is a degradation, not a terminal.
+  /// — a whole-scope [`barrier_moved`](Self::barrier_moved) and the covering
+  /// `Rescan` the Monitor mints for it — and the subscriber learns that its
+  /// coverage is UNPROVEN and must re-enumerate, rather than being told a root is
+  /// alive on no evidence. The retry deadline is kept: this is a degradation, not
+  /// a terminal.
   ///
   /// ONCE per episode ([`budget_lossy`](ScopeState::budget_lossy)). The fact is
   /// "this root's liveness is unproven", which does not become more true each
@@ -4640,7 +4643,10 @@ impl DriverCore {
   /// Deliberately NOT the full [`on_root_overflow`](Self::on_root_overflow)
   /// treatment: device trust is left alone, because closing it arms another
   /// refresh — the very effect the budget cannot dispatch — and parked work is
-  /// left alone, because nothing here says a window was dropped.
+  /// left alone, because nothing here says a window was dropped. What IS taken
+  /// from it is the barrier funnel, because what this arm establishes is exactly
+  /// what an overflow establishes for a live barrier: a window this scope cannot
+  /// account for.
   pub(crate) fn on_refresh_declined(
     &mut self,
     scope: ScopeId,
@@ -4668,6 +4674,22 @@ impl DriverCore {
       // drain. Purging first closes that escape the same way `on_delivery`'s
       // `Refused` arm closes it one screen away.
       Self::purge_scope_emits(&mut self.effects, scope);
+      // BARRIER FUNNEL: this root's liveness is UNPROVEN, and a window nothing
+      // is proving may have carried any coverage transition at all — so it is a
+      // move about the whole scope, the same shape `on_root_overflow` has. The
+      // routed cover degrade cannot stand in for it: that funnel is gated on a
+      // recorded claim, so a never-narrowed scope — and every kernel-recursive
+      // scope, which never records one — would get no move, and an in-pool write
+      // would claim after the `Rescan` and certify across the unproven window.
+      // The overflow `Rescan` minted below is the instruction this retirement
+      // owes, so it stands one and the retirement stands none of its own.
+      Self::barrier_moved(
+        &mut self.barrier_moves,
+        state,
+        scope,
+        BarrierLocation::Scope,
+        true,
+      );
       self.monitor.on_overflow(Scope::Root(scope), now);
       self.drain_monitor();
     }
@@ -4697,12 +4719,16 @@ impl DriverCore {
   /// live-root gating [`arm_liveness`] applies, the same way a caller-forced
   /// deadline should — a scope with no root yet simply finds `arm_refresh` a
   /// no-op on the next timeout, exactly as an organically-armed deadline
-  /// would. The seam this backs
-  /// ([`DebugTickLiveness`](crate::driver::Command::DebugTickLiveness)) exists
-  /// so a suite can drive one scope's periodic re-stat deterministically
-  /// instead of waiting on a real interval to elapse against dozens of parked
-  /// OS threads — see its doc for why that wait is the wrong shape on a slow
-  /// runner.
+  /// would. The two seams this backs exist so a suite can drive one scope's
+  /// periodic re-stat deterministically instead of waiting on a real interval
+  /// to elapse against dozens of parked OS threads — see their docs for why
+  /// that wait is the wrong shape on a slow runner.
+  /// [`DebugTickLiveness`](crate::driver::Command::DebugTickLiveness) runs the
+  /// tick inside its own command arm and drains what it raised before
+  /// replying; [`DebugArmLivenessDue`](crate::driver::Command::DebugArmLivenessDue)
+  /// replies first and leaves the tick to the driver's own timer, which is the
+  /// only staging under which a cell can observe what the production path
+  /// orders between a funnel's `Rescan` and the retirement it covers.
   #[cfg(all(test, feature = "tokio", not(miri)))]
   pub(crate) fn force_liveness_due(&mut self, scope: ScopeId) {
     if let Some(state) = self.scopes.get_mut(&scope) {
@@ -5416,7 +5442,7 @@ impl DriverCore {
       };
       for planned in planned {
         let planned = if fence {
-          match self.fenced(state, exclusions, scope, &planned) {
+          match self.fenced(state, exclusions, scope, &planned, now) {
             Fenced::Stands => planned,
             Fenced::Dropped => continue,
             // The widened signal takes the dropped one's PLACE, so everything
@@ -5482,7 +5508,7 @@ impl DriverCore {
         // `Rescan` naming exactly the subtree the caller pruned — an instruction
         // to enumerate ground whose every later change stays silent.
         if let Some(repair) = revealed
-          && let Some(repair) = self.fenced_repair(state, exclusions, scope, repair)
+          && let Some(repair) = self.fenced_repair(state, exclusions, scope, repair, now)
         {
           Self::accept(
             &mut self.monitor,
@@ -5501,7 +5527,7 @@ impl DriverCore {
       batch.trailing = core::mem::take(&mut batch.trailing)
         .into_iter()
         .filter_map(
-          |planned| match self.fenced(state, exclusions, scope, &planned) {
+          |planned| match self.fenced(state, exclusions, scope, &planned, now) {
             Fenced::Stands => Some(planned),
             Fenced::Dropped => None,
             Fenced::Widened(widened) => Some(widened),
@@ -5530,7 +5556,11 @@ impl DriverCore {
   /// stand — which is what keeps a `Rescan` from naming a path the caller pruned.
   /// Its EVIDENCE for someone else's grant survives: a pair straddling the fence
   /// is a real crossing, and the half that lies inside the reported tree is owed
-  /// its report.
+  /// its report. That surviving evidence is also how a vanished SOURCE whose only
+  /// destination this fence replaced is still granted its pairing cookie at
+  /// settlement — which is why the widening arm's consumption has to be
+  /// remembered by the Monitor rather than merely attempted: the half it names is
+  /// fed after this pass, not before it.
   ///
   /// Classifying a whole batch ahead of feeding it leaks on a profile whose
   /// records are addressed through per-directory anchors (a reparent mid-read
@@ -5539,7 +5569,13 @@ impl DriverCore {
   /// for the same reason it is needed: only FSEvents parks, and every FSEvents
   /// record is anchored at the ROOT watch with a whole root-relative location, so
   /// no reparent can change how a later one resolves.
-  fn fence_resolved(&self, state: &ScopeState, scope: ScopeId, mut resolved: Resolved) -> Resolved {
+  fn fence_resolved(
+    &mut self,
+    state: &ScopeState,
+    scope: ScopeId,
+    mut resolved: Resolved,
+    now: Instant,
+  ) -> Resolved {
     let exclusions = !self.exclusions.is_empty() && !backend_enforces_exclusions(state.profile);
     if !exclusions && state.prune.is_empty() {
       return resolved;
@@ -5548,7 +5584,7 @@ impl DriverCore {
     let before = resolved.planned.len();
     let mut kept = Vec::with_capacity(before);
     for planned in core::mem::take(&mut resolved.planned) {
-      let planned = match self.fenced(state, exclusions, scope, &planned) {
+      let planned = match self.fenced(state, exclusions, scope, &planned, now) {
         Fenced::Stands => planned,
         Fenced::Dropped => continue,
         Fenced::Widened(widened) => widened,
@@ -5567,7 +5603,9 @@ impl DriverCore {
       // Fenced for the reason the batch-time twin is: this cover is born after
       // its record's verdict and names ground that verdict never judged, so it
       // is the one input that could carry a `Rescan` into a pruned subtree.
-      kept.extend(revealed.and_then(|repair| self.fenced_repair(state, exclusions, scope, repair)));
+      kept.extend(
+        revealed.and_then(|repair| self.fenced_repair(state, exclusions, scope, repair, now)),
+      );
     }
     resolved.planned = kept;
     if before > 0 && resolved.planned.is_empty() {
@@ -5736,13 +5774,14 @@ impl DriverCore {
   /// which is the same trade [`fenced`](Self::fenced) already makes for every
   /// other located over-signal.
   fn fenced_repair(
-    &self,
+    &mut self,
     state: &ScopeState,
     exclusions: bool,
     scope: ScopeId,
     repair: Planned,
+    now: Instant,
   ) -> Option<Planned> {
-    match self.fenced(state, exclusions, scope, &repair) {
+    match self.fenced(state, exclusions, scope, &repair, now) {
       Fenced::Stands => Some(repair),
       Fenced::Dropped => None,
       Fenced::Widened(widened) => Some(widened),
@@ -5953,12 +5992,24 @@ impl DriverCore {
   ///   destination's nearest unpruned parent is the instruction that covers it,
   ///   and it dominates any barrier still waiting under the moved subtree, which
   ///   a bare drop left waiting for its deadline.
+  ///
+  ///   The half the Monitor parked for that rename is CONSUMED here in the same
+  ///   breath ([`Monitor::consume_pending_move`]). The destination this arm
+  ///   replaces never reaches the Monitor, so nothing is left to pair with — and
+  ///   an unpaired half holds its detached subtree, and the scope's move settle
+  ///   with it, until the pairing window elapses. Shedding it at once is what the
+  ///   prune seat asked for; waiting a day for a pairing that cannot happen is
+  ///   the opposite. Where the half is not parked yet — the batch-classifying
+  ///   profile, whose fences all run ahead of its feeds — the Monitor REMEMBERS
+  ///   the consumption and resolves the half the moment it arrives, which is the
+  ///   same shedding one ordering later.
   fn fenced(
-    &self,
+    &mut self,
     state: &ScopeState,
     exclusions: bool,
     scope: ScopeId,
     planned: &Planned,
+    now: Instant,
   ) -> Fenced {
     match planned {
       Planned::Rec(rec) => {
@@ -5988,7 +6039,32 @@ impl DriverCore {
         // read as a directory, because the profiles that report the fewest
         // classes are exactly the ones that move whole subtrees silently.
         if matches!(rec.kind(), RecordKind::MovedTo) && rec.is_dir() != Some(false) {
-          return Fenced::Widened(self.unpruned_cover(state, scope, directory, &path));
+          let widened = self.unpruned_cover(state, scope, directory, &path);
+          // The destination never reaches the Monitor, so the SOURCE half parked
+          // under this cookie would never be paired: it would hold its detached
+          // subtree — and the scope's move settle with it — until the pairing
+          // window elapsed, which the option bounds at a day. Nothing is waiting
+          // for it any more, so it is consumed here and torn down exactly as that
+          // window's expiry would tear it down: the same emissions, the
+          // source-side departure included. The widened `Rescan` stands unchanged
+          // beside it, and the prune's resource-shedding contract holds without a
+          // wait.
+          //
+          // It reaches the half directly on the discipline that FEEDS AS IT
+          // CLASSIFIES ([`feeds_at_classify`]): there the source was fed — and
+          // parked — before this destination was judged. On a batch-classifying
+          // profile every fence runs ahead of every feed, so the half is not
+          // parked yet and there is nothing here to take; the consumption is
+          // REMEMBERED by the Monitor instead and the half that the settlement's
+          // cookie grant later feeds is resolved on arrival, at once, on this same
+          // expiry path. Those scopes hold no per-directory watches and so shed no
+          // subtree — what an unpaired half of theirs holds is the scope's move
+          // settle, and with it every cover fence and every new sync, for the whole
+          // window.
+          if let Some(cookie) = rec.cookie() {
+            self.monitor.consume_pending_move(scope, cookie, now);
+          }
+          return Fenced::Widened(widened);
         }
         Fenced::Dropped
       }
@@ -6554,8 +6630,8 @@ impl DriverCore {
   /// the dominated barrier's caller to re-read, it does not say the new cover has
   /// a hole — so it must NOT mark the scope's cover fence lossy and must NOT
   /// rewind the settle floor, and the Monitor recovers no watch set for it. The
-  /// funnels that stand their OWN `Rescan` (3 through 7) go through the ordinary
-  /// loss path, which stays lossy: those are losses.
+  /// funnels that stand their OWN `Rescan` (3 through 7, and 9) go through the
+  /// ordinary loss path, which stays lossy: those are losses.
   ///
   /// The drain that follows is what puts the instruction into the effect queue
   /// ahead of the flush the driver is about to run — the whole point of standing

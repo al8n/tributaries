@@ -4173,9 +4173,12 @@ struct CookieGuard {
   /// [`dispatched_generation`]: Self::dispatched_generation
   generation: Arc<AtomicU64>,
   /// The generation current when this write was dispatched. A claim finding the
-  /// live generation moved past this one is refused: the root the cookie was to
-  /// be reported on is gone, and its create event could never reach the current
-  /// stream.
+  /// live generation moved past this one is refused: the object the cookie was to
+  /// be reported on is not the one this scope now watches, and its create event
+  /// could never reach the current stream. The scope itself SURVIVES that move —
+  /// the only writer of the generation is the replace commit, and its stream
+  /// carries the replacement `Rescan` the commit stands — so the refusal is a
+  /// domination and not a retirement.
   dispatched_generation: u64,
 }
 
@@ -4184,10 +4187,11 @@ impl CookieGuard {
   /// owns it — the cookie itself, or (where the write failed after minting its
   /// directory) the directory alone. `None`
   /// means the handover was REFUSED — a cancel named this obligation, the
-  /// registry is gone, the scope is retiring, or the scope's root generation has
-  /// moved past the one this write was dispatched under — so a sweep has already
-  /// passed this path by, or the root the cookie belongs to is gone; either way
-  /// the caller must unlink the file itself.
+  /// registry is gone, the scope is retiring, the scope's root generation has
+  /// moved past the one this write was dispatched under, or a coverage
+  /// transition dominated this barrier — so a sweep has already passed this path
+  /// by, or the ground the cookie was to be reported on has moved; either way the
+  /// caller must unlink the file itself.
   ///
   /// The refusal check and the transition are ONE critical section against the
   /// sweeps, and every sweep raises its flag BEFORE taking the ledger. So a
@@ -4197,7 +4201,8 @@ impl CookieGuard {
   /// is always owned by exactly one of the two. The generation is one more
   /// refusal reason inside this SAME section, never a new race: a replace commit
   /// bumps it, so a write whose captured generation is stale reaps itself
-  /// exactly as a retired one does. The record's own REAP MARK is one more, read
+  /// exactly as a retired one does — it simply answers the other word (see the
+  /// domination paragraph below). The record's own REAP MARK is one more, read
   /// in this same section: a cancel that named this obligation while its write
   /// was still in the pool forces the claim to refuse and self-reap, closing the
   /// "delivered-but-unread cookie orphaned by a raced cancel" window. The mark
@@ -4210,34 +4215,20 @@ impl CookieGuard {
   /// its flag is raised before that take, so this refuses on either observation
   /// and the write reaps its own file.
   ///
-  /// The record's DOMINATION flag is the last of the refusals read in this same
-  /// section: a coverage transition touched the ground this barrier depends on
-  /// while the write was in the pool, so the write certifies nothing. It answers
-  /// its own refusal reason rather than the shared one, because the caller learns
-  /// a different fact from it — a dominated barrier has a located `Rescan` on its
-  /// stream and is to re-read, where a retired one has no stream left at all.
-  /// Last, and not first, because the two overlap: a transition that also ends
-  /// the scope is reported as the end of the scope, which is the stronger fact.
+  /// WHICH word a refusal answers in is not decided here: it is
+  /// [`precedence`](Self::precedence), the one classification this claim shares
+  /// with every arm of the write's completion, so a caller cannot be told two
+  /// different things about the same state depending on whether its write
+  /// happened to land.
   fn claim(&self, residue: &CookieResidue) -> Result<CookieId, ClaimRefused> {
     let mut inner = lock_ledger(&self.ledger);
-    let Some(ob) = inner.obligations.get_mut(&self.id) else {
-      return Err(ClaimRefused::Retired);
-    };
-    if ob.reap_requested
-      || self.shutdown.load(Ordering::SeqCst)
-      || self.retiring.load(Ordering::SeqCst)
-      || self.generation.load(Ordering::SeqCst) != self.dispatched_generation
-    {
-      return Err(ClaimRefused::Retired);
+    if let Some(refused) = self.precedence(inner.obligations.get(&self.id)).refusal() {
+      return Err(refused);
     }
-    // Read LAST of the refusals, so domination is answered only where nothing
-    // else refuses. The reasons overlap — a root replace both moves the scope's
-    // coverage and supersedes the generation the write was dispatched under —
-    // and where they do, the older word is the more specific one: there is no
-    // stream left to carry the covering `Rescan` that `Dominated` promises.
-    if ob.dominated {
-      return Err(ClaimRefused::Dominated);
-    }
+    let ob = inner
+      .obligations
+      .get_mut(&self.id)
+      .expect("the precedence just read this record under this same lock");
     // Transition THIS write's own record — born at its dispatch under this same
     // lock — rather than inserting one: there is no insert-by-path anywhere, so
     // a claim can never displace another obligation. A same-path successor and
@@ -4261,6 +4252,100 @@ impl CookieGuard {
     inner.by_path.insert(residue.path().to_path_buf(), self.id);
     Ok(self.id)
   }
+
+  /// THE PRECEDENCE. One classification of what this write may report, read off
+  /// the record the caller already holds under the ledger lock together with the
+  /// three flags this guard carries: reap mark, gone registry or retiring scope
+  /// answer `Retired`; a stale root generation or the record's domination flag
+  /// answer `Dominated`; otherwise the write's own outcome stands.
+  ///
+  /// It is ONE function because every terminal a dispatched write reaches has to
+  /// agree. The claim asks it, and so does every arm of the write's completion —
+  /// the clean failure, the residue, and each typed refusal alike. A failure arm
+  /// that answered its own error without asking would tell a caller whose barrier
+  /// a move already met to retry a write, or tell a caller whose stream really
+  /// ended that its filesystem refused something, and either answer contradicts
+  /// the terminal the transition already stood a `Rescan` for.
+  ///
+  /// `None` is an ABSENT record: the abnormal-path [`Drop`] already took the
+  /// ledger, and its flag is raised before that take, so `Retired` is the same
+  /// answer the flags would have given.
+  ///
+  /// The retirement words are read FIRST, because the two overlap: a transition
+  /// that also ends the scope is reported as the end of the scope, which is the
+  /// stronger fact. The generation joins the domination flag rather than the
+  /// refusals above it: its only writer is the replace commit, which advances it
+  /// at the lane swap and then raises the move, so a write released between the
+  /// two is dominated by a transition whose `Rescan` the surviving stream
+  /// carries — not retired on a stream that ended.
+  fn precedence(&self, ob: Option<&Obligation>) -> ClaimPrecedence {
+    let Some(ob) = ob else {
+      return ClaimPrecedence::Retired;
+    };
+    if ob.reap_requested
+      || self.shutdown.load(Ordering::SeqCst)
+      || self.retiring.load(Ordering::SeqCst)
+    {
+      return ClaimPrecedence::Retired;
+    }
+    if self.generation.load(Ordering::SeqCst) != self.dispatched_generation || ob.dominated {
+      return ClaimPrecedence::Dominated;
+    }
+    ClaimPrecedence::Proceed
+  }
+
+  /// Retires this write's record as never-created and classifies what it may
+  /// report, in ONE ledger critical section — the shape every failure arm that
+  /// produced no file uses.
+  ///
+  /// The retirement and the interlocks it is judged against cannot be separated:
+  /// the record carries two of the precedence's five words, and a second turn of
+  /// the lock would read them off a record that no longer exists.
+  fn retire_never_created(&self) -> ClaimPrecedence {
+    let mut inner = lock_ledger(&self.ledger);
+    let ob = inner.retire(self.id, Reaped::NeverCreated);
+    self.precedence(ob.as_ref())
+  }
+}
+
+/// What [`CookieGuard::precedence`] says about the terminal a dispatched write
+/// may report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimPrecedence {
+  /// The stream this cookie would have been reported on is ending: a cancel named
+  /// the obligation, the registry is gone, or the scope is retiring.
+  Retired,
+  /// A coverage transition moved the ground this barrier depends on while the
+  /// write was in the pool — the record's own flag, or the root generation the
+  /// replace commit advanced — and the surviving stream carries the `Rescan` the
+  /// retirement stood.
+  Dominated,
+  /// Neither: the write's own outcome is the answer.
+  Proceed,
+}
+
+impl ClaimPrecedence {
+  /// The refusal this precedence carries, if it refuses at all — the one seam
+  /// between the precedence and [`ClaimRefused`], so the claim and the completion
+  /// arms cannot disagree about which word a given state earns.
+  const fn refusal(self) -> Option<ClaimRefused> {
+    match self {
+      Self::Retired => Some(ClaimRefused::Retired),
+      Self::Dominated => Some(ClaimRefused::Dominated),
+      Self::Proceed => None,
+    }
+  }
+
+  /// This precedence's answer, or `outcome` where the write's own verdict stands.
+  fn terminal_or(
+    self,
+    outcome: impl FnOnce() -> crate::error::SyncRootError,
+  ) -> crate::error::SyncRootError {
+    match self.refusal() {
+      Some(refused) => refused.terminal(),
+      None => outcome(),
+    }
+  }
 }
 
 /// One barrier a coverage transition retired, and what its retirement still owes
@@ -4282,12 +4367,15 @@ struct DominatedBarrier {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClaimRefused {
   /// The obligation is gone or its scope is: a cancel named it, the registry is
-  /// gone, the scope is retiring, or the root generation moved past the one this
-  /// write was dispatched under. There is no stream left to report the cookie on.
+  /// gone, or the scope is retiring. There is no stream left to report the cookie
+  /// on.
   Retired,
   /// A coverage transition on this barrier's ground retired it while the write
-  /// was in the pool. The retirement stood the covering `Rescan` its terminal
-  /// promises, so the caller is told to re-read rather than that its root died.
+  /// was in the pool — the record's own flag, or the root generation moved past
+  /// the one this write was dispatched under, which is the replace commit's swap
+  /// and leaves the scope live on its replacement stream. The retirement stood
+  /// the covering `Rescan` its terminal promises, so the caller is told to
+  /// re-read rather than that its root died.
   Dominated,
 }
 
@@ -5860,6 +5948,29 @@ pub(crate) enum Command {
     /// channel) by the time this resolves.
     reply: futures_channel::oneshot::Sender<()>,
   },
+  /// A test-only arming of `scope`'s root-liveness deadline
+  /// ([`DriverCore::force_liveness_due`]) that replies AT ONCE and runs no tick
+  /// of its own: the deadline is simply due, so the loop's own timer arm fires
+  /// it on the next pass and the tick — the dispatch, or the decline and its
+  /// covering `Rescan` — runs on the production path with no command anywhere
+  /// inside it.
+  ///
+  /// The distinction from [`DebugTickLiveness`](Self::DebugTickLiveness) is the
+  /// whole point of having both. That command drives the tick INSIDE the command
+  /// arm and drains the resulting moves before replying, which is what a suite
+  /// staging a budget wants; here the reply lands before the tick runs, so
+  /// nothing the tick raises has been drained by a round trip the production
+  /// path would not have had. A cell that must observe the ORDER between a
+  /// funnel's covering `Rescan` and the retirement of the barriers that funnel
+  /// covers can only stage it this way — any command between the two forces a
+  /// loop top, and the loop top is itself a drain.
+  #[cfg(all(test, feature = "tokio", not(miri)))]
+  DebugArmLivenessDue {
+    /// The scope whose liveness deadline is forced due.
+    scope: ScopeId,
+    /// Resolved once the deadline is armed — before the tick it will provoke.
+    reply: futures_channel::oneshot::Sender<()>,
+  },
 }
 
 /// Lowers a refused cover reconcile to the public outcome — answered at
@@ -5890,6 +6001,34 @@ const fn settle_outcome(settle: CoverSettle) -> CoverOutcome {
   }
 }
 
+/// The terminal a parked obligation's revocation answers — the ONE thing that
+/// differs between the revocations [`retire_parked_cookies`] serves, and so the
+/// one thing its callers name.
+///
+/// The question that decides it is whether the SCOPE survives. A cancel, a close
+/// and a scope death end the stream the cookie would have been reported on, and
+/// there is nothing left to carry a covering `Rescan`. A replacement or a widen
+/// commit leaves the scope alive on its own stream with the commit's `Rescan`
+/// standing, which is a met barrier and not a dead root — the same split
+/// [`CookieGuard::precedence`] applies to a write already in the pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParkedTerminal {
+  /// The stream ends with the obligation.
+  Retired,
+  /// The scope survives, under a `Rescan` that covers the ground this sync named.
+  Dominated,
+}
+
+impl ParkedTerminal {
+  /// The barrier's answer to this terminal.
+  const fn error(self) -> crate::error::SyncRootError {
+    match self {
+      Self::Retired => crate::error::SyncRootError::Retired,
+      Self::Dominated => crate::error::SyncRootError::Dominated,
+    }
+  }
+}
+
 /// Retires every PARKED obligation `doomed` selects, BEFORE any write is
 /// dispatched for it — the ONE pre-physical terminal, shared by the cancel
 /// sweep, the replace-commit's uncovered-parked revoke, and the close sweep.
@@ -5897,9 +6036,16 @@ const fn settle_outcome(settle: CoverSettle) -> CoverOutcome {
 /// Each selected obligation earns `NeverCreated`: a parked record is
 /// pre-physical by construction (no write was dispatched, so no file can exist),
 /// which is exactly the evidence that terminal names. Its caller is answered
-/// `Retired` through the fence's routing entry, and its settle fence is abandoned
-/// in the core — the same prune the cancelled-ack path runs, and equally
-/// untouching of the scope's loss memory and settle floor.
+/// `terminal` through the fence's routing entry, and its settle fence is
+/// abandoned in the core — the same prune the cancelled-ack path runs, and
+/// equally untouching of the scope's loss memory and settle floor.
+///
+/// `terminal` is the caller's to name because this one retirement serves two
+/// different facts (see [`ParkedTerminal`]): the sweeps whose scope is ending
+/// answer `Retired`, and the live-scope revocations — a replacement whose new
+/// root no longer contains the target, and the two widen commits — answer
+/// `Dominated`, because their scope and its handle both survive and the commit
+/// stood the `Rescan` that terminal promises.
 ///
 /// The ledger is walked ONCE, and `doomed` sees each parked obligation together
 /// with its routing entry, so a selection can read the record's truth (scope,
@@ -5910,6 +6056,7 @@ fn retire_parked_cookies<F: FsOps>(
   core: &mut DriverCore,
   parked_cookies: &mut BTreeMap<FenceId, ParkedCookie>,
   cookies: &CookieRegistry<F>,
+  terminal: ParkedTerminal,
   doomed: &dyn Fn(&Obligation, &ParkedCookie) -> bool,
 ) {
   // Decide AND retire under the one ledger lock; the replies and the core's fence
@@ -5937,9 +6084,9 @@ fn retire_parked_cookies<F: FsOps>(
   for fence in &abandoned {
     if let Some(parked) = parked_cookies.remove(fence) {
       // The umbrella's canceller has usually dropped this receiver already (so the
-      // send is a no-op there), but a direct-API caller learns its parked sync was
-      // retired rather than reading a bare `Closed`.
-      let _ = parked.reply.send(Err(crate::error::SyncRootError::Retired));
+      // send is a no-op there), but a direct-API caller learns which terminal its
+      // parked sync reached rather than reading a bare `Closed`.
+      let _ = parked.reply.send(Err(terminal.error()));
     }
   }
   core.abandon_cover_fences(&abandoned);
@@ -5992,9 +6139,13 @@ where
   // way — and, since the cookie is simply never written, its obligation reaches
   // the pre-physical terminal with it rather than lingering in the ledger for a
   // write that will never be dispatched.
-  retire_parked_cookies(core, parked_cookies, cookies, &|_, parked| {
-    parked.reply.is_canceled()
-  });
+  retire_parked_cookies(
+    core,
+    parked_cookies,
+    cookies,
+    ParkedTerminal::Retired,
+    &|_, parked| parked.reply.is_canceled(),
+  );
   for (fence, settle) in core.poll_cover_settlements(pass) {
     // A missing sender is a caller dropped at close; settlement already
     // updated the core's bookkeeping either way.
@@ -6069,13 +6220,15 @@ where
       // batch input), and the loop-top `execute_effects` flushes them to the
       // consumer before that record can be routed.
       let _ = core.resignal_coverage_deficits(scope);
-      // The FOURTH drain. The loop's other three sit above `execute_effects`,
-      // which feeds its outcomes straight back into the core — so a coverage
-      // transition raised by this iteration's effects is otherwise in hand only
-      // at the NEXT loop top, after the stamp below has already been taken, and
-      // the barrier would be retired by a transition it was dispatched after.
-      // Re-signal first, then drain, then stamp: a deficit whose re-arm failed
-      // neither dominates nor proceeds by accident.
+      // The drain this dispatch owes itself. `execute_effects` drains to a
+      // fixpoint, so nothing its effects raised is still outstanding — but this
+      // resolution runs on the far side of it and raises transitions of its own:
+      // the re-signal above, and the settle observation's own lossy rewind in
+      // the poll that fed this loop. Without this call such a transition would
+      // be in hand only at the NEXT loop top, after the stamp below has already
+      // been taken, and the barrier would be retired by a transition it was
+      // dispatched after. Re-signal first, then drain, then stamp: a deficit
+      // whose re-arm failed neither dominates nor proceeds by accident.
       drain_barrier_moves::<R, F>(core, cookies, op_tx, now);
       // THE DISPATCH RE-JUDGES THE COVER — the other half of stamping here.
       //
@@ -6196,8 +6349,15 @@ where
             // obligation reaches the same pre-physical terminal a clean failure
             // does, and the caller is told the name whose object moved rather than
             // handed a barrier that certifies nothing.
-            lock_ledger(&guard.ledger).retire(guard.id, Reaped::NeverCreated);
-            let _ = reply.send(Err(crate::error::SyncRootError::DirReplaced { dir: *dir }));
+            //
+            // The retirement hands the record back and the PRECEDENCE is read
+            // from that one take: a refusal about the ground is beside the point
+            // for a caller whose stream has ended or whose barrier a move already
+            // met, so those two answer ahead of it.
+            let _ =
+              reply.send(Err(guard.retire_never_created().terminal_or(|| {
+                crate::error::SyncRootError::DirReplaced { dir: *dir }
+              })));
           }
           Err(CookieWriteError {
             crossed: Some(dir), ..
@@ -6209,11 +6369,12 @@ where
             // unreportable whatever its ordering, and the barrier could only time
             // out. Refused with nothing created, on the same pre-physical terminal
             // the other ground refusals reach, and naming the directory whose
-            // ground the caller must move off.
-            lock_ledger(&guard.ledger).retire(guard.id, Reaped::NeverCreated);
-            let _ = reply.send(Err(crate::error::SyncRootError::DirCrossesMount {
-              dir: *dir,
-            }));
+            // ground the caller must move off, under the same precedence its
+            // sibling refusals answer through.
+            let _ =
+              reply.send(Err(guard.retire_never_created().terminal_or(|| {
+                crate::error::SyncRootError::DirCrossesMount { dir: *dir }
+              })));
           }
           Err(CookieWriteError {
             excluded: Some(excluded),
@@ -6226,13 +6387,13 @@ where
             // never resolve. The admission's lexical check could not see this
             // (that is what a symlink is), so the refusal is taken here, before
             // anything is created, and the obligation reaches the same
-            // pre-physical terminal a clean failure does.
-            lock_ledger(&guard.ledger).retire(guard.id, Reaped::NeverCreated);
+            // pre-physical terminal a clean failure does, under the same
+            // precedence its sibling refusals answer through.
             let ExcludedCookieDir { dir, exclusion } = *excluded;
-            let _ = reply.send(Err(crate::error::SyncRootError::DirExcluded {
-              dir,
-              exclusion,
-            }));
+            let _ =
+              reply.send(Err(guard.retire_never_created().terminal_or(|| {
+                crate::error::SyncRootError::DirExcluded { dir, exclusion }
+              })));
           }
           Err(CookieWriteError {
             pruned: Some(pruned),
@@ -6246,10 +6407,13 @@ where
             // anything was created, so the obligation reaches the same
             // pre-physical terminal a clean failure does, and the caller is told
             // WHICH word closed the directory rather than being handed a bare
-            // write error.
-            lock_ledger(&guard.ledger).retire(guard.id, Reaped::NeverCreated);
+            // write error — under the same precedence its sibling refusals
+            // answer through.
             let PrunedCookieDir { dir, pattern } = *pruned;
-            let _ = reply.send(Err(crate::error::SyncRootError::DirPruned { dir, pattern }));
+            let _ =
+              reply.send(Err(guard.retire_never_created().terminal_or(|| {
+                crate::error::SyncRootError::DirPruned { dir, pattern }
+              })));
           }
           Err(CookieWriteError {
             source,
@@ -6262,11 +6426,22 @@ where
             // a long-lived scope from growing the ledger — and, because the
             // record leaves only once nothing physical can exist, it can never
             // uncount a live obligation.
-            lock_ledger(&guard.ledger).retire(guard.id, Reaped::NeverCreated);
-            let _ = reply.send(Err(crate::error::SyncRootError::Write {
-              path: dir.join(&*name),
-              source,
-            }));
+            //
+            // The retirement hands the record back, and the PRECEDENCE is read
+            // from that one take rather than from a second turn of the lock: a
+            // barrier a move already retired — publishing its flag under this same
+            // lock, or advancing the generation at a replace commit's lane swap —
+            // is dominated whatever this write's physical outcome turned out to
+            // be, and a scope whose stream is ending is retired whatever it turned
+            // out to be. Reporting the write failure instead tells a caller whose
+            // barrier is already met to retry the write, where what it owes is the
+            // re-read the `Rescan` on its stream is asking for.
+            let _ = reply.send(Err(guard.retire_never_created().terminal_or(|| {
+              crate::error::SyncRootError::Write {
+                path: dir.join(&*name),
+                source,
+              }
+            })));
           }
           Err(CookieWriteError {
             source,
@@ -6283,12 +6458,24 @@ where
             // never ask for this path, so nobody else ever will. A retry that
             // fails again leaves the record `RemoveFailed`: counted, owned, and
             // swept at the scope's teardown.
+            //
+            // The claim's own refusal is what says what this write may report,
+            // and the WHOLE refusal is kept rather than narrowed to one of its two
+            // words: the residue is reaped exactly as before, and a caller whose
+            // barrier a move already met is told to re-read while one whose stream
+            // has ended is told it ended — neither is told to retry a write whose
+            // failure is beside the point. The claim answers through the same
+            // precedence every arm beside this one answers through.
             let residue = *residue;
-            let claimed = guard.claim(&residue).ok();
-            self_reap(&ops, &guard, residue, claimed);
-            let _ = reply.send(Err(crate::error::SyncRootError::Write {
-              path: dir.join(&*name),
-              source,
+            let claimed = guard.claim(&residue);
+            let refused = claimed.as_ref().err().copied();
+            self_reap(&ops, &guard, residue, claimed.ok());
+            let _ = reply.send(Err(match refused {
+              Some(refused) => refused.terminal(),
+              None => crate::error::SyncRootError::Write {
+                path: dir.join(&*name),
+                source,
+              },
             }));
           }
         }
@@ -6557,11 +6744,22 @@ fn self_reap<F: FsOps>(
 /// under a surviving scope; a parked write whose directory now sits outside that
 /// coverage would place a cookie the current stream could never observe, so its
 /// obligation is retired `NeverCreated` (no write was dispatched, so nothing
-/// physical was ever created) and its caller answered `Retired`, rather than left
-/// to strand. A parked write STILL inside the (widened) root is kept: it
-/// dispatches normally under the bumped generation. The DISPATCHED counterpart —
-/// a write already in the pool — is revoked instead by the generation the same
-/// commit bumped, checked when it claims.
+/// physical was ever created) rather than left to strand.
+///
+/// Its caller is answered `Dominated`, not `Retired`. Every caller of this
+/// revocation is a COMMIT on a live scope — a replacement whose new root no
+/// longer contains the target, and the two widen commits — and each records the
+/// new root on that same surviving scope in the very next step, under its own
+/// covering `Rescan`. The scope and its handle are both alive, so what the caller
+/// is owed is the instruction to re-read, which is exactly what this terminal
+/// promises; telling it the root died would contradict the replacement the commit
+/// just made.
+///
+/// A parked write STILL inside the (widened) root is kept: it dispatches normally
+/// under the bumped generation. The DISPATCHED counterpart — a write already in
+/// the pool — is revoked instead by the generation the same commit bumped,
+/// checked when it claims, and answers the same word for the same reason
+/// ([`CookieGuard::precedence`]).
 fn revoke_uncovered_parked_cookies<F: FsOps>(
   core: &mut DriverCore,
   parked_cookies: &mut BTreeMap<FenceId, ParkedCookie>,
@@ -6569,9 +6767,13 @@ fn revoke_uncovered_parked_cookies<F: FsOps>(
   scope: ScopeId,
   new_root: &Path,
 ) {
-  retire_parked_cookies(core, parked_cookies, cookies, &|ob, parked| {
-    ob.scope == scope && !cookie_dir_within_root(new_root, &parked.dir)
-  });
+  retire_parked_cookies(
+    core,
+    parked_cookies,
+    cookies,
+    ParkedTerminal::Dominated,
+    &|ob, parked| ob.scope == scope && !cookie_dir_within_root(new_root, &parked.dir),
+  );
 }
 
 /// Drops CANCELLED awaited-unwatch waiters (the caller dropped its future, so
@@ -7836,8 +8038,9 @@ fn cookie_dir<'a>(root: &Path, dir: &'a Path) -> &'a Path {
 /// across profiles: on a DESCENDING profile the door releases the target and
 /// reserved pins and drops the permit itself the moment admission finishes
 /// sampling (`AdmittedDirs::held`), so the slot is free again well before the
-/// write runs; on a KERNEL-RECURSIVE profile the permit rides the pins to the
-/// claim and comes back there instead. On both, a caller that walks away
+/// write runs; on a KERNEL-RECURSIVE profile the permit rides the pins into the
+/// write and comes back where they do — at the cookie directory's open, which is
+/// the last thing the admission is read for. On both, a caller that walks away
 /// mid-sampling drops the readings it had already accumulated with its future,
 /// while the job still inside a syscall keeps the slot until that syscall
 /// returns and its own descriptor goes with it. Nothing the caller owns is
@@ -7891,9 +8094,12 @@ fn cookie_dir<'a>(root: &Path, dir: &'a Path) -> &'a Path {
 /// latency and never a resource. That "microseconds" bound is on the sampling
 /// itself, not on how long a SLOT stays taken: on a descending profile the two
 /// coincide (the permit drops at the door), so a caller waiting there really is
-/// waiting on syscalls; on a kernel-recursive profile a claimed obligation holds
-/// its permit until its write is dispatched, so a caller queued behind a full
-/// door there can be waiting on a fence settle, not a `stat`.
+/// waiting on syscalls; on a kernel-recursive profile an admitted obligation
+/// holds its permit until its write has the cookie directory open, so a caller
+/// queued behind a full door there can be waiting on a fence settle, not a
+/// `stat`. Never past that: the write releases the pins and the permit the
+/// instant it holds descriptors of its own, so nothing a stalled post-create
+/// syscall does can keep the door shut.
 pub(crate) const MAX_SYNC_SAMPLINGS: usize = 32;
 
 #[derive(Debug, Clone)]
@@ -7949,6 +8155,42 @@ impl SyncPinAllowance {
     Arc::new(SyncPinPermit {
       freed: allowance.freed,
     })
+  }
+
+  /// A permit taken, without waiting, from THIS allowance — so a cell can keep
+  /// the allowance and watch its slot come back while a write is in flight,
+  /// rather than infer the release from something else.
+  ///
+  /// The slot is free by construction wherever a cell uses it: the allowance is
+  /// the cell's own and nothing else can reach it.
+  ///
+  /// Its cfg is exactly the union of its callers (the real-filesystem identity
+  /// cells).
+  #[cfg(all(
+    test,
+    feature = "tokio",
+    not(miri),
+    any(target_os = "linux", target_os = "macos")
+  ))]
+  pub(crate) fn taken_here(&self) -> Arc<SyncPinPermit> {
+    let _ = self.taken.try_send(());
+    Arc::new(SyncPinPermit {
+      freed: Arc::clone(&self.freed),
+    })
+  }
+
+  /// How many of this allowance's slots are occupied right now — the door's
+  /// observable, counted off the channel every permit puts its token in.
+  ///
+  /// Its cfg is exactly the union of its callers, as [`taken_here`](Self::taken_here) is.
+  #[cfg(all(
+    test,
+    feature = "tokio",
+    not(miri),
+    any(target_os = "linux", target_os = "macos")
+  ))]
+  pub(crate) fn occupied(&self) -> usize {
+    self.taken.len()
   }
 }
 
@@ -8489,8 +8731,9 @@ pub(crate) struct AdmittedDirs {
   ///
   /// It rides HERE rather than beside the future that took it because what has to
   /// be bounded is the descriptors, and these are the descriptors: a sampling that
-  /// reached the driver keeps its slot until the obligation carrying it writes,
-  /// refuses or retires. `None` is a sampling that holds nothing at all — the
+  /// reached the driver keeps its slot until the obligation carrying it refuses,
+  /// retires, or reaches the point in its write where the admission is no longer
+  /// read — the cookie directory's open. `None` is a sampling that holds nothing at all — the
   /// default the driver's own suites admit through, and every platform that pins no
   /// object.
   ///
@@ -9537,6 +9780,40 @@ impl FsOps for RealFs {
         "the watched root was not this scope's object when the sync was admitted",
       )));
     }
+    // The LANDING the door judged, against the one the caller's spelling resolves
+    // to now — the lexical twin of the identity compare below, and the half of the
+    // admission's verdict the write never asked for.
+    //
+    // An identity carries through a MOVE. A target reparented inside the scope is
+    // deliberately no coverage transition, so the epoch never sees it, and a
+    // spelling that reaches the moved object anyway — an intermediate symlink
+    // re-targeted behind it — resolves to a directory standing somewhere the
+    // admission never judged. The dispatch does not catch it either: it re-judges
+    // the cover against `cover_dir`, which is the landing the ADMISSION read, so a
+    // shrink that pruned the ground the target now stands in is re-judged against
+    // the old place and passes. The marker then lands in unwatched ground, the
+    // write reports success, and the barrier can only time out.
+    //
+    // So the write REFUSES where the canonical directory it resolved differs from
+    // the remembered landing. It is the retryable, pre-birth `DirReplaced` shape
+    // and not a ground refusal, because nothing about the caller's request is
+    // wrong: the directory the door admitted is no longer what the spelling lands
+    // on, and a fresh sync is admitted for whatever now stands there.
+    //
+    // No cover snapshot is taken beside it. A landing that is UNCHANGED was
+    // re-judged against the applied cover at dispatch, and a cover transition after
+    // dispatch retires the in-pool obligation through the ordinary move.
+    //
+    // Taken here, before the walk: a write that cannot stand where it was admitted
+    // opens no descriptor and descends nothing. The arms that hold tuples rather
+    // than objects read no landing at all ([`AdmittedDirs::target_landing`]) and
+    // are narrowed by nothing here, exactly as they are by the identity compares.
+    if admitted
+      .target_landing()
+      .is_some_and(|landing| landing != canonical_dir)
+    {
+      return Err(CookieWriteError::replaced(canonical_dir));
+    }
     // The parent, OPENED — and from here on nothing this write does resolves a
     // pathname of its own. Everything below is a verdict about the object this
     // one call is holding, and the create at the end is anchored at it (see
@@ -9684,6 +9961,20 @@ impl FsOps for RealFs {
         }
       },
     );
+    // THE ADMISSION IS DONE WITH, and it goes here — the kernel-recursive pins
+    // and the door's allowance slot with it.
+    //
+    // Its last read is the comparison just above. Every proof left — the
+    // sole-entry reading of a minted directory, the post-create ground re-read,
+    // the withdrawal — runs on descriptors this write OWNS: the parent it walked
+    // to, the cookie directory it just opened, and the marker's own handle. So
+    // holding the admission past this line proves nothing and costs the one thing
+    // the door bounds: eight (macOS) or thirty-two stalled post-create syscalls
+    // would otherwise keep every slot occupied, and syncs on unrelated healthy
+    // roots queue at a door held by writes that are already past needing it.
+    //
+    // The permit rides the pins ([`AdmittedDirs`]), so one drop returns both.
+    drop(admitted);
     // From HERE this write has a physical fact to answer for wherever the
     // directory is minted per obligation: `clean` would claim the filesystem is
     // exactly as this write found it, and it is not. Every failure below therefore
@@ -11296,7 +11587,13 @@ fn sweep_reap_requests<R, F>(
   F: FsOps,
 {
   cookies.sweep_reap_marks::<R>(op_tx);
-  retire_parked_cookies(core, parked_cookies, cookies, &|ob, _| ob.reap_requested);
+  retire_parked_cookies(
+    core,
+    parked_cookies,
+    cookies,
+    ParkedTerminal::Retired,
+    &|ob, _| ob.reap_requested,
+  );
 }
 
 /// Handles a `CookieRemoveDone` (§2.3), identical in the live arm and the close
@@ -13486,6 +13783,15 @@ pub(crate) async fn run<R, F>(
           );
           let _ = reply.send(());
         }
+        #[cfg(all(test, feature = "tokio", not(miri)))]
+        Ok(Command::DebugArmLivenessDue { scope, reply }) => {
+          // Arm and answer, nothing else: the tick itself belongs to the loop's
+          // own timer arm, which fires on the very next pass because the
+          // deadline this sets is already behind every `now`. Nothing is drained
+          // here — draining is exactly what this command exists not to do.
+          core.force_liveness_due(scope);
+          let _ = reply.send(());
+        }
         // The watcher facade dropped: same orderly teardown, nobody to tell.
         Err(_) => break None,
       },
@@ -13570,7 +13876,13 @@ pub(crate) async fn run<R, F>(
   // Retiring them BEFORE the drain is what keeps the drain's ledger-quiescence
   // condition honest — a pre-physical obligation nothing will ever complete must
   // not hold close open for the grace, nor be reported as a non-quiesced cookie.
-  retire_parked_cookies(&mut core, &mut parked_cookies, &cookies, &|_, _| true);
+  retire_parked_cookies(
+    &mut core,
+    &mut parked_cookies,
+    &cookies,
+    ParkedTerminal::Retired,
+    &|_, _| true,
+  );
   // The sweep re-armed every `Owned`/parked record (dispatched now); a record
   // still mid-backoff was coalesced and keeps its far retry deadline, which the
   // ~1 s grace could outrun — close would then report `NotQuiesced` where a
@@ -16458,6 +16770,22 @@ fn kick_control_queue<R, F>(
 /// ping-pongs: the move it raises is drained on the next pass, by which point the
 /// obligations it would retire are already retired, so no further `Rescan` is
 /// stood and the round stops.
+///
+/// # The flag is published before the `Rescan` is queued, and no delta escapes
+///
+/// [`CookieRegistry::invalidate_barriers`] sets the domination flag under the
+/// ledger lock and releases that lock before this loop purges the marker emit and
+/// stands the covering `Rescan`, so a writer in the pool can claim in between,
+/// read `Dominated`, self-reap and answer its caller microseconds before the
+/// instruction exists. That ordering is answered rather than closed, because
+/// nothing can reach the CONSUMER in the interval: both halves run in this one
+/// synchronous call on the driver thread, ahead of that thread's next
+/// `execute_effects`, and the stream advances only through that flush. A caller
+/// that has already been told `Dominated` cannot therefore observe any delta
+/// ordered after the transition without the `Rescan` ahead of it, which is
+/// exactly what the terminal promises. A panic or a cancellation between the two
+/// ends the driver, and with it every stream this `Rescan` could have been owed
+/// on — so there is no surviving consumer left to be owed one.
 fn drain_barrier_moves<R, F>(
   core: &mut DriverCore,
   cookies: &CookieRegistry<F>,
@@ -16527,7 +16855,32 @@ fn execute_effects<R, F>(
   // root's DELETE_SELF) must not resurrect its queue; the dead scope's batch is
   // dropped rather than dispatched.
   let mut torn_down: BTreeSet<ScopeId> = BTreeSet::new();
-  while let Some(effect) = core.poll_effect() {
+  loop {
+    // THE DRAIN RUNS BEFORE EVERY EFFECT LEAVES THE QUEUE. The sites outside
+    // this function assume every move is raised BETWEEN effect passes. A funnel
+    // fired from a fed-back outcome inside this pass — the probe-budget decline
+    // below is the proven case; an arm failure or a settle observation fed back
+    // the same way is the class — raises its move and stands its `Rescan` in one
+    // step, and the same pass would then flush that `Rescan` before any drain
+    // had set the domination flag. An in-pool writer released in that window
+    // claims, answers `Ok`, and its marker is later withdrawn under a `Rescan`
+    // that already passed the consumer before the barrier was installed.
+    //
+    // Ahead of the POLL, not merely ahead of the execution: the retirement also
+    // purges the marker emit of every barrier it retires, and an effect already
+    // taken off the queue is past the reach of that purge.
+    //
+    // The invariant is then local and total: no `Rescan` a funnel stood leaves
+    // the queue before the barriers that funnel retires are flagged, and no
+    // marker emit of a retired barrier leaves it at all. It is a cheap no-op
+    // when no move is queued, and it converges — a covering `Rescan` stood from
+    // inside the drain appends to this same queue and raises a move of its own,
+    // but the barriers it covers are already flagged and `invalidate_barriers`
+    // is idempotent, so the next turn reports none and stands nothing.
+    drain_barrier_moves::<R, F>(core, cookies, op_tx, now);
+    let Some(effect) = core.poll_effect() else {
+      break;
+    };
     match effect {
       Effect::SpawnStream { scope, root } => {
         pending_spawns.insert(scope);
