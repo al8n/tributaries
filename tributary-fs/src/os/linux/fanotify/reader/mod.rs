@@ -257,7 +257,7 @@ fn drain_events(
       &BufferContext {
         stats: &shared.stats,
         transport: &shared.transport,
-        exclusions: reseed.exclusions(),
+        fence: reseed.fence(),
       },
       || reseed.walk(),
       |subtree, subtree_fid, budget| reseed.walk_subtree(subtree, subtree_fid, budget),
@@ -278,9 +278,9 @@ struct BufferContext<'a> {
   stats: &'a BackendStatsShared,
   /// The transport state the loss/fatal signalling is routed through.
   transport: &'a transport::TransportState,
-  /// The caller's exclusion fence, consulted by [`classify`] before any map
-  /// self-maintenance runs.
-  exclusions: &'a [std::path::PathBuf],
+  /// The reported tree's boundary — the caller's exclusions and the root's own
+  /// prune seat — consulted by [`classify`] before any map self-maintenance runs.
+  fence: super::Fence<'a>,
 }
 
 /// Processes one decoded buffer: [`classify`]s each event into its admission
@@ -305,11 +305,12 @@ struct BufferContext<'a> {
 /// maps one moved-in directory's descendants (its resolved current path, its FID,
 /// and the remaining directory budget). Both mirror `ReseedContext`'s methods.
 ///
-/// `cx.exclusions` is handed straight to [`classify`], which decides the fence BEFORE
-/// any map self-maintenance runs. Nothing is filtered here afterwards: an excluded
+/// `cx.fence` is handed straight to [`classify`], which decides the verdict BEFORE
+/// any map self-maintenance runs. Nothing is filtered here afterwards: a fenced
 /// event arrives as [`Admission::ExcludedDrop`] having mutated nothing, so this loop
 /// never sees a forwarded event the caller asked not to hear about, and — the
-/// property that matters — excluded activity never grew the map to get here.
+/// property that matters — excluded or pruned activity never grew the map to get
+/// here.
 fn process_decoded<R, S, Q>(
   decoded: super::fid::DecodeOutcome,
   map: &mut FidMap,
@@ -326,7 +327,7 @@ where
   let &BufferContext {
     stats,
     transport,
-    exclusions,
+    fence,
   } = cx;
   // The batch memo (design §4.9) caches admitted directory resolutions FOR THIS
   // buffer only: the reader is single-threaded and the map is queue-ordered, so a
@@ -342,7 +343,7 @@ where
   if !lossy {
     events.reserve(decoded.events.len());
     for event in &decoded.events {
-      match classify(map, event, &mut memo, exclusions) {
+      match classify(map, event, &mut memo, fence) {
         // A forwarded event whose admission mutated no growing node, OR a root
         // self-event routed to the death lifecycle. A `LearnDir` may have grown the
         // map past its cap (design §4.9): a capped map that keeps eventing while

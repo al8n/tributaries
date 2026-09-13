@@ -39,7 +39,13 @@ rustup toolchain install nightly --component miri
 rustup override set nightly
 cargo miri setup
 
-export MIRIFLAGS="-Zmiri-strict-provenance -Zmiri-disable-isolation -Zmiri-symbolic-alignment-check -Zmiri-tree-borrows"
+# The glob engine (globset, pulled in through regex-automata) depends on memchr,
+# whose fallback word loads compute an aligned pointer by address arithmetic
+# rather than by construction. The SYMBOLIC alignment check flags that
+# arithmetic as UB by design — Miri documents this as a known false-positive
+# class of the flag, not a bug in memchr or in this crate's own code. Miri's
+# default alignment check stays on and still enforces real alignment here.
+export MIRIFLAGS="-Zmiri-strict-provenance -Zmiri-disable-isolation -Zmiri-tree-borrows"
 
 # Miri reports ONE cpu unless told otherwise, and `available_parallelism` is what a
 # multi-threaded runtime sizes its worker pool from — so every `flavor = "multi_thread"`

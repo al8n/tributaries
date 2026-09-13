@@ -195,9 +195,9 @@ impl SyncAdmission {
 /// [`sync_root`](Watcher::sync_root) to retry under the SAME sequence — the paired
 /// [`SyncTicket`] stays valid. `None` means the sequence is spent or its fate is
 /// ambiguous — the write was admitted then retired
-/// ([`Write`](SyncRootError::Write)), the sync reached a post-birth terminal
-/// ([`Retired`](SyncRootError::Retired)), or the watcher is
-/// [`Closed`](SyncRootError::Closed) — so a retry must re-mint through
+/// ([`Write`](SyncRootError::Write), [`DirPruned`](SyncRootError::DirPruned)), the
+/// sync reached a post-birth terminal ([`Retired`](SyncRootError::Retired)), or the
+/// watcher is [`Closed`](SyncRootError::Closed) — so a retry must re-mint through
 /// [`mint_sync_ticket`](Watcher::mint_sync_ticket).
 #[derive(Debug)]
 pub struct SyncRootDenied {
@@ -219,7 +219,9 @@ impl SyncRootDenied {
   /// so a future refusal is fail-safe — an unnecessary re-mint, never a reused
   /// sequence. Post-birth by construction and therefore deliberately absent from
   /// the returned set: `Write` (admitted, then retired before the reply — the
-  /// sequence is burned), `Retired` (a post-admission terminal), and `Closed`.
+  /// sequence is burned), `DirPruned` (the same shape: the verdict needs the canonical
+  /// directory only the write can resolve, so it too is admitted and then retired),
+  /// `Retired` (a post-admission terminal), and `Closed`.
   pub(crate) fn classify(error: SyncRootError, admission: SyncAdmission) -> Self {
     let admission = if matches!(
       error,
@@ -1103,8 +1105,11 @@ impl<R> Watcher<R> {
   ///
   /// # Errors
   ///
-  /// The same four as [`watch`](Self::watch):
+  /// The same four as [`watch`](Self::watch), plus the household's own:
   ///
+  /// - [`WatchRootError::InvalidOptions`] when a glob seat carries more than
+  ///   [`RootOptions::MAX_SEAT_PATTERNS`] patterns — refused before any
+  ///   filesystem work;
   /// - [`WatchRootError::NotFound`] / [`WatchRootError::NotADirectory`] when
   ///   the root cannot serve as a watch target;
   /// - [`WatchRootError::Overlaps`] when it is not disjoint from an
@@ -1116,6 +1121,10 @@ impl<R> Watcher<R> {
     root: impl Into<PathBuf>,
     options: RootOptions,
   ) -> Result<RootHandle, WatchRootError> {
+    // Judged before anything is canonicalized, reserved or sent: a household
+    // whose seats are out of range is a configuration mistake, and answering it
+    // as one costs the caller no filesystem work and this watcher no state.
+    options.validate()?;
     let supplied = root.into();
     let canonical = std::fs::canonicalize(&supplied).map_err(|err| {
       if err.kind() == std::io::ErrorKind::NotFound {
@@ -1240,15 +1249,47 @@ impl<R> Watcher<R> {
   ///   make-before-break and covers its whole window with a `Rescan`.
   ///
   /// - **Every other replace** (kernel-recursive backends, widening by more
-  ///   than one segment, and disjoint or narrowing targets on the descending
-  ///   backend) is make-before-break:
+  ///   than one segment, disjoint or narrowing targets on the descending
+  ///   backend, and — whatever its shape — a replace on a scope whose
+  ///   [`prune`](RootOptions::prune) seat is engaged) is make-before-break:
   ///   the new stream is live before the old one is retired, and the commit
   ///   delivers one epoch-bumped full-root `Rescan` instructing the consumer
   ///   to re-read the (re-rooted) world — which covers the swap window and
   ///   the newly covered delta alike.
   ///
+  ///   The prune seat is on that list because its words RE-BASE (see below) and
+  ///   the splice does not walk what it adopts: ground the re-based words stop
+  ///   covering was left unarmed by the old root and would stay unarmed and
+  ///   unannounced, while ground they newly cover would stay armed and
+  ///   reporting. The fresh stream reads the whole new root under the re-based
+  ///   seat and covers the difference with the `Rescan` it already mints.
+  ///
   /// Locations are relative to [`root_path(handle)`](Self::root_path) at
   /// delivery time.
+  ///
+  /// # The root's words are KEPT, and they are RE-BASED
+  ///
+  /// A replace swaps the root, never the [`RootOptions`] it was armed with: the
+  /// scope keeps its interest and both of its glob seats. Those seats are
+  /// ROOT-RELATIVE by definition, so keeping them re-bases every pattern onto the
+  /// new root — the same words, read against a different origin — and a
+  /// position-sensitive pattern means something new the moment the origin moves.
+  ///
+  /// Both directions are real and neither is repaired here:
+  ///
+  /// - **over-coverage.** `prune = ["a/cache"]` on `/r` names `/r/a/cache`. After
+  ///   replacing the root with `/r/a` it names `/r/a/a/cache` and stops covering
+  ///   the directory it was written for, which is now armed and delivered.
+  /// - **under-coverage.** The mirror: replacing `/r` with its parent `/p` makes
+  ///   the same pattern name `/p/a/cache` — a directory the caller never asked
+  ///   about — while `/p/r/a/cache` is watched again.
+  ///
+  /// An `include` seat re-bases without changing meaning (it matches the object's
+  /// NAME, which no re-rooting moves), and a depth-free `prune` pattern
+  /// (`**/node_modules`) is likewise position-independent. Depth-anchored words
+  /// are the ones to restate: a caller that wants them read against the new root
+  /// should re-issue the watch under a fresh [`watch_with`](Self::watch_with)
+  /// rather than replace, which is the only way to state new words at all.
   ///
   /// Atomic-on-failure: every error leaves the old root's coverage
   /// untouched. NOT cancel-abortive: the reservation travels with the
@@ -1515,6 +1556,10 @@ impl<R> Watcher<R> {
   /// [`DirExcluded`](SyncRootError::DirExcluded) when `dir` is inside the root but
   /// under one of the configured exclusions, whose whole purpose is to keep that
   /// subtree's events off the stream the barrier waits on;
+  /// [`DirPruned`](SyncRootError::DirPruned) when this ROOT's own
+  /// [`prune`](crate::RootOptions::prune) seat covers the CANONICAL directory the
+  /// write resolves for `dir`, for the same reason and carrying the pattern that did
+  /// it;
   /// [`Write`](SyncRootError::Write) when the
   /// create fails (a read-only tree surfaces as `PermissionDenied`);
   /// [`WriteInFlight`](SyncRootError::WriteInFlight) when a physical write for this
@@ -1526,7 +1571,8 @@ impl<R> Watcher<R> {
   /// cleanup backlog cap is reached; [`Retired`](SyncRootError::Retired) when the
   /// root died while the write was parked; [`Closed`](SyncRootError::Closed) once
   /// the watcher is closed. The admission is returned (retryable) for every refusal
-  /// except [`Write`](SyncRootError::Write), [`Retired`](SyncRootError::Retired),
+  /// except [`Write`](SyncRootError::Write),
+  /// [`DirPruned`](SyncRootError::DirPruned), [`Retired`](SyncRootError::Retired),
   /// and [`Closed`](SyncRootError::Closed), whose sequence is spent — re-mint to
   /// retry those.
   pub async fn sync_root(

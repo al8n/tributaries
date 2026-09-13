@@ -61,7 +61,20 @@ impl DriverCore {
   ) -> Vec<Planned> {
     let mask = event.mask;
     if let Some(rename) = &event.rename {
-      return self.plan_rename(state, scope, &rename.old_path, &rename.new_path);
+      // `FAN_ONDIR` is set exactly when the renamed object is a directory, so
+      // this ONE mask proves the class of both halves. Stamping it is what keeps
+      // the common fence from reading a file rename as a directory one and
+      // suppressing both halves against a directory-only `prune` word — a ghost
+      // left at the old name, silence at the new one, and no `Rescan` between
+      // them. It is the same proof the admission fence upstream judged the pair
+      // on, so the two layers cannot disagree about one object.
+      return self.plan_rename(
+        state,
+        scope,
+        &rename.old_path,
+        &rename.new_path,
+        Some(mask.ondir()),
+      );
     }
 
     let Some(path) = &event.path else {
@@ -149,13 +162,22 @@ impl DriverCore {
   /// present, so the Monitor pairs them with no window; a half whose end lies
   /// outside the root degrades to a located rescan of the in-root end (a move
   /// across the root boundary), never a half-move. The RDCW lowering plans its
-  /// pump-paired renames through this same path.
+  /// pump-paired renames on the same shape, from names it has already resolved.
+  ///
+  /// `is_dir` is the class BOTH halves carry — one object is renamed, so one
+  /// class describes both ends — and it travels onto the records rather than
+  /// being left for a downstream layer to guess. The guess is not free: the
+  /// common fence judges a classless record as anything but a proven directory,
+  /// so an unstamped pair of a DIRECTORY rename would walk through a
+  /// directory-only `prune` word, and a `None` stamped where the source knew the
+  /// answer throws away a fact the caller paid for.
   pub(in crate::core) fn plan_rename(
     &mut self,
     state: &ScopeState,
     scope: ScopeId,
     old_path: &Path,
     new_path: &Path,
+    is_dir: Option<bool>,
   ) -> Vec<Planned> {
     let old = lower(state, old_path);
     let new = lower(state, new_path);
@@ -168,16 +190,7 @@ impl DriverCore {
     }
 
     match (old, new) {
-      (Lowered::Target(from), Lowered::Target(to)) => {
-        let cookie = self.next_cookie();
-        let from_rec = OsRecord::new(state.watch, RecordKind::MovedFrom)
-          .with_target(from)
-          .with_cookie(cookie);
-        let to_rec = OsRecord::new(state.watch, RecordKind::MovedTo)
-          .with_target(to)
-          .with_cookie(cookie);
-        vec![Planned::Rec(from_rec), Planned::Rec(to_rec)]
-      }
+      (Lowered::Target(from), Lowered::Target(to)) => self.paired_rename(state, from, to, is_dir),
       // One end is outside the root: a move across the boundary. Cover the
       // in-root end with a located rescan (its content changed) rather than
       // pairing a half that has no partner under the root.
@@ -186,6 +199,39 @@ impl DriverCore {
       }
       _ => vec![Planned::Over(Scope::Root(scope))],
     }
+  }
+
+  /// The adjacent `MovedFrom`/`MovedTo` pair itself, from two ALREADY-lowered
+  /// root-relative ends: one freshly-minted counter cookie, and one class stamped
+  /// on both halves.
+  ///
+  /// Shared with the RDCW lowering, which resolves its ends from watch-relative
+  /// names rather than from absolute paths but owes the records exactly the same
+  /// shape — and above all the same class on both halves, which is the property
+  /// a second spelling of this would be free to lose.
+  pub(in crate::core) fn paired_rename(
+    &mut self,
+    state: &ScopeState,
+    from: tributary_proto::Location,
+    to: tributary_proto::Location,
+    is_dir: Option<bool>,
+  ) -> Vec<Planned> {
+    let cookie = self.next_cookie();
+    let stamp = |rec: OsRecord| match is_dir {
+      Some(is_dir) => rec.with_is_dir(is_dir),
+      None => rec,
+    };
+    let from_rec = stamp(
+      OsRecord::new(state.watch, RecordKind::MovedFrom)
+        .with_target(from)
+        .with_cookie(cookie),
+    );
+    let to_rec = stamp(
+      OsRecord::new(state.watch, RecordKind::MovedTo)
+        .with_target(to)
+        .with_cookie(cookie),
+    );
+    vec![Planned::Rec(from_rec), Planned::Rec(to_rec)]
   }
 }
 

@@ -9608,8 +9608,16 @@ mod kernel_recursive_fanotify {
       name: Some(b"r".to_vec()),
       rename: None,
     };
-    let Admission::RootDeath(admitted) = classify(&mut map, &raw, &mut MemoBatch::new(), &[])
-    else {
+    let Admission::RootDeath(admitted) = classify(
+      &mut map,
+      &raw,
+      &mut MemoBatch::new(),
+      crate::os::linux::fanotify::Fence::new(
+        std::path::Path::new("/root"),
+        &[],
+        &tributary_proto::glob::Globs::default(),
+      ),
+    ) else {
       panic!("the root delete-from-parent must classify as RootDeath, not a firehose drop");
     };
 
@@ -10116,6 +10124,95 @@ mod rdcw_lowering {
       "the counter cookie pairs the halves into one Moved"
     );
     assert_eq!(emitted[0].location(), &loc(&["b", "new.txt"]));
+  }
+
+  /// One object is renamed, so ONE class describes both halves — and the pair
+  /// carries it, because the fence judges a classless record as anything but a
+  /// proven directory and a directory-only `prune` word would otherwise take a
+  /// directory rename whole.
+  ///
+  /// Extended records each carry their own bit, so the three agreeing shapes are
+  /// asserted together: two that agree, one lone proof, and none at all.
+  #[test]
+  fn a_paired_rename_carries_the_class_its_halves_agree_on() {
+    let extended = |action, components: &[&str], attributes: Option<u32>| RdcwRecord {
+      attributes,
+      ..rdcw(action, components)
+    };
+    let moved = |old: RdcwRecord, new: RdcwRecord| {
+      let mut core = DriverCore::new(WINDOW, LIVENESS);
+      let scope = live_scope(&mut core);
+      core.on_batch(scope, payload(vec![RdcwEvent::Renamed { old, new }]), at(1));
+      let effects = drain(&mut core);
+      let emitted = emits(&effects);
+      assert_eq!(emitted.len(), 1, "{emitted:?}");
+      (emitted[0].kind().is_moved(), emitted[0].is_dir())
+    };
+
+    assert_eq!(
+      moved(
+        extended(RdcwAction::RenamedOld, &["old"], Some(0x10)),
+        extended(RdcwAction::RenamedNew, &["new"], Some(0x10)),
+      ),
+      (true, Some(true)),
+      "two halves that agree stamp what they agree on"
+    );
+    assert_eq!(
+      moved(
+        extended(RdcwAction::RenamedOld, &["old"], Some(0x20)),
+        rdcw(RdcwAction::RenamedNew, &["new"]),
+      ),
+      (true, Some(false)),
+      "a lone proof speaks for the pair — there is one object to speak about"
+    );
+    assert_eq!(
+      moved(
+        rdcw(RdcwAction::RenamedOld, &["old"]),
+        rdcw(RdcwAction::RenamedNew, &["new"]),
+      ),
+      (true, None),
+      "and two basic records honestly prove nothing"
+    );
+  }
+
+  /// Two halves whose classes CONTRADICT each other are the one shape no reading
+  /// can reconcile: nothing here can decide which end told the truth, and either
+  /// stamp is a guess that decides whether the fence keeps the pair. The pair is
+  /// admitted as a covering rescan at the ends' common parent — a directory by
+  /// construction, holding both names, asserting nothing about the class.
+  ///
+  /// Revert witness: pick a side and the cell reads a `Moved` carrying a class
+  /// one of the two records denied.
+  #[test]
+  fn a_paired_rename_whose_halves_disagree_covers_their_common_parent() {
+    let extended = |action, components: &[&str], attributes: u32| RdcwRecord {
+      attributes: Some(attributes),
+      ..rdcw(action, components)
+    };
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_scope(&mut core);
+
+    core.on_batch(
+      scope,
+      payload(vec![RdcwEvent::Renamed {
+        old: extended(RdcwAction::RenamedOld, &["a", "b", "old"], 0x10),
+        new: extended(RdcwAction::RenamedNew, &["a", "b", "new"], 0x20),
+      }]),
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let emitted = emits(&effects);
+
+    assert_eq!(emitted.len(), 1, "{emitted:?}");
+    assert!(
+      emitted[0].kind().is_rescan(),
+      "contradicting evidence buys a cover, never a guessed record: {emitted:?}"
+    );
+    assert_eq!(
+      emitted[0].location(),
+      &loc(&["a", "b"]),
+      "and the cover is the directory holding both names"
+    );
   }
 
   #[test]
@@ -10999,6 +11096,7 @@ mod usn_lowering {
     let mut admission = UsnAdmission::new(map, 64).with_fence(UsnFence::new(
       PathBuf::from("/r"),
       vec![PathBuf::from("/r/cache")],
+      tributary_proto::glob::Globs::default(),
     ));
     let mut admitted = Vec::new();
     for round in 0..200u128 {
@@ -11623,6 +11721,7 @@ mod usn_lowering {
     let mut adm = UsnAdmission::new(map, 64).with_fence(UsnFence::new(
       PathBuf::from("/r"),
       vec![PathBuf::from("/r/a/cache")],
+      tributary_proto::glob::Globs::default(),
     ));
     let mut core = DriverCore::new(WINDOW, LIVENESS);
     let scope = live_scope(&mut core);
@@ -15736,7 +15835,7 @@ mod prune {
   /// stages it, never announces it and never arms it — while `node_modules_old`
   /// proves the match is a whole COMPONENT, not a name prefix.
   ///
-  /// Revert witness: drop the `prune_root` test in `on_enumerated` and
+  /// Revert witness: drop the `is_pruned` test in `on_enumerated` and
   /// `/r/node_modules` joins the coverage set.
   #[test]
   fn a_cold_listing_never_stages_a_pruned_directory() {
@@ -15785,7 +15884,7 @@ mod prune {
   /// The live half, in its create shape: a directory created on a pruned name
   /// after the cold read is fenced by the same rule the listing was.
   ///
-  /// Revert witness: drop the prune half of `fence_root` and the create installs
+  /// Revert witness: drop the prune half of `is_fenced` and the create installs
   /// `/r/node_modules` and queues its arm.
   #[test]
   fn a_live_create_of_a_pruned_directory_never_enters_coverage() {
@@ -15837,7 +15936,7 @@ mod prune {
       core.on_inotify_events(
         scope,
         vec![
-          inotify(root, IN_MODIFY, 0, Some("node_modules")),
+          inotify(root, IN_MODIFY | IN_ISDIR, 0, Some("node_modules")),
           inotify(root, IN_CREATE | IN_ISDIR, 0, Some("node_modules")),
         ],
         at(2 + round),
@@ -16233,6 +16332,439 @@ mod prune {
     );
   }
 
+  /// The seat speaks for DIRECTORIES. A plain file whose own name matches a
+  /// pattern is not pruned by it — narrowing which files arrive is `include`'s
+  /// seat — so `**/.*`, written to skip dot-DIRECTORIES, does not silently ban
+  /// every dotfile in the tree.
+  ///
+  /// Both halves of the fence are witnessed: the cold listing keeps the file and
+  /// drops the directory, and the live records do the same.
+  ///
+  /// Revert witness: judge a record on its own last segment whatever its class
+  /// and `.env` — cold and live — disappears with `.git`.
+  #[test]
+  fn a_file_matching_a_prune_pattern_is_not_pruned_by_it() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let (scope, req, root) = live_descending(&mut core, &pruning(&["**/.*"]));
+    core.on_enumerated(
+      req,
+      listed(vec![
+        entry(".git", FileKind::Dir),
+        entry(".env", FileKind::File),
+        entry("src", FileKind::Dir),
+      ]),
+    );
+    let effects = drain(&mut core);
+
+    assert_eq!(
+      core.covered_paths(),
+      vec![PathBuf::from("/r"), PathBuf::from("/r/src")],
+      "the dot-DIRECTORY is subtracted from the watch: {effects:?}"
+    );
+
+    // The live half is where delivery can be read (a root's own crawl announces
+    // nothing — it is discovery of a tree that was already there), and it agrees
+    // with the cold one in both directions.
+    core.on_inotify_events(
+      scope,
+      vec![
+        inotify(root, IN_CREATE, 0, Some(".hidden")),
+        inotify(root, IN_CREATE | IN_ISDIR, 0, Some(".cache")),
+      ],
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+    assert_eq!(
+      changes
+        .iter()
+        .map(|change| change.location().clone())
+        .collect::<Vec<_>>(),
+      vec![loc(&[".hidden"])],
+      "the file delivers and the directory is fenced: {changes:?}"
+    );
+    assert!(
+      !effects.iter().any(|e| matches!(
+        e,
+        Effect::AddWatch { path, .. } if path.as_path() == Path::new("/r/.cache")
+      )),
+      "and only the directory costs coverage: {effects:?}"
+    );
+    // A file still inside an already-pruned DIRECTORY is gone, though: the walk
+    // covers a path's ancestors whatever its own class is. Witnessed on the
+    // kernel-recursive profile above
+    // (`a_kernel_recursive_scope_that_enforces_exclusions_still_prunes` drops
+    // `node_modules/deep/o.tmp`, a proven file), which is the only profile that
+    // can report from inside a subtree the descending one never armed.
+  }
+
+  /// The sync cookie is the WATCHER's artifact, not the tree's, and no pattern
+  /// of the caller's may reach it. `**/.*` names every dotted directory in the
+  /// tree — including, by accident, the reserved cookie directory — and the
+  /// barrier that directory exists to carry would then wait forever on an event
+  /// its own root had fenced.
+  ///
+  /// Asserted on COVERAGE first: on a descending backend the marker's create is
+  /// only reported at all if the cookie directory was armed, so the exemption
+  /// has to hold in the cold listing, not merely at delivery.
+  ///
+  /// Revert witness: drop the cookie arm from `prune_prefixes` and
+  /// `/r/.tributaries-sync-cookies-0` leaves coverage, taking the marker with
+  /// it.
+  #[test]
+  fn the_sync_cookie_directory_is_never_pruned() {
+    const COOKIE_DIR: &str = ".tributaries-sync-cookies-0";
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let (scope, req, root) = live_descending(&mut core, &pruning(&["**/.*"]));
+    core.on_enumerated(
+      req,
+      listed(vec![
+        entry(COOKIE_DIR, FileKind::Dir),
+        entry(".git", FileKind::Dir),
+      ]),
+    );
+    let effects = drain(&mut core);
+
+    assert_eq!(
+      core.covered_paths(),
+      vec![
+        PathBuf::from("/r"),
+        PathBuf::from(format!("/r/{COOKIE_DIR}")),
+      ],
+      "the cookie directory is armed and the caller's dot-directory is not: \
+       {effects:?}"
+    );
+
+    // And the marker inside it reaches the stream — which is the whole point:
+    // that record IS the barrier.
+    let (cookie, cookie_req) = arm(&mut core, &effects, &format!("/r/{COOKIE_DIR}"));
+    core.on_enumerated(cookie_req, listed(Vec::new()));
+    let _ = drain(&mut core);
+    core.on_inotify_events(
+      scope,
+      vec![inotify(cookie, IN_CREATE, 0, Some(".tributaries-sync-1"))],
+      at(1),
+    );
+    let changes = drain(&mut core);
+    let changes = emits(&changes);
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.location() == &loc(&[COOKIE_DIR, ".tributaries-sync-1"])),
+      "the marker the barrier waits on is delivered: {changes:?}"
+    );
+
+    // Non-vacuity: the exemption is the NAME's, not the seat standing down —
+    // a sibling dot-directory of the caller's is still pruned.
+    core.on_inotify_events(
+      scope,
+      vec![inotify(root, IN_CREATE | IN_ISDIR, 0, Some(".hidden"))],
+      at(2),
+    );
+    let changes = drain(&mut core);
+    let changes = emits(&changes);
+    assert!(
+      !mentions(&changes, ".hidden"),
+      "the caller's own dot-directory is still fenced: {changes:?}"
+    );
+  }
+
+  /// The reserved directory is exempt at ANY depth, which is the depth it
+  /// actually stands at: a sync is placed under the SUBSCRIPTION's directory,
+  /// and that need not be the watched root. A first-segment-only exemption would
+  /// leave every sync below the root back where it started.
+  ///
+  /// FSEvents is the witness because a kernel-recursive stream reports a deep
+  /// path without anything having to be armed on the way down.
+  #[test]
+  fn a_nested_cookie_directory_is_never_pruned() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_fsevents(&mut core, &pruning(&["**/.*"]));
+
+    core.on_batch_events(
+      scope,
+      vec![
+        ev(
+          "/r/sub/.tributaries-sync-cookies-0/.tributaries-sync-1",
+          flags(&[FsEventFlags::ITEM_CREATED, FsEventFlags::ITEM_IS_FILE]),
+          1,
+          10,
+        ),
+        ev(
+          "/r/sub/.hidden/notes.txt",
+          flags(&[FsEventFlags::ITEM_CREATED, FsEventFlags::ITEM_IS_FILE]),
+          2,
+          11,
+        ),
+      ],
+      at(1),
+    );
+    let changes = drain(&mut core);
+    let changes = emits(&changes);
+
+    assert_eq!(
+      changes
+        .iter()
+        .map(|change| change.location().clone())
+        .collect::<Vec<_>>(),
+      vec![loc(&[
+        "sub",
+        ".tributaries-sync-cookies-0",
+        ".tributaries-sync-1"
+      ])],
+      "the nested marker survives and the caller's own nested dot-directory \
+       does not: {changes:?}"
+    );
+  }
+
+  /// A rename can carry a subtree ACROSS a position-sensitive pattern, and on a
+  /// profile with no rename geometry there is no Monitor report to notice it.
+  /// With `a/cache` pruned, `/r/a/cache/x` is silent; renaming `/r/a` to `/r/b`
+  /// makes `/r/b/cache/x` reportable, and the consumer would otherwise be left
+  /// holding a bare `Moved(a → b)` and no way to learn that.
+  ///
+  /// fanotify is the witness: it decides exclusions at admission, so it runs no
+  /// geometry, and its `FAN_RENAME` carries both halves atomically. The repair
+  /// is one located `Rescan` at the DESTINATION — it restores no coverage (a
+  /// kernel-recursive stream already covers the destination) and does not need
+  /// to; what was lost is the consumer's VIEW.
+  ///
+  /// Revert witness: drop the `revealed` arm from the fence and the pair arrives
+  /// with no cover at all.
+  #[test]
+  fn a_kernel_recursive_directory_rename_covers_its_destination() {
+    use crate::os::linux::{
+      RawLinuxEvent,
+      fanotify::{
+        AdmittedEvent, AdmittedRename,
+        fid::{FAN_ONDIR, FAN_RENAME, FanMask},
+      },
+    };
+
+    let rename = |mask: u64, old: &str, new: &str| {
+      RawLinuxEvent::Fanotify(AdmittedEvent {
+        mask: FanMask::new(mask),
+        path: None,
+        rename: Some(AdmittedRename {
+          old_path: PathBuf::from(old),
+          new_path: PathBuf::from(new),
+        }),
+      })
+    };
+    let feed = |core: &mut DriverCore, scope, events: Vec<RawLinuxEvent>, now| {
+      let events = events.into_iter().map(SourceEvent::Linux).collect();
+      core.on_batch(scope, BatchPayload::detached(events), now);
+    };
+
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = core
+      .on_watch_with(
+        PathBuf::from("/r"),
+        &pruning(&["a/cache"]),
+        BackendKind::Fanotify,
+      )
+      .expect("a fresh scope registers");
+    let _ = drain(&mut core);
+    core.on_stream_spawned(
+      scope,
+      Ok(RootMeta {
+        root: PathBuf::from("/r"),
+        root_dev: 1,
+        root_mnt_id: None,
+        mounts: Vec::new(),
+        identity: crate::os::RootIdentity::new(1, 1),
+        ancestors: Vec::new(),
+        backend: BackendKind::Fanotify,
+      }),
+    );
+    let _ = drain(&mut core);
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(0));
+    let _ = drain(&mut core);
+
+    // Staging: the pruned position really is silent where it stands.
+    feed(
+      &mut core,
+      scope,
+      vec![RawLinuxEvent::Fanotify(AdmittedEvent {
+        mask: FanMask::new(crate::os::linux::fanotify::fid::FAN_CREATE),
+        path: Some(PathBuf::from("/r/a/cache/x")),
+        rename: None,
+      })],
+      at(1),
+    );
+    let changes = drain(&mut core);
+    assert!(
+      emits(&changes).is_empty(),
+      "staging: the pruned position is silent: {changes:?}"
+    );
+
+    feed(
+      &mut core,
+      scope,
+      vec![rename(FAN_RENAME | FAN_ONDIR, "/r/a", "/r/b")],
+      at(2),
+    );
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.kind().is_moved() && change.location() == &loc(&["b"])),
+      "the rename itself is reported: {changes:?}"
+    );
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.kind().is_rescan() && change.location() == &loc(&["b"])),
+      "and the destination is covered, so the newly reportable ground is \
+       re-read: {changes:?}"
+    );
+
+    // The ground really is reportable now.
+    feed(
+      &mut core,
+      scope,
+      vec![RawLinuxEvent::Fanotify(AdmittedEvent {
+        mask: FanMask::new(crate::os::linux::fanotify::fid::FAN_CREATE),
+        path: Some(PathBuf::from("/r/b/cache/x")),
+        rename: None,
+      })],
+      at(3),
+    );
+    let changes = drain(&mut core);
+    let changes = emits(&changes);
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.location() == &loc(&["b", "cache", "x"])),
+      "a change under the relocated subtree now reaches the caller: {changes:?}"
+    );
+
+    // A FILE rename buys no destination cover, and this backend can say which it
+    // was: `FAN_ONDIR` is set exactly when the object is a directory, so a bare
+    // `FAN_RENAME` PROVES a file and the lowering stamps that proof onto both
+    // halves. A move that relocates no subtree can reveal no ground.
+    feed(
+      &mut core,
+      scope,
+      vec![rename(FAN_RENAME, "/r/one.txt", "/r/two.txt")],
+      at(4),
+    );
+    let changes = drain(&mut core);
+    let changes = emits(&changes);
+    assert!(
+      changes.iter().any(|change| change.kind().is_moved()
+        && change.location() == &loc(&["two.txt"])
+        && change.is_dir() == Some(false)),
+      "the pair carries the class the mask proved: {changes:?}"
+    );
+    assert!(
+      !changes.iter().any(|change| change.kind().is_rescan()),
+      "and a proven file move reveals nothing, so nothing is covered: {changes:?}"
+    );
+  }
+
+  /// The same repair at the second, and last, place a planned input is born.
+  /// FSEvents parks a rename half for a probe, so its records are minted at the
+  /// resolution rather than at compile time — and it is the one geometry-less
+  /// profile that PROVES an object's class, which is what lets this cell state
+  /// both halves of the rule.
+  ///
+  /// Revert witness: drop the `revealed` arm from `fence_resolved` and the
+  /// directory rename lands with no cover at its destination.
+  #[test]
+  fn a_probe_resolved_file_rename_buys_no_destination_cover() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_fsevents(&mut core, &pruning(&["a/cache"]));
+
+    // A DIRECTORY rename: the subtree relocated, so the destination is covered.
+    core.on_batch_events(
+      scope,
+      vec![
+        ev(
+          "/r/a",
+          flags(&[FsEventFlags::ITEM_RENAMED, FsEventFlags::ITEM_IS_DIR]),
+          10,
+          42,
+        ),
+        ev(
+          "/r/b",
+          flags(&[FsEventFlags::ITEM_RENAMED, FsEventFlags::ITEM_IS_DIR]),
+          11,
+          42,
+        ),
+      ],
+      at(1),
+    );
+    let reqs = probes(&drain(&mut core));
+    assert_eq!(reqs.len(), 2, "both halves of a same-batch pair probe");
+    core.on_probe_result(reqs[0].0, ProbeOutcome::Missing, at(2));
+    core.on_probe_result(
+      reqs[1].0,
+      ProbeOutcome::Present {
+        kind: FileKind::Dir,
+        file_id: NonZeroU64::new(42),
+        dev: 1,
+      },
+      at(2),
+    );
+    let changes = drain(&mut core);
+    let changes = emits(&changes);
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.kind().is_rescan() && change.location() == &loc(&["b"])),
+      "the relocated subtree's destination is covered: {changes:?}"
+    );
+
+    // A proven FILE rename relocates no subtree, so it reveals nothing and buys
+    // no cover of its own.
+    core.on_batch_events(
+      scope,
+      vec![
+        ev(
+          "/r/one.txt",
+          flags(&[FsEventFlags::ITEM_RENAMED, FsEventFlags::ITEM_IS_FILE]),
+          12,
+          43,
+        ),
+        ev(
+          "/r/two.txt",
+          flags(&[FsEventFlags::ITEM_RENAMED, FsEventFlags::ITEM_IS_FILE]),
+          13,
+          43,
+        ),
+      ],
+      at(3),
+    );
+    let reqs = probes(&drain(&mut core));
+    assert_eq!(reqs.len(), 2);
+    core.on_probe_result(reqs[0].0, ProbeOutcome::Missing, at(4));
+    core.on_probe_result(
+      reqs[1].0,
+      ProbeOutcome::Present {
+        kind: FileKind::File,
+        file_id: NonZeroU64::new(43),
+        dev: 1,
+      },
+      at(4),
+    );
+    let changes = drain(&mut core);
+    let changes = emits(&changes);
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.kind().is_moved() && change.location() == &loc(&["two.txt"])),
+      "non-vacuity: the file rename itself is reported: {changes:?}"
+    );
+    assert!(
+      !changes
+        .iter()
+        .any(|change| change.kind().is_rescan() && change.location() == &loc(&["two.txt"])),
+      "and nothing covers its destination: {changes:?}"
+    );
+  }
+
   /// The ROOT is never pruned, however total the pattern: its root-relative path
   /// is empty, and the match needs a prefix of length at least one. A seat can
   /// silence everything below the root and still not silence the root itself.
@@ -16261,6 +16793,466 @@ mod prune {
         .iter()
         .any(|change| change.kind().is_rescan() && change.location().is_empty()),
       "and the root's own coverage loss is still reported: {changes:?}"
+    );
+  }
+
+  /// The seat's leaf match wants a PROVEN directory. A listing that could not
+  /// classify an entry has not proven one, so the entry is staged — and the
+  /// pruning still happens one level down, where the unproven name is a proper
+  /// ancestor prefix.
+  ///
+  /// `readdir` answers `DT_UNKNOWN` on whole filesystems, and reading that as a
+  /// directory would take every regular FILE on such a filesystem whose name
+  /// matched a pattern, with no `Rescan` behind it.
+  ///
+  /// Revert witness: judge an unknown kind as a directory and `cache` leaves
+  /// coverage with the proven one.
+  #[test]
+  fn an_unproven_listing_kind_is_staged_and_prunes_at_its_children() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let (_scope, req, _root) = live_descending(&mut core, &pruning(&["**/cache"]));
+    core.on_enumerated(
+      req,
+      listed(vec![
+        entry("cache", FileKind::Unknown),
+        entry("proven", FileKind::Dir),
+      ]),
+    );
+    let effects = drain(&mut core);
+
+    // Staged, not silenced: the Monitor asks what the entry IS, which is exactly
+    // the question the listing could not answer.
+    let probe = probes(&effects)
+      .into_iter()
+      .find(|(_, path)| path.as_path() == Path::new("/r/cache"))
+      .map(|(req, _)| req)
+      .unwrap_or_else(|| panic!("the unclassified entry is staged: {effects:?}"));
+    core.on_probe_result(
+      probe,
+      ProbeOutcome::Present {
+        kind: FileKind::Dir,
+        file_id: NonZeroU64::new(121),
+        dev: 1,
+      },
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let (_, deep) = arm(&mut core, &effects, "/r/cache");
+    assert!(
+      core.covered_paths().contains(&PathBuf::from("/r/cache")),
+      "and it costs exactly the one watch the pattern would have saved: \
+       {effects:?}"
+    );
+
+    // One level down the name IS an ancestor prefix, so that watch is the WHOLE
+    // cost — and a proven directory under it is what the seat speaks for.
+    core.on_enumerated(deep, listed(vec![entry("cache", FileKind::Dir)]));
+    let effects = drain(&mut core);
+    assert!(
+      !core
+        .covered_paths()
+        .contains(&PathBuf::from("/r/cache/cache")),
+      "and everything under the unproven name still prunes: {effects:?}"
+    );
+  }
+
+  /// The live half of the same rule, on the backend that provoked it: RDCW's
+  /// basic records carry no class at all, so a regular file named like a pruned
+  /// word must still deliver. Reading the absent class as a directory dropped
+  /// every create, write and delete of `/r/cache` with nothing to recover them.
+  ///
+  /// The proven halves bracket it: an extended record that says DIRECTORY is
+  /// pruned, and one that says FILE is not.
+  ///
+  /// Revert witness: judge a classless record as a directory and the first
+  /// assertion finds nothing delivered.
+  #[test]
+  fn a_classless_record_is_never_pruned_by_its_own_name() {
+    use crate::os::windows::{RawWindowsEvent, RdcwAction, RdcwEvent, RdcwName, RdcwRecord};
+
+    let record = |attributes: Option<u32>, name: &str| RdcwRecord {
+      action: RdcwAction::Added,
+      name: RdcwName::Utf8(vec![name.to_owned()]),
+      file_id: None,
+      parent_id: None,
+      attributes,
+      reparse_tag: None,
+    };
+    let feed = |core: &mut DriverCore, scope, records: Vec<RdcwRecord>, now| {
+      core.on_batch(
+        scope,
+        BatchPayload::detached(
+          records
+            .into_iter()
+            .map(|record| SourceEvent::Windows(RawWindowsEvent::Rdcw(RdcwEvent::Single(record))))
+            .collect(),
+        ),
+        now,
+      );
+    };
+
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = core
+      .on_watch_with(PathBuf::from("/r"), &pruning(&["cache"]), BackendKind::Rdcw)
+      .expect("a fresh scope registers");
+    let _ = drain(&mut core);
+    core.on_stream_spawned(
+      scope,
+      Ok(RootMeta {
+        root: PathBuf::from("/r"),
+        root_dev: 1,
+        root_mnt_id: None,
+        mounts: Vec::new(),
+        identity: crate::os::RootIdentity::new(1, 1),
+        ancestors: Vec::new(),
+        backend: BackendKind::Rdcw,
+      }),
+    );
+    let _ = drain(&mut core);
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(0));
+    let _ = drain(&mut core);
+
+    feed(&mut core, scope, vec![record(None, "cache")], at(1));
+    let changes = drain(&mut core);
+    let changes = emits(&changes);
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.location() == &loc(&["cache"])),
+      "a basic record proves no directory, so the seat does not speak for it: \
+       {changes:?}"
+    );
+
+    // `FILE_ATTRIBUTE_DIRECTORY` is the proof the seat wants, and its absence on
+    // an EXTENDED record is a proof of the other thing.
+    feed(&mut core, scope, vec![record(Some(0x10), "cache")], at(2));
+    let changes = drain(&mut core);
+    assert!(
+      emits(&changes).is_empty(),
+      "a proven directory on a pruned name is still fenced: {changes:?}"
+    );
+    feed(&mut core, scope, vec![record(Some(0x20), "cache")], at(3));
+    let changes = drain(&mut core);
+    let changes = emits(&changes);
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.location() == &loc(&["cache"])),
+      "and a proven FILE was never the seat's business: {changes:?}"
+    );
+  }
+
+  /// The destination cover a geometry-less profile owes is born AFTER its
+  /// record's verdict, and it names ground that verdict never judged — so it goes
+  /// through the fence like everything else bound for the Monitor.
+  ///
+  /// The shape is exactly the one the record fence cannot see. RDCW's basic
+  /// records carry no class, so a directory rename `/r/src -> /r/cache` under
+  /// `prune = ["cache"]` keeps BOTH halves — an unproven class is judged on its
+  /// ancestors alone — and the cover then aims a `Rescan` at `cache`, the one
+  /// subtree the caller closed. A consumer told to enumerate ground whose every
+  /// later change is silent is worse off than one told nothing.
+  ///
+  /// Widened rather than dropped, for the reason every located over-signal is:
+  /// the recovery survives at the nearest unpruned parent, which here is the root
+  /// itself.
+  ///
+  /// Revert witness: accept `revealed()` unjudged and the first assertion finds a
+  /// `Rescan` naming `cache`.
+  #[test]
+  fn a_late_destination_cover_is_judged_by_the_seat() {
+    use crate::os::windows::{RawWindowsEvent, RdcwAction, RdcwEvent, RdcwName, RdcwRecord};
+
+    let record = |action, name: &str| RdcwRecord {
+      action,
+      name: RdcwName::Utf8(vec![name.to_owned()]),
+      file_id: None,
+      parent_id: None,
+      attributes: None,
+      reparse_tag: None,
+    };
+    let rename = |core: &mut DriverCore, scope, from: &str, to: &str, now| {
+      core.on_batch(
+        scope,
+        BatchPayload::detached(vec![SourceEvent::Windows(RawWindowsEvent::Rdcw(
+          RdcwEvent::Renamed {
+            old: record(RdcwAction::RenamedOld, from),
+            new: record(RdcwAction::RenamedNew, to),
+          },
+        ))]),
+        now,
+      );
+    };
+
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = core
+      .on_watch_with(PathBuf::from("/r"), &pruning(&["cache"]), BackendKind::Rdcw)
+      .expect("a fresh scope registers");
+    let _ = drain(&mut core);
+    core.on_stream_spawned(
+      scope,
+      Ok(RootMeta {
+        root: PathBuf::from("/r"),
+        root_dev: 1,
+        root_mnt_id: None,
+        mounts: Vec::new(),
+        identity: crate::os::RootIdentity::new(1, 1),
+        ancestors: Vec::new(),
+        backend: BackendKind::Rdcw,
+      }),
+    );
+    let _ = drain(&mut core);
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(0));
+    let _ = drain(&mut core);
+
+    rename(&mut core, scope, "src", "cache", at(1));
+    let changes = drain(&mut core);
+    let changes = emits(&changes);
+    assert!(
+      !changes
+        .iter()
+        .any(|change| change.kind().is_rescan() && change.location() == &loc(&["cache"])),
+      "no recovery instruction names the subtree the caller closed: {changes:?}"
+    );
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.kind().is_rescan() && change.location() == &loc(&[])),
+      "the cover survives at the nearest unpruned parent — the root: {changes:?}"
+    );
+
+    // Non-vacuity: an UNPRUNED destination still gets its located cover, at the
+    // destination itself. Nothing about the cover changed except where the seat
+    // speaks.
+    rename(&mut core, scope, "other", "build", at(2));
+    let changes = drain(&mut core);
+    let changes = emits(&changes);
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.kind().is_rescan() && change.location() == &loc(&["build"])),
+      "an unpruned rename still reveals its destination: {changes:?}"
+    );
+  }
+
+  /// The exemption is the ARTIFACT's, not the whole subtree's. This driver writes
+  /// exactly two things under a reserved name — the directory itself and the
+  /// marker standing directly in it — so anything DEEPER is somebody else's, and
+  /// a free pass would arm and deliver ground the caller closed under a name it
+  /// never chose (a foreign platform's like-named user directory, or a peer's
+  /// stray file).
+  ///
+  /// Judged on the kernel-recursive profile, which is the only one that can
+  /// report from inside a subtree the descending profile never armed.
+  ///
+  /// Revert witness: exempt the whole subtree and `cache/deep.tmp` under the
+  /// reserved name is delivered.
+  #[test]
+  fn a_deep_descendant_of_the_cookie_directory_is_pruned_normally() {
+    const COOKIE_DIR: &str = ".tributaries-sync-cookies-0";
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_fsevents(&mut core, &pruning(&["**/cache"]));
+
+    core.on_batch_events(
+      scope,
+      vec![
+        // The marker itself: the barrier's own event, exempt whatever the seat
+        // says — and the reason the exemption exists at all.
+        ev(
+          &format!("/r/{COOKIE_DIR}/.tributaries-sync-1"),
+          flags(&[FsEventFlags::ITEM_CREATED, FsEventFlags::ITEM_IS_FILE]),
+          1,
+          10,
+        ),
+        // Two levels down, under a pruned ancestor of its own: nothing this
+        // driver ever wrote, so nothing the seat may not speak for.
+        ev(
+          &format!("/r/{COOKIE_DIR}/cache/deep.tmp"),
+          flags(&[FsEventFlags::ITEM_CREATED, FsEventFlags::ITEM_IS_FILE]),
+          2,
+          11,
+        ),
+      ],
+      at(1),
+    );
+    let changes = drain(&mut core);
+    let changes = emits(&changes);
+
+    assert_eq!(
+      changes
+        .iter()
+        .map(|change| change.location().clone())
+        .collect::<Vec<_>>(),
+      vec![loc(&[COOKIE_DIR, ".tributaries-sync-1"])],
+      "the marker passes and the deep descendant is fenced by its own ancestor: \
+       {changes:?}"
+    );
+  }
+
+  /// A located over-signal is a RECOVERY instruction, and the seat may not take
+  /// one away without leaving something in its place. A signal whose own LEAF a
+  /// word covers is re-aimed one level up — a `Rescan` that covers the pruned
+  /// leaf's recovery while naming only ground the caller still hears about —
+  /// while a signal under a pruned ANCESTOR has no such parent and is dropped.
+  ///
+  /// The producer here is FSEvents' flagless word, which lowers to a located
+  /// rescan at the object itself; a USN `HARD_LINK_CHANGE` on a regular file
+  /// lowers to the same shape.
+  ///
+  /// Revert witness: judge the over on its own leaf and `sub`'s cover disappears
+  /// with `sub/a.tmp`.
+  #[test]
+  fn a_located_over_at_a_pruned_leaf_widens_to_its_parent() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_fsevents(&mut core, &pruning(&["**/*.tmp", "**/node_modules"]));
+
+    core.on_batch_events(
+      scope,
+      vec![
+        // The leaf alone matches: widened to `sub`.
+        ev("/r/sub/a.tmp", FsEventFlags::new(0), 1, 0),
+        // A pruned ANCESTOR: there is no unpruned parent inside the ground the
+        // caller closed, so this one goes.
+        ev("/r/node_modules/deep", FsEventFlags::new(0), 2, 0),
+      ],
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.kind().is_rescan() && change.location() == &loc(&["sub"])),
+      "the recovery survives its own leaf, at the nearest unpruned parent: \
+       {changes:?}"
+    );
+    assert!(
+      !changes
+        .iter()
+        .any(|change| change.location() == &loc(&["sub", "a.tmp"])),
+      "and no rescan names the pruned leaf itself: {changes:?}"
+    );
+    assert!(
+      !mentions(&changes, "node_modules"),
+      "a signal under a pruned ancestor is dropped whole: {changes:?}"
+    );
+  }
+
+  /// The widen at the shallowest depth it can happen at: a leaf directly under
+  /// the watch has no descent segment to climb, so the honest degrade is the
+  /// scope-wide cover — never a quiet drop, and still never a path.
+  #[test]
+  fn a_pruned_leaf_at_the_watch_widens_to_the_scope_cover() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_fsevents(&mut core, &pruning(&["**/*.tmp"]));
+
+    core.on_batch_events(
+      scope,
+      vec![ev("/r/a.tmp", FsEventFlags::new(0), 1, 0)],
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.kind().is_rescan() && change.location().is_empty()),
+      "the cover climbs to the watch itself: {changes:?}"
+    );
+    assert!(
+      !mentions(&changes, "a.tmp"),
+      "and still names nothing the caller pruned: {changes:?}"
+    );
+  }
+
+  /// The class a rename's records carry reaches the fence, and decides the pair.
+  /// `FAN_ONDIR` is set exactly when the renamed object is a directory, so a
+  /// pruned-name FILE rename delivers both halves while the same rename PROVEN
+  /// as a directory has its pruned end fenced.
+  ///
+  /// Revert witness: leave both halves unstamped and the file pair vanishes with
+  /// no `Rescan` — a ghost at `cache1` and silence at `cache2`.
+  #[test]
+  fn a_fanotify_file_rename_on_a_pruned_name_delivers_both_halves() {
+    use crate::os::linux::{
+      RawLinuxEvent,
+      fanotify::{
+        AdmittedEvent, AdmittedRename,
+        fid::{FAN_ONDIR, FAN_RENAME, FanMask},
+      },
+    };
+
+    let rename = |mask: u64, old: &str, new: &str| {
+      RawLinuxEvent::Fanotify(AdmittedEvent {
+        mask: FanMask::new(mask),
+        path: None,
+        rename: Some(AdmittedRename {
+          old_path: PathBuf::from(old),
+          new_path: PathBuf::from(new),
+        }),
+      })
+    };
+    let feed = |core: &mut DriverCore, scope, events: Vec<RawLinuxEvent>, now| {
+      let events = events.into_iter().map(SourceEvent::Linux).collect();
+      core.on_batch(scope, BatchPayload::detached(events), now);
+    };
+
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = core
+      .on_watch_with(
+        PathBuf::from("/r"),
+        &pruning(&["cache*"]),
+        BackendKind::Fanotify,
+      )
+      .expect("a fresh scope registers");
+    let _ = drain(&mut core);
+    core.on_stream_spawned(
+      scope,
+      Ok(RootMeta {
+        root: PathBuf::from("/r"),
+        root_dev: 1,
+        root_mnt_id: None,
+        mounts: Vec::new(),
+        identity: crate::os::RootIdentity::new(1, 1),
+        ancestors: Vec::new(),
+        backend: BackendKind::Fanotify,
+      }),
+    );
+    let _ = drain(&mut core);
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(0));
+    let _ = drain(&mut core);
+
+    feed(
+      &mut core,
+      scope,
+      vec![rename(FAN_RENAME, "/r/cache1", "/r/cache2")],
+      at(1),
+    );
+    let changes = drain(&mut core);
+    let changes = emits(&changes);
+    assert!(
+      changes.iter().any(|change| change.kind().is_moved()
+        && change.location() == &loc(&["cache2"])
+        && change.kind().moved_from() == Some(&loc(&["cache1"]))),
+      "a directory-only word never spoke for a file, and the pair says which it \
+       was: {changes:?}"
+    );
+
+    // The same rename PROVEN as a directory: now the word does speak for it, and
+    // the pruned destination is fenced.
+    feed(
+      &mut core,
+      scope,
+      vec![rename(FAN_RENAME | FAN_ONDIR, "/r/src", "/r/cache3")],
+      at(2),
+    );
+    let changes = drain(&mut core);
+    let changes = emits(&changes);
+    assert!(
+      !mentions(&changes, "cache3"),
+      "the proven directory's pruned end is fenced: {changes:?}"
     );
   }
 }
@@ -16629,6 +17621,312 @@ mod include {
       located(&changes),
       vec![loc(&["notes.txt"]), loc(&["clip.mp4"]), loc(&["clips"])],
       "every change reaches the consumer: {changes:?}"
+    );
+  }
+
+  /// The watcher's OWN sync cookie is admitted whatever the seat says. The
+  /// marker is a proven FILE with a name no caller's pattern will ever describe,
+  /// and it is the file a `sync` barrier waits on: a seat that dropped it would
+  /// turn every restricted-include sync into a timeout — the caller parked on an
+  /// event its own media pattern had silenced.
+  ///
+  /// The exemption is the reserved NAME's, at the first segment: the cookie
+  /// directory's own record and everything inside it.
+  ///
+  /// Revert witness: drop the cookie clause from `admits` and the marker's
+  /// `Created` never leaves the core.
+  #[test]
+  fn the_sync_cookie_is_admitted_by_a_restrictive_seat() {
+    const COOKIE_DIR: &str = ".tributaries-sync-cookies-0";
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_fsevents(&mut core, &including(&["**/*.mp4"]));
+
+    core.on_batch_events(
+      scope,
+      vec![
+        ev(
+          &format!("/r/{COOKIE_DIR}/.tributaries-sync-1"),
+          flags(&[FsEventFlags::ITEM_CREATED, FsEventFlags::ITEM_IS_FILE]),
+          1,
+          10,
+        ),
+        // The depth a sync actually stands at: the cookie directory is minted
+        // under the SUBSCRIPTION's directory, which need not be the root.
+        ev(
+          &format!("/r/sub/{COOKIE_DIR}/.tributaries-sync-2"),
+          flags(&[FsEventFlags::ITEM_CREATED, FsEventFlags::ITEM_IS_FILE]),
+          2,
+          11,
+        ),
+        ev(
+          "/r/notes.txt",
+          flags(&[FsEventFlags::ITEM_CREATED, FsEventFlags::ITEM_IS_FILE]),
+          3,
+          12,
+        ),
+      ],
+      at(1),
+    );
+    let changes = drain(&mut core);
+    let changes = emits(&changes);
+
+    assert_eq!(
+      located(&changes),
+      vec![
+        loc(&[COOKIE_DIR, ".tributaries-sync-1"]),
+        loc(&["sub", COOKIE_DIR, ".tributaries-sync-2"]),
+      ],
+      "the barrier's own markers deliver, at either depth, and the caller's \
+       unmatched file does not: {changes:?}"
+    );
+
+    // Non-vacuity in the other direction: a name that merely BEGINS with the
+    // reserved stem is a user directory, and its contents obey the seat.
+    core.on_batch_events(
+      scope,
+      vec![ev(
+        "/r/.tributaries-sync-cookies-mine/notes.txt",
+        flags(&[FsEventFlags::ITEM_CREATED, FsEventFlags::ITEM_IS_FILE]),
+        4,
+        13,
+      )],
+      at(2),
+    );
+    let changes = drain(&mut core);
+    let changes = emits(&changes);
+    assert!(
+      changes.is_empty(),
+      "a user directory sharing the stem is a user directory: {changes:?}"
+    );
+  }
+
+  /// The include seat's cookie exemption is the ARTIFACT's, exactly as the prune
+  /// seat's is: the reserved directory and the marker standing DIRECTLY in it,
+  /// and nothing deeper. A file two levels down under a reserved name is not this
+  /// driver's — a peer's stray, or a foreign platform's like-named user directory
+  /// — and a seat that admitted it would deliver a caller's own unmatched files
+  /// through a name the caller never chose.
+  ///
+  /// Revert witness: exempt any segment and `deep/unmatched.tmp` is delivered
+  /// through a seat that names only `**/*.mp4`.
+  #[test]
+  fn a_deep_descendant_of_the_cookie_directory_obeys_the_include_seat() {
+    const COOKIE_DIR: &str = ".tributaries-sync-cookies-0";
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_fsevents(&mut core, &including(&["**/*.mp4"]));
+
+    core.on_batch_events(
+      scope,
+      vec![
+        ev(
+          &format!("/r/{COOKIE_DIR}/.tributaries-sync-1"),
+          flags(&[FsEventFlags::ITEM_CREATED, FsEventFlags::ITEM_IS_FILE]),
+          1,
+          10,
+        ),
+        ev(
+          &format!("/r/{COOKIE_DIR}/deep/unmatched.tmp"),
+          flags(&[FsEventFlags::ITEM_CREATED, FsEventFlags::ITEM_IS_FILE]),
+          2,
+          11,
+        ),
+        ev(
+          &format!("/r/{COOKIE_DIR}/deep/clip.mp4"),
+          flags(&[FsEventFlags::ITEM_CREATED, FsEventFlags::ITEM_IS_FILE]),
+          3,
+          12,
+        ),
+      ],
+      at(1),
+    );
+    let changes = drain(&mut core);
+    let changes = emits(&changes);
+
+    assert_eq!(
+      located(&changes),
+      vec![
+        loc(&[COOKIE_DIR, ".tributaries-sync-1"]),
+        loc(&[COOKIE_DIR, "deep", "clip.mp4"]),
+      ],
+      "the marker passes on the exemption and the deep file only on the pattern: \
+       {changes:?}"
+    );
+  }
+
+  /// A directory across the scope's MOUNT boundary is a directory. The listing
+  /// refuses to descend into it — the mount boundary is the scope boundary — but
+  /// the refusal is stated as a descent boundary, not by reporting the object as
+  /// something it is not, so the class that reaches the consumer is `Some(true)`
+  /// and no file seat may speak for it.
+  ///
+  /// The EMPTY seat is the sharpest witness: it admits no file whatsoever, so a
+  /// directory that survives it survived AS a directory.
+  ///
+  /// Coverage is asserted alongside, because the boundary itself must still hold:
+  /// the entry is announced and never armed, exactly as before.
+  ///
+  /// Read at a directory armed AFTER the root's own crawl, because that crawl is
+  /// discovery of a tree that was already there and announces nothing.
+  ///
+  /// Revert witness: lower a cross-mount directory to `FileKind::Other` again and
+  /// its `Created` is dropped by the seat, silently.
+  #[test]
+  fn a_cross_mount_directory_is_delivered_as_the_directory_it_is() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let (scope, root) = live_descending(&mut core, &including(&[]));
+
+    // A directory created live arms and cold-reads, and THAT read announces.
+    core.on_inotify_events(
+      scope,
+      vec![inotify(root, IN_CREATE | IN_ISDIR, 0, Some("sub"))],
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let sub = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch { watch, path, .. } if path.as_path() == Path::new("/r/sub") => {
+          Some(*watch)
+        }
+        _ => None,
+      })
+      .unwrap_or_else(|| panic!("the new directory arms: {effects:?}"));
+    core.on_watch_installed(sub, core.arm_attempt(sub), WatchOutcome::Installed(2));
+    let sub_req = drain(&mut core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, path, .. } if path.as_path() == Path::new("/r/sub") => Some(*req),
+        _ => None,
+      })
+      .unwrap_or_else(|| panic!("the armed directory cold-enumerates"));
+
+    // `mnt` sits on another device, so the read must not descend it; `here` is an
+    // ordinary directory on the root's own device, and `notes.txt` a plain file.
+    let entry = |name: &str, kind: FileKind, dev: u64, ino: u64| RawDirEntry {
+      name: name.as_bytes().to_vec(),
+      kind,
+      dev,
+      ino,
+      mnt_id: None,
+    };
+    core.on_enumerated(
+      sub_req,
+      RawEnumerate::Listed {
+        entries: vec![
+          entry("mnt", FileKind::Dir, 2, 20),
+          entry("here", FileKind::Dir, 1, 21),
+          entry("notes.txt", FileKind::File, 1, 22),
+        ],
+        complete: true,
+      },
+    );
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+
+    assert_eq!(
+      located(&changes),
+      vec![loc(&["sub", "mnt"]), loc(&["sub", "here"])],
+      "both directories are announced past a seat that admits no file, and the \
+       file is the one it silences: {changes:?}"
+    );
+    assert_eq!(
+      changes[0].is_dir(),
+      Some(true),
+      "the boundary directory carries the class it has, which is what carried \
+       it past the seat"
+    );
+
+    assert!(
+      !core.covered_paths().contains(&PathBuf::from("/r/sub/mnt")),
+      "the boundary still holds: the far-side directory is never armed: {:?}",
+      core.covered_paths()
+    );
+    assert!(
+      core.covered_paths().contains(&PathBuf::from("/r/sub/here")),
+      "non-vacuity: the near-side one is: {:?}",
+      core.covered_paths()
+    );
+    assert!(
+      !effects.iter().any(|e| matches!(
+        e,
+        Effect::Enumerate { path, .. } if path.as_path() == Path::new("/r/sub/mnt")
+      )),
+      "and never read: {effects:?}"
+    );
+  }
+
+  /// A COLD LISTING's unclassified entry is unproven, not proven-not — and that
+  /// is what carries its `Created` past a restrictive seat.
+  ///
+  /// The entry is retained as an unsettled occupant and may still stat as a
+  /// directory; announcing it as a proven non-directory hands this seat a licence
+  /// to drop the only announcement that directory will ever get, after which
+  /// coverage installs beneath it and its children arrive with no parent creation
+  /// and no `Rescan` behind them. The class the Monitor stamps is three-valued
+  /// for exactly this reason, and the seat's unproven clause then fails open on
+  /// it.
+  ///
+  /// Revert witness: stamp an unclassified listing entry `Some(false)` and
+  /// `mystery` is dropped by a seat that names only `**/*.mp4`.
+  #[test]
+  fn an_unclassified_listing_entry_survives_a_restrictive_seat() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let (scope, root) = live_descending(&mut core, &including(&["**/*.mp4"]));
+
+    core.on_inotify_events(
+      scope,
+      vec![inotify(root, IN_CREATE | IN_ISDIR, 0, Some("sub"))],
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let sub = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch { watch, path, .. } if path.as_path() == Path::new("/r/sub") => {
+          Some(*watch)
+        }
+        _ => None,
+      })
+      .unwrap_or_else(|| panic!("the new directory arms: {effects:?}"));
+    core.on_watch_installed(sub, core.arm_attempt(sub), WatchOutcome::Installed(2));
+    let sub_req = drain(&mut core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, path, .. } if path.as_path() == Path::new("/r/sub") => Some(*req),
+        _ => None,
+      })
+      .unwrap_or_else(|| panic!("the armed directory cold-enumerates"));
+
+    let entry = |name: &str, kind: FileKind, ino: u64| RawDirEntry {
+      name: name.as_bytes().to_vec(),
+      kind,
+      dev: 1,
+      ino,
+      mnt_id: None,
+    };
+    core.on_enumerated(
+      sub_req,
+      RawEnumerate::Listed {
+        entries: vec![
+          entry("mystery", FileKind::Unknown, 30),
+          entry("notes.txt", FileKind::File, 31),
+        ],
+        complete: true,
+      },
+    );
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+
+    assert_eq!(
+      located(&changes),
+      vec![loc(&["sub", "mystery"])],
+      "the unproven entry survives and the proven file the seat does not name \
+       does not: {changes:?}"
+    );
+    assert_eq!(
+      changes[0].is_dir(),
+      None,
+      "and it reaches the consumer as unproven, which is what carried it"
     );
   }
 

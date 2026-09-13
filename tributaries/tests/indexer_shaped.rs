@@ -575,7 +575,8 @@ fn rig(prefix: &str, volume: u64, options: TributariesOptions) -> Rig {
   let watcher = Watcher::<TokioRuntime>::new(WatcherOptions::new()).expect("build watcher");
   let volume_key = std::vec![Comp::Volume(volume)];
   let source = IndexerSource::new(watcher, std::vec![(volume_key.clone(), root.clone())]);
-  let w: Indexer = Tributaries::with_source(source, options);
+  let w: Indexer =
+    Tributaries::with_source(source, options).expect("the default capacities are in range");
   Rig {
     _dir: dir,
     root,

@@ -134,9 +134,10 @@ enum WalkStall {
 /// verify mismatch is a [`WalkStall::Vanished`]. The tree mutating under
 /// the walk restarts the whole attempt — no local repair is complete.
 ///
-/// `fence` is the caller's exclusions: an excluded directory is never learned
-/// and never descended, so a preexisting excluded subtree consumes none of the
-/// directory cap — the same guarantee the live stream's fence gives.
+/// `fence` is the reported tree's boundary — the caller's exclusions and the
+/// root's own prune seat: a fenced directory is never learned and never
+/// descended, so a preexisting fenced subtree consumes none of the directory cap
+/// — the same guarantee the live stream's fence gives.
 fn seed_walk(
   canonical: &Path,
   root_identity: ffi::HandleIdentity,
@@ -216,11 +217,14 @@ fn walk_under(
           return Err(WalkStall::Broken);
         };
         let child_path = dir_path.join(&name);
-        // THE EXCLUSION FENCE, ahead of the learn AND of the per-child open:
-        // an excluded directory is not in the reported tree, so it costs no
-        // map entry, no handle and no descent, and the churn inside it can
-        // never consume the cap the rest of the tree competes for.
-        if fence.excludes_path(&child_path) {
+        // THE FENCE — both seats — ahead of the learn AND of the per-child open:
+        // an excluded or pruned directory is not in the reported tree, so it
+        // costs no map entry, no handle and no descent, and the churn inside it
+        // can never consume the cap the rest of the tree competes for. The child
+        // is a DIRECTORY here by construction (the non-directory entries were
+        // skipped above), so the prune half is asked on its own name as well as
+        // its ancestors'.
+        if fence.fences_path(true, &child_path) {
           continue;
         }
         match map.learn(child.frn, dir_frn, name.clone()) {
@@ -300,7 +304,7 @@ struct JournalIo {
   root_identity: ffi::HandleIdentity,
   /// The configured directory cap, preserved across reseeds.
   max_directories: Option<usize>,
-  /// The caller's exclusions, resolved against the root — consulted by every
+  /// The reported tree's boundary, resolved against the root — consulted by every
   /// walk this pump runs (the reseed's fresh one and every moved-in subtree),
   /// exactly as the admission consults its own copy on the live stream.
   fence: UsnFence,
@@ -373,7 +377,11 @@ pub(super) fn spawn(
   // identity, because this is the point where the retirement is granted or
   // withheld and the only point that can see the volume at all.
   let renames = rename_semantics_of(root_handle);
-  let fence = UsnFence::new(canonical.clone(), config.exclusions.clone());
+  let fence = UsnFence::new(
+    canonical.clone(),
+    config.exclusions.clone(),
+    config.prune.clone(),
+  );
   let map = seed_walk(&canonical, identity, config.max_map_directories, &fence)?;
 
   // The probe held: everything past here is a hard spawn outcome.

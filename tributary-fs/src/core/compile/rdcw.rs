@@ -151,9 +151,26 @@ impl DriverCore {
   }
 
   /// Plans a paired rename. Both names decodable → the fanotify
-  /// counter-cookie path, fed the absolute forms it lowers; an escalated end
-  /// covers its side with a located rescan instead (and the decodable end
-  /// still plans, so nothing under it is dropped).
+  /// counter-cookie path, fed the root-relative ends this lowering resolves;
+  /// an escalated end covers its side with a located rescan instead (and the
+  /// decodable end still plans, so nothing under it is dropped).
+  ///
+  /// # The class both halves carry
+  ///
+  /// One object is renamed, so ONE class describes both ends — but this backend
+  /// delivers the ends as two records, and extended records each carry their own
+  /// directory bit. [`agreed_class`] reads the two as one fact: a basic record
+  /// contributes nothing, a lone extended record speaks for the pair, and two
+  /// that agree stamp what they agree on. Dropping the class would put a
+  /// directory-only `prune` word in front of a FILE rename the pump paired
+  /// correctly, and take both halves with no `Rescan` behind them.
+  ///
+  /// Two records that CONTRADICT each other are a different thing. Nothing here
+  /// can decide which end told the truth, and either stamp is a guess that
+  /// decides whether the pair survives the fence — so the pair is admitted as a
+  /// covering rescan at the ends' COMMON PARENT instead: a directory by
+  /// construction, containing both names, asserting nothing about the object's
+  /// class at all.
   fn plan_rdcw_rename(
     &mut self,
     state: &ScopeState,
@@ -167,14 +184,13 @@ impl DriverCore {
       // cookie and emit the adjacent pair directly — the fanotify path's
       // (Target, Target) arm, without a lossy absolute-path round-trip
       // (host path separators must never decide a lowering).
-      let cookie = self.next_cookie();
-      let from_rec = OsRecord::new(state.watch, RecordKind::MovedFrom)
-        .with_target(from)
-        .with_cookie(cookie);
-      let to_rec = OsRecord::new(state.watch, RecordKind::MovedTo)
-        .with_target(to)
-        .with_cookie(cookie);
-      return vec![Planned::Rec(from_rec), Planned::Rec(to_rec)];
+      let Some(is_dir) = agreed_class(old.is_dir(), new.is_dir()) else {
+        return vec![Planned::Over(located(
+          state.watch,
+          Some(common_parent(&from, &to)),
+        ))];
+      };
+      return self.paired_rename(state, from, to, is_dir);
     }
     let (old_resolved, new_resolved) = (resolve(&old.name), resolve(&new.name));
     // At least one end escalated (or named the root — the seam surprise):
@@ -191,6 +207,43 @@ impl DriverCore {
     }
     planned
   }
+}
+
+/// The ONE class two halves of a rename carry, or [`None`] when they contradict
+/// each other.
+///
+/// A rename moves one object, so its two records describe one class. `Some(None)`
+/// — neither half proved anything — is a real answer and not a conflict: it is
+/// what a basic-record pair honestly knows, and it leaves the fence to judge the
+/// pair on its ancestors alone. A lone proof speaks for both halves for the same
+/// reason: there is only one object to speak about.
+///
+/// The refusal is reserved for two proofs that disagree, which no reading can
+/// reconcile and which the caller answers with a cover rather than a stamp.
+const fn agreed_class(old: Option<bool>, new: Option<bool>) -> Option<Option<bool>> {
+  match (old, new) {
+    (Some(old), Some(new)) if old != new => None,
+    (Some(class), _) | (_, Some(class)) => Some(Some(class)),
+    (None, None) => Some(None),
+  }
+}
+
+/// The deepest location containing BOTH ends of a rename — their longest common
+/// prefix.
+///
+/// A rename's two ends are distinct names, so their common prefix is a proper
+/// prefix of each: a real DIRECTORY holding both, which is what makes it safe to
+/// cover with a rescan that names no object whose class is in doubt. The empty
+/// location — two ends directly under the watch — is the watch's own directory,
+/// and the rescan covers it whole.
+fn common_parent(from: &Location, to: &Location) -> Location {
+  let shared = from
+    .segments()
+    .iter()
+    .zip(to.segments())
+    .take_while(|(from, to)| from == to)
+    .count();
+  Location::from_segments(from.segments()[..shared].iter().cloned())
 }
 
 /// Plans a single-object record proving `proven` at its resolved target — the

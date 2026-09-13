@@ -64,17 +64,103 @@ mod tests;
 /// ```text
 /// $ app --moved=false --removed=false
 /// ```
+///
+/// An UPDATE (`clap::FromArgMatches::update_from_arg_matches`) narrows only the
+/// bits the command line actually carried: updating an unrelated argument leaves
+/// the mask as it stood, `--moved=false` alone clears exactly `moved`, and a
+/// [`none`](Self::none) mask survives both — the flag defaults are what a PARSE
+/// falls back to, never something an update writes over a caller's own gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "clap", derive(clap::Args))]
 pub struct Interest {
-  #[cfg_attr(feature = "clap", arg(long, action = clap::ArgAction::Set, num_args = 0..=1, require_equals = true, default_missing_value = "true", default_value_t = true))]
   created: bool,
-  #[cfg_attr(feature = "clap", arg(long, action = clap::ArgAction::Set, num_args = 0..=1, require_equals = true, default_missing_value = "true", default_value_t = true))]
   modified: bool,
-  #[cfg_attr(feature = "clap", arg(long, action = clap::ArgAction::Set, num_args = 0..=1, require_equals = true, default_missing_value = "true", default_value_t = true))]
   removed: bool,
-  #[cfg_attr(feature = "clap", arg(long, action = clap::ArgAction::Set, num_args = 0..=1, require_equals = true, default_missing_value = "true", default_value_t = true))]
   moved: bool,
+}
+
+/// The `clap` face of [`Interest`]: the same four flags the mask derived before,
+/// kept in a proxy so the UPDATE can be written by hand. Every bit defaults to
+/// `true`, which is what makes a flagless parse [`Interest::all`] — and exactly
+/// what a derived update would write over an existing mask, since a defaulted
+/// argument is indistinguishable there from a given one.
+#[cfg(feature = "clap")]
+#[derive(Debug, Clone, clap::Args)]
+#[group(id = "Interest")]
+struct InterestArgs {
+  #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1, require_equals = true, default_missing_value = "true", default_value_t = true)]
+  created: bool,
+  #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1, require_equals = true, default_missing_value = "true", default_value_t = true)]
+  modified: bool,
+  #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1, require_equals = true, default_missing_value = "true", default_value_t = true)]
+  removed: bool,
+  #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1, require_equals = true, default_missing_value = "true", default_value_t = true)]
+  moved: bool,
+}
+
+#[cfg(feature = "clap")]
+impl Interest {
+  /// The flag names, in field order — the ONE list, so a bit added to the mask
+  /// cannot be forgotten by the update rule, nor by the arg group of a household
+  /// that flattens these flags (an outer group must name every nested id, or the
+  /// flag cannot make an optional household present).
+  pub(crate) const FLAGS: [&'static str; 4] = ["created", "modified", "removed", "moved"];
+}
+
+#[cfg(feature = "clap")]
+impl From<InterestArgs> for Interest {
+  fn from(args: InterestArgs) -> Self {
+    let InterestArgs {
+      created,
+      modified,
+      removed,
+      moved,
+    } = args;
+    Self {
+      created,
+      modified,
+      removed,
+      moved,
+    }
+  }
+}
+
+#[cfg(feature = "clap")]
+impl clap::FromArgMatches for Interest {
+  fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+    InterestArgs::from_arg_matches(matches).map(Into::into)
+  }
+
+  /// Sets each bit the COMMAND LINE actually spelled, and leaves every other one
+  /// as it stood — one list of flags, so a bit added to the mask cannot be
+  /// forgotten here.
+  fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+    for (flag, bit) in Self::FLAGS.into_iter().zip([
+      &mut self.created,
+      &mut self.modified,
+      &mut self.removed,
+      &mut self.moved,
+    ]) {
+      if let Some(given) = crate::options::command_line_value(matches, flag) {
+        *bit = given;
+      }
+    }
+    Ok(())
+  }
+}
+
+#[cfg(feature = "clap")]
+impl clap::Args for Interest {
+  fn group_id() -> Option<clap::Id> {
+    InterestArgs::group_id()
+  }
+
+  fn augment_args(cmd: clap::Command) -> clap::Command {
+    InterestArgs::augment_args(cmd)
+  }
+
+  fn augment_args_for_update(cmd: clap::Command) -> clap::Command {
+    InterestArgs::augment_args_for_update(cmd)
+  }
 }
 
 /// The kind names the `serde` face spells an [`Interest`] with, in emission order —

@@ -477,6 +477,65 @@ mod clap_face {
       );
     }
   }
+
+  /// An UPDATE applies what the COMMAND LINE carried, and nothing else.
+  ///
+  /// Every knob here but `--exclusions` has a flag default, and a derived update
+  /// cannot tell a default from a value someone gave — so one `--latency` used to
+  /// reset the backend selection, the native buffer size, both capacities, the
+  /// liveness interval and the map cap to what a flagless command line means,
+  /// silently discarding whatever a configuration layer had loaded.
+  #[test]
+  fn an_update_changes_only_the_knobs_the_command_line_carried() {
+    use clap::{CommandFactory as _, FromArgMatches as _};
+
+    fn matches(args: &[&str]) -> clap::ArgMatches {
+      Cli::command_for_update().get_matches_from(std::iter::once("app").chain(args.iter().copied()))
+    }
+
+    let configured = WatcherOptions::new()
+      .with_backend(Backend::Inotify)
+      .with_event_capacity(NonZeroUsize::new(4096).unwrap())
+      .with_os_batch_capacity(NonZeroUsize::new(16).unwrap())
+      .with_os_buffer_bytes(NonZeroU32::new(128 * 1024).unwrap())
+      .with_move_window(Duration::from_millis(750))
+      .with_root_liveness_interval(Duration::from_secs(90))
+      .with_max_map_directories(Some(250_000))
+      .with_exclusions(std::vec![PathBuf::from("/repo/target")]);
+
+    let mut options = configured.clone();
+    options
+      .update_from_arg_matches(&matches(&["--latency", "25ms"]))
+      .expect("the update applies");
+    assert_eq!(
+      options,
+      configured.clone().with_latency(Duration::from_millis(25)),
+      "the named knob moves and every other one stands"
+    );
+
+    // An update naming nothing of this group changes nothing at all.
+    let mut options = configured.clone();
+    options
+      .update_from_arg_matches(&matches(&[]))
+      .expect("the update applies");
+    assert_eq!(options, configured);
+
+    // The repeatable seat REPLACES the list it updates, and only when it is named.
+    let mut options = configured.clone();
+    options
+      .update_from_arg_matches(&matches(&["--exclusions", "/a", "--exclusions", "/b"]))
+      .expect("the update applies");
+    assert_eq!(
+      options.exclusions_slice(),
+      [PathBuf::from("/a"), PathBuf::from("/b")],
+      "a named list is the whole list — there is no spelling for appending one path"
+    );
+    assert_eq!(
+      options.backend(),
+      Backend::Inotify,
+      "and it carries nothing else with it"
+    );
+  }
 }
 
 /// The per-ROOT household: its defaults, its builders and its two faces.
@@ -550,6 +609,50 @@ mod root_options {
     assert_eq!(cleared, RootOptions::new());
   }
 
+  /// Each pattern is bounded on its own; this is the bound on the SET, and it is
+  /// what keeps the fence's worst case a number. A set the matcher refuses to
+  /// union degrades to asking every pattern in turn, and the prune fence asks a
+  /// set once per directory prefix of every event — so an unbounded list buys
+  /// `patterns × depth` automaton passes per event, decided by a document rather
+  /// than by this crate.
+  ///
+  /// Both seats, both sides of the boundary, and the refusal names how many were
+  /// supplied so a person can act on it.
+  #[test]
+  fn a_seat_past_the_pattern_cap_is_a_typed_refusal() {
+    let many = |count: usize| {
+      (0..count)
+        .map(|n| glob(&std::format!("**/w{n}")))
+        .collect::<std::vec::Vec<_>>()
+    };
+    let cap = RootOptions::MAX_SEAT_PATTERNS;
+
+    assert!(
+      RootOptions::new().with_prune(many(cap)).validate().is_ok(),
+      "the ceiling itself is honoured"
+    );
+    assert_eq!(
+      RootOptions::new().with_prune(many(cap + 1)).validate(),
+      Err(OptionsError::TooManyPrunePatterns { supplied: cap + 1 }),
+      "and one past it is refused, naming what was supplied"
+    );
+    assert_eq!(
+      RootOptions::new().with_include(many(cap + 1)).validate(),
+      Err(OptionsError::TooManyIncludePatterns { supplied: cap + 1 }),
+      "the include seat carries the same ceiling"
+    );
+    assert!(
+      RootOptions::new()
+        .with_prune(many(cap + 1))
+        .validate()
+        .is_err_and(|err| err.is_too_many_prune_patterns()),
+      "and the refusal is readable without a match"
+    );
+
+    // The default household is nowhere near any of this.
+    assert!(RootOptions::new().validate().is_ok());
+  }
+
   /// The `serde` face: one object keyed by the field names, the seats lists of
   /// plain strings, every key optional.
   #[cfg(feature = "serde")]
@@ -589,6 +692,67 @@ mod root_options {
         serde_json::from_str(r#"{"prune": ["**/Caches"], "include": ["**/*.mkv"]}"#).unwrap();
       assert_eq!(patterns(parsed.prune()), ["**/Caches"]);
       assert_eq!(parsed.include().map(patterns), Some(std::vec!["**/*.mkv"]));
+    }
+
+    /// A seat past the ceiling is a DOCUMENT error, refused mid-list rather than
+    /// collected whole and measured afterwards.
+    ///
+    /// The bound is a resource bound, so a face that reads an untrusted length to
+    /// the end before judging it has already paid what the bound exists to
+    /// refuse: every pattern in the list compiles an automaton on the way in. The
+    /// element that would take the seat past the ceiling is where the read stops.
+    ///
+    /// Revert witness: derive the two fields plainly and a 257-entry document
+    /// parses into a household `validate` then has to catch — after compiling
+    /// every one of them.
+    #[test]
+    fn a_document_past_the_pattern_ceiling_is_refused() {
+      let cap = RootOptions::MAX_SEAT_PATTERNS;
+      let list = |count: usize| {
+        (0..count)
+          .map(|n| std::format!("\"**/w{n}\""))
+          .collect::<std::vec::Vec<_>>()
+          .join(",")
+      };
+
+      let full: RootOptions =
+        serde_json::from_str(&std::format!(r#"{{"prune": [{}]}}"#, list(cap)))
+          .expect("the ceiling itself is honoured");
+      assert_eq!(full.prune().len(), cap);
+
+      let err =
+        serde_json::from_str::<RootOptions>(&std::format!(r#"{{"prune": [{}]}}"#, list(cap + 1)))
+          .expect_err("one past it is a document error");
+      assert!(
+        err.to_string().contains(&std::format!("{cap}")),
+        "the refusal names the ceiling: {err}"
+      );
+
+      let err =
+        serde_json::from_str::<RootOptions>(&std::format!(r#"{{"include": [{}]}}"#, list(cap + 1)))
+          .expect_err("the include seat carries the same ceiling");
+      assert!(err.to_string().contains(&std::format!("{cap}")), "{err}");
+
+      // The seat's other two shapes are untouched: absent is the absent seat,
+      // and an explicit empty list is the engaged one that admits nothing.
+      assert_eq!(
+        serde_json::from_str::<RootOptions>(r#"{}"#)
+          .expect("an empty document parses")
+          .include(),
+        None
+      );
+      assert_eq!(
+        serde_json::from_str::<RootOptions>(r#"{"include": []}"#)
+          .expect("an empty seat parses")
+          .include(),
+        Some(&[][..])
+      );
+      assert_eq!(
+        serde_json::from_str::<RootOptions>(r#"{"include": null}"#)
+          .expect("an explicit null parses")
+          .include(),
+        None
+      );
     }
 
     /// A document naming ONE key leaves every other knob at the value `new()`
@@ -670,15 +834,58 @@ mod root_options {
       );
     }
 
-    /// The flattened `Interest` flags default to the EMPTY mask, exactly as they
-    /// do everywhere `Interest` is flattened: a bare flag SETS a bit, so a
-    /// flagless command line subscribes to nothing rather than to `Interest::all`.
+    /// A FLAGLESS command line is the default household — the same value
+    /// `RootOptions::new()` and an absent serde document hand back.
+    ///
+    /// The standalone `Interest` group's clap face reads a flagless parse as the
+    /// EMPTY mask, and flattening it here made `--prune '**/x'` alone build a root
+    /// subscribed to nothing: no creates, no modifications, no removals, no moves,
+    /// only the unmaskable `Rescan`s — while every other face of the same household
+    /// meant every kind. The proxy reinterprets only the flagless case.
+    ///
+    /// Revert witness: flatten the protocol `Interest` group back into
+    /// `RootOptions` and the first row parses to `Interest::new()`.
     #[test]
-    fn the_flattened_interest_flags_default_empty() {
-      assert_eq!(parse(&[]).interest(), Interest::new());
+    fn a_flagless_command_line_is_the_default_household() {
+      assert_eq!(parse(&[]), RootOptions::new());
+      assert_eq!(parse(&[]).interest(), RootOptions::DEFAULT_INTEREST);
+      // A seat flag is not an interest flag: the household still defaults.
+      assert_eq!(
+        parse(&["--prune", "**/node_modules"]).interest(),
+        RootOptions::DEFAULT_INTEREST
+      );
+    }
+
+    /// ANY interest flag narrows to exactly the ones given — the opt-in act the
+    /// household's docs promise, with no bit riding along from the default.
+    #[test]
+    fn one_interest_flag_narrows_to_exactly_that_kind() {
+      assert_eq!(
+        parse(&["--created"]).interest(),
+        Interest::new().with_created()
+      );
       assert_eq!(
         parse(&["--created", "--moved"]).interest(),
         Interest::new().with_created().with_moved()
+      );
+      assert_eq!(parse(&["--ondir"]).interest(), Interest::new().with_ondir());
+    }
+
+    /// The standalone `Interest` group keeps ITS face: a flagless parse there is
+    /// still the empty mask, because there the flags are the whole value rather than
+    /// one field of a household with a deliver-everything default.
+    #[test]
+    fn the_standalone_interest_group_still_defaults_empty() {
+      #[derive(Debug, clap::Parser)]
+      struct Bare {
+        #[command(flatten)]
+        interest: Interest,
+      }
+
+      assert_eq!(
+        Bare::parse_from(["app"]).interest,
+        Interest::new(),
+        "flattening `Interest` on its own is untouched by the household's proxy"
       );
     }
 
@@ -691,6 +898,139 @@ mod root_options {
         err.render().to_string().contains("invalid glob"),
         "the type's own message reaches the command line: {}",
         err.render()
+      );
+    }
+
+    /// The household composes as an OPTIONAL flatten, which is the one shape that
+    /// needs a real arg group underneath it.
+    ///
+    /// clap decides `Some` from `None` by asking whether this household's
+    /// `ArgGroup` was matched, and it asks for the group's id while BUILDING the
+    /// command — panicking outright when there is none. Forwarding the proxy's own
+    /// derived group would not do either: clap's derive leaves that group empty for
+    /// any struct containing a nested flatten, and an empty group is never present,
+    /// so every flag would parse and then be discarded.
+    ///
+    /// Both halves are asserted: the household is `None` when the caller spelled
+    /// nothing of it, and `Some` — carrying the value — after ANY of its arguments,
+    /// the nested interest flags included.
+    ///
+    /// Revert witness: drop `group_id` and this cell panics before it parses a
+    /// single argument.
+    #[test]
+    fn an_optional_flatten_is_present_exactly_when_a_flag_was_given() {
+      #[derive(Debug, clap::Parser)]
+      struct Optional {
+        #[arg(long)]
+        unrelated: bool,
+        #[command(flatten)]
+        root: Option<RootOptions>,
+      }
+
+      let parse = |args: &[&str]| {
+        Optional::parse_from(std::iter::once("app").chain(args.iter().copied())).root
+      };
+
+      assert_eq!(parse(&[]), None, "nothing of the household was spelled");
+      assert_eq!(
+        parse(&["--unrelated"]),
+        None,
+        "and another argument entirely does not conjure one"
+      );
+
+      // A direct argument.
+      let pruned = parse(&["--prune", "**/node_modules"]).expect("a seat flag makes it present");
+      assert_eq!(patterns(pruned.prune()), ["**/node_modules"]);
+      assert_eq!(
+        pruned.interest(),
+        RootOptions::DEFAULT_INTEREST,
+        "and the rest of the household is still its own default"
+      );
+
+      let included = parse(&["--include", "**/*.mp4"]).expect("the other seat too");
+      assert_eq!(
+        included.include().map(patterns),
+        Some(std::vec!["**/*.mp4"])
+      );
+
+      // A NESTED argument — the half a forwarded derived group would have lost.
+      for flag in [
+        "--created",
+        "--removed",
+        "--modified",
+        "--moved",
+        "--attrib",
+        "--ondir",
+      ] {
+        let narrowed =
+          parse(&[flag]).unwrap_or_else(|| panic!("{flag} is a member of the household's group"));
+        assert_ne!(
+          narrowed.interest(),
+          RootOptions::DEFAULT_INTEREST,
+          "{flag} both makes the household present and narrows it"
+        );
+      }
+      assert_eq!(
+        parse(&["--created", "--moved"]).map(|root| root.interest()),
+        Some(Interest::new().with_created().with_moved())
+      );
+    }
+
+    /// An UPDATE changes only what the command line carried. The interest is the
+    /// field that could not survive the proxy on its own: no flag given means
+    /// every kind, so round-tripping an EXISTING interest through those flags
+    /// erases the empty one, and an unrelated `--prune` would silently broaden
+    /// what the caller subscribed to. The flags are consulted instead of the
+    /// value.
+    ///
+    /// Revert witness: rebuild the household from the proxy unconditionally and
+    /// the first assertion reads `Interest::all()`.
+    #[test]
+    fn an_update_leaves_an_interest_the_command_line_never_mentioned() {
+      let update = |mut options: RootOptions, args: &[&str]| {
+        let matches = <Cli as clap::CommandFactory>::command_for_update()
+          .try_get_matches_from(std::iter::once("app").chain(args.iter().copied()))
+          .expect("the command line parses");
+        clap::FromArgMatches::update_from_arg_matches(&mut options, &matches)
+          .expect("the update applies");
+        options
+      };
+
+      let empty = RootOptions::new().with_interest(Interest::new());
+      let updated = update(empty.clone(), &["--prune", "**/node_modules"]);
+      assert_eq!(
+        updated.interest(),
+        Interest::new(),
+        "an explicit EMPTY interest survives an unrelated seat update"
+      );
+      assert_eq!(patterns(updated.prune()), ["**/node_modules"]);
+
+      // A narrowed interest survives the same way — the update is not free to
+      // widen it back to the household default either.
+      let narrow = RootOptions::new().with_interest(Interest::new().with_created());
+      assert_eq!(
+        update(narrow, &["--include", "**/*.mp4"]).interest(),
+        Interest::new().with_created()
+      );
+
+      // And a seat the command line did not mention keeps its value, while the
+      // one it did mention is replaced.
+      let seated = RootOptions::new()
+        .with_prune([glob("**/.git")])
+        .with_include([glob("**/*.mov")]);
+      let updated = update(seated, &["--prune", "**/node_modules"]);
+      assert_eq!(patterns(updated.prune()), ["**/node_modules"]);
+      assert_eq!(
+        updated.include().map(patterns),
+        Some(std::vec!["**/*.mov"]),
+        "the untouched seat is untouched"
+      );
+
+      // An interest flag that IS on the command line still narrows, so nothing
+      // above is a claim that updates cannot reach the interest at all.
+      assert_eq!(
+        update(empty, &["--moved"]).interest(),
+        Interest::new().with_moved()
       );
     }
   }

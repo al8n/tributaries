@@ -32,23 +32,119 @@
 /// ```text
 /// $ app --created --removed --moved
 /// ```
+///
+/// An UPDATE (`clap::FromArgMatches::update_from_arg_matches`) sets only the bits
+/// the command line actually named, and leaves every other one as it stood: a
+/// household updated for an unrelated argument keeps the subscription it was
+/// carrying. That is not what the flags mean on a PARSE — there they are the whole
+/// value, and the ones absent are the mask's `false`s — but an update is handed an
+/// existing mask, and writing `false` over a bit nobody mentioned would silently
+/// unsubscribe it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(default))]
-#[cfg_attr(feature = "clap", derive(clap::Args))]
 pub struct Interest {
-  #[cfg_attr(feature = "clap", arg(long))]
   created: bool,
-  #[cfg_attr(feature = "clap", arg(long))]
   removed: bool,
-  #[cfg_attr(feature = "clap", arg(long))]
   modified: bool,
-  #[cfg_attr(feature = "clap", arg(long))]
   moved: bool,
-  #[cfg_attr(feature = "clap", arg(long))]
   attrib: bool,
-  #[cfg_attr(feature = "clap", arg(long))]
   ondir: bool,
+}
+
+/// The `clap` face of [`Interest`]: the same six flags the mask derived before,
+/// kept in a proxy so the UPDATE can be written by hand. The group id is pinned to
+/// the type's own name, so a command that flattens the group is unchanged.
+///
+/// A bare `bool` flag carries clap's own `false` default, which is why the derived
+/// update could not be kept: it asks `contains_id`, and a default satisfies that
+/// exactly as a given flag does.
+#[cfg(feature = "clap")]
+#[derive(Debug, Clone, clap::Args)]
+#[group(id = "Interest")]
+struct InterestArgs {
+  #[arg(long)]
+  created: bool,
+  #[arg(long)]
+  removed: bool,
+  #[arg(long)]
+  modified: bool,
+  #[arg(long)]
+  moved: bool,
+  #[arg(long)]
+  attrib: bool,
+  #[arg(long)]
+  ondir: bool,
+}
+
+#[cfg(feature = "clap")]
+impl From<InterestArgs> for Interest {
+  fn from(args: InterestArgs) -> Self {
+    let InterestArgs {
+      created,
+      removed,
+      modified,
+      moved,
+      attrib,
+      ondir,
+    } = args;
+    Self {
+      created,
+      removed,
+      modified,
+      moved,
+      attrib,
+      ondir,
+    }
+  }
+}
+
+/// Whether the COMMAND LINE is where an argument's value came from — the one
+/// question `ArgMatches::get_flag` cannot answer, since a boolean argument reads
+/// `false` both when it was given as `false` and when it was never given at all.
+#[cfg(feature = "clap")]
+fn given_on_command_line(matches: &clap::ArgMatches, id: &str) -> bool {
+  matches.value_source(id) == Some(clap::parser::ValueSource::CommandLine)
+}
+
+#[cfg(feature = "clap")]
+impl clap::FromArgMatches for Interest {
+  fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+    InterestArgs::from_arg_matches(matches).map(Into::into)
+  }
+
+  /// Sets each bit the COMMAND LINE named, and leaves every other one as it stood
+  /// — one list of flags, so a bit added to the mask cannot be forgotten here.
+  fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+    for (flag, bit) in [
+      ("created", &mut self.created),
+      ("removed", &mut self.removed),
+      ("modified", &mut self.modified),
+      ("moved", &mut self.moved),
+      ("attrib", &mut self.attrib),
+      ("ondir", &mut self.ondir),
+    ] {
+      if given_on_command_line(matches, flag) {
+        *bit = matches.get_flag(flag);
+      }
+    }
+    Ok(())
+  }
+}
+
+#[cfg(feature = "clap")]
+impl clap::Args for Interest {
+  fn group_id() -> Option<clap::Id> {
+    InterestArgs::group_id()
+  }
+
+  fn augment_args(cmd: clap::Command) -> clap::Command {
+    InterestArgs::augment_args(cmd)
+  }
+
+  fn augment_args_for_update(cmd: clap::Command) -> clap::Command {
+    InterestArgs::augment_args_for_update(cmd)
+  }
 }
 
 impl Interest {

@@ -45,7 +45,7 @@ pub use change::{Change, ChangeKind};
 pub use error::WatchError;
 #[cfg(feature = "glob")]
 #[cfg_attr(docsrs, doc(cfg(feature = "glob")))]
-pub use glob::{Glob, GlobError, Globs};
+pub use glob::{Glob, GlobError, Globs, GlobsError, MAX_SEAT_PATTERNS};
 pub use id::{ArmAttempt, ChangeId, Epoch, Identity, MoveCookie, ReqId, ScopeId, WatchId};
 pub use interest::Interest;
 pub use monitor::Monitor;

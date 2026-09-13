@@ -14,34 +14,78 @@ All notable changes to this workspace are documented here. The format is based o
   `watch_with(root, RootOptions::new().with_interest(interest))`, and the default
   household is byte-for-byte the behaviour it always had.
 
-  - **`prune`** subtracts SUBTREES from the watch itself: a directory whose
-    root-relative path — or any ancestor's, below the root — matches is never
-    enumerated, never armed, never descended, and nothing at or under it is
-    delivered. It is the per-root, glob-shaped twin of `WatcherOptions::exclusions`,
-    and unlike that option it never stands down to a backend: no OS API takes a
-    glob, so the enforcement is the common layer's on every backend, FSEvents and
-    fanotify included. No `Rescan` ever names a pruned path, and the watched root
-    itself can never be pruned.
+  - **`prune`** subtracts SUBTREES from the watch itself, matched against
+    root-relative DIRECTORY paths: a directory whose path — or any ancestor's,
+    below the root — matches is never enumerated, never armed, never descended,
+    and nothing at or under it is delivered. It speaks for DIRECTORIES only — a
+    plain file whose own name matches is not dropped by it, so `**/.*` skips
+    dot-directories without silently banning every dotfile — and narrowing which
+    files arrive is `include`'s job. It is the per-root, glob-shaped twin of
+    `WatcherOptions::exclusions`, and unlike that option it never stands down to a
+    backend: no OS API takes a glob, so the enforcement is the common layer's on
+    every backend, FSEvents and fanotify included. No `Rescan` ever names a pruned
+    path, and the watched root itself can never be pruned.
   - **`include`** narrows file DELIVERY only, changing no coverage, so it can be
-    widened later without re-arming anything. `None` — the default — delivers
-    everything. Directories, `Rescan`s, objects whose class no backend proved, and
-    renames whose SOURCE matched are always delivered: the seat fails OPEN, because
-    a folder the consumer never hears about is a hole in its view.
+    widened later without re-arming anything. It is matched against the object's
+    NAME — the last path segment, alone — so `*.mp4` and `**/*.mp4` are the same
+    seat and a pattern containing a `/` matches nothing. `None` — the default —
+    delivers everything. Directories, `Rescan`s, objects whose class no backend
+    proved, and renames whose SOURCE matched are always delivered: the seat fails
+    OPEN, because a folder the consumer never hears about is a hole in its view.
+
+  Neither seat reaches the watcher's own sync cookie, so a `sync` barrier resolves
+  whatever the patterns say; a cookie directory `prune` would have covered is
+  refused before anything is created, as the new `SyncRootError::DirPruned`. That
+  verdict is taken on the CANONICAL directory the write itself selects — the
+  target's parent when the target is a file, every symlink on the way resolved —
+  so a link into a pruned subtree is refused rather than left waiting on an event
+  the fence would suppress, and a file subscription whose parent is reportable is
+  not refused for its own name.
+
+  `prune` is enforced at each backend's OWN boundary, not only at the common
+  layer's exit. The two kernel-recursive backends that keep an admission map
+  (fanotify, the USN journal) receive the compiled seat and consult it in their
+  seed walk, their reseed walk, every moved-in subtree walk, every live directory
+  learn, and ahead of bounded transport admission — so a pruned subtree is never
+  enumerated, never mapped, and its churn can never consume the directory cap
+  whose exhaustion kills the source. FSEvents and `ReadDirectoryChangesW` keep no
+  such map and need nothing beyond the common-layer fence.
 
   Patterns are `tributary_proto::glob::Glob` (re-exported as `tributary_fs::Glob`),
-  matched case-insensitively against a `/`-joined root-relative path with
-  `literal_separator` — `*.mp4` does not match `a/b.mp4`, `**/*.mp4` does, and
-  `**/node_modules` matches `node_modules` at any depth. They live behind
-  `tributary-proto`'s new `glob` feature, which `tributary-fs` and `tributaries`
-  enable unconditionally; both faces carry them (serde: lists of plain strings;
-  clap: repeatable `--prune` / `--include` flags, an absent `--include` being the
-  absent seat).
+  matched case-insensitively with `literal_separator` — `*` never crosses a `/`,
+  `**/` spans any depth including zero, so `**/node_modules` matches
+  `node_modules` at any depth while `a/cache` names one place. Pattern and
+  candidate are both folded to NFC, so a composed pattern matches a decomposed
+  filesystem name (and back). They live behind `tributary-proto`'s new `glob`
+  feature, which `tributary-fs` and `tributaries` enable unconditionally; both
+  faces carry them (serde: lists of plain strings; clap: repeatable `--prune` /
+  `--include` flags, an absent `--include` being the absent seat).
+
+  `Watcher::replace_root` keeps the root's words and RE-BASES them onto the new
+  root — they are root-relative — so a depth-anchored `prune` pattern means
+  something different after a replace; `replace_root`'s own docs name both the
+  over- and the under-coverage consequence.
+
+  `Glob::new` PROVES a pattern can be matched with, not merely parsed: it builds
+  the pattern's own automaton and reports the size limit as a `GlobError`, so no
+  face — serde, clap, or a programmatic build — can turn a caller's configuration
+  value into a panic. `Globs::matched` names which pattern of a set answered,
+  which is what makes the `DirPruned` refusal actionable.
 
 - **`tributary-proto`** — `Change::is_dir()`: the object's class where the source
   proved it, `None` where nothing did. The same three-valued fact the OS records
   already carried, threaded through the emission path unchanged — no stat is
   performed for it, and a consumer filtering on it must treat `None` as unknown.
   `Change::new` takes it as a new final argument.
+
+- **`tributary-proto`** — `DirEntry::with_boundary()` / `is_boundary()` /
+  `descends()`: a listing can now say "a directory the core must NOT descend into"
+  without lying about the object's class. A driver marks a directory across the
+  scope's mount boundary this way instead of lowering its kind to a non-directory,
+  so the boundary directory is still announced as a directory (`Change::is_dir()`
+  is `Some(true)`) while the Monitor arms, descends and claims coverage over it
+  exactly as before. `DirEntry::is_dir()` is the object's class; `descends()` is
+  the coverage question.
 
 - **`tributaries`**, **`tributary-fs`**, **`tributary-proto`** — optional **`serde`**
   and **`clap`** faces on the option households, both off by default and neither
@@ -67,6 +111,11 @@ All notable changes to this workspace are documented here. The format is based o
     `--watcher-event-capacity`, so the three households can be flattened onto ONE
     `clap::Command` beside `TributariesOptions`'s `--event-capacity`. The `serde` key
     is unchanged.
+  - `RootOptions`'s clap face reads its interest flags as "narrow to exactly these":
+    a command line giving NONE of them is `RootOptions::new()` — every kind — like
+    every other face of that household, and giving any narrows to those alone. The
+    standalone `tributary_proto::Interest` group keeps its own face, where a flagless
+    parse is the empty mask.
 
 - **`tributaries`** — the two glob seats reach the umbrella, so a subscription carries
   them and every source is armed with them.
@@ -77,19 +126,230 @@ All notable changes to this workspace are documented here. The format is based o
     narrowing this subscription's delivery: `prune` subtracts coverage, so a pruned
     subtree is never entered at all, while `interest`, the `Filter` and the `Debounce`
     posture stay per-subscription gates over a root armed at the source's widest
-    policy. Both faces carry them (serde: lists of plain strings, an invalid pattern
+    policy. They match what the fs household's seats match — `prune` against
+    root-relative DIRECTORY paths, `include` against the object's NAME alone. Both
+    faces carry them (serde: lists of plain strings, an invalid pattern
     being a document error; clap: repeatable `--prune` / `--include`, an absent
     `--include` being the absent seat), and neither constrains `C`.
   - `RootGlobs` — the per-root words a source receives, `WatchOptions::root_globs`
     extracts them, and a root remembers the ones it was ARMED with, so a widen's
     restore re-arms a survivor under its own words rather than the newcomer's.
+  - **One root, one set of words.** Roots are SHARED, so every subscription a root
+    serves carries that root's `RootGlobs`, and the per-subscription `Filter` is what
+    narrows delivery further. A watch whose seats differ from those of the root that
+    would serve it — the root already covering it, or ANY root its wider key would
+    subsume — is REFUSED with the new `WatchError::RootWordsConflict` (carrying the
+    conflicting root's key depth and both word sets, with
+    `WatchError::is_root_words_conflict` beside the other predicates), never silently
+    re-scoped and never merged: no union or intersection of two callers' seats is one
+    either of them asked for. Unengaged words are a value like any other and conflict
+    with engaged ones; equality is `RootGlobs`'s own — the same patterns, as written, in
+    the same order. The verdict is the planner's, taken off the root records BEFORE
+    anything is armed, disarmed, retargeted or re-pointed — the gapless in-place widen
+    included — so a refused watch moves no coverage and owes nobody a `Rescan`.
+  - **`prune` is anchored to the root that carries it.** It is matched root-relative,
+    so the same pattern text under a different root names different ground — while
+    `include` matches an object's NAME and means the same thing anywhere. A
+    subscription may therefore share a root only when the words are EQUAL *and*
+    either its key IS that root's key or neither side carries a `prune` seat: a watch
+    DEEPER than its covering root would ride words written for the shallower one, and
+    a WIDEN re-bases every subsumed root's words onto the wider key — which is how
+    `prune = ["sub"]` on a root at `/r/sub` came to name that entire root, and its
+    still-published subscriber to fall silent after one `Rescan`. Both are refused
+    with the same `WatchError::RootWordsConflict`, whose new `reason` field carries
+    the new `WordsConflict` enum: `Differ` when the text conflicts, `Anchored` when
+    equal text would be re-aimed. An `include`-only household is shareable at any
+    depth, and the per-subscription `Filter` carries no anchor at all.
+  - A cookie directory the root's own `prune` seat covers reaches a `sync` caller as
+    `SyncError::CookieDirUncovered` — the same verdict as one outside the root or under a
+    watcher exclusion, all three being "no event could ever arrive there" — rather than as
+    a write failure it would be pointless to retry.
+  - `Source::replace`'s contract states what the fs binding's `replace_root` does: a
+    retarget swaps the root's key and KEEPS its words, which are root-relative and are
+    therefore re-based onto the new key, so a depth-anchored `prune` pattern names a
+    different directory afterwards (both the over- and the under-coverage case are named).
+    Stating new words is what an `arm` is for.
   - `Event::is_dir()`: the affected object's class where the source proved it, `None`
     where nothing did. A move's two projections carry it (both endpoints are one
     object); a synthesized delivery reports `None`. `SourceEvent` carries it too, stated
     by the new `SourceEvent::with_is_dir` and read by `SourceEvent::is_dir`;
     `tributary_fs::Event::is_dir()` is the fs layer's own accessor behind it.
+  - **`prune`'s leaf match wants a PROVEN directory.** An object whose class nothing
+    reported is judged on its ANCESTORS alone, exactly as a proven file is: reading
+    "unknown" as "directory" silenced real files — every create, write and delete of a
+    regular `cache` under `prune = ["cache"]` on a backend whose ordinary records carry
+    no class, with no `Rescan` behind them. The cost of the other direction is bounded
+    and visible: an unclassified directory a word names costs one watch, and prunes at
+    its children, where its name is a proper ancestor prefix. A located recovery signal
+    is not dropped by its own leaf either — it is WIDENED to the nearest unpruned
+    parent, so an exact-file `Rescan` (a USN `HARD_LINK_CHANGE`, a boundary-crossing
+    rename) still covers what it was owed for without naming pruned ground; a signal
+    under a pruned ANCESTOR is still dropped. fanotify renames now carry the class
+    `FAN_ONDIR` proves, and `ReadDirectoryChangesW` pairs carry the class both halves
+    agree on — two halves that contradict each other become a covering `Rescan` at
+    their common parent rather than a guess.
+  - **A replace on a scope with an engaged `prune` seat is make-before-break**, whatever
+    its shape. The words re-base with the root, and the same-transport widen adopts the
+    old subtree without walking it — so ground the re-based words stop covering would
+    stay unarmed and unannounced forever. The fresh stream reads the whole new root and
+    covers the difference with the `Rescan` it already mints.
+  - **The sync cookie is created relative to the object that was judged.** The write
+    opens the cookie's parent ONCE — on Unix through a root-confined, no-follow,
+    descriptor-relative walk from the watched root; on Windows by reading the name back
+    off the handle its mint path opens — then takes the containment and `prune` verdicts
+    on that object and creates relative to it. A symlink swapped into an intermediate
+    directory after the verdict can no longer redirect the create into pruned ground or
+    out of the watched root.
+  - **The sync cookie descends from the live ROOT OBJECT, and its marker is bound to the
+    judged directory.** Each live scope now retains, from its spawn, the root itself —
+    an `O_DIRECTORY|O_NOFOLLOW` descriptor on Unix, a zero-access directory handle on
+    Windows — beside the canonical path and the generation, and every cookie write
+    descends from it after re-checking its identity against the one the scope was armed
+    on. A root renamed aside with a fresh tree stood at its name used to leave both
+    canonical paths resolving inside the REPLACEMENT while the stream stayed attached to
+    the original: containment passed, the write reported success, and the marker landed
+    where no event of that scope could come from. The descriptor lives and dies with the
+    scope's registry entry, so a replace or a retirement swaps it with the root it
+    belongs to. On Windows the marker itself is now created with `NtCreateFile` anchored
+    at the cookie directory's own handle — no component of its path is resolved, so a
+    peer that renames the freshly minted directory aside and stands a junction at its old
+    leaf has nothing to redirect — and the create's result is re-read off both handles
+    and required to stand directly inside the directory the write judged before any
+    success is reported.
+  - **Every late repair goes through the prune fence.** The destination cover a
+    geometry-less profile owes on a kept directory rename is born AFTER that record's
+    verdict and names ground the verdict never judged, so it is now fenced like any other
+    planned input — widened to the nearest unpruned parent, or dropped. An RDCW basic
+    record proves no class, so `/r/src -> /r/cache` under `prune = ["cache"]` kept both
+    halves and then aimed a `Rescan` at `cache`: an instruction to enumerate a subtree
+    whose every later change stays silent.
+  - **The cookie exemption is exactly two paths.** `prune` and `include` exempt the
+    reserved cookie directory and its DIRECT marker child, and nothing deeper — the only
+    two things this driver ever writes there. A whole-subtree exemption handed anything
+    under a reserved name a free pass through both seats, so a peer's stray file (or a
+    foreign platform's like-named user directory) was armed, mapped and delivered
+    through ground the caller had closed.
+  - **A cold listing's unclassified entry is announced as UNPROVEN.** The class stamped
+    on such an entry's `Created` — and read by the `ondir` gate — is three-valued from
+    `FileKind` (`proven_dir`): a directory is `Some(true)`, an unclassifiable entry is
+    `None`, and every known non-directory is `Some(false)`. It used to collapse to
+    `Some(false)`, which let a delivery seat drop a real directory's only announcement on
+    a proof the listing never made — after which coverage installs and its children
+    arrive with no parent creation and no `Rescan` behind them.
+
+- **`tributary-proto`** — `glob::MAX_SEAT_PATTERNS` (256), `glob::GlobsError`, and a
+  fallible `Globs::new`. The bound on a pattern SET now lives beside the matcher rather
+  than on one configuration household above it: `Globs::new` is the only door a compiled
+  set comes through, so a direct caller — or another crate's own seat — is bounded by the
+  same number `RootOptions` refuses on, and the count is checked by bounded collection
+  before anything is compiled or cloned. `RootOptions::MAX_SEAT_PATTERNS` is now that
+  constant, and `RootOptions`' serde face refuses an over-full seat MID-DOCUMENT rather
+  than after compiling every pattern in it. `Globs` has no `FromIterator` impl any more —
+  `collect` cannot fail, and a set built by truncating past the bound is the unbounded
+  seat the bound exists to refuse; `TryFrom<Vec<Glob>>` is the fallible spelling.
+  `FileKind::proven_dir` states the three-valued directory class a kind proves.
+
+- **`tributary-fs`** — `RootOptions` answers a stable `clap::ArgGroup` (`group_id`,
+  explicitly populated with every direct and nested argument id), so
+  `#[command(flatten)] root: Option<RootOptions>` builds and parses: it is `Some` after
+  any of the household's flags — the nested interest flags included — and `None`
+  otherwise. Without it clap panicked while BUILDING the command, and forwarding the
+  proxy's own derived group would not have helped, that group being left empty by the
+  derive for any struct containing a nested flatten.
+
+- **`tributaries`** — every optional household on the `clap` face answers a stable,
+  explicitly populated `ArgGroup`: `TributariesOptions`, `WatchOptions` and `RootGlobs`
+  each name every argument they carry, the nested debounce, interest and seat flags
+  included. `#[command(flatten)] options: Option<TributariesOptions>` used to build a
+  command whose group was EMPTY — clap's derive leaves it so for any struct containing a
+  nested flatten — and an empty group is never present, so `--event-capacity 4096` parsed
+  and was then silently discarded as `None`. The same held of `Option<WatchOptions<C>>`
+  under `--prune` or an interest flag.
+
+- **`tributaries`** — the per-root glob seats are bounded before anything is armed.
+  `RootGlobs::MAX_SEAT_PATTERNS` (the vocabulary's own `glob::MAX_SEAT_PATTERNS`) caps
+  either seat of `RootGlobs` and `WatchOptions`; `validate` on both households and the
+  new `OptionsError::TooManyPrunePatterns` / `OptionsError::TooManyIncludePatterns` state
+  it, both serde faces refuse an over-full list MID-DOCUMENT rather than after building
+  every pattern in it, and `Tributaries::watch` refuses one with the new
+  `WatchError::InvalidOptions` before the request is even submitted. The seats are the
+  words handed to `Source::arm` and asked once per candidate thereafter, so an unchecked
+  length was per-event work a caller wrote and a custom source paid, with nothing above
+  the seam to notice.
+
+- **`tributary-proto`** — `glob::MAX_GLOB_LEN` (1024 bytes) and `glob::MAX_GLOB_NESTING`
+  (8) bound what `Glob::new` will compile, as typed `GlobError`s, before the matcher is
+  asked at all. Alternation is the vocabulary's only recursive construct and the matcher
+  parses it recursively, so a balanced, syntactically perfect `{{{{…}}}}` of a few
+  thousand levels overflowed the process stack from any face — serde, clap, or a
+  programmatic build. `Glob::new` also sets `backslash_escape` explicitly on every host:
+  the matcher's default is the platform's, so `foo\*` meant the literal name `foo*` on
+  Unix and `foo/*` on Windows, and one serialized word subtracted different ground
+  depending on where it was read. Escapes are on everywhere, and a dangling `\` is a
+  refusal everywhere.
+
+- **`tributary-fs`** — `RootOptions::MAX_SEAT_PATTERNS` (256) and
+  `RootOptions::validate`, with `OptionsError::TooManyPrunePatterns` /
+  `TooManyIncludePatterns` and the new `WatchRootError::InvalidOptions` that
+  `watch_with` answers with before any filesystem work. A pattern set the matcher
+  declines to union degrades to one automaton pass per pattern, and the prune fence asks
+  a set once per directory prefix of every event — so the seat cap is what makes that
+  worst case a number (256 passes per prefix) rather than whatever a document happened
+  to list.
+
+- **`tributaries`** — `TributariesOptions::MAX_EVENT_CAPACITY` (2^20) and
+  `MAX_COMMAND_CAPACITY` (2^16), checked by the new `TributariesOptions::validate` and
+  reported as the new `OptionsError` (`EventCapacityTooLarge` /
+  `CommandCapacityTooLarge`, also carried by `BuildError::InvalidOptions`). Both
+  channels are allocated eagerly with one slot per item, so a capacity a document or a
+  flag could name but no allocator could serve was an allocation-size panic inside the
+  channel; every face now refuses it where the value is written, and every constructor
+  refuses it before the first channel exists.
+
+- **`tributaries`** — `RootGlobs` carries both configuration faces: serde (two optional
+  lists of plain pattern strings, an absent `include` being the absent seat) and a
+  `clap::Args` group with the repeatable `--prune` / `--include` a subscription already
+  spells its seats with. A consumer arming its own `Source` configures the words from a
+  document or a command line instead of re-deriving the vocabulary.
 
 ### Changed
+
+- **`tributaries`** — **BREAKING**: `Tributaries::with_source`, `parts` and
+  `parts_local` return `Result<_, OptionsError>`. Construction is where the umbrella's
+  capacities are checked, and the check has to be in front of the channels rather than
+  behind them; `Tributaries::new` (the fs constructor) keeps its signature and answers
+  `BuildError::InvalidOptions`. A household built from the defaults, or from any value
+  either face will admit, is always `Ok`.
+
+- **`tributaries`** — a `clap` UPDATE (`FromArgMatches::update_from_arg_matches`) on
+  `TributariesOptions`, `DebounceConfig`, `Interest` or `WatchOptions` applies only the
+  arguments the COMMAND LINE carried. A derived update cannot tell a flag's default from
+  a value someone gave, so `--event-capacity` alone used to reset the command mailbox,
+  switch the coalescer on with a default policy, and re-open an `Interest` a caller had
+  narrowed. The optional flattened debounce group is instantiated only when one of its
+  own flags was given, which is the rule a parse already followed.
+
+- **`tributary-fs`** — a `clap` UPDATE on `WatcherOptions` applies only the knobs the
+  COMMAND LINE carried: `--latency` alone leaves the backend selection, the native
+  buffer size, both capacities, the liveness interval and the map cap exactly as they
+  stood, where a derived update reset every one of them to its flag default.
+  `--exclusions` REPLACES the list it updates — the flag repeats to spell a whole list,
+  and there is no spelling for adding one path — and a list nobody names is left alone.
+  The flags, their defaults and the parse result are unchanged.
+
+- **`tributary-proto`** — a `clap` UPDATE on `Interest` writes only the bits the command
+  line NAMED. A bare boolean flag carries clap's own `false` default, so a derived
+  update unsubscribed every kind the command line did not mention — `--attrib` alone
+  emptied the rest of the mask, and an update for an argument in some other group of the
+  same command emptied it outright. The flagless PARSE still means the empty mask, which
+  is what makes this group's flags the whole value they are.
+
+- **`tributaries`** — a per-root household the fs layer refuses
+  (`WatchRootError::InvalidOptions`) reaches a `watch` caller as an explicitly
+  classified `FaultKind::Other`, with the typed refusal recoverable through
+  `WatchError::as_fs`. It is a caller-configuration verdict: not `Capacity`, the one
+  kind the umbrella retries, and not `Unsupported`, which is read as a verdict on the
+  platform.
 
 - **`tributaries`** — **BREAKING for a custom `Source`**: `Source::arm` and
   `LocalSource::arm` take the per-root `&RootGlobs` as a third argument
