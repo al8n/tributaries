@@ -474,6 +474,15 @@ domination `Rescan` is stood — and nothing else in either crate behaves differ
   a `clap` `ValueValidation`), the accepted inputs are unchanged up to and including the
   ceiling, and `validate` keeps the same check for lists assembled in code.
 
+- **`tributary-fs`**, **`tributaries`** — the same four glob seats now preflight BORROWED,
+  a step ahead of the copy the entry above describes: `--prune`/`--include` are read
+  straight off `clap`'s own matches, refusing the occurrence past `MAX_SEAT_PATTERNS` and
+  a pattern past `MAX_GLOB_LEN` before either is copied into the crate's own
+  `Vec<String>`, let alone compiled. The refusal is a fixed `clap` `ValueValidation`,
+  worded to differ from the belt below it, and covers both the parse and the update path
+  of every household that carries the seats (`tributary_fs::RootOptions`, `RootGlobs`,
+  `WatchOptions`).
+
 - **`tributary-proto`** — `Glob`'s `serde` face reads through a string VISITOR, so
   `MAX_GLOB_LEN` is judged on the bytes the format is already holding rather than after
   an owned `String` has been built. Deserializing through `String` first handed an

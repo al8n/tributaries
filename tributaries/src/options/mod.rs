@@ -486,6 +486,72 @@ fn compile_seat(patterns: Vec<String>, flag: &str) -> Result<Vec<Glob>, clap::Er
     .collect()
 }
 
+/// One seat flag's values, BORROWED straight off `matches` — the door
+/// [`SeatArgs::from_arg_matches`] has not yet opened, so nothing seen here is ever
+/// copied into the proxy's own `Vec<String>`.
+///
+/// Walks at most [`RootGlobs::MAX_SEAT_PATTERNS`] + 1 values — the same over-cap
+/// witness [`collect_seat`] and [`compile_seat`] take — refusing the first one
+/// longer than [`MAX_GLOB_LEN`](tributary_proto::glob::MAX_GLOB_LEN), the bound
+/// [`Glob::new`] itself enforces, before the count of everything seen in that
+/// window is judged. Neither refusal echoes a value: the length message names the
+/// bound and the length it measured, never the text, and the count message names
+/// only the bound.
+///
+/// Both messages are worded to differ from [`compile_seat`]'s own refusals, so a
+/// caller — and a test — can tell which pass caught the seat.
+///
+/// # Errors
+///
+/// A fixed message naming [`MAX_GLOB_LEN`](tributary_proto::glob::MAX_GLOB_LEN)
+/// and the offending value's length when one value is longer than that bound; a
+/// fixed message naming [`RootGlobs::MAX_SEAT_PATTERNS`] when more values than
+/// that are present.
+#[cfg(feature = "clap")]
+fn preflight_seat(matches: &clap::ArgMatches, id: &str, flag: &str) -> Result<(), clap::Error> {
+  let Some(values) = matches.get_many::<String>(id) else {
+    return Ok(());
+  };
+  let mut supplied = 0usize;
+  for value in values.take(RootGlobs::MAX_SEAT_PATTERNS + 1) {
+    if value.len() > tributary_proto::glob::MAX_GLOB_LEN {
+      return Err(clap::Error::raw(
+        clap::error::ErrorKind::ValueValidation,
+        std::format!(
+          "a {flag} pattern of {} bytes is over the {}-byte limit before it is copied\n",
+          value.len(),
+          tributary_proto::glob::MAX_GLOB_LEN
+        ),
+      ));
+    }
+    supplied += 1;
+  }
+  if supplied > RootGlobs::MAX_SEAT_PATTERNS {
+    return Err(clap::Error::raw(
+      clap::error::ErrorKind::ValueValidation,
+      std::format!(
+        "more {flag} patterns than the per-seat limit of {} before any of them is copied\n",
+        RootGlobs::MAX_SEAT_PATTERNS
+      ),
+    ));
+  }
+  Ok(())
+}
+
+/// Both glob seats, preflighted BORROWED before [`SeatArgs::from_arg_matches`] or
+/// its update copies either into the household's own `Vec<String>`.
+///
+/// Called FIRST in every [`clap::FromArgMatches`] entry point of both households
+/// that carry [`SeatArgs`] ([`RootGlobs`], [`WatchOptions`]), on both the parse
+/// and the update path, so a seat [`compile_seat`] would go on to refuse anyway
+/// is never even copied off the matches first.
+#[cfg(feature = "clap")]
+fn preflight_seats(matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+  preflight_seat(matches, "prune", "--prune")?;
+  preflight_seat(matches, "include", "--include")?;
+  Ok(())
+}
+
 /// The value an argument carried, but ONLY when the COMMAND LINE is where it came
 /// from — the one question `ArgMatches::get_one` cannot answer, because a
 /// DEFAULTED argument reads there exactly like a given one.
@@ -2167,9 +2233,11 @@ impl<'de> serde::Deserialize<'de> for TributariesOptions {
 /// is per-event work — and the length is a caller's to write. Both are capped at
 /// [`MAX_SEAT_PATTERNS`](Self::MAX_SEAT_PATTERNS), which
 /// [`validate`](Self::validate) checks, the `serde` face refuses mid-document, the
-/// `clap` face refuses at the occurrence past it — before a pattern of the seat is
-/// compiled at all — and [`Tributaries::watch`](crate::Tributaries::watch) refuses
-/// on before anything is planned. The programmatic setters keep the same list
+/// `clap` face refuses BORROWED — the occurrence past it and a pattern past
+/// [`MAX_GLOB_LEN`](tributary_proto::glob::MAX_GLOB_LEN) are both judged on the
+/// matches before a single value is copied into this crate's own proxy, let alone
+/// compiled — and [`Tributaries::watch`](crate::Tributaries::watch) refuses on
+/// before anything is planned. The programmatic setters keep the same list
 /// bounded AT COLLECTION: they retain one pattern past the ceiling and no more,
 /// whatever the iterator handed to them goes on to yield, so `validate` is always
 /// reachable and always sees the over-cap witness. Beneath all of them the
@@ -2430,6 +2498,7 @@ impl From<&RootGlobs> for SeatArgs {
 #[cfg(feature = "clap")]
 impl clap::FromArgMatches for RootGlobs {
   fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+    preflight_seats(matches)?;
     let (prune, include) = SeatArgs::from_arg_matches(matches)?.compiled()?;
     Ok(Self { prune, include })
   }
@@ -2438,6 +2507,7 @@ impl clap::FromArgMatches for RootGlobs {
   /// which is what the shared flags already give it: neither carries a default, so
   /// a repeatable argument nobody spelled has no values to write.
   fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+    preflight_seats(matches)?;
     let mut args = SeatArgs::from(&*self);
     args.update_from_arg_matches(matches)?;
     let (prune, include) = args.compiled()?;
@@ -2775,6 +2845,7 @@ impl<C> clap::FromArgMatches for WatchOptions<C> {
   /// values: a fresh accept-all [`Filter`] — never one shared with a caller's —
   /// and the inherited [`Debounce`] posture.
   fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+    preflight_seats(matches)?;
     let WatchOptionsArgs { interest, seats } = WatchOptionsArgs::from_arg_matches(matches)?;
     let (prune, include) = seats.compiled()?;
     Ok(Self {
@@ -2792,6 +2863,7 @@ impl<C> clap::FromArgMatches for WatchOptions<C> {
   /// carrying no flag default at all, and the [`Filter`] and [`Debounce`] posture
   /// from being on no face: an update never writes them.
   fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+    preflight_seats(matches)?;
     let mut args = WatchOptionsArgs::from(&*self);
     args.update_from_arg_matches(matches)?;
     let WatchOptionsArgs { interest, seats } = args;

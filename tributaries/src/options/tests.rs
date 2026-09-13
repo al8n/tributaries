@@ -1509,6 +1509,174 @@ mod clap_face {
     }
   }
 
+  /// The occurrence past the ceiling is refused before a single value is copied
+  /// off `matches` into this crate's own `Vec<String>` — earlier than
+  /// [`compile_seat`], which only ever sees what that copy already holds — on
+  /// BOTH households, both seat flags and both paths (parse, update).
+  ///
+  /// Every value here is in range on its own, so a refusal that happened to be
+  /// [`compile_seat`]'s post-copy one would still pass a bare `ValueValidation`
+  /// check; the preflight's message is worded to differ from it, and this checks
+  /// for that wording rather than only the error kind.
+  #[test]
+  fn an_over_full_seat_is_refused_by_the_preflight_before_any_copy() {
+    let cap = RootGlobs::MAX_SEAT_PATTERNS;
+
+    for flag in ["--prune", "--include"] {
+      let mut over: std::vec::Vec<std::string::String> = std::vec::Vec::new();
+      for n in 0..=cap {
+        over.push(flag.to_owned());
+        over.push(std::format!("**/w{n}"));
+      }
+
+      // PARSE — RootGlobs.
+      let err =
+        GlobsCli::try_parse_from(std::iter::once("app".to_owned()).chain(over.iter().cloned()))
+          .err()
+          .expect("one occurrence past the ceiling is refused");
+      assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+      let rendered = err.render().to_string();
+      assert!(
+        rendered.contains(&std::format!("{cap}")),
+        "the refusal names the ceiling: {rendered}"
+      );
+      assert!(
+        rendered.contains("before any of them is copied"),
+        "the refusal is the preflight's, not compile_seat's: {rendered}"
+      );
+
+      // PARSE — WatchOptions shares the same flags.
+      let err =
+        WatchCli::try_parse_from(std::iter::once("app".to_owned()).chain(over.iter().cloned()))
+          .err()
+          .expect("the subscription household carries the same ceiling");
+      assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+      assert!(
+        err
+          .render()
+          .to_string()
+          .contains("before any of them is copied"),
+        "refused by the same preflight: {}",
+        err.render()
+      );
+
+      // UPDATE — both households, same rule.
+      let refs: std::vec::Vec<&str> = over.iter().map(std::string::String::as_str).collect();
+
+      let mut globs = RootGlobs::new();
+      let err = globs
+        .update_from_arg_matches(&update_matches::<RootGlobs>(&refs))
+        .expect_err("an over-full update is refused before it writes the household");
+      assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+      assert!(
+        err
+          .render()
+          .to_string()
+          .contains("before any of them is copied")
+      );
+      assert_eq!(
+        globs,
+        RootGlobs::new(),
+        "the refused update left the seat exactly as it stood"
+      );
+
+      let mut watch = WatchOptions::<OsString>::new();
+      let err = watch
+        .update_from_arg_matches(&update_matches::<WatchOptions<OsString>>(&refs))
+        .expect_err("the subscription household's update refuses the same way");
+      assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+      assert!(
+        err
+          .render()
+          .to_string()
+          .contains("before any of them is copied")
+      );
+    }
+  }
+
+  /// A value longer than [`tributary_proto::glob::MAX_GLOB_LEN`] is refused
+  /// before a single byte of it is copied off `matches` — earlier than
+  /// `Glob::new`, which [`compile_seat`] only reaches after that copy — on BOTH
+  /// households, both seat flags and both paths (parse, update), and the
+  /// refusal never holds the pattern itself.
+  #[test]
+  fn an_oversized_seat_pattern_is_refused_by_the_preflight_before_any_copy() {
+    let bound = tributary_proto::glob::MAX_GLOB_LEN;
+    let over = "?".repeat(bound + 1);
+
+    for flag in ["--prune", "--include"] {
+      // PARSE — RootGlobs.
+      let argv = std::vec::Vec::from([flag.to_owned(), over.clone()]);
+      let err =
+        GlobsCli::try_parse_from(std::iter::once("app".to_owned()).chain(argv.iter().cloned()))
+          .err()
+          .expect("one byte past the length bound is refused");
+      assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+      let rendered = err.render().to_string();
+      assert!(
+        rendered.contains(&std::format!("{bound}"))
+          && rendered.contains(&std::format!("{} bytes", over.len())),
+        "the refusal names the bound and the length: {rendered}"
+      );
+      assert!(
+        !rendered.contains(&over),
+        "and never the text itself: {rendered}"
+      );
+      assert!(
+        rendered.contains("before it is copied"),
+        "the refusal is the preflight's, not compile_seat's belt: {rendered}"
+      );
+      assert!(
+        !rendered.contains("invalid glob"),
+        "Glob::new was never reached: {rendered}"
+      );
+
+      // PARSE — WatchOptions.
+      let err =
+        WatchCli::try_parse_from(std::iter::once("app".to_owned()).chain(argv.iter().cloned()))
+          .err()
+          .expect("the subscription household carries the same bound");
+      assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+      assert!(
+        err.render().to_string().contains("before it is copied"),
+        "refused by the same preflight: {}",
+        err.render()
+      );
+
+      // UPDATE — both households.
+      let refs: std::vec::Vec<&str> = std::vec::Vec::from([flag, over.as_str()]);
+
+      let mut globs = RootGlobs::new();
+      let err = globs
+        .update_from_arg_matches(&update_matches::<RootGlobs>(&refs))
+        .expect_err("an oversized update value is refused before it writes the household");
+      assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+      assert!(err.render().to_string().contains("before it is copied"));
+      assert_eq!(
+        globs,
+        RootGlobs::new(),
+        "the refused update left the seat exactly as it stood"
+      );
+
+      let mut watch = WatchOptions::<OsString>::new();
+      let err = watch
+        .update_from_arg_matches(&update_matches::<WatchOptions<OsString>>(&refs))
+        .expect_err("the subscription household's update refuses the same way");
+      assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    // A pattern exactly AT the bound still parses, on both households.
+    let at_bound = "?".repeat(bound);
+    assert_eq!(
+      GlobsCli::parse_from(["app", "--prune", at_bound.as_str()])
+        .globs
+        .prune()[0]
+        .as_str()
+        .len(),
+      bound
+    );
+  }
+
   /// An UPDATE applies what the COMMAND LINE carried and nothing else — the rule every
   /// household on this face follows.
   ///
