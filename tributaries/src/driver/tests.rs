@@ -18923,8 +18923,9 @@ async fn on_sync_skips_an_already_canceled_barrier() {
 /// [`Source::end_sync`]. No [`Source::cancel_sync`] is issued: the write returned NORMALLY, so
 /// the by-name reclamation the abandon arms use would name a sync that has already resolved.
 /// And the reply is READY without the owner ever pumping `next`, which is what "at once, never
-/// at the caller's deadline" means — the retirement stood the covering `Rescan` before it
-/// answered, so there is no later observation to wait for.
+/// at the caller's deadline" means — the retirement STOOD (queued, not yet delivered) the
+/// covering `Rescan` before it answered, so there is no later observation the caller must wait
+/// for to be resolved, even though the `Rescan` itself only reaches the stream at the next flush.
 ///
 /// FAIL-ON-REVERT: answer this arm `Err(SyncError::Busy)` (the placeholder this replaced) and
 /// the outcome assertion fails — a caller whose barrier is already met by re-enumeration would
@@ -18983,6 +18984,45 @@ async fn a_pre_install_domination_resolves_the_caller_dominated() {
     h.owner.source.ended_syncs.is_empty(),
     "no marker exists, so none is reaped: {:?}",
     h.owner.source.ended_syncs
+  );
+}
+
+/// The deterministic half of the accepted no-live-cover-change-during-sync deviation: a forced
+/// pre-install domination driven through the PUBLIC
+/// [`Tributaries::sync`](super::Tributaries::sync), not [`Owner::on_sync`] directly, so the
+/// command-plane plumbing [`a_pre_install_domination_resolves_the_caller_dominated`] bypasses —
+/// the dedicated sync mailbox, the run loop's own dispatch of it, and the reply channel — is
+/// pinned too, end to end.
+///
+/// FAIL-ON-REVERT: same as the lib cell above — answer `FakeSource::begin_sync`'s
+/// `dominate_syncs` arm `Err(SyncError::Busy)` instead of `Ok(Begun::Dominated)`, and the
+/// outcome assertion fails, this time proven through the real mailbox and run loop rather than a
+/// directly-driven `on_sync`.
+#[tokio::test]
+async fn a_forced_domination_resolves_through_the_public_sync_entry_point() {
+  use crate::source::SyncOutcome;
+
+  let mut source = FakeSource::new();
+  source.supports_sync = true;
+  source.dominate_syncs = true;
+  let w: super::Tributaries<OsString, (), TokioRuntime, u32> =
+    super::Tributaries::with_source(source, TributariesOptions::new())
+      .expect("the default capacities are in range");
+  let sub = w
+    .watch(key("/a"), (), WatchOptions::new())
+    .await
+    .expect("watch /a");
+
+  let outcome = tokio::time::timeout(Duration::from_secs(5), w.sync(sub, Duration::from_secs(5)))
+    .await
+    .expect(
+      "a pre-install domination resolves within the test deadline, never at the caller's own \
+       sync timeout",
+    )
+    .expect("a dominated barrier is a MET barrier, not a refusal");
+  assert!(
+    matches!(outcome, SyncOutcome::Dominated),
+    "the forced domination reaches the caller through the real run loop and mailbox: {outcome:?}"
   );
 }
 

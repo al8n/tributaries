@@ -995,7 +995,10 @@ where
   /// transition, each stands a located
   /// [`Rescan`](crate::EventKind::Rescan), and a barrier whose ground one of them
   /// touches is retired by it — [`Dominated`](SyncOutcome::Dominated) — rather than
-  /// certified past it.
+  /// certified past it. EXCEPT: arming the barrier's own reserved cookie directory
+  /// is not a transition — it is the write's own ground coming into coverage,
+  /// created by the write itself — so the first sync of a directory does not
+  /// dominate its own marker.
   ///
   /// It is not a refusal and never costs the caller a round trip. A transition that
   /// arrives before the marker is installed answers this call at once; one that arrives
@@ -1071,8 +1074,8 @@ where
   /// kernel-recursive backend (FSEvents, fanotify) there are no per-directory
   /// watches to transition, so the certificate rests where it always did — on the
   /// descriptors the watcher pins for the sync target and the reserved cookie
-  /// directory for the sync's duration. The assumption below is the same one this
-  /// note always stated; it does not widen.
+  /// directory until the marker is created. The assumption below is the same one
+  /// this note always stated; it does not widen.
   ///
   /// Identity, mount frame and landing are re-verified at the write on every
   /// backend, a minted reserved directory is proved to hold only its marker, every
@@ -1085,9 +1088,11 @@ where
   /// holds no descriptor on the objects it was admitted against — the door samples
   /// them and releases — so what it carries into the write is a REMEMBERED tuple,
   /// and a replacement reusing the admitted inode inside that parked window is no
-  /// longer refused as a replaced directory. Where such a reuse is a
-  /// watch-lifecycle event the epoch retires the barrier instead; where it is not,
-  /// it is the same-uid residual this note already names.
+  /// longer refused as a replaced directory. A `Parked` obligation is exempt from
+  /// move-retirement, and its dispatch re-judges only the applied cover — never
+  /// the epoch — so an inode reuse inside that parked window on a descending
+  /// backend is caught by neither the released pins nor the epoch: it is the
+  /// same-uid residual this note already names, full stop.
   ///
   /// What remains outside the contract is therefore a process running with the
   /// watcher's OWN uid acting BEHIND coverage that never transitions: renaming,

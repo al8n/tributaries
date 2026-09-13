@@ -1027,6 +1027,29 @@ async fn probes_outstanding(rig: &Rig) -> usize {
   on_reply.await.expect("the driver replies")
 }
 
+/// Forces `scope`'s root-liveness deadline immediately due and drives it
+/// through the SAME `on_timeout` path the driver's own periodic tick runs,
+/// resolving once the resulting dispatch — or, at the probe budget, the
+/// decline and its covering `Rescan` — has been fully applied
+/// ([`Command::DebugTickLiveness`]).
+///
+/// The deterministic replacement for waiting on a scope's own next real-clock
+/// interval to land: on a hosted runner with dozens of probe threads parked,
+/// that wait times the runner, not the driver, and can miss every window a
+/// suite is willing to spend. Safe to call on a scope whose probe is already
+/// outstanding, or whose budget decline already latched this episode — both
+/// coalesce exactly as a real tick would.
+#[cfg(not(miri))]
+async fn tick_liveness(rig: &Rig, scope: ScopeId) {
+  let (reply, on_reply) = futures_channel::oneshot::channel();
+  rig
+    .commands
+    .send(Command::DebugTickLiveness { scope, reply })
+    .await
+    .unwrap();
+  on_reply.await.expect("the driver replies");
+}
+
 /// Settles until the outstanding-probe count reaches `target`, reporting whether
 /// it got there — the async analogue of [`settle`] for a count only a `Command`
 /// round trip can read.
@@ -1400,6 +1423,16 @@ async fn drain_events(rig: &Rig) {
 ///
 /// not(miri): the claim needs `MAX_LIVENESS_PROBES` real parked threads, exactly
 /// as its sibling above.
+///
+/// THE FIRST claim used to wait on the turned-away scope's own next real-clock
+/// interval landing — an eventual `settle_within` whose only trigger was a
+/// wall-clock tick racing sixty-four parked OS threads. On a slow hosted
+/// runner that tick can land outside any window a suite is willing to spend
+/// (three widenings of that window were not enough), so it is driven through
+/// [`tick_liveness`] instead: deterministic and owned by the test, not the
+/// runner's scheduler. Only the DELIVERY of what the tick produces onto the
+/// event channel stays an eventual read (a plain drain here, since the seam's
+/// own reply already barriers the drain against the tick).
 #[cfg(not(miri))]
 #[tokio::test]
 async fn a_probe_declined_at_the_budget_reports_the_scope_unproven_once() {
@@ -1407,8 +1440,9 @@ async fn a_probe_declined_at_the_budget_reports_the_scope_unproven_once() {
   let registry = RecordingRegistry::default();
   let roots: Vec<String> = (0..ticked).map(|index| format!("/r{index}")).collect();
   let rig = ticking_rig_over(Duration::from_millis(20), registry.clone(), &roots);
+  let mut scopes = Vec::with_capacity(ticked);
   for root in &roots {
-    let _ = watch(&rig, root).await;
+    scopes.push(watch(&rig, root).await);
   }
   // The baseline: every registration window's closing `Rescan` is spent, so what
   // the window below counts came from the decline and from nothing else.
@@ -1434,27 +1468,24 @@ async fn a_probe_declined_at_the_budget_reports_the_scope_unproven_once() {
   // still full — a delta against the stream this cell emptied, not a count of
   // everything the rig ever said.
   //
-  // An EVENTUAL claim on the shared wait rather than a window of its own. What it
-  // waits on is a TICK: the scope the budget turned away is told nothing until
-  // its next interval comes round, and with sixty-five scopes ticking against
-  // sixty-four parked threads, when that interval lands is the runner's business
-  // and not this cell's. A hosted runner reached it later than a hand-rolled
-  // window allowed, and a fixed short window is the wrong shape for a fact that
-  // is eventually true: it can only fail spuriously, never catch a defect
-  // earlier. The loop returns the instant the cover arrives, so the wider budget
-  // costs a passing run nothing — the same reasoning [`settle_within`] documents.
+  // Which of the sixty-five scopes the budget left short a probe is a race, not
+  // fixed (staged above only as an aggregate count), so the tick is forced on
+  // every one of them: the sixty-four already parked coalesce onto their own
+  // outstanding probe exactly as a real tick would (a no-op here), and the one
+  // left with none actually declines. `tick_liveness` replies only once that
+  // decline — and the `Rescan` it mints — has been fully drained by the driver
+  // loop, so the channel already carries it by the time the loop below reads.
+  for &scope in &scopes {
+    tick_liveness(&rig, scope).await;
+  }
   let mut opened = 0usize;
-  let unproven = settle_within(interpreted_rounds(400), || {
-    while let Ok((_, _, change)) = rig.events.try_recv() {
-      if change.kind().is_rescan() {
-        opened += 1;
-      }
+  while let Ok((_, _, change)) = rig.events.try_recv() {
+    if change.kind().is_rescan() {
+      opened += 1;
     }
-    opened > 0
-  })
-  .await;
+  }
   assert!(
-    unproven,
+    opened > 0,
     "a scope the budget turned away says its coverage is unproven, while the \
      budget is still full — not at the release"
   );

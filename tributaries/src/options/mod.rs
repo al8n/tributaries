@@ -869,11 +869,58 @@ impl Debounce {
   }
 }
 
-/// The legal spellings of a [`Debounce`] variant tag, in declaration order —
-/// the externally-tagged name each variant carries, [`Custom`](Debounce::Custom)
-/// included (its tag names the variant, never the [`DebounceConfig`] payload).
+/// Which [`Debounce`] variant one tag names — the seed's answer, so the enum
+/// visitor below does nothing but read the tag and then ask for the payload
+/// (or not) the named variant carries.
 #[cfg(feature = "serde")]
-const DEBOUNCE_NAMES: [&str; 3] = ["inherit", "off", "custom"];
+#[derive(Debug, Clone, Copy)]
+enum DebounceVariant {
+  Inherit,
+  Off,
+  Custom,
+}
+
+#[cfg(feature = "serde")]
+impl DebounceVariant {
+  /// The externally-tagged name this variant carries,
+  /// [`Custom`](Self::Custom) included (its tag names the variant, never the
+  /// [`DebounceConfig`] payload) — the one place this word is spelled, so
+  /// [`DEBOUNCE_NAMES`] and the identifier visitor below both derive from it
+  /// rather than typing it out a second time.
+  const fn tag(&self) -> &'static str {
+    match self {
+      Self::Inherit => "inherit",
+      Self::Off => "off",
+      Self::Custom => "custom",
+    }
+  }
+}
+
+/// Every [`DebounceVariant`], in declaration order — the single list
+/// [`DEBOUNCE_NAMES`] and the identifier visitor below both read, so a
+/// renamed posture cannot drift between [`DebounceVariant::tag`] and what
+/// this door accepts. Adding a variant to [`DebounceVariant`] without adding
+/// it here is not a compile error — this is still a hand-maintained edge —
+/// but it is now the ONLY one.
+#[cfg(feature = "serde")]
+const ALL_DEBOUNCE_VARIANTS: [DebounceVariant; 3] = [
+  DebounceVariant::Inherit,
+  DebounceVariant::Off,
+  DebounceVariant::Custom,
+];
+
+/// The legal spellings of a [`Debounce`] variant tag, in declaration order —
+/// derived from [`ALL_DEBOUNCE_VARIANTS`] rather than typed out a second time.
+#[cfg(feature = "serde")]
+const DEBOUNCE_NAMES: [&str; ALL_DEBOUNCE_VARIANTS.len()] = {
+  let mut names = [""; ALL_DEBOUNCE_VARIANTS.len()];
+  let mut index = 0;
+  while index < ALL_DEBOUNCE_VARIANTS.len() {
+    names[index] = ALL_DEBOUNCE_VARIANTS[index].tag();
+    index += 1;
+  }
+  names
+};
 
 /// The longest name in [`DEBOUNCE_NAMES`], in bytes — the ceiling a tag is
 /// measured against before anything is done with it. Derived from the
@@ -891,16 +938,6 @@ const MAX_DEBOUNCE_NAME_LEN: usize = {
   }
   longest
 };
-
-/// Which [`Debounce`] variant one tag names — the seed's answer, so the enum
-/// visitor below does nothing but read the tag and then ask for the payload
-/// (or not) the named variant carries.
-#[cfg(feature = "serde")]
-enum DebounceVariant {
-  Inherit,
-  Off,
-  Custom,
-}
 
 /// One variant tag, read as BORROWED text and measured before it is copied,
 /// compared or echoed — the same mold [`Interest`] and
@@ -961,12 +998,50 @@ impl serde::de::Visitor<'_> for DebounceTag {
         name.len()
       )));
     }
-    match name {
-      "inherit" => Ok(DebounceVariant::Inherit),
-      "off" => Ok(DebounceVariant::Off),
-      "custom" => Ok(DebounceVariant::Custom),
-      other => Err(E::unknown_variant(other, &DEBOUNCE_NAMES)),
+    ALL_DEBOUNCE_VARIANTS
+      .into_iter()
+      .find(|variant| variant.tag() == name)
+      .ok_or_else(|| E::unknown_variant(name, &DEBOUNCE_NAMES))
+  }
+
+  /// The bytes-identifier door a format reads when its tag comes as raw bytes
+  /// rather than `str` (a binary format's map-key, for one) — bounded and
+  /// echoed the same way [`visit_str`](Self::visit_str) is, `unknown_variant`
+  /// included, since serde's own error only accepts a `str` to echo.
+  fn visit_bytes<E>(self, name: &[u8]) -> Result<Self::Value, E>
+  where
+    E: serde::de::Error,
+  {
+    if name.len() > MAX_DEBOUNCE_NAME_LEN {
+      return Err(E::custom(format_args!(
+        "a debounce posture name is at most {MAX_DEBOUNCE_NAME_LEN} bytes, and this one is {}",
+        name.len()
+      )));
     }
+    ALL_DEBOUNCE_VARIANTS
+      .into_iter()
+      .find(|variant| variant.tag().as_bytes() == name)
+      .ok_or_else(|| E::unknown_variant(&String::from_utf8_lossy(name), &DEBOUNCE_NAMES))
+  }
+
+  /// The identifier door a NON-self-describing format answers with — the
+  /// variant's declaration-order INDEX, which is what [`Debounce`]'s derived
+  /// `Serialize` still writes for such a format. Bounds-checked against
+  /// [`ALL_DEBOUNCE_VARIANTS`]'s own length rather than hand-counted, so a
+  /// renamed or added posture moves the ceiling with it.
+  fn visit_u64<E>(self, index: u64) -> Result<Self::Value, E>
+  where
+    E: serde::de::Error,
+  {
+    usize::try_from(index)
+      .ok()
+      .and_then(|index| ALL_DEBOUNCE_VARIANTS.get(index).copied())
+      .ok_or_else(|| {
+        E::custom(format_args!(
+          "a debounce variant index is at most {}, and this one is {index}",
+          ALL_DEBOUNCE_VARIANTS.len() - 1
+        ))
+      })
   }
 }
 
@@ -975,8 +1050,8 @@ impl<'de> serde::Deserialize<'de> for Debounce {
   /// One externally-tagged posture: `"inherit"` and `"off"` carry nothing,
   /// `{"custom": ...}` carries a whole [`DebounceConfig`] — the exact shape
   /// serde's own derive would produce, kept by hand so the TAG is read through
-  /// the bounded [`DebounceTag`] visitor rather than an owned, unbounded
-  /// `String` serde's derive would build to match it against the vocabulary.
+  /// a bounded identifier visitor rather than an owned, unbounded `String`
+  /// serde's derive would build to match it against the vocabulary.
   fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
   where
     D: serde::Deserializer<'de>,

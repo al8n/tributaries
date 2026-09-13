@@ -4965,8 +4965,9 @@ impl<F: FsOps> CookieRegistry<F> {
   /// `mkdir` deep in the tree retires nothing that did not move. Never a `Parked`
   /// one: it has not been stamped yet, and a bump raised during its own settle
   /// wait is exactly what stamping at DISPATCH exists to not count against it —
-  /// it is judged there instead, against the epoch this move has already
-  /// advanced.
+  /// the dispatch instead RE-JUDGES THE COVER left behind by every transition
+  /// this scope saw while parked, and only afterwards takes the epoch as its
+  /// stamp (see the dispatch site).
   ///
   /// WHAT each retirement does, in one critical section per record: it sets the
   /// [`dominated`](Obligation::dominated) flag — the claim interlock, so an
@@ -5825,6 +5826,39 @@ pub(crate) enum Command {
   #[cfg(all(test, feature = "tokio"))]
   DebugTeardownPressure {
     reply: futures_channel::oneshot::Sender<usize>,
+  },
+  /// A test-only, deterministic root-liveness tick for exactly `scope`: forces
+  /// its liveness deadline immediately due
+  /// ([`DriverCore::force_liveness_due`]), runs the SAME `on_timeout` path the
+  /// driver's own periodic timer runs, and drains the resulting effects (the
+  /// dispatch, or — at the probe budget — the decline and its covering
+  /// `Rescan`) before replying.
+  ///
+  /// Exists because a suite that waits for a scope's own NEXT real-clock
+  /// interval to land is timing the runner, not the driver: with dozens of
+  /// probe threads parked and a hosted runner under load, a tick that is
+  /// "eventually true" in the code can still miss every window a suite is
+  /// willing to spend. This seam makes the tick itself an owned, synchronous
+  /// step — only the delivery of whatever it produces onto the event channel
+  /// stays an eventual wait, which is the shape [`settle_within`] already
+  /// covers correctly.
+  ///
+  /// Idempotent to call on a scope whose probe is already outstanding (the
+  /// ordinary `ScopeBusy` coalescing path runs, same as a real tick that finds
+  /// one in flight) and on a scope whose budget decline already latched this
+  /// episode (`on_refresh_declined`'s own once-per-episode rule applies
+  /// unchanged) — a suite that does not know which of several scopes is the
+  /// one left short a probe can drive every one of them through this command
+  /// and let the core's own idempotence sort it out.
+  #[cfg(all(test, feature = "tokio", not(miri)))]
+  DebugTickLiveness {
+    /// The scope whose liveness deadline is forced due.
+    scope: ScopeId,
+    /// Resolved once the tick's effects (dispatch or decline) have been fully
+    /// drained — a barrier, not a report: whatever the tick produced is
+    /// already applied (and, for a `Rescan`, already sent on the event
+    /// channel) by the time this resolves.
+    reply: futures_channel::oneshot::Sender<()>,
   },
 }
 
@@ -8693,7 +8727,18 @@ impl AdmittedDirs {
   /// Counted off the readings themselves rather than off the process's
   /// descriptor table: what the split is about is which objects this value keeps
   /// alive, and a table count cannot separate those from the runtime's own.
-  #[cfg(all(test, any(target_os = "linux", target_os = "macos"), not(miri)))]
+  ///
+  /// The gate is the UNION of this helper's consumers' gates, which is the whole
+  /// gate of the one module that reads it — `driver::tests` is `feature =
+  /// "tokio"`, and its `identity` module adds the real-syscall conditions. A
+  /// helper gated wider than its readers is dead code on every leg the readers
+  /// are absent from, and this crate denies dead code.
+  #[cfg(all(
+    test,
+    feature = "tokio",
+    not(miri),
+    any(target_os = "linux", target_os = "macos")
+  ))]
   pub(crate) fn pins_held(&self) -> (usize, bool) {
     let pinned = [&self.root, &self.target, &self.cookies]
       .into_iter()
@@ -13401,6 +13446,42 @@ pub(crate) async fn run<R, F>(
             &streams.replace_states,
             &deferred_grants,
           ));
+        }
+        #[cfg(all(test, feature = "tokio", not(miri)))]
+        Ok(Command::DebugTickLiveness { scope, reply }) => {
+          core.force_liveness_due(scope);
+          core.on_timeout(now());
+          // Drain synchronously, in the SAME order the loop's own discipline
+          // puts before every flush — a `BarrierMove` this tick's
+          // `drain_monitor` queued must be retired before the effect queue is
+          // flushed, or the retired obligation's marker emit would still be
+          // in it — replying only once the dispatch (or the decline and its
+          // covering `Rescan`) has actually run, so the caller never races
+          // the effect this tick produced.
+          drain_barrier_moves::<R, F>(&mut core, &cookies, &op_tx, &now);
+          execute_effects::<R, F>(
+            &mut core,
+            &ops,
+            &config,
+            &op_tx,
+            &reaper,
+            &mut streams.handles,
+            &mut pending_spawns,
+            &mut pending_teardowns,
+            &mut scope_backends,
+            &mut lanes,
+            &mut source_taps,
+            &events,
+            &mut unwatch_replies,
+            &mut deferred_grants,
+            &mut pending_control,
+            &mut control_inflight,
+            &mut probes,
+            &mut cookies,
+            &registry,
+            &now,
+          );
+          let _ = reply.send(());
         }
         // The watcher facade dropped: same orderly teardown, nobody to tell.
         Err(_) => break None,

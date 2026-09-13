@@ -706,19 +706,10 @@ impl<R> Source<OsString> for FsSource<R> {
     self.pending_syncs.remove(&handle);
     match result {
       Ok(path) => Ok(Begun::Installed(path_components(&path))),
-      // A coverage transition on the barrier's ground retired it before the reply
-      // was sent, and the retirement stood the covering `Rescan` for the ground
-      // this sync named. That is not an error at this seam: it is
-      // `SyncOutcome::Dominated`'s own contract, so it is carried as the outcome
-      // and the caller is resolved at once. A barrier already met by
-      // re-enumeration must not be told to wait.
-      Err(SyncRootDenied {
-        error: SyncRootError::Dominated,
-        ..
-      }) => Ok(Begun::Dominated),
       // The umbrella never retries `sync_root` at this level, so a returned
-      // admission is dropped; the mapping is over the carried `error`.
-      Err(SyncRootDenied { error, .. }) => Err(sync_error_from_fs(error)),
+      // admission is dropped; the classification is over the carried `error`
+      // alone, in `begun_from_fs`.
+      Err(SyncRootDenied { error, .. }) => begun_from_fs(error),
     }
   }
 
@@ -975,6 +966,29 @@ fn watch_error_from_fs(err: WatchRootError) -> WatchError {
   WatchError::source(SourceFault::new(kind).with_source(err))
 }
 
+/// Classifies a resolved `sync_root` result into what [`FsSource::begin_sync`] owes the caller —
+/// the one arm of the seam that is NOT reached through [`sync_error_from_fs`]'s wildcard, and the
+/// stage's single load-bearing production line.
+///
+/// [`Dominated`](SyncRootError::Dominated) is the ONE `sync_root` refusal that is not an error: a
+/// coverage transition on the barrier's ground retired it before the marker could be installed,
+/// and the retirement stood the covering `Rescan` for the ground this sync named — which is
+/// exactly what `SyncOutcome::Dominated` promises a caller, so it is carried as the OUTCOME and
+/// the caller is resolved at once. Every other refusal is delegated to [`sync_error_from_fs`]
+/// unchanged, so the two classifications cannot drift apart.
+///
+/// FAIL-ON-REVERT: delete the `Dominated` arm (fold it into the delegation instead) and a barrier
+/// that was MET reaches the caller as `sync_error_from_fs`'s wildcard —
+/// `SyncError::CookieWrite(FaultKind::Other)`, a filesystem write failure for a write that never
+/// happened, which is precisely the untrue and un-actionable outcome that function's own doc
+/// says it avoids.
+fn begun_from_fs(error: SyncRootError) -> Result<Begun<OsString>, SyncError> {
+  match error {
+    SyncRootError::Dominated => Ok(Begun::Dominated),
+    error => Err(sync_error_from_fs(error)),
+  }
+}
+
 /// Classifies a refused sync-cookie write into the neutral barrier vocabulary — the third of
 /// this binding's seam mappings, beside [`watch_error_from_fs`] and
 /// [`replace_error_to_watch_error`], and standalone for the same reason they are: the
@@ -999,10 +1013,10 @@ fn watch_error_from_fs(err: WatchRootError) -> WatchError {
 ///   [`FaultKind`] (a read-only tree is `PermissionDenied`).
 ///
 /// [`Dominated`](SyncRootError::Dominated) is deliberately absent: a barrier a coverage
-/// transition retired is not a refused write but a met barrier, taken by `begin_sync` as
-/// [`Begun::Dominated`] before this is ever reached. Left to the wildcard it would reach a
-/// caller as a write failure, which is both untrue and un-actionable — hence this note rather
-/// than silence.
+/// transition retired is not a refused write but a met barrier, taken by [`begun_from_fs`] as
+/// [`Begun::Dominated`] before this function is ever reached. Left to the wildcard it would
+/// reach a caller as a write failure, which is both untrue and un-actionable — hence this note
+/// rather than silence.
 ///
 /// The fs error type is `#[non_exhaustive]`, and the wildcard is deliberately the FAILED-write
 /// arm: a variant added later is a refused barrier until it is classified here, never a silent

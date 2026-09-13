@@ -9800,6 +9800,183 @@ mod descending {
       assert!(core.take_barrier_moves().is_empty());
     }
 
+    /// THIS PROCESS's reserved cookie directory is the one arm the funnel
+    /// deliberately does not bump on.
+    ///
+    /// The first sync of a directory MINTS that directory and the cascade arms
+    /// it: it is the barrier's own ground coming into coverage, created by the
+    /// write itself, and it can only ever hold markers. A bump there would let
+    /// every barrier dominate ITSELF on its first sync — the arm lands AT the
+    /// reserved directory, which intersects the obligation's `cover_dir` (its
+    /// parent), so the retirement would refuse the claim or purge the emit of the
+    /// very write that created the ground. A foreign directory standing at that
+    /// name is the EEXIST arm's business, never the epoch's.
+    ///
+    /// This is the one barrier fact the fake cannot witness: `FakeFs`'s cookie
+    /// write PUTS the reserved directory into its tree and injects no source
+    /// event for it, so no cascade arms it and no driver cell reaches the funnel.
+    /// The real proof is on real inotify — `watcher::linux_kernel_tests` and the
+    /// `linux_inotify` integration suite — and here, sans-I/O, at the funnel.
+    ///
+    /// Revert witness: raise the bump unconditionally and this stamp moves under
+    /// an arm the write itself caused.
+    #[test]
+    fn the_reserved_cookie_directory_s_own_arm_never_moves_the_stamp() {
+      let (mut core, scope, req, _root) = live_descending();
+      let before = quiesce(&mut core, scope);
+      core.on_enumerated(req, listed(vec![entry(COOKIE_DIR, FileKind::Dir, 1, 11)]));
+      run_cascade(&mut core, &BTreeMap::new());
+      assert_eq!(
+        core.covered_paths(),
+        vec![p("/r"), p("/r").join(COOKIE_DIR)],
+        "non-vacuity: the cascade really did arm the reserved directory"
+      );
+      assert_eq!(epoch(&core, scope).0, before.0, "no funnel was passed");
+      assert!(core.take_barrier_moves().is_empty());
+    }
+
+    /// The exemption is NAME-ONLY on the armed child itself; it says nothing
+    /// about what the reserved directory's own cold enumeration later discovers
+    /// underneath it. A foreign directory MOVED IN at the reserved name hides
+    /// only its own depth-one contents from the consumer classifier — a
+    /// subdirectory one level deeper is not suppressed, arms under its own
+    /// (non-reserved) name, and passes the funnel like any other child.
+    ///
+    /// Revert witness: widen the exemption to cover the reserved directory's
+    /// whole subtree (matching by prefix rather than by leaf-equality-of-the-
+    /// armed-child-alone) and this subdirectory's arm goes silent too.
+    #[test]
+    fn a_subdirectory_of_the_reserved_directory_still_moves_the_stamp() {
+      let (mut core, scope, req, _root) = live_descending();
+      let before = quiesce(&mut core, scope);
+      core.on_enumerated(req, listed(vec![entry(COOKIE_DIR, FileKind::Dir, 1, 11)]));
+      let cookie_dir_path = format!("/r/{COOKIE_DIR}");
+      let listings = BTreeMap::from([(
+        cookie_dir_path.as_str(),
+        vec![entry("sub", FileKind::Dir, 1, 12)],
+      )]);
+      run_cascade(&mut core, &listings);
+      assert_eq!(
+        core.covered_paths(),
+        vec![
+          p("/r"),
+          p("/r").join(COOKIE_DIR),
+          p("/r").join(COOKIE_DIR).join("sub"),
+        ],
+        "non-vacuity: the reserved directory's own cascade really did reach the subdirectory"
+      );
+      assert_eq!(
+        epoch(&core, scope).0,
+        before.0 + 1,
+        "the subdirectory moved the stamp exactly once — the reserved leaf above it moved it not \
+         at all"
+      );
+      assert_eq!(
+        core.take_barrier_moves(),
+        vec![BarrierMove {
+          scope,
+          location: ground(&format!("/r/{COOKIE_DIR}/sub")),
+          rescan_stands: false,
+        }],
+        "located at the subdirectory's own path, and at nothing else"
+      );
+    }
+
+    /// The exemption is the EXACT leaf this core holds, never the reserved name
+    /// space the classifier recognizes. That space is predictable and unowned: a
+    /// peer can stand as many reserved-SHAPED siblings under the tree as it
+    /// likes, and each one of them is ordinary ground coming into coverage, which
+    /// every barrier standing there must see.
+    ///
+    /// Revert witness: match the classifier instead of the leaf and the forged
+    /// sibling's arm goes silent.
+    #[test]
+    fn a_reserved_shaped_sibling_s_arm_still_moves_the_stamp() {
+      let (mut core, scope, req, _root) = live_descending();
+      let forged = ".tributaries-sync-cookies-1";
+      assert!(
+        crate::is_sync_cookie_dir_name(forged),
+        "staging: the forged name is inside the space the classifier accepts"
+      );
+      assert_ne!(
+        forged, COOKIE_DIR,
+        "staging: and outside the one leaf this core reserves"
+      );
+      let before = quiesce(&mut core, scope);
+      core.on_enumerated(
+        req,
+        listed(vec![
+          entry(COOKIE_DIR, FileKind::Dir, 1, 11),
+          entry(forged, FileKind::Dir, 1, 12),
+        ]),
+      );
+      run_cascade(&mut core, &BTreeMap::new());
+      assert_eq!(
+        epoch(&core, scope).0,
+        before.0 + 1,
+        "the forged sibling moved the stamp exactly once — the reserved leaf \
+         armed beside it moved it not at all"
+      );
+      assert_eq!(
+        core.take_barrier_moves(),
+        vec![BarrierMove {
+          scope,
+          location: ground(&format!("/r/{forged}")),
+          rescan_stands: false,
+        }],
+        "located at the forged sibling's own path, and at nothing else"
+      );
+    }
+
+    /// The exemption is a property of the ARM, not of a quiet queue: a reserved
+    /// arm landing while a located move of the same scope is already queued
+    /// records nothing and folds nothing — the queued move keeps its own ground,
+    /// so the burst retires exactly the barriers the other arm touched.
+    #[test]
+    fn the_reserved_arm_records_nothing_mid_burst() {
+      let (mut core, scope, req, root) = live_descending();
+      let before = quiesce(&mut core, scope);
+      core.on_enumerated(req, listed(vec![entry("sub", FileKind::Dir, 1, 11)]));
+      run_cascade(&mut core, &BTreeMap::new());
+      let armed = epoch(&core, scope);
+      assert_eq!(
+        armed.0,
+        before.0 + 1,
+        "staging: `sub`'s move is queued and undrained"
+      );
+
+      core.on_inotify_events(
+        scope,
+        vec![inotify(
+          &[root],
+          IN_CREATE | IN_ISDIR,
+          0,
+          Some(COOKIE_DIR.as_bytes()),
+        )],
+        at(1),
+      );
+      run_cascade(&mut core, &BTreeMap::new());
+      assert_eq!(
+        core.covered_paths(),
+        vec![p("/r"), p("/r").join(COOKIE_DIR), p("/r/sub")],
+        "non-vacuity: the reserved directory really was armed on top of the burst"
+      );
+      assert_eq!(
+        epoch(&core, scope).0,
+        armed.0,
+        "the reserved arm passed no funnel"
+      );
+      assert_eq!(
+        core.take_barrier_moves(),
+        vec![BarrierMove {
+          scope,
+          location: ground("/r/sub"),
+          rescan_stands: false,
+        }],
+        "and the move already queued keeps its own ground — no fold to the scope"
+      );
+    }
+
     /// A scope's BIRTH inserts its root into the watch map directly, outside the
     /// child-arm funnel — and owes no bump, since no obligation of the scope can
     /// exist yet.

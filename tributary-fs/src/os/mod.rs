@@ -535,11 +535,35 @@ impl core::fmt::Display for Backend {
   }
 }
 
+/// Every [`Backend`] variant, in declaration order — the single list
+/// [`BACKEND_NAMES`] and the identifier visitor below both read, so a renamed
+/// backend cannot drift between [`Backend::as_str`] and what this door
+/// accepts. Adding a variant to [`Backend`] without adding it to
+/// [`Backend::as_str`]'s match is already a compile error; adding it to THIS
+/// array is not — so this is still a hand-maintained edge, but now the ONLY
+/// one: nothing else here needs a second, independent update.
+#[cfg(feature = "serde")]
+const ALL_BACKENDS: [Backend; 5] = [
+  Backend::Auto,
+  Backend::Inotify,
+  Backend::Fanotify,
+  Backend::Rdcw,
+  Backend::UsnJournal,
+];
+
 /// The legal spellings of a [`Backend`] tag, in variant-declaration order —
 /// the same lowercase (kebab-case for `usn-journal`) words [`Backend::as_str`]
-/// returns.
+/// returns, derived from [`ALL_BACKENDS`] rather than typed out a second time.
 #[cfg(feature = "serde")]
-const BACKEND_NAMES: [&str; 5] = ["auto", "inotify", "fanotify", "rdcw", "usn-journal"];
+const BACKEND_NAMES: [&str; ALL_BACKENDS.len()] = {
+  let mut names = [""; ALL_BACKENDS.len()];
+  let mut index = 0;
+  while index < ALL_BACKENDS.len() {
+    names[index] = ALL_BACKENDS[index].as_str();
+    index += 1;
+  }
+  names
+};
 
 /// The longest name in [`BACKEND_NAMES`], in bytes — the ceiling a tag is
 /// measured against before anything is done with it. Derived from the
@@ -558,66 +582,146 @@ const MAX_BACKEND_NAME_LEN: usize = {
   longest
 };
 
+/// One variant tag, read through a BOUNDED identifier visitor — the same mold
+/// [`Interest`](crate::Interest)'s own bounded tag uses, applied here through
+/// `deserialize_identifier`: [`Backend`] is externally tagged, so the tag is the
+/// enum's variant identifier rather than the whole value a `deserialize_str`
+/// door would read — the identifier arm a non-self-describing format answers
+/// with an INDEX rather than a string. Its `Value` is [`Backend`] directly
+/// (every variant is a unit variant, so there is no payload left to read once
+/// the identifier resolves): both spellings and the index are looked up
+/// against [`ALL_BACKENDS`] rather than matched by hand, so a renamed tag
+/// cannot drift between [`Backend::as_str`] and what this door accepts.
+///
+/// Asking the format for an owned `String` first hands an untrusted document
+/// one allocation per tag before the five-word vocabulary it is about to fail
+/// is ever consulted, and formatting an unknown tag into `unknown_variant` then
+/// hands it a second allocation of the same size, live at the same instant. So
+/// the ceiling is judged first, on the bytes the format is already holding, and
+/// a tag past it is refused with a FIXED message naming the bound and the
+/// length — never the value. What reaches `unknown_variant` is by construction
+/// at most [`MAX_BACKEND_NAME_LEN`] bytes, so the echo it formats is bounded
+/// too.
+#[cfg(feature = "serde")]
+struct BackendName;
+
+#[cfg(feature = "serde")]
+impl<'de> serde::de::DeserializeSeed<'de> for BackendName {
+  type Value = Backend;
+
+  fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+  where
+    D: serde::Deserializer<'de>,
+  {
+    deserializer.deserialize_identifier(self)
+  }
+}
+
+#[cfg(feature = "serde")]
+impl serde::de::Visitor<'_> for BackendName {
+  type Value = Backend;
+
+  fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    write!(f, "a backend name of at most {MAX_BACKEND_NAME_LEN} bytes")
+  }
+
+  /// The one door, and the one every other text arm reaches: `visit_borrowed_str`
+  /// and `visit_string` are serde's own forwards to it, so text the format
+  /// borrows out of its input is measured without being copied at all, and
+  /// text the format already owns is measured before this face does
+  /// anything with it.
+  fn visit_str<E>(self, name: &str) -> Result<Self::Value, E>
+  where
+    E: serde::de::Error,
+  {
+    if name.len() > MAX_BACKEND_NAME_LEN {
+      // The length, never the value: an over-long tag is exactly the input
+      // whose echo is the hazard.
+      return Err(E::custom(format_args!(
+        "a backend name is at most {MAX_BACKEND_NAME_LEN} bytes, and this one is {}",
+        name.len()
+      )));
+    }
+    ALL_BACKENDS
+      .into_iter()
+      .find(|backend| backend.as_str() == name)
+      .ok_or_else(|| E::unknown_variant(name, &BACKEND_NAMES))
+  }
+
+  /// The bytes-identifier door a format reads when its tag comes as raw bytes
+  /// rather than `str` (a binary format's map-key, for one) — bounded and
+  /// echoed the same way [`visit_str`](Self::visit_str) is, `unknown_variant`
+  /// included, since serde's own error only accepts a `str` to echo.
+  fn visit_bytes<E>(self, name: &[u8]) -> Result<Self::Value, E>
+  where
+    E: serde::de::Error,
+  {
+    if name.len() > MAX_BACKEND_NAME_LEN {
+      return Err(E::custom(format_args!(
+        "a backend name is at most {MAX_BACKEND_NAME_LEN} bytes, and this one is {}",
+        name.len()
+      )));
+    }
+    ALL_BACKENDS
+      .into_iter()
+      .find(|backend| backend.as_str().as_bytes() == name)
+      .ok_or_else(|| E::unknown_variant(&String::from_utf8_lossy(name), &BACKEND_NAMES))
+  }
+
+  /// The identifier door a NON-self-describing format answers with — the
+  /// variant's declaration-order INDEX, which is what [`Backend`]'s derived
+  /// `Serialize` still writes for such a format. Bounds-checked against
+  /// [`ALL_BACKENDS`]'s own length rather than hand-counted, so a renamed or
+  /// added variant moves the ceiling with it.
+  fn visit_u64<E>(self, index: u64) -> Result<Self::Value, E>
+  where
+    E: serde::de::Error,
+  {
+    usize::try_from(index)
+      .ok()
+      .and_then(|index| ALL_BACKENDS.get(index).copied())
+      .ok_or_else(|| {
+        E::custom(format_args!(
+          "a backend variant index is at most {}, and this one is {index}",
+          ALL_BACKENDS.len() - 1
+        ))
+      })
+  }
+}
+
 #[cfg(feature = "serde")]
 impl<'de> serde::Deserialize<'de> for Backend {
-  /// A single tag, read through a BOUNDED borrowed-string visitor — the same
-  /// mold this crate's own exclusion-path face uses.
-  ///
-  /// Asking the format for an owned `String` first hands an untrusted document
-  /// one allocation per tag before the five-word vocabulary it is about to fail
-  /// is ever consulted, and formatting an unknown tag into `unknown_variant`
-  /// then hands it a second allocation of the same size, live at the same
-  /// instant. So the ceiling is judged first, on the bytes the format is
-  /// already holding, and a tag past it is refused with a FIXED message naming
-  /// the bound and the length — never the value. What reaches
-  /// `unknown_variant` is by construction at most [`MAX_BACKEND_NAME_LEN`]
-  /// bytes, so the echo it formats is bounded too.
+  /// One externally-tagged, unit-only vocabulary — the string form
+  /// (`"auto"`), the map form a unit variant takes (`{"auto": null}`), and a
+  /// non-self-describing format's variant-index form all resolve through a
+  /// bounded identifier seed rather than an owned, unbounded `String` serde's
+  /// derive would build to match it against the vocabulary.
   fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
   where
     D: serde::Deserializer<'de>,
   {
-    struct BackendName;
+    struct BackendVisitor;
 
-    impl serde::de::Visitor<'_> for BackendName {
+    impl<'de> serde::de::Visitor<'de> for BackendVisitor {
       type Value = Backend;
 
       fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "a backend name of at most {MAX_BACKEND_NAME_LEN} bytes")
       }
 
-      /// The one door, and the one every other arm reaches: `visit_borrowed_str`
-      /// and `visit_string` are serde's own forwards to it, so text the format
-      /// borrows out of its input is measured without being copied at all, and
-      /// text the format already owns is measured before this face does
-      /// anything with it.
-      fn visit_str<E>(self, name: &str) -> Result<Self::Value, E>
+      fn visit_enum<A>(self, data: A) -> Result<Self::Value, A::Error>
       where
-        E: serde::de::Error,
+        A: serde::de::EnumAccess<'de>,
       {
-        if name.len() > MAX_BACKEND_NAME_LEN {
-          // The length, never the value: an over-long tag is exactly the input
-          // whose echo is the hazard.
-          return Err(E::custom(format_args!(
-            "a backend name is at most {MAX_BACKEND_NAME_LEN} bytes, and this one is {}",
-            name.len()
-          )));
-        }
-        match name {
-          "auto" => Ok(Backend::Auto),
-          "inotify" => Ok(Backend::Inotify),
-          "fanotify" => Ok(Backend::Fanotify),
-          "rdcw" => Ok(Backend::Rdcw),
-          "usn-journal" => Ok(Backend::UsnJournal),
-          other => Err(E::unknown_variant(other, &BACKEND_NAMES)),
-        }
+        use serde::de::VariantAccess as _;
+
+        let (backend, access) = data.variant_seed(BackendName)?;
+        access.unit_variant()?;
+        Ok(backend)
       }
     }
 
-    // `deserialize_str` rather than `deserialize_string`: this door needs to
-    // READ the tag, not to own it, and the hint is what lets a format borrow
-    // straight out of its input instead of allocating a copy it would only be
-    // measured against.
-    deserializer.deserialize_str(BackendName)
+    deserializer.deserialize_enum("Backend", &BACKEND_NAMES, BackendVisitor)
   }
 }
 
@@ -1309,7 +1413,9 @@ mod tests {
   /// [`Backend`]'s hand-written bounded-visitor [`Deserialize`](serde::Deserialize).
   #[cfg(feature = "serde")]
   mod serde_face {
-    use super::Backend;
+    use serde::de::{DeserializeSeed as _, value::U64Deserializer};
+
+    use super::super::{BACKEND_NAMES, Backend, BackendName};
 
     #[test]
     fn every_variant_round_trips() {
@@ -1323,6 +1429,28 @@ mod tests {
         let json = serde_json::to_string(&backend).unwrap();
         assert_eq!(json, format!(r#""{}""#, backend.as_str()));
         assert_eq!(serde_json::from_str::<Backend>(&json).unwrap(), backend);
+      }
+    }
+
+    /// The externally-tagged MAP form a unit variant takes — `derive(Deserialize)`
+    /// accepted `{"auto": null}` for every variant, and the bounded hand impl
+    /// must accept exactly the same shape: `deserialize_enum` frames it, not
+    /// `deserialize_str`.
+    #[test]
+    fn every_variant_round_trips_through_the_map_form() {
+      for backend in [
+        Backend::Auto,
+        Backend::Inotify,
+        Backend::Fanotify,
+        Backend::Rdcw,
+        Backend::UsnJournal,
+      ] {
+        let document = format!(r#"{{"{}": null}}"#, backend.as_str());
+        assert_eq!(
+          serde_json::from_str::<Backend>(&document).unwrap(),
+          backend,
+          "the map form of a unit variant round-trips: {document}"
+        );
       }
     }
 
@@ -1352,6 +1480,38 @@ mod tests {
       );
     }
 
+    /// The same bound, over the bytes-identifier door — the one a binary
+    /// format's map-key reaches, which `serde_json` never drives.
+    #[test]
+    fn an_over_long_backend_name_is_refused_without_echoing_it_as_bytes() {
+      use serde::de::Visitor as _;
+
+      const FILLER: u8 = b'z';
+
+      let tag = alloc_vec(FILLER, 1024 * 1024);
+      let refusal = BackendName
+        .visit_bytes::<serde_json::Error>(&tag)
+        .expect_err("a tag past the vocabulary's longest name is refused")
+        .to_string();
+
+      assert!(
+        refusal.contains("at most 11 bytes"),
+        "the refusal names the bound: {refusal}"
+      );
+      assert!(
+        refusal.contains(&tag.len().to_string()),
+        "and the length it measured: {refusal}"
+      );
+      assert!(
+        !refusal.contains(&(FILLER as char).to_string().repeat(9)),
+        "and none of the value itself: {refusal}"
+      );
+    }
+
+    fn alloc_vec(byte: u8, len: usize) -> std::vec::Vec<u8> {
+      core::iter::repeat_n(byte, len).collect()
+    }
+
     /// A junk tag inside the bound reaches the vocabulary and is refused as
     /// `unknown_variant`, with the (short, bounded) tag echoed.
     #[test]
@@ -1362,6 +1522,35 @@ mod tests {
       assert!(
         refusal.contains("unknown variant") && refusal.contains("notabackend"),
         "the vocabulary answers an in-bound tag: {refusal}"
+      );
+    }
+
+    /// A non-self-describing format's identifier door answers with the
+    /// variant's declaration-order INDEX rather than a name — the shape
+    /// `Backend`'s own derived `Serialize` still writes for such a format.
+    /// `U64Deserializer` drives `deserialize_identifier` exactly the way such a
+    /// format would: index `0` is the first variant, and an out-of-range index
+    /// is refused with a fixed message.
+    #[test]
+    fn index_zero_resolves_to_the_first_variant_through_a_non_self_describing_identifier() {
+      let seed_result = BackendName.deserialize(U64Deserializer::<serde_json::Error>::new(0));
+      assert!(
+        matches!(seed_result, Ok(Backend::Auto)),
+        "index 0 is the first variant, Backend::Auto"
+      );
+    }
+
+    #[test]
+    fn an_out_of_range_backend_index_is_refused() {
+      let out_of_range = BACKEND_NAMES.len() as u64;
+      let refusal =
+        BackendName.deserialize(U64Deserializer::<serde_json::Error>::new(out_of_range));
+      let refusal = refusal
+        .expect_err("an index at or past the vocabulary's length names no variant")
+        .to_string();
+      assert!(
+        refusal.contains(&format!("at most {}", BACKEND_NAMES.len() - 1)),
+        "the refusal names the fixed bound: {refusal}"
       );
     }
   }

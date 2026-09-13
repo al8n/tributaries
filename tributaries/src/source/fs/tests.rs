@@ -296,6 +296,49 @@ fn sync_error_from_fs_classifies_a_refused_cookie_honestly() {
   );
 }
 
+/// [`begun_from_fs`](super::begun_from_fs) — the stage's single load-bearing production line —
+/// takes [`SyncRootError::Dominated`] as the one refusal that is not an error, and delegates
+/// every other refusal to [`sync_error_from_fs`](super::sync_error_from_fs) unchanged.
+///
+/// `Dominated` is asserted beside a neighbour that really is transient (`WriteInFlight`) and one
+/// that is terminal (`Retired`), because the value of the classification is the DISTINCTION: a
+/// classifier that folded `Dominated` into either neighbour's shape would still pass an
+/// assertion on `Dominated` alone.
+///
+/// FAIL-ON-REVERT: delete the `Dominated` arm from `begun_from_fs` (fold it into the delegation
+/// to `sync_error_from_fs` instead) and the first assertion below fails — a barrier that was MET
+/// is reported `Err(SyncError::CookieWrite(..))`, the wildcard's write-failure shape, for a write
+/// that never happened.
+#[test]
+fn begun_from_fs_classifies_a_resolved_sync_honestly() {
+  use tributary_fs::SyncRootError;
+
+  use crate::{Begun, error::SyncError};
+
+  assert!(
+    matches!(
+      super::begun_from_fs(SyncRootError::Dominated),
+      Ok(Begun::Dominated)
+    ),
+    "a barrier a coverage transition retired is MET by the covering `Rescan` the retirement \
+     stood, so it is the outcome the caller is resolved with, never a refusal"
+  );
+  assert!(
+    matches!(
+      super::begun_from_fs(SyncRootError::WriteInFlight),
+      Err(SyncError::Busy)
+    ),
+    "every other refusal is delegated to `sync_error_from_fs` unchanged"
+  );
+  assert!(
+    matches!(
+      super::begun_from_fs(SyncRootError::Retired),
+      Err(SyncError::Retired)
+    ),
+    "a dead root is a terminal, and nothing about domination reclassifies it"
+  );
+}
+
 /// The fs-to-neutral EVENT binding ([`SourceEvent::from_fs`](super::SourceEvent::from_fs)),
 /// driven from a real lower-layer [`tributary_fs::Event`] all the way to the delivery a
 /// source-only subscriber receives — the propagation of a rename's SOURCE coordinate across
