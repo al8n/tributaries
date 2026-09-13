@@ -833,7 +833,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Every target runs the same seven-way partition, one shard per job. The
+        # Every target runs the same nine-way partition, one shard per job. The
         # partition is disjoint and exhaustive over every workspace test, so the
         # shards together are exactly the single unsharded pass they replace.
         #
@@ -852,9 +852,11 @@ jobs:
           - riscv64gc-unknown-linux-gnu
           - aarch64-apple-darwin
         test-group:
-          - rest
+          - proto-rest
           - proto-monitor-head
           - proto-monitor-tail
+          - umbrella-head
+          - umbrella-tail
           - fs-rest
           - fs-cookie
           - fs-descending
@@ -876,19 +878,26 @@ jobs:
             os: macos-latest
     runs-on: ${{ matrix.os }}
     # Sized from the shards themselves, not from the 6 h default a job inherits
-    # by saying nothing. All seven interpreted on one host, tree borrows then
+    # by saying nothing. All nine interpreted on one host, tree borrows then
     # stacked: `fs-descending` ~38/~24 min for 93 cells, `fs-rest` ~33/~20 for
-    # 684, `rest` ~28/~23 for 229, `proto-monitor-head` ~18/~12 for 219,
-    # `fs-driver` ~17/~10 for 75, `proto-monitor-tail` ~11/~8 for 146,
-    # `fs-cookie` ~8/~6 for 76. Tree borrows costs 1.2-1.7x its stacked
-    # counterpart and reorders the middle of the table, so the bound is sized
-    # from it; both jobs share it because both run this same matrix. Add the
-    # toolchain install, `cargo miri setup` and a cold build, and even the
-    # longest tree-borrows job lands inside an hour, which leaves headroom for
-    # a slow runner or a cache miss. What it buys is the failure mode: a shard
-    # that wedges — the one thing an interpreter makes easy, since a cell can
-    # spin without ever being wrong — now reports in 90 minutes instead of
-    # burning six hours of a concurrency slot before anyone hears about it.
+    # 684, `proto-monitor-head` ~18/~12 for 219, `fs-driver` ~17/~10 for 75,
+    # `proto-monitor-tail` ~11/~8 for 146, `fs-cookie` ~8/~6 for 76. `rest` —
+    # now split into `proto-rest` (84 cells), `umbrella-head` (92) and
+    # `umbrella-tail` (66) — ran 40-60 min stacked and 80-90+ min tree borrows
+    # on CI run 34376836146 (865ec7d): five of seven tree-borrows `rest` shards
+    # hit this timeout outright, because the umbrella's suite grew on this
+    # branch (options faces, glob seats, sync cells) past what one shard fits.
+    # The three-way split targets ≤ 45 min per shard under tree borrows, the
+    # same bound the other shards above already clear. Tree borrows costs
+    # 1.2-1.7x its stacked counterpart and reorders the middle of the table, so
+    # the bound is sized from it; both jobs share it because both run this
+    # same matrix. Add the toolchain install, `cargo miri setup` and a cold
+    # build, and even the longest tree-borrows job lands inside an hour, which
+    # leaves headroom for a slow runner or a cache miss. What it buys is the
+    # failure mode: a shard that wedges — the one thing an interpreter makes
+    # easy, since a cell can spin without ever being wrong — now reports in 90
+    # minutes instead of burning six hours of a concurrency slot before anyone
+    # hears about it.
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
@@ -911,7 +920,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Every target runs the same seven-way partition, one shard per job. The
+        # Every target runs the same nine-way partition, one shard per job. The
         # partition is disjoint and exhaustive over every workspace test, so the
         # shards together are exactly the single unsharded pass they replace.
         #
@@ -930,9 +939,11 @@ jobs:
           - riscv64gc-unknown-linux-gnu
           - aarch64-apple-darwin
         test-group:
-          - rest
+          - proto-rest
           - proto-monitor-head
           - proto-monitor-tail
+          - umbrella-head
+          - umbrella-tail
           - fs-rest
           - fs-cookie
           - fs-descending
@@ -954,19 +965,26 @@ jobs:
             os: macos-latest
     runs-on: ${{ matrix.os }}
     # Sized from the shards themselves, not from the 6 h default a job inherits
-    # by saying nothing. All seven interpreted on one host, tree borrows then
+    # by saying nothing. All nine interpreted on one host, tree borrows then
     # stacked: `fs-descending` ~38/~24 min for 93 cells, `fs-rest` ~33/~20 for
-    # 684, `rest` ~28/~23 for 229, `proto-monitor-head` ~18/~12 for 219,
-    # `fs-driver` ~17/~10 for 75, `proto-monitor-tail` ~11/~8 for 146,
-    # `fs-cookie` ~8/~6 for 76. Tree borrows costs 1.2-1.7x its stacked
-    # counterpart and reorders the middle of the table, so the bound is sized
-    # from it; both jobs share it because both run this same matrix. Add the
-    # toolchain install, `cargo miri setup` and a cold build, and even the
-    # longest tree-borrows job lands inside an hour, which leaves headroom for
-    # a slow runner or a cache miss. What it buys is the failure mode: a shard
-    # that wedges — the one thing an interpreter makes easy, since a cell can
-    # spin without ever being wrong — now reports in 90 minutes instead of
-    # burning six hours of a concurrency slot before anyone hears about it.
+    # 684, `proto-monitor-head` ~18/~12 for 219, `fs-driver` ~17/~10 for 75,
+    # `proto-monitor-tail` ~11/~8 for 146, `fs-cookie` ~8/~6 for 76. `rest` —
+    # now split into `proto-rest` (84 cells), `umbrella-head` (92) and
+    # `umbrella-tail` (66) — ran 40-60 min stacked and 80-90+ min tree borrows
+    # on CI run 34376836146 (865ec7d): five of seven tree-borrows `rest` shards
+    # hit this timeout outright, because the umbrella's suite grew on this
+    # branch (options faces, glob seats, sync cells) past what one shard fits.
+    # The three-way split targets ≤ 45 min per shard under tree borrows, the
+    # same bound the other shards above already clear. Tree borrows costs
+    # 1.2-1.7x its stacked counterpart and reorders the middle of the table, so
+    # the bound is sized from it; both jobs share it because both run this
+    # same matrix. Add the toolchain install, `cargo miri setup` and a cold
+    # build, and even the longest tree-borrows job lands inside an hour, which
+    # leaves headroom for a slow runner or a cache miss. What it buys is the
+    # failure mode: a shard that wedges — the one thing an interpreter makes
+    # easy, since a cell can spin without ever being wrong — now reports in 90
+    # minutes instead of burning six hours of a concurrency slot before anyone
+    # hears about it.
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7

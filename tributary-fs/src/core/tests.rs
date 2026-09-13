@@ -1208,6 +1208,7 @@ fn identity_minting_respects_devices_and_mounts() {
     pending_widen: None,
     prune: Globs::default(),
     include: None,
+    markers: BTreeMap::new(),
   };
   let fid = NonZeroU64::new(7);
   assert!(mint(&state, Path::new("/r/a"), fid, None).is_some());
@@ -1249,6 +1250,7 @@ fn blind_mount_table_refuses_event_side_trust() {
     pending_widen: None,
     prune: Globs::default(),
     include: None,
+    markers: BTreeMap::new(),
   };
   let fid = NonZeroU64::new(7);
   assert!(
@@ -3012,6 +3014,7 @@ mod lowering {
       pending_widen: None,
       prune: Globs::default(),
       include: None,
+      markers: BTreeMap::new(),
     }
   }
 
@@ -17255,6 +17258,291 @@ mod prune {
       "the proven directory's pruned end is fenced: {changes:?}"
     );
   }
+
+  /// A marker the driver armed for a pending sync is exempt from the seat BY ITS
+  /// LEAF, whatever the directories above it are called. A peer that renames the
+  /// sync's own directory into pruned ground between the descriptor walk and the
+  /// create leaves the marker under a name the positional cookie exemption cannot
+  /// recognize, and a seat that took it there would strand the barrier on an
+  /// event that can no longer arrive.
+  ///
+  /// Non-vacuity in both directions: the same word still silences an ORDINARY
+  /// file at that path, and the marker's leaf stops being exempt once its
+  /// obligation is released.
+  ///
+  /// Revert witness: drop the marker clause from the record arm of `fenced` and
+  /// the marker's `Created` never leaves the core.
+  #[test]
+  fn an_active_sync_marker_is_delivered_from_pruned_ground() {
+    const MARKER: &str = ".tributaries-sync-1-2-3-abcdef";
+    const OWNER: crate::driver::CookieId = crate::driver::CookieId(1);
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_fsevents(&mut core, &pruning(&["blocked"]));
+    core.arm_sync_marker(scope, Arc::from(MARKER), OWNER);
+
+    core.on_batch_events(
+      scope,
+      vec![
+        ev(
+          &format!("/r/blocked/{MARKER}"),
+          flags(&[FsEventFlags::ITEM_CREATED, FsEventFlags::ITEM_IS_FILE]),
+          1,
+          10,
+        ),
+        ev(
+          "/r/blocked/notes.txt",
+          flags(&[FsEventFlags::ITEM_CREATED, FsEventFlags::ITEM_IS_FILE]),
+          2,
+          11,
+        ),
+      ],
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.location() == &loc(&["blocked", MARKER])),
+      "the barrier's own marker reaches the core through pruned ground: {changes:?}"
+    );
+    assert!(
+      !changes
+        .iter()
+        .any(|change| change.location() == &loc(&["blocked", "notes.txt"])),
+      "and the caller's own file in the same directory is still pruned: {changes:?}"
+    );
+
+    // Released with its obligation: the exemption is the sync's, not the name's.
+    core.release_sync_markers([(scope, Arc::from(MARKER), OWNER)]);
+    core.on_batch_events(
+      scope,
+      vec![ev(
+        &format!("/r/blocked/{MARKER}"),
+        flags(&[FsEventFlags::ITEM_CREATED, FsEventFlags::ITEM_IS_FILE]),
+        3,
+        12,
+      )],
+      at(2),
+    );
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+    assert!(
+      changes.is_empty(),
+      "a released leaf is an ordinary name again: {changes:?}"
+    );
+  }
+
+  /// A live fanotify (kernel-recursive, admission-mapped) root at `/r`.
+  fn live_fanotify(core: &mut DriverCore, options: &RootOptions) -> ScopeId {
+    let scope = core
+      .on_watch_with(PathBuf::from("/r"), options, BackendKind::Fanotify)
+      .expect("a fresh scope registers");
+    let _ = drain(core);
+    core.on_stream_spawned(
+      scope,
+      Ok(RootMeta {
+        root: PathBuf::from("/r"),
+        root_dev: 1,
+        root_mnt_id: None,
+        mounts: Vec::new(),
+        identity: crate::os::RootIdentity::new(1, 1),
+        ancestors: Vec::new(),
+        backend: BackendKind::Fanotify,
+      }),
+    );
+    let _ = drain(core);
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(0));
+    let _ = drain(core);
+    scope
+  }
+
+  /// A live USN-journal root at `/r`.
+  fn live_usn(core: &mut DriverCore, options: &RootOptions) -> ScopeId {
+    let scope = core
+      .on_watch_with(PathBuf::from("/r"), options, BackendKind::UsnJournal)
+      .expect("a fresh scope registers");
+    let _ = drain(core);
+    core.on_stream_spawned(
+      scope,
+      Ok(RootMeta {
+        root: PathBuf::from("/r"),
+        root_dev: 1,
+        root_mnt_id: None,
+        mounts: Vec::new(),
+        identity: crate::os::RootIdentity::new(1, 1),
+        ancestors: Vec::new(),
+        backend: BackendKind::UsnJournal,
+      }),
+    );
+    let _ = drain(core);
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(0));
+    let _ = drain(core);
+    scope
+  }
+
+  /// The `Rescan` locations one drain carried.
+  fn rescans(changes: &[&Change]) -> Vec<Location> {
+    changes
+      .iter()
+      .filter(|change| change.kind().is_rescan())
+      .map(|change| change.location().clone())
+      .collect()
+  }
+
+  /// A directory rename INTO pruned ground is not a silent drop: the fence stands
+  /// ONE located `Rescan` at the destination's nearest unpruned parent in the
+  /// dropped record's place. The subtree really did move somewhere the seat
+  /// covers, so every later change under it — this driver's own sync marker
+  /// included — is silent from that instant, and the consumer had nothing telling
+  /// it to re-read. On a kernel-recursive profile the source has already forgotten
+  /// the moved subtree, so the cover is the ONLY thing that can dominate a barrier
+  /// still waiting under it.
+  ///
+  /// Asserted on all three kernel-recursive lowerings that report a rename pair,
+  /// because each reaches the fence by its own route.
+  ///
+  /// Revert witness: drop the `MovedTo` arm of `fenced` and every cover here goes
+  /// with it, leaving only the departure.
+  #[test]
+  fn a_directory_rename_into_pruned_ground_covers_the_scope() {
+    use crate::os::windows::{
+      RawWindowsEvent,
+      usn::{UsnAdmitted, UsnTarget},
+    };
+
+    // fanotify: the admission map forgot the moved subtree, so nothing under the
+    // destination can ever resolve again.
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_fanotify(&mut core, &pruning(&["blocked"]));
+    core.on_batch(
+      scope,
+      BatchPayload::detached(vec![SourceEvent::Linux(RawLinuxEvent::Fanotify(
+        crate::os::linux::fanotify::AdmittedEvent {
+          mask: crate::os::linux::fanotify::fid::FanMask::new(
+            crate::os::linux::fanotify::fid::FAN_RENAME
+              | crate::os::linux::fanotify::fid::FAN_ONDIR,
+          ),
+          path: None,
+          rename: Some(crate::os::linux::fanotify::AdmittedRename {
+            old_path: PathBuf::from("/r/open"),
+            new_path: PathBuf::from("/r/blocked"),
+          }),
+        },
+      ))]),
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+    assert_eq!(
+      rescans(&changes),
+      vec![loc(&[])],
+      "one cover, at the root — the nearest unpruned parent of `/r/blocked`: {changes:?}"
+    );
+    assert!(
+      !mentions(&changes, "blocked"),
+      "and it names no pruned ground: {changes:?}"
+    );
+
+    // USN: the same shape through the journal lowering's pair.
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_usn(&mut core, &pruning(&["blocked"]));
+    let component = |c: &str| UsnTarget::Resolved(vec![c.to_owned()]);
+    core.on_batch(
+      scope,
+      BatchPayload::detached(vec![SourceEvent::Windows(RawWindowsEvent::Usn(
+        UsnAdmitted::Renamed {
+          old: component("open"),
+          old_content: 0,
+          new: component("blocked"),
+          new_content: 0,
+          is_dir: true,
+        },
+      ))]),
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+    assert_eq!(
+      rescans(&changes),
+      vec![loc(&[])],
+      "the journal's pair owes the same one cover: {changes:?}"
+    );
+    assert!(
+      !mentions(&changes, "blocked"),
+      "and it names no pruned ground either: {changes:?}"
+    );
+  }
+
+  /// The descending profile owes the cover too. Its own geometry pass cannot
+  /// stand one: the pass reads the Monitor's report of a reparent, and a
+  /// destination the fence takes is never fed, so no reparent is ever reported.
+  #[test]
+  fn a_descending_directory_rename_into_pruned_ground_covers_the_scope() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let (scope, req, root) = live_descending(&mut core, &pruning(&["blocked"]));
+    core.on_enumerated(req, listed(vec![entry("open", FileKind::Dir)]));
+    let effects = drain(&mut core);
+    let (_, open_req) = arm(&mut core, &effects, "/r/open");
+    core.on_enumerated(open_req, listed(Vec::new()));
+    let _ = drain(&mut core);
+
+    core.on_inotify_events(
+      scope,
+      vec![
+        inotify(root, IN_MOVED_FROM | IN_ISDIR, 9, Some("open")),
+        inotify(root, IN_MOVED_TO | IN_ISDIR, 9, Some("blocked")),
+      ],
+      at(1),
+    );
+    core.on_timeout(at(1_000));
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+
+    assert!(
+      rescans(&changes).contains(&loc(&[])),
+      "the departure's destination is covered at the root: {changes:?}"
+    );
+    assert!(
+      !mentions(&changes, "blocked"),
+      "and no cover names the pruned destination: {changes:?}"
+    );
+  }
+
+  /// The cover climbs to the NEAREST unpruned parent, not merely one segment: a
+  /// destination under a pruned ancestor several levels down has no unpruned
+  /// parent inside the subtree the seat closed, and a `Rescan` there would name
+  /// ground the caller asked never to hear about.
+  #[test]
+  fn a_rename_into_deeply_pruned_ground_covers_the_nearest_unpruned_parent() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_fanotify(&mut core, &pruning(&["a/blocked"]));
+    core.on_batch(
+      scope,
+      BatchPayload::detached(vec![SourceEvent::Linux(RawLinuxEvent::Fanotify(
+        crate::os::linux::fanotify::AdmittedEvent {
+          mask: crate::os::linux::fanotify::fid::FanMask::new(
+            crate::os::linux::fanotify::fid::FAN_RENAME
+              | crate::os::linux::fanotify::fid::FAN_ONDIR,
+          ),
+          path: None,
+          rename: Some(crate::os::linux::fanotify::AdmittedRename {
+            old_path: PathBuf::from("/r/open"),
+            new_path: PathBuf::from("/r/a/blocked/deep"),
+          }),
+        },
+      ))]),
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+    assert_eq!(
+      rescans(&changes),
+      vec![loc(&["a"])],
+      "the cover stands at `/r/a` — above the pruned `a/blocked`, not beside \
+       `deep`: {changes:?}"
+    );
+  }
 }
 
 mod include {
@@ -17697,6 +17985,152 @@ mod include {
     assert!(
       changes.is_empty(),
       "a user directory sharing the stem is a user directory: {changes:?}"
+    );
+  }
+
+  /// The positional cookie exemption reads the marker's PARENT, and a parent is
+  /// only as stable as whoever can rename it. A peer that renames the reserved
+  /// directory to an ordinary name between the write's descriptor walk and its
+  /// create leaves the marker under `ordinary/`, where clause (d) no longer
+  /// recognizes it and a seat naming the caller's own media takes the one file
+  /// the barrier waits on.
+  ///
+  /// So the marker is exempt by its own LEAF as well, which the driver arms with
+  /// the obligation and releases with it. The leaf carries the sync's
+  /// unpredictable nonce, so the exemption cannot be borrowed: an unarmed name at
+  /// the same path obeys the seat, and so does the marker's leaf once released.
+  ///
+  /// Revert witness: drop the marker clause from `admits` and the renamed
+  /// parent's marker is silenced by `**/*.mp4`.
+  #[test]
+  fn an_active_marker_is_admitted_under_a_renamed_cookie_directory() {
+    const MARKER: &str = ".tributaries-sync-1-2-3-abcdef";
+    const OWNER: crate::driver::CookieId = crate::driver::CookieId(1);
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_fsevents(&mut core, &including(&["**/*.mp4"]));
+    core.arm_sync_marker(scope, Arc::from(MARKER), OWNER);
+
+    core.on_batch_events(
+      scope,
+      vec![
+        // The cookie directory was renamed to `ordinary` after it was opened;
+        // the anchored create followed the descriptor, so the marker landed here.
+        ev(
+          &format!("/r/ordinary/{MARKER}"),
+          flags(&[FsEventFlags::ITEM_CREATED, FsEventFlags::ITEM_IS_FILE]),
+          1,
+          10,
+        ),
+        // A name the driver never armed, in the very same directory.
+        ev(
+          "/r/ordinary/.tributaries-sync-someone-else",
+          flags(&[FsEventFlags::ITEM_CREATED, FsEventFlags::ITEM_IS_FILE]),
+          2,
+          11,
+        ),
+      ],
+      at(1),
+    );
+    let changes = drain(&mut core);
+    let changes = emits(&changes);
+    assert_eq!(
+      located(&changes),
+      vec![loc(&["ordinary", MARKER])],
+      "the armed marker is admitted by its identity, and nothing else in that \
+       directory is: {changes:?}"
+    );
+
+    // Released with its obligation: the exemption is the sync's, not the name's.
+    core.release_sync_markers([(scope, Arc::from(MARKER), OWNER)]);
+    core.on_batch_events(
+      scope,
+      vec![ev(
+        &format!("/r/ordinary/{MARKER}"),
+        flags(&[FsEventFlags::ITEM_CREATED, FsEventFlags::ITEM_IS_FILE]),
+        3,
+        12,
+      )],
+      at(2),
+    );
+    let changes = drain(&mut core);
+    let changes = emits(&changes);
+    assert!(
+      changes.is_empty(),
+      "a released leaf is an ordinary name again: {changes:?}"
+    );
+  }
+
+  /// A marker leaf frees at its obligation's terminal, so the very name a
+  /// retiring sync is queueing a release for may already belong to a SUCCESSOR by
+  /// the time the drain runs. The exact interleaving: the loop-top drain runs; an
+  /// unlink worker retires the predecessor and queues its release under the
+  /// ledger lock; the command step admits a successor under the same scope and
+  /// leaf, whose arm takes ownership of the entry; the next drain applies the
+  /// predecessor's release.
+  ///
+  /// Keyed by the leaf alone that release removes the SUCCESSOR's live exemption,
+  /// and the marker the successor's barrier waits on is then taken by an include
+  /// seat naming the caller's own media — a `sync` that reported success and can
+  /// never resolve. Keyed by the obligation, the stale release finds an owner that
+  /// is not its own and removes nothing.
+  ///
+  /// Revert witness: drop the owner comparison from `release_sync_markers` and
+  /// the successor's marker is silenced by `**/*.mp4`.
+  #[test]
+  fn a_stale_release_never_disarms_a_same_name_successor() {
+    const MARKER: &str = ".tributaries-sync-1-2-3-abcdef";
+    const PREDECESSOR: crate::driver::CookieId = crate::driver::CookieId(7);
+    const SUCCESSOR: crate::driver::CookieId = crate::driver::CookieId(8);
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_fsevents(&mut core, &including(&["**/*.mp4"]));
+
+    // The predecessor's admission, then its retirement — which only QUEUES the
+    // release; nothing has reached the core yet.
+    core.arm_sync_marker(scope, Arc::from(MARKER), PREDECESSOR);
+    // The successor is admitted under the freed name before that drain runs, and
+    // its arm takes ownership of the entry.
+    core.arm_sync_marker(scope, Arc::from(MARKER), SUCCESSOR);
+    // The drain, applying the predecessor's queued release.
+    core.release_sync_markers([(scope, Arc::from(MARKER), PREDECESSOR)]);
+
+    core.on_batch_events(
+      scope,
+      vec![ev(
+        &format!("/r/ordinary/{MARKER}"),
+        flags(&[FsEventFlags::ITEM_CREATED, FsEventFlags::ITEM_IS_FILE]),
+        1,
+        10,
+      )],
+      at(1),
+    );
+    let changes = drain(&mut core);
+    let changes = emits(&changes);
+    assert_eq!(
+      located(&changes),
+      vec![loc(&["ordinary", MARKER])],
+      "the successor owns the leaf, so its predecessor's release disarmed \
+       nothing: {changes:?}"
+    );
+
+    // Non-vacuity: the successor's OWN release still ends the exemption, so the
+    // ownership test is a guard on the release and not a way to keep a leaf armed
+    // forever.
+    core.release_sync_markers([(scope, Arc::from(MARKER), SUCCESSOR)]);
+    core.on_batch_events(
+      scope,
+      vec![ev(
+        &format!("/r/ordinary/{MARKER}"),
+        flags(&[FsEventFlags::ITEM_CREATED, FsEventFlags::ITEM_IS_FILE]),
+        2,
+        11,
+      )],
+      at(2),
+    );
+    let changes = drain(&mut core);
+    let changes = emits(&changes);
+    assert!(
+      changes.is_empty(),
+      "the owner's own release frees the leaf: {changes:?}"
     );
   }
 

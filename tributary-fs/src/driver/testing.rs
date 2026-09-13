@@ -1738,7 +1738,6 @@ impl FsOps for FakeFs {
       },
       receiver,
       meta,
-      root_pin: None,
     })
   }
 
@@ -1947,26 +1946,21 @@ impl FsOps for FakeFs {
     })
   }
 
-  /// No descriptors exist in a modelled tree, so this fake pins nothing and the
-  /// [`LiveRoot`] the driver records for it carries no object. What the real
-  /// implementation would refuse for, the fake never reaches: its whole world is
-  /// the path map below.
-  fn pin_root(
-    &self,
-    root: &Path,
-    identity: crate::os::RootIdentity,
-  ) -> Option<std::sync::Arc<crate::driver::RootPin>> {
-    let _ = (root, identity);
-    None
-  }
-
   fn write_cookie(
     &self,
     root: &crate::driver::LiveRoot,
     dir: &Path,
+    admitted: crate::driver::AdmittedDirs,
     name: &str,
     prune: &tributary_proto::glob::Globs,
+    exclusions: &[PathBuf],
   ) -> Result<CookieFile, CookieWriteError> {
+    // The modelled tree has no relationship to the real filesystem the admission
+    // door samples, so no admitted identity ever names a node here. The
+    // object-replacement verdicts — the target's and the reserved cookie
+    // directory's — are real-syscall properties and are proven where they live,
+    // against real inodes.
+    let _ = admitted;
     let root = root.path();
     // The dispatch is counted BEFORE the hold: a cell that must race a scope
     // retirement (or an abandoned reply) against a write in flight needs to know
@@ -2020,6 +2014,14 @@ impl FsOps for FakeFs {
           "the cookie directory resolves outside the watched root",
         )));
       }
+      // The watcher's exclusions, judged on that same CANONICAL directory — the
+      // production refusal, mirrored, so a cell can prove the verdict is taken on
+      // the directory the write resolves rather than on the spelling the
+      // admission already cleared.
+      if let Some(exclusion) = crate::driver::cookie_dir_excluded(exclusions, &canonical_dir) {
+        let exclusion = exclusion.to_path_buf();
+        return Err(CookieWriteError::excluded(canonical_dir, exclusion));
+      }
       // The root's prune seat, judged on the CANONICAL directory this write
       // would create in — the production refusal, mirrored, so a cell can prove
       // the verdict is taken on the path the writer selects rather than on the
@@ -2071,6 +2073,9 @@ impl FsOps for FakeFs {
         source: std::io::Error::new(kind, "cookie write left an unresolved file"),
         residue: Some(Box::new(CookieResidue::File(file))),
         pruned: None,
+        excluded: None,
+        replaced: None,
+        crossed: None,
       });
     }
     Ok(file)

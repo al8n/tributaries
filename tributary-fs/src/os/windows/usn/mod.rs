@@ -1508,6 +1508,23 @@ impl UsnFence {
     !self.unengaged() && self.fences_path(directory, &self.joined(dir, name))
   }
 
+  /// The EXCLUSION half of [`excludes_end`](Self::excludes_end) alone.
+  ///
+  /// One caller: the rename destination this layer still NAMES to the common
+  /// fence. A subtree renamed into pruned ground owes the consumer a covering
+  /// `Rescan` at the destination's nearest unpruned parent, and the fence that
+  /// stands it can only do so for a destination it was told about — so the prune
+  /// half is left to decide there rather than here, while the map below still
+  /// forgets the departed subtree exactly as it does for any move out of the
+  /// reported tree. An EXCLUSION is different in kind: the caller took that
+  /// subtree out of the reported world outright, nothing inside one is owed a
+  /// recovery instruction there, and a sync whose cookie directory lies in one is
+  /// refused before any write.
+  fn excluded_end(&self, dir: &[String], name: &UsnName) -> bool {
+    !self.exclusions.is_empty()
+      && crate::driver::excluded(&self.exclusions, &self.joined(dir, name))
+  }
+
   /// Whether the link one record was written under is outside the reported tree.
   ///
   /// A parent the map cannot resolve is OUT OF ROOT, not excluded, and never
@@ -2298,6 +2315,25 @@ impl UsnAdmission {
     };
     let old_end = resolve_end(old_parent.clone(), &old.name);
     let new_end = resolve_end(new_parent.clone(), &new.name);
+    // THE DESTINATION THIS LAYER STILL NAMES. The map above must forget a
+    // subtree that left the reported tree, and it does — but the CONSUMER is
+    // owed more than a departure when the tree it left for is merely pruned:
+    // every later change under that destination is silent by the seat's own
+    // rule, including this driver's own sync marker, so the common fence stands
+    // one covering `Rescan` at the destination's nearest unpruned parent. It can
+    // only stand one for a destination it was told about, so the prune half's
+    // verdict is left to it while the EXCLUSION half still nulls here (a subtree
+    // the caller took out of the reported world is owed nothing inside it, and a
+    // sync cannot be placed in one). Nulled with the source too — a rename with
+    // no reported source is a move-IN, whose destination this layer reports on
+    // its own membership verb and whose arriving subtree the walk covers.
+    let reported_destination = new_end.clone().or_else(|| {
+      let dir = old_parent
+        .as_ref()
+        .and_then(|_| self.map.resolve_dir(new.parent))
+        .filter(|dir| !self.fence.excluded_end(dir, &new.name))?;
+      resolve_end(Some(dir), &new.name)
+    });
 
     // Map maintenance mirrors the boundary shape.
     if is_dir {
@@ -2481,7 +2517,7 @@ impl UsnAdmission {
     // own record's end. Nothing is registered here, because a booking made from
     // a lowering is a booking a half whose endpoint is not reportable never
     // makes: see [`SessionTable::observe`].
-    match (old_end, new_end) {
+    match (old_end, reported_destination) {
       (Some(old_target), Some(new_target)) => out.push(UsnAdmitted::Renamed {
         old: old_target,
         old_content,
@@ -6129,6 +6165,87 @@ mod exclusion_fence {
     // And the arrival really is unmapped: a create under it resolves nothing.
     adm.admit(record(80, 70, reason::FILE_CREATE, FILE, "child"), &mut out);
     assert!(out.is_empty(), "{out:?}");
+  }
+
+  /// A directory moved OUT of the reported tree into PRUNED ground still NAMES
+  /// its destination. The map must forget the departed subtree — and does — but
+  /// the common fence owes the consumer one covering `Rescan` at the
+  /// destination's nearest unpruned parent, and it can only stand one for a
+  /// destination this layer told it about. Degrading the pair to the source half
+  /// alone decided that question here, where the seat's climb cannot be
+  /// expressed, and left a barrier under the moved subtree waiting for its
+  /// deadline.
+  ///
+  /// An EXCLUDED destination is not the same question and keeps the degrade: the
+  /// caller took that subtree out of the reported world, so nothing inside it is
+  /// owed a recovery instruction there.
+  ///
+  /// Revert witness: null the pruned destination with the excluded one and the
+  /// pair collapses to a `Single` the fence can no longer cover from.
+  #[test]
+  fn a_move_out_into_pruned_ground_still_names_its_destination() {
+    let mut adm = pruned_admission(None, &["**/cache"]);
+    let mut out = Vec::new();
+    adm.admit(
+      record(10, ROOT, reason::RENAME_OLD_NAME, DIR, "keep"),
+      &mut out,
+    );
+    adm.admit(
+      record(
+        10,
+        ROOT,
+        reason::RENAME_OLD_NAME | reason::RENAME_NEW_NAME,
+        DIR,
+        "cache",
+      ),
+      &mut out,
+    );
+    assert!(
+      matches!(
+        &out[..],
+        [UsnAdmitted::Renamed {
+          old: UsnTarget::Resolved(from),
+          new: UsnTarget::Resolved(to),
+          is_dir: true,
+          ..
+        }] if from == &["keep".to_owned()] && to == &["cache".to_owned()]
+      ),
+      "the pair reaches the common fence whole, destination included: {out:?}"
+    );
+    assert_eq!(
+      adm.map_mut().directories(),
+      0,
+      "while the map still forgets the subtree that left the reported tree"
+    );
+
+    // The exclusion half is unchanged: the departure alone.
+    let mut adm = {
+      let mut map = FrnMap::new(ROOT, None);
+      map.seed([(10, ROOT, "keep".into())]);
+      UsnAdmission::new(map, 64).with_fence(fence(&["/r/gone"]))
+    };
+    let mut out = Vec::new();
+    adm.admit(
+      record(10, ROOT, reason::RENAME_OLD_NAME, DIR, "keep"),
+      &mut out,
+    );
+    adm.admit(
+      record(
+        10,
+        ROOT,
+        reason::RENAME_OLD_NAME | reason::RENAME_NEW_NAME,
+        DIR,
+        "gone",
+      ),
+      &mut out,
+    );
+    assert!(
+      matches!(
+        &out[..],
+        [UsnAdmitted::Single { target: UsnTarget::Resolved(c), .. }] if c == &["keep".to_owned()]
+      ),
+      "an excluded destination is still nulled here: {out:?}"
+    );
   }
 
   /// A file's churn inside an excluded subtree delivers nothing either — and the

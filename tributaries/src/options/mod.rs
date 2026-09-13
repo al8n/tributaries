@@ -6,6 +6,12 @@ use core::{num::NonZeroUsize, time::Duration};
 
 use std::vec::Vec;
 
+// Only the clap-face proxy types (`SeatArgs`'s `Vec<String>` fields, `compile_seat`)
+// name `String` directly; every other type in this module is `Vec<Glob>` or plain
+// `Glob`, so the bare name has no consumer once `clap` is off.
+#[cfg(feature = "clap")]
+use std::string::String;
+
 use tributary_proto::glob::Glob;
 
 use crate::{filter::Filter, interest::Interest};
@@ -14,18 +20,22 @@ use crate::{filter::Filter, interest::Interest};
 mod tests;
 
 /// Why an options household cannot be honored — the watcher-global
-/// [`TributariesOptions`] capacities, or one of the two per-root glob seats
-/// [`WatchOptions`] and [`RootGlobs`] carry.
+/// [`TributariesOptions`] capacities, the coalescer's buffered-entry cap, or one
+/// of the two per-root glob seats [`WatchOptions`] and [`RootGlobs`] carry.
 ///
 /// Each of them names a quantity a caller writes and the watcher then SPENDS, so
 /// each carries a ceiling. The two channel capacities are spent eagerly:
 /// assembling a [`Tributaries`](crate::Tributaries) allocates each channel up
 /// front, one slot per item, so a capacity near [`usize::MAX`] is not a large
 /// buffer but an allocation-size overflow — a panic deep inside the channel rather
-/// than a verdict a caller can read. A glob seat is spent per EVENT instead: its
-/// patterns compile into one matcher the source asks on every candidate, and past
-/// [`RootGlobs::MAX_SEAT_PATTERNS`] that matcher stops unioning them and asks each
-/// pattern in turn.
+/// than a verdict a caller can read. The coalescer's cap is spent LAZILY, which is
+/// what made an unbounded one dangerous rather than merely odd: it is the
+/// structural bound in FRONT of the bounded event channel, so a cap no burst can
+/// reach is a settle buffer that grows with the burst while the
+/// overflow-to-`Rescan` machinery the bound exists to trigger never engages. A
+/// glob seat is spent per EVENT instead: its patterns compile into one matcher the
+/// source asks on every candidate, and past [`RootGlobs::MAX_SEAT_PATTERNS`] that
+/// matcher stops unioning them and asks each pattern in turn.
 ///
 /// Every face turns such a value into one of these instead
 /// ([`TributariesOptions::validate`], [`WatchOptions::validate`],
@@ -53,6 +63,16 @@ pub enum OptionsError {
   CommandCapacityTooLarge {
     /// The capacity the options carried.
     supplied: NonZeroUsize,
+  },
+  /// The coalescer's buffered-entry cap exceeds
+  /// [`DebounceConfig::MAX_BUFFERED_ENTRIES`].
+  #[error(
+    "a buffered-entry cap of {supplied} exceeds the {} ceiling",
+    DebounceConfig::MAX_BUFFERED_ENTRIES
+  )]
+  MaxBufferedTooLarge {
+    /// The cap the policy carried.
+    supplied: usize,
   },
   /// The per-root [`prune`](RootGlobs::prune) seat carries more patterns than
   /// [`RootGlobs::MAX_SEAT_PATTERNS`].
@@ -89,6 +109,12 @@ impl OptionsError {
     matches!(self, Self::CommandCapacityTooLarge { .. })
   }
 
+  /// Whether this is [`MaxBufferedTooLarge`](Self::MaxBufferedTooLarge).
+  #[inline]
+  pub const fn is_max_buffered_too_large(&self) -> bool {
+    matches!(self, Self::MaxBufferedTooLarge { .. })
+  }
+
   /// Whether this is [`TooManyPrunePatterns`](Self::TooManyPrunePatterns).
   #[inline]
   pub const fn is_too_many_prune_patterns(&self) -> bool {
@@ -122,6 +148,29 @@ const fn check_command_capacity(capacity: NonZeroUsize) -> Result<NonZeroUsize, 
   Ok(capacity)
 }
 
+/// The ONE range rule behind every face of [`DebounceConfig::max_buffered`]: the
+/// builders' clamp of `0` to `1` (a cap no entry can be admitted under), and the
+/// [`MAX_BUFFERED_ENTRIES`](DebounceConfig::MAX_BUFFERED_ENTRIES) ceiling above
+/// it.
+///
+/// Both halves in one function because the two doors that PARSE a cap — a
+/// document and a command line — must mean by a number exactly what
+/// [`with_max_buffered`](DebounceConfig::with_max_buffered) means by it, and the
+/// constructors that only VALIDATE one (`TributariesOptions::validate` for the
+/// watcher-global policy, `WatchOptions::validate` for a
+/// [`Debounce::Custom`] override) must refuse exactly what those doors refuse.
+/// A clamp cannot be applied at validation — it would silently rewrite a caller's
+/// household — so validation reads the ceiling half alone, which is the only half
+/// a builder can leave out of range.
+const fn check_max_buffered(max_buffered: usize) -> Result<usize, OptionsError> {
+  if max_buffered > DebounceConfig::MAX_BUFFERED_ENTRIES {
+    return Err(OptionsError::MaxBufferedTooLarge {
+      supplied: max_buffered,
+    });
+  }
+  Ok(if max_buffered == 0 { 1 } else { max_buffered })
+}
+
 /// The ONE ceiling rule behind both glob seats of both households that carry them
 /// ([`WatchOptions`] and [`RootGlobs`]), stated over the two LENGTHS so a builder,
 /// a document and a command line are all judged by the same number.
@@ -143,6 +192,14 @@ const fn check_seats(prune: usize, include: Option<usize>) -> Result<(), Options
 
 /// Reads ONE glob seat, refusing the element past
 /// [`RootGlobs::MAX_SEAT_PATTERNS`] rather than the list after it.
+///
+/// Each ELEMENT is read through [`Glob`]'s own face, which measures a pattern
+/// against [`MAX_GLOB_LEN`](tributary_proto::glob::MAX_GLOB_LEN) on the bytes the
+/// format is holding — before the pattern is copied or compiled, and so before
+/// this seat ever takes it. The two bounds are therefore both enforced mid-stream:
+/// an over-long word refuses at the word, an over-long list at the element past
+/// the ceiling, and neither waits for a document that a caller controls the length
+/// of to end.
 ///
 /// The refusal has to happen mid-sequence to mean anything: a document is an
 /// untrusted length, and collecting it whole so the count can be checked
@@ -249,10 +306,26 @@ where
 #[derive(Debug, Clone, clap::Args)]
 #[group(skip)]
 struct SeatArgs {
+  /// Held as the STRINGS the command line carried, not as compiled patterns, and
+  /// compiled only once the count has been judged ([`compile_seat`]). A
+  /// `value_parser` builds one automaton per occurrence as the parse walks the
+  /// arguments, so a `parse_from` handed an arbitrarily long iterator has compiled
+  /// — and is holding — every one of them before any household can count them,
+  /// which is exactly the work [`RootGlobs::MAX_SEAT_PATTERNS`] exists to bound.
   #[arg(long)]
-  prune: Vec<Glob>,
-  #[arg(long)]
-  include: Option<Vec<Glob>>,
+  prune: Vec<String>,
+  /// `num_args = 0..=1` is what gives the seat all THREE of its states a command
+  /// line can otherwise only spell two of. The seat is `Option<Vec<Glob>>`: absent
+  /// (deliver every file), engaged-and-EMPTY (deliver no file — directories and
+  /// `Rescan`s only), or engaged with patterns. A plain repeatable flag requires a
+  /// value per occurrence, so the empty seat — a legitimate, documented policy
+  /// every other face can express — had no spelling at all here, and no parse could
+  /// produce it. Taking zero values makes a bare `--include` exactly that seat,
+  /// while occurrences still append, so `--include a --include b` is unchanged.
+  ///
+  /// Raw strings for `prune`'s reason, and bounded the same way.
+  #[arg(long, num_args = 0..=1)]
+  include: Option<Vec<String>>,
 }
 
 #[cfg(feature = "clap")]
@@ -260,6 +333,64 @@ impl SeatArgs {
   /// The seat flag names — the ONE list, so a seat added to the vocabulary cannot
   /// be forgotten by a household's arg group.
   const FLAGS: [&'static str; 2] = ["prune", "include"];
+
+  /// Both seats compiled — the one site either household compiles at, and only
+  /// after [`compile_seat`] has judged their length.
+  fn compiled(self) -> Result<(Vec<Glob>, Option<Vec<Glob>>), clap::Error> {
+    Ok((
+      compile_seat(self.prune, "--prune")?,
+      self
+        .include
+        .map(|include| compile_seat(include, "--include"))
+        .transpose()?,
+    ))
+  }
+
+  /// The way back, for an UPDATE: a compiled seat renders to the patterns it was
+  /// compiled from, which is the spelling the flags carry.
+  fn spelled(prune: &[Glob], include: Option<&[Glob]>) -> Self {
+    let pattern = |glob: &Glob| glob.as_str().to_owned();
+    Self {
+      prune: prune.iter().map(pattern).collect(),
+      include: include.map(|include| include.iter().map(pattern).collect()),
+    }
+  }
+}
+
+/// Compiles ONE glob seat off the command line, refusing a list longer than
+/// [`RootGlobs::MAX_SEAT_PATTERNS`] BEFORE it compiles anything.
+///
+/// The order is the whole point. A seat past the ceiling is refused for a resource
+/// reason — every pattern in it is an automaton the source then asks per candidate
+/// — so a face that compiles first and counts afterwards has already paid what the
+/// bound exists to refuse. The count is a property of the list, not of any pattern
+/// in it, so it can be answered without touching one.
+///
+/// A pattern the matcher cannot compile is still the flag's own refusal, carrying
+/// the type's message, so the value a person mistyped is the one they are told
+/// about.
+#[cfg(feature = "clap")]
+fn compile_seat(patterns: Vec<String>, flag: &str) -> Result<Vec<Glob>, clap::Error> {
+  if patterns.len() > RootGlobs::MAX_SEAT_PATTERNS {
+    return Err(clap::Error::raw(
+      clap::error::ErrorKind::ValueValidation,
+      std::format!(
+        "more {flag} patterns than the per-seat limit of {}\n",
+        RootGlobs::MAX_SEAT_PATTERNS
+      ),
+    ));
+  }
+  patterns
+    .iter()
+    .map(|pattern| {
+      Glob::new(pattern).map_err(|err| {
+        clap::Error::raw(
+          clap::error::ErrorKind::ValueValidation,
+          std::format!("invalid value for {flag}: {err}\n"),
+        )
+      })
+    })
+    .collect()
 }
 
 /// The value an argument carried, but ONLY when the COMMAND LINE is where it came
@@ -322,9 +453,13 @@ where
 /// $ app --quiet-window 100ms --max-hold 2s --max-buffered 4096
 /// ```
 ///
-/// Both doors honor the same clamp the builders do: a
-/// [`max_buffered`](Self::max_buffered) of `0` becomes `1`, never a buffer no entry
-/// can be admitted to.
+/// Both doors honor the same range rule: a [`max_buffered`](Self::max_buffered) of
+/// `0` becomes `1` (never a buffer no entry can be admitted to), exactly as the
+/// builders read it, and one past
+/// [`MAX_BUFFERED_ENTRIES`](Self::MAX_BUFFERED_ENTRIES) is REFUSED — by the
+/// deserializer, by the flag's parser, and by the validation of whichever
+/// household carries the policy ([`TributariesOptions::validate`],
+/// [`WatchOptions::validate`] for a [`Debounce::Custom`] override).
 ///
 /// An UPDATE (`clap::FromArgMatches::update_from_arg_matches`) changes only the
 /// knobs the command line actually carried: updating `--quiet-window` alone leaves
@@ -448,29 +583,26 @@ fn clap_duration_default(duration: Duration) -> clap::builder::OsStr {
   clap::builder::Str::from(humantime::format_duration(duration).to_string()).into()
 }
 
-/// The one clamp behind both faces of [`DebounceConfig::max_buffered`]: `0` is a cap
-/// no entry can be admitted under, and the builders already read it as `1`. A loaded
-/// or parsed value must mean what the same number means through
-/// [`with_max_buffered`](DebounceConfig::with_max_buffered), so the clamp lives here
-/// rather than in one door of three.
-#[cfg(any(feature = "serde", feature = "clap"))]
-const fn clamp_max_buffered(max_buffered: usize) -> usize {
-  if max_buffered == 0 { 1 } else { max_buffered }
-}
-
 #[cfg(feature = "serde")]
 fn de_max_buffered<'de, D>(deserializer: D) -> Result<usize, D::Error>
 where
   D: serde::Deserializer<'de>,
 {
-  use serde::Deserialize as _;
+  use serde::{Deserialize as _, de::Error as _};
 
-  usize::deserialize(deserializer).map(clamp_max_buffered)
+  let supplied = usize::deserialize(deserializer)?;
+  check_max_buffered(supplied).map_err(D::Error::custom)
 }
 
+/// The command-line door onto the same rule. Boxed because the flag can fail two
+/// ways — the text is not a number, or the number is out of range — and the two
+/// errors are of different types; clap renders whichever one it is gotten.
 #[cfg(feature = "clap")]
-fn clamped_max_buffered(text: &str) -> Result<usize, core::num::ParseIntError> {
-  text.parse().map(clamp_max_buffered)
+fn clamped_max_buffered(
+  text: &str,
+) -> Result<usize, Box<dyn std::error::Error + Send + Sync + 'static>> {
+  let supplied: usize = text.parse()?;
+  Ok(check_max_buffered(supplied)?)
 }
 
 impl DebounceConfig {
@@ -486,6 +618,28 @@ impl DebounceConfig {
   /// channel's default) — the structural memory bound in front of the bounded event
   /// channel. See [`max_buffered`](Self::max_buffered).
   pub const DEFAULT_MAX_BUFFERED: usize = 1024;
+
+  /// The largest buffered-entry cap (2^20 entries), matching
+  /// [`TributariesOptions::MAX_EVENT_CAPACITY`] — the channel this buffer sits in
+  /// front of.
+  ///
+  /// The cap is the coalescer's whole memory bound, and it is spent lazily: an
+  /// entry is allocated per distinct path a burst touches, and the shedding that
+  /// answers a full buffer (purge the subscription, owe it a dominating
+  /// [`Rescan`](crate::EventKind::Rescan)) only engages once the cap is reached.
+  /// A cap no burst can reach therefore does not describe a large buffer; it
+  /// removes the bound. Combined with a long [`max_hold`](Self::max_hold) and a
+  /// producer touching fresh paths, the settle buffer and its deadline indexes
+  /// then grow ahead of the bounded event channel until the process runs out of
+  /// memory — the one outcome the documented bound exists to make impossible.
+  ///
+  /// So a value past this stops naming a coalescing trade and starts naming an
+  /// unbounded one, and every face refuses it instead — the deserializer, the
+  /// flag's parser, and the validation of whichever household carries the policy.
+  /// Matching the event channel's own ceiling is deliberate: the buffer is the
+  /// stage before that channel, and letting it be ordered larger than the channel
+  /// it feeds would be a bound that never binds first.
+  pub const MAX_BUFFERED_ENTRIES: usize = 1 << 20;
 
   /// The default debounce policy.
   #[inline]
@@ -518,6 +672,11 @@ impl DebounceConfig {
   }
 
   /// Returns this policy with the buffered-entry cap set (0 is clamped to 1).
+  ///
+  /// Infallible, like every other builder here: a value past
+  /// [`MAX_BUFFERED_ENTRIES`](Self::MAX_BUFFERED_ENTRIES) is refused by the
+  /// validation of whichever household this policy is installed in, which is
+  /// where the two parsing faces refuse it too.
   #[inline]
   #[must_use]
   pub const fn with_max_buffered(mut self, max_buffered: usize) -> Self {
@@ -525,7 +684,8 @@ impl DebounceConfig {
     self
   }
 
-  /// Sets the buffered-entry cap (0 is clamped to 1).
+  /// Sets the buffered-entry cap (0 is clamped to 1; the ceiling is met at the
+  /// household's validation — see [`with_max_buffered`](Self::with_max_buffered)).
   #[inline]
   pub const fn set_max_buffered(&mut self, max_buffered: usize) -> &mut Self {
     self.max_buffered = if max_buffered == 0 { 1 } else { max_buffered };
@@ -941,23 +1101,31 @@ impl TributariesOptions {
     }
   }
 
-  /// Checks both capacities against their documented ceilings.
+  /// Checks both capacities — and the debounce policy's buffered-entry cap, when
+  /// one is configured — against their documented ceilings.
   ///
   /// Every [`Tributaries`](crate::Tributaries) constructor runs this BEFORE it
   /// allocates a channel, so a caller normally never calls it; it is public so a
   /// configuration layer can refuse a bad setting where the setting is read, with
-  /// the same verdict construction would give. The [`DebounceConfig`] carries no
-  /// unbounded quantity of its own — its buffered cap is clamped, never refused —
-  /// so nothing else here has a range to check.
+  /// the same verdict construction would give. The nested [`DebounceConfig`] is
+  /// read here because a household is validated as a whole: its cap is the
+  /// coalescer's memory bound and is spent long after construction, so a
+  /// validation that stopped at the two channels would let an unbounded settle
+  /// buffer through the one door every constructor goes past.
   ///
   /// # Errors
   ///
-  /// The first capacity found above its ceiling, as an [`OptionsError`].
+  /// The first quantity found above its ceiling, as an [`OptionsError`].
   pub const fn validate(&self) -> Result<(), OptionsError> {
     if let Err(err) = check_event_capacity(self.event_capacity) {
       return Err(err);
     }
     if let Err(err) = check_command_capacity(self.command_capacity) {
+      return Err(err);
+    }
+    if let Some(debounce) = self.debounce
+      && let Err(err) = check_max_buffered(debounce.max_buffered)
+    {
       return Err(err);
     }
     Ok(())
@@ -1151,10 +1319,12 @@ impl Default for TributariesOptions {
 /// A seat is asked once per candidate by the source it is armed on, so its length
 /// is per-event work — and the length is a caller's to write. Both are capped at
 /// [`MAX_SEAT_PATTERNS`](Self::MAX_SEAT_PATTERNS), which
-/// [`validate`](Self::validate) checks, the `serde` face refuses mid-document, and
-/// [`Tributaries::watch`](crate::Tributaries::watch) refuses on before anything is
-/// planned. Beneath all of them the matcher's own constructor carries the same
-/// bound, so words this household never saw are bounded too.
+/// [`validate`](Self::validate) checks, the `serde` face refuses mid-document, the
+/// `clap` face refuses at the occurrence past it — before a pattern of the seat is
+/// compiled at all — and [`Tributaries::watch`](crate::Tributaries::watch) refuses
+/// on before anything is planned. Beneath all of them the matcher's own
+/// constructor carries the same bound, so words this household never saw are
+/// bounded too.
 ///
 /// # Configuration faces
 ///
@@ -1174,11 +1344,14 @@ impl Default for TributariesOptions {
 /// ```
 ///
 /// With the `clap` feature it is a `clap::Args` group whose `--prune` and
-/// `--include` repeat, once per pattern; `--include` given no times at all is
-/// again the absent seat.
+/// `--include` repeat, once per pattern. `--include` spells all THREE of the seat's
+/// states there: given no times at all it is again the ABSENT seat (deliver every
+/// file); given once with NO VALUE it is the engaged-but-empty seat (deliver no
+/// file — directories and `Rescan`s only); given with values it carries them.
 ///
 /// ```text
 /// $ app --prune '**/node_modules' --prune '**/.git' --include '**/*.mp4'
+/// $ app --include                       # directories and Rescans only
 /// ```
 ///
 /// Those are the SAME flag names [`WatchOptions`] carries, deliberately — one
@@ -1203,27 +1376,17 @@ pub struct RootGlobs {
 }
 
 #[cfg(feature = "clap")]
-impl From<SeatArgs> for RootGlobs {
-  fn from(args: SeatArgs) -> Self {
-    let SeatArgs { prune, include } = args;
-    Self { prune, include }
-  }
-}
-
-#[cfg(feature = "clap")]
 impl From<&RootGlobs> for SeatArgs {
   fn from(globs: &RootGlobs) -> Self {
-    Self {
-      prune: globs.prune.clone(),
-      include: globs.include.clone(),
-    }
+    Self::spelled(&globs.prune, globs.include.as_deref())
   }
 }
 
 #[cfg(feature = "clap")]
 impl clap::FromArgMatches for RootGlobs {
   fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
-    SeatArgs::from_arg_matches(matches).map(Into::into)
+    let (prune, include) = SeatArgs::from_arg_matches(matches)?.compiled()?;
+    Ok(Self { prune, include })
   }
 
   /// Applies the seat the COMMAND LINE named and leaves the other as it stood —
@@ -1232,7 +1395,7 @@ impl clap::FromArgMatches for RootGlobs {
   fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
     let mut args = SeatArgs::from(&*self);
     args.update_from_arg_matches(matches)?;
-    let SeatArgs { prune, include } = args;
+    let (prune, include) = args.compiled()?;
     self.prune = prune;
     self.include = include;
     Ok(())
@@ -1475,14 +1638,16 @@ impl RootGlobs {
 /// [`with_filter`](Self::with_filter). Neither face constrains `C`.
 ///
 /// With the `clap` feature it is a `clap::Args` group of [`Interest`]'s own flags plus
-/// a repeatable `--prune` and `--include`, once per pattern; `--include` given no times
-/// at all is [`None`] (deliver every file), which is what makes the seat's ABSENCE
-/// expressible from a command line. The [`Debounce`] posture is skipped there:
-/// [`Debounce::Custom`] carries a whole [`DebounceConfig`], which one flag cannot name
-/// (see [`Debounce`]).
+/// a repeatable `--prune` and `--include`, once per pattern. `--include` spells all
+/// THREE of the seat's states: given no times at all it is [`None`] (deliver every
+/// file); given once with NO VALUE it is the engaged-but-empty seat (deliver no file —
+/// directories and `Rescan`s only); given with values it carries them. The
+/// [`Debounce`] posture is skipped there: [`Debounce::Custom`] carries a whole
+/// [`DebounceConfig`], which one flag cannot name (see [`Debounce`]).
 ///
 /// ```text
 /// $ app --moved=false --removed=false --prune '**/node_modules' --include '**/*.mp4'
+/// $ app --include                       # directories and Rescans only
 /// ```
 ///
 /// An UPDATE (`clap::FromArgMatches::update_from_arg_matches`) changes only what
@@ -1534,10 +1699,7 @@ impl<C> From<&WatchOptions<C>> for WatchOptionsArgs {
   fn from(options: &WatchOptions<C>) -> Self {
     Self {
       interest: options.interest,
-      seats: SeatArgs {
-        prune: options.prune.clone(),
-        include: options.include.clone(),
-      },
+      seats: SeatArgs::spelled(&options.prune, options.include.as_deref()),
     }
   }
 }
@@ -1548,10 +1710,8 @@ impl<C> clap::FromArgMatches for WatchOptions<C> {
   /// values: a fresh accept-all [`Filter`] — never one shared with a caller's —
   /// and the inherited [`Debounce`] posture.
   fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
-    let WatchOptionsArgs {
-      interest,
-      seats: SeatArgs { prune, include },
-    } = WatchOptionsArgs::from_arg_matches(matches)?;
+    let WatchOptionsArgs { interest, seats } = WatchOptionsArgs::from_arg_matches(matches)?;
+    let (prune, include) = seats.compiled()?;
     Ok(Self {
       interest,
       filter: Filter::all(),
@@ -1569,10 +1729,8 @@ impl<C> clap::FromArgMatches for WatchOptions<C> {
   fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
     let mut args = WatchOptionsArgs::from(&*self);
     args.update_from_arg_matches(matches)?;
-    let WatchOptionsArgs {
-      interest,
-      seats: SeatArgs { prune, include },
-    } = args;
+    let WatchOptionsArgs { interest, seats } = args;
+    let (prune, include) = seats.compiled()?;
     self.interest = interest;
     self.prune = prune;
     self.include = include;
@@ -1641,18 +1799,26 @@ impl<C> WatchOptions<C> {
   pub const MAX_SEAT_PATTERNS: usize = RootGlobs::MAX_SEAT_PATTERNS;
 
   /// Checks both glob seats against
-  /// [`MAX_SEAT_PATTERNS`](Self::MAX_SEAT_PATTERNS) — what
+  /// [`MAX_SEAT_PATTERNS`](Self::MAX_SEAT_PATTERNS), and a
+  /// [`Debounce::Custom`] override's buffered-entry cap against
+  /// [`DebounceConfig::MAX_BUFFERED_ENTRIES`] — what
   /// [`Tributaries::watch`](crate::Tributaries::watch) runs before it plans
   /// anything, so an over-full seat is refused where it was written rather than
-  /// handed down to a source.
+  /// handed down to a source, and an unbounded settle buffer is refused before
+  /// the coalescer it would be instantiated in exists.
   ///
   /// # Errors
   ///
   /// [`OptionsError::TooManyPrunePatterns`] /
-  /// [`OptionsError::TooManyIncludePatterns`].
+  /// [`OptionsError::TooManyIncludePatterns`] /
+  /// [`OptionsError::MaxBufferedTooLarge`].
   #[inline]
   pub fn validate(&self) -> Result<(), OptionsError> {
-    check_seats(self.prune.len(), self.include.as_ref().map(Vec::len))
+    check_seats(self.prune.len(), self.include.as_ref().map(Vec::len))?;
+    if let Debounce::Custom(config) = self.debounce {
+      check_max_buffered(config.max_buffered)?;
+    }
+    Ok(())
   }
 }
 

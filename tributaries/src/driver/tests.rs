@@ -20901,6 +20901,189 @@ mod reserved_namespace {
   }
 
   // ---------------------------------------------------------------------------
+  // A barrier is identified by its marker's LEAF, under its own root.
+  // ---------------------------------------------------------------------------
+
+  /// The marker's ancestor path can change between the write and the observation, and the
+  /// barrier must not care.
+  ///
+  /// A binding reports where its marker landed by spelling out the directories its walk
+  /// traversed. A peer that renames one of those directories in the window between the walk
+  /// and the create leaves the marker under the NEW name — correctly: the create is anchored
+  /// at the descriptor the walk opened, not at a path — and the backend orders that rename
+  /// ahead of the create, so the owner is told about the marker at a path the write never
+  /// mentioned. Nothing is wrong with that marker: it is exactly where the ordered queue
+  /// says it is, which is the whole content of the barrier.
+  ///
+  /// What identifies it is its own NAME, which the seam requires a binding to mint around an
+  /// unpredictable nonce, so nothing else under this root can wear it.
+  ///
+  /// FAIL-ON-REVERT: compare the pending key WHOLE against the event's key and the reply
+  /// stays pending — `now_or_never()` answers `None` — while the caller waits out its entire
+  /// deadline over a source that did nothing wrong.
+  async fn assert_a_marker_under_a_renamed_ancestor_resolves_its_barrier(
+    written_at: &str,
+    observed_at: &str,
+  ) {
+    let mut h = Harness::new();
+    let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+    let handle = h.owner.subsumer.subscription_root(sub).expect("live root");
+    h.drain();
+
+    let (reply_tx, mut reply_rx) = futures_channel::oneshot::channel();
+    h.owner.pending_syncs.push(crate::driver::PendingSync {
+      cookie_key: key(written_at),
+      sub,
+      root: handle,
+      loss_serial_at_install: 0,
+      dominated_at_install: false,
+      reply: reply_tx,
+    });
+
+    h.owner
+      .consume_source_event(&source_created(handle, observed_at, 1));
+
+    let delivered = h.drain();
+    assert!(
+      delivered.is_empty(),
+      "the marker is an artifact wherever it landed, so no consumer learns of it: \
+       {delivered:?}"
+    );
+    assert!(
+      matches!(
+        (&mut reply_rx).now_or_never(),
+        Some(Ok(Ok(SyncOutcome::Delivered)))
+      ),
+      "the barrier resolves on the marker's own name, not on the path its parent held at \
+       write time"
+    );
+  }
+
+  /// The leaf-grammar ground: the marker's own name is the whole of its identity.
+  #[tokio::test]
+  async fn a_marker_under_a_renamed_ancestor_resolves_its_barrier_by_leaf_grammar() {
+    assert_a_marker_under_a_renamed_ancestor_resolves_its_barrier(
+      "/a/live/cookie-7",
+      "/a/moved/cookie-7",
+    )
+    .await;
+  }
+
+  /// The same, on the parent-directory ground — the shape a marker whose name follows no
+  /// grammar this crate knows arrives in.
+  #[tokio::test]
+  async fn a_marker_under_a_renamed_ancestor_resolves_its_barrier_by_parent_directory() {
+    assert_a_marker_under_a_renamed_ancestor_resolves_its_barrier(
+      &format!("/a/live/{COOKIE_DIR}/anything"),
+      &format!("/a/moved/{COOKIE_DIR}/anything"),
+    )
+    .await;
+  }
+
+  /// The same identity at a move's SOURCE endpoint: a marker renamed OUT of the reserved
+  /// namespace, observed under an ancestor the write never named. Both halves are asserted,
+  /// as in every other row here — a resolution bought by swallowing the user endpoint would
+  /// be a silent loss with a certificate on top.
+  #[tokio::test]
+  async fn a_marker_leaving_the_namespace_under_a_renamed_ancestor_resolves_its_barrier() {
+    let mut h = Harness::new();
+    let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+    let handle = h.owner.subsumer.subscription_root(sub).expect("live root");
+    h.drain();
+
+    let (reply_tx, mut reply_rx) = futures_channel::oneshot::channel();
+    h.owner.pending_syncs.push(crate::driver::PendingSync {
+      cookie_key: key("/a/live/cookie-7"),
+      sub,
+      root: handle,
+      loss_serial_at_install: 0,
+      dominated_at_install: false,
+      reply: reply_tx,
+    });
+
+    h.owner.consume_source_event(&source_moved_at(
+      handle,
+      "/a/moved/cookie-7",
+      "moved/cookie-7",
+      "/a/adopted",
+      "adopted",
+      1,
+    ));
+
+    let delivered = h.drain();
+    let projected = delivered
+      .iter()
+      .find(|e| e.subscription() == sub)
+      .expect("the user endpoint is delivered, barrier or no barrier");
+    assert!(
+      projected.kind().is_created(),
+      "the covered endpoint is the destination, so the move projects to a Created: \
+       {projected:?}"
+    );
+    assert_eq!(projected.path(), Path::new("/a/adopted"));
+    assert!(
+      matches!(
+        (&mut reply_rx).now_or_never(),
+        Some(Ok(Ok(SyncOutcome::Delivered)))
+      ),
+      "the marker was observed at the move's source endpoint under a spelling the write \
+       never reported, and that is still an observation of it"
+    );
+  }
+
+  /// A marker's name resolves a barrier only under the ROOT that barrier was written for.
+  ///
+  /// The leaf is what identifies a marker; the root is what BOUNDS that identification. Two
+  /// roots watched at once are two independent queues, and what has drained from one proves
+  /// nothing about the other — so a barrier resolved by a stranger's marker would certify a
+  /// delivery its own subscriber has not been handed. The name alone cannot be trusted to
+  /// keep them apart: it is a binding's rendering, and two watchers of two trees may render
+  /// with the same generator.
+  ///
+  /// FAIL-ON-REVERT: drop the root-handle test from the match and this barrier resolves
+  /// `Delivered` on a change from a tree it has nothing to do with.
+  #[tokio::test]
+  async fn a_marker_under_another_root_leaves_the_barrier_pending() {
+    let mut h = Harness::new();
+    let mine = h.watch("/a", Interest::all()).await.expect("watch /a");
+    let other = h.watch("/b", Interest::all()).await.expect("watch /b");
+    let my_root = h.owner.subsumer.subscription_root(mine).expect("live root");
+    let other_root = h
+      .owner
+      .subsumer
+      .subscription_root(other)
+      .expect("live root");
+    assert_ne!(
+      my_root, other_root,
+      "staging: two disjoint watches ride two physical roots"
+    );
+    h.drain();
+
+    let (reply_tx, mut reply_rx) = futures_channel::oneshot::channel();
+    h.owner.pending_syncs.push(crate::driver::PendingSync {
+      cookie_key: key("/a/cookie-7"),
+      sub: mine,
+      root: my_root,
+      loss_serial_at_install: 0,
+      dominated_at_install: false,
+      reply: reply_tx,
+    });
+
+    h.owner
+      .consume_source_event(&source_created(other_root, "/b/cookie-7", 1));
+
+    assert!(
+      (&mut reply_rx).now_or_never().is_none(),
+      "a marker of the same name under another root is not this barrier's proof"
+    );
+    assert_eq!(
+      h.owner.pending_syncs.len(),
+      1,
+      "and the barrier is still parked, waiting for its own"
+    );
+  }
+
+  // ---------------------------------------------------------------------------
   // …and on a cookie observed as a move's SOURCE endpoint.
   // ---------------------------------------------------------------------------
 

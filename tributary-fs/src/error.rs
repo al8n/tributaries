@@ -289,6 +289,17 @@ pub enum SyncRootError {
   /// Exclusions apply to every root on every platform, so the refusal is the
   /// same everywhere — it does not depend on which backend resolved, and it is
   /// made before the write rather than discovered by waiting.
+  ///
+  /// The verdict is taken TWICE, because a spelling is not a location. The
+  /// admission judges `dir` as supplied, which costs nothing and refuses the
+  /// common case synchronously; the write then judges the directory it actually
+  /// resolved — every symlink on the way followed, and the
+  /// cookie-goes-beside-a-file rule applied — because only that one is where the
+  /// marker would land. A link whose spelling clears every exclusion and whose
+  /// target sits inside one is refused by the second check, with
+  /// [`dir`](Self::DirExcluded::dir) naming the resolved directory rather than
+  /// the spelling. Since the caller cannot tell which check refused, the
+  /// admission's sequence is treated as spent for both — re-mint to retry.
   #[error(
     "cookie directory {} is under excluded directory {}",
     dir.display(),
@@ -333,11 +344,82 @@ pub enum SyncRootError {
     /// The pattern of the root's prune seat that covers it.
     pattern: tributary_proto::glob::Glob,
   },
+  /// The directory the cookie would have gone in is no longer the OBJECT the
+  /// sync was admitted for: a peer renamed that directory aside and stood a
+  /// replacement at its name after the admission and before the write.
+  ///
+  /// A barrier certifies ordering for the directory object that existed at
+  /// admission, and only for it. A replacement standing at the same name is a
+  /// different object, and the queue that would carry the marker's create is not
+  /// yet attached to it — so a marker born there rides no ordering this root's
+  /// stream reads, and a later cold enumeration of the replacement could
+  /// synthesize that create ahead of changes that truly preceded it. The write is
+  /// therefore refused with nothing created, rather than reporting a barrier that
+  /// certifies an ordering nobody proved.
+  ///
+  /// It also answers for the watcher's own reserved cookie directory one level
+  /// inside `dir`, on the two questions that directory raises. One standing there
+  /// must be the object the admission read; one this write CREATED must hold
+  /// nothing but this write's marker once that marker exists, because a directory
+  /// a peer exchanged in carries changes older than the marker that no queue of
+  /// this root reported. The second reading is about the whole directory, so a
+  /// second watcher of the same user that creates a marker of its own inside that
+  /// one create-and-enumerate window is refused here too — retry, and the reserved
+  /// directory now standing is read by the fresh admission and adopted on the
+  /// identity instead.
+  ///
+  /// The admission's sequence is SPENT: the verdict needs the object only the
+  /// write's own descriptor walk can reach, so it is taken after the sync was
+  /// admitted. Re-mint through
+  /// [`mint_sync_ticket`](crate::Watcher::mint_sync_ticket) to retry, which
+  /// re-reads the directory that now stands at the name.
+  #[error("cookie directory {} was replaced after the sync was admitted", dir.display())]
+  DirReplaced {
+    /// The cookie parent the write resolved — the name the replacement stands
+    /// at, as the descriptor answered it.
+    dir: PathBuf,
+  },
+  /// A directory was already standing at the reserved cookie-directory name — the
+  /// private directory this watcher's markers go in, one level inside the
+  /// directory the sync named — on a DEVICE other than its parent's: a mount
+  /// boundary.
+  ///
+  /// A root's crawl does not descend across a mount, so the reserved directory
+  /// beyond one is never enumerated and no watch is ever armed inside it. A marker
+  /// created there is unreportable however it is ordered, and the barrier waiting
+  /// on its event could only time out — so the write is refused with nothing
+  /// created, exactly as [`DirPruned`](Self::DirPruned) and
+  /// [`DirExcluded`](Self::DirExcluded) are, and for the same reason: a barrier no
+  /// source can report is not a barrier.
+  ///
+  /// Unlike those two this is not a configuration word but the shape of the tree,
+  /// and it is not transient either — a retry finds the same mount. Sync a
+  /// directory on the root's own mount instead, or take the mount off the reserved
+  /// name.
+  ///
+  /// The admission's sequence is SPENT: the verdict needs the object only the
+  /// write's own descriptor walk can reach, so it is taken after the sync was
+  /// admitted. Re-mint through
+  /// [`mint_sync_ticket`](crate::Watcher::mint_sync_ticket) to retry.
+  #[error("cookie directory {} lies across a mount boundary", dir.display())]
+  DirCrossesMount {
+    /// The reserved cookie directory the write reached — the name the mount
+    /// stands at, as the descriptor answered it.
+    dir: PathBuf,
+  },
   /// The cookie name is not a single normal filename component — it holds a
-  /// path separator, a `.`/`..`, or is absolute or empty. A name like this
-  /// would escape the directory the barrier was validated for, so it is refused
-  /// before any write. The umbrella mints names that never trip this; a caller
-  /// that hits it violated the reserved-namespace contract.
+  /// path separator, a `.`/`..`, is absolute or empty, or is longer than 255
+  /// bytes (`NAME_MAX` on every supported filesystem, so a longer leaf names
+  /// nothing that could ever be created). A name like this would escape the
+  /// directory the barrier was validated for, so it is refused before any write
+  /// — and before it is stored, so an unbounded one cannot be retained by a
+  /// bookkeeping that counts records rather than bytes.
+  ///
+  /// **Not reachable through [`Watcher::sync_root`](crate::Watcher::sync_root).**
+  /// That call takes no name: the leaf is minted with the admission
+  /// ([`SyncTicket::leaf`](crate::SyncTicket::leaf)) and is one normal component
+  /// by construction. The variant survives as the driver's own fail-closed
+  /// invariant, and as a stable spelling of what that invariant guards.
   #[error("cookie name {name:?} is not a single normal filename component")]
   BadCookieName {
     /// The offending name as supplied.
@@ -347,6 +429,16 @@ pub enum SyncRootError {
   /// [`std::io::ErrorKind::PermissionDenied`] — the honest refusal: a tree
   /// with no writable covered location cannot support a kernel-mediated
   /// barrier at all.
+  ///
+  /// It is also what the admission door answers when it cannot HOLD the
+  /// directories a sync is judged against — a descriptor table with no room left
+  /// (`EMFILE`/`ENFILE`), a directory this process may not open, or a
+  /// non-directory standing at the watcher's reserved cookie name. That refusal
+  /// creates nothing, but a caller cannot tell it apart from the write's own
+  /// failure and neither can the classification, so its sequence is spent with
+  /// every other `Write`'s. A name nothing answers at is NOT one of these: an
+  /// absent directory is a reading the write reasons from, not a failure to take
+  /// one.
   #[error("could not write sync cookie {}: {source}", path.display())]
   Write {
     /// Where the write was aimed — `dir` joined with the cookie name. It is a
@@ -370,8 +462,12 @@ pub enum SyncRootError {
   /// admitting a second would make cancel-by-name ambiguous and could target
   /// another root's sync. The name is freed when the holding obligation reaches
   /// its terminal (its cookie confirmed removed, or the sync retired), so
-  /// sequential reuse of a name admits; concurrent syncs need distinct names
-  /// (the umbrella's minted names are always distinct).
+  /// sequential reuse of a name admits.
+  ///
+  /// **Not reachable through [`Watcher::sync_root`](crate::Watcher::sync_root).**
+  /// Every leaf is minted from its own admission and carries that admission's
+  /// nonce, so two live syncs of one watcher cannot collide on a name. The variant
+  /// survives as the driver's own fail-closed invariant.
   #[error("cookie name {name:?} is already held by a live sync of this watcher")]
   NameInUse {
     /// The contested name as supplied.

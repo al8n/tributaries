@@ -143,6 +143,16 @@ fn every_out_of_range_value_is_a_typed_refusal() {
       supplied: WatcherOptions::MAX_EXCLUSIONS + 1
     })
   );
+  let over_long = "/".repeat(WatcherOptions::MAX_EXCLUSION_LEN + 1);
+  assert_eq!(
+    WatcherOptions::new()
+      .with_exclusions(vec![PathBuf::from(&over_long)])
+      .validate(),
+    Err(OptionsError::ExclusionTooLong {
+      supplied: WatcherOptions::MAX_EXCLUSION_LEN + 1
+    }),
+    "the length bound is the builders' backstop for what the faces refuse as they parse"
+  );
   assert_eq!(
     WatcherOptions::new().with_latency(Duration::MAX).validate(),
     Err(OptionsError::LatencyTooLarge {
@@ -199,7 +209,12 @@ fn the_documented_maxima_are_themselves_in_range() {
     .with_os_batch_capacity(WatcherOptions::MAX_OS_BATCH_CAPACITY)
     .with_os_buffer_bytes(WatcherOptions::MAX_OS_BUFFER_BYTES)
     .with_root_liveness_interval(WatcherOptions::MAX_ROOT_LIVENESS_INTERVAL)
-    .with_exclusions(vec![PathBuf::from("/x"); WatcherOptions::MAX_EXCLUSIONS])
+    .with_exclusions(vec![
+      PathBuf::from(
+        "/".repeat(WatcherOptions::MAX_EXCLUSION_LEN)
+      );
+      WatcherOptions::MAX_EXCLUSIONS
+    ])
     .validate()
     .expect("the maxima are admissible");
   WatcherOptions::new()
@@ -273,6 +288,118 @@ mod serde_face {
         "{document}"
       );
     }
+  }
+
+  /// The exclusion list past its ceiling is a DOCUMENT error, refused mid-list
+  /// rather than read whole and measured afterwards.
+  ///
+  /// The bound is a resource bound — the OS honours eight per root — so a face
+  /// that reads an untrusted length to the end before judging it has already
+  /// allocated everything the bound exists to refuse: a streaming document naming
+  /// millions of exclusions costs the process its memory before the caller ever
+  /// holds a value to validate. The element that would take the set past the
+  /// ceiling is where the read stops.
+  ///
+  /// Revert witness: derive the field plainly and a nine-entry document parses
+  /// into a household `validate` then has to catch — after allocating every path.
+  #[test]
+  fn a_document_past_the_exclusion_ceiling_is_refused() {
+    let cap = WatcherOptions::MAX_EXCLUSIONS;
+    let list = |count: usize| {
+      (0..count)
+        .map(|n| format!("\"/x{n}\""))
+        .collect::<Vec<_>>()
+        .join(",")
+    };
+
+    let full: WatcherOptions =
+      serde_json::from_str(&format!(r#"{{"exclusions": [{}]}}"#, list(cap)))
+        .expect("the ceiling itself is honoured");
+    assert_eq!(full.exclusions_slice().len(), cap);
+    full.validate().expect("and it is an admissible household");
+
+    let err =
+      serde_json::from_str::<WatcherOptions>(&format!(r#"{{"exclusions": [{}]}}"#, list(cap + 1)))
+        .expect_err("one past it is a document error");
+    assert!(
+      err.to_string().contains(&format!("{cap}")),
+      "the refusal names the ceiling: {err}"
+    );
+
+    // The empty list is untouched: no exclusion is the default household.
+    assert!(
+      serde_json::from_str::<WatcherOptions>(r#"{"exclusions": []}"#)
+        .expect("an empty list parses")
+        .exclusions_slice()
+        .is_empty()
+    );
+  }
+
+  /// The per-path LENGTH ceiling, judged on the bytes the format is holding
+  /// rather than after a `PathBuf` has been built out of them.
+  ///
+  /// The count ceiling above bounds nothing on its own: eight entries is a small
+  /// number, and one of them can be as long as an untrusted document cares to make
+  /// it. Deserializing straight into `PathBuf` handed the document one allocation
+  /// of its own choosing per entry, paid in full before the household existed to
+  /// run `validate` on.
+  ///
+  /// The refusal is asserted through its SHAPE — it names the length it measured
+  /// and the ceiling — which is what a caller sees instead of an allocation.
+  ///
+  /// Revert witness: read the element as a plain `PathBuf` and the over-long first
+  /// exclusion is owned before anything measures it; only `validate` would catch
+  /// it, and only after the fact.
+  #[test]
+  fn an_over_long_exclusion_is_refused_before_its_path_is_built() {
+    let cap = WatcherOptions::MAX_EXCLUSION_LEN;
+
+    let full: WatcherOptions =
+      serde_json::from_str(&format!(r#"{{"exclusions": ["{}"]}}"#, "x".repeat(cap)))
+        .expect("the ceiling itself is honoured");
+    assert_eq!(full.exclusions_slice()[0].as_os_str().len(), cap);
+    full.validate().expect("and it is an admissible household");
+
+    let err = serde_json::from_str::<WatcherOptions>(&format!(
+      r#"{{"exclusions": ["{}"]}}"#,
+      "x".repeat(cap + 1)
+    ))
+    .expect_err("one byte past it is a document error");
+    let message = err.to_string();
+    assert!(
+      message.contains(&format!("{}", cap + 1)) && message.contains(&format!("{cap}")),
+      "the refusal names the length it measured and the ceiling: {err}"
+    );
+  }
+
+  /// The element past the SEAT is refused by its count, and is never read as a
+  /// path at all — so an enormous ninth entry costs the refusal and nothing else.
+  ///
+  /// The two bounds are independent, and the order they are asked in is what makes
+  /// the second one free: a count check taken after deserializing the ninth
+  /// element still allocates the one entry the seat is certain to refuse. The
+  /// ninth here is far past the LENGTH ceiling too, so whichever message comes
+  /// back says which check ran.
+  ///
+  /// Revert witness: check the count after `next_element::<Exclusion>` and the
+  /// refusal flips to the length message — the ninth path was read before anyone
+  /// counted it.
+  #[test]
+  fn an_over_long_ninth_exclusion_is_refused_by_count() {
+    let cap = WatcherOptions::MAX_EXCLUSIONS;
+    let mut list = (0..cap).map(|n| format!("\"/x{n}\"")).collect::<Vec<_>>();
+    list.push(format!(
+      "\"{}\"",
+      "x".repeat(WatcherOptions::MAX_EXCLUSION_LEN * 4)
+    ));
+
+    let err =
+      serde_json::from_str::<WatcherOptions>(&format!(r#"{{"exclusions": [{}]}}"#, list.join(",")))
+        .expect_err("the ninth element is refused");
+    assert!(
+      err.to_string().contains(&format!("limit of {cap}")),
+      "the refusal is the seat's count, taken without reading the element as a path: {err}"
+    );
   }
 
   /// Durations are humantime TEXT in both directions.
@@ -422,6 +549,128 @@ mod clap_face {
       parse(&["--exclusions", "/a", "--exclusions", "/b"]).exclusions_slice(),
       [PathBuf::from("/a"), PathBuf::from("/b")]
     );
+  }
+
+  /// And the ceiling, at the same flag: the occurrence past
+  /// [`WatcherOptions::MAX_EXCLUSIONS`] is refused before the household is built.
+  ///
+  /// `--exclusions` repeats, and a programmatic `parse_from` can hand it an
+  /// arbitrarily long iterator, so a face that reads the values into an owned list
+  /// and measures it afterwards has already built what the bound exists to refuse.
+  /// The count is asked of the matches, which own the values either way.
+  ///
+  /// Revert witness: drop the count check and the nine-flag row parses into a
+  /// household `validate` then has to catch.
+  #[test]
+  fn an_over_full_exclusions_flag_is_refused() {
+    let cap = WatcherOptions::MAX_EXCLUSIONS;
+    let flags = |count: usize| {
+      (0..count)
+        .flat_map(|n| ["--exclusions".to_owned(), format!("/x{n}")])
+        .collect::<Vec<_>>()
+    };
+
+    let full = Cli::parse_from(std::iter::once("app".to_owned()).chain(flags(cap))).options;
+    assert_eq!(full.exclusions_slice().len(), cap, "the ceiling parses");
+    full.validate().expect("and it is an admissible household");
+
+    let err = Cli::try_parse_from(std::iter::once("app".to_owned()).chain(flags(cap + 1)))
+      .err()
+      .expect("one occurrence past the ceiling is refused");
+    assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    assert!(
+      err.render().to_string().contains(&format!("{cap}")),
+      "the refusal names the ceiling: {}",
+      err.render()
+    );
+
+    // An UPDATE is judged by the same rule, and by the same number.
+    let matches = |rest: Vec<String>| {
+      <WatcherOptions as clap::Args>::augment_args_for_update(clap::Command::new("app"))
+        .try_get_matches_from(std::iter::once("app".to_owned()).chain(rest))
+        .expect("the parse itself accepts repeated flags")
+    };
+    let mut options = WatcherOptions::new();
+    assert!(
+      clap::FromArgMatches::update_from_arg_matches(&mut options, &matches(flags(cap + 1)))
+        .is_err(),
+      "an over-full update is refused before it writes the household"
+    );
+    assert!(
+      options.exclusions_slice().is_empty(),
+      "and the household it refused is left exactly as it stood"
+    );
+  }
+
+  /// The per-value LENGTH ceiling, at the same flag: a value longer than
+  /// [`WatcherOptions::MAX_EXCLUSION_LEN`] is refused as the parse reads it,
+  /// before any path is built and long before the household collects one.
+  ///
+  /// The occurrence count above bounds the number of paths, not their size, and a
+  /// `parse_from` can hand this flag a value of any length at all. The refusal is
+  /// the flag's own `ValueValidation`, naming the length it measured.
+  ///
+  /// Revert witness: drop the `value_parser` and the over-long value parses into a
+  /// household `validate` then has to catch — after the path has been built.
+  #[test]
+  fn an_over_long_exclusion_value_is_refused() {
+    let cap = WatcherOptions::MAX_EXCLUSION_LEN;
+
+    let full = Cli::parse_from(["app", "--exclusions", &"x".repeat(cap)]).options;
+    assert_eq!(
+      full.exclusions_slice()[0].as_os_str().len(),
+      cap,
+      "the ceiling itself parses"
+    );
+    full.validate().expect("and it is an admissible household");
+
+    let err = Cli::try_parse_from(["app", "--exclusions", &"x".repeat(cap + 1)])
+      .err()
+      .expect("one byte past the ceiling is refused");
+    assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    assert!(
+      err.render().to_string().contains(&format!("{cap}")),
+      "the refusal names the ceiling: {}",
+      err.render()
+    );
+
+    // An UPDATE is judged at the same door, and one door EARLIER than the
+    // occurrence count is: the value parser runs inside the parse, so an over-long
+    // value never reaches the matches an update would read, let alone the
+    // household it would have been written into.
+    let refused =
+      <WatcherOptions as clap::Args>::augment_args_for_update(clap::Command::new("app"))
+        .try_get_matches_from(["app", "--exclusions", &"x".repeat(cap + 1)]);
+    assert_eq!(
+      refused
+        .expect_err("an over-long update value is refused by the parse itself")
+        .kind(),
+      clap::error::ErrorKind::ValueValidation
+    );
+  }
+
+  /// The full seat of in-range values is accepted on this face: eight paths, each
+  /// at the length ceiling.
+  ///
+  /// Without it the two refusals above could be satisfied by a face that refuses
+  /// everything.
+  #[test]
+  fn a_full_seat_of_in_range_exclusions_parses() {
+    let value = "x".repeat(WatcherOptions::MAX_EXCLUSION_LEN);
+    let mut args = vec!["app".to_owned()];
+    for _ in 0..WatcherOptions::MAX_EXCLUSIONS {
+      args.push("--exclusions".to_owned());
+      args.push(value.clone());
+    }
+
+    let options = Cli::parse_from(args).options;
+    assert_eq!(
+      options.exclusions_slice().len(),
+      WatcherOptions::MAX_EXCLUSIONS
+    );
+    options
+      .validate()
+      .expect("both ceilings are inclusive on every face");
   }
 
   /// Every `Backend` variant is reachable under the tag `as_str` reports.
@@ -755,6 +1004,55 @@ mod root_options {
       );
     }
 
+    /// A WORD past the per-pattern length ceiling stops the seat at that word,
+    /// before it collects — and before anything the size of the word is owned.
+    ///
+    /// The seat's own bound is on the COUNT, and it cannot see this one: a single
+    /// first element is one element whatever its length. The per-pattern ceiling is
+    /// the element's own face's, measured on the bytes the format is holding, and
+    /// this is what says the seat inherits it rather than reading the list first.
+    ///
+    /// The word after it cannot compile, so the refusal proves WHERE the read
+    /// stopped: a seat that had gone on would answer with that word's syntax error
+    /// instead.
+    ///
+    /// Revert witness: deserialize each element through `String` first and the same
+    /// refusal arrives after an allocation the document decided the size of.
+    #[test]
+    fn a_seat_word_past_the_length_ceiling_is_refused_at_the_word() {
+      let over = "?".repeat(tributary_proto::glob::MAX_GLOB_LEN * 1024);
+      let err = serde_json::from_str::<RootOptions>(&std::format!(
+        r#"{{"prune": ["{over}", "[unclosed"]}}"#
+      ))
+      .expect_err("the first word is past the length ceiling");
+      let rendered = err.to_string();
+      assert!(
+        rendered.contains(&std::format!(
+          "over the {}-byte limit",
+          tributary_proto::glob::MAX_GLOB_LEN
+        )),
+        "the refusal is the WORD's length: {rendered}"
+      );
+      assert!(
+        !rendered.contains("unclosed"),
+        "and the seat never reached the word after it: {rendered}"
+      );
+      assert!(
+        rendered.len() < over.len() / 1024,
+        "nothing the size of the word survives the refusal: {rendered}"
+      );
+
+      let err = serde_json::from_str::<RootOptions>(&std::format!(r#"{{"include": ["{over}"]}}"#))
+        .expect_err("the include seat carries the same per-word ceiling");
+      assert!(
+        err.to_string().contains(&std::format!(
+          "over the {}-byte limit",
+          tributary_proto::glob::MAX_GLOB_LEN
+        )),
+        "{err}"
+      );
+    }
+
     /// A document naming ONE key leaves every other knob at the value `new()`
     /// gives it — the struct-level `#[serde(default)]`.
     #[test]
@@ -834,6 +1132,89 @@ mod root_options {
       );
     }
 
+    /// `--include` spells ALL THREE of the seat's states.
+    ///
+    /// The seat is `Option<Vec<Glob>>` and its three states mean three different
+    /// policies: absent delivers every file, engaged-and-EMPTY delivers none
+    /// (directories and `Rescan`s only), and engaged with patterns delivers what
+    /// they name. A plain repeatable flag requires a value per occurrence, so the
+    /// middle one — a documented policy the serde face and the programmatic builder
+    /// can both express — had NO spelling at all here: omitting the flag gave the
+    /// absent seat, `--include` with no value was a parse error, and every
+    /// successful occurrence produced a non-empty list. `num_args = 0..=1` closes
+    /// that, and appending is unchanged.
+    ///
+    /// An UPDATE keeps the command-line-only rule: a seat the command line did not
+    /// name is left as it stood, and a bare `--include` SETS the empty seat rather
+    /// than reading as "nothing given".
+    ///
+    /// Revert witness: drop `num_args` and the bare rows below fail at the parse.
+    #[test]
+    fn the_include_flag_spells_all_three_seat_states() {
+      // ABSENT — every file.
+      assert_eq!(parse(&[]).include(), None);
+
+      // EMPTY — no file; directories and Rescans only.
+      assert_eq!(
+        parse(&["--include"]).include().map(patterns),
+        Some(std::vec![]),
+        "a bare --include is the engaged-but-EMPTY seat, not the absent one"
+      );
+
+      // NON-EMPTY — occurrences still append, in order.
+      assert_eq!(
+        parse(&["--include", "*.mp4", "--include", "*.mov"])
+          .include()
+          .map(patterns),
+        Some(std::vec!["*.mp4", "*.mov"])
+      );
+
+      // UPDATE — the command-line-only rule, in both directions.
+      let matches = |rest: &[&str]| {
+        <RootOptions as clap::Args>::augment_args_for_update(clap::Command::new("app"))
+          .get_matches_from(std::iter::once("app").chain(rest.iter().copied()))
+      };
+      let mut kept = RootOptions::new().with_include([glob("*.mp4")]);
+      clap::FromArgMatches::update_from_arg_matches(&mut kept, &matches(&["--prune", "**/.git"]))
+        .expect("the update applies");
+      assert_eq!(
+        kept.include().map(patterns),
+        Some(std::vec!["*.mp4"]),
+        "an unrelated flag leaves the seat exactly as it stood"
+      );
+
+      let mut emptied = RootOptions::new().with_include([glob("*.mp4")]);
+      clap::FromArgMatches::update_from_arg_matches(&mut emptied, &matches(&["--include"]))
+        .expect("the update applies");
+      assert_eq!(
+        emptied.include().map(patterns),
+        Some(std::vec![]),
+        "a bare --include on an update SETS the empty seat"
+      );
+
+      // OPTIONAL FLATTEN — a bare --include is a value source, so the household is
+      // present.
+      #[derive(Debug, clap::Parser)]
+      struct OptionalCli {
+        #[command(flatten)]
+        options: Option<RootOptions>,
+      }
+
+      <OptionalCli as clap::CommandFactory>::command().debug_assert();
+      assert_eq!(
+        OptionalCli::parse_from(["app", "--include"])
+          .options
+          .expect("a bare --include makes the optional household present")
+          .include()
+          .map(patterns),
+        Some(std::vec![])
+      );
+      assert!(
+        OptionalCli::parse_from(["app"]).options.is_none(),
+        "and nothing spelled is still no household"
+      );
+    }
+
     /// A FLAGLESS command line is the default household — the same value
     /// `RootOptions::new()` and an absent serde document hand back.
     ///
@@ -886,6 +1267,74 @@ mod root_options {
         Bare::parse_from(["app"]).interest,
         Interest::new(),
         "flattening `Interest` on its own is untouched by the household's proxy"
+      );
+    }
+
+    /// A seat past its ceiling is refused at the FLAG, and refused WITHOUT
+    /// compiling the patterns it carries.
+    ///
+    /// The count is a property of the list, not of any pattern in it, so it can be
+    /// answered before a single automaton exists — and it has to be, because a
+    /// `parse_from` takes an arbitrarily long iterator and every value clap
+    /// compiled on the way past is memory the ceiling was written to refuse.
+    ///
+    /// The pattern that would fail to compile sits AFTER the 256th, so the refusal
+    /// this asserts can only be the count: a face that compiled as it parsed would
+    /// answer with that pattern's own error instead, which is precisely the work
+    /// this cell says never happens.
+    ///
+    /// Revert witness: parse the seats as `Vec<Glob>` again and the row below is
+    /// refused for the unclosed bracket rather than for its length.
+    #[test]
+    fn an_over_full_seat_is_refused_before_it_compiles() {
+      let cap = RootOptions::MAX_SEAT_PATTERNS;
+      let flags = |flag: &str, count: usize, tail: Option<&str>| {
+        (0..count)
+          .flat_map(|n| [flag.to_owned(), std::format!("**/w{n}")])
+          .chain(
+            tail
+              .into_iter()
+              .flat_map(|tail| [flag.to_owned(), tail.to_owned()]),
+          )
+          .collect::<Vec<_>>()
+      };
+      let run =
+        |args: Vec<String>| Cli::try_parse_from(std::iter::once("app".to_owned()).chain(args));
+
+      // The ceiling itself parses, and compiles every one of its patterns.
+      assert_eq!(
+        run(flags("--prune", cap, None))
+          .expect("the ceiling itself is honoured")
+          .options
+          .prune()
+          .len(),
+        cap
+      );
+
+      let err =
+        run(flags("--prune", cap, Some("[unclosed"))).expect_err("one past the ceiling is refused");
+      assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+      let rendered = err.render().to_string();
+      assert!(
+        rendered.contains(&std::format!("{cap}")),
+        "the refusal is the COUNT, naming the ceiling: {rendered}"
+      );
+      assert!(
+        !rendered.contains("invalid glob"),
+        "and the pattern past the ceiling was never compiled: {rendered}"
+      );
+
+      // The include seat carries the same ceiling, through the same helper.
+      let err =
+        run(flags("--include", cap + 1, None)).expect_err("the include seat is bounded too");
+      assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+      assert_eq!(
+        run(flags("--include", cap, None))
+          .expect("its ceiling is honoured too")
+          .options
+          .include()
+          .map(<[Glob]>::len),
+        Some(cap)
       );
     }
 

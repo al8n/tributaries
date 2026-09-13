@@ -6,7 +6,7 @@ use std::{
   path::{Path, PathBuf},
   pin::Pin,
   sync::{
-    Arc, PoisonError, RwLock,
+    Arc, Mutex, PoisonError, RwLock,
     atomic::{AtomicU64, Ordering},
   },
   task::{Context, Poll},
@@ -14,6 +14,10 @@ use std::{
 
 use agnostic_lite::RuntimeLite;
 use futures_core::Stream;
+use rand_chacha::{
+  ChaCha20Rng,
+  rand_core::{RngCore, SeedableRng},
+};
 use tributary_proto::{Change, Interest, ScopeId};
 
 use crate::{
@@ -38,6 +42,46 @@ mod linux_kernel_tests;
 
 /// Mints one id per [`Watcher`], branding its handles (see [`RootHandle`]).
 static WATCHER_INSTANCES: AtomicU64 = AtomicU64::new(1);
+
+/// Seeds a watcher's marker-nonce generator — the ONE entropy draw in that
+/// watcher's life, taken while it is assembled and never repeated.
+///
+/// `None` when no seed could be taken, which the watcher carries as "no generator"
+/// for the rest of its life: [`Watcher::mint_sync_ticket`] then mints nothing, so
+/// no sync is ever admitted under a leaf a peer could compute. The stream this
+/// hands back lives on the [`Watcher`], where what the construction does and does
+/// not claim is written down (see its `nonces` field).
+fn sync_nonce_generator() -> Option<ChaCha20Rng> {
+  sync_nonce_seed().map(ChaCha20Rng::from_seed)
+}
+
+/// The 32 bytes [`sync_nonce_generator`] builds a watcher's stream from, read
+/// straight out of the platform's entropy interface.
+///
+/// There is no fallback, because a seed something else could compute would make
+/// every nonce derived from it computable too — and the nonce is the whole of what
+/// keeps a co-user of the tree from pre-creating the marker name a barrier is
+/// about to wait on.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+fn sync_nonce_seed() -> Option<[u8; 32]> {
+  let mut seed = [0u8; 32];
+  getrandom::fill(&mut seed).ok()?;
+  Some(seed)
+}
+
+/// `wasm32-unknown-unknown` has no entropy source of its own — the backend is the
+/// embedder's choice, and a library cannot make it for them.
+///
+/// So no seed is ever taken there, the watcher holds no generator, and
+/// [`Watcher::mint_sync_ticket`] answers [`None`] rather than minting a leaf
+/// something else can compute. That costs the sync path nothing at runtime: it is
+/// a `None` the watcher has carried since it was built, not work done per call. It
+/// is also the platform that has no filesystem backend at all, so nothing is lost
+/// there that was ever reachable.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+fn sync_nonce_seed() -> Option<[u8; 32]> {
+  None
+}
 
 /// An opaque handle to one watched root of a [`Watcher`].
 ///
@@ -92,10 +136,16 @@ impl RootHandle {
 /// but the successor holds a DIFFERENT ticket, so a delayed cancel through this one
 /// resolves the retired sync (a true no-op), never the successor.
 ///
-/// Opaque: its fields are the minting watcher's brand and the mint sequence, both
-/// private. It carries no path and no server-side state until the sync it keys is
-/// admitted, so minting one — even in a flood — retains nothing. Exported like
-/// [`RootHandle`].
+/// It also CARRIES THE MARKER LEAF the sync will write
+/// ([`leaf`](Self::leaf)) — the one name that identifies this sync's marker on the
+/// stream. The leaf is minted here rather than accepted from the caller, because
+/// the filtering the marker depends on (the active-marker exemption both seats
+/// grant it) is only sound for a name no other writer under the tree can guess.
+///
+/// Opaque: its fields are the minting watcher's brand, the mint sequence and the
+/// leaf's nonce, all private. It carries no path and no server-side state until
+/// the sync it keys is admitted, so minting one — even in a flood — retains
+/// nothing. Exported like [`RootHandle`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SyncTicket {
   /// The minting watcher's brand — a ticket presented to a DIFFERENT watcher is
@@ -106,12 +156,21 @@ pub struct SyncTicket {
   /// The per-watcher monotonic mint sequence, never re-minted, so the ticket maps
   /// to one incarnation across all time — the ledger's `by_ticket` key.
   seq: u64,
+  /// The unguessable word this ticket's marker leaf is rendered with, drawn at
+  /// mint off the watcher's cryptographic stream. Carried rather than the
+  /// rendered string so the ticket stays `Copy` and allocation-free.
+  nonce: u64,
 }
 
 impl SyncTicket {
-  /// Brands a mint sequence under the issuing watcher.
-  pub(crate) const fn new(instance: u64, seq: u64) -> Self {
-    Self { instance, seq }
+  /// Brands a mint sequence, and the leaf nonce drawn with it, under the issuing
+  /// watcher.
+  pub(crate) const fn new(instance: u64, seq: u64, nonce: u64) -> Self {
+    Self {
+      instance,
+      seq,
+      nonce,
+    }
   }
 
   /// The issuing watcher's brand.
@@ -122,6 +181,27 @@ impl SyncTicket {
   /// The per-watcher mint sequence — the ledger's `by_ticket` key.
   pub(crate) const fn seq(&self) -> u64 {
     self.seq
+  }
+
+  /// The LEAF the sync this ticket admits writes its marker under — the name that
+  /// identifies the marker on the stream, whatever path its parent has by the time
+  /// the create is reported.
+  ///
+  /// A caller correlates its barrier on this: the marker's own create event is the
+  /// one that rides the root's ordered queue behind every change the backend
+  /// reported before the write, and the last segment is what names it. The landing
+  /// PATH [`sync_root`](Watcher::sync_root) returns is the spelling at write time
+  /// and is for reaping, not for correlation (see that method).
+  ///
+  /// Minted, never chosen: the four fields are the issuing watcher's brand, this
+  /// process's id, the mint sequence and a word off a cryptographic stream the
+  /// watcher seeded from the OS. The first three are computable from any marker
+  /// already lying under the tree, so it is the last that keeps a co-user of the
+  /// tree from pre-creating the name a barrier is about to wait on. Rendering
+  /// allocates; the ticket itself stays `Copy`.
+  #[must_use]
+  pub fn leaf(&self) -> String {
+    crate::driver::sync_cookie_name(self.instance, std::process::id(), self.seq, self.nonce)
   }
 }
 
@@ -156,14 +236,23 @@ pub struct SyncAdmission {
   /// move-only — admitted at most once: the wire ticket
   /// [`sync_root`](Watcher::sync_root) builds and the ledger's `by_ticket` key.
   seq: u64,
+  /// The leaf nonce drawn with this sequence, carried so
+  /// [`sync_root`](Watcher::sync_root) renders the SAME leaf the paired
+  /// [`SyncTicket`] answers — one draw, one name, whichever half is asked.
+  nonce: u64,
 }
 
 impl SyncAdmission {
-  /// Mints an admission under the issuing watcher's brand and sequence. The sole
-  /// constructor, called only by [`mint_sync_ticket`](Watcher::mint_sync_ticket),
-  /// which mints the paired [`SyncTicket`] from the same brand and sequence.
-  pub(crate) const fn new(instance: u64, seq: u64) -> Self {
-    Self { instance, seq }
+  /// Mints an admission under the issuing watcher's brand, sequence and leaf
+  /// nonce. The sole constructor, called only by
+  /// [`mint_sync_ticket`](Watcher::mint_sync_ticket), which mints the paired
+  /// [`SyncTicket`] from the same three.
+  pub(crate) const fn new(instance: u64, seq: u64, nonce: u64) -> Self {
+    Self {
+      instance,
+      seq,
+      nonce,
+    }
   }
 
   /// The issuing watcher's brand.
@@ -176,6 +265,19 @@ impl SyncAdmission {
   pub(crate) const fn seq(&self) -> u64 {
     self.seq
   }
+
+  /// The leaf nonce this admission was minted with — the wire ticket
+  /// [`sync_root`](Watcher::sync_root) builds carries it, and the leaf both halves
+  /// render is the same string.
+  pub(crate) const fn nonce(&self) -> u64 {
+    self.nonce
+  }
+
+  /// The marker LEAF this admission's sync writes — the same string the paired
+  /// [`SyncTicket::leaf`] answers, rendered from the same three fields.
+  pub(crate) fn leaf(&self) -> String {
+    crate::driver::sync_cookie_name(self.instance, std::process::id(), self.seq, self.nonce)
+  }
 }
 
 /// Why a [`sync_root`](Watcher::sync_root) call did not place a cookie, plus — for
@@ -183,7 +285,9 @@ impl SyncAdmission {
 /// a same-sequence retry.
 ///
 /// `admission` is `Some` **iff** the refusal is provably PRE-BIRTH: a synchronous
-/// door refusal, or a driver refusal raised before the sync was admitted
+/// door refusal — except the door's own pin failure, which is spelled
+/// [`Write`](SyncRootError::Write) and is classified with the rest of that
+/// variant — or a driver refusal raised before the sync was admitted
 /// ([`WriteInFlight`](SyncRootError::WriteInFlight),
 /// [`NameInUse`](SyncRootError::NameInUse),
 /// [`TicketInUse`](SyncRootError::TicketInUse),
@@ -195,7 +299,10 @@ impl SyncAdmission {
 /// [`sync_root`](Watcher::sync_root) to retry under the SAME sequence — the paired
 /// [`SyncTicket`] stays valid. `None` means the sequence is spent or its fate is
 /// ambiguous — the write was admitted then retired
-/// ([`Write`](SyncRootError::Write), [`DirPruned`](SyncRootError::DirPruned)), the
+/// ([`Write`](SyncRootError::Write), [`DirPruned`](SyncRootError::DirPruned),
+/// [`DirExcluded`](SyncRootError::DirExcluded),
+/// [`DirReplaced`](SyncRootError::DirReplaced),
+/// [`DirCrossesMount`](SyncRootError::DirCrossesMount)), the
 /// sync reached a post-birth terminal ([`Retired`](SyncRootError::Retired)), or the
 /// watcher is [`Closed`](SyncRootError::Closed) — so a retry must re-mint through
 /// [`mint_sync_ticket`](Watcher::mint_sync_ticket).
@@ -219,9 +326,20 @@ impl SyncRootDenied {
   /// so a future refusal is fail-safe — an unnecessary re-mint, never a reused
   /// sequence. Post-birth by construction and therefore deliberately absent from
   /// the returned set: `Write` (admitted, then retired before the reply — the
-  /// sequence is burned), `DirPruned` (the same shape: the verdict needs the canonical
+  /// sequence is burned; the DOOR's own pin failure creates nothing and could have
+  /// kept its sequence, but it wears the same variant, and one variant gets one
+  /// classification — the fail-safe direction of an unnecessary re-mint),
+  /// `DirPruned` (the same shape: the verdict needs the canonical
   /// directory only the write can resolve, so it too is admitted and then retired),
-  /// `Retired` (a post-admission terminal), and `Closed`.
+  /// `DirExcluded` (refused at the admission for the caller's SPELLING and again at
+  /// the write for the directory that spelling resolved to — the caller cannot tell
+  /// the two apart, so the post-birth reading governs), `DirReplaced` (the same
+  /// shape as `DirPruned`: the verdict needs the object only the write's own
+  /// descent can reach, so it too is admitted and then retired — and re-minting is
+  /// what re-reads the directory that now stands at the name),
+  /// `DirCrossesMount` (the same shape again, taken on the reserved cookie
+  /// directory's own descriptor), `Retired` (a
+  /// post-admission terminal), and `Closed`.
   pub(crate) fn classify(error: SyncRootError, admission: SyncAdmission) -> Self {
     let admission = if matches!(
       error,
@@ -229,7 +347,6 @@ impl SyncRootDenied {
         | SyncRootError::ForeignTicket
         | SyncRootError::BadCookieName { .. }
         | SyncRootError::DirOutsideRoot { .. }
-        | SyncRootError::DirExcluded { .. }
         | SyncRootError::WriteInFlight
         | SyncRootError::NameInUse { .. }
         | SyncRootError::TicketInUse {}
@@ -915,7 +1032,36 @@ pub struct Watcher<R> {
   /// (uniqueness, not ordering, is all a ticket needs). `u64` and driver-lifetime,
   /// so it never wraps — the same non-exhaustion argument the cookie id mint
   /// stands on.
+  ///
+  /// It starts at 1 rather than 0 because the sequence is also the `seq` FIELD of
+  /// the marker leaf the mint renders, and the reserved namespace's grammar
+  /// refuses 0 there ([`is_sync_cookie_name`](crate::is_sync_cookie_name)): a leaf
+  /// the classifier rejects is a genuine marker republished on every consumer
+  /// stream as a user create.
   sync_tickets: Arc<AtomicU64>,
+  /// The marker-leaf nonce stream: ONE cryptographic generator per watcher, seeded
+  /// from the OS while the watcher is built and never re-seeded. Each
+  /// [`mint_sync_ticket`](Self::mint_sync_ticket) draws one word off it, which is
+  /// arithmetic under a short lock rather than an OS call — the single entropy read
+  /// was paid once, on the constructing thread.
+  ///
+  /// `None` means no seed could be taken, which the watcher carries for the rest
+  /// of its life: it then mints no admission at all rather than handing out a leaf
+  /// something else could compute. Behind an `Arc<Mutex<_>>` for the same reason
+  /// the sequence is behind an `Arc`: clones of one watcher must draw from ONE
+  /// stream, never from two copies that would publish the same words twice.
+  nonces: Option<Arc<Mutex<ChaCha20Rng>>>,
+  /// The bound on the descriptors the sync door may be HOLDING at once
+  /// ([`SyncPinAllowance`](crate::driver::SyncPinAllowance)). Every
+  /// [`sync_root`](Self::sync_root) takes a slot of it before it opens the pins
+  /// its admission is judged on, and the slot travels with those pins, so a
+  /// caller that polls a flood of syncs together waits at this door instead of
+  /// exhausting the process's descriptor table on the way to one that counts
+  /// them.
+  ///
+  /// Shared across clones of one watcher, like the mint above: the bound belongs
+  /// to the watcher, not to a handle.
+  pins: crate::driver::SyncPinAllowance,
   events: EventStream,
   roots: Arc<RwLock<RootSet>>,
   // `fn() -> R`, not `R`: the watcher holds no runtime value, so its auto
@@ -963,6 +1109,10 @@ impl<R: RuntimeLite> Watcher<R> {
     ops: impl crate::driver::FsOps,
   ) -> Result<Self, BuildError> {
     let (command_tx, command_rx) = async_channel::bounded(16);
+    // The sync door's descriptor bound, sized by the ledger cap that already
+    // bounds how many syncs this watcher may have outstanding — read before the
+    // config is handed to the task, which owns it from there on.
+    let pins = crate::driver::SyncPinAllowance::new(config.cookie_global_cap);
     // The cookie-cleanup ingress: ONE ledger, minted HERE and shared between this
     // handle and the driver task below, because a public cleanup request must
     // address the very records that driver admits. Its two halves are created
@@ -988,11 +1138,37 @@ impl<R: RuntimeLite> Watcher<R> {
       instance: WATCHER_INSTANCES.fetch_add(1, Ordering::Relaxed),
       commands: command_tx,
       cleanup,
-      sync_tickets: Arc::new(AtomicU64::new(0)),
+      sync_tickets: Arc::new(AtomicU64::new(1)),
+      nonces: sync_nonce_generator().map(|generator| Arc::new(Mutex::new(generator))),
+      pins,
       events: Box::pin(event_rx),
       roots,
       _runtime: PhantomData,
     })
+  }
+
+  /// A watcher over a fake platform whose global cookie cap — the ledger's bound,
+  /// and the size of the sync door's descriptor allowance — is the cell's to
+  /// choose. What those cells stage is the door's bound itself, and the
+  /// production one is far too wide to stand a flood against.
+  ///
+  /// Its cfg is exactly the union of the cells that call it (the
+  /// real-filesystem identity module).
+  #[cfg(all(
+    test,
+    feature = "tokio",
+    not(miri),
+    any(target_os = "linux", target_os = "macos")
+  ))]
+  pub(crate) fn new_with_cookie_cap(
+    options: WatcherOptions,
+    ops: impl crate::driver::FsOps,
+    cookie_global_cap: usize,
+  ) -> Result<Self, BuildError> {
+    options.validate()?;
+    let mut config = driver_config(&options, crate::os::BackendKind::FsEvents);
+    config.cookie_global_cap = cookie_global_cap;
+    Self::spawn_with(options, config, ops)
   }
 
   /// A watcher over a fake platform, for hermetic lifecycle tests.
@@ -1482,19 +1658,45 @@ impl<R> Watcher<R> {
   /// carry the SAME mint sequence, so the ticket cancels exactly the incarnation
   /// the admission admits.
   ///
-  /// Pure memory: one `Relaxed` atomic increment, no channel, no allocation.
-  /// Neither half has server-side state until the sync the admission admits is
-  /// born, so minting a flood that is never used retains nothing. The mint is
-  /// monotonic and driver-lifetime, so a sequence is never re-minted — and, the
-  /// admission being move-only, that sequence is admitted at most once: the two
-  /// facts that make a cancel through the ticket address at most one incarnation,
-  /// ever.
-  pub fn mint_sync_ticket(&self) -> (SyncAdmission, SyncTicket) {
+  /// The mint also draws the sync's MARKER LEAF — the name
+  /// [`sync_root`](Self::sync_root) writes and [`SyncTicket::leaf`] answers. The
+  /// leaf is minted here rather than taken from the caller because everything that
+  /// rests on it rests on its being unguessable: both per-root seats grant an
+  /// active marker's leaf an exemption wherever it stands, so a leaf a peer under
+  /// the tree could predict would let an ordinary file of that name take the
+  /// exemption — and be recorded as the barrier's observation — ahead of the
+  /// marker's own create.
+  ///
+  /// Pure memory: one `Relaxed` atomic increment and one word off this watcher's
+  /// own cryptographic stream, under a lock held for that draw alone — no channel,
+  /// no allocation, no OS call (the single entropy read that keyed the stream was
+  /// paid once, when the watcher was built). Neither half has server-side state
+  /// until the sync the admission admits is born, so minting a flood that is never
+  /// used retains nothing. The mint is monotonic and driver-lifetime, so a sequence
+  /// is never re-minted — and, the admission being move-only, that sequence is
+  /// admitted at most once: the two facts that make a cancel through the ticket
+  /// address at most one incarnation, ever.
+  ///
+  /// # `None`
+  ///
+  /// The watcher never got an entropy seed, so it has no unpredictable leaf to
+  /// mint. It answers `None` for the rest of its life, and no sync can be admitted
+  /// through it — deliberately, because a barrier standing on a name something
+  /// else can compute is not a barrier. Today that is only
+  /// `wasm32-unknown-unknown`, which supplies no entropy interface and no
+  /// filesystem backend either.
+  #[must_use]
+  pub fn mint_sync_ticket(&self) -> Option<(SyncAdmission, SyncTicket)> {
+    let nonce = {
+      let nonces = self.nonces.as_ref()?;
+      let mut nonces = nonces.lock().unwrap_or_else(PoisonError::into_inner);
+      nonces.next_u64()
+    };
     let seq = self.sync_tickets.fetch_add(1, Ordering::Relaxed);
-    (
-      SyncAdmission::new(self.instance, seq),
-      SyncTicket::new(self.instance, seq),
-    )
+    Some((
+      SyncAdmission::new(self.instance, seq, nonce),
+      SyncTicket::new(self.instance, seq, nonce),
+    ))
   }
 
   /// Places a **sync cookie** — the kernel-mediated barrier marker — under
@@ -1511,13 +1713,124 @@ impl<R> Watcher<R> {
   ///
   /// # The returned path is the only authority on where the cookie is
   ///
-  /// The cookie does NOT land at `dir.join(name)`. It lands one level deeper, in
+  /// The cookie does NOT land at `dir.join(leaf)`. It lands one level deeper, in
   /// a reserved-namespace directory the watcher creates and owns inside `dir`,
   /// because a cookie's removal must be anchored to a directory nobody else may
   /// write — a name in a directory the watched tree owns can be rebound between
   /// the removal's proof and its unlink, and no amount of re-checking closes
-  /// that. Reap what this call RETURNED; a path re-derived from `dir` and `name`
+  /// that. Reap what this call RETURNED; a path re-derived from `dir` and the leaf
   /// names nothing.
+  ///
+  /// That path is the spelling at WRITE time: it is the name the write's own parent
+  /// descriptor answered to, and a peer that renames one of the traversed
+  /// directories after that reading leaves the cookie under the new name while this
+  /// reply keeps the old one. Nothing is broken by that — the removal is anchored to
+  /// the directory the create was made through, and a reap of this path resolves the
+  /// same record it was published under — but a caller must not treat the returned
+  /// path as the marker's ADDRESS. What identifies the marker on the stream is its
+  /// last component: [`SyncTicket::leaf`], minted with the admission, whose create
+  /// event arrives under whatever path the marker's parent has by then.
+  ///
+  /// # The barrier is a promise about an OBJECT
+  ///
+  /// What this call certifies an ordering for is the DIRECTORY OBJECT `dir` named
+  /// when the sync was admitted, and never merely the name. The write is detached
+  /// from that instant — by the coverage-settle fence, and by the blocking pool it
+  /// then runs on — and a peer that renames that directory aside and stands a
+  /// replacement at its name inside the window leaves every pathname the write
+  /// resolves perfectly valid: the replacement is a legitimate child of the proven
+  /// root, so the descent reaches it, while the coverage this scope would report a
+  /// marker's create through is not yet armed on it. A marker born there rides no
+  /// queue this root's stream reads, and a later cold enumeration of the
+  /// replacement can report its create ahead of changes that truly preceded it —
+  /// a barrier that resolves while certifying nothing.
+  ///
+  /// So the directory's identity is read HERE and re-read off the descriptor the
+  /// write ends holding, and a replacement is a REFUSAL
+  /// ([`DirReplaced`](SyncRootError::DirReplaced)) rather than a write: a marker is
+  /// never born inside an object whose coverage this call did not prove. The
+  /// sequence is spent by it — the verdict needs the object only the write can
+  /// reach — so a retry re-mints, which re-reads whatever now stands at the name.
+  ///
+  /// The same promise reaches one level FURTHER DOWN, to the object the marker is
+  /// actually born in. A marker does not go in `dir` itself but in the private
+  /// reserved directory the watcher keeps inside it, and that name is as swappable
+  /// as its parent's: a peer that prepares a directory of its own — same owner,
+  /// same mode, descendants already inside it — and moves it into the reserved name
+  /// after the admission would otherwise be adopted on those looks alone. So the
+  /// reserved name is sampled at admission too, and the write's own create decides
+  /// between two cases and no others. A directory already standing there is
+  /// adopted only if it is EXACTLY the object the admission read — device and
+  /// inode — and refused otherwise
+  /// ([`DirReplaced`](SyncRootError::DirReplaced) again, including for a reserved
+  /// directory that appeared after the cut).
+  ///
+  /// Where nothing stands there the write makes one, and its own `mkdirat` is not
+  /// by itself a licence to enter what the following `openat` reaches: the
+  /// reserved name is `.tributaries-sync-cookies-<uid>`, which every peer under
+  /// the tree can predict, so a peer with rename rights can exchange the empty
+  /// directory the create just bound for one it prepared — same owner, same mode,
+  /// descendants already inside it. Ownership and mode cannot tell those apart. So
+  /// the create arm proves the property the ordering actually rests on instead:
+  /// once the marker exists, it is the ONLY thing the directory holds — enumerated
+  /// through the descriptor the write is holding, AFTER the create rather than
+  /// before it. Before it, the reading would describe the directory as it was and
+  /// leave a peer the whole window up to the create to insert something into it;
+  /// after it, that entry is there to be found. A directory carrying what makes it
+  /// dangerous — changes older than the marker that no queue of this scope
+  /// reported, which a cold enumeration could order behind it — is refused, the
+  /// marker is destroyed again through the descriptors that created it, and the
+  /// call answers [`DirReplaced`](SyncRootError::DirReplaced) with nothing of the
+  /// write left on disk. The residual is stated plainly: a directory exchanged
+  /// into the reserved name during the create IS entered if it turns out to hold
+  /// nothing but this write's marker — that is exactly what the proof needs — so a
+  /// marker written into it may, under a descending backend whose coverage was
+  /// never armed on that object, wait out its caller's timeout rather than
+  /// resolve; no ordering is ever falsely certified by it.
+  ///
+  /// A directory reached either way must live on the parent's own device: a mount
+  /// standing at the reserved name is ground no crawl of this root descends into,
+  /// and is refused as
+  /// [`DirCrossesMount`](SyncRootError::DirCrossesMount). Ownership and mode are
+  /// still checked, and are still only ever grounds to REFUSE: no directory is
+  /// entered because its bits look right.
+  ///
+  /// # The judged objects are held for the sync's duration
+  ///
+  /// An identity is a `(dev, ino)` pair, and an inode number is a slot the
+  /// filesystem reclaims. A peer that removes one of the judged directories,
+  /// churns allocations until a replacement of its own receives that number, and
+  /// moves the replacement onto the name satisfies every field of the comparison
+  /// above — so the comparison alone would certify an ordering for a directory the
+  /// cut never covered. This call therefore does not merely READ those objects; on
+  /// the platforms that can hold one it opens a descriptor onto the watched root,
+  /// onto `dir`, and onto the reserved directory where one already stands, and
+  /// holds them. A held inode is not reclaimable, so an equality at write time is
+  /// an object identity rather than a coincidence of numbering.
+  ///
+  /// They are held for the SYNC'S DURATION and no longer: the descriptors travel
+  /// with the admission and are dropped when it writes, refuses, or retires. One
+  /// visible consequence is worth stating — a judged directory deleted while the
+  /// sync is in flight stays allocated until the sync settles, so the kernel's own
+  /// deletion notice for it is deferred to that moment rather than arriving at the
+  /// unlink. The window is bounded by the same caps that bound parked syncs.
+  ///
+  /// # The leaf is minted, never chosen
+  ///
+  /// This call takes no name. The leaf is drawn by
+  /// [`mint_sync_ticket`](Self::mint_sync_ticket) together with the admission and
+  /// read back off the paired [`SyncTicket`], and it carries a word off a
+  /// cryptographic stream the watcher seeded from the OS.
+  ///
+  /// That is a correctness property, not a convenience. Admitting a sync ARMS an
+  /// exemption on the marker's leaf: for as long as the sync is live, a change
+  /// whose last segment is that leaf passes both per-root seats wherever it stands,
+  /// so the barrier stays resolvable even when a peer renames the reserved
+  /// directory out from under the marker between the write's descriptor walk and
+  /// its create. With a caller-chosen leaf that exemption is a hole — an ordinary
+  /// file of the same name, changing anywhere in the scope, takes it and can be
+  /// recorded as the barrier's observation ahead of the marker's own create. A
+  /// minted leaf closes it: no other writer under the tree can name the file.
   ///
   /// The write is parked on the scope's coverage-settle fence: under a
   /// descending backend, a change inside a subtree whose per-directory watch
@@ -1536,7 +1849,7 @@ impl<R> Watcher<R> {
   ///
   /// `admission` is the move-only [`SyncAdmission`] half of a fresh
   /// [`mint_sync_ticket`](Self::mint_sync_ticket) pair, consumed BY VALUE to admit
-  /// THIS sync. The type system thus forbids presenting one admission — one mint
+  /// THIS sync and to supply the marker leaf it writes. The type system thus forbids presenting one admission — one mint
   /// sequence — to two syncs, so a later cancel through the paired ticket can never
   /// alias a second incarnation. A pre-birth refusal hands the admission back in
   /// [`SyncRootDenied`] for a same-sequence retry (a refusal burns nothing); see
@@ -1549,37 +1862,91 @@ impl<R> Watcher<R> {
   /// [`SyncAdmission`] to retry under the same sequence:
   /// [`SyncRootError::UnknownRoot`] for a foreign or dead handle;
   /// [`ForeignTicket`](SyncRootError::ForeignTicket) when `admission` was minted by
-  /// a different watcher; [`BadCookieName`](SyncRootError::BadCookieName) when
-  /// `name` is not a single normal component;
+  /// a different watcher;
   /// [`DirOutsideRoot`](SyncRootError::DirOutsideRoot) when `dir` is not inside the
   /// root (including via `..` traversal);
   /// [`DirExcluded`](SyncRootError::DirExcluded) when `dir` is inside the root but
   /// under one of the configured exclusions, whose whole purpose is to keep that
-  /// subtree's events off the stream the barrier waits on;
+  /// subtree's events off the stream the barrier waits on — judged both on the
+  /// spelling given here and on the directory the write actually resolves, so a
+  /// symlink into an excluded subtree is refused too;
   /// [`DirPruned`](SyncRootError::DirPruned) when this ROOT's own
   /// [`prune`](crate::RootOptions::prune) seat covers the CANONICAL directory the
   /// write resolves for `dir`, for the same reason and carrying the pattern that did
   /// it;
+  /// [`DirReplaced`](SyncRootError::DirReplaced) when the directory the write's
+  /// own descent reaches is not the object `dir` named at admission — a peer
+  /// replaced it in the meantime, and the barrier promises an ordering for the
+  /// object that was judged — or when the reserved cookie directory inside it is
+  /// not the object the admission read there, or is one this write created and
+  /// something besides its own marker turns out to be standing in;
+  /// [`DirCrossesMount`](SyncRootError::DirCrossesMount) when a directory already
+  /// standing at that reserved name lies on another device, which is ground this
+  /// root's crawl never descends into;
   /// [`Write`](SyncRootError::Write) when the
-  /// create fails (a read-only tree surfaces as `PermissionDenied`);
+  /// create fails (a read-only tree surfaces as `PermissionDenied`), and when this
+  /// call cannot HOLD the directories the sync is judged against — a descriptor
+  /// table with no room left above all, which is reported rather than mistaken for
+  /// a directory that was not there;
   /// [`WriteInFlight`](SyncRootError::WriteInFlight) when a physical write for this
-  /// root is already in flight; [`NameInUse`](SyncRootError::NameInUse) when a live
-  /// sync of this watcher already holds `name`;
+  /// root is already in flight;
   /// [`TicketInUse`](SyncRootError::TicketInUse) when a live sync of this watcher
   /// already holds this admission's sequence;
   /// [`CleanupBacklog`](SyncRootError::CleanupBacklog) when the root's cookie
   /// cleanup backlog cap is reached; [`Retired`](SyncRootError::Retired) when the
   /// root died while the write was parked; [`Closed`](SyncRootError::Closed) once
-  /// the watcher is closed. The admission is returned (retryable) for every refusal
+  /// the watcher is closed. [`BadCookieName`](SyncRootError::BadCookieName) and
+  /// [`NameInUse`](SyncRootError::NameInUse) are not reachable from here — the leaf
+  /// is minted, so it is a single normal component by construction and unique to
+  /// one live sync — and survive only as the driver's own fail-closed invariants.
+  /// The admission is returned (retryable) for every refusal
   /// except [`Write`](SyncRootError::Write),
-  /// [`DirPruned`](SyncRootError::DirPruned), [`Retired`](SyncRootError::Retired),
+  /// [`DirPruned`](SyncRootError::DirPruned),
+  /// [`DirExcluded`](SyncRootError::DirExcluded),
+  /// [`DirReplaced`](SyncRootError::DirReplaced),
+  /// [`DirCrossesMount`](SyncRootError::DirCrossesMount),
+  /// [`Retired`](SyncRootError::Retired),
   /// and [`Closed`](SyncRootError::Closed), whose sequence is spent — re-mint to
   /// retry those.
+  ///
+  /// # Platform notes
+  ///
+  /// The exclusion and `prune` verdicts are taken on the name the OS answers for
+  /// the descriptor the write ended holding — and on the reserved directory the
+  /// marker itself goes in, which an exclusion may name exactly while leaving its
+  /// parent perfectly reportable. A directory renamed INTO excluded or pruned
+  /// ground at any point up to that reading, including mid-descent, which the
+  /// descriptor-relative walk itself cannot notice, is refused before anything is
+  /// created.
+  ///
+  /// The verdict is then RE-TAKEN once the marker exists, because the create is
+  /// descriptor-relative and follows the object it was aimed at: a peer that
+  /// renames the judged directory into fenced ground while the write is in flight
+  /// carries the marker there with it. Such a write does not succeed — the marker
+  /// is removed again through the anchors that created it and the call answers
+  /// [`DirExcluded`](SyncRootError::DirExcluded) or
+  /// [`DirPruned`](SyncRootError::DirPruned), with nothing of the write left on
+  /// disk. So a rename into fenced ground during this call is a refusal a caller
+  /// can act on rather than a barrier that can only time out, and success means
+  /// the marker stood on reportable ground at the last instant this call could
+  /// ask. Nothing precedes a rename that lands after that instant; a marker the
+  /// seats close over only then is suppressed exactly as any other excluded or
+  /// pruned delivery is, which is those seats' documented semantics rather than a
+  /// hole in this call.
+  ///
+  /// On Windows this write's cookie path is still path-addressed at three
+  /// points (opening the cookie parent by pathname after the root identity check;
+  /// a cookie directory renamed between mint and marker create passing
+  /// revalidation with a stale reported landing; a post-create validation
+  /// failure dropping the marker handle). A concurrent rename of `root` or of
+  /// the cookie directory during this call can therefore leave the caller's
+  /// barrier unresolved until it times out, rather than resolving or
+  /// reporting a definite refusal. Tracked as
+  /// <https://github.com/al8n/tributaries/issues/134>.
   pub async fn sync_root(
     &self,
     root: RootHandle,
     dir: impl Into<PathBuf>,
-    name: impl Into<String>,
     admission: SyncAdmission,
   ) -> Result<PathBuf, SyncRootDenied> {
     if root.instance() != self.instance {
@@ -1599,15 +1966,13 @@ impl<R> Watcher<R> {
       ));
     }
     let dir = dir.into();
-    let name = name.into();
-    // The name the caller supplies must be a single normal component — a
-    // separator, `..`, or absolute name would escape the directory on a join.
-    if !crate::driver::is_normal_cookie_name(&name) {
-      return Err(SyncRootDenied::classify(
-        SyncRootError::BadCookieName { name },
-        admission,
-      ));
-    }
+    // The marker's LEAF, rendered from the admission this call consumes — never
+    // taken from the caller. It is one normal component by construction (the
+    // reserved stem, three decimal fields and sixteen hex digits), so the driver's
+    // own check of that is an internal invariant rather than a door the caller can
+    // knock on; and it is unpredictable, which is what the active-marker exemption
+    // the write arms rests on.
+    let name = admission.leaf();
     // The cookie must be reportable on THIS root's stream: a directory outside
     // its coverage could never mint an event the caller will see. Containment is
     // checked on LEXICALLY NORMALIZED components — a plain `starts_with` accepts
@@ -1627,12 +1992,55 @@ impl<R> Watcher<R> {
         admission,
       ));
     }
+    // The OBJECTS this sync is admitted for, sampled here because here is where the
+    // barrier's promise is made: what a sync certifies is an ordering for the
+    // directories that existed at admission, and the write is detached from this
+    // instant by the coverage-settle fence and the blocking pool. A peer that
+    // renames one of them aside and stands a replacement at its name inside that
+    // window leaves every pathname the write resolves valid and every one of them
+    // about the wrong object; these readings are what the write compares what it
+    // reached against before it creates anything ([`SyncRootError::DirReplaced`]).
+    // Two of them, because the marker is not born in the directory the caller
+    // named but in the reserved cookie directory one level inside it, and a
+    // replacement THERE is a directory whose coverage the cut never proved just as
+    // surely. Two `stat`s on this caller's own thread, in [`watch`](Self::watch)'s
+    // mold — never on the driver's owner loop, which must not resolve a pathname
+    // against a mount that can hang.
+    //
+    // Bounded FIRST, and by the watcher rather than by the driver: the caps that
+    // bound a sync are counted when the driver READS the command below, which is
+    // far too late to bound what this thread opens. A caller may poll thousands of
+    // these futures together, and every one of them would hold its pins while its
+    // send waited behind a sixteen-deep mailbox — `EMFILE` for the whole process,
+    // reached before a single cap was consulted, with the watcher's own I/O and
+    // the application's going down with it. So a slot of the watcher's allowance
+    // is taken before any descriptor is, and it travels INSIDE the sampling: it
+    // comes back when the pins do, including when this future is dropped before
+    // the send below ([`SyncPinAllowance`](crate::driver::SyncPinAllowance)).
+    let permit = self.pins.acquire().await;
+    let admitted = match crate::driver::AdmittedDirs::read(permit, &root_path, &dir) {
+      Ok(admitted) => admitted,
+      // A pin this door could not TAKE is not a reading about the tree, and
+      // answering it as one is what hid a full descriptor table behind a verdict
+      // about a directory. It is reported as the write failure it is, carrying the
+      // OS error the caller can act on — a definite absence, by contrast, is a
+      // reading and is carried in the sampling as one.
+      Err(source) => {
+        return Err(SyncRootDenied::classify(
+          SyncRootError::Write {
+            path: dir.join(&name),
+            source,
+          },
+          admission,
+        ));
+      }
+    };
 
     // The wire is UNCHANGED: build the seq-bearing ticket the driver still keys
     // `by_ticket` on FROM the admission (a plain read of its two fields, no move),
     // so the affine admission stays in this frame across the await — "returning" it
     // on a refusal is then a local move, never a trip across the channel.
-    let ticket = SyncTicket::new(admission.instance(), admission.seq());
+    let ticket = SyncTicket::new(admission.instance(), admission.seq(), admission.nonce());
 
     let (reply, response) = futures_channel::oneshot::channel();
     if self
@@ -1640,6 +2048,7 @@ impl<R> Watcher<R> {
       .send(Command::SyncRoot {
         scope: root.scope(),
         dir,
+        admitted,
         name,
         ticket,
         reply,
