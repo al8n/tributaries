@@ -702,7 +702,7 @@ pub enum SyncError {
   #[error("the sync barrier timed out")]
   Timeout,
   /// The barrier could not start because the watcher is momentarily busy in one
-  /// of three ways, all transient and RETRYABLE:
+  /// of four ways, all transient and RETRYABLE:
   ///
   /// - another barrier is already in flight for the subscription's root (at most
   ///   one physical cookie write per root may be outstanding, so a hung backend
@@ -717,6 +717,13 @@ pub enum SyncError {
   ///   waiting to be received, so the in-flight population is bounded here
   ///   instead. Refused BEFORE any cookie is written, so a refusal leaves no
   ///   marker behind.
+  /// - the directory the barrier was admitted for was REPLACED — renamed aside
+  ///   with a fresh directory standing at its name — before the cookie could be
+  ///   written. A barrier certifies an ordering for the directory OBJECT that
+  ///   existed when it was admitted, and the replacement's coverage is not armed
+  ///   yet, so a marker written there would ride no ordering at all. Refused
+  ///   before anything is created, and a retry is admitted for whatever now
+  ///   stands at the name.
   ///
   /// Retry once the outstanding work resolves.
   #[error(

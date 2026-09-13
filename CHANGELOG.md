@@ -59,7 +59,8 @@ All notable changes to this workspace are documented here. The format is based o
   filesystem name (and back). They live behind `tributary-proto`'s new `glob`
   feature, which `tributary-fs` and `tributaries` enable unconditionally; both
   faces carry them (serde: lists of plain strings; clap: repeatable `--prune` /
-  `--include` flags, an absent `--include` being the absent seat).
+  `--include` flags, where `--include` spells all three of the seat's states —
+  absent, given with no value for the empty seat, and given with patterns).
 
   `Watcher::replace_root` keeps the root's words and RE-BASES them onto the new
   root — they are root-relative — so a depth-anchored `prune` pattern means
@@ -164,6 +165,24 @@ All notable changes to this workspace are documented here. The format is based o
     `SyncError::CookieDirUncovered` — the same verdict as one outside the root or under a
     watcher exclusion, all three being "no event could ever arrive there" — rather than as
     a write failure it would be pointless to retry.
+  - **The watcher's exclusions are judged where the cookie actually lands, too.**
+    `sync_root` checked them against the caller's spelling alone, and a spelling is not a
+    location: an intermediate symlink resolves one that clears every exclusion into a
+    directory inside one, and the marker written there is a marker the source is under
+    instruction never to report. The write now takes the same verdict the `prune` seat
+    gets, on the directory its descriptor walk resolved, and answers
+    `SyncRootError::DirExcluded` before creating anything — which also makes that variant
+    spend its admission (`SyncRootDenied::admission` is `None` for it), since the caller
+    cannot tell the pre-birth refusal from the post-birth one. A rename INTO excluded
+    ground after the walk still lands the marker under the exclusion, where the barrier
+    times out exactly as it would for any excluded delivery; `sync_root`'s docs say so.
+  - **A cookie leaf is length-bounded at 255 bytes** (`NAME_MAX` on every supported
+    filesystem), refused as `SyncRootError::BadCookieName` with the other name-shape
+    violations. It is the only caller-supplied value of unbounded length the cookie
+    machinery retains, and it retains it in several places at once — so the ledger's
+    record caps bounded entries while a single invalid filename could still exhaust the
+    allocator. The validated leaf is now shared across the ledger, the name index and the
+    delivery seats' active-marker set rather than copied into each.
   - `Source::replace`'s contract states what the fs binding's `replace_root` does: a
     retarget swaps the root's key and KEEPS its words, which are root-relative and are
     therefore re-based onto the new key, so a depth-anchored `prune` pattern names a
@@ -351,6 +370,165 @@ All notable changes to this workspace are documented here. The format is based o
   kind the umbrella retries, and not `Unsupported`, which is read as a verdict on the
   platform.
 
+- **`tributary-fs`**, **`tributaries`** — the `clap` `--include` flag takes zero or one
+  value (`num_args = 0..=1`), so a command line can spell every state the seat has.
+  `include` is `Option<Vec<Glob>>` and its three states are three different policies:
+  absent delivers every file, engaged-and-EMPTY delivers none (directories and `Rescan`s
+  only), and engaged with patterns delivers what they name. A flag requiring a value per
+  occurrence could reach only two of them — a bare `--include` was a parse error and every
+  successful occurrence produced a non-empty list — so `tributary_fs::RootOptions`,
+  `RootGlobs` and `WatchOptions` could not parse or update to the documented
+  directories-and-`Rescan`s-only policy at all. Occurrences still append, so
+  `--include a --include b` is unchanged, and an update still applies only what the
+  command line carried.
+
+- **`tributary-fs`** — **BREAKING**: `Watcher::sync_root(root, dir, admission)` no longer
+  takes a cookie name, and `Watcher::mint_sync_ticket` returns
+  `Option<(SyncAdmission, SyncTicket)>`. The marker LEAF is minted with the admission —
+  the watcher's own brand, this process's id, the mint sequence and a word off a
+  ChaCha20 stream the watcher seeded from the OS — and read back through the new
+  `SyncTicket::leaf()`. `None` from the mint means the watcher never got an entropy seed
+  and can admit no sync at all, which today is only `wasm32-unknown-unknown`.
+
+  A caller-chosen leaf was unsound, not merely redundant: admitting a sync ARMS an
+  exemption on the marker's leaf, so that for as long as the sync is live a change whose
+  last segment is that leaf clears both per-root seats wherever it stands — which is what
+  keeps the barrier resolvable when a peer renames the reserved directory out from under
+  the marker. With a name the caller picked, an ORDINARY file of that name, changing
+  anywhere in the scope, took the same exemption and could be recorded as the barrier's
+  observation ahead of the marker's own create. The mint closes that: no other writer
+  under the tree can name the file.
+
+  `SyncRootError::BadCookieName` and `SyncRootError::NameInUse` are no longer reachable
+  from `sync_root` and survive as the driver's own fail-closed invariants. The
+  reserved-leaf grammar is exported as `tributary_fs::is_sync_cookie_name`, beside the
+  existing `is_sync_cookie_dir_name`, so the layer that decides what reaches a consumer
+  classifies with the minter's own rule rather than a copy of it.
+
+- **`tributaries`** — the fs binding no longer renders a cookie name from `SyncToken`; it
+  places the leaf `tributary_fs::Watcher` minted and correlates the barrier on that. A
+  custom `Source` is unaffected in signature, and `Source::begin_sync`'s contract now
+  states both ways to discharge the unpredictability obligation: render the token's
+  `nonce` into the marker's identity, or take an identity a lower layer mints
+  unpredictably itself. A binding built directly on `tributary_fs::Watcher` must take the
+  second route — that watcher's leaf is no longer choosable.
+
+- **`tributary-fs`** — on Unix a sync cookie's containment, exclusion and `prune` verdicts
+  are taken on the path the OS answers for the descriptor the write ENDED HOLDING, not on
+  the components the descent was handed. Each `openat` is descriptor-relative and so
+  correct on its own, but a peer that renames an already-opened ancestor moves the rest of
+  the descent with it while every remaining step still succeeds: a sync naming `<root>/a/x`
+  whose `<root>/a` was renamed into excluded ground mid-walk used to be judged as
+  `<root>/a/x`, pass, and create the marker where the source had been told never to report
+  from — the write reporting success while the caller's barrier waited out its whole
+  deadline. Such a descent is now refused before anything is created, with the same typed
+  `DirExcluded` / `DirPruned` verdicts. Creation stays descriptor-relative, and the
+  reported landing keeps its documented meaning: the spelling at write time, for reaping,
+  never the marker's address.
+
+- **`tributary-fs`** — on Unix a sync cookie's exclusion and `prune` verdicts are taken
+  on the cookie's OWN directory — the reserved directory the marker is created in — and
+  re-taken once the marker exists. Judging only the parent left two holes with the same
+  outcome: an exclusion naming `<dir>/.tributaries-sync-cookies-<uid>` exactly covered
+  every event the marker could mint while the parent passed every test, and a rename of
+  the judged directory into excluded or pruned ground during the write carried the
+  marker there with it, the create being descriptor-relative. Both used to return `Ok`
+  for a marker the fence then suppressed, leaving the caller's barrier to wait out its
+  whole deadline. Both are now the typed `DirExcluded` / `DirPruned` refusals: the first
+  before anything is created, the second after the marker is removed again through the
+  anchors that created it, so nothing of the write is on disk either way. A rename that
+  lands after that last reading is unchanged — the seats' own documented semantics.
+
+- **`tributary-fs`**, **`tributaries`** — both configuration faces enforce their
+  collection ceilings WHILE THEY PARSE, rather than leaving them to `validate` after the
+  whole input has been read. `WatcherOptions::exclusions` refuses the element past
+  `MAX_EXCLUSIONS` mid-document and the occurrence past it on the command line; the four
+  glob seats (`tributary_fs::RootOptions`, `RootGlobs`, `WatchOptions`) hold the flags'
+  values as strings and refuse a seat longer than `MAX_SEAT_PATTERNS` BEFORE compiling
+  any of them. Both ceilings are resource bounds — a path list allocated per entry, an
+  automaton compiled and kept per pattern — so a face that read an untrusted length to
+  the end before judging it had already paid what the bound exists to refuse; a
+  `parse_from` or a streaming document could spend the process's memory on a household
+  that could only ever be rejected. The refusals are the format's own (a document error,
+  a `clap` `ValueValidation`), the accepted inputs are unchanged up to and including the
+  ceiling, and `validate` keeps the same check for lists assembled in code.
+
+- **`tributary-fs`** — a sync barrier certifies an ordering for the DIRECTORY OBJECT its
+  cookie directory named when the sync was admitted, and a replacement standing at that
+  name is the new typed `SyncRootError::DirReplaced` refusal. The write is detached from
+  the admission by the coverage-settle fence and the blocking pool, and every step of its
+  descent below the root is opened by name: a peer that renamed a covered directory aside
+  and stood a fresh one at its name inside that window was descended into exactly as the
+  original would have been. The marker then landed inside a directory whose coverage the
+  scope had not armed, so its create entered no ordered queue, and a later cold
+  enumeration of the replacement could report that create ahead of descendants that were
+  on disk before it — a barrier that resolved while proving nothing. The directory's
+  identity is now read at the admission door and re-read off the descriptor the write
+  ends holding; a mismatch refuses before anything is created, so no marker is ever born
+  inside an object whose coverage the admission did not judge. The sequence is spent by
+  the refusal (the verdict needs the object only the write can reach), so a retry
+  re-mints, which re-reads whatever now stands at the name.
+
+- **`tributaries`** — the umbrella classifies that refusal as
+  `SyncError::Busy`, beside the two transient refusals it already reported that way.
+  Nothing was written and nothing about the caller's request is wrong — the directory it
+  named still exists and is still covered — so it is neither a write failure nor an
+  uncovered cookie directory, and a fresh sync is admitted for whatever now stands at
+  the name.
+
+- **`tributary-proto`** — `Glob`'s `serde` face reads through a string VISITOR, so
+  `MAX_GLOB_LEN` is judged on the bytes the format is already holding rather than after
+  an owned `String` has been built. Deserializing through `String` first handed an
+  untrusted document one allocation of its own choosing per rejected pattern, paid in
+  full before the ceiling that pattern was about to fail was consulted at all: a first
+  word of a few hundred megabytes cost exactly that, and a streaming document could
+  spend the process's memory on patterns that could only ever be refused. The refusal is
+  the same typed one, bounded as it always was (the over-length arm keeps a short
+  preview, never a copy of the word), and the accepted inputs are unchanged up to and
+  including the ceiling. Both glob seats of `tributary_fs::RootOptions`, `RootGlobs` and
+  `WatchOptions` inherit it, so an over-long word now stops a seat at that word rather
+  than after the list. What a `Deserialize` cannot decline is the FORMAT's own reading —
+  one that must allocate while unescaping still allocates the source once, and a
+  document whose size must be bounded is bounded by a limited reader on the caller's
+  side.
+
+- **`tributary-fs`** — an exclusion path is LENGTH-bounded on every face, by the new
+  `WatcherOptions::MAX_EXCLUSION_LEN` (4096 bytes, `PATH_MAX`). The seat's count ceiling
+  bounded nothing on its own: eight is a small number, and a single entry can be as long
+  as an untrusted document cares to make it, so a first exclusion of a few hundred
+  megabytes was allocated in full before any bound was consulted. The `serde` face now
+  reads each element through a string visitor and measures the bytes the format is
+  already holding before it builds a `PathBuf`, and refuses the element PAST the seat by
+  its count alone — probing for it without deserializing it into a path — so the one
+  entry the seat is certain to refuse is never allocated either. `--exclusions` refuses
+  an over-long value as the parse reads it, as a `clap` `ValueValidation`, and
+  `validate` carries the same bound as the backstop for a list assembled in code, as the
+  new `OptionsError::ExclusionTooLong`. Accepted inputs are unchanged up to and
+  including both ceilings.
+
+- **`tributary-fs`** — the identity proof now reaches the object a marker is actually
+  born in: the RESERVED COOKIE DIRECTORY the watcher keeps inside the directory a sync
+  names. A `mkdirat` that succeeds is its own proof — the directory is new, empty, named
+  by nobody else, and its create is kernel-ordered after the cut that proved its parent —
+  but one that reports `EEXIST` is now adopted only if it is EXACTLY the object the
+  admission read at that name. Ownership and mode were the whole of that test before, and
+  a peer running as the same user could satisfy them: prepare a directory, fill it with
+  descendants, chmod it `0700`, and rename it onto the reserved name in the window the
+  settle fence and the blocking pool open. The marker then landed in a directory no crawl
+  of the scope had enumerated, so a later cold enumeration could report its create ahead
+  of descendants that were on disk before it. A replacement, or a reserved directory that
+  merely APPEARED after the cut, is now `SyncRootError::DirReplaced`; the uid and mode
+  checks remain, as grounds to refuse and never as grounds to adopt.
+
+- **`tributary-fs`**, **`tributaries`** — a reserved cookie directory standing across a
+  MOUNT BOUNDARY is the new typed `SyncRootError::DirCrossesMount` refusal. A root's
+  crawl does not descend across a mount and arms no watch beyond one, so a marker created
+  there is unreportable however it is ordered and the barrier could only time out. It is
+  refused before anything is created, and the umbrella classifies it as
+  `SyncError::CookieDirUncovered` — the same "that directory could never report the
+  cookie" the exclusion and `prune` refusals mean, and permanent in the same way (unlike
+  `DirReplaced`, a retry meets the same mount).
+
 - **`tributaries`** — **BREAKING for a custom `Source`**: `Source::arm` and
   `LocalSource::arm` take the per-root `&RootGlobs` as a third argument
   (`arm(&mut self, key: &[C], globs: &RootGlobs)`). An out-of-tree source must accept
@@ -359,6 +537,15 @@ All notable changes to this workspace are documented here. The format is based o
   watches or delivers what the caller asked it not to. `RootGlobs::new()` (both seats
   unengaged) asks for exactly the behaviour every source had before the seats existed.
   Every other seam item is unchanged, including canonical-key adoption.
+
+### Known limitations
+
+- **`tributary-fs`**, **`tributaries`** — on Windows, `Watcher::sync_root` and
+  `Tributaries::sync`'s cookie path is still path-addressed at three points, so
+  a concurrent rename of the watched root or of the cookie directory during a
+  sync can leave the barrier unresolved until it times out rather than
+  resolving or reporting a definite refusal. Tracked as
+  [#134](https://github.com/al8n/tributaries/issues/134).
 
 ## [0.1.0]
 

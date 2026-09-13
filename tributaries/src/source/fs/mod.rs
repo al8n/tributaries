@@ -677,21 +677,30 @@ impl<R> Source<OsString> for FsSource<R> {
     // Any op that touches the watcher first re-forwards deferred prunes, so a
     // stale narrower cover never trails behind this write.
     self.flush_deferred_prunes();
-    let name = cookie_name(token);
     let dir = key_to_path(dir_key);
     // Mint the cancel address and record it BEFORE the await: if this future is
     // dropped mid-await (a caller cancel or a close won the owner's race), the
     // entry deliberately REMAINS for `cancel_sync` to consume — the owner never
     // learned the cookie path, so the ticket is the only precise handle on a write
     // that may still land. The token is stored beside it as the incarnation guard.
-    let (admission, ticket) = self.watcher.mint_sync_ticket();
+    //
+    // The mint is also where the marker's LEAF comes from: the lower watcher draws
+    // it off its own cryptographic stream and this binding renders none of its own,
+    // so the one name the barrier stands on is minted at exactly one site in the
+    // workspace. A watcher with no entropy source mints nothing and this binding
+    // reports the same `Entropy` refusal the owner's own generator would have —
+    // nothing has reached the filesystem yet, so the refusal leaves no marker
+    // behind.
+    let Some((admission, ticket)) = self.watcher.mint_sync_ticket() else {
+      return Err(SyncError::Entropy);
+    };
     self.pending_syncs.insert(handle, (token, ticket));
     // The fs watcher parks the write on the root's coverage-settle fence and
     // resolves at write-complete — never at observe. That is exactly the
     // bounded initiation this seam promises. The move-only admission is consumed
-    // by the call; the `Copy` ticket stays recorded above for the abandonment
-    // cancel.
-    let result = self.watcher.sync_root(handle, dir, name, admission).await;
+    // by the call (and carries the leaf it writes); the `Copy` ticket stays
+    // recorded above for the abandonment cancel.
+    let result = self.watcher.sync_root(handle, dir, admission).await;
     // A NORMAL return (Ok or Err) means the sync resolved server-side, so drop the
     // in-flight entry here; only the dropped-future path above leaves it behind.
     self.pending_syncs.remove(&handle);
@@ -753,23 +762,30 @@ impl<R> Source<OsString> for FsSource<R> {
     //
     // GROUND 1 — the LEAF is a name this workspace mints: the fs layer's cookie
     // DIRECTORY (whose own create is that driver's artifact, never a user change),
-    // or a cookie sitting directly in the sync directory, which is where every
+    // or a marker sitting directly in the sync directory, which is where every
     // version of this binding put its cookies before the cookie directory existed.
-    // Matching the older shape too is what keeps a crash leftover suppressed across
-    // an upgrade instead of resurfacing as a user create — see `is_cookie_name`.
+    // Both grammars live in the lower crate, which is the ONE minter of a marker
+    // leaf: this binding renders no name of its own, so it can have no grammar of
+    // its own to drift from that one. Matching the older shape too is what keeps a
+    // crash leftover suppressed across an upgrade instead of resurfacing as a user
+    // create — see `tributary_fs::is_sync_cookie_name`.
     //
     // GROUND 2 — the leaf's IMMEDIATE parent is exactly a cookie directory, whatever
-    // the leaf. `tributary_fs::Watcher::sync_root` takes the cookie's name from ITS
-    // caller and accepts any normal component, so a second consumer of the lower
-    // crate watching this same tree mints cookie names with no grammar this crate
-    // could know; the directory they land in is the only thing that identifies them.
-    // Suppressing on the directory costs at most a file someone created inside a
-    // `0o700` directory this driver owns — while a leaf grammar alone would surface
-    // another watcher's GENUINE cookies as user changes, which is the failure this
-    // classifier exists to prevent and strictly worse than the cost.
+    // the leaf. The cookie directory is `0o700` ground the fs driver owns, so nothing
+    // that lands in it is a user change worth reporting; and a leaf grammar alone
+    // cannot be the whole answer, because a marker RENAMED while it stands wears a
+    // name no grammar recognizes and would then surface as a user create. Ground 1's
+    // grammar and this one are therefore both needed: the leaf identifies a marker
+    // wherever its directory has been moved to, and the directory identifies whatever
+    // stands inside it whatever the leaf has been renamed to.
     //
     // Neither ground reads any deeper component, so a user file merely living under
-    // some ancestor whose name shares the stem stays a user change.
+    // some ancestor whose name shares the stem stays a user change — and, the other
+    // way round, a marker whose ancestor directory is renamed while it stands is
+    // classified the same under either path. That is what keeps it off consumer
+    // streams and available to its own barrier wherever the queue reports it from:
+    // the barrier is correlated by the marker's leaf under its root, so the two
+    // halves read exactly the same components.
     //
     // GROUND 2 IS DECIDED FIRST, and reads only the PARENT component — because "whatever
     // the leaf" has to include a leaf that is not UTF-8. Paths on Unix are bytes, so an
@@ -796,7 +812,9 @@ impl<R> Source<OsString> for FsSource<R> {
     key
       .last()
       .and_then(|leaf| leaf.to_str())
-      .is_some_and(|leaf| is_cookie_name(leaf) || tributary_fs::is_sync_cookie_dir_name(leaf))
+      .is_some_and(|leaf| {
+        tributary_fs::is_sync_cookie_name(leaf) || tributary_fs::is_sync_cookie_dir_name(leaf)
+      })
   }
 
   fn root_key(&self, handle: RootHandle) -> Option<Vec<OsString>> {
@@ -955,13 +973,15 @@ fn watch_error_from_fs(err: WatchRootError) -> WatchError {
 ///
 /// The line it draws is between a barrier that FAILED and one that could never have been met:
 ///
-/// - **the cookie directory is not covered** — outside the root, under a watcher exclusion, or
-///   under this root's own `prune` seat. All three are refused before any write, and all three
-///   mean the same thing to the caller: a cookie written there would produce no event on this
-///   subscription's stream, so the barrier would wait for something that cannot arrive. The
-///   glob-shaped one ([`DirPruned`](SyncRootError::DirPruned)) is the newest of the three and no
-///   different in kind — reported as a write failure it read as "your filesystem refused this",
-///   which is neither true nor actionable.
+/// - **the cookie directory is not covered** — outside the root, under a watcher exclusion, under
+///   this root's own `prune` seat, or across a mount boundary at the reserved cookie directory's
+///   own name. All four are refused before any write, and all four mean the same thing to the
+///   caller: a cookie written there would produce no event on this subscription's stream, so the
+///   barrier would wait for something that cannot arrive. The glob-shaped one
+///   ([`DirPruned`](SyncRootError::DirPruned)) and the mount-shaped one
+///   ([`DirCrossesMount`](SyncRootError::DirCrossesMount)) are no different in kind — reported as
+///   write failures they read as "your filesystem refused this", which is neither true nor
+///   actionable.
 /// - **transient** ([`Busy`](SyncError::Busy)) — a write already in flight for this root, or a
 ///   cookie-cleanup backlog. Nothing was written; ask again.
 /// - **a genuine write failure**, carrying the concrete `io::Error` behind an honest
@@ -973,8 +993,15 @@ fn watch_error_from_fs(err: WatchRootError) -> WatchError {
 fn sync_error_from_fs(error: SyncRootError) -> SyncError {
   match error {
     SyncRootError::UnknownRoot | SyncRootError::Retired => SyncError::Retired,
+    // The fourth of the uncovered shapes, and the only one the TREE decides rather
+    // than a configuration word: a mount standing at the reserved cookie
+    // directory's name. No crawl of the root descends across it, so a marker there
+    // produces no event on this subscription's stream — the same "the barrier could
+    // never be met" the other three mean, and just as permanent, so it is not the
+    // retryable `Busy` its sibling `DirReplaced` is.
     SyncRootError::DirOutsideRoot { .. }
     | SyncRootError::DirExcluded { .. }
+    | SyncRootError::DirCrossesMount { .. }
     | SyncRootError::DirPruned { .. } => SyncError::CookieDirUncovered,
     SyncRootError::Write { source, .. } => {
       let kind = match source.kind() {
@@ -992,6 +1019,13 @@ fn sync_error_from_fs(error: SyncRootError) -> SyncError {
     // a failing unlink the driver is retrying). No physical write happened;
     // it is transient and retryable, the same shape as `WriteInFlight`.
     SyncRootError::CleanupBacklog => SyncError::Busy,
+    // The cookie directory was replaced between the admission and the write, so the barrier's
+    // promise is about an object that is no longer there. Nothing was written and nothing about
+    // the CALLER's request is wrong — the directory it named still exists and is still covered —
+    // so this is neither a write failure nor an uncovered directory but the same transient,
+    // retryable shape the two above have: a fresh sync is admitted for whatever now stands at
+    // the name.
+    SyncRootError::DirReplaced { .. } => SyncError::Busy,
     SyncRootError::Closed => SyncError::Closed,
     _ => SyncError::CookieWrite(SourceFault::new(FaultKind::Other)),
   }
@@ -1046,136 +1080,6 @@ fn replace_error_to_watch_error(err: ReplaceRootError, root: &std::path::Path) -
   };
   let _ = root;
   WatchError::Source(SourceFault::new(kind))
-}
-
-/// The reserved sync-cookie namespace. (Watchman's `.watchman-cookie-`
-/// precedent.) A cookie's leaf begins with this — but the prefix alone does not
-/// make a leaf a cookie: see [`is_cookie_name`] for the grammar that does.
-const COOKIE_PREFIX: &str = ".tributaries-sync-";
-
-/// The nonce's rendered width: `{:016x}` on a `u64`, so exactly sixteen lowercase
-/// hex digits, zero-padded — never fewer, never more, whatever the value.
-const COOKIE_NONCE_DIGITS: usize = 16;
-
-/// Renders a cookie's file name from the owner's token. Unique across
-/// concurrent syncs (seq), watcher instances in one process (instance), and
-/// processes (pid) — so a crashed prior process's leftovers collide with
-/// nothing — and UNPREDICTABLE to any other writer under the tree (nonce),
-/// which is what keeps the barrier from being resolvable by a marker someone
-/// else pre-created.
-///
-/// **All four fields are rendered**, and the last is the load-bearing one:
-/// `(instance, pid, seq)` is computable from any cookie already lying under the
-/// tree, so a name built from those three alone would announce the NEXT one.
-/// This is the fs binding's discharge of [`Source::begin_sync`]'s
-/// incorporate-the-nonce obligation.
-///
-/// This is the only minter of the name [`is_cookie_name`] recognizes; the two must
-/// be changed together, and the round-trip cell pins that they are.
-fn cookie_name(token: SyncToken) -> String {
-  // The trailing nonce (lowercase hex) is what makes the name unpredictable to
-  // any other writer — see `SyncToken::new`.
-  format!(
-    "{COOKIE_PREFIX}{}-{}-{}-{:0width$x}",
-    token.instance(),
-    token.pid(),
-    token.seq(),
-    token.nonce(),
-    width = COOKIE_NONCE_DIGITS,
-  )
-}
-
-/// Whether `leaf` is a sync cookie's file name as SOME release of this binding minted
-/// it directly in the sync directory: the reserved prefix, then `instance-pid-seq`
-/// rendered decimal — each inside the range its own minter can produce, never merely
-/// well-formed — then, for the shape [`cookie_name`] mints today, a `nonce` of sixteen
-/// lowercase hex digits.
-///
-/// # Why both shapes
-///
-/// The three-field form is what this binding minted before the cookie name carried a
-/// nonce, and a cookie's whole point is that it may outlive the process that wrote it:
-/// a crash leftover on disk was named by whichever release was running then, not by the
-/// one that later watches the tree. Dropping the older shape would make the first watch
-/// after an upgrade report every stale cookie as a user create.
-///
-/// # Why the grammar is checked rather than the prefix alone
-///
-/// Suppression removes a change from every consumer stream, so whatever it matches
-/// vanishes. A bare prefix test therefore swallows any user file whose name happens to
-/// begin with the reserved stem — silently, with no `Rescan` and no diagnostic, for the
-/// life of the watch. These names are minted **by this crate**, so their shapes are
-/// knowable exactly; checking them keeps the reserved namespace total over the cookies
-/// this binding itself writes at the sync directory, while leaving every other name
-/// there a user change. Cookies written by a DIFFERENT consumer of `tributary-fs` carry
-/// no shape this crate can know — those are identified by the directory they land in
-/// instead (see `is_sync_artifact`).
-fn is_cookie_name(leaf: &str) -> bool {
-  let Some(rest) = leaf.strip_prefix(COOKIE_PREFIX) else {
-    return false;
-  };
-  let mut fields = rest.split('-');
-  let (Some(instance), Some(pid), Some(seq)) = (fields.next(), fields.next(), fields.next()) else {
-    return false;
-  };
-  // Every decimal field is bounded to EXACTLY what its minter can render, and each
-  // bound must hold for the three-field release as well as for today's, since both
-  // shapes are accepted here. Too wide swallows a user file — silently, with no
-  // `Rescan`; too narrow surfaces a GENUINE cookie as a user create, which is the
-  // worse direction, so no bound below is a guess about a field's range.
-  //
-  // * `instance` — `Owner::on_sync` renders `sub.instance().get()`, and an
-  //   [`InstanceId`](crate::subscription::InstanceId) is a `NonZeroU64` minted as
-  //   `fetch_add(1) + 1`: the first owner in a process brands 1, and 0 is not
-  //   representable at all. The three-field release rendered this field from the
-  //   same type, so the floor holds for both shapes.
-  // * `pid` — `std::process::id()`, a `u32`, which is where the ceiling comes from.
-  //   Its FLOOR is the one bound here resting on OS semantics rather than on this
-  //   workspace's own source: pid 0 is the scheduler on Unix and the System Idle
-  //   pseudo-process on Windows, never a process that can execute this code. It is
-  //   therefore the first bound to drop should that evidence ever be questioned.
-  // * `seq` — `Owner::sync_seq`, which starts at 0 and is PRE-incremented before the
-  //   token is minted, so the first sync of every owner renders 1 and no sync ever
-  //   renders 0; the three-field release pre-incremented identically. (The lower
-  //   crate's `sync_tickets` does start at 0, but that sequence brands a
-  //   [`SyncTicket`](tributary_fs::SyncTicket) — an in-memory cancel address — and
-  //   never reaches a file name.)
-  //
-  // The `nonce` deliberately gets NO value bound: it is a word off the driver's
-  // cookie-nonce generator, so every `u64` including 0 is mintable, and its
-  // sixteen-lowercase-hex shape is the whole of what can be checked.
-  if !(is_minted_decimal(instance, 1, u64::MAX)
-    && is_minted_decimal(pid, 1, u64::from(u32::MAX))
-    && is_minted_decimal(seq, 1, u64::MAX))
-  {
-    return false;
-  }
-  match fields.next() {
-    // The historical three-field shape, exhausted.
-    None => true,
-    // Today's shape: the nonce, and nothing after it.
-    Some(nonce) => {
-      fields.next().is_none()
-        && nonce.len() == COOKIE_NONCE_DIGITS
-        && nonce
-          .bytes()
-          .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase() && b <= b'f')
-    }
-  }
-}
-
-/// Whether `field` is exactly what `format!("{n}")` renders for some `n` in `min..=max`:
-/// decimal digits, no sign, and no redundant leading zero (`0` itself is the one-digit
-/// case).
-///
-/// The range is the caller's to justify from the field's minter — see the per-field
-/// derivation in [`is_cookie_name`], the only caller.
-fn is_minted_decimal(field: &str, min: u64, max: u64) -> bool {
-  field.bytes().all(|b| b.is_ascii_digit())
-    && (field.len() == 1 || !field.starts_with('0'))
-    && field
-      .parse::<u64>()
-      .is_ok_and(|value| (min..=max).contains(&value))
 }
 
 /// Rebuilds a filesystem path from key components — the reverse of

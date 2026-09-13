@@ -113,8 +113,9 @@ run_shard() {
 
 # The suite runs one shard per process, and the partition covers every workspace
 # test exactly once: the four `fs-*` groups partition tributary-fs by test-name
-# prefix, the two `proto-monitor-*` groups partition the monitor suite, and `rest`
-# is everything else outside tributary-fs.
+# prefix, the two `proto-monitor-*` groups partition the monitor suite,
+# `proto-rest` is everything else in tributary-proto, and the two `umbrella-*`
+# groups partition the tributaries crate's own suite.
 #
 # All four `fs-*` shards pass `--features tokio`, and they must agree on it: the
 # test modules under `driver::` and `watcher::` are gated
@@ -124,10 +125,11 @@ run_shard() {
 # whole tokio-enabled lib suite (counts from a native run; miri drops the
 # `not(miri)` cells from each side alike).
 #
-# `rest` deliberately keeps the default feature set. It is not vacuous, but the
-# umbrella's own `driver::tests`/`demux::tests` carry the same tokio gate and so
-# are not interpreted here; enabling them is a coverage decision (+201 cells on
-# every target in both models), not part of un-vacuuming the shards above.
+# `proto-rest`, `umbrella-head` and `umbrella-tail` deliberately keep the default
+# feature set. None is vacuous, but the umbrella's own `driver::tests`/
+# `demux::tests` carry the same tokio gate as tributary-fs's `driver::` suite and
+# so are not interpreted here; enabling them is a coverage decision, not part of
+# un-vacuuming the shards above.
 #
 # The 32-bit target FORCED this — full address reuse alone does not fit the whole
 # workspace in one i686 process — but every target runs the same partition. A
@@ -145,12 +147,20 @@ run_shard() {
 # complement, expressed as skips. That asymmetry is deliberate — a test named
 # outside the enumerated range still lands in the second shard rather than falling
 # through a gap, so the partition stays exhaustive as the suite grows.
+#
+# The tributaries crate's own suite splits by top-level module instead of by
+# letter: `coalesce`, `subsume` and `route` are its three heaviest modules by
+# native count and together make up the larger half, so `umbrella-head`
+# enumerates exactly those three and `umbrella-tail` is their complement,
+# expressed as skips of the same three names — the same asymmetry as the monitor
+# split: a module added tomorrow, or a test added to a module already on one
+# side, lands in `umbrella-tail` rather than falling through a gap.
 case "$TEST_GROUP" in
   "")
     run_shard cargo miri test --all-targets --target "$TARGET"
     ;;
-  rest)
-    run_shard cargo miri test --all-targets --workspace --exclude tributary-fs --target "$TARGET" -- \
+  proto-rest)
+    run_shard cargo miri test -p tributary-proto --lib --target "$TARGET" -- \
       --skip monitor::tests::
     ;;
   proto-monitor-head)
@@ -168,6 +178,14 @@ case "$TEST_GROUP" in
       --skip monitor::tests::g \
       --skip monitor::tests::h \
       --skip monitor::tests::i
+    ;;
+  umbrella-head)
+    run_shard cargo miri test -p tributaries --all-targets --target "$TARGET" -- \
+      coalesce:: subsume:: route::
+    ;;
+  umbrella-tail)
+    run_shard cargo miri test -p tributaries --all-targets --target "$TARGET" -- \
+      --skip coalesce:: --skip subsume:: --skip route::
     ;;
   fs-rest)
     run_shard cargo miri test -p tributary-fs --all-targets --features tokio --target "$TARGET" -- \

@@ -455,6 +455,86 @@ mod serde_face {
     assert!(err.to_string().contains("invalid glob"), "{err}");
   }
 
+  /// An over-length pattern is refused on the bytes the FORMAT is holding, so
+  /// nothing proportional to it is ever owned — not by a `Glob`, and not by the
+  /// refusal either.
+  ///
+  /// A pattern is a configuration value out of an untrusted document. Asking the
+  /// format for an owned `String` first handed that document one allocation of its
+  /// own choosing per rejected pattern, made in full before the ceiling the pattern
+  /// was about to fail had been consulted at all — a first word of a few hundred
+  /// megabytes was paid for and then thrown away. The string visitor measures the
+  /// borrowed text instead, and [`Glob::new`] measures before it copies or
+  /// compiles.
+  ///
+  /// The proof is the refusal's SHAPE, which is all an outside caller can read: it
+  /// names the pattern's true length, keeps only the bounded preview of it, and is
+  /// itself orders of magnitude shorter than the input — nothing the size of the
+  /// document survives the refusal.
+  ///
+  /// Both halves of the format's contract are pinned. The plain word is one the
+  /// format can hand over borrowed; the second carries an escape, so the format
+  /// must allocate to unescape it and the check lands on text it already owns. The
+  /// bound is the same in both, and the second is the case this face documents as
+  /// the format's own allocation rather than one it could decline.
+  ///
+  /// Revert witness: deserialize through `String` first and both are refused with
+  /// the same words, after an allocation the document alone decided the size of.
+  #[test]
+  fn an_over_length_pattern_is_refused_before_it_is_owned() {
+    let over = "?".repeat(MAX_GLOB_LEN * 1024);
+    let bounded = |rendered: &std::string::String| {
+      assert!(
+        rendered.contains(&std::format!("{} bytes", over.len())),
+        "the refusal names the true length: {rendered}"
+      );
+      assert!(
+        rendered.contains(&std::format!("over the {MAX_GLOB_LEN}-byte limit")),
+        "and the ceiling it is over: {rendered}"
+      );
+      assert!(
+        rendered.contains(&over[..OVER_LENGTH_PREVIEW_BYTES]),
+        "it keeps the bounded preview of the pattern: {rendered}"
+      );
+      assert!(
+        rendered.len() < over.len() / 1024,
+        "and nothing else of it: a refusal this long carries no copy of a \
+         {}-byte word",
+        over.len()
+      );
+    };
+
+    let borrowed = serde_json::from_str::<Glob>(&std::format!("\"{over}\""))
+      .expect_err("a word past the ceiling is a document error");
+    bounded(&borrowed.to_string());
+
+    // `\u003f` is `?`, so this is the same pattern one byte longer — spelled so
+    // the format has to unescape it, which is the arm that reaches the visitor
+    // with text of its own.
+    let unescaped = serde_json::from_str::<Glob>(&std::format!("\"\\u003f{over}\""))
+      .expect_err("the escaped spelling is refused by the same bound");
+    let rendered = unescaped.to_string();
+    assert!(
+      rendered.contains(&std::format!("{} bytes", over.len() + 1)),
+      "the length is the DECODED one: {rendered}"
+    );
+    assert!(
+      rendered.len() < over.len() / 1024,
+      "and the refusal is bounded there too: {rendered}"
+    );
+  }
+
+  /// The accepted side of the same door: a pattern AT the ceiling still parses,
+  /// so the bound the visitor enforces is the documented one rather than one
+  /// short of it.
+  #[test]
+  fn a_pattern_at_the_ceiling_still_parses() {
+    let at = "?".repeat(MAX_GLOB_LEN);
+    let parsed: Glob = serde_json::from_str(&std::format!("\"{at}\""))
+      .expect("the ceiling itself is a pattern this face accepts");
+    assert_eq!(parsed.as_str().len(), MAX_GLOB_LEN);
+  }
+
   /// Escapes survive: the string the format decodes is the pattern that compiles.
   #[test]
   fn an_escaped_string_decodes_before_it_compiles() {
