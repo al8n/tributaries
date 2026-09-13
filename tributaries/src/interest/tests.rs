@@ -130,3 +130,116 @@ fn rescan_is_always_admitted() {
       .admits(&EventKind::<u8>::Rescan)
   );
 }
+
+/// The `serde` face: the list of the kinds the mask admits.
+#[cfg(feature = "serde")]
+mod serde_face {
+  use super::Interest;
+
+  #[test]
+  fn default_round_trips() {
+    let json = serde_json::to_string(&Interest::default()).unwrap();
+    assert_eq!(json, r#"["created","modified","removed","moved"]"#);
+    assert_eq!(
+      serde_json::from_str::<Interest>(&json).unwrap(),
+      Interest::default()
+    );
+  }
+
+  #[test]
+  fn the_empty_gate_is_the_empty_list() {
+    let json = serde_json::to_string(&Interest::none()).unwrap();
+    assert_eq!(json, "[]");
+    assert_eq!(
+      serde_json::from_str::<Interest>(&json).unwrap(),
+      Interest::none()
+    );
+  }
+
+  /// A present list is EXHAUSTIVE: what it does not name is gated away.
+  #[test]
+  fn a_partial_list_gates_away_every_kind_it_does_not_name() {
+    let parsed: Interest = serde_json::from_str(r#"["created"]"#).unwrap();
+    assert_eq!(parsed, Interest::none().with_created());
+    assert!(parsed.created());
+    assert!(!parsed.modified() && !parsed.removed() && !parsed.moved());
+  }
+
+  /// A name outside the vocabulary is refused, not ignored: a misspelled kind
+  /// would otherwise quietly stop being delivered.
+  #[test]
+  fn an_unknown_kind_name_is_refused() {
+    assert!(serde_json::from_str::<Interest>(r#"["created", "renamed"]"#).is_err());
+  }
+
+  #[test]
+  fn every_kind_round_trips_on_its_own() {
+    /// One flag and the bit it is expected to clear.
+    type Case = (&'static str, fn(Interest) -> Interest);
+
+    let cases: [Case; 4] = [
+      ("created", |i| i.with_created()),
+      ("modified", |i| i.with_modified()),
+      ("removed", |i| i.with_removed()),
+      ("moved", |i| i.with_moved()),
+    ];
+    for (name, expected) in cases {
+      let document = format!(r#"["{name}"]"#);
+      assert_eq!(
+        serde_json::from_str::<Interest>(&document).unwrap(),
+        expected(Interest::none()),
+        "{name}"
+      );
+    }
+  }
+}
+
+/// The `clap` face: one `--<kind>` flag per bit, every bit defaulting to `true`.
+#[cfg(feature = "clap")]
+mod clap_face {
+  use super::Interest;
+  use clap::Parser as _;
+
+  #[derive(clap::Parser)]
+  struct Cli {
+    #[command(flatten)]
+    interest: Interest,
+  }
+
+  fn parse(args: &[&str]) -> Interest {
+    Cli::parse_from(std::iter::once("app").chain(args.iter().copied())).interest
+  }
+
+  #[test]
+  fn no_flags_is_the_deliver_everything_default() {
+    assert_eq!(parse(&[]), Interest::default());
+    assert!(parse(&[]).is_all());
+  }
+
+  /// Narrowing is what a flag does, and each narrows EXACTLY its own bit.
+  #[test]
+  fn every_flag_clears_exactly_its_own_bit() {
+    /// One flag and the bit it is expected to clear.
+    type Case = (&'static str, fn(Interest) -> Interest);
+
+    let cases: [Case; 4] = [
+      ("--created=false", |mut i| *i.clear_created()),
+      ("--modified=false", |mut i| *i.clear_modified()),
+      ("--removed=false", |mut i| *i.clear_removed()),
+      ("--moved=false", |mut i| *i.clear_moved()),
+    ];
+    for (flag, expected) in cases {
+      assert_eq!(parse(&[flag]), expected(Interest::all()), "{flag}");
+    }
+  }
+
+  /// The bare flag still names its bit — it is the `true` the default already is.
+  #[test]
+  fn a_bare_flag_sets_its_bit() {
+    assert_eq!(parse(&["--created"]), Interest::all());
+    assert_eq!(
+      parse(&["--created", "--moved=false"]),
+      *Interest::all().clear_moved()
+    );
+  }
+}

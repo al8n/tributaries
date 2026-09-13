@@ -72,3 +72,100 @@ fn ondir_does_not_affect_is_empty() {
   assert!(i.is_empty());
   assert!(i.ondir());
 }
+
+/// The `serde` face: a plain object of the field names, every key optional.
+#[cfg(all(feature = "serde", feature = "std"))]
+mod serde_face {
+  use super::Interest;
+
+  #[test]
+  fn default_round_trips() {
+    let json = serde_json::to_string(&Interest::default()).unwrap();
+    assert_eq!(
+      serde_json::from_str::<Interest>(&json).unwrap(),
+      Interest::default()
+    );
+    let json = serde_json::to_string(&Interest::all()).unwrap();
+    assert_eq!(
+      serde_json::from_str::<Interest>(&json).unwrap(),
+      Interest::all()
+    );
+  }
+
+  /// A document naming ONE key leaves every other bit at the type's own default
+  /// (the empty mask) — the struct-level `#[serde(default)]`.
+  #[test]
+  fn a_partial_document_defaults_every_absent_key() {
+    let parsed: Interest = serde_json::from_str(r#"{"created": true}"#).unwrap();
+    assert_eq!(parsed, Interest::new().with_created());
+    assert!(parsed.created());
+    assert!(!parsed.removed() && !parsed.modified() && !parsed.moved());
+    assert!(!parsed.attrib() && !parsed.ondir());
+  }
+
+  /// Forward compatibility: no `deny_unknown_fields`, so a document written for a
+  /// later vocabulary still loads.
+  #[test]
+  fn an_unknown_key_is_accepted() {
+    let parsed: Interest =
+      serde_json::from_str(r#"{"created": true, "some_future_kind": true}"#).unwrap();
+    assert_eq!(parsed, Interest::new().with_created());
+  }
+
+  #[test]
+  fn the_wire_names_are_the_field_names() {
+    let json = serde_json::to_value(Interest::all()).unwrap();
+    for key in ["created", "removed", "modified", "moved", "attrib", "ondir"] {
+      assert_eq!(json.get(key), Some(&serde_json::Value::Bool(true)), "{key}");
+    }
+  }
+}
+
+/// The `clap` face: one `--<field>` flag per bit, each defaulting to `false`.
+#[cfg(feature = "clap")]
+mod clap_face {
+  use super::Interest;
+  use clap::Parser as _;
+
+  #[derive(clap::Parser)]
+  struct Cli {
+    #[command(flatten)]
+    interest: Interest,
+  }
+
+  fn parse(args: &[&str]) -> Interest {
+    Cli::parse_from(std::iter::once("app").chain(args.iter().copied())).interest
+  }
+
+  #[test]
+  fn no_flags_is_the_default() {
+    assert_eq!(parse(&[]), Interest::default());
+  }
+
+  /// Each long flag sets EXACTLY its own bit.
+  #[test]
+  fn every_flag_sets_exactly_its_own_bit() {
+    /// One flag and the bit it is expected to set.
+    type Case = (&'static str, fn(Interest) -> Interest);
+
+    let cases: [Case; 6] = [
+      ("--created", |i| i.with_created()),
+      ("--removed", |i| i.with_removed()),
+      ("--modified", |i| i.with_modified()),
+      ("--moved", |i| i.with_moved()),
+      ("--attrib", |i| i.with_attrib()),
+      ("--ondir", |i| i.with_ondir()),
+    ];
+    for (flag, expected) in cases {
+      assert_eq!(parse(&[flag]), expected(Interest::new()), "{flag}");
+    }
+  }
+
+  #[test]
+  fn flags_compose() {
+    assert_eq!(
+      parse(&["--created", "--moved", "--ondir"]),
+      Interest::new().with_created().with_moved().with_ondir()
+    );
+  }
+}

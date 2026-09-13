@@ -13,9 +13,26 @@ keywords = ["filesystem", "notify", "sans-io", "no-std", "watcher"]
 
 [features]
 default = ["std"]
-std = []
+std = ["serde?/std"]
+# Optional `serde` face on the crate's configuration vocabulary (`Interest`).
+# Off by default; `no_std` builds keep it (serde's derive needs neither `std`
+# nor `alloc` for the bool struct it faces).
+serde = ["dep:serde"]
+# Optional `clap` face on the same vocabulary — `Interest` becomes a
+# `clap::Args` group. clap itself is std-only, so the face implies `std`.
+clap = ["dep:clap", "std"]
 
 [dependencies]
+clap = { version = "4", optional = true, default-features = false, features = [
+  "std",
+  "derive",
+] }
+serde = { version = "1", optional = true, default-features = false, features = [
+  "derive",
+] }
+
+[dev-dependencies]
+serde_json = "1"
 
 [lints]
 workspace = true
