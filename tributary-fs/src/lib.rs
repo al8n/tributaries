@@ -13,15 +13,18 @@ mod stamped;
 mod watcher;
 
 pub use driver::{is_sync_cookie_dir_name, is_sync_cookie_name};
-pub use error::{
-  BuildError, CloseError, ReplaceRootError, SyncRootError, UnwatchError, WatchRootError,
-};
+pub use error::{BuildError, CloseError, ReplaceRootError, UnwatchError, WatchRootError};
 pub use event::{Event, EventKind, MovedEvent};
 pub use options::{OptionsError, RootOptions, WatcherOptions};
 pub use os::{Backend, BackendKind, BackendStats, ProbeStage, SourceError};
-pub use watcher::{
-  CoverOutcome, RequestOutcome, RootHandle, SkipReason, SyncAdmission, SyncRootDenied, SyncTicket,
-  Watcher,
+pub use watcher::{CoverOutcome, RequestOutcome, RootHandle, SkipReason, Watcher};
+
+/// The sync barrier's vocabulary, behind the experimental `sync` feature.
+#[cfg(feature = "sync")]
+#[cfg_attr(docsrs, doc(cfg(feature = "sync")))]
+pub use crate::{
+  error::SyncRootError,
+  watcher::{SyncAdmission, SyncRootDenied, SyncTicket},
 };
 
 pub use tributary_proto::{

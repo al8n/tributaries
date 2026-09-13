@@ -14,6 +14,21 @@ keywords = ["filesystem", "notify", "inotify", "fsevents", "watcher"]
 [features]
 tokio = ["agnostic-lite/tokio"]
 smol = ["agnostic-lite/smol"]
+# The sync BARRIER — `Watcher::{mint_sync_ticket, sync_root, request_cancel_sync,
+# request_remove_cookie}`, `SyncTicket`, `SyncAdmission`, `SyncRootDenied`,
+# `SyncRootError`, and the driver's whole cookie ledger beneath them.
+# EXPERIMENTAL and off by default: with it off no obligation is ever created, so
+# the driver stands no retirement, no domination `Rescan`, no claim and no cookie
+# write, and every other surface behaves exactly as it does with the feature on.
+#
+# The two dependencies it takes are the ONE mechanism that makes a marker leaf
+# unguessable: `rand_chacha` is the per-watcher nonce stream and `getrandom` the
+# single 32-byte OS seed that starts it. Neither has a reader outside the barrier,
+# so neither is compiled into a build that does not ask for it. `getrandom` is
+# declared only in the non-wasm target table, so on `wasm32-unknown-unknown` this
+# feature enables `rand_chacha` alone and the watcher holds no generator — the
+# same answer that target has always given.
+sync = ["dep:rand_chacha", "dep:getrandom"]
 # Optional `serde` face on the configuration households (`WatcherOptions`,
 # `Backend`, and the re-exported `Interest`). Off by default; `Duration` knobs
 # read and write as humantime text ("10ms", "2s").
@@ -53,7 +68,7 @@ futures-util = { version = "0.3", default-features = false, features = [
 # reveals nothing about the seed behind them. Pure computation with no OS
 # dependency, so — unlike `getrandom` below — it needs no target gate and builds
 # for `wasm32-unknown-unknown` unchanged.
-rand_chacha = "0.9"
+rand_chacha = { version = "0.9", optional = true }
 thiserror = "2"
 # `glob` is enabled unconditionally: the per-root `prune` / `include` seats are
 # part of this crate's API, not an optional face.
@@ -79,7 +94,7 @@ serde = { version = "1", optional = true, features = ["derive"] }
 # generator and mints no admission at all, rather than handing out a leaf
 # something else can compute.
 [target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
-getrandom = "0.3"
+getrandom = { version = "0.3", optional = true }
 
 [dev-dependencies]
 serde_json = "1"

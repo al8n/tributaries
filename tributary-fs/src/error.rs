@@ -255,8 +255,12 @@ impl CloseError {
 /// Why [`Watcher::sync_root`](crate::Watcher::sync_root) could not place a
 /// sync cookie. The barrier's *observation* is the caller's job (the cookie's
 /// event arrives on the stream); this error covers only the placement.
+///
+/// Requires the experimental `sync` feature.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
+#[cfg(feature = "sync")]
+#[cfg_attr(docsrs, doc(cfg(feature = "sync")))]
 pub enum SyncRootError {
   /// The handle does not name a live root of this watcher.
   #[error("the handle does not name a live root of this watcher")]

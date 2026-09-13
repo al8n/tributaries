@@ -20,8 +20,8 @@ mod view;
 pub use demux::{Demux, Lane};
 pub use driver::Tributaries;
 pub use error::{
-  BuildError, CloseError, FaultKind, SourceCloseError, SourceFault, SyncError, UnwatchError,
-  WatchError, WordsConflict,
+  BuildError, CloseError, FaultKind, SourceCloseError, SourceFault, UnwatchError, WatchError,
+  WordsConflict,
 };
 pub use event::{Event, EventKind};
 pub use filter::{Filter, FilterInput};
@@ -29,7 +29,15 @@ pub use interest::Interest;
 pub use options::{
   Debounce, DebounceConfig, OptionsError, RootGlobs, TributariesOptions, WatchOptions,
 };
-pub use source::{Armed, Begun, LocalSource, Source, SourceEvent, SyncOutcome, SyncToken};
+pub use source::{Armed, LocalSource, Source, SourceEvent};
+
+/// The sync barrier's vocabulary, behind the experimental `sync` feature.
+#[cfg(feature = "sync")]
+#[cfg_attr(docsrs, doc(cfg(feature = "sync")))]
+pub use crate::{
+  error::SyncError,
+  source::{Begun, SyncOutcome, SyncToken},
+};
 pub use subscription::{InstanceId, Subscription};
 pub use view::{Snapshot, WatchView};
 

@@ -20,10 +20,9 @@ use agnostic_lite::{
 };
 use tributary_proto::{FileKind, IoClass, ScopeId, Segment, WatchId};
 
-use super::{
-  CookieDir, CookieFile, CookieRemoval, CookieResidue, CookieWriteError, FsOps, ScopeRegistry,
-  SourceControl, SpawnedSource,
-};
+#[cfg(feature = "sync")]
+use super::{CookieDir, CookieFile, CookieRemoval, CookieResidue, CookieWriteError};
+use super::{FsOps, ScopeRegistry, SourceControl, SpawnedSource};
 use crate::{
   core::{ExpectedObject, MountRefresh, ProbeOutcome, RawDirEntry, RawEnumerate, RootLiveness},
   driver::ControlRequest,
@@ -159,10 +158,13 @@ struct FakeState {
   scope_generation: Mutex<BTreeMap<ScopeId, u64>>,
   /// Cookies written and removed, in call order — the observable that a sync
   /// placed (and reaped) its marker.
+  #[cfg(feature = "sync")]
   cookie_writes: Mutex<Vec<PathBuf>>,
+  #[cfg(feature = "sync")]
   cookie_removes: Mutex<Vec<PathBuf>>,
   /// When set, every cookie write fails with this error kind (the read-only
   /// tree, modeled).
+  #[cfg(feature = "sync")]
   cookie_write_failure: Mutex<Option<std::io::ErrorKind>>,
   /// When set, every cookie write CREATES its file and then fails with this
   /// error kind, handing the file back as the residue: the write that could not
@@ -170,14 +172,17 @@ struct FakeState {
   /// [`cookie_write_failure`](Self::cookie_write_failure), which models a write
   /// that left nothing on disk — the whole difference being whether the caller
   /// may retire the obligation pre-physically.
+  #[cfg(feature = "sync")]
   cookie_write_strand: Mutex<Option<std::io::ErrorKind>>,
   /// Cookie writes that reached the blocking pool, counted before any hold — the
   /// observable that a write is IN FLIGHT, which is what a cell racing a
   /// retirement or an abandoned reply against it must wait for.
+  #[cfg(feature = "sync")]
   cookie_dispatches: AtomicUsize,
   /// When set, `write_cookie` parks until the gate releases: the window in which
   /// a test retires the scope, drops the reply, or tears the driver down while
   /// the write is still in the pool.
+  #[cfg(feature = "sync")]
   cookie_write_hold: Mutex<Option<HoldGate>>,
   /// Parks `detach_scope` — the one call the DRIVER'S OWN TASK makes inside the
   /// interval between a scope's delivery lane going and its retirement being
@@ -187,24 +192,29 @@ struct FakeState {
   /// The next N cookie REMOVES fail with a transient error (a hung/faulty
   /// unlink), so a cell can prove the record is RETAINED and the path retried
   /// rather than orphaned. Decremented per failed remove.
+  #[cfg(feature = "sync")]
   cookie_remove_failures: AtomicUsize,
   /// Cookie removes that reached the blocking pool, counted before any hold —
   /// the observable that an unlink is IN FLIGHT, which a cell racing a close (or
   /// a Drop) against a hung terminal unlink must wait for.
+  #[cfg(feature = "sync")]
   cookie_remove_dispatches: AtomicUsize,
   /// When set, `remove_cookie` parks until the gate releases: the window a
   /// close (or a cancelled driver's Drop) races against a hung terminal unlink.
+  #[cfg(feature = "sync")]
   cookie_remove_hold: Mutex<Option<HoldGate>>,
   /// When set, `remove_cookie` parks AFTER the node is unlinked (so `files_under`
   /// already reflects the removal) but BEFORE it records the remove and returns —
   /// "the unlink syscall completed; the pool job has not yet taken the ledger
   /// lock to confirm". The R11-3 preemption window: a successor can reclaim the
   /// path here, and the parked job's later confirm must be refused by id.
+  #[cfg(feature = "sync")]
   cookie_remove_confirm_hold: Mutex<Option<HoldGate>>,
   /// Path prefixes whose cookie removes fail PERSISTENTLY (without unlinking the
   /// node), modeling a still-failing mount for one subtree while another has
   /// recovered — the per-scope-recovery re-arm fairness cells. Checked after the
   /// hold and before the global countdown knob and the unlink.
+  #[cfg(feature = "sync")]
   cookie_remove_failure_prefixes: Mutex<Vec<PathBuf>>,
   /// Cookie DIRECTORIES whose disposal fails persistently, keyed by the
   /// directory's own path — a same-uid peer that planted a file inside it, a
@@ -213,17 +223,20 @@ struct FakeState {
   /// `CookieDir::dispose`), so a cell that has to exercise a SURVIVING directory
   /// — the directory-only obligation, its `RemoveFailed` parking, and its
   /// convergence on a later retry — has no other way to produce one.
+  #[cfg(feature = "sync")]
   cookie_dispose_failure_dirs: Mutex<Vec<PathBuf>>,
   /// Cookie directory disposals that reached the blocking pool — the observable
   /// that separates "the retry disposed" from "the retry did nothing", and the
   /// counterpart to `cookie_remove_dispatches` for the other half of a
   /// retirement.
+  #[cfg(feature = "sync")]
   cookie_dispose_dispatches: AtomicUsize,
   /// Cookie directories that CANONICALIZE elsewhere — the fake's model of an
   /// intermediate symlink. A spelled directory maps to the real path it resolves
   /// to, so `write_cookie` can mirror the production canonicalize-and-verify: a
   /// directory that resolves outside the root is refused even though its spelling
   /// sits under it. An unmapped directory canonicalizes to itself.
+  #[cfg(feature = "sync")]
   canonical_dirs: Mutex<HashMap<PathBuf, PathBuf>>,
   /// The resume point every live fake handle mints — the journal-bearing
   /// backends' `SourceControl::resume_token`, modeled.
@@ -370,20 +383,34 @@ impl Default for FakeState {
       spawn_backend: Mutex::new(BackendKind::FsEvents),
       arms: Mutex::default(),
       scope_generation: Mutex::default(),
+      #[cfg(feature = "sync")]
       cookie_writes: Mutex::default(),
+      #[cfg(feature = "sync")]
       cookie_removes: Mutex::default(),
+      #[cfg(feature = "sync")]
       cookie_write_failure: Mutex::default(),
+      #[cfg(feature = "sync")]
       cookie_write_strand: Mutex::default(),
+      #[cfg(feature = "sync")]
       cookie_dispatches: AtomicUsize::new(0),
+      #[cfg(feature = "sync")]
       cookie_write_hold: Mutex::default(),
       detach_hold: Mutex::default(),
+      #[cfg(feature = "sync")]
       cookie_remove_failures: AtomicUsize::new(0),
+      #[cfg(feature = "sync")]
       cookie_remove_dispatches: AtomicUsize::new(0),
+      #[cfg(feature = "sync")]
       cookie_remove_hold: Mutex::default(),
+      #[cfg(feature = "sync")]
       cookie_remove_confirm_hold: Mutex::default(),
+      #[cfg(feature = "sync")]
       cookie_remove_failure_prefixes: Mutex::default(),
+      #[cfg(feature = "sync")]
       cookie_dispose_failure_dirs: Mutex::default(),
+      #[cfg(feature = "sync")]
       cookie_dispose_dispatches: AtomicUsize::new(0),
+      #[cfg(feature = "sync")]
       canonical_dirs: Mutex::default(),
       resume_token: Mutex::default(),
       spawn_resume_points: Mutex::default(),
@@ -491,6 +518,7 @@ impl FakeFs {
   ///
   /// An ABSENT node yields inode 0, which no cell and no fake write ever mints:
   /// staging a cookie for a path with nothing at it is meant to match nothing.
+  #[cfg(feature = "sync")]
   pub(crate) fn cookie_at(&self, path: impl AsRef<Path>) -> CookieFile {
     let path = path.as_ref().to_path_buf();
     let identity = self.state.nodes.lock().unwrap().get(&path).map_or_else(
@@ -503,6 +531,7 @@ impl FakeFs {
   /// The same landing in the shape the LEDGER holds: a residue whose file half is
   /// still owed. What a claim, a self-reap, or a hand-built obligation record
   /// takes.
+  #[cfg(feature = "sync")]
   pub(crate) fn cookie_residue_at(&self, path: impl AsRef<Path>) -> CookieResidue {
     CookieResidue::File(self.cookie_at(path))
   }
@@ -946,16 +975,19 @@ impl FakeFs {
   }
 
   /// Cookies written so far, in call order.
+  #[cfg(feature = "sync")]
   pub(crate) fn cookie_writes(&self) -> Vec<PathBuf> {
     self.state.cookie_writes.lock().unwrap().clone()
   }
 
   /// Cookies unlinked so far, in call order.
+  #[cfg(feature = "sync")]
   pub(crate) fn cookie_removes(&self) -> Vec<PathBuf> {
     self.state.cookie_removes.lock().unwrap().clone()
   }
 
   /// Fails every subsequent cookie write with `kind` — the read-only tree.
+  #[cfg(feature = "sync")]
   pub(crate) fn fail_cookie_writes(&self, kind: std::io::ErrorKind) {
     *self.state.cookie_write_failure.lock().unwrap() = Some(kind);
   }
@@ -964,6 +996,7 @@ impl FakeFs {
   /// `kind`, handing the file back as the residue — the created-but-unresolved
   /// write. What a cell built on this proves is an accounting property: the file
   /// exists, so the obligation may not be retired as though nothing had been made.
+  #[cfg(feature = "sync")]
   pub(crate) fn strand_cookie_writes(&self, kind: std::io::ErrorKind) {
     *self.state.cookie_write_strand.lock().unwrap() = Some(kind);
   }
@@ -971,6 +1004,7 @@ impl FakeFs {
   /// Fails the next `n` cookie REMOVES with a transient error, then lets removes
   /// succeed again — a flaky/hung unlink, so a cell can prove the record is
   /// retained and the path retried until it clears.
+  #[cfg(feature = "sync")]
   pub(crate) fn fail_next_cookie_removes(&self, n: usize) {
     self.state.cookie_remove_failures.store(n, Ordering::SeqCst);
   }
@@ -979,6 +1013,7 @@ impl FakeFs {
   /// `spelled` canonicalizes to `canonical`, so the fake's beneath check runs
   /// against the real target — a `canonical` outside the root is refused, matching
   /// production's `std::fs::canonicalize` before the containment test.
+  #[cfg(feature = "sync")]
   pub(crate) fn resolve_cookie_dir_to(
     &self,
     spelled: impl AsRef<Path>,
@@ -992,6 +1027,7 @@ impl FakeFs {
 
   /// Cookie writes dispatched to the pool so far (counted before any hold), so a
   /// cell can prove a write is IN FLIGHT before racing something against it.
+  #[cfg(feature = "sync")]
   pub(crate) fn cookie_dispatches(&self) -> usize {
     self.state.cookie_dispatches.load(Ordering::SeqCst)
   }
@@ -999,6 +1035,7 @@ impl FakeFs {
   /// Cookie removes dispatched to the pool so far (counted before any hold), so
   /// a cell can prove a terminal unlink is IN FLIGHT before racing a close (or a
   /// Drop) against it.
+  #[cfg(feature = "sync")]
   pub(crate) fn cookie_remove_dispatches(&self) -> usize {
     self.state.cookie_remove_dispatches.load(Ordering::SeqCst)
   }
@@ -1006,6 +1043,7 @@ impl FakeFs {
   /// Holds every subsequent cookie write in the blocking pool until the returned
   /// gate is released — the window a retirement, an abandoned reply, or a driver
   /// teardown races the write in.
+  #[cfg(feature = "sync")]
   pub(crate) fn hold_cookie_writes(&self) -> HoldRelease {
     let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new(), AtomicUsize::new(0)));
     *self.state.cookie_write_hold.lock().unwrap() = Some(Arc::clone(&gate));
@@ -1016,6 +1054,7 @@ impl FakeFs {
   /// returned gate is released — a hung terminal unlink, so a cell can prove a
   /// close reports `NotQuiesced` within its grace rather than wedging, and that
   /// a cancelled driver's `Drop` does not block on it.
+  #[cfg(feature = "sync")]
   pub(crate) fn hold_cookie_removes(&self) -> HoldRelease {
     let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new(), AtomicUsize::new(0)));
     *self.state.cookie_remove_hold.lock().unwrap() = Some(Arc::clone(&gate));
@@ -1027,6 +1066,7 @@ impl FakeFs {
   /// window, where a successor sync can reclaim the freed path before the stale
   /// confirm lands. `files_under` flips at the gate; `cookie_removes()` records
   /// only after release, so the two bracket the ABA window cleanly.
+  #[cfg(feature = "sync")]
   pub(crate) fn hold_cookie_remove_confirms(&self) -> HoldRelease {
     let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new(), AtomicUsize::new(0)));
     *self.state.cookie_remove_confirm_hold.lock().unwrap() = Some(Arc::clone(&gate));
@@ -1036,6 +1076,7 @@ impl FakeFs {
   /// Fails every cookie remove whose path lies under `prefix`, PERSISTENTLY and
   /// without unlinking the node — a still-failing mount subtree, so a cell can
   /// hold one scope's backlog failing while another recovers.
+  #[cfg(feature = "sync")]
   pub(crate) fn fail_cookie_removes_under(&self, prefix: impl AsRef<Path>) {
     self
       .state
@@ -1047,6 +1088,7 @@ impl FakeFs {
 
   /// Clears a prefix armed by [`fail_cookie_removes_under`](Self::fail_cookie_removes_under)
   /// — that subtree's mount recovered, so its removes succeed from here on.
+  #[cfg(feature = "sync")]
   pub(crate) fn clear_cookie_remove_failures_under(&self, prefix: impl AsRef<Path>) {
     let prefix = prefix.as_ref();
     self
@@ -1070,6 +1112,7 @@ impl FakeFs {
     not(miri),
     any(target_os = "linux", target_os = "macos", target_os = "windows")
   ))]
+  #[cfg(feature = "sync")]
   pub(crate) fn fail_cookie_disposal_of(&self, dir: impl AsRef<Path>) {
     self
       .state
@@ -1086,6 +1129,7 @@ impl FakeFs {
     not(miri),
     any(target_os = "linux", target_os = "macos", target_os = "windows")
   ))]
+  #[cfg(feature = "sync")]
   pub(crate) fn clear_cookie_disposal_failure_of(&self, dir: impl AsRef<Path>) {
     let dir = dir.as_ref();
     self
@@ -1102,6 +1146,7 @@ impl FakeFs {
     not(miri),
     any(target_os = "linux", target_os = "macos", target_os = "windows")
   ))]
+  #[cfg(feature = "sync")]
   pub(crate) fn cookie_dispose_dispatches(&self) -> usize {
     self.state.cookie_dispose_dispatches.load(Ordering::SeqCst)
   }
@@ -1998,6 +2043,7 @@ impl FsOps for FakeFs {
     })
   }
 
+  #[cfg(feature = "sync")]
   fn write_cookie(
     &self,
     root: &crate::driver::LiveRoot,
@@ -2133,6 +2179,7 @@ impl FsOps for FakeFs {
     Ok(file)
   }
 
+  #[cfg(feature = "sync")]
   fn remove_cookie(&self, cookie: &CookieFile) -> Result<CookieRemoval, std::io::Error> {
     let path = cookie.path();
     // Counted BEFORE the hold: a cell racing a close (or a cancelled driver's
@@ -2224,6 +2271,7 @@ impl FsOps for FakeFs {
   /// The directory itself is never touched: a cell hands in a real `CookieDir` it
   /// minted for the purpose and cleans it up itself, so this models the verdict
   /// without modeling the filesystem.
+  #[cfg(feature = "sync")]
   fn dispose_cookie_dir(&self, dir: &CookieDir) -> Result<(), std::io::Error> {
     self
       .state

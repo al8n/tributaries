@@ -22,9 +22,9 @@ use std::{
 };
 
 use super::Watcher;
-use crate::{
-  Backend, CoverOutcome, Event, Interest, SyncRootDenied, WatcherOptions, error::SyncRootError,
-};
+use crate::{Backend, CoverOutcome, Event, Interest, WatcherOptions};
+#[cfg(feature = "sync")]
+use crate::{SyncRootDenied, error::SyncRootError};
 
 type TokioWatcher = Watcher<agnostic_lite::tokio::TokioRuntime>;
 
@@ -693,6 +693,7 @@ async fn set_cover_root_key_cancel_re_arms_every_pruned_region() {
 /// prune filter and the second sync's marker never arrives — the wait below burns
 /// its whole deadline while the pruned sibling assertion still passes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "sync")]
 async fn set_cover_keeps_a_covered_directory_s_reserved_sync_directory_armed() {
   let root = scratch_root("cover-cookie-dir");
   std::fs::create_dir_all(root.join("drop")).expect("a plain sibling directory");
@@ -798,6 +799,7 @@ async fn set_cover_keeps_a_covered_directory_s_reserved_sync_directory_armed() {
 /// the `SetCover` handler and `<root>/a` keeps its watch, the marker stays on
 /// disk, and the second sync is admitted — the widening this replaced.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "sync")]
 async fn set_cover_dominates_the_owned_marker_standing_in_the_ground_it_takes() {
   let root = scratch_root("cover-owned-marker");
   std::fs::create_dir_all(root.join("a")).expect("the ground the sync writes in");
@@ -916,6 +918,7 @@ async fn set_cover_dominates_the_owned_marker_standing_in_the_ground_it_takes() 
 /// arrives, and the marker stays on disk as a certificate over a window whose
 /// ground was replaced.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "sync")]
 async fn a_same_name_substitution_under_a_live_sync_dominates_its_barrier() {
   let root = scratch_root("substitution-dominates");
   std::fs::create_dir_all(root.join("a")).expect("the ground the sync writes in");
@@ -977,6 +980,7 @@ async fn a_same_name_substitution_under_a_live_sync_dominates_its_barrier() {
 /// (a data event, a reparent within the scope, a widen commit), and the `Rescan`
 /// this cell refuses appears.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "sync")]
 async fn a_stable_tree_delivers_its_marker_and_dominates_nothing() {
   let root = scratch_root("stable-delivers");
   std::fs::create_dir_all(root.join("a")).expect("the ground the sync writes in");
@@ -1039,6 +1043,7 @@ async fn a_stable_tree_delivers_its_marker_and_dominates_nothing() {
 /// `<root>/alias/sub`, which `covers` cannot match against the landing the marker
 /// actually stood in.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "sync")]
 async fn set_cover_dominates_a_live_alias_sync_at_the_landing_it_wrote_in() {
   let root = scratch_root("cover-alias-landing");
   let actual = root.join("actual");
@@ -1156,6 +1161,7 @@ async fn set_cover_dominates_a_live_alias_sync_at_the_landing_it_wrote_in() {
 /// and this sync is ADMITTED — a reserved directory and a marker appear under
 /// `<root>/drop/sub` and the refusal assertion below fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "sync")]
 async fn a_sync_resolving_through_a_link_into_pruned_ground_is_refused_as_uncovered() {
   let root = scratch_root("cover-link-uncovered");
   let keep = root.join("keep");
@@ -1226,11 +1232,13 @@ async fn a_sync_resolving_through_a_link_into_pruned_ground_is_refused_as_uncove
 /// thread-local of this test's own thread could reach), so an arming names both the
 /// directory it speaks for and the point of the door's three it stands in front of;
 /// this cell's scratch root makes the pair unique to it.
+#[cfg(feature = "sync")]
 struct DoorStep {
   dir: PathBuf,
   point: crate::driver::SyncDoorPoint,
 }
 
+#[cfg(feature = "sync")]
 impl DoorStep {
   fn arm(
     dir: &Path,
@@ -1248,6 +1256,7 @@ impl DoorStep {
   }
 }
 
+#[cfg(feature = "sync")]
 impl Drop for DoorStep {
   fn drop(&mut self) {
     crate::driver::SYNC_DOOR_STEP
@@ -1281,6 +1290,7 @@ impl Drop for DoorStep {
 /// Real inotify, because the fact is the kernel's: no modelled tree can be asked
 /// what an open descriptor does to a `rmdir`'s notification.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "sync")]
 async fn a_parked_sampling_never_defers_the_root_s_death() {
   let outer = scratch_root("door-parked-rootdeath");
   let root = outer.join("watched");
@@ -1355,10 +1365,12 @@ async fn a_parked_sampling_never_defers_the_root_s_death() {
 ///
 /// Keyed by the directory the sync named, which this cell's scratch root makes
 /// unique to it.
+#[cfg(feature = "sync")]
 struct WriteStep {
   dir: PathBuf,
 }
 
+#[cfg(feature = "sync")]
 impl WriteStep {
   fn arm(dir: &Path, step: impl FnOnce() + Send + 'static) -> Self {
     crate::driver::COOKIE_WRITE_STEP
@@ -1371,6 +1383,7 @@ impl WriteStep {
   }
 }
 
+#[cfg(feature = "sync")]
 impl Drop for WriteStep {
   fn drop(&mut self) {
     crate::driver::COOKIE_WRITE_STEP
@@ -1405,6 +1418,7 @@ impl Drop for WriteStep {
 /// Real inotify, because the fact is the kernel's: no modelled tree can be asked
 /// what an open descriptor does to a `rmdir`'s notification.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "sync")]
 async fn a_parked_cookie_write_never_defers_the_root_s_death() {
   let outer = scratch_root("write-parked-rootdeath");
   let root = outer.join("watched");

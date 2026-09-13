@@ -40,19 +40,21 @@ use agnostic_lite::{RuntimeLite, tokio::TokioRuntime};
 use futures_util::FutureExt;
 use tempfile::TempDir;
 use tributaries::{
-  Armed, Begun, DebounceConfig, Epoch, Event, EventKind, FaultKind, Glob, RootGlobs, Source,
-  SourceEvent, SourceFault, Subscription, SyncError, SyncToken, Tributaries, TributariesOptions,
-  WatchError, WatchOptions, WatchView,
+  Armed, DebounceConfig, Epoch, Event, EventKind, FaultKind, Glob, RootGlobs, Source, SourceEvent,
+  SourceFault, Subscription, Tributaries, TributariesOptions, WatchError, WatchOptions, WatchView,
 };
+#[cfg(feature = "sync")]
+use tributaries::{Begun, SyncError, SyncToken};
 // The fs types come from the `tributary-fs` DEV-dependency, not the umbrella: this
 // suite is the custom-source proof, compiled and run with the umbrella's `fs` feature
 // OFF (its test target requires only `tokio`), exactly as a downstream crate binding
 // its own transport would depend on the stack.
 use tributary_fs::{
   EventKind as FsEventKind, Interest as FsInterest, RootHandle, RootOptions as FsRootOptions,
-  SyncRootDenied, SyncRootError, SyncTicket, WatchRootError, Watcher, WatcherOptions,
-  is_sync_cookie_dir_name,
+  WatchRootError, Watcher, WatcherOptions, is_sync_cookie_dir_name,
 };
+#[cfg(feature = "sync")]
+use tributary_fs::{SyncRootDenied, SyncRootError, SyncTicket};
 
 /// The custom, **non-`OsString`** key component: an indexer-shaped location coordinate.
 ///
@@ -94,6 +96,7 @@ struct IndexerSource<R: RuntimeLite> {
   /// the watcher-minted [`SyncTicket`] that can cancel it. Recorded BEFORE `begin_sync` awaits, so
   /// a future dropped mid-write still leaves `cancel_sync` a precise address for a marker that may
   /// yet land — the fs binding's own arrangement, mirrored here.
+  #[cfg(feature = "sync")]
   pending_syncs: HashMap<RootHandle, (SyncToken, SyncTicket)>,
   /// Cell-scoped: rewrite one `Seg` of a completed write's REPORTED landing, `(true, reported)`.
   ///
@@ -144,6 +147,7 @@ fn fs_fault(err: WatchRootError) -> WatchError {
 /// is resolved at once. Reported as a transient refusal instead it would tell a caller whose
 /// barrier is already met to retry, and a tree churning faster than one round trip would livelock
 /// it.
+#[cfg(feature = "sync")]
 fn begun_from_denial(error: SyncRootError) -> Result<Begun<Comp>, SyncError> {
   Err(match error {
     SyncRootError::Dominated => return Ok(Begun::Dominated),
@@ -166,6 +170,7 @@ impl<R: RuntimeLite> IndexerSource<R> {
       mounts,
       pending_releases: VecDeque::new(),
       pending_set: HashSet::new(),
+      #[cfg(feature = "sync")]
       pending_syncs: HashMap::new(),
       stale_landing: None,
       reported_landings: HashMap::new(),
@@ -441,6 +446,7 @@ impl<R: RuntimeLite> Source<Comp> for IndexerSource<R> {
   /// A refusal is classified by [`begun_from_denial`], standalone for the reason the product
   /// binding's own map is: the classification IS the contract, so it is asserted directly
   /// rather than through a barrier that has to be provoked.
+  #[cfg(feature = "sync")]
   async fn begin_sync(
     &mut self,
     handle: RootHandle,
@@ -478,6 +484,7 @@ impl<R: RuntimeLite> Source<Comp> for IndexerSource<R> {
   /// Reaps a marker this binding placed — synchronous, non-blocking, fire-and-forget. The lower
   /// watcher owns every cookie it wrote and unlinks it at teardown regardless, so a reap that
   /// arrives late (or to an already-closed watcher) leaks nothing.
+  #[cfg(feature = "sync")]
   fn end_sync(&mut self, _handle: RootHandle, cookie_key: &[Comp]) {
     // The reap addresses the marker that EXISTS, which is what the real binding does too: its
     // report and its cleanup key are the same spelling, stale or not. Only here are the two
@@ -496,6 +503,7 @@ impl<R: RuntimeLite> Source<Comp> for IndexerSource<R> {
   /// The recorded [`SyncToken`] is the incarnation guard: a cancel whose token does not match the
   /// stored one is stale (a later incarnation superseded it), so the entry is consumed and the
   /// cancel issued ONLY on a match, leaving a live successor's entry intact for its own cancel.
+  #[cfg(feature = "sync")]
   fn cancel_sync(&mut self, handle: RootHandle, token: SyncToken) {
     if let Some(&(stored, ticket)) = self.pending_syncs.get(&handle)
       && stored == token
@@ -1364,6 +1372,7 @@ async fn deleted_root_delivers_terminal_rescan_and_is_retired() {
 /// its own `(instance, pid, seq)` name again would fail the first of those, and the barrier's own
 /// end-to-end cell below would then never resolve.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "sync")]
 async fn a_marker_identity_changes_with_the_token_nonce() {
   let watcher = tributary_fs::Watcher::<TokioRuntime>::new(tributary_fs::WatcherOptions::new())
     .expect("build a watcher");
@@ -1574,6 +1583,7 @@ async fn sync_barrier_resolves_when_the_reported_landing_is_stale() {
 /// FAIL-ON-REVERT: drop the `Dominated` arm from [`begun_from_denial`] and the wildcard takes it
 /// — the first assertion then sees an `Err(CookieWrite)`.
 #[test]
+#[cfg(feature = "sync")]
 fn a_dominated_barrier_is_carried_as_an_outcome_not_as_a_refusal() {
   assert!(
     matches!(begun_from_denial(SyncRootError::Dominated), Ok(begun) if begun.is_dominated()),

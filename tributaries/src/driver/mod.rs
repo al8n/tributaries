@@ -40,6 +40,7 @@ use std::{
 
 use agnostic_lite::RuntimeLite;
 use futures_util::FutureExt;
+#[cfg(feature = "sync")]
 use rand_chacha::{
   ChaCha20Rng,
   rand_core::{RngCore, SeedableRng},
@@ -51,16 +52,22 @@ use tributary_fs::{RootHandle, WatcherOptions};
 
 use crate::{
   coalesce::Coalescer,
-  error::{CloseError, SourceCloseError, SyncError, UnwatchError, WatchError},
+  error::{CloseError, SourceCloseError, UnwatchError, WatchError},
   event::Event,
   filter::{Filter, FilterInput},
   interest::Interest,
   options::{Debounce, DebounceConfig, OptionsError, RootGlobs, TributariesOptions, WatchOptions},
   route::{ReservedEndpoints, RoutableEvent},
-  source::{Armed, Begun, LocalSource, Source, SourceEvent, SyncOutcome, SyncToken},
+  source::{Armed, LocalSource, Source, SourceEvent},
   subscription::Subscription,
   subsume::{Salvage, Subsumer, UnwatchOutcome, WatchOutcome},
   view::WatchView,
+};
+
+#[cfg(feature = "sync")]
+use crate::{
+  error::SyncError,
+  source::{Begun, SyncOutcome, SyncToken},
 };
 
 #[cfg(feature = "fs")]
@@ -127,6 +134,7 @@ enum Command<C, V> {
 /// admission AND observation inside one `R::timeout`. The public [`Command`] mailbox carries
 /// key/value-bearing variants whose `async_channel::Send` is not `Send` for all `C`/`V`, so a sync's
 /// admission must never queue behind it — hence its own channel.
+#[cfg(feature = "sync")]
 struct SyncRequest {
   /// The subscription the barrier is for.
   sub: Subscription,
@@ -145,6 +153,7 @@ struct SyncRequest {
 
 /// One in-flight sync barrier: the cookie the owner is waiting to see, whose
 /// subscription (and root) it belongs to, and the caller's parked reply.
+#[cfg(feature = "sync")]
 struct PendingSync<C, H> {
   /// The cookie's canonical key AS THE WRITE REPORTED IT — what
   /// [`Source::end_sync`] is handed to reap the marker, and the source of the
@@ -173,6 +182,7 @@ struct PendingSync<C, H> {
   reply: futures_channel::oneshot::Sender<Result<SyncOutcome, SyncError>>,
 }
 
+#[cfg(feature = "sync")]
 impl<C: PartialEq, H> PendingSync<C, H> {
   /// Whether `location` names THIS barrier's marker: its last segment is the
   /// marker's leaf.
@@ -381,6 +391,7 @@ pub struct Tributaries<C, V, R, H> {
   /// `R::timeout` — impossible over [`commands`](Self::commands), whose `async_channel::Send` is not
   /// `Send` for all `C`/`V`. Cloned and dropped in lockstep with `commands`, so the last handle
   /// dropped closes both.
+  #[cfg(feature = "sync")]
   sync_commands: async_channel::Sender<SyncRequest>,
   /// The shared **coverage-loss generation**, bumped by the owner's single loss choke point
   /// ([`Owner::note_loss`]) and readable by any handle without touching the owner.
@@ -436,6 +447,7 @@ impl<C, V, R, H> Clone for Tributaries<C, V, R, H> {
   fn clone(&self) -> Self {
     Self {
       commands: self.commands.clone(),
+      #[cfg(feature = "sync")]
       sync_commands: self.sync_commands.clone(),
       loss_gen: Arc::clone(&self.loss_gen),
       closes: self.closes.clone(),
@@ -630,6 +642,7 @@ where
     // Sync's dedicated admission mailbox, the SAME capacity as the command mailbox. Its item type is
     // concrete (`SyncRequest`, no `C`/`V`), so `async_channel::Send<SyncRequest>` is `Send` for every
     // `C`/`V` — exactly what lets `Tributaries::sync` bound admission inside `R::timeout`.
+    #[cfg(feature = "sync")]
     let (sync_command_tx, sync_command_rx) = async_channel::bounded(command_capacity.get());
     // The dedicated shutdown signal, bounded at one slot: the first close wins, and any
     // racing close resolves to `Stopped` once the owner is gone. It carries ONLY close replies, so
@@ -666,7 +679,9 @@ where
       // Eager when the watcher-global debounce is on; a per-subscription Custom
       // override instantiates it lazily at commit otherwise (`register_debounce`).
       coalescer: debounce.map(|config| Coalescer::new(Some(config))),
+      #[cfg(feature = "sync")]
       pending_syncs: Vec::new(),
+      #[cfg(feature = "sync")]
       sync_seq: 0,
       loss_serial: HashMap::new(),
       loss_gen: Arc::clone(&loss_gen),
@@ -674,10 +689,12 @@ where
       // CONSTRUCTING thread, while the owner is still a value and its future does not yet exist,
       // so the acquisition is on no loop's path. Every later cookie nonce is a word off the stream
       // it seeds, minted by the owner itself with arithmetic and never a syscall.
+      #[cfg(feature = "sync")]
       nonces: sync_nonce_generator(),
       cleanup_tx,
       cleanup_rx,
       commands: command_rx,
+      #[cfg(feature = "sync")]
       sync_commands: sync_command_rx,
       closes: close_rx,
       events: event_tx,
@@ -688,6 +705,7 @@ where
     Ok((
       Self {
         commands: command_tx,
+        #[cfg(feature = "sync")]
         sync_commands: sync_command_tx,
         loss_gen,
         closes: close_tx,
@@ -1108,6 +1126,10 @@ where
   /// is not a security boundary against its own uid. Tracked as
   /// <https://github.com/al8n/tributaries/issues/135>, companion of
   /// <https://github.com/al8n/tributaries/issues/134>.
+  ///
+  /// Requires the experimental `sync` feature.
+  #[cfg(feature = "sync")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "sync")))]
   pub async fn sync(
     &self,
     sub: Subscription,
@@ -1440,8 +1462,10 @@ where
   /// for abandoned callers and every observed cookie searches it by key, so an
   /// unbounded population would make the owner's own bookkeeping grow with the
   /// barriers it is trying to finish; bounded, both scans are a small constant.
+  #[cfg(feature = "sync")]
   pending_syncs: Vec<PendingSync<C, S::Handle>>,
   /// The per-owner monotonic cookie sequence — the `seq` of every `SyncToken`.
+  #[cfg(feature = "sync")]
   sync_seq: u64,
   /// Per-subscription monotonic **loss serial**, bumped every time the sub
   /// sheds a delta to (or overflows) a parked `Rescan`, and NEVER decremented
@@ -1539,6 +1563,7 @@ where
   /// [`next_u64`](RngCore::next_u64) on an already-seeded stream: arithmetic, with no syscall, no
   /// blocking, no offload onto a foreign spawner and no interaction with the caller's timeout
   /// whatsoever. It is the same trade the standard library makes when it seeds a `RandomState`.
+  #[cfg(feature = "sync")]
   nonces: Option<ChaCha20Rng>,
   commands: async_channel::Receiver<Command<C, V>>,
   /// The receive end of sync's **dedicated** admission mailbox (the concrete [`SyncRequest`]), so a
@@ -1552,6 +1577,7 @@ where
   /// ready work on an idle loop). Its senders drop with the public handles; a closed receiver merely
   /// disables the arm and is inert to the loop-top take (teardown stays governed by the command
   /// channel and the close signal), and any request still queued at teardown is replied `Closed`.
+  #[cfg(feature = "sync")]
   sync_commands: async_channel::Receiver<SyncRequest>,
   /// The receive end of the dedicated **high-priority shutdown signal**: a
   /// [`close`](Tributaries::close) sends its [`CloseReply`] here, NOT the command mailbox. The
@@ -2596,6 +2622,7 @@ where
     // panic path as well as its normal one, where a second unwind is not a contained failure but
     // an immediate process ABORT — before the remaining cookies are reaped, and with nothing
     // reported about any of it.
+    #[cfg(feature = "sync")]
     for pending in std::mem::take(&mut self.pending_syncs) {
       let source = &mut self.source;
       let _ = offer_source(&mut self.source_disposals, move || {
@@ -2699,6 +2726,7 @@ enum Teardown {
 /// write that never returns (a hung FUSE/NFS mount) can no longer wedge the loop — a timed-out sync
 /// frees the owner within the caller's own deadline, and a close during a held write tears down at
 /// once instead of waiting the write out.
+#[cfg(feature = "sync")]
 enum SyncAdmit {
   /// The barrier was parked (awaiting its cookie), errored to its caller, or abandoned because the
   /// caller went away — either way the owner keeps looping.
@@ -2713,6 +2741,7 @@ enum SyncAdmit {
 /// `select`. The cancellation arm holds `&mut reply` for the race's whole duration, so `reply` cannot
 /// be moved or sent until the `select` block ends; funneling the winner through this owned enum defers
 /// every use of `reply` to after that borrow is released.
+#[cfg(feature = "sync")]
 enum SyncStep<C> {
   /// A [`CloseReply`] arrived on the dedicated close signal.
   Close(CloseReply),
@@ -2991,6 +3020,7 @@ where
   // public command senders, so it closes when every handle is dropped — but, like the close signal,
   // that is NOT itself a teardown signal (the command channel closing remains the dropped-handles
   // one). A closed sync mailbox merely disables its arm.
+  #[cfg(feature = "sync")]
   let mut sync_open = true;
   // The loop yields `(reply, drain_owed)`: `reply` is the close acknowledgement (if any);
   // `drain_owed` is true only on a **source drain** (the source's `next` yielded `None` while
@@ -3001,6 +3031,7 @@ where
     // Reap barriers whose caller went away (timed out, or dropped the future):
     // their cookies are inert — namespace-suppressed forever — so this map
     // stays bounded by LIVE waiters, never by every sync ever issued.
+    #[cfg(feature = "sync")]
     owner.prune_abandoned_syncs();
 
     // The dedicated shutdown signal is checked FIRST every iteration, non-blockingly, BEFORE the
@@ -3030,6 +3061,7 @@ where
     // ready work (this `try_recv` cannot block). A closed mailbox is inert here — `Err(Closed)` and
     // `Err(Empty)` alike fall through, driving neither teardown (the COMMAND channel closing remains
     // the dropped-handles signal) nor a spin.
+    #[cfg(feature = "sync")]
     if let Ok(req) = owner.sync_commands.try_recv() {
       // Counted against the data-plane fairness valve like the `select!`'s own sync arm. A barrier is
       // completed BY a source event, so admitting one is control-plane work that CREATES data-plane
@@ -3143,7 +3175,13 @@ where
     // control-plane, above the data plane — and on a closed mailbox (every handle dropped) resolves
     // `None` to disable itself, deferring teardown to the command channel (mirroring the close arm),
     // never spinning the biased select.
+    // With the barrier gated out there is no admission mailbox at all. The arm below
+    // stays — `select_biased!` is a macro and its arms cannot carry a `#[cfg]` — and is
+    // fed a future that never resolves, over a type no value of which can exist, so the
+    // arm is unreachable rather than merely quiet.
+    #[cfg(feature = "sync")]
     let sync_commands = &owner.sync_commands;
+    #[cfg(feature = "sync")]
     let sync_arm = async move {
       if sync_open {
         // `Ok(req)` → a sync request; `Err` (mailbox closed) → `None` = disable the arm.
@@ -3152,6 +3190,8 @@ where
         futures_util::future::pending::<Option<SyncRequest>>().await
       }
     };
+    #[cfg(not(feature = "sync"))]
+    let sync_arm = futures_util::future::pending::<Option<core::convert::Infallible>>();
 
     // The one owner `select!`: acknowledge a close, apply a grant resolution, dispatch a command, pump
     // one source event, or fire the settle/retry timer — whichever is ready. The close arm is FIRST (a
@@ -3191,6 +3231,7 @@ where
         // `Sync` did, counting it a control-plane win against the fairness valve. This arm is what
         // wakes an IDLE loop on a sync; a sync arriving under a command flood is served by the
         // loop-top drain above, which the biased select can never starve.
+        #[cfg(feature = "sync")]
         Some(req) => {
           command_streak += 1;
           match owner.on_sync(req.sub, req.loss_gen_at_call, req.reply).await {
@@ -3205,10 +3246,14 @@ where
         }
         // The sync mailbox closed (every handle dropped): disable the arm and let the command channel
         // observe its own close — the sync channel closing is not a teardown signal on its own.
+        #[cfg(feature = "sync")]
         None => {
           sync_open = false;
           Flow::Continue
         }
+        // Unreachable: the future above never resolves with the barrier gated out.
+        #[cfg(not(feature = "sync"))]
+        _ => Flow::Continue,
       },
       raw = owner.source.next().fuse() => { command_streak = 0; match raw {
         // A terminal event on a **dead root** (the source has forgotten its handle) retires that
@@ -3326,12 +3371,14 @@ where
   // Reap every cookie still riding a pending sync: their callers will see the
   // dropped reply as `Closed`, but the marker FILES must not survive the owner
   // (their names are unique, so unreaped they accrue in the watched trees).
+  #[cfg(feature = "sync")]
   owner.reap_all_pending_syncs();
 
   // Fail every sync request still queued on the dedicated admission mailbox. Sync has its own channel
   // now, so — mirroring the old teardown reply of `Closed` to a queued `Command::Sync` — each
   // undispatched `SyncRequest` is answered `Closed` here, so its caller resolves promptly instead of
   // waiting out its own deadline. An undispatched request placed no cookie, so none leaks.
+  #[cfg(feature = "sync")]
   while let Ok(req) = owner.sync_commands.try_recv() {
     let _ = req.reply.send(Err(SyncError::Closed));
   }
@@ -3472,6 +3519,7 @@ where
 /// generator" for the rest of its life. The stream this hands back lives on the
 /// [`Owner`], which is also where what the whole construction does and does not
 /// claim is written down: see [`nonces`](Owner::nonces).
+#[cfg(feature = "sync")]
 fn sync_nonce_generator() -> Option<ChaCha20Rng> {
   sync_nonce_seed().map(ChaCha20Rng::from_seed)
 }
@@ -3483,7 +3531,10 @@ fn sync_nonce_generator() -> Option<ChaCha20Rng> {
 /// of its life: every barrier then ends in [`SyncError::Entropy`]. There is no
 /// fallback, because a seed something else could compute would make every nonce
 /// derived from it computable too.
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[cfg(all(
+  feature = "sync",
+  not(all(target_arch = "wasm32", target_os = "unknown"))
+))]
 fn sync_nonce_seed() -> Option<[u8; 32]> {
   let mut seed = [0u8; 32];
   getrandom::fill(&mut seed).ok()?;
@@ -3500,7 +3551,7 @@ fn sync_nonce_seed() -> Option<[u8; 32]> {
 /// done per call — no target consults an entropy source per sync. What a driver
 /// that HAS a generator does per barrier is arithmetic on the stream this seed
 /// would have keyed.
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[cfg(all(feature = "sync", target_arch = "wasm32", target_os = "unknown"))]
 fn sync_nonce_seed() -> Option<[u8; 32]> {
   None
 }
@@ -3617,6 +3668,7 @@ const EXECUTOR_FAIRNESS_BUDGET: u32 = 64;
 /// configured mailbox capacity, because the two bound different things: the
 /// mailbox bounds requests waiting to be RECEIVED, this bounds requests already
 /// admitted and not yet finished.
+#[cfg(feature = "sync")]
 const MAX_PENDING_SYNCS: usize = 256;
 
 /// How many recently-armed [`Source::Handle`]s the debug-only generation-uniqueness
@@ -4815,6 +4867,7 @@ where
     // `Dominated`, so a pending sync does not wait for a cookie on a stream
     // that just re-based onto the wider root.
     for &moved in repointed {
+      #[cfg(feature = "sync")]
       self.dominate_syncs_of_subscription(moved);
     }
   }
@@ -5282,6 +5335,7 @@ where
     // met honestly — fail it typed rather than resolve it over a subscription
     // that is going away. (A ROOT DEATH is the asymmetric case: its terminal
     // `Rescan` dominates, so those resolve `Dominated`.)
+    #[cfg(feature = "sync")]
     self.retire_syncs_of_subscription(sub);
     // Reject a foreign/forged handle BEFORE mutating any state: a `Subscription` minted by a
     // DIFFERENT watcher instance carries a different brand even when its `ScopeId` collides with a
@@ -5662,6 +5716,7 @@ where
           // re-based onto the fresh handle), rather than waiting for a cookie
           // whose old handle is dead.
           for &sub in &subscribers {
+            #[cfg(feature = "sync")]
             self.dominate_syncs_of_subscription(sub);
           }
         }
@@ -6103,6 +6158,7 @@ where
     }
     salvage.keep_key(root_key);
     self.retire_salvage(salvage);
+    #[cfg(feature = "sync")]
     self.dominate_syncs_of_root(root);
   }
 
@@ -6795,6 +6851,7 @@ where
       };
       let salvage = target.merge_max(sub, key, epoch, value);
       self.retire_salvage(salvage);
+      #[cfg(feature = "sync")]
       self.dominate_syncs_of_subscription(sub);
     }
   }
@@ -6900,6 +6957,7 @@ where
     // a caller waking on another thread drain past a `Rescan` that is not
     // yet in the channel or `needs_rescan` — the prohibited half-barrier.
     if event.kind().is_rescan() {
+      #[cfg(feature = "sync")]
       self.dominate_pending_syncs(event);
     } else if reserved.any() {
       // The cookie's own event, however it arrived: created in place, unlinked, RENAMED
@@ -6912,6 +6970,7 @@ where
       // past a delivery this barrier's resolution implies it will find. A `Rescan` is never
       // classified, so the two arms are disjoint by construction rather than by ordering
       // luck.
+      #[cfg(feature = "sync")]
       self.resolve_matching_pending_sync(event, reserved);
     }
   }
@@ -6976,6 +7035,7 @@ where
   /// [`SyncError::Entropy`] at that same position, so the checks a caller can act on
   /// ([`Busy`](SyncError::Busy), [`UnknownSubscription`](SyncError::UnknownSubscription)) still
   /// answer first.
+  #[cfg(feature = "sync")]
   async fn on_sync(
     &mut self,
     sub: Subscription,
@@ -7201,6 +7261,7 @@ where
   /// frees its file — the driver already saw its own `reply.send(Ok)` succeed, so its send-failure
   /// self-reap will not run. Skipping the install also spares `pending_syncs` an entry the loop-top
   /// prune would immediately reap.
+  #[cfg(feature = "sync")]
   fn admit_begun_cookie(
     &mut self,
     cookie_key: Vec<C>,
@@ -7296,6 +7357,7 @@ where
   /// advance on a removal: the entry moved down into the vacated slot is examined on the next
   /// turn instead of being skipped. Same idiom as
   /// [`dominate_pending_syncs`](Self::dominate_pending_syncs).
+  #[cfg(feature = "sync")]
   fn resolve_matching_pending_sync(
     &mut self,
     event: &SourceEvent<C, S::Handle>,
@@ -7342,6 +7404,7 @@ where
   /// the loss that ate the cookie already owes the subscriber a
   /// re-enumeration, which is the barrier — met by domination rather than by
   /// delivery.
+  #[cfg(feature = "sync")]
   fn dominate_pending_syncs(&mut self, event: &SourceEvent<C, S::Handle>) {
     // Reached only for a `Rescan` (the caller gates on it), so this is the delivered-`Rescan`
     // choke point: a barrier already CALLED but not yet installed must be dominated by it too.
@@ -7382,6 +7445,7 @@ where
   /// A subscription whose key can no longer be resolved (raced retirement) answers `true`:
   /// over-domination costs its caller a re-enumeration it can still perform, whereas
   /// under-domination would resolve a barrier `Delivered` for a stream that is gone.
+  #[cfg(feature = "sync")]
   fn rescan_affects(&self, sub: Subscription, at: &[C]) -> bool
   where
     C: PartialEq,
@@ -7395,6 +7459,7 @@ where
   /// Resolves every barrier riding `root` as `Dominated` — the root died, and
   /// `retire_if_dead` has already parked each subscriber a durable terminal
   /// `Rescan` that dominates anything the cookie would have proven.
+  #[cfg(feature = "sync")]
   fn dominate_syncs_of_root(&mut self, root: S::Handle)
   where
     S::Handle: PartialEq,
@@ -7425,6 +7490,7 @@ where
   /// `Rescan` (a widen re-point, a restore rebind): re-enumeration meets the
   /// barrier, so it must not wait for a cookie whose stream may have moved
   /// under it.
+  #[cfg(feature = "sync")]
   fn dominate_syncs_of_subscription(&mut self, sub: Subscription) {
     self.note_domination();
     let mut salvage = Salvage::new();
@@ -7446,6 +7512,7 @@ where
   /// Fails every barrier of `sub` typed — the CALLER unwatched it, which owes
   /// no `Rescan`, so the barrier cannot be met honestly. (Asymmetric with a
   /// root death, which resolves `Dominated`.)
+  #[cfg(feature = "sync")]
   fn retire_syncs_of_subscription(&mut self, sub: Subscription) {
     let mut salvage = Salvage::new();
     let mut i = 0;
@@ -7475,6 +7542,7 @@ where
   /// the cookie is inert — its events are suppressed by the namespace forever
   /// — so the entry is simply reaped, keeping the map bounded by LIVE waiters
   /// rather than by total syncs ever issued.
+  #[cfg(feature = "sync")]
   fn prune_abandoned_syncs(&mut self) {
     let mut salvage = Salvage::new();
     let mut i = 0;
@@ -7532,6 +7600,7 @@ where
   /// the sharper reason that it may itself be running on an unwind. It takes the same
   /// [`offer_source`] shape all the same, and for a reason of its own: this funnel is gated because
   /// a caller can drive it, that loop because it is a loop.
+  #[cfg(feature = "sync")]
   fn reap_cookie(&mut self, root: S::Handle, cookie_key: &[C]) {
     // OPTIONAL, through [`offer_source`]. Two of the five prunes that reach this funnel are LIVE
     // and caller-driven — an abandoned barrier's prune every loop tick, a caller `unwatch` — so a
@@ -7569,6 +7638,7 @@ where
   /// [`contain`](tributary_proto::unwind::contain) rather than a bare `catch_unwind` because
   /// disposing of the caught PAYLOAD runs the panicking source's own `Drop`, which would escape at
   /// the same place to the same effect.
+  #[cfg(feature = "sync")]
   fn abandon_sync(&mut self, root: S::Handle, token: SyncToken) {
     // OPTIONAL, through [`offer_source`], for the reason [`reap_cookie`](Self::reap_cookie)'s is:
     // one of its two callers is the LIVE abandon, which a caller reaches by requesting a barrier
@@ -7583,6 +7653,7 @@ where
 
   /// Reaps every still-pending cookie at owner teardown — the marker files must
   /// not outlive the owner.
+  #[cfg(feature = "sync")]
   fn reap_all_pending_syncs(&mut self) {
     let mut salvage = Salvage::new();
     for pending in std::mem::take(&mut self.pending_syncs) {

@@ -88,11 +88,6 @@ All notable changes to this workspace are documented here. The format is based o
   exactly as before. `DirEntry::is_dir()` is the object's class; `descends()` is
   the coverage question.
 
-- **`tributary-proto`** — `Monitor::cover_domination()`: mints the located
-  `Rescan` a DOMINATED sync barrier is retired with, and reconciles nothing —
-  the seat a coverage transition's retirement stands its instruction through,
-  as distinct from an overflow, which additionally recovers the watch set.
-
 - **`tributaries`**, **`tributary-fs`**, **`tributary-proto`** — optional **`serde`**
   and **`clap`** faces on the option households, both off by default and neither
   changing anything when off. `serde` gives every household one document keyed by its
@@ -336,6 +331,28 @@ All notable changes to this workspace are documented here. The format is based o
   spells its seats with. A consumer arming its own `Source` configures the words from a
   document or a command line instead of re-deriving the vocabulary.
 
+- **`tributary-fs`**, **`tributaries`** — the **`sync` feature**: the caller-visible sync
+  barrier — `Watcher::{mint_sync_ticket, sync_root, request_cancel_sync,
+  request_remove_cookie}`, `SyncTicket`, `SyncAdmission`, `SyncRootDenied`, `SyncRootError`,
+  `Tributaries::sync`, `Source::{begin_sync, end_sync, cancel_sync}`, `SyncToken`, `Begun`,
+  `SyncOutcome`, `SyncError` — now sits behind it, OFF by default and marked experimental.
+  A build without it compiles no cookie ledger, no admission door and no retirement path,
+  and takes neither `rand_chacha` nor `getrandom`. Every other surface is unchanged in both
+  states, `WatcherOptions::cookie_global_cap` included: it stays on both configuration faces
+  whatever the gate, and is simply inert without `sync`.
+
+#### `sync` feature (experimental, off by default)
+
+The barrier below is behind the new `sync` feature on **`tributary-fs`** and
+**`tributaries`**, OFF by default and experimental for this release: with it off no
+obligation is ever created, so no cookie is written, no barrier is retired and no
+domination `Rescan` is stood — and nothing else in either crate behaves differently.
+
+- **`tributary-proto`** — `Monitor::cover_domination()`: mints the located
+  `Rescan` a DOMINATED sync barrier is retired with, and reconciles nothing —
+  the seat a coverage transition's retirement stands its instruction through,
+  as distinct from an overflow, which additionally recovers the watch set.
+
 - **`tributary-fs`**, **`tributaries`** — a barrier a coverage transition retired before
   it was installed is the new typed `SyncRootError::Dominated` refusal, and the umbrella
   carries it to the caller as `Ok(SyncOutcome::Dominated)`. It is a barrier MET by
@@ -398,6 +415,66 @@ All notable changes to this workspace are documented here. The format is based o
   `--include a --include b` is unchanged, and an update still applies only what the
   command line carried.
 
+- **`tributary-fs`**, **`tributaries`** — both configuration faces enforce their
+  collection ceilings WHILE THEY PARSE, rather than leaving them to `validate` after the
+  whole input has been read. `WatcherOptions::exclusions` refuses the element past
+  `MAX_EXCLUSIONS` mid-document and the occurrence past it on the command line; the four
+  glob seats (`tributary_fs::RootOptions`, `RootGlobs`, `WatchOptions`) hold the flags'
+  values as strings and refuse a seat longer than `MAX_SEAT_PATTERNS` BEFORE compiling
+  any of them. Both ceilings are resource bounds — a path list allocated per entry, an
+  automaton compiled and kept per pattern — so a face that read an untrusted length to
+  the end before judging it had already paid what the bound exists to refuse; a
+  `parse_from` or a streaming document could spend the process's memory on a household
+  that could only ever be rejected. The refusals are the format's own (a document error,
+  a `clap` `ValueValidation`), the accepted inputs are unchanged up to and including the
+  ceiling, and `validate` keeps the same check for lists assembled in code.
+
+- **`tributary-proto`** — `Glob`'s `serde` face reads through a string VISITOR, so
+  `MAX_GLOB_LEN` is judged on the bytes the format is already holding rather than after
+  an owned `String` has been built. Deserializing through `String` first handed an
+  untrusted document one allocation of its own choosing per rejected pattern, paid in
+  full before the ceiling that pattern was about to fail was consulted at all: a first
+  word of a few hundred megabytes cost exactly that, and a streaming document could
+  spend the process's memory on patterns that could only ever be refused. The refusal is
+  the same typed one, bounded as it always was (the over-length arm keeps a short
+  preview, never a copy of the word), and the accepted inputs are unchanged up to and
+  including the ceiling. Both glob seats of `tributary_fs::RootOptions`, `RootGlobs` and
+  `WatchOptions` inherit it, so an over-long word now stops a seat at that word rather
+  than after the list. What a `Deserialize` cannot decline is the FORMAT's own reading —
+  one that must allocate while unescaping still allocates the source once, and a
+  document whose size must be bounded is bounded by a limited reader on the caller's
+  side.
+
+- **`tributary-fs`** — an exclusion path is LENGTH-bounded on every face, by the new
+  `WatcherOptions::MAX_EXCLUSION_LEN` (4096 bytes, `PATH_MAX`). The seat's count ceiling
+  bounded nothing on its own: eight is a small number, and a single entry can be as long
+  as an untrusted document cares to make it, so a first exclusion of a few hundred
+  megabytes was allocated in full before any bound was consulted. The `serde` face now
+  reads each element through a string visitor and measures the bytes the format is
+  already holding before it builds a `PathBuf`, and refuses the element PAST the seat by
+  its count alone — probing for it without deserializing it into a path — so the one
+  entry the seat is certain to refuse is never allocated either. `--exclusions` refuses
+  an over-long value as the parse reads it, as a `clap` `ValueValidation`, and
+  `validate` carries the same bound as the backstop for a list assembled in code, as the
+  new `OptionsError::ExclusionTooLong`. Accepted inputs are unchanged up to and
+  including both ceilings.
+
+- **`tributaries`** — **BREAKING for a custom `Source`**: `Source::arm` and
+  `LocalSource::arm` take the per-root `&RootGlobs` as a third argument
+  (`arm(&mut self, key: &[C], globs: &RootGlobs)`). An out-of-tree source must accept
+  the parameter and either honour both seats or document in its own docs that it cannot
+  — nothing above the seam re-checks them, so a source that ignores one silently
+  watches or delivers what the caller asked it not to. `RootGlobs::new()` (both seats
+  unengaged) asks for exactly the behaviour every source had before the seats existed.
+  Every other seam item is unchanged, including canonical-key adoption.
+
+#### `sync` feature (experimental, off by default)
+
+The barrier below is behind the new `sync` feature on **`tributary-fs`** and
+**`tributaries`**, OFF by default and experimental for this release: with it off no
+obligation is ever created, so no cookie is written, no barrier is retired and no
+domination `Rescan` is stood — and nothing else in either crate behaves differently.
+
 - **`tributary-fs`** — **BREAKING**: `Watcher::sync_root(root, dir, admission)` no longer
   takes a cookie name, and `Watcher::mint_sync_ticket` returns
   `Option<(SyncAdmission, SyncTicket)>`. The marker LEAF is minted with the admission —
@@ -456,20 +533,6 @@ All notable changes to this workspace are documented here. The format is based o
   anchors that created it, so nothing of the write is on disk either way. A rename that
   lands after that last reading is unchanged — the seats' own documented semantics.
 
-- **`tributary-fs`**, **`tributaries`** — both configuration faces enforce their
-  collection ceilings WHILE THEY PARSE, rather than leaving them to `validate` after the
-  whole input has been read. `WatcherOptions::exclusions` refuses the element past
-  `MAX_EXCLUSIONS` mid-document and the occurrence past it on the command line; the four
-  glob seats (`tributary_fs::RootOptions`, `RootGlobs`, `WatchOptions`) hold the flags'
-  values as strings and refuse a seat longer than `MAX_SEAT_PATTERNS` BEFORE compiling
-  any of them. Both ceilings are resource bounds — a path list allocated per entry, an
-  automaton compiled and kept per pattern — so a face that read an untrusted length to
-  the end before judging it had already paid what the bound exists to refuse; a
-  `parse_from` or a streaming document could spend the process's memory on a household
-  that could only ever be rejected. The refusals are the format's own (a document error,
-  a `clap` `ValueValidation`), the accepted inputs are unchanged up to and including the
-  ceiling, and `validate` keeps the same check for lists assembled in code.
-
 - **`tributary-fs`** — a sync barrier certifies an ordering for the DIRECTORY OBJECT its
   cookie directory named when the sync was admitted, and a replacement standing at that
   name is the new typed `SyncRootError::DirReplaced` refusal. The write is detached from
@@ -493,36 +556,6 @@ All notable changes to this workspace are documented here. The format is based o
   uncovered cookie directory, and a fresh sync is admitted for whatever now stands at
   the name.
 
-- **`tributary-proto`** — `Glob`'s `serde` face reads through a string VISITOR, so
-  `MAX_GLOB_LEN` is judged on the bytes the format is already holding rather than after
-  an owned `String` has been built. Deserializing through `String` first handed an
-  untrusted document one allocation of its own choosing per rejected pattern, paid in
-  full before the ceiling that pattern was about to fail was consulted at all: a first
-  word of a few hundred megabytes cost exactly that, and a streaming document could
-  spend the process's memory on patterns that could only ever be refused. The refusal is
-  the same typed one, bounded as it always was (the over-length arm keeps a short
-  preview, never a copy of the word), and the accepted inputs are unchanged up to and
-  including the ceiling. Both glob seats of `tributary_fs::RootOptions`, `RootGlobs` and
-  `WatchOptions` inherit it, so an over-long word now stops a seat at that word rather
-  than after the list. What a `Deserialize` cannot decline is the FORMAT's own reading —
-  one that must allocate while unescaping still allocates the source once, and a
-  document whose size must be bounded is bounded by a limited reader on the caller's
-  side.
-
-- **`tributary-fs`** — an exclusion path is LENGTH-bounded on every face, by the new
-  `WatcherOptions::MAX_EXCLUSION_LEN` (4096 bytes, `PATH_MAX`). The seat's count ceiling
-  bounded nothing on its own: eight is a small number, and a single entry can be as long
-  as an untrusted document cares to make it, so a first exclusion of a few hundred
-  megabytes was allocated in full before any bound was consulted. The `serde` face now
-  reads each element through a string visitor and measures the bytes the format is
-  already holding before it builds a `PathBuf`, and refuses the element PAST the seat by
-  its count alone — probing for it without deserializing it into a path — so the one
-  entry the seat is certain to refuse is never allocated either. `--exclusions` refuses
-  an over-long value as the parse reads it, as a `clap` `ValueValidation`, and
-  `validate` carries the same bound as the backstop for a list assembled in code, as the
-  new `OptionsError::ExclusionTooLong`. Accepted inputs are unchanged up to and
-  including both ceilings.
-
 - **`tributary-fs`** — the identity proof now reaches the object a marker is actually
   born in: the RESERVED COOKIE DIRECTORY the watcher keeps inside the directory a sync
   names. A `mkdirat` that succeeds is its own proof — the directory is new, empty, named
@@ -545,15 +578,6 @@ All notable changes to this workspace are documented here. The format is based o
   `SyncError::CookieDirUncovered` — the same "that directory could never report the
   cookie" the exclusion and `prune` refusals mean, and permanent in the same way (unlike
   `DirReplaced`, a retry meets the same mount).
-
-- **`tributaries`** — **BREAKING for a custom `Source`**: `Source::arm` and
-  `LocalSource::arm` take the per-root `&RootGlobs` as a third argument
-  (`arm(&mut self, key: &[C], globs: &RootGlobs)`). An out-of-tree source must accept
-  the parameter and either honour both seats or document in its own docs that it cannot
-  — nothing above the seam re-checks them, so a source that ignores one silently
-  watches or delivers what the caller asked it not to. `RootGlobs::new()` (both seats
-  unengaged) asks for exactly the behaviour every source had before the seats existed.
-  Every other seam item is unchanged, including canonical-key adoption.
 
 - **`tributary-fs`**, **`tributaries`** — **a sync barrier certifies delivery only within
   one coverage epoch; any change to the root's coverage on the barrier's ground while it
@@ -635,6 +659,13 @@ All notable changes to this workspace are documented here. The format is based o
   elapsed.
 
 ### Known limitations
+
+#### `sync` feature (experimental, off by default)
+
+The barrier below is behind the new `sync` feature on **`tributary-fs`** and
+**`tributaries`**, OFF by default and experimental for this release: with it off no
+obligation is ever created, so no cookie is written, no barrier is retired and no
+domination `Rescan` is stood — and nothing else in either crate behaves differently.
 
 - **`tributary-fs`**, **`tributaries`** — on Windows, `Watcher::sync_root` and
   `Tributaries::sync`'s cookie path is still path-addressed at three points, so

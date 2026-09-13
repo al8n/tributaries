@@ -1402,9 +1402,11 @@ enum Planned {
   /// ([`stand_covering_rescan`](DriverCore::stand_covering_rescan), the funnels
   /// that stand none of their own). Every other funnel stands its `Rescan`
   /// through [`Over`](Self::Over) and stays lossy — those ARE losses.
+  #[cfg(feature = "sync")]
   Dominated(Scope),
 }
 
+#[cfg(feature = "sync")]
 impl Planned {
   /// Re-flavours a planned covering `Rescan` as a DOMINATION rather than a loss
   /// ([`Dominated`](Self::Dominated)).
@@ -1818,6 +1820,7 @@ struct ScopeState {
   /// [`None`] and adds nothing — that queued change is the earlier mint's and
   /// already carries the earlier mint's entry, so it keeps the flavour the
   /// earlier mint gave it instead of having it taken away.
+  #[cfg(feature = "sync")]
   dominating_rescans: BTreeSet<ChangeId>,
   /// A same-transport widen's WITNESSED WINDOW (INV-ROOT), open from the
   /// reservation of the widened root's watch id to the commit gate. The
@@ -2577,6 +2580,7 @@ impl DriverCore {
         liveness_deadline: None,
         applied_cover: None,
         settle_floor: None,
+        #[cfg(feature = "sync")]
         dominating_rescans: BTreeSet::new(),
         pending_widen: None,
         prune,
@@ -3232,6 +3236,7 @@ impl DriverCore {
   /// name is only reusable once its previous holder retired, so the newcomer is
   /// the live owner by construction and the predecessor's pending release is the
   /// stale one.
+  #[cfg(feature = "sync")]
   pub(crate) fn arm_sync_marker(
     &mut self,
     scope: ScopeId,
@@ -3258,6 +3263,7 @@ impl DriverCore {
   /// again, and a name-keyed removal would then disarm a LIVE successor whose
   /// marker has not been written yet. Comparing the owner makes the stale release
   /// a no-op instead.
+  #[cfg(feature = "sync")]
   pub(crate) fn release_sync_markers(
     &mut self,
     released: impl IntoIterator<Item = (ScopeId, Arc<str>, crate::driver::CookieId)>,
@@ -4545,6 +4551,12 @@ impl DriverCore {
   /// live scope already carries is the one handed back, so a write already in
   /// the pool keeps reading the flag this store will raise. A scope this core no
   /// longer holds binds nothing — it has already been retired.
+  // The flag is the scope's OWN terminal bookkeeping and is stored at the core's
+  // removal site, which is not about syncs; with the barrier gated out the ledger
+  // that binds one is gone, so nothing calls this and nothing reads the field.
+  // Keeping the removal site ungated is what A26.1 asks for, so the two are
+  // allowed to stand unread rather than gated with their one caller.
+  #[cfg_attr(not(feature = "sync"), allow(dead_code))]
   pub(crate) fn bind_retiring(&mut self, scope: ScopeId, flag: Arc<AtomicBool>) {
     if let Some(state) = self.scopes.get_mut(&scope) {
       state.retiring = Some(flag);
@@ -6792,6 +6804,7 @@ impl DriverCore {
       // straight at the funnel ([`stand_covering_rescan`](Self::stand_covering_rescan))
       // rather than compiled from a raw event, and the barrier it retires was
       // refused at birth had its ground lain under a prune seat or an exclusion.
+      #[cfg(feature = "sync")]
       Planned::Dominated(_) => Fenced::Stands,
     }
   }
@@ -7039,6 +7052,7 @@ impl DriverCore {
         Self::barrier_moved(moves, state, scope, ground, rescan_stands);
         RecordOutcome::Nothing
       }
+      #[cfg(feature = "sync")]
       Planned::Dominated(target) => {
         // The same funnel bump the overflow arm raises, for the same reason and
         // with the same claim: the `Rescan` this stands IS the covering
@@ -7427,6 +7441,7 @@ impl DriverCore {
   /// A `Rescan` is never taken. It is the no-silent-loss escape and names a
   /// subtree to re-read rather than an object, so no marker leaf may speak for
   /// one.
+  #[cfg(feature = "sync")]
   pub(crate) fn purge_marker_emits(&mut self, scope: ScopeId, name: &str) -> usize {
     let before = self.effects.len();
     self.effects.retain(|effect| {
@@ -7478,6 +7493,7 @@ impl DriverCore {
   /// The drain that follows is what puts the instruction into the effect queue
   /// ahead of the flush the driver is about to run — the whole point of standing
   /// it here rather than one loop pass later.
+  #[cfg(feature = "sync")]
   pub(crate) fn stand_covering_rescan(&mut self, scope: ScopeId, at: &Path, now: Instant) {
     let Some(mut state) = self.scopes.remove(&scope) else {
       return;
@@ -8080,6 +8096,7 @@ impl DriverCore {
       // accrue them without bound. Unreachable today — an obligation exists
       // only for an admitted sync, which requires a publicly live scope — which
       // is exactly why the bound is made structural rather than argued.
+      #[cfg(feature = "sync")]
       if change.kind().is_rescan() {
         state.dominating_rescans.remove(&change.id());
       }
@@ -8132,7 +8149,13 @@ impl DriverCore {
     // obligations exempts every instruction it stood rather than only the last
     // — so every other `Rescan`, including the ones funnels 3 through 7 stand
     // for real losses, reaches the handling below unchanged.
-    if change.kind().is_rescan() && !state.dominating_rescans.remove(&change.id()) {
+    // With the barrier gated out no retirement ever stands a domination, so the
+    // latch has nothing in it and every `Rescan` is the loss it looks like.
+    #[cfg(feature = "sync")]
+    let dominating = state.dominating_rescans.remove(&change.id());
+    #[cfg(not(feature = "sync"))]
+    let dominating = false;
+    if change.kind().is_rescan() && !dominating {
       self.cover_fences.entry(scope).or_default().mark_lossy();
       if state.applied_cover.is_some() {
         state.applied_cover = Some(Vec::new());
@@ -8545,6 +8568,7 @@ fn learn_device(state: &mut ScopeState, path: &Path, dev: u64) {
 ///
 /// The same two readings [`DriverCore::admits`]' marker clauses take, asked of an
 /// explicit name rather than of the scope's active set.
+#[cfg(feature = "sync")]
 fn names_leaf(change: &Change, name: &str) -> bool {
   let names = |location: &Location| {
     location

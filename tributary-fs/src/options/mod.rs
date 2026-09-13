@@ -1644,7 +1644,16 @@ impl Default for WatcherOptions {
 /// the reserved cookie directory and `include` always admits what is inside it,
 /// so a `sync` barrier resolves whatever the patterns say. A cookie directory a
 /// seat WOULD have pruned is refused before anything is created
-/// ([`SyncRootError::DirPruned`](crate::SyncRootError::DirPruned)) — judged on the
+// The refusal's type only exists behind the `sync` feature, so the link is only
+// spelled as one where it resolves.
+#[cfg_attr(
+  feature = "sync",
+  doc = "([`SyncRootError::DirPruned`](crate::SyncRootError::DirPruned)) — judged on the"
+)]
+#[cfg_attr(
+  not(feature = "sync"),
+  doc = "(`SyncRootError::DirPruned`, behind the `sync` feature) — judged on the"
+)]
 /// CANONICAL directory the write resolves, so a symlink into a pruned subtree is
 /// refused and a file target whose parent is reportable is not.
 ///

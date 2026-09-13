@@ -30,9 +30,11 @@ use std::{
   time::Duration,
 };
 
+#[cfg(feature = "sync")]
+use tributary_fs::SyncRootError;
 use tributary_fs::{
-  Backend, CoverOutcome, Event, Interest, ProbeStage, ReplaceRootError, SourceError, SyncRootError,
-  TokioWatcher, WatchRootError, WatcherOptions,
+  Backend, CoverOutcome, Event, Interest, ProbeStage, ReplaceRootError, SourceError, TokioWatcher,
+  WatchRootError, WatcherOptions,
 };
 
 mod common;
@@ -1025,6 +1027,7 @@ fn entries_of(dir: &Path) -> Vec<PathBuf> {
 /// assertion over the mount point alone would be satisfied by a lazy unmount as
 /// much as by a refusal.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_bound_cookie_directory_refuses_the_sync_before_any_marker() {
   use std::os::unix::fs::PermissionsExt;
 
@@ -1095,6 +1098,7 @@ async fn a_bound_cookie_directory_refuses_the_sync_before_any_marker() {
 /// The origin is OUTSIDE the root and on the same superblock, which is the shape
 /// that makes the device belt inert: same device, different mount.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_bound_sync_target_refuses_the_sync_before_any_marker() {
   const CELL: &str = "a_bound_sync_target_refuses_the_sync_before_any_marker";
   if !privileged_or_skip(CELL) {
@@ -1169,6 +1173,7 @@ async fn a_bound_sync_target_refuses_the_sync_before_any_marker() {
 /// object, and an assertion over the mount point alone would be satisfied by a
 /// lazy unmount as much as by a refusal.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_bound_alias_of_outside_ground_refuses_the_sync_at_the_admission() {
   const CELL: &str = "a_bound_alias_of_outside_ground_refuses_the_sync_at_the_admission";
   if !privileged_or_skip(CELL) {
@@ -1310,6 +1315,7 @@ async fn non_utf8_name_escalates_to_rescan() {
 /// rig turns. The assertion accepts whichever of the three the contract hands
 /// back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "sync")]
 async fn a_degraded_cover_settles_behind_its_ordering_proof() {
   use std::os::unix::ffi::OsStrExt;
 
@@ -1550,6 +1556,7 @@ async fn replace_root_widens_and_rebinds() {
 /// hermetic cell; a signal-storm kernel's honest dirty-read `Rescan` is the
 /// domination signal, tolerated here — never a false Delivered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "sync")]
 async fn a_sync_barrier_across_a_widen_resolves_by_delivery() {
   let root = scratch_root("widen-sync");
   let sub = root.join("y");
@@ -1670,6 +1677,7 @@ async fn a_sync_barrier_across_a_widen_resolves_by_delivery() {
 /// staged, the barrier never certifies over an interval nothing stood for. The
 /// reported staging says which round was which.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "sync")]
 async fn a_widen_racing_an_excursion_never_certifies_a_dark_interval() {
   let root = scratch_root("widen-excursion");
   let adopted = root.join("y");
@@ -1824,6 +1832,7 @@ async fn a_widen_racing_an_excursion_never_certifies_a_dark_interval() {
 /// It also says nothing about a rename whose destination is inside the root: that
 /// half pairs into a `Moved` and is a different resolution path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "sync")]
 async fn a_sync_cookie_never_overtakes_a_parked_move_out() {
   let root = scratch_root("move-out-sync");
   // The destination is a separate scratch root, so the rename's other half lands
@@ -5275,6 +5284,7 @@ const CELL_BUDGET: Duration = Duration::from_secs(300);
 /// (~2^31 arms), so that closure is pinned by the `WdTable` collision cells,
 /// not here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "sync")]
 async fn overflow_swallowed_unmount_rebinds_or_dies_loudly() {
   if !privileged_or_skip("overflow_swallowed_unmount_rebinds_or_dies_loudly") {
     return;
@@ -6091,12 +6101,15 @@ async fn descriptor_renewal_keeps_the_tree_watched() {
   // A barrier over the renewed tree resolves: the cookie write parks on the
   // coverage-settle fence, so resolving here proves the re-proof settled and
   // released it.
-  let (admission, _ticket) = w.mint_sync_ticket().expect("this host seeds a watcher");
-  let cookie = tokio::time::timeout(scaled(DEADLINE), w.sync_root(handle, &root, admission))
-    .await
-    .expect("the barrier resolves once the renewal's re-proof settles")
-    .expect("the sync admits and writes its cookie");
-  let _ = std::fs::remove_file(&cookie);
+  #[cfg(feature = "sync")]
+  {
+    let (admission, _ticket) = w.mint_sync_ticket().expect("this host seeds a watcher");
+    let cookie = tokio::time::timeout(scaled(DEADLINE), w.sync_root(handle, &root, admission))
+      .await
+      .expect("the barrier resolves once the renewal's re-proof settles")
+      .expect("the sync admits and writes its cookie");
+    let _ = std::fs::remove_file(&cookie);
+  }
 }
 
 /// Collects every event as it arrives until one satisfies `pred` (or the

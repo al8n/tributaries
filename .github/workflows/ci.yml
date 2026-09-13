@@ -124,8 +124,8 @@ jobs:
         # dedicated Linux jobs own them.
         run: |
           cargo +1.95 test -p tributary-proto --all-features
-          cargo +1.95 test -p tributary-fs --features tokio,smol
-          cargo +1.95 test -p tributaries --features fs,tokio,smol
+          cargo +1.95 test -p tributary-fs --features tokio,smol,sync
+          cargo +1.95 test -p tributaries --features fs,tokio,smol,sync
 
   # A declared dependency floor is a claim too, and never an exercised one:
   # cargo resolves the NEWEST compatible version, so a floor can sit years below
@@ -309,6 +309,18 @@ jobs:
       # The blanket --exclude-no-default-features above never builds the FEATURELESS
       # umbrella (the generic core: no fs, no runtime); pin it explicitly here.
       run: cargo check -p tributaries --no-default-features
+    - name: Check both states of the sync gate, outside the powerset
+      # The powerset already reaches `sync` on and off for both crates, but only in
+      # combination with whatever other features a given run carries. These four are
+      # the two gate states on their own, pinned so they cannot vanish if the matrix
+      # flags change — the same reason the featureless umbrella above is pinned.
+      # `--tests` on the gate-OFF legs is the shape nothing else compiles: it is where
+      # the `#[cfg(not(feature = "sync"))]` halves of the driver live.
+      run: |
+        cargo check -p tributary-fs --no-default-features --tests
+        cargo check -p tributary-fs --features sync --tests
+        cargo check -p tributaries --no-default-features --tests
+        cargo check -p tributaries --features sync --tests
     - name: Test fs-off custom-source suite
       # The #20 regression pin: `indexer_shaped` binds its own Source over the
       # `tributary-fs` DEV-dependency and must compile and run with the umbrella's

@@ -214,6 +214,7 @@ fn replace_error_from_fs_classifies_both_capacity_refusals_as_capacity_refusals(
 /// value of the classification is the DISTINCTION: a `Busy` is retried, an uncovered directory is
 /// re-chosen, and a `CookieWrite` carries the concrete `io::Error` for a caller to read.
 #[test]
+#[cfg(feature = "sync")]
 fn sync_error_from_fs_classifies_a_refused_cookie_honestly() {
   use std::path::PathBuf;
 
@@ -310,6 +311,7 @@ fn sync_error_from_fs_classifies_a_refused_cookie_honestly() {
 /// is reported `Err(SyncError::CookieWrite(..))`, the wildcard's write-failure shape, for a write
 /// that never happened.
 #[test]
+#[cfg(feature = "sync")]
 fn begun_from_fs_classifies_a_resolved_sync_honestly() {
   use tributary_fs::SyncRootError;
 
@@ -569,10 +571,12 @@ mod integration {
   use tributary_fs::{RootHandle, WatchRootError, WatcherOptions};
 
   use super::super::{FsSource, OPPORTUNISTIC_RELEASE_HANDOFFS, key_to_path};
+  #[cfg(feature = "sync")]
+  use crate::source::SyncToken;
   use crate::{
     event::path_components,
     options::RootGlobs,
-    source::{Source, SourceEvent, SyncToken},
+    source::{Source, SourceEvent},
   };
 
   /// One validated pattern for the glob-seat cells.
@@ -1751,6 +1755,7 @@ mod integration {
   /// token mismatch touches nothing and the live entry survives intact for its own incarnation's
   /// matching cancel; only a matching token removes the entry and fires the watcher-side cancel.
   #[tokio::test(flavor = "current_thread")]
+  #[cfg(feature = "sync")]
   async fn fs_source_cancel_sync_stale_token_leaves_current_entry_intact() {
     let (_dir, root) = scratch();
     let mut source = FsSource::<TokioRuntime>::new(WatcherOptions::new()).expect("build FsSource");

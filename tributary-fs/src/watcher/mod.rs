@@ -14,15 +14,18 @@ use std::{
 
 use agnostic_lite::RuntimeLite;
 use futures_core::Stream;
+#[cfg(feature = "sync")]
 use rand_chacha::{
   ChaCha20Rng,
   rand_core::{RngCore, SeedableRng},
 };
 use tributary_proto::{Change, Interest, ScopeId};
 
+#[cfg(feature = "sync")]
+use crate::{driver::CookieIngress, error::SyncRootError};
 use crate::{
-  driver::{Command, CookieIngress, DriverConfig, RealFs, ScopeRegistry, run},
-  error::{BuildError, CloseError, ReplaceRootError, SyncRootError, UnwatchError, WatchRootError},
+  driver::{Command, DriverConfig, RealFs, ScopeRegistry, run},
+  error::{BuildError, CloseError, ReplaceRootError, UnwatchError, WatchRootError},
   event::Event,
   options::{RootOptions, WatcherOptions},
   os::{BackendKind, BackendStats, RootIdentity, SourceError},
@@ -51,6 +54,7 @@ static WATCHER_INSTANCES: AtomicU64 = AtomicU64::new(1);
 /// no sync is ever admitted under a leaf a peer could compute. The stream this
 /// hands back lives on the [`Watcher`], where what the construction does and does
 /// not claim is written down (see its `nonces` field).
+#[cfg(feature = "sync")]
 fn sync_nonce_generator() -> Option<ChaCha20Rng> {
   sync_nonce_seed().map(ChaCha20Rng::from_seed)
 }
@@ -62,7 +66,10 @@ fn sync_nonce_generator() -> Option<ChaCha20Rng> {
 /// every nonce derived from it computable too — and the nonce is the whole of what
 /// keeps a co-user of the tree from pre-creating the marker name a barrier is
 /// about to wait on.
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[cfg(all(
+  feature = "sync",
+  not(all(target_arch = "wasm32", target_os = "unknown"))
+))]
 fn sync_nonce_seed() -> Option<[u8; 32]> {
   let mut seed = [0u8; 32];
   getrandom::fill(&mut seed).ok()?;
@@ -78,7 +85,7 @@ fn sync_nonce_seed() -> Option<[u8; 32]> {
 /// a `None` the watcher has carried since it was built, not work done per call. It
 /// is also the platform that has no filesystem backend at all, so nothing is lost
 /// there that was ever reachable.
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[cfg(all(feature = "sync", target_arch = "wasm32", target_os = "unknown"))]
 fn sync_nonce_seed() -> Option<[u8; 32]> {
   None
 }
@@ -146,7 +153,11 @@ impl RootHandle {
 /// leaf's nonce, all private. It carries no path and no server-side state until
 /// the sync it keys is admitted, so minting one — even in a flood — retains
 /// nothing. Exported like [`RootHandle`].
+///
+/// Requires the experimental `sync` feature.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg(feature = "sync")]
+#[cfg_attr(docsrs, doc(cfg(feature = "sync")))]
 pub struct SyncTicket {
   /// The minting watcher's brand — a ticket presented to a DIFFERENT watcher is
   /// refused at the door ([`SyncRootError::ForeignTicket`] on `sync_root`, a
@@ -162,6 +173,7 @@ pub struct SyncTicket {
   nonce: u64,
 }
 
+#[cfg(feature = "sync")]
 impl SyncTicket {
   /// Brands a mint sequence, and the leaf nonce drawn with it, under the issuing
   /// watcher.
@@ -226,7 +238,11 @@ impl SyncTicket {
 /// are the watcher brand and the mint sequence — so it holds across
 /// [`sync_root`](Watcher::sync_root)'s await without perturbing the future's
 /// `Send`. Exported like [`SyncTicket`].
+///
+/// Requires the experimental `sync` feature.
 #[derive(Debug)]
+#[cfg(feature = "sync")]
+#[cfg_attr(docsrs, doc(cfg(feature = "sync")))]
 pub struct SyncAdmission {
   /// The minting watcher's brand — an admission presented to a DIFFERENT watcher
   /// is refused at the door ([`SyncRootError::ForeignTicket`]), never aliasing
@@ -242,6 +258,7 @@ pub struct SyncAdmission {
   nonce: u64,
 }
 
+#[cfg(feature = "sync")]
 impl SyncAdmission {
   /// Mints an admission under the issuing watcher's brand, sequence and leaf
   /// nonce. The sole constructor, called only by
@@ -307,7 +324,11 @@ impl SyncAdmission {
 /// sync reached a post-birth terminal ([`Retired`](SyncRootError::Retired)), or the
 /// watcher is [`Closed`](SyncRootError::Closed) — so a retry must re-mint through
 /// [`mint_sync_ticket`](Watcher::mint_sync_ticket).
+///
+/// Requires the experimental `sync` feature.
 #[derive(Debug)]
+#[cfg(feature = "sync")]
+#[cfg_attr(docsrs, doc(cfg(feature = "sync")))]
 pub struct SyncRootDenied {
   /// The placement failure — the same vocabulary the pre-split
   /// [`sync_root`](Watcher::sync_root) returned directly.
@@ -318,6 +339,7 @@ pub struct SyncRootDenied {
   pub admission: Option<SyncAdmission>,
 }
 
+#[cfg(feature = "sync")]
 impl SyncRootDenied {
   /// Wraps a [`sync_root`](Watcher::sync_root) refusal, returning the admission for
   /// a same-sequence retry only when `error` is provably PRE-BIRTH (the refusal
@@ -1044,6 +1066,7 @@ pub struct Watcher<R> {
   /// public reap or cancel is a mark ON the obligation it names — never a message
   /// about it — so it rides no channel that a command burst could saturate, and no
   /// channel that a flood could grow.
+  #[cfg(feature = "sync")]
   cleanup: CookieIngress,
   /// The sync-ticket mint: a per-watcher monotonic sequence, held behind an `Arc`
   /// so it is shared (and stays unique) across any `Watcher` clones. Bumped once
@@ -1057,6 +1080,7 @@ pub struct Watcher<R> {
   /// refuses 0 there ([`is_sync_cookie_name`](crate::is_sync_cookie_name)): a leaf
   /// the classifier rejects is a genuine marker republished on every consumer
   /// stream as a user create.
+  #[cfg(feature = "sync")]
   sync_tickets: Arc<AtomicU64>,
   /// The marker-leaf nonce stream: ONE cryptographic generator per watcher, seeded
   /// from the OS while the watcher is built and never re-seeded. Each
@@ -1069,6 +1093,7 @@ pub struct Watcher<R> {
   /// something else could compute. Behind an `Arc<Mutex<_>>` for the same reason
   /// the sequence is behind an `Arc`: clones of one watcher must draw from ONE
   /// stream, never from two copies that would publish the same words twice.
+  #[cfg(feature = "sync")]
   nonces: Option<Arc<Mutex<ChaCha20Rng>>>,
   /// The bound on the descriptors the sync door may be HOLDING at once
   /// ([`SyncPinAllowance`](crate::driver::SyncPinAllowance), sized by
@@ -1084,9 +1109,11 @@ pub struct Watcher<R> {
   ///
   /// Shared across clones of one watcher, like the mint above: the bound belongs
   /// to the watcher, not to a handle.
+  #[cfg(feature = "sync")]
   pins: crate::driver::SyncPinAllowance,
   /// The blocking pool the sync door samples its admission pins on
   /// ([`BlockingSpawner`]).
+  #[cfg(feature = "sync")]
   blocking: BlockingSpawner,
   events: EventStream,
   roots: Arc<RwLock<RootSet>>,
@@ -1119,6 +1146,7 @@ type EventStream =
 /// and `Send + Sync` (the captured closure is zero-capture, so it is both) keeps
 /// the watcher's own auto traits independent of `R`, which is the whole point of
 /// holding `PhantomData<fn() -> R>` rather than an `R`.
+#[cfg(feature = "sync")]
 type BlockingSpawner = Arc<dyn Fn(Box<dyn FnOnce() + Send>) + Send + Sync + 'static>;
 
 impl<R> core::fmt::Debug for Watcher<R> {
@@ -1161,6 +1189,7 @@ impl<R: RuntimeLite> Watcher<R> {
     // for thirty-two doors. The arithmetic both numbers come out of is on
     // [`DriverConfig::sync_door_allowance`]. Read before the config is handed to
     // the task, which owns it from there on.
+    #[cfg(feature = "sync")]
     let pins = crate::driver::SyncPinAllowance::new(DriverConfig::sync_door_allowance(
       config.cookie_global_cap,
     ));
@@ -1168,6 +1197,7 @@ impl<R: RuntimeLite> Watcher<R> {
     // handle and the driver task below, because a public cleanup request must
     // address the very records that driver admits. Its two halves are created
     // together for the same reason the command channel's are.
+    #[cfg(feature = "sync")]
     let (cleanup, cookie_wake) = crate::driver::cookie_ingress();
     let (event_tx, event_rx) = async_channel::bounded(options.event_capacity().get());
     let roots = Arc::new(RwLock::new(RootSet::default()));
@@ -1177,6 +1207,11 @@ impl<R: RuntimeLite> Watcher<R> {
     let registry = RegistryWriter {
       roots: Arc::clone(&roots),
     };
+    // The cookie wake is the ledger's half of the ingress above, so the driver
+    // takes it only where the ledger exists. A parameter cannot be dropped from a
+    // call the way a `#[cfg]` drops it from a signature, so the spawn is written
+    // once per state.
+    #[cfg(feature = "sync")]
     R::spawn_detach(run::<R, _>(
       config,
       ops,
@@ -1185,15 +1220,22 @@ impl<R: RuntimeLite> Watcher<R> {
       event_tx,
       registry,
     ));
+    #[cfg(not(feature = "sync"))]
+    R::spawn_detach(run::<R, _>(config, ops, command_rx, event_tx, registry));
     Ok(Self {
       instance: WATCHER_INSTANCES.fetch_add(1, Ordering::Relaxed),
       commands: command_tx,
+      #[cfg(feature = "sync")]
       cleanup,
+      #[cfg(feature = "sync")]
       sync_tickets: Arc::new(AtomicU64::new(1)),
+      #[cfg(feature = "sync")]
       nonces: sync_nonce_generator().map(|generator| Arc::new(Mutex::new(generator))),
+      #[cfg(feature = "sync")]
       pins,
       // The ONE place `R` is in scope for the door: the sampling's pool is
       // captured here and erased ([`BlockingSpawner`]).
+      #[cfg(feature = "sync")]
       blocking: Arc::new(|job| R::spawn_blocking_detach(job)),
       events: Box::pin(event_rx),
       roots,
@@ -1211,6 +1253,7 @@ impl<R: RuntimeLite> Watcher<R> {
   #[cfg(all(
     test,
     feature = "tokio",
+    feature = "sync",
     not(miri),
     any(target_os = "linux", target_os = "macos")
   ))]
@@ -1739,6 +1782,10 @@ impl<R> Watcher<R> {
   /// else can compute is not a barrier. Today that is only
   /// `wasm32-unknown-unknown`, which supplies no entropy interface and no
   /// filesystem backend either.
+  ///
+  /// Requires the experimental `sync` feature.
+  #[cfg(feature = "sync")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "sync")))]
   #[must_use]
   pub fn mint_sync_ticket(&self) -> Option<(SyncAdmission, SyncTicket)> {
     let nonce = {
@@ -1768,6 +1815,7 @@ impl<R> Watcher<R> {
   /// with an empty reading, which is not a weaker claim but a different one: an
   /// absent pin MEANS nothing stood at that name when the sync was admitted, and
   /// the write reasons from that.
+  #[cfg(feature = "sync")]
   async fn sample_admitted(
     &self,
     permit: &Arc<crate::driver::SyncPinPermit>,
@@ -2141,6 +2189,10 @@ impl<R> Watcher<R> {
   /// not a security boundary against its own uid.
   /// Tracked as <https://github.com/al8n/tributaries/issues/135>, companion of
   /// <https://github.com/al8n/tributaries/issues/134>.
+  ///
+  /// Requires the experimental `sync` feature.
+  #[cfg(feature = "sync")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "sync")))]
   pub async fn sync_root(
     &self,
     root: RootHandle,
@@ -2383,6 +2435,10 @@ impl<R> Watcher<R> {
   /// reuses names and needs incarnation precision reaps through its [`SyncTicket`]
   /// instead — [`request_cancel_sync`](Self::request_cancel_sync) addresses exactly
   /// one incarnation for all time and is a no-op after it resolves.
+  ///
+  /// Requires the experimental `sync` feature.
+  #[cfg(feature = "sync")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "sync")))]
   pub fn request_remove_cookie(&self, path: impl Into<PathBuf>) {
     self.cleanup.request_remove(&path.into());
   }
@@ -2418,6 +2474,10 @@ impl<R> Watcher<R> {
   /// has a record to mark whatever the sync's stage, including a write still in the
   /// pool — and the driver owns every cookie it writes regardless, so a cancel to
   /// an already-closed driver leaks nothing.
+  ///
+  /// Requires the experimental `sync` feature.
+  #[cfg(feature = "sync")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "sync")))]
   pub fn request_cancel_sync(&self, ticket: SyncTicket) {
     // A foreign ticket's sequence is unrelated to this watcher's `by_ticket`;
     // resolving it could alias one of our incarnations, so drop it at the door
@@ -2677,6 +2737,7 @@ impl<R> Watcher<R> {
   #[cfg(all(
     test,
     feature = "tokio",
+    feature = "sync",
     not(miri),
     any(target_os = "linux", target_os = "macos")
   ))]

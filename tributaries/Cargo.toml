@@ -24,6 +24,19 @@ fs = ["dep:tributary-fs"]
 # runtime.
 tokio = ["agnostic-lite/tokio", "tributary-fs?/tokio"]
 smol = ["agnostic-lite/smol", "tributary-fs?/smol"]
+# The sync BARRIER — `Tributaries::sync`, `Source::{begin_sync, end_sync, cancel_sync}`,
+# `SyncToken`, `Begun`, `SyncOutcome`, `SyncError` — and the owner bookkeeping beneath
+# them, forwarded to the fs binding's own gate where that binding is compiled in (the
+# weak `?` dependency: nothing to forward when `fs` is off, and a custom `Source`
+# consumer still gets the barrier vocabulary).
+#
+# EXPERIMENTAL and off by default. With it off no barrier is ever admitted, so nothing
+# else in the crate behaves differently. Its two dependencies are the one mechanism that
+# makes a cookie name unguessable: `rand_chacha` is the per-driver nonce stream and
+# `getrandom` the single OS seed that starts it. `getrandom` is declared only in the
+# non-wasm target table, so on `wasm32-unknown-unknown` this enables `rand_chacha` alone
+# and the driver holds no generator — the answer that target has always given.
+sync = ["dep:rand_chacha", "dep:getrandom", "tributary-fs?/sync"]
 # Optional `serde` face on the option households (`TributariesOptions`,
 # `DebounceConfig`, `Debounce`, `Interest`, `WatchOptions`), forwarded to the
 # inner crates so a `fs` consumer's `WatcherOptions` and `Backend` carry it too
@@ -63,7 +76,7 @@ serde = { version = "1", optional = true, features = ["derive"] }
 # words in cookie file names still reveals nothing about the seed behind them. Pure
 # computation with no OS dependency, so — unlike `getrandom` below — it needs no target
 # gate and builds for `wasm32-unknown-unknown` unchanged.
-rand_chacha = "0.9"
+rand_chacha = { version = "0.9", optional = true }
 thiserror = "2"
 tributary-fs = { version = "0.2", path = "../tributary-fs", optional = true }
 # `glob` is enabled unconditionally: the per-root seats ride the umbrella's own
@@ -79,7 +92,7 @@ tributary-proto = { version = "0.2", path = "../tributary-proto", features = [
 # call. Absent it a driver holds no generator and refuses every barrier outright, rather
 # than running on a name something else can compute.
 [target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
-getrandom = "0.3"
+getrandom = { version = "0.3", optional = true }
 
 [dev-dependencies]
 # Mirror a real consumer's manifest: the indexer-shaped integration suite
