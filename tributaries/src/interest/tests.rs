@@ -172,6 +172,64 @@ mod serde_face {
     assert!(serde_json::from_str::<Interest>(r#"["created", "renamed"]"#).is_err());
   }
 
+  /// A tag longer than the longest valid name is refused ON ITS LENGTH, and the
+  /// refusal says nothing about the value.
+  ///
+  /// This vocabulary is four words of at most eight bytes. A megabyte-long tag is
+  /// not a near miss to be reported helpfully — it is an untrusted document asking
+  /// this face to copy it and then to format it into an error, twice its size live
+  /// at the same instant. The bound is judged first, and the message it produces is
+  /// fixed.
+  #[test]
+  fn an_over_long_kind_name_is_refused_without_echoing_it() {
+    const FILLER: char = 'z';
+
+    let tag: String = core::iter::repeat_n(FILLER, 1024 * 1024).collect();
+    let document = format!(r#"["{tag}"]"#);
+    let refusal = serde_json::from_str::<Interest>(&document)
+      .expect_err("a tag past the vocabulary's longest name is refused")
+      .to_string();
+
+    assert!(
+      refusal.contains("at most 8 bytes"),
+      "the refusal names the bound: {refusal}"
+    );
+    assert!(
+      refusal.contains(&tag.len().to_string()),
+      "and the length it measured: {refusal}"
+    );
+    // A handful of the tag's own bytes would already be an echo; the message is
+    // shorter than the tag by orders of magnitude, and carries none of it.
+    assert!(
+      !refusal.contains(&FILLER.to_string().repeat(9)),
+      "and none of the value itself: {refusal}"
+    );
+  }
+
+  /// A junk tag one byte past the bound is refused by the LENGTH gate, and one
+  /// inside it by the vocabulary — the two doors, on either side of the ceiling.
+  #[test]
+  fn a_junk_kind_name_is_refused_on_whichever_side_of_the_bound_it_falls() {
+    // Nine bytes: past the eight-byte ceiling, so the length gate answers.
+    let refusal = serde_json::from_str::<Interest>(r#"["ninebytes"]"#)
+      .expect_err("nine bytes is past the ceiling")
+      .to_string();
+    assert!(
+      refusal.contains("at most 8 bytes"),
+      "the length gate answers a nine-byte tag: {refusal}"
+    );
+
+    // Eight bytes: inside the ceiling, so the vocabulary answers — and the echo it
+    // formats is bounded by that ceiling by construction.
+    let refusal = serde_json::from_str::<Interest>(r#"["notakind"]"#)
+      .expect_err("an eight-byte non-name is still not one of the four")
+      .to_string();
+    assert!(
+      refusal.contains("unknown variant") && refusal.contains("notakind"),
+      "the vocabulary answers an in-bound tag: {refusal}"
+    );
+  }
+
   #[test]
   fn every_kind_round_trips_on_its_own() {
     /// One flag and the bit it is expected to clear.

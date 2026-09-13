@@ -193,10 +193,13 @@ fn the_per_pattern_fallback_answers_what_the_union_answers() {
 /// it — and the ceiling itself is legal, only the step past it is not.
 #[test]
 fn a_set_past_the_pattern_ceiling_is_a_typed_refusal() {
+  // One compiled pattern, cloned: the ceiling counts entries, not distinct
+  // automatons, and cloning is an `Arc` pointer copy — 512 SEPARATELY compiled
+  // globs cross 32-bit Miri's address-space limit. `**/w0` is kept as the source
+  // text so the `is_match("a/w0")` claim below still holds.
   let many = |count: usize| {
-    (0..count)
-      .map(|n| glob(&std::format!("**/w{n}")))
-      .collect::<std::vec::Vec<_>>()
+    let pattern = glob("**/w0");
+    std::iter::repeat_n(pattern, count).collect::<std::vec::Vec<_>>()
   };
 
   let full = Globs::new(many(MAX_SEAT_PATTERNS)).expect("the ceiling itself is honoured");
