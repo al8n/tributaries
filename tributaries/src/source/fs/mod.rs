@@ -994,17 +994,19 @@ fn watch_error_from_fs(err: WatchRootError) -> WatchError {
 fn sync_error_from_fs(error: SyncRootError) -> SyncError {
   match error {
     SyncRootError::UnknownRoot | SyncRootError::Retired => SyncError::Retired,
-    // The fourth of the uncovered shapes, and the only one the TREE decides rather
-    // than a configuration word: a mount standing anywhere between the watched root
-    // and the reserved cookie directory's name — a same-superblock bind mount
-    // included. No crawl of the root descends across it, so a marker there
-    // produces no event on this subscription's stream — the same "the barrier could
-    // never be met" the other three mean, and just as permanent, so it is not the
-    // retryable `Busy` its sibling `DirReplaced` is.
+    // Five spellings of one fact: the marker's ground is not on this
+    // subscription's stream. Three are configuration words — an exclusion, the
+    // root's prune seat, and a `set_cover` that narrowed the root's per-directory
+    // coverage past the directory. One is the TREE's: a mount standing anywhere
+    // between the watched root and the reserved cookie directory's name, a
+    // same-superblock bind mount included, which no crawl of the root descends
+    // across. All are permanent for the request as issued, so none is the retryable
+    // `Busy` their sibling `DirReplaced` is.
     SyncRootError::DirOutsideRoot { .. }
     | SyncRootError::DirExcluded { .. }
     | SyncRootError::DirCrossesMount { .. }
-    | SyncRootError::DirPruned { .. } => SyncError::CookieDirUncovered,
+    | SyncRootError::DirPruned { .. }
+    | SyncRootError::DirUncovered { .. } => SyncError::CookieDirUncovered,
     SyncRootError::Write { source, .. } => {
       let kind = match source.kind() {
         std::io::ErrorKind::NotFound => FaultKind::NotFound,

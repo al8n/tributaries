@@ -942,20 +942,29 @@ fn a_liveness_probe_answers_while_the_blocking_pool_stays_occupied() {
 /// A probe that has not answered is a hung root; a second thread against the
 /// same path proves nothing and would let a wall-clock tick mint one thread per
 /// interval for as long as the mount stays wedged. One outstanding probe per
-/// scope is the bound, and the tick simply re-arms its deadline.
+/// scope and generation is the bound, and the tick simply re-arms its deadline.
+///
+/// Every claim here is a DELTA against the moment the gate captured its probe,
+/// never an absolute count. The rig ticks on the wall clock, so how many probes
+/// have already completed before the gate is installed is a property of how fast
+/// the host runs this cell — nine of them under an interpreter, one natively —
+/// and asserting the absolute number pins the interpreter's speed rather than the
+/// driver's behaviour.
 #[tokio::test]
 async fn a_second_liveness_tick_dispatches_no_second_probe() {
   let registry = RecordingRegistry::default();
   let rig = ticking_descending_rig(Duration::from_millis(20), registry.clone());
   let scope = watch(&rig, "/r").await;
 
-  // The birth refresh is already behind us, so this gate captures the first
-  // TICKED probe and holds it there.
+  // This gate captures the next ticked probe and holds it there. One probe per
+  // scope is outstanding at a time, so a captured probe is the ONLY one in
+  // flight and the completion count is stable from here.
   let hold = rig.fs.hold_refreshes();
   assert!(
     settle(|| hold.captured() == 1).await,
     "staging: one ticked probe is parked inside the refresh"
   );
+  let completed = rig.fs.refreshes();
 
   // Many further intervals elapse against that parked probe. The settle
   // EXPIRING is the claim: no second dispatch ever happens.
@@ -969,12 +978,524 @@ async fn a_second_liveness_tick_dispatches_no_second_probe() {
   );
   assert_eq!(
     rig.fs.refreshes(),
-    1,
-    "only the birth refresh ever completed"
+    completed,
+    "and none completed either — the parked probe is still the only one"
   );
 
   hold.release();
   let _ = scope;
+}
+
+/// A ticking descending rig over `roots`, all on one fake filesystem.
+fn ticking_rig_over(interval: Duration, registry: RecordingRegistry, roots: &[String]) -> Rig {
+  let fs = FakeFs::new(1);
+  for (index, root) in roots.iter().enumerate() {
+    fs.put(root, FileKind::Dir, 1 + index as u64);
+  }
+  fs.spawn_backend(BackendKind::Inotify);
+  let (cmd_tx, cmd_rx) = async_channel::bounded(16);
+  let (cleanup, cookie_wake) = cookie_ingress();
+  let (ev_tx, ev_rx) = async_channel::bounded(1024);
+  tokio::spawn(run::<TokioRuntime, FakeFs>(
+    DriverConfig {
+      profile: BackendKind::Inotify,
+      root_liveness_interval: interval,
+      ..config()
+    },
+    fs.clone(),
+    cmd_rx,
+    cookie_wake,
+    ev_tx,
+    registry,
+  ));
+  Rig {
+    fs,
+    commands: cmd_tx,
+    cleanup,
+    events: ev_rx,
+  }
+}
+
+/// The probe threads the driver has dispatched and not yet heard back from.
+async fn probes_outstanding(rig: &Rig) -> usize {
+  let (reply, on_reply) = futures_channel::oneshot::channel();
+  rig
+    .commands
+    .send(Command::DebugProbesOutstanding { reply })
+    .await
+    .unwrap();
+  on_reply.await.expect("the driver replies")
+}
+
+/// Settles until the outstanding-probe count reaches `target`, reporting whether
+/// it got there — the async analogue of [`settle`] for a count only a `Command`
+/// round trip can read.
+#[must_use]
+async fn settle_probes(rig: &Rig, target: usize) -> bool {
+  settle_probes_within(rig, 200, target).await
+}
+
+/// [`settle_probes`] with a caller-chosen round budget.
+///
+/// Staging a count that depends on dozens of real OS threads actually reaching
+/// a parked state costs real wall clock the shared 200-round window does not
+/// promise — [`SETTLE_ROUND_SLICE`] is scaled for a slow (sanitizer)
+/// instrument, but the round COUNT is not, so a cell whose target is
+/// `MAX_LIVENESS_PROBES`-sized threads needs its own wider budget the same way
+/// [`settle_within`] widens [`settle`]. The condition is eventually-true either
+/// way, so a wider budget can only prevent a spurious failure, never mask one.
+#[must_use]
+async fn settle_probes_within(rig: &Rig, rounds: usize, target: usize) -> bool {
+  for _ in 0..interpreted_rounds(rounds) {
+    if probes_outstanding(rig).await == target {
+      return true;
+    }
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    std::thread::sleep(settle_round_slice());
+  }
+  probes_outstanding(rig).await == target
+}
+
+/// Whether the outstanding-probe count HOLDS at `target` for a whole window — the
+/// negative form, where the window elapsing without a change is the observation.
+#[must_use]
+async fn probes_hold_at(rig: &Rig, target: usize) -> bool {
+  for _ in 0..interpreted_rounds(60) {
+    if probes_outstanding(rig).await != target {
+      return false;
+    }
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    std::thread::sleep(settle_round_slice());
+  }
+  true
+}
+
+/// Sends one `Replace` and returns the driver's verdict.
+async fn replace_root(
+  rig: &Rig,
+  scope: ScopeId,
+  new_root: &str,
+) -> Result<(), crate::error::ReplaceRootError> {
+  let (reply, on_reply) = futures_channel::oneshot::channel();
+  rig
+    .commands
+    .send(Command::Replace {
+      scope,
+      root: PathBuf::from(new_root),
+      reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from(new_root)),
+      reply,
+    })
+    .await
+    .unwrap();
+  on_reply.await.expect("the driver replies")
+}
+
+/// A replacement root is probed immediately, and the retiring root's late answer
+/// is DROPPED rather than read as the replacement's verdict.
+///
+/// Both halves are the same defect. Keyed by scope alone, the retiring root's
+/// outstanding probe held the scope's only seat AND left the core's refresh
+/// pending, so the replacement got no probe until a `stat` that may be inside a
+/// wedged mount forever came back — and when it did come back, its verdict was
+/// about an object this scope no longer watches. A replacement standing on a
+/// filesystem that has since been unmounted could then read live for as long as
+/// the OLD root stayed hung, and the answer that finally arrived could kill it
+/// for the old root's death.
+///
+/// Two gates, so neither half rests on which answer the runtime happens to
+/// deliver first: the retiring root's probe parks on the first gate and stays
+/// there while the whole rest of the cell runs, and the replacement's own probes
+/// ride the second.
+///
+/// Revert witnesses, one per half. Leave the core's `refresh_pending` set across
+/// the replace commit — or stop retiring the scope's probe tag there; either
+/// alone starves the replacement — and the second gate never captures anything.
+/// Forward a probe's answer without checking its tag and the last release below
+/// kills the live replacement.
+#[tokio::test]
+async fn a_replacement_root_is_probed_while_the_retiring_root_s_probe_is_parked() {
+  let registry = RecordingRegistry::default();
+  // Disjoint roots, so the replacement takes the general STREAM replace — the
+  // path the two probes must be independent across — rather than the
+  // same-transport widen an `old ⊂ new` pair would take.
+  let rig = ticking_rig_over(
+    Duration::from_millis(20),
+    registry.clone(),
+    &["/old".to_owned(), "/new".to_owned()],
+  );
+  let scope = watch(&rig, "/old").await;
+
+  // The retiring root's probe parks here and never leaves until the very end.
+  let old_gate = rig.fs.hold_refreshes();
+  assert!(
+    settle(|| old_gate.captured() == 1).await,
+    "staging: /old's probe is parked inside the refresh"
+  );
+
+  // Everything dispatched from now on rides a gate of its own, so the two roots'
+  // probes are separable.
+  let new_gate = rig.fs.hold_refreshes();
+  replace_root(&rig, scope, "/new")
+    .await
+    .expect("the replacement commits");
+
+  // THE FIRST HALF: the replacement is probed while the old root's probe is
+  // still inside its call.
+  assert!(
+    settle(|| new_gate.captured() >= 1).await,
+    "the replacement root gets a probe of its own without waiting for the \
+     retiring root's"
+  );
+  assert_eq!(
+    old_gate.captured(),
+    1,
+    "and the retiring root's probe is still parked where it was"
+  );
+
+  // The old root's path vanishes: its probe, whenever it answers, now carries
+  // death evidence — for an object this scope replaced.
+  rig.fs.remove("/old");
+
+  // Let the replacement's own probes run to completion, so the core has spent
+  // every gate a cross-world answer could hide behind and the only thing left
+  // outstanding is the retiring root's parked probe.
+  new_gate.release();
+  assert!(
+    settle_probes(&rig, 1).await,
+    "the replacement's probes answer and leave only the parked one outstanding"
+  );
+  assert!(
+    registry.dead().is_empty(),
+    "staging: the live replacement is alive at this point"
+  );
+
+  // THE SECOND HALF: the retiring root's answer finally arrives, reporting the
+  // old root gone. It is addressed to a tag this scope has left behind, so it is
+  // dropped — the replacement is not killed by the death of the root it replaced.
+  old_gate.release();
+  assert!(
+    settle_probes(&rig, 0).await,
+    "every probe thread has exited"
+  );
+  assert!(
+    !settle(|| !registry.dead().is_empty()).await,
+    "the retiring root's late answer is dropped, not read as the replacement's death"
+  );
+}
+
+/// A probe stays COUNTED until its thread exits, whatever happens to the scope it
+/// was dispatched for.
+///
+/// The budget bounds threads, and a thread is not gone because its scope is: a
+/// `stat` inside a wedged mount cannot be cancelled or joined, so a teardown that
+/// forgot its probe left the thread alive and the count wrong. Repeat that under
+/// watch/tick/unwatch churn and the driver spends one thread and one stack per
+/// retired scope with nothing bounding the total — and once spawning starts
+/// failing, every probe falls back onto the blocking pool whose stall the thread
+/// existed to escape.
+///
+/// Revert witness: drop the scope's entry at teardown instead of retiring its tag
+/// and the count falls to zero at the unwatch, while three threads are still
+/// parked inside the filesystem.
+#[tokio::test]
+async fn a_retired_scope_s_probe_stays_counted_until_its_thread_exits() {
+  const SCOPES: usize = 3;
+  let registry = RecordingRegistry::default();
+  let roots: Vec<String> = (0..SCOPES).map(|index| format!("/r{index}")).collect();
+  let rig = ticking_rig_over(Duration::from_millis(20), registry.clone(), &roots);
+  let mut scopes = Vec::new();
+  for root in &roots {
+    scopes.push(watch(&rig, root).await);
+  }
+
+  let gate = rig.fs.hold_refreshes();
+  assert!(
+    settle_probes(&rig, SCOPES).await,
+    "staging: every scope has a probe parked inside the refresh"
+  );
+
+  for scope in &scopes {
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Unwatch {
+        scope: *scope,
+        reply: Some(reply),
+      })
+      .await
+      .unwrap();
+    let _ = tokio::time::timeout(interpreted_secs(10), on_reply).await;
+  }
+
+  assert!(
+    probes_hold_at(&rig, SCOPES).await,
+    "every retired scope's probe is still counted — the threads are still parked"
+  );
+
+  gate.release();
+  assert!(
+    settle_probes(&rig, 0).await,
+    "and the count returns to zero exactly when the threads leave"
+  );
+}
+
+/// At the probe budget a tick dispatches NOTHING, and the scope it turned away
+/// ticks again once the budget frees.
+///
+/// The budget is the only real bound on threads the driver cannot reclaim: scope
+/// ids are never reused, so the per-scope rule bounds nothing across churn. What
+/// it must not do is turn a scope away permanently — a declined tick that left
+/// the core's refresh pending would coalesce every later arming onto a probe
+/// nobody sent, and that scope's death would never be observed again. So the
+/// decline drops the pending mark and re-arms the deadline, and the next interval
+/// tries again.
+///
+/// Every root here is unmounted under the held gate, so the observation is a
+/// death count: no PARKED scope dies while its probe is parked, and once the
+/// gate opens EVERY scope dies — including the one the budget turned away,
+/// which ticks again once its probe can be dispatched.
+///
+/// Post-c5a1a68: the scope whose tick FINDS the budget full is not itself
+/// parked on this gate — its decline is routed through the loss funnel
+/// (`on_overflow(Scope::Root)`), and the covering `Rescan` that decline arms
+/// samples the root through the crawl's own path, not through `hold_refreshes`.
+/// It is told its coverage is unproven, and with the root already `Missing` it
+/// may legitimately die from that recovery before the gate ever releases —
+/// natively the decline usually lands after the staging assertion below, but
+/// under a slower binary it can land before. So the staging assertion bounds
+/// only the parked population, not that scope.
+///
+/// not(miri): the claim needs `MAX_LIVENESS_PROBES` real parked threads, and
+/// sixty-four of them under an interpreter is a shard timeout rather than a test.
+/// The arithmetic the budget performs is ordinary counting Miri has nothing to
+/// say about; what it bounds is threads, which is a native fact.
+#[cfg(not(miri))]
+#[tokio::test]
+async fn a_tick_at_the_probe_budget_dispatches_nothing_and_retries_later() {
+  let ticked = MAX_LIVENESS_PROBES + 1;
+  let registry = RecordingRegistry::default();
+  let mut roots: Vec<String> = (0..ticked).map(|index| format!("/r{index}")).collect();
+  roots.push("/late".to_owned());
+  let rig = ticking_rig_over(Duration::from_millis(20), registry.clone(), &roots);
+  for root in &roots[..ticked] {
+    let _ = watch(&rig, root).await;
+  }
+
+  // Every root vanishes, and every probe from here parks before it can say so.
+  let gate = rig.fs.hold_refreshes();
+  rig.fs.set_root_liveness(RootLiveness::Missing);
+
+  // Widened past the shared 200-round window: this stages sixty-four real OS
+  // threads actually reaching a parked state inside the fake's refresh, and
+  // under a slow (sanitizer-instrumented) binary that outruns the round
+  // count's fixed budget well before it outruns wall-clock patience. The
+  // round count is what has to grow here — see `settle_probes_within` — the
+  // same reasoning `interpreted_rounds` documents for an interpreter, applied
+  // to a different kind of slow binary. Mirrors this same test's own final
+  // assertion, which already spends this wider budget.
+  assert!(
+    settle_probes_within(&rig, 400, MAX_LIVENESS_PROBES).await,
+    "staging: the budget fills"
+  );
+  assert!(
+    probes_hold_at(&rig, MAX_LIVENESS_PROBES).await,
+    "and it holds: the scope whose tick found the budget full dispatched nothing"
+  );
+  // No PARKED scope can die while its probe is parked, but the one scope whose
+  // tick finds the budget full (which of the `ticked` roots that is is a race,
+  // not fixed) is never parked on this gate at all: its decline is routed
+  // through the loss funnel's covering Rescan (c5a1a68), sampled through the
+  // crawl's own path, so with the root already Missing it may legitimately die
+  // from that recovery before this gate ever releases. That declined scope is
+  // the only candidate; every other (parked) scope must still be alive.
+  assert!(
+    registry.dead().len() <= 1,
+    "no scope with a parked probe can die while every probe is parked (dead: {:?})",
+    registry.dead()
+  );
+
+  // One more root, registered while the budget is full, so it is its BIRTH
+  // refresh that is declined. A completing refresh is what SEEDS the liveness
+  // deadline, so this scope has none: without the decline arming one, it would
+  // never tick and its death would never be observed at all. Registered by hand
+  // because the shared helper waits for the birth refresh this cell is
+  // deliberately preventing.
+  let (reply, on_reply) = futures_channel::oneshot::channel();
+  rig
+    .commands
+    .send(Command::Watch {
+      root: PathBuf::from("/late"),
+      options: crate::options::RootOptions::new(),
+      reply,
+    })
+    .await
+    .unwrap();
+  let grant = on_reply
+    .await
+    .unwrap()
+    .expect("a root registers even with every probe parked");
+  grant.defuse();
+
+  gate.release();
+  let expected = ticked + 1;
+  assert!(
+    settle_within(interpreted_rounds(400), || registry.dead().len()
+      == expected)
+    .await,
+    "every scope dies once the probes answer — the scopes the budget turned away \
+     ticked again and got probes of their own (dead: {}, expected {expected})",
+    registry.dead().len()
+  );
+}
+
+/// Empties the event stream and waits for it to STAY empty — the baseline a
+/// delta-shaped event assertion is read against.
+///
+/// not(miri): its only caller is the probe-budget cell below, which is itself
+/// `#[cfg(not(miri))]` — real parked threads, not an interpreter.
+#[cfg(not(miri))]
+async fn drain_events(rig: &Rig) {
+  let mut quiet = 0;
+  for _ in 0..interpreted_rounds(400) {
+    let mut took = false;
+    while rig.events.try_recv().is_ok() {
+      took = true;
+    }
+    quiet = if took { 0 } else { quiet + 1 };
+    if quiet >= 10 {
+      return;
+    }
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+  }
+}
+
+/// A scope the probe budget turns away is told its coverage is UNPROVEN, and
+/// told once.
+///
+/// A declined tick that only withdrew the core's pending mark left the scope
+/// falsely live and silent. At the budget there is no probe of this scope to
+/// coalesce onto and none is coming: every slot is held by a call that may never
+/// return, and on a descending backend the in-tree death notice can itself be
+/// postponed without bound by a descriptor a stalled write is holding. So the
+/// root can die and the subscriber would never hear — no `Rescan`, no terminal,
+/// a coverage claim nobody is checking.
+///
+/// Sixty-five ticking scopes fill sixty-four slots; the one left over is the
+/// scope the budget turned away, and it stays turned away for as long as the
+/// gate holds. Its covering `Rescan` is the observable, and it is read as a
+/// DELTA — the registrations' own closing covers are drained first — while the
+/// budget is still full, never at the release.
+///
+/// ONCE is the second half. The fact does not become more true each interval,
+/// and a `Rescan` per tick against a wedged filesystem is a re-enumeration storm
+/// the subscriber pays for. The window below spans many intervals, so a per-tick
+/// signal would be counted as such.
+///
+/// Revert witness: drop the loss funnel from the budget arm of
+/// `on_refresh_declined` and no `Rescan` arrives at all until the gate opens;
+/// drop the once-per-episode latch and the count runs with the intervals.
+///
+/// not(miri): the claim needs `MAX_LIVENESS_PROBES` real parked threads, exactly
+/// as its sibling above.
+#[cfg(not(miri))]
+#[tokio::test]
+async fn a_probe_declined_at_the_budget_reports_the_scope_unproven_once() {
+  let ticked = MAX_LIVENESS_PROBES + 1;
+  let registry = RecordingRegistry::default();
+  let roots: Vec<String> = (0..ticked).map(|index| format!("/r{index}")).collect();
+  let rig = ticking_rig_over(Duration::from_millis(20), registry.clone(), &roots);
+  for root in &roots {
+    let _ = watch(&rig, root).await;
+  }
+  // The baseline: every registration window's closing `Rescan` is spent, so what
+  // the window below counts came from the decline and from nothing else.
+  drain_events(&rig).await;
+
+  // Every root vanishes, and every probe from here parks before it can say so.
+  let gate = rig.fs.hold_refreshes();
+  rig.fs.set_root_liveness(RootLiveness::Missing);
+  assert!(
+    settle_probes_within(&rig, 400, MAX_LIVENESS_PROBES).await,
+    "staging: the budget fills"
+  );
+  assert!(
+    probes_hold_at(&rig, MAX_LIVENESS_PROBES).await,
+    "and it holds: one scope is left with no slot at all"
+  );
+  assert!(
+    registry.dead().is_empty(),
+    "staging: nothing can die while every probe is parked"
+  );
+
+  // FIRST: the turned-away scope's covering `Rescan` arrives while the budget is
+  // still full — a delta against the stream this cell emptied, not a count of
+  // everything the rig ever said.
+  //
+  // An EVENTUAL claim on the shared wait rather than a window of its own. What it
+  // waits on is a TICK: the scope the budget turned away is told nothing until
+  // its next interval comes round, and with sixty-five scopes ticking against
+  // sixty-four parked threads, when that interval lands is the runner's business
+  // and not this cell's. A hosted runner reached it later than a hand-rolled
+  // window allowed, and a fixed short window is the wrong shape for a fact that
+  // is eventually true: it can only fail spuriously, never catch a defect
+  // earlier. The loop returns the instant the cover arrives, so the wider budget
+  // costs a passing run nothing — the same reasoning [`settle_within`] documents.
+  let mut opened = 0usize;
+  let unproven = settle_within(interpreted_rounds(400), || {
+    while let Ok((_, _, change)) = rig.events.try_recv() {
+      if change.kind().is_rescan() {
+        opened += 1;
+      }
+    }
+    opened > 0
+  })
+  .await;
+  assert!(
+    unproven,
+    "a scope the budget turned away says its coverage is unproven, while the \
+     budget is still full — not at the release"
+  );
+  assert!(
+    registry.dead().is_empty(),
+    "and it is a degradation, not a terminal — nothing died"
+  );
+
+  // THEN: nothing more, across many further intervals of the same episode. The
+  // budget is stable (every slot is parked, so no scope can free one and no new
+  // scope can be turned away), so a second cover here could only be the same
+  // fact restated — a re-enumeration storm on top of a wedged filesystem.
+  drain_events(&rig).await;
+  let mut repeats = 0usize;
+  for _ in 0..interpreted_rounds(120) {
+    while let Ok((_, _, change)) = rig.events.try_recv() {
+      if change.kind().is_rescan() {
+        repeats += 1;
+      }
+    }
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+  }
+  assert_eq!(
+    repeats, 0,
+    "the episode is reported once: every later declined tick of the same budget \
+     adds nothing"
+  );
+
+  // The budget frees: every parked probe answers, the turned-away scope ticks
+  // again, and every root's death is finally observed.
+  gate.release();
+  let expected = ticked;
+  assert!(
+    settle_within(interpreted_rounds(400), || registry.dead().len()
+      == expected)
+    .await,
+    "every scope dies once the probes answer — the one the budget turned away \
+     ticked again and got a probe of its own (dead: {}, expected {expected})",
+    registry.dead().len()
+  );
 }
 
 /// The refresh samples the root's identity AND its mount frame from ONE object, so
@@ -3350,6 +3871,604 @@ mod descending {
         resolved(ack).await,
         CoverOutcome::Applied,
         "a prune-only reconcile settles clean"
+      );
+    }
+
+    /// Sends one `SyncRoot` and returns the driver's verdict verbatim — no
+    /// retry, no unwrap, because these cells are about the REFUSAL.
+    async fn sync_dir(
+      rig: &Rig,
+      scope: ScopeId,
+      dir: &str,
+      name: &str,
+    ) -> Result<PathBuf, crate::error::SyncRootError> {
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::SyncRoot {
+          scope,
+          dir: PathBuf::from(dir),
+          admitted: Default::default(),
+          name: name.to_owned(),
+          ticket: ticket(),
+          reply,
+        })
+        .await
+        .unwrap();
+      on_reply.await.expect("the driver replies")
+    }
+
+    /// A sync of a directory the applied cover no longer holds is refused BEFORE
+    /// birth, and refused the same way every time.
+    ///
+    /// The cut is what makes it unobservable: `/r/drop`'s watch is gone, so a
+    /// marker created under it reaches no source and the caller's barrier could
+    /// only time out. Reporting success and letting the wait expire is the one
+    /// answer the sync must never give, so the admission judges cover membership
+    /// with the other pre-birth ground refusals.
+    ///
+    /// Pre-birth is the second half, and the repeat is how it is read: an
+    /// admitted sync holds the scope's single-flight gate, so a refusal that had
+    /// minted an obligation would answer the SECOND call `WriteInFlight` instead.
+    /// Two identical `DirUncovered`s and a ledger still at zero say nothing was
+    /// created either time.
+    ///
+    /// Non-vacuity: the retained side of the very same cover still syncs, so the
+    /// refusal is the COVER's verdict and not a sync path that stopped working.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sync_outside_the_applied_cover_is_refused_before_birth() {
+      let (rig, scope) = covered_rig(&[("/r/keep", 11), ("/r/drop", 12)]).await;
+      shrunk_to_keep(&rig, scope).await;
+
+      for attempt in 1..=2 {
+        assert!(
+          matches!(
+            sync_dir(&rig, scope, "/r/drop", ".tributaries-sync-1-2-3").await,
+            Err(crate::error::SyncRootError::DirUncovered { ref dir })
+              if dir == std::path::Path::new("/r/drop")
+          ),
+          "attempt {attempt}: a sync of pruned ground is refused as uncovered"
+        );
+        let (reply, on_reply) = futures_channel::oneshot::channel();
+        rig
+          .commands
+          .send(Command::DebugCookieCount { reply })
+          .await
+          .unwrap();
+        assert_eq!(
+          on_reply.await.expect("the driver replies"),
+          0,
+          "attempt {attempt}: the refusal minted no obligation"
+        );
+      }
+      assert!(
+        rig.fs.cookie_writes().is_empty(),
+        "and nothing was ever written"
+      );
+
+      // The retained half of the same cover is untouched.
+      let path = sync_dir(&rig, scope, "/r/keep", ".tributaries-sync-4-5-6")
+        .await
+        .expect("a sync inside the applied cover still admits");
+      assert_eq!(path, PathBuf::from("/r/keep/.tributaries-sync-4-5-6"));
+    }
+
+    /// The watch `path` currently holds, if any: the most recent arm of that path
+    /// the fake has not since reclaimed. Re-arms mint a fresh id, so the LAST one
+    /// is the live binding.
+    fn live_watch_at(rig: &Rig, path: &str) -> Option<WatchId> {
+      let live = rig.fs.live_watches();
+      rig
+        .fs
+        .arms()
+        .into_iter()
+        .rev()
+        .find(|(watch, armed)| armed == std::path::Path::new(path) && live.contains(watch))
+        .map(|(watch, _)| watch)
+    }
+
+    /// The obligations the driver owns right now.
+    async fn cookie_count(rig: &Rig) -> usize {
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::DebugCookieCount { reply })
+        .await
+        .unwrap();
+      on_reply.await.expect("the driver replies")
+    }
+
+    /// Settles until the driver owns `target` obligations, reporting whether it
+    /// got there — the async analogue of [`settle`] for a count only a `Command`
+    /// round trip can read.
+    #[must_use = "an expired budget means the obligation never appeared, which is a staging failure"]
+    async fn settle_cookies(rig: &Rig, target: usize) -> bool {
+      for _ in 0..interpreted_rounds(200) {
+        if cookie_count(rig).await == target {
+          return true;
+        }
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        std::thread::sleep(settle_round_slice());
+      }
+      cookie_count(rig).await == target
+    }
+
+    /// Sends one `SyncRoot` for `dir` and hands back the caller's half of the
+    /// reply — the cells below race a cover against a sync that has been admitted
+    /// and has not yet answered.
+    async fn begin_sync(
+      rig: &Rig,
+      scope: ScopeId,
+      dir: &str,
+      name: &str,
+    ) -> futures_channel::oneshot::Receiver<Result<PathBuf, crate::error::SyncRootError>> {
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::SyncRoot {
+          scope,
+          dir: PathBuf::from(dir),
+          admitted: Default::default(),
+          name: name.to_owned(),
+          ticket: ticket(),
+          reply,
+        })
+        .await
+        .unwrap();
+      on_reply
+    }
+
+    /// A shrink does not take the ground a PARKED sync is still going to write in.
+    ///
+    /// The admission proved `/r/a` covered and let the sync through; nothing binds
+    /// the obligation to that cover. A cover arriving while the write is still
+    /// parked on its settle fence would mark `/r/a` strictly outside and reclaim
+    /// its watch — and the marker, when the fence finally settles, would be born
+    /// in ground no watch reports. `sync_root` would answer with a path while the
+    /// caller's barrier could only time out.
+    ///
+    /// So the driver widens the requested cover by every in-flight sync's target
+    /// before the core reconciles, and the watch is the observable: `/r/a`'s
+    /// binding survives a cover that names only `/r/b`, and the sync still
+    /// completes at its own path once the fence settles.
+    ///
+    /// Revert witness: drop the widening from the `SetCover` handler and `/r/a`'s
+    /// watch is reclaimed by the shrink while the write is still parked.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_shrink_keeps_the_ground_a_parked_sync_will_write_in() {
+      let (rig, scope) = covered_rig(&[("/r/a", 11), ("/r/b", 12)]).await;
+      let ack = send_set_cover(&rig, scope, &["/r/a"]).await;
+      assert_eq!(
+        resolved(ack).await,
+        CoverOutcome::Applied,
+        "staging: the sync below is admitted onto ground the cover holds"
+      );
+      let armed = live_watch_at(&rig, "/r/a").expect("staging: /r/a holds a watch");
+
+      // Stall the grow so the sync's own settle fence never settles: its
+      // obligation stays PARKED — admitted, counted, and pre-physical.
+      let hold = rig.fs.hold_arms();
+      let _grow = send_set_cover(&rig, scope, &["/r/a", "/r/b"]).await;
+      let mut on_sync = begin_sync(&rig, scope, "/r/a", ".tributaries-sync-7-8-9").await;
+      assert!(
+        settle_cookies(&rig, 1).await,
+        "staging: the sync is admitted and its write is parked on the fence"
+      );
+      assert!(
+        futures_util::poll!(&mut on_sync).is_pending(),
+        "staging: the parked write has not answered"
+      );
+      assert!(
+        rig.fs.cookie_writes().is_empty(),
+        "staging: and nothing is on disk for it yet"
+      );
+
+      // The cover the caller now asks for names only /r/b. The widening is what
+      // keeps /r/a with it.
+      let _shrink = send_set_cover(&rig, scope, &["/r/b"]).await;
+      for _ in 0..interpreted_rounds(40) {
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+      }
+      assert_eq!(
+        live_watch_at(&rig, "/r/a"),
+        Some(armed),
+        "the parked sync's ground keeps the very watch it was admitted under \
+         (disarms: {:?})",
+        rig.fs.disarms()
+      );
+
+      hold.release();
+      let path = on_sync
+        .await
+        .expect("the driver replies")
+        .expect("the parked write lands once the coverage settles");
+      assert_eq!(path, PathBuf::from("/r/a/.tributaries-sync-7-8-9"));
+      assert_eq!(
+        live_watch_at(&rig, "/r/a"),
+        Some(armed),
+        "and it was the SAME binding throughout — nothing was reclaimed and re-armed"
+      );
+    }
+
+    /// The same promise for a write already IN THE POOL: the obligation has left
+    /// its fence and its `write_cookie` is running, so the marker may land at any
+    /// instant — into ground a shrink would otherwise have stopped watching.
+    ///
+    /// The in-pool phase is the sharper half of the two. A parked write can still
+    /// be reasoned about as "nothing exists yet"; here the create is in flight,
+    /// and the watch that has to carry it must survive a cover that lands
+    /// mid-syscall.
+    ///
+    /// Revert witness: drop the widening from the `SetCover` handler and the
+    /// shrink reclaims `/r/a`'s watch while the write is inside the pool.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_shrink_keeps_the_ground_an_in_pool_write_is_landing_in() {
+      let (rig, scope) = covered_rig(&[("/r/a", 11), ("/r/b", 12)]).await;
+      let ack = send_set_cover(&rig, scope, &["/r/a"]).await;
+      assert_eq!(
+        resolved(ack).await,
+        CoverOutcome::Applied,
+        "staging: the sync below is admitted onto ground the cover holds"
+      );
+      let armed = live_watch_at(&rig, "/r/a").expect("staging: /r/a holds a watch");
+
+      // The write reaches the pool (a prune-only cover settles at the next loop
+      // top, so the fence is not what holds it) and parks inside its syscall.
+      let writes = rig.fs.hold_cookie_writes();
+      let mut on_sync = begin_sync(&rig, scope, "/r/a", ".tributaries-sync-7-8-9").await;
+      assert!(
+        settle(|| writes.captured() >= 1).await,
+        "staging: the write left the fence and is inside the pool"
+      );
+      assert!(
+        futures_util::poll!(&mut on_sync).is_pending(),
+        "staging: and it has not answered"
+      );
+
+      let _shrink = send_set_cover(&rig, scope, &["/r/b"]).await;
+      for _ in 0..interpreted_rounds(40) {
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+      }
+      assert_eq!(
+        live_watch_at(&rig, "/r/a"),
+        Some(armed),
+        "the in-pool write's ground keeps the watch its marker has to be \
+         reported through (disarms: {:?})",
+        rig.fs.disarms()
+      );
+
+      writes.release();
+      let path = on_sync
+        .await
+        .expect("the driver replies")
+        .expect("the write lands");
+      assert_eq!(path, PathBuf::from("/r/a/.tributaries-sync-7-8-9"));
+      assert_eq!(
+        live_watch_at(&rig, "/r/a"),
+        Some(armed),
+        "and it was the SAME binding throughout"
+      );
+    }
+
+    /// And the promise outlives the WRITE: an obligation whose marker is already
+    /// on disk keeps its ground covered until that obligation RETIRES.
+    ///
+    /// `sync_root` answers the instant the file exists. Everything that gives the
+    /// file its meaning happens strictly afterwards — the barrier still has to
+    /// see the create come off the directory's own watch — and in between the
+    /// create is merely QUEUED. A reader takes its control traffic first, so a
+    /// shrink landing there disarms the watch, empties the attribution the queued
+    /// create would have been read against, and the create is discarded: a write
+    /// that reported success, with nothing left that can report it.
+    ///
+    /// Staged in exactly that order — write to completion, shrink, and only then
+    /// inject the create — because the order IS the defect. The marker's create
+    /// is read off the consumer's stream as a DELTA against a stream this cell
+    /// empties after the write.
+    ///
+    /// Revert witness: restore the `Parked | InPool` filter to `live_sync_dirs`
+    /// and the shrink reclaims `/r/a`'s watch, so the create is attributed to a
+    /// dead anchor and never reaches the consumer at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_shrink_keeps_the_ground_an_owned_marker_is_still_unread_in() {
+      const MARKER: &str = ".tributaries-sync-7-8-9";
+      let (rig, scope) = covered_rig(&[("/r/a", 11), ("/r/b", 12)]).await;
+      let ack = send_set_cover(&rig, scope, &["/r/a"]).await;
+      assert_eq!(
+        resolved(ack).await,
+        CoverOutcome::Applied,
+        "staging: the sync below is admitted onto ground the cover holds"
+      );
+      let armed = live_watch_at(&rig, "/r/a").expect("staging: /r/a holds a watch");
+
+      // The write runs to completion: the file exists, the obligation OWNS it,
+      // and nothing has reaped it — the phase the old filter excluded.
+      let path = sync_dir(&rig, scope, "/r/a", MARKER)
+        .await
+        .expect("the sync completes");
+      assert_eq!(path, PathBuf::from("/r/a/.tributaries-sync-7-8-9"));
+      assert_eq!(
+        cookie_count(&rig).await,
+        1,
+        "staging: the obligation owns its marker and has not retired"
+      );
+
+      // The baseline for the delta below: whatever the staging said is spent, so
+      // the create read after the shrink came from the injection and nowhere else.
+      while rig.events.try_recv().is_ok() {}
+
+      let _shrink = send_set_cover(&rig, scope, &["/r/b"]).await;
+      for _ in 0..interpreted_rounds(40) {
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+      }
+      assert_eq!(
+        live_watch_at(&rig, "/r/a"),
+        Some(armed),
+        "the owned marker's ground keeps the very watch its create has to be \
+         attributed to (disarms: {:?})",
+        rig.fs.disarms()
+      );
+
+      // The queued create, delivered now — off the watch the shrink had to keep.
+      rig.fs.send_inotify_batch(
+        "/r",
+        vec![attributed(&[armed], IN_CREATE, MARKER.as_bytes())],
+      );
+      let mut delivered = false;
+      for _ in 0..interpreted_rounds(200) {
+        while let Ok((_, _, change)) = rig.events.try_recv() {
+          if change.location() == &loc(&["a", MARKER]) {
+            delivered = true;
+          }
+        }
+        if delivered {
+          break;
+        }
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+      }
+      assert!(
+        delivered,
+        "and the marker's create reaches the consumer after the shrink — the \
+         barrier a successful write promised can still resolve"
+      );
+    }
+
+    /// The alias tree the two cells below shrink against: `/r/alias/sub` is the
+    /// caller's spelling and `/r/actual/sub` is where it lands, with `/r/other`
+    /// as the ground a shrink keeps.
+    ///
+    /// The fake holds no symlink targets, so the link is expressed the way it
+    /// expresses one everywhere else in this suite — a canonical mapping the
+    /// write resolves through ([`FakeFs::resolve_cookie_dir_to`]). Both spellings
+    /// are real directories here, which is what lets the cells read the two
+    /// coordinates apart: only one of them may keep its watch.
+    ///
+    /// `cfg`: its consumers' union — a landing is a reading only the arms that
+    /// hold DESCRIPTORS take, and the tuple arms have none.
+    #[cfg(all(not(miri), any(target_os = "linux", target_os = "macos")))]
+    async fn alias_rig() -> (Rig, ScopeId) {
+      let (rig, scope) = covered_rig(&[
+        ("/r/actual", 11),
+        ("/r/actual/sub", 13),
+        ("/r/alias", 14),
+        ("/r/alias/sub", 15),
+        ("/r/other", 12),
+      ])
+      .await;
+      rig
+        .fs
+        .resolve_cookie_dir_to("/r/alias/sub", "/r/actual/sub");
+      (rig, scope)
+    }
+
+    /// Sends one `SyncRoot` whose door PINNED a landing the caller's spelling
+    /// does not name, and hands back the caller's half of the reply.
+    ///
+    /// The readings are assembled exactly as the door assembles them — the root's
+    /// frame, the target's landing and frame, and the reserved directory's — so
+    /// the admission takes its real verdict over them
+    /// ([`admitted_ground_refusal`]) rather than over the empty sampling the
+    /// other cells here pass.
+    ///
+    /// `cfg`: its consumers' union, and [`AdmittedDir::framed_at`]'s.
+    #[cfg(all(not(miri), any(target_os = "linux", target_os = "macos")))]
+    async fn begin_landed_sync(
+      rig: &Rig,
+      scope: ScopeId,
+      dir: &str,
+      landing: &str,
+      name: &str,
+    ) -> futures_channel::oneshot::Receiver<Result<PathBuf, crate::error::SyncRootError>> {
+      let landing = PathBuf::from(landing);
+      let reserved = landing.join(cookie_dir_name());
+      // One device, one mount: the frame is not what these cells are about, and a
+      // mismatch here would refuse the sync before the cover was ever consulted.
+      let admitted = crate::driver::AdmittedDirs::held(
+        crate::driver::SyncPinAllowance::permit(),
+        crate::driver::AdmittedDir::framed_at(None, 1, Some(11)),
+        crate::driver::AdmittedDir::framed_at(Some(landing), 1, Some(11)),
+        crate::driver::AdmittedDir::framed_at(Some(reserved), 1, Some(11)),
+      );
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::SyncRoot {
+          scope,
+          dir: PathBuf::from(dir),
+          admitted,
+          name: name.to_owned(),
+          ticket: ticket(),
+          reply,
+        })
+        .await
+        .unwrap();
+      on_reply
+    }
+
+    /// The widening's coordinate is the LANDING the admission pinned, not the
+    /// spelling the caller passed — proved while the write is still PARKED.
+    ///
+    /// A spelling is not a location, and the admission already knows it: the
+    /// cover is asked of the pins precisely because an intermediate symlink
+    /// resolves somewhere else. The widening has to be asked of the same reading,
+    /// or a shrink retains the ground the caller wrote down while pruning the
+    /// ground the marker lands in — and the core's watches are addressed at the
+    /// second. `sync_root` would then answer `Ok` over a marker no watch of this
+    /// root can report.
+    ///
+    /// Both spellings are armed before the shrink, so the two coordinates are
+    /// told apart rather than merely both surviving: exactly one of them may keep
+    /// its watch, and it must be the landing.
+    ///
+    /// Revert witness: widen with `ob.dir` and the assertions invert — the
+    /// spelling keeps its watch and the landing loses it, over a sync that still
+    /// reports success.
+    #[cfg(all(not(miri), any(target_os = "linux", target_os = "macos")))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_shrink_keeps_the_landing_a_parked_alias_sync_will_write_in() {
+      let (rig, scope) = alias_rig().await;
+      let ack = send_set_cover(&rig, scope, &["/r/actual", "/r/alias"]).await;
+      assert_eq!(
+        resolved(ack).await,
+        CoverOutcome::Applied,
+        "staging: the sync below is admitted onto ground the cover holds, by both names"
+      );
+      let landed = live_watch_at(&rig, "/r/actual/sub").expect("staging: the landing is armed");
+      assert!(
+        live_watch_at(&rig, "/r/alias/sub").is_some(),
+        "staging: and so is the spelling, so the shrink can tell them apart"
+      );
+
+      // Stall the grow so the sync's own settle fence never settles: its
+      // obligation stays PARKED — admitted, counted, and pre-physical.
+      let hold = rig.fs.hold_arms();
+      let _grow = send_set_cover(&rig, scope, &["/r/actual", "/r/alias", "/r/other"]).await;
+      let mut on_sync = begin_landed_sync(
+        &rig,
+        scope,
+        "/r/alias/sub",
+        "/r/actual/sub",
+        ".tributaries-sync-2-4-6",
+      )
+      .await;
+      assert!(
+        settle_cookies(&rig, 1).await,
+        "staging: the sync is admitted and its write is parked on the fence"
+      );
+      assert!(
+        futures_util::poll!(&mut on_sync).is_pending(),
+        "staging: the parked write has not answered"
+      );
+
+      let _shrink = send_set_cover(&rig, scope, &["/r/other"]).await;
+      for _ in 0..interpreted_rounds(40) {
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+      }
+      assert_eq!(
+        live_watch_at(&rig, "/r/actual/sub"),
+        Some(landed),
+        "the LANDING keeps the very watch the marker's create has to come off \
+         (disarms: {:?})",
+        rig.fs.disarms()
+      );
+
+      hold.release();
+      let path = on_sync
+        .await
+        .expect("the driver replies")
+        .expect("the parked write lands once the coverage settles");
+      assert_eq!(
+        path,
+        PathBuf::from("/r/actual/sub/.tributaries-sync-2-4-6"),
+        "and the marker really did land at the landing"
+      );
+
+      // The grow's held re-arm was what kept the shrink's own prune from
+      // executing, so the two coordinates are told apart on the far side of the
+      // release — where the prune has run and has taken exactly one of them.
+      assert!(
+        settle(|| live_watch_at(&rig, "/r/alias/sub").is_none()).await,
+        "the shrink reclaims the ground the caller only SPELLED — the widening \
+         keeps nothing for it (disarms: {:?})",
+        rig.fs.disarms()
+      );
+      assert_eq!(
+        live_watch_at(&rig, "/r/actual/sub"),
+        Some(landed),
+        "while the landing keeps the SAME binding throughout: the coordinate is \
+         where the write resolves, not how it was written"
+      );
+    }
+
+    /// The same coordinate, one phase later: the write is already IN THE POOL, so
+    /// the marker may land at any instant — into ground the shrink would
+    /// otherwise have stopped watching, under a name the shrink never saw.
+    ///
+    /// Revert witness: widen with `ob.dir` and the shrink reclaims the landing's
+    /// watch while the create is inside the pool, keeping the spelling's instead.
+    #[cfg(all(not(miri), any(target_os = "linux", target_os = "macos")))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_shrink_keeps_the_landing_an_in_pool_alias_write_is_landing_in() {
+      let (rig, scope) = alias_rig().await;
+      let landed = live_watch_at(&rig, "/r/actual/sub").expect("staging: the landing is armed");
+      assert!(
+        live_watch_at(&rig, "/r/alias/sub").is_some(),
+        "staging: and so is the spelling, so the shrink can tell them apart"
+      );
+
+      // The write reaches the pool (a prune-only cover settles at the next loop
+      // top, so the fence is not what holds it) and parks inside its syscall.
+      let writes = rig.fs.hold_cookie_writes();
+      let mut on_sync = begin_landed_sync(
+        &rig,
+        scope,
+        "/r/alias/sub",
+        "/r/actual/sub",
+        ".tributaries-sync-3-6-9",
+      )
+      .await;
+      assert!(
+        settle(|| writes.captured() >= 1).await,
+        "staging: the write left the fence and is inside the pool"
+      );
+      assert!(
+        futures_util::poll!(&mut on_sync).is_pending(),
+        "staging: and it has not answered"
+      );
+
+      let _shrink = send_set_cover(&rig, scope, &["/r/other"]).await;
+      for _ in 0..interpreted_rounds(40) {
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+      }
+      assert_eq!(
+        live_watch_at(&rig, "/r/actual/sub"),
+        Some(landed),
+        "the in-pool write's LANDING keeps the watch its marker has to be \
+         reported through (disarms: {:?})",
+        rig.fs.disarms()
+      );
+      assert_eq!(
+        live_watch_at(&rig, "/r/alias/sub"),
+        None,
+        "and the caller's spelling does not"
+      );
+
+      writes.release();
+      let path = on_sync
+        .await
+        .expect("the driver replies")
+        .expect("the write lands");
+      assert_eq!(
+        path,
+        PathBuf::from("/r/actual/sub/.tributaries-sync-3-6-9"),
+        "and the marker really did land at the landing"
       );
     }
 
@@ -9057,7 +10176,7 @@ mod descending {
       use tributary_proto::RecordKind;
 
       fn live_core_at(root: &str) -> (DriverCore, ScopeId) {
-        let mut core = DriverCore::new(Duration::from_millis(100), Duration::ZERO);
+        let mut core = DriverCore::new(Duration::from_millis(100), Duration::ZERO, None);
         let scope = core
           .on_watch(
             PathBuf::from(root),
@@ -9543,7 +10662,7 @@ mod descending {
       use tributary_proto::RecordKind;
 
       fn unit_core_at(root: &str) -> (DriverCore, ScopeId, tributary_proto::WatchId) {
-        let mut core = DriverCore::new(Duration::from_millis(100), Duration::ZERO);
+        let mut core = DriverCore::new(Duration::from_millis(100), Duration::ZERO, None);
         let scope = core
           .on_watch(
             PathBuf::from(root),
@@ -9754,7 +10873,7 @@ mod descending {
       }
       let at = || Instant::from_origin(Duration::from_millis(5));
 
-      let mut core = DriverCore::new(Duration::from_millis(100), Duration::ZERO);
+      let mut core = DriverCore::new(Duration::from_millis(100), Duration::ZERO, None);
       // The scope that dies in the drain: root plus one armed child, so a lost
       // child binding mints a real `RemoveWatch` ahead of the root death.
       let (dead, dead_root) = spawn_root(&mut core, "/r", 1);
@@ -9843,7 +10962,7 @@ mod descending {
       let mut deferred_grants: BTreeMap<ScopeId, DeferredGrant> = BTreeMap::new();
       let mut pending_control: crate::driver::PendingControl = BTreeMap::new();
       let mut control_inflight: crate::driver::ControlInflight = BTreeMap::new();
-      let mut probes_in_flight: BTreeSet<ScopeId> = BTreeSet::new();
+      let mut probes = crate::driver::LivenessProbes::default();
       let registry = NullRegistry;
       let now = || Instant::from_origin(Duration::from_millis(5));
       let reaper = crate::driver::TeardownReaper::new().expect("the reaper secures its thread");
@@ -9865,7 +10984,7 @@ mod descending {
         &mut deferred_grants,
         &mut pending_control,
         &mut control_inflight,
-        &mut probes_in_flight,
+        &mut probes,
         &mut cookies,
         &registry,
         &now,
@@ -9914,7 +11033,7 @@ mod descending {
       assert_eq!(rx.len(), 3, "the snapshot reads the queued prefix length");
 
       // (b) The decrement: one prefix message consumed per iteration, saturating.
-      let mut core = DriverCore::new(Duration::from_millis(100), Duration::ZERO);
+      let mut core = DriverCore::new(Duration::from_millis(100), Duration::ZERO, None);
       let reserved = core.reserve_watch_id();
       let mut phase = crate::driver::SameFdPhase::CatchUp {
         reserved,
@@ -12018,7 +13137,7 @@ mod sync_cookie {
   /// admissions park on — these cells build a ledger state by hand, with no driver
   /// loop to settle anything.
   fn fence_source() -> DriverCore {
-    DriverCore::new(Duration::from_millis(1), Duration::from_secs(30))
+    DriverCore::new(Duration::from_millis(1), Duration::from_secs(30), None)
   }
 
   /// A registry over a ledger nothing else holds — the cells that drive the
@@ -12062,7 +13181,14 @@ mod sync_cookie {
     ticket: u64,
   ) -> CookieGuard {
     let fence = core.open_cover_fence(scope);
-    let id = reg.admit_parked(scope, Arc::from(name), ticket, fence);
+    let id = reg.admit_parked(
+      scope,
+      PathBuf::from("/r"),
+      None,
+      Arc::from(name),
+      ticket,
+      fence,
+    );
     reg
       .dispatch_guard(scope, id)
       .expect("a freshly admitted obligation dispatches")
@@ -12802,7 +13928,14 @@ mod sync_cookie {
     let fence = core.open_cover_fence(scope);
 
     let name: Arc<str> = Arc::from(".tributaries-sync-shared-leaf");
-    let id = reg.admit_parked(scope, Arc::clone(&name), ticket().seq(), fence);
+    let id = reg.admit_parked(
+      scope,
+      PathBuf::from("/r"),
+      None,
+      Arc::clone(&name),
+      ticket().seq(),
+      fence,
+    );
     lock_ledger(&reg.ledger).retire(id, Reaped::NeverCreated);
 
     let released = reg.take_released_markers();
@@ -15966,6 +17099,7 @@ mod sync_cookie {
         m,
         Obligation {
           scope,
+          cover_dir: PathBuf::from("/r"),
           name: Arc::from(name),
           ticket: m.0,
           id: m,
@@ -16038,6 +17172,7 @@ mod sync_cookie {
         m,
         Obligation {
           scope,
+          cover_dir: PathBuf::from("/r"),
           name: Arc::from("n"),
           ticket: m.0,
           id: m,
@@ -16110,6 +17245,7 @@ mod sync_cookie {
         f,
         Obligation {
           scope,
+          cover_dir: PathBuf::from("/r"),
           name: Arc::from("n2"),
           ticket: f.0,
           id: f,
@@ -16540,6 +17676,7 @@ mod sync_cookie {
         id,
         Obligation {
           scope,
+          cover_dir: PathBuf::from("/r"),
           name: Arc::from(name),
           ticket: id.0,
           id,
@@ -17363,7 +18500,14 @@ mod sync_cookie {
       let name = ".tributaries-sync-phase-parked";
       let t = ticket();
       let fence = core.open_cover_fence(scope);
-      let id = reg.admit_parked(scope, Arc::from(name), t.seq(), fence);
+      let id = reg.admit_parked(
+        scope,
+        PathBuf::from("/r"),
+        None,
+        Arc::from(name),
+        t.seq(),
+        fence,
+      );
       cleanup.request_cancel(t);
       assert!(
         reg.dispatch_guard(scope, id).is_none(),
@@ -20213,7 +21357,7 @@ mod sync_cookie {
         )
       };
       let verdict = |admitted: &crate::driver::AdmittedDirs| {
-        crate::driver::admitted_ground_refusal(&root, admitted, &quiet, &[])
+        crate::driver::admitted_ground_refusal(&root, admitted, &quiet, &[], &|_| true)
       };
 
       // The bind exactly: same device, different mount, contained landing.
@@ -20266,11 +21410,120 @@ mod sync_cookie {
             &judged((40, Some(12)), (40, Some(12))),
             &pruned,
             &[],
+            &|_| true,
           ),
           Some(crate::SyncRootError::DirCrossesMount { .. })
         ),
         "the mount verdict is taken first, so a bind is never reported as a seat \
          the caller could retract"
+      );
+    }
+
+    /// The APPLIED COVER is asked of the landings, and the reserved directory is
+    /// asked of its PARENT.
+    ///
+    /// The admission's own cover test runs on the caller's spelling, and a
+    /// spelling is not a location: an intermediate symlink under retained ground
+    /// resolves into the subtree a cut took, so the landing is the only reading
+    /// that sees it. Refusing there is what keeps `sync_root` from answering `Ok`
+    /// over a marker no watch can report.
+    ///
+    /// The reserved directory's rule is the one this cell is really for, because
+    /// getting it wrong breaks the exemption the cut itself keeps: no cover can
+    /// name the watcher's reserved leaf, so a cover naming a FILE marks that leaf
+    /// strictly outside while `on_set_cover` deliberately keeps its watch. Judging
+    /// the leaf directly would refuse every second sync of such a directory — the
+    /// exact case the exemption exists for. Judging its PARENT refuses only what
+    /// must be refused: a reserved name that is itself a link out of covered
+    /// ground.
+    ///
+    /// Asked of the rule rather than of a tree because the rule is pure — the
+    /// landings are values the door already read, and the cover is a lexical
+    /// statement about paths. The kernel cell in `watcher::linux_kernel_tests`
+    /// stages the symlink for real.
+    ///
+    /// Revert witnesses, one per arm: drop the landing check and the first arm
+    /// answers `None`; judge the reserved LEAF instead of its parent and the last
+    /// arm refuses a sync the cut deliberately kept observable.
+    #[test]
+    fn the_applied_cover_is_asked_of_the_landings_and_of_the_reserved_parent() {
+      // Names only: nothing here is resolved and nothing needs to exist.
+      let root = PathBuf::from("/watched");
+      let quiet = tributary_proto::glob::Globs::default();
+      let frame = 40;
+      let judged = |target: &Path, cookies: &Path| {
+        crate::driver::AdmittedDirs::held(
+          crate::driver::SyncPinAllowance::permit(),
+          crate::driver::AdmittedDir::framed_at(None, frame, Some(11)),
+          crate::driver::AdmittedDir::framed_at(Some(target.to_path_buf()), frame, Some(11)),
+          crate::driver::AdmittedDir::framed_at(Some(cookies.to_path_buf()), frame, Some(11)),
+        )
+      };
+      // The applied cover, as the core answers it: a path is covered iff it is an
+      // ancestor or a descendant of some retained prefix.
+      let covering = |retained: Vec<PathBuf>| {
+        move |path: &Path| {
+          retained
+            .iter()
+            .any(|kept| path.starts_with(kept) || kept.starts_with(path))
+        }
+      };
+      let reserved_leaf = cookie_dir_name();
+
+      // A cover of `<root>/keep`, and a target that RESOLVED into the subtree the
+      // cut took. The caller's spelling never appears here — the verdict is the
+      // landing's.
+      let landing = root.join("drop").join("sub");
+      let cover = covering(vec![root.join("keep")]);
+      match crate::driver::admitted_ground_refusal(
+        &root,
+        &judged(&landing, &landing.join(&reserved_leaf)),
+        &quiet,
+        &[],
+        &cover,
+      ) {
+        Some(crate::SyncRootError::DirUncovered { dir }) => assert_eq!(
+          dir, landing,
+          "the refusal names the landing, which is where the caller's directory is"
+        ),
+        other => panic!("a landing the cut took is uncovered ground: {other:?}"),
+      }
+
+      // The target is covered and only the RESERVED name is a link out: the
+      // parent rule is what catches it, and the reply names the reserved
+      // directory rather than the directory holding it.
+      let kept = root.join("keep");
+      let strayed = root.join("drop").join(&reserved_leaf);
+      match crate::driver::admitted_ground_refusal(
+        &root,
+        &judged(&kept, &strayed),
+        &quiet,
+        &[],
+        &cover,
+      ) {
+        Some(crate::SyncRootError::DirUncovered { dir }) => assert_eq!(
+          dir, strayed,
+          "each pinned object is judged where it stood, not just the shallowest"
+        ),
+        other => panic!("a reserved directory outside the cover is uncovered: {other:?}"),
+      }
+
+      // THE EXEMPTION, which this rule must not break: the cover names a FILE, so
+      // the reserved directory beside it is strictly outside every retained prefix
+      // — and the cut keeps its watch anyway. Judging the leaf would refuse this
+      // sync; judging its parent admits it.
+      let file_cover = covering(vec![root.join("keep").join("f.txt")]);
+      assert!(
+        crate::driver::admitted_ground_refusal(
+          &root,
+          &judged(&kept, &kept.join(&reserved_leaf)),
+          &quiet,
+          &[],
+          &file_cover,
+        )
+        .is_none(),
+        "a covered directory's own reserved directory is admitted, however the \
+         cover spelled the coverage"
       );
     }
 

@@ -318,6 +318,35 @@ pub enum SyncRootError {
     /// The exclusion covering it, as supplied in the options.
     exclusion: PathBuf,
   },
+  /// The set-cover narrowed the root's coverage past this directory; a marker
+  /// written there could never be observed.
+  ///
+  /// A [`set_cover`](crate::Watcher::set_cover) on a descending backend drops the
+  /// per-directory watches strictly outside the retained set — that is what it is
+  /// for. Ground outside the applied cover therefore has no watch to report a
+  /// create, and the barrier would wait on an event no source can produce. The
+  /// same shape as [`DirExcluded`](Self::DirExcluded) and
+  /// [`DirPruned`](Self::DirPruned) — a configuration word the caller said, this
+  /// one through the cover rather than the options — and refused for the same
+  /// reason, before anything is created.
+  ///
+  /// The verdict is LEXICAL, taken against the cover the core last applied: the
+  /// directory must be an ancestor or a descendant of a retained prefix. It cannot
+  /// arise on a kernel-recursive backend (a whole-subtree stream never narrows) nor
+  /// on a scope no cover ever narrowed. It is refused BEFORE the sync is admitted,
+  /// so the admission's sequence is untouched — widen the cover to include the
+  /// directory (or sync a covered one) and retry with the same
+  /// [`SyncTicket`](crate::SyncTicket).
+  ///
+  /// The watcher's own reserved cookie directory inside a COVERED directory is not
+  /// what this refuses: a cover cannot know that directory's name, so the core
+  /// keeps its watch armed across the cut rather than obliging every caller to
+  /// retain it.
+  #[error("cookie directory {} is outside the root's applied cover", dir.display())]
+  DirUncovered {
+    /// The requested cookie directory.
+    dir: PathBuf,
+  },
   /// The cookie directory lies inside the root but under a subtree the root's
   /// own [`prune`](crate::RootOptions::prune) seat covers — the per-root,
   /// glob-shaped twin of [`DirExcluded`](Self::DirExcluded), refused for exactly

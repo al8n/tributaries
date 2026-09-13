@@ -48,9 +48,9 @@ use tributary_proto::{
 
 use crate::{
   core::{
-    CoverNoop, CoverReconcile, CoverSettle, Delivery, DriverCore, Effect, ExpectedObject, FenceId,
-    MountRefresh, ProbeId, ProbeOutcome, RawDirEntry, RawEnumerate, RootLiveness, SettlePass,
-    WidenCommit, WidenTaint,
+    CoverNoop, CoverReconcile, CoverSettle, DeclineReason, Delivery, DriverCore, Effect,
+    ExpectedObject, FenceId, MountRefresh, ProbeId, ProbeOutcome, RawDirEntry, RawEnumerate,
+    RootLiveness, SettlePass, WidenCommit, WidenTaint,
   },
   error::WatchRootError,
   os::{
@@ -2880,6 +2880,24 @@ fn cookie_dir_name() -> String {
   cookie_dir_name_for(euid)
 }
 
+/// The ONE directory leaf this process reserves, handed to the core at
+/// construction so its set-cover shrink can exempt exactly that name
+/// ([`DriverCore::reserved_cookie_dir`](crate::core::DriverCore)).
+///
+/// `None` on the platforms that reserve no stable leaf: Windows mints a fresh
+/// directory per obligation and never looks one up, so there is no single name to
+/// exempt — and answering with the bare stem would hand the core the legacy name
+/// the classifier keeps suppressed.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn reserved_cookie_dir_leaf() -> Option<Arc<str>> {
+  Some(Arc::from(cookie_dir_name()))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn reserved_cookie_dir_leaf() -> Option<Arc<str>> {
+  None
+}
+
 /// How many candidate names one [`CookieDir::open_or_create`] will mint before
 /// it gives up.
 ///
@@ -3669,13 +3687,39 @@ enum Reaped {
   AbnormalResidual,
 }
 
-/// One cookie obligation's ledger record: the scope it belongs to, its rendered
-/// name (kept so retiring the record can also drop its `by_name` index without
-/// recomputation), the ticket sequence keying it (kept for the same reason on the
-/// `by_ticket` index), its immutable incarnation identity, the path it landed at,
-/// the reap mark, its LRU re-arm key, and its lifecycle phase.
+/// One cookie obligation's ledger record: the scope it belongs to, the directory
+/// its sync was admitted for, its rendered name (kept so retiring the record can
+/// also drop its `by_name` index without recomputation), the ticket sequence
+/// keying it (kept for the same reason on the `by_ticket` index), its immutable
+/// incarnation identity, the path it landed at, the reap mark, its LRU re-arm
+/// key, and its lifecycle phase.
 struct Obligation {
   scope: ScopeId,
+  /// WHERE this obligation's marker actually lands: the admission's PINNED
+  /// target landing when the door read one, and the caller's lexical directory
+  /// only when it could not. Held for as long as the record lives so a set-cover
+  /// can widen its retained cover by it ([`CookieRegistry::live_sync_dirs`]), in
+  /// EVERY phase and not merely while the write is still in flight. Nothing else
+  /// reads it: the write addresses its own pinned descriptors, and every removal
+  /// goes through the residue's landing.
+  ///
+  /// The landing rather than the spelling, because the two differ exactly where
+  /// it matters. A sync of `/r/alias/sub` under an intermediate `alias →
+  /// /r/actual` writes at `/r/actual/sub`; that is where the core's watches are
+  /// addressed and where the marker's create comes off, while the spelling names
+  /// ground no watch of this marker stands on. Widening by the spelling would
+  /// retain the wrong subtree and prune the right one — the very ground the
+  /// admission's own landing test ([`admitted_ground_refusal`]) had just proved
+  /// this sync was inside of.
+  ///
+  /// The fallback is not a weakening: it applies on the arms that hold TUPLES
+  /// rather than descriptors — Windows, Miri, the unsupported platforms — where
+  /// the door reads no landing at all and the write is path-addressed anyway, so
+  /// the spelling IS the coordinate.
+  ///
+  /// One path per record, so the ledger's caps bound it exactly as they bound the
+  /// name beside it.
+  cover_dir: PathBuf,
   /// The rendered cookie LEAF, shared as an `Arc<str>` with the `by_name` index,
   /// the core's active-marker set and the release queue rather than copied into
   /// each — one validated, length-bounded allocation per obligation
@@ -4259,13 +4303,22 @@ impl<F: FsOps> CookieRegistry<F> {
   ///   with it and is unique by construction.
   ///
   /// `ticket` is the caller's [`SyncTicket`] sequence — the `by_ticket` key an
-  /// incarnation-precise cancel resolves through.
+  /// incarnation-precise cancel resolves through. `dir` is the directory the
+  /// caller SPELLED and `landing` is where the door's pin found it; the record
+  /// keeps the second in preference to the first, because a later set-cover has
+  /// to keep the ground this obligation depends on for as long as the record
+  /// lives, and that ground is where the marker lands rather than how the caller
+  /// wrote it ([`Obligation::cover_dir`],
+  /// [`live_sync_dirs`](Self::live_sync_dirs)). `None` is the platforms with no
+  /// landing to read, where the spelling is the coordinate.
   ///
   /// Called only AFTER every admission refusal has passed: a refused sync must
   /// create nothing at all.
   fn admit_parked(
     &mut self,
     scope: ScopeId,
+    dir: PathBuf,
+    landing: Option<&Path>,
     name: Arc<str>,
     ticket: u64,
     fence: FenceId,
@@ -4277,6 +4330,7 @@ impl<F: FsOps> CookieRegistry<F> {
       id,
       Obligation {
         scope,
+        cover_dir: landing.map_or(dir, Path::to_path_buf),
         name: Arc::clone(&name),
         ticket,
         id,
@@ -4413,6 +4467,46 @@ impl<F: FsOps> CookieRegistry<F> {
       .obligations
       .values()
       .any(|ob| ob.scope == scope && matches!(ob.phase, Phase::Parked { .. } | Phase::InPool))
+  }
+
+  /// The ground `scope`'s LIVE syncs depend on — every obligation of that scope,
+  /// in every phase, from its admission to its retirement, each named by the
+  /// coordinate its marker actually lands at ([`Obligation::cover_dir`]) rather
+  /// than by the spelling its caller used.
+  ///
+  /// A set-cover widens its retained cover by these before the core reconciles
+  /// ([`DriverCore::on_set_cover`]). The admission proved the ground covered when
+  /// it let the sync through, and nothing binds the obligation to the cover it
+  /// was admitted under — so a shrink arriving inside that window would drop the
+  /// very watches the marker's create has to come off, and the caller's barrier
+  /// could only time out over a write that succeeded.
+  ///
+  /// The window does NOT close at the claim, and that is the whole of why the
+  /// filter is the record's EXISTENCE rather than a phase. `sync_root` answers
+  /// the instant the file exists, while everything that gives the marker its
+  /// meaning happens strictly after: the barrier still has to OBSERVE the create
+  /// through that directory's watch, the cleanup still has to prove its unlink
+  /// against the same ground, and a failed unlink still has to be retried there.
+  /// A cover narrowing past a claimed obligation disarms the watch while the
+  /// create is merely QUEUED — a reader takes its control traffic first, and the
+  /// disarm empties the attribution the queued create would have been read
+  /// against — so the create is discarded and the successful write becomes
+  /// unobservable. The residue phases are kept for the same reason: a record
+  /// whose unlink is still failing keeps its directory armed, which is what makes
+  /// its retry observable.
+  ///
+  /// A record exists exactly until its typed terminal ([`retire`]), so "not
+  /// retired" is read off the map itself. One O(ledger) walk, which the global
+  /// cap bounds — as it bounds the number of directories this can return.
+  ///
+  /// [`retire`]: LedgerInner::retire
+  fn live_sync_dirs(&self, scope: ScopeId) -> Vec<PathBuf> {
+    lock_ledger(&self.ledger)
+      .obligations
+      .values()
+      .filter(|ob| ob.scope == scope)
+      .map(|ob| ob.cover_dir.clone())
+      .collect()
   }
 
   /// Whether a LIVE obligation already holds this rendered cookie name — the
@@ -5478,6 +5572,14 @@ pub(crate) enum Command {
   /// prove a mark never survives the obligation it names (the boundedness rule).
   #[cfg(all(test, feature = "tokio"))]
   DebugCookieReapMarks {
+    reply: futures_channel::oneshot::Sender<usize>,
+  },
+  /// A test-only count of the root-liveness probes dispatched and not yet
+  /// answered, so a suite can prove a thread stays COUNTED across the teardown of
+  /// the scope it was dispatched for — the accounting a hung mount would
+  /// otherwise erase.
+  #[cfg(all(test, feature = "tokio"))]
+  DebugProbesOutstanding {
     reply: futures_channel::oneshot::Sender<usize>,
   },
   /// A test-only count of `scope`'s PARKED removal records (`RemoveFailed`
@@ -7531,8 +7633,9 @@ impl SyncPinAllowance {
   /// Shared like the door's own, so a cell hands it to
   /// [`AdmittedDirs::held`] exactly as the door does.
   ///
-  /// Its cfg is exactly the union of the modules that call it (the real-filesystem
-  /// directory-only, identity and Windows non-adoption cells).
+  /// Its cfg is exactly the union of the modules that call it (the cover-fence
+  /// cells, and the real-filesystem directory-only, identity and Windows
+  /// non-adoption cells).
   #[cfg(all(
     test,
     feature = "tokio",
@@ -8677,11 +8780,22 @@ fn cookie_ground_refusal(
 /// landing is where the caller's directory actually is — the same choice the
 /// write's own refusals make, and the only one a caller can act on when an
 /// intermediate symlink is what made the two differ.
+///
+/// # The applied cover is the fourth fact, and it is asked HERE
+///
+/// The admission's own cover test runs on the caller's spelling, which is not a
+/// location: an intermediate symlink under retained ground resolving into a
+/// subtree the cut stopped watching passes it, and the write then follows the
+/// link. So the cover is asked again, of the pins — `covers` is the applied
+/// cover's membership test ([`DriverCore::covers`]), passed in because it is the
+/// core's fact and this runs beside the core rather than inside it, and it is as
+/// lexical as everything else here.
 fn admitted_ground_refusal(
   root: &Path,
   admitted: &AdmittedDirs,
   prune: &Globs,
   exclusions: &[PathBuf],
+  covers: &dyn Fn(&Path) -> bool,
 ) -> Option<crate::error::SyncRootError> {
   #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
   if let Some(reference) = admitted.root_frame() {
@@ -8699,6 +8813,33 @@ fn admitted_ground_refusal(
         });
       }
     }
+  }
+  // The cover, taken after the frame and before the floor: a landing outside the
+  // applied cover holds no watch, so the marker's create reaches no source and the
+  // caller's barrier could only time out — the same "no source can report this"
+  // fact the exclusion and prune words state, arriving from the third seat.
+  if let Some(landing) = admitted.target_landing()
+    && !covers(landing)
+  {
+    return Some(crate::error::SyncRootError::DirUncovered {
+      dir: landing.to_path_buf(),
+    });
+  }
+  // The reserved directory is asked of its PARENT, which is the rule the cut
+  // itself keeps: no cover can name the watcher's own reserved leaf, so the
+  // set-cover keeps that leaf's watch armed exactly while the directory HOLDING
+  // it stays covered. Asking the leaf directly would instead refuse every second
+  // sync of a directory a cover narrowed to one file — the very case that
+  // exemption exists for, since a cover naming a file marks the reserved sibling
+  // strictly outside. Asking the parent refuses what it must: a reserved name
+  // that is itself a link out of covered ground, whose marker would land where
+  // nothing is armed.
+  if let Some(landing) = admitted.cookies_landing()
+    && landing.parent().is_some_and(|parent| !covers(parent))
+  {
+    return Some(crate::error::SyncRootError::DirUncovered {
+      dir: landing.to_path_buf(),
+    });
   }
   // The target first and the reserved directory second, in the order the write
   // descends and asks: the shallower ground is the one a caller moves off.
@@ -10412,6 +10553,134 @@ enum ControlBatchEnd {
   Answered,
 }
 
+/// The most root-liveness probes one watcher may have OUTSTANDING at once.
+///
+/// A probe is an OS thread of its own (see the [`Effect::RefreshMounts`] dispatch
+/// for why it cannot ride the blocking pool), and a `stat` that has entered a
+/// wedged mount has no cancellation: nothing the driver can do reclaims that
+/// thread before the filesystem answers. The count of threads a hung tree can
+/// accumulate is therefore whatever the driver is willing to spend, and this is
+/// the number: sixty-four parked probes, each a thread and its stack, is the cost
+/// accepted before liveness OBSERVATION is allowed to degrade rather than the
+/// process.
+///
+/// At the budget a tick dispatches nothing and tells the core so
+/// ([`DriverCore::on_refresh_declined`] with
+/// [`BudgetFull`](crate::core::DeclineReason::BudgetFull)), which drops the
+/// scope's pending mark so the next interval re-arms.
+///
+/// What a SATURATED budget means, said in one place: the scope it turned away is
+/// being watched for death by nothing at all — not by a probe of its own, and not
+/// by an in-tree notice a stalled write's descriptor can postpone without bound.
+/// So it degrades to a LOCATED `RESCAN`, not to silence: the turned-away scope
+/// goes through the core's loss funnel once per budget episode and its subscriber
+/// is told its coverage is unproven, which it answers by re-enumerating. The
+/// retry deadline is kept, so the scope recovers on its own the moment a slot
+/// frees. Nothing is logged and nothing is refused — a hung root is a hung mount,
+/// and a watcher whose roots are all wedged has a filesystem problem the watcher
+/// cannot out-thread; what it must never do is keep reporting those roots alive on
+/// no evidence.
+pub(crate) const MAX_LIVENESS_PROBES: usize = 64;
+
+/// The root-liveness probes this driver has dispatched and not yet heard back
+/// from — the owner loop's accounting for threads it cannot reclaim.
+///
+/// Probes are GENERATION-tagged per scope rather than keyed by scope alone.
+/// Keying by scope alone made the accounting and the coverage disagree in both
+/// directions: a teardown that dropped the entry left the thread alive and
+/// uncounted (watch/tick/unwatch churn against a wedged root accumulated one
+/// thread per retired scope with no bound at all), and a replacement root
+/// inherited the retiring root's outstanding probe, so it got no probe of its own
+/// until a call that may never return came back. A generation makes the two
+/// independent: the replacement dispatches immediately under a fresh tag, and the
+/// old root's late answer arrives under a tag no longer current and is dropped
+/// before it can be read as the new root's verdict.
+///
+/// Entries leave ONLY by receipt, because that is the only moment a thread is
+/// known to be gone. Teardown and replace bump the generation; neither removes
+/// anything.
+#[derive(Debug, Default)]
+struct LivenessProbes {
+  /// Each scope's CURRENT probe tag. Present while the scope is live or holds an
+  /// outstanding probe, and dropped once neither is true, so watch/unwatch churn
+  /// cannot grow it.
+  generation: BTreeMap<ScopeId, u64>,
+  /// The `(scope, generation)` pairs dispatched and unanswered — one entry per
+  /// live probe thread (a pool fallback included), which is also what bounds the
+  /// map above.
+  in_flight: BTreeSet<(ScopeId, u64)>,
+}
+
+impl LivenessProbes {
+  /// Live probe threads: dispatched and not yet answered. Every entry is a thread
+  /// (or a pool-fallback job) still inside `refresh_mounts`, so this IS the count
+  /// the budget bounds — there is no second gauge to drift from it.
+  fn outstanding(&self) -> usize {
+    self.in_flight.len()
+  }
+
+  /// Whether any probe of `scope` is still outstanding.
+  fn any_in_flight(&self, scope: ScopeId) -> bool {
+    self
+      .in_flight
+      .range((scope, 0)..=(scope, u64::MAX))
+      .next()
+      .is_some()
+  }
+
+  /// Drops `scope`'s tag once nothing of its is outstanding: with no in-flight
+  /// entry left there is no answer a re-used tag could collide with, and the
+  /// entry would otherwise outlive every retired scope.
+  fn forget_settled(&mut self, scope: ScopeId) {
+    if !self.any_in_flight(scope) {
+      self.generation.remove(&scope);
+    }
+  }
+
+  /// Retires `scope`'s current tag — a root REPLACE committed, or the scope tore
+  /// down. Whatever is in flight stays counted (the thread is alive), but its
+  /// answer is no longer current, so it will be dropped rather than applied to a
+  /// world it does not describe.
+  fn retire_generation(&mut self, scope: ScopeId) {
+    let tag = self.generation.entry(scope).or_default();
+    *tag = tag.wrapping_add(1);
+    self.forget_settled(scope);
+  }
+
+  /// Claims a slot for one probe of `scope`, returning the tag to dispatch it
+  /// under — or the REASON it was refused, which the core acts on differently
+  /// ([`DeclineReason`]): the scope already has a probe outstanding under this tag
+  /// (a hung root — a second thread on it proves nothing), or the watcher is at
+  /// [`MAX_LIVENESS_PROBES`] and nothing at all is going to prove this root.
+  ///
+  /// The per-scope test comes FIRST and is reported as itself even when the budget
+  /// is also full: a scope with its own probe still running has a proof in flight,
+  /// whatever the rest of the watcher is doing, so it is not the scope the budget
+  /// left unwatched.
+  fn claim(&mut self, scope: ScopeId) -> Result<u64, DeclineReason> {
+    let tag = *self.generation.entry(scope).or_default();
+    if self.in_flight.contains(&(scope, tag)) {
+      return Err(DeclineReason::ScopeBusy);
+    }
+    if self.outstanding() >= MAX_LIVENESS_PROBES {
+      return Err(DeclineReason::BudgetFull);
+    }
+    self.in_flight.insert((scope, tag));
+    Ok(tag)
+  }
+
+  /// Books one probe's answer: its thread has exited, so the slot comes back
+  /// whatever the tag said. Reports whether the answer is CURRENT — `false` for a
+  /// probe addressed to a root this scope has since replaced or to a scope that
+  /// has torn down, which the caller drops rather than feeding to the core.
+  fn retire(&mut self, scope: ScopeId, generation: u64) -> bool {
+    self.in_flight.remove(&(scope, generation));
+    let current = self.generation.get(&scope) == Some(&generation);
+    self.forget_settled(scope);
+    current
+  }
+}
+
 /// One blocking operation's result, shipped back to the select loop.
 enum OpResult<H> {
   /// One spawn finished. BOTH outcomes can carry a live native stream: a
@@ -10429,6 +10698,10 @@ enum OpResult<H> {
   },
   MountsRefreshed {
     scope: ScopeId,
+    /// The probe's tag at dispatch. A replace commit and a teardown both retire
+    /// the scope's tag, so an answer that no longer carries the current one is
+    /// about a world this scope has left and is dropped ([`LivenessProbes`]).
+    generation: u64,
     refresh: MountRefresh,
   },
   TornDown {
@@ -10679,6 +10952,7 @@ pub(crate) async fn run<R, F>(
   let mut core = DriverCore::new(
     config.effective_move_window(),
     config.root_liveness_interval,
+    reserved_cookie_dir_leaf(),
   )
   .with_exclusions(config.exclusions.clone());
   let origin = R::now();
@@ -10795,14 +11069,14 @@ pub(crate) async fn run<R, F>(
   let mut cut_token_seq: u64 = 0;
   let mut pending_control: PendingControl = BTreeMap::new();
   let mut control_inflight: ControlInflight = BTreeMap::new();
-  // The scopes with a ROOT-LIVENESS PROBE outstanding. A probe runs on a thread
-  // of its own rather than on the blocking pool — see the `RefreshMounts`
-  // dispatch for why the pool is the one executor it must not share — and this
-  // set is what keeps a wall-clock tick from minting a second thread against a
-  // root the first has not come back from. Entries are removed when the probe's
-  // `MountsRefreshed` lands and at scope teardown, so the set is bounded by live
-  // scopes.
-  let mut probes_in_flight: BTreeSet<ScopeId> = BTreeSet::new();
+  // The ROOT-LIVENESS PROBES outstanding, generation-tagged per scope. A probe
+  // runs on a thread of its own rather than on the blocking pool — see the
+  // `RefreshMounts` dispatch for why the pool is the one executor it must not
+  // share — and this is what keeps a wall-clock tick from minting a second thread
+  // against a root the first has not come back from, what bounds the threads a
+  // wedged tree can accumulate, and what keeps a replacement root's probes
+  // independent of the retiring root's ([`LivenessProbes`]).
+  let mut probes = LivenessProbes::default();
   // Awaited unwatch replies parked until the scope is fully quiescent, each
   // paired with the verdict to send then: `true` for a live scope this
   // unwatch tears down, `false` (UnknownRoot) for a scope whose root already
@@ -10867,7 +11141,7 @@ pub(crate) async fn run<R, F>(
       &mut deferred_grants,
       &mut pending_control,
       &mut control_inflight,
-      &mut probes_in_flight,
+      &mut probes,
       &mut cookies,
       &registry,
       &now,
@@ -10894,6 +11168,7 @@ pub(crate) async fn run<R, F>(
       &mut parked_cookies,
       &mut cookies,
       &registry,
+      &mut probes,
       &now,
     ) {
       // A commit just enqueued its own post-splice effects (the widened
@@ -10921,7 +11196,7 @@ pub(crate) async fn run<R, F>(
         &mut deferred_grants,
         &mut pending_control,
         &mut control_inflight,
-        &mut probes_in_flight,
+        &mut probes,
         &mut cookies,
         &registry,
         &now,
@@ -11429,6 +11704,7 @@ pub(crate) async fn run<R, F>(
                   &mut source_taps,
                   &registry,
                   &cookies,
+                  &mut probes,
                   scope,
                   spawned,
                   replace.reservation.path(),
@@ -11661,12 +11937,20 @@ pub(crate) async fn run<R, F>(
             }
           }},
           OpResult::Probed { probe, outcome } => core.on_probe_result(probe, outcome, now()),
-          OpResult::MountsRefreshed { scope, refresh } => {
-            // The probe's thread is done with this scope: its seat comes back
-            // here, in lockstep with the core clearing its own pending mark, so
-            // the next tick may dispatch again.
-            probes_in_flight.remove(&scope);
-            core.on_mounts_refreshed(scope, refresh, now())
+          OpResult::MountsRefreshed {
+            scope,
+            generation,
+            refresh,
+          } => {
+            // The probe's thread has EXITED, which is the only thing that frees
+            // its budget slot — so the seat comes back whatever the tag says.
+            // The reading itself is forwarded only under the CURRENT tag: an
+            // answer addressed to a root this scope has since replaced describes
+            // a world it no longer watches (its liveness verdict above all), and
+            // an answer for a torn-down scope has nothing left to feed.
+            if probes.retire(scope, generation) {
+              core.on_mounts_refreshed(scope, refresh, now());
+            }
           }
           OpResult::WatchInstalled {
             watch,
@@ -11764,6 +12048,7 @@ pub(crate) async fn run<R, F>(
               &mut source_taps,
               &registry,
               &cookies,
+              &mut probes,
               scope,
               spawned,
               replace.reservation.path(),
@@ -12419,7 +12704,7 @@ pub(crate) async fn run<R, F>(
             let _ = reply.send(admitted_verdict(&unproven_scopes, scope, UnwatchAck::Unknown));
           }
         }
-        Ok(Command::SetCover { scope, retained, mut reply }) => {
+        Ok(Command::SetCover { scope, mut retained, mut reply }) => {
           // In-place bidirectional coverage reconcile. The core is the authority on whether
           // a reconcile ran: every refusal — unknown scope, not yet publicly live,
           // kernel-recursive profile, refused cover — comes back as a typed `Noop` and is
@@ -12446,6 +12731,30 @@ pub(crate) async fn run<R, F>(
             let _ = reply.send(CoverOutcome::Skipped(SkipReason::Backlogged));
             continue;
           }
+          // A shrink may not take the ground an ADMITTED sync depends on. The
+          // admission proved that ground covered, but nothing binds the
+          // obligation to the cover it was admitted under: a cover arriving
+          // inside that window would prune the watches the marker's create has to
+          // come off, and the caller would then wait out its barrier over a write
+          // that reported success. So every LIVE obligation's LANDING joins the
+          // retained cover here — one term per unretired obligation of this
+          // scope, bounded by the cookie caps — and the R24 reserved-directory
+          // exemption keeps the marker's own directory with it, that directory's
+          // parent now being retained. The landing and not the caller's spelling,
+          // because an intermediate symlink puts the marker — and the watch that
+          // has to report it — somewhere the spelling does not name.
+          //
+          // The cover is held to the obligation's RETIREMENT, not to its claim:
+          // the write returns the moment the file exists, while the barrier's
+          // observation, the cleanup's proof and any retry all happen after that
+          // — a claimed marker whose create is still queued is exactly the case a
+          // disarm makes unobservable ([`CookieRegistry::live_sync_dirs`]).
+          //
+          // Widening only ever ADDS coverage, so it cannot lose an event; what it
+          // costs is that the applied cover is briefly a superset of the one the
+          // caller asked for, until the next `set_cover` — by which time these
+          // obligations have retired and name nothing.
+          retained.extend(cookies.live_sync_dirs(scope));
           match core.on_set_cover(scope, &retained) {
             CoverReconcile::Reconciling => {
               if let Some(reply) = reply {
@@ -12503,11 +12812,39 @@ pub(crate) async fn run<R, F>(
                   dir,
                   exclusion,
                 }));
+              } else if !core.covers(scope, &dir) {
+                // Inside the root, outside the root's own APPLIED COVER: a
+                // `set_cover` narrowed this scope's per-directory coverage past
+                // this directory, so the ground the marker would land in holds no
+                // watch and its create reaches no source. The third word with the
+                // same shape as the two above — an exclusion, a prune pattern, and
+                // now a cover — and refused for the same reason, before birth.
+                //
+                // Read off the cover the core APPLIED, not the one the caller last
+                // requested: a refused or superseded request narrowed nothing, and
+                // a scope whose cover degraded to the empty claim is being re-armed
+                // from the root and fences nothing ([`DriverCore::covers`]).
+                //
+                // Only the caller's own subscriptions are its business here. The
+                // watcher's reserved cookie directory one level inside `dir` is
+                // NOT: no cover can name it, so the core keeps its watch armed
+                // across the cut instead — which is what makes a covered
+                // directory's SECOND sync (the one that reuses the reserved
+                // directory and so provokes no directory create) observable at all.
+                //
+                // This is a SPELLING test and cannot be the whole answer: a
+                // resolved landing under an intermediate symlink is judged again
+                // against the same cover, off the pins ([`admitted_ground_refusal`]).
+                // Kept here because it is cheap and pre-pin: a caller naming
+                // uncovered ground outright is turned away before the door opens a
+                // descriptor.
+                let _ = reply.send(Err(crate::error::SyncRootError::DirUncovered { dir }));
               } else if let Some(refusal) = admitted_ground_refusal(
                 &root,
                 &admitted,
                 &core.scope_prune(scope),
                 &config.exclusions,
+                &|landing| core.covers(scope, landing),
               ) {
                 // Every check above judged the caller's SPELLING, which is not a
                 // location. This judges where the door's pinned objects actually
@@ -12632,7 +12969,14 @@ pub(crate) async fn run<R, F>(
                 // admission, and it costs nothing: both run in this one command
                 // step, and the release drain is the loop top's, so no release can
                 // be applied in between.
-                let id = cookies.admit_parked(scope, Arc::clone(&name), ticket.seq(), fence);
+                let id = cookies.admit_parked(
+                  scope,
+                  dir.clone(),
+                  admitted.target_landing(),
+                  Arc::clone(&name),
+                  ticket.seq(),
+                  fence,
+                );
                 core.arm_sync_marker(scope, name, id);
                 // The routing half: which caller this fence answers, and where its
                 // cookie is to be written. Inserted in the same step as the record
@@ -12664,6 +13008,10 @@ pub(crate) async fn run<R, F>(
         #[cfg(all(test, feature = "tokio"))]
         Ok(Command::DebugCoverFenceEntry { scope, reply }) => {
           let _ = reply.send(core.holds_cover_fence_entry(scope));
+        }
+        #[cfg(all(test, feature = "tokio"))]
+        Ok(Command::DebugProbesOutstanding { reply }) => {
+          let _ = reply.send(probes.outstanding());
         }
         #[cfg(all(test, feature = "tokio"))]
         Ok(Command::DebugCookieReapMarks { reply }) => {
@@ -12862,9 +13210,14 @@ pub(crate) async fn run<R, F>(
             core.on_watch_installed(watch, attempt, outcome);
           }
           Ok(OpResult::Enumerated { req, raw }) => core.on_enumerated(req, raw),
-          Ok(OpResult::MountsRefreshed { scope, refresh }) => {
-            probes_in_flight.remove(&scope);
-            core.on_mounts_refreshed(scope, refresh, now())
+          Ok(OpResult::MountsRefreshed {
+            scope,
+            generation,
+            refresh,
+          }) => {
+            if probes.retire(scope, generation) {
+              core.on_mounts_refreshed(scope, refresh, now());
+            }
           }
           // A spawn that raced the close: the stream is live but has no owner —
           // tear it down INSIDE the close accounting (the handle's Drop is only
@@ -12990,7 +13343,7 @@ pub(crate) async fn run<R, F>(
     &mut deferred_grants,
     &mut pending_control,
     &mut control_inflight,
-    &mut probes_in_flight,
+    &mut probes,
     &mut cookies,
     &registry,
     &now,
@@ -14836,6 +15189,7 @@ fn resolve_widen_catchups<R, F>(
   parked_cookies: &mut BTreeMap<FenceId, ParkedCookie>,
   cookies: &mut CookieRegistry<F>,
   registry: &impl ScopeRegistry,
+  probes: &mut LivenessProbes,
   now: &impl Fn() -> Instant,
 ) -> bool
 where
@@ -14932,6 +15286,7 @@ where
         replay,
         backend,
         stats,
+        probes,
         now,
       )
     };
@@ -15051,6 +15406,7 @@ fn commit_replace<F>(
   source_taps: &mut BTreeMap<ScopeId, EventReceiver>,
   registry: &impl ScopeRegistry,
   cookies: &CookieRegistry<F>,
+  probes: &mut LivenessProbes,
   scope: ScopeId,
   spawned: EscrowedSpawn<F::Handle>,
   reserved: &Path,
@@ -15138,6 +15494,14 @@ where
     stats,
   );
   let watch = core.root_watch(scope);
+  // Retire the scope's liveness-probe tag with the root it named. A probe still
+  // inside the retiring root's `stat` keeps its budget slot — the thread is
+  // alive — but its answer is now about a world this scope has left, so it will
+  // be dropped rather than judged against the replacement's identity. The commit
+  // below clears the core's pending mark and arms a refresh of its own, and that
+  // one claims the fresh tag: the replacement is probed immediately, however long
+  // the old root takes to answer.
+  probes.retire_generation(scope);
   // The rebind supersedes every arm the retired transport still owes, and hands
   // back the attempt the replay must name — so a straggler from the dead world
   // answers an attempt the core no longer holds and is discarded, rather than
@@ -15175,6 +15539,7 @@ fn commit_widen<R, F>(
   replay: WatchOutcome,
   backend: BackendKind,
   stats: Option<crate::os::BackendStatsHandle>,
+  probes: &mut LivenessProbes,
   now: &impl Fn() -> Instant,
 ) -> Result<WidenOutcome, crate::error::ReplaceRootError>
 where
@@ -15216,6 +15581,12 @@ where
   let published_ancestors = meta.ancestors.clone();
   match core.on_root_widened(scope, meta, reserved, now()) {
     WidenCommit::Committed(attempt) => {
+      // The widened root is a DIFFERENT object, so the scope's liveness-probe tag
+      // retires with the old one exactly as it does at a stream replace: an
+      // in-flight probe keeps its budget slot and loses its standing, and the
+      // refresh the commit just armed claims the fresh tag. Only this arm — the
+      // refusals below leave the old world live and its probe current.
+      probes.retire_generation(scope);
       // The splice landed: NOW the registry names the widened root — the
       // same single-writer program order as birth and the stream replace
       // (decision complete, then publish, then the caller can observe).
@@ -15626,7 +15997,7 @@ fn execute_effects<R, F>(
   deferred_grants: &mut BTreeMap<ScopeId, DeferredGrant>,
   pending_control: &mut PendingControl,
   control_inflight: &mut ControlInflight,
-  probes_in_flight: &mut BTreeSet<ScopeId>,
+  probes: &mut LivenessProbes,
   cookies: &mut CookieRegistry<F>,
   registry: &impl ScopeRegistry,
   now: &impl Fn() -> Instant,
@@ -15698,12 +16069,14 @@ fn execute_effects<R, F>(
         // not only across later ones.
         pending_control.remove(&scope);
         control_inflight.remove(&scope);
-        // The liveness probe's seat goes with the scope for the same reason:
-        // scope ids are never reused, so an entry left behind by a probe whose
-        // answer arrives after the teardown (or never, on a hung root) would
-        // grow this set unbounded under watch/unwatch churn. A late answer for
-        // a gone scope is inert on both sides — the core has no state to feed.
-        probes_in_flight.remove(&scope);
+        // The liveness probe's TAG is retired with the scope, and deliberately
+        // not its seat: a probe inside a wedged `stat` is still a live thread,
+        // and forgetting it here is what let watch/tick/unwatch churn against a
+        // hung root accumulate one uncounted thread per retired scope. Retiring
+        // the tag makes its eventual answer inert — scope ids are never reused,
+        // so the core would have nothing to feed anyway — while the budget keeps
+        // counting the thread until it actually exits.
+        probes.retire_generation(scope);
         torn_down.insert(scope);
         // The lane's drain tap dies with the lane — a clone kept past this
         // point would grow the map unbounded under watch/unwatch churn.
@@ -15813,24 +16186,53 @@ fn execute_effects<R, F>(
         // this scope's death detector, so it gets execution capacity that the
         // stalled write cannot occupy — its own OS thread.
         //
-        // ONE outstanding probe per scope. A probe that has not answered is a
-        // hung root; a second thread on the same path proves nothing and would
-        // let a wall-clock tick mint a thread per interval against a mount that
-        // never returns. The core re-arms the scope's deadline either way, so a
-        // skipped tick costs one interval and nothing else. (The core's own
-        // `refresh_pending` already coalesces at the source; this set is the
-        // belt on the executor side, and it can only fire if the two ever
-        // diverge — in which case the outstanding probe's own answer still
-        // clears the core's flag.)
+        // A thread cannot be RECLAIMED, only waited for: a `stat` that has
+        // entered a wedged mount has no cancellation, so every probe dispatched
+        // here is a thread the driver has spent until the filesystem answers.
+        // Two bounds follow from that, and a third rule keeps them honest across
+        // a root swap.
         //
-        // Threads are bounded by LIVE SCOPES, not by ticks: at most one per
-        // scope, released when the probe answers or the scope tears down. A
-        // scope torn down earlier in this same drain is skipped outright — the
-        // core has already dropped its state, so the answer would be inert, and
-        // dispatching would leave a set entry nothing removes.
-        if torn_down.contains(&scope) || !probes_in_flight.insert(scope) {
+        // ONE outstanding probe per scope AND TAG. A probe that has not answered
+        // is a hung root; a second thread on the same path proves nothing and
+        // would let a wall-clock tick mint a thread per interval against a mount
+        // that never returns. The core re-arms the scope's deadline either way,
+        // so a skipped tick costs one interval and nothing else. (The core's own
+        // `refresh_pending` already coalesces at the source; this is the belt on
+        // the executor side, and it can only fire if the two ever diverge — in
+        // which case the outstanding probe's own answer still clears the core's
+        // flag.)
+        //
+        // A watcher-wide BUDGET is the real bound, because the per-scope rule
+        // bounds nothing on its own: scope ids are never reused, so churn against
+        // a wedged tree retires scopes whose threads live on. At
+        // [`MAX_LIVENESS_PROBES`] this dispatches nothing and TELLS the core, so
+        // the scope's pending mark drops and its next tick re-arms rather than
+        // coalescing onto a probe that was never sent — and, because a scope the
+        // budget turned away has no proof of liveness at all, the core routes it
+        // through its loss funnel once per episode instead of leaving it falsely
+        // live and silent.
+        //
+        // The TAG is what makes a replacement root independent of the retiring
+        // one: a replace commit retires the scope's tag, so the replacement's own
+        // refresh claims a fresh one and dispatches immediately even while the
+        // old root's probe is still inside its `stat` — and that probe's eventual
+        // answer is dropped on receipt instead of being read as the new root's
+        // verdict. A scope torn down earlier in this same drain is skipped
+        // outright: the core has already dropped its state, so the answer would
+        // be inert and the thread would be spent for nothing.
+        if torn_down.contains(&scope) {
           continue;
         }
+        let generation = match probes.claim(scope) {
+          Ok(generation) => generation,
+          // The core is TOLD which refusal this was: a coalescing skip over a
+          // running probe and a budget that left this root unwatched degrade to
+          // different things ([`DriverCore::on_refresh_declined`]).
+          Err(reason) => {
+            core.on_refresh_declined(scope, now(), reason);
+            continue;
+          }
+        };
         let ops = ops.clone();
         let tx = op_tx.clone();
         let pooled_ops = ops.clone();
@@ -15840,18 +16242,26 @@ fn execute_effects<R, F>(
           .name("tributary-liveness".to_owned())
           .spawn(move || {
             let refresh = ops.refresh_mounts(&root);
-            let _ = tx.try_send(OpResult::MountsRefreshed { scope, refresh });
+            let _ = tx.try_send(OpResult::MountsRefreshed {
+              scope,
+              generation,
+              refresh,
+            });
           })
           .is_err()
         {
           // The OS refused a thread (`EAGAIN`). Fall back to the pool for this
           // one probe rather than dropping it: progress is then the pool's,
-          // which is exactly what it was before, and the scope keeps its set
-          // entry until the probe answers — so nothing is lost and nothing is
-          // dispatched twice.
+          // which is exactly what it was before, and the claim stands until the
+          // probe answers — so nothing is lost, nothing is dispatched twice, and
+          // the budget counts a pool job exactly as it counts a thread.
           R::spawn_blocking_detach(move || {
             let refresh = pooled_ops.refresh_mounts(&pooled_root);
-            let _ = pooled_tx.try_send(OpResult::MountsRefreshed { scope, refresh });
+            let _ = pooled_tx.try_send(OpResult::MountsRefreshed {
+              scope,
+              generation,
+              refresh,
+            });
           });
         }
       }
