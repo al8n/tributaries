@@ -294,7 +294,8 @@ impl SyncAdmission {
 /// [`CleanupBacklog`](SyncRootError::CleanupBacklog), and the reply-borne
 /// [`UnknownRoot`](SyncRootError::UnknownRoot) /
 /// [`BadCookieName`](SyncRootError::BadCookieName) /
-/// [`DirOutsideRoot`](SyncRootError::DirOutsideRoot)). Such a refusal burns
+/// [`DirOutsideRoot`](SyncRootError::DirOutsideRoot) /
+/// [`DirUncovered`](SyncRootError::DirUncovered)). Such a refusal burns
 /// nothing, so re-present the returned admission to
 /// [`sync_root`](Watcher::sync_root) to retry under the SAME sequence — the paired
 /// [`SyncTicket`] stays valid. `None` means the sequence is spent or its fate is
@@ -347,6 +348,7 @@ impl SyncRootDenied {
         | SyncRootError::ForeignTicket
         | SyncRootError::BadCookieName { .. }
         | SyncRootError::DirOutsideRoot { .. }
+        | SyncRootError::DirUncovered { .. }
         | SyncRootError::WriteInFlight
         | SyncRootError::NameInUse { .. }
         | SyncRootError::TicketInUse {}
@@ -391,6 +393,13 @@ pub enum RequestOutcome {
 /// queued. The settled verdicts ([`Applied`](Self::Applied) /
 /// [`Degraded`](Self::Degraded)) are constructed only by that settlement, so
 /// no code path can resolve them early.
+///
+/// Whatever the outcome, the cover the watcher APPLIED is the requested one widened
+/// by the target directory of every sync of that root that has not yet retired — a
+/// coverage superset that keeps an admitted marker observable, and its removal
+/// provable, for as long as the obligation lives, and that lasts only until the next
+/// reconcile (see [`Watcher::set_cover`]). No variant here reports it: a superset
+/// loses nothing a caller could act on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CoverOutcome {
@@ -1953,6 +1962,12 @@ impl<R> Watcher<R> {
   /// [`prune`](crate::RootOptions::prune) seat covers the CANONICAL directory the
   /// write resolves for `dir`, for the same reason and carrying the pattern that did
   /// it;
+  /// [`DirUncovered`](SyncRootError::DirUncovered) when a
+  /// [`set_cover`](Self::set_cover) has narrowed this root's coverage past `dir` —
+  /// the third way the caller's own words can leave the marker's ground unwatched,
+  /// refused before birth like the two above (the watcher's reserved cookie
+  /// directory inside a covered `dir` is exempt from the cut, so a second sync of
+  /// that directory stays observable);
   /// [`DirReplaced`](SyncRootError::DirReplaced) when the directory the write's
   /// own descent reaches is not the object `dir` named at admission — a peer
   /// replaced it in the meantime, and the barrier promises an ordering for the
@@ -2341,6 +2356,25 @@ impl<R> Watcher<R> {
   /// `retained` are the watcher's own canonical coordinates (as
   /// [`root_path`](Self::root_path) reports), so they line up with the watches' addressing.
   ///
+  /// # The applied cover is widened by the syncs still live
+  ///
+  /// A [`sync_root`](Self::sync_root) that has been admitted holds a promise about ground the
+  /// caller's new cover may no longer name. The watcher therefore applies `retained` **plus
+  /// the target directory of every sync of this root that has not yet retired**, so a shrink
+  /// can never prune the watches that marker has to be reported through — the caller's barrier
+  /// would otherwise wait out its deadline over a write that reported success. The directory
+  /// is the one the sync's target RESOLVED to when it was admitted, so an intermediate symlink
+  /// widens the cover where the marker really lands rather than where it was spelled.
+  ///
+  /// The promise outlives the write's own return. `sync_root` answers as soon as the marker
+  /// exists, and only afterwards is the create OBSERVED through the directory's watch, the
+  /// marker's removal proved against the same ground, and a failed removal retried there — so
+  /// the widening lasts until the obligation retires, not until the write returns. The
+  /// widening is a coverage **superset**, so it loses nothing; it is bounded by the watcher's
+  /// sync-obligation caps, and it lasts only until the next `set_cover`, by which time those
+  /// obligations have retired. The acknowledgement reports the reconcile exactly as it would
+  /// without it.
+  ///
   /// # The acknowledgement is an effect-completion fence
   ///
   /// The returned future resolves when the reconcile has **settled** — every re-arm the grow
@@ -2447,6 +2481,11 @@ impl<R> Watcher<R> {
   /// when the request can NEVER be enqueued — `root` is a foreign handle (another watcher's brand)
   /// or the watcher is closed — so the caller must drop the intent rather than retry. Never blocks
   /// and never panics.
+  ///
+  /// The applied cover is widened by the target directory of every not-yet-retired
+  /// [`sync_root`](Self::sync_root) obligation of this root, exactly as it is for the awaited
+  /// [`set_cover`](Self::set_cover) — see that method for what the widening costs and why it
+  /// can never lose an event.
   pub fn request_set_cover(&self, root: RootHandle, retained: Vec<PathBuf>) -> RequestOutcome {
     // A foreign handle's scope number can name THIS watcher's unrelated root — reject it (never
     // retryable) before touching the channel, exactly as the awaited `set_cover` does.

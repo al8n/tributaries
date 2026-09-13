@@ -7,6 +7,18 @@ const WINDOW: Duration = Duration::from_millis(100);
 /// time this far, so it is inert everywhere else.
 const LIVENESS: Duration = Duration::from_secs(30);
 
+/// The reserved sync-cookie directory leaf the harness cores are built with.
+///
+/// One FIXED name, standing for the single leaf a real process reserves — the
+/// core is told the name rather than deriving it, so the cells can put
+/// reserved-SHAPED siblings beside it and ask what the shrink does with them.
+const COOKIE_DIR: &str = ".tributaries-sync-cookies-0";
+
+/// [`COOKIE_DIR`] in the shape [`DriverCore::new`] takes it.
+fn reserved_dir() -> Option<Arc<str>> {
+  Some(Arc::from(COOKIE_DIR))
+}
+
 /// The scope's delivery lane, for cells whose transport never swaps.
 fn lane_zero(_: ScopeId) -> u64 {
   0
@@ -100,7 +112,7 @@ fn live_core() -> (DriverCore, ScopeId) {
 /// The same, under a narrowed subscription — the shape an admission claim
 /// needs, since `Interest::all()` admits on any fact at all.
 fn live_core_with(interest: Interest) -> (DriverCore, ScopeId) {
-  let mut core = DriverCore::new(WINDOW, LIVENESS);
+  let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
   let scope = core
     .on_watch(PathBuf::from("/r"), interest, BackendKind::FsEvents)
     .expect("a fresh scope registers");
@@ -135,7 +147,7 @@ fn live_core_with(interest: Interest) -> (DriverCore, ScopeId) {
 /// A live core whose birth refresh could NOT read the mount table: device
 /// boundaries stay unknown, so event-side identity/cookie trust is refused.
 fn live_core_blind_mounts() -> (DriverCore, ScopeId) {
-  let mut core = DriverCore::new(WINDOW, LIVENESS);
+  let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
   let scope = core
     .on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::FsEvents)
     .expect("a fresh scope registers");
@@ -1197,6 +1209,7 @@ fn identity_minting_respects_devices_and_mounts() {
     mounts_authoritative: true,
     refresh_pending: false,
     refresh_stale: false,
+    budget_lossy: false,
     refresh_world_stale: false,
     lag: LagState::Normal,
     park: Park::default(),
@@ -1239,6 +1252,7 @@ fn blind_mount_table_refuses_event_side_trust() {
     mounts_authoritative: false,
     refresh_pending: false,
     refresh_stale: false,
+    budget_lossy: false,
     refresh_world_stale: false,
     lag: LagState::Normal,
     park: Park::default(),
@@ -1864,7 +1878,7 @@ fn rename_coalesced_with_create_and_remove_grounds_by_existence() {
 
 #[test]
 fn seeded_mount_blocks_pairing_before_any_probe_learns_it() {
-  let mut core = DriverCore::new(WINDOW, LIVENESS);
+  let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
   let scope = core
     .on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::FsEvents)
     .expect("a fresh scope registers");
@@ -1907,7 +1921,7 @@ fn birth_window_refuses_cookies_until_the_refresh_installs() {
   // A mount can appear between the spawn's seed read and stream start,
   // landing in neither the seed nor the event stream — so a scope is born
   // trust-closed, and only the post-live birth refresh installs authority.
-  let mut core = DriverCore::new(WINDOW, LIVENESS);
+  let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
   let scope = core
     .on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::FsEvents)
     .expect("a fresh scope registers");
@@ -1993,7 +2007,7 @@ fn birth_window_refuses_cookies_until_the_refresh_installs() {
 
 #[test]
 fn a_loss_racing_the_birth_refresh_rearms_it_once() {
-  let mut core = DriverCore::new(WINDOW, LIVENESS);
+  let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
   let scope = core
     .on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::FsEvents)
     .expect("a fresh scope registers");
@@ -2345,7 +2359,7 @@ fn kernel_loss_flags_revoke_trust_but_coverage_rescans_do_not() {
 fn same_batch_unmount_keeps_colliding_rename_foreign() {
   // The volume was known at spawn; a rename coalesces into the SAME batch as
   // the volume's unmount, with a root-device object colliding on the fileID.
-  let mut core = DriverCore::new(WINDOW, LIVENESS);
+  let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
   let scope = core
     .on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::FsEvents)
     .expect("a fresh scope registers");
@@ -2763,7 +2777,7 @@ fn single_partner_grant_is_probe_order_independent() {
 /// delivered — not even through the dying retry.
 #[test]
 fn spawn_failure_emits_nothing_public() {
-  let mut core = DriverCore::new(WINDOW, LIVENESS);
+  let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
   let scope = core
     .on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::FsEvents)
     .expect("a fresh scope registers");
@@ -2792,7 +2806,7 @@ fn spawn_failure_emits_nothing_public() {
 /// fence covers a scope the driver refused before it went live.
 #[test]
 fn spawn_rejection_emits_nothing_public() {
-  let mut core = DriverCore::new(WINDOW, LIVENESS);
+  let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
   let scope = core
     .on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::FsEvents)
     .expect("a fresh scope registers");
@@ -3003,6 +3017,7 @@ mod lowering {
       mounts_authoritative: true,
       refresh_pending: false,
       refresh_stale: false,
+      budget_lossy: false,
       refresh_world_stale: false,
       lag: LagState::Normal,
       park: Park::default(),
@@ -3140,7 +3155,7 @@ mod lowering {
   /// `/` root unusable).
   #[test]
   fn filesystem_root_scope_grounds_descendants_located() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = core
       .on_watch(PathBuf::from("/"), Interest::all(), BackendKind::FsEvents)
       .expect("a fresh scope registers");
@@ -3440,7 +3455,7 @@ mod descending {
   }
 
   fn live_descending_with(root_mnt_id: Option<u64>) -> (DriverCore, ScopeId, ReqId, WatchId) {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = core
       .on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Inotify)
       .expect("a fresh scope registers");
@@ -4027,7 +4042,7 @@ mod descending {
   /// promotes anything.
   #[test]
   fn descending_root_arm_failure_is_never_live_and_silent() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let (scope, root_watch) = spawned_with_pending_root_arm_at(&mut core, "/r");
     core.on_watch_installed(
       root_watch,
@@ -4062,7 +4077,7 @@ mod descending {
   /// stays silent — and the failed scope promotes no dying delivery.
   #[test]
   fn root_arm_failure_leaves_a_live_sibling_untouched() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let (live, live_root) = live_descending_at(&mut core, "/live");
     let (failed, failed_root) = spawned_with_pending_root_arm_at(&mut core, "/r");
     core.on_watch_installed(
@@ -4967,6 +4982,143 @@ mod descending {
     assert_eq!(state.settle_floor, Some(vec![p("/r/keep")]));
     assert!(core.cover_fences.is_empty());
     (core, scope, root_watch)
+  }
+
+  /// A set-cover never takes the reserved cookie directory of a directory it
+  /// still covers.
+  ///
+  /// The cover speaks for the caller's SUBSCRIPTIONS, and no caller can name the
+  /// watcher's reserved directory — so a cover retaining a file under `/r` marks
+  /// that directory's sibling reserved directory strictly outside and would prune
+  /// it. Nothing re-arms it afterwards: the next sync into `/r` finds the reserved
+  /// directory already standing (the EEXIST arm), so no directory create reaches
+  /// the root's watch, the marker is born in unarmed ground, and the barrier can
+  /// only time out.
+  ///
+  /// Non-vacuity in both directions. A plain sibling directory IS pruned, so the
+  /// exemption is the NAME's and not the shrink standing down; and a reserved
+  /// directory whose PARENT the cover genuinely narrowed away goes with that
+  /// parent, so the exemption is the parent's coverage too — no sync of an
+  /// uncovered directory is admitted, so nothing will ever land there.
+  ///
+  /// Revert witness: drop the reserved-directory arm from the prune filter and
+  /// `/r/<reserved>` leaves coverage with the sibling.
+  #[test]
+  fn a_set_cover_keeps_the_reserved_cookie_directory_of_a_covered_directory() {
+    let (mut core, scope, req, _root) = live_descending();
+    // Built by joining rather than spelled as one literal: the core joins with the
+    // PLATFORM separator, so a nested listing key written `"/r/g"` matches nothing
+    // on Windows and the child is silently never enumerated.
+    let root = p("/r");
+    let sibling = root.join("g");
+    let nested = sibling.join(COOKIE_DIR);
+    core.on_enumerated(
+      req,
+      listed(vec![
+        entry(COOKIE_DIR, FileKind::Dir, 1, 11),
+        entry("g", FileKind::Dir, 1, 12),
+      ]),
+    );
+    run_cascade(
+      &mut core,
+      &BTreeMap::from([(
+        sibling.to_str().expect("test paths are UTF-8"),
+        vec![entry(COOKIE_DIR, FileKind::Dir, 1, 13)],
+      )]),
+    );
+    assert_eq!(
+      core.covered_paths(),
+      vec![
+        root.clone(),
+        root.join(COOKIE_DIR),
+        sibling.clone(),
+        nested.clone(),
+      ],
+      "cold discovery armed both reserved directories and the sibling"
+    );
+
+    // The caller keeps one FILE subscription. `/r` stays covered (it is the
+    // retained path's ancestor); `/r/g` and everything under it does not.
+    assert_eq!(
+      core.on_set_cover(scope, &[root.join("f")]),
+      CoverReconcile::Reconciling
+    );
+    let _ = drain(&mut core);
+
+    assert_eq!(
+      core.covered_paths(),
+      vec![root.clone(), root.join(COOKIE_DIR)],
+      "the covered directory's reserved directory survives; the plain sibling \
+       and the reserved directory under it do not"
+    );
+  }
+
+  /// The exemption is THIS PROCESS'S reserved leaf, not the reserved NAME SPACE.
+  ///
+  /// [`is_sync_cookie_dir_name`](crate::is_sync_cookie_dir_name) recognizes the
+  /// bare stem and every canonical `u32` qualifier, because it has to classify
+  /// what any run of this crate — under any uid, on a shared filesystem — may have
+  /// left behind. That space is predictable and unowned: a peer that can create
+  /// directories under the watched tree can stand as many reserved-SHAPED
+  /// siblings there as it likes, the cold crawl arms every one of them, and an
+  /// exemption written against the classifier would then keep a watch descriptor
+  /// per forged name across every shrink. The set-cover would stop being a
+  /// reclamation mechanism, and an inotify watch table can be exhausted that way
+  /// — which is coverage LOSS, from the very rule that exists to preserve
+  /// coverage.
+  ///
+  /// Equality against the one leaf the core was built with keeps the bound the
+  /// exemption claims: at most ONE extra watch per covered directory, by
+  /// construction, whatever a peer names its directories.
+  ///
+  /// Revert witness: match the classifier instead of the leaf and every forged
+  /// sibling below survives the shrink.
+  #[test]
+  fn a_set_cover_exempts_only_this_process_s_reserved_cookie_directory() {
+    let (mut core, scope, req, _root) = live_descending();
+    let root = p("/r");
+    // The real leaf, three forged qualifiers, and the bare stem — every one of
+    // them a name the classifier accepts, only one of them this process's.
+    let forged = [
+      ".tributaries-sync-cookies-1",
+      ".tributaries-sync-cookies-2",
+      ".tributaries-sync-cookies-3",
+      ".tributaries-sync-cookies",
+    ];
+    for name in forged {
+      assert!(
+        crate::is_sync_cookie_dir_name(name),
+        "staging: {name} is inside the space the classifier accepts"
+      );
+    }
+    let mut listing = vec![entry(COOKIE_DIR, FileKind::Dir, 1, 11)];
+    for (index, name) in forged.iter().enumerate() {
+      listing.push(entry(name, FileKind::Dir, 1, 20 + index as u64));
+    }
+    core.on_enumerated(req, listed(listing));
+    run_cascade(&mut core, &BTreeMap::new());
+    assert_eq!(
+      core.covered_paths().len(),
+      2 + forged.len(),
+      "staging: the cold crawl armed the root, the real directory and every \
+       forged sibling ({:?})",
+      core.covered_paths()
+    );
+
+    // One FILE subscription: every reserved-shaped sibling of it is strictly
+    // outside the cover.
+    assert_eq!(
+      core.on_set_cover(scope, &[root.join("f")]),
+      CoverReconcile::Reconciling
+    );
+    let _ = drain(&mut core);
+
+    assert_eq!(
+      core.covered_paths(),
+      vec![root.clone(), root.join(COOKIE_DIR)],
+      "only the leaf this process reserves is exempt — the forged siblings go \
+       with the shrink"
+    );
   }
 
   /// [`root_listing`] plus one entry no kind could be read for — the
@@ -7132,7 +7284,7 @@ mod descending {
   /// then takes the whole coverage, in the silence the contract requires.
   #[test]
   fn set_cover_before_the_grant_is_refused_not_live() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let (scope, root_watch) = spawned_with_pending_root_arm_at(&mut core, "/r");
     assert_eq!(
       core.on_set_cover(scope, &[p("/r/keep")]),
@@ -9078,7 +9230,7 @@ mod kernel_recursive_fanotify {
   /// A live fanotify scope rooted at `/r`: the KR spawn doubles as the root's
   /// watch-result, and the birth refresh installs authoritative (empty) trust.
   fn live_fanotify() -> (DriverCore, ScopeId) {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = core
       .on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Fanotify)
       .expect("a fresh scope registers");
@@ -9333,7 +9485,7 @@ mod kernel_recursive_fanotify {
   /// queued only once the last reference to the removed root drops, and this
   /// driver's own sync pins are such references.
   fn live_inotify() -> (DriverCore, ScopeId) {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = core
       .on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Inotify)
       .expect("a fresh scope registers");
@@ -9535,7 +9687,7 @@ mod kernel_recursive_fanotify {
   /// refresh (the pre-L4.2 behavior). The loss path itself is unaffected.
   #[test]
   fn liveness_interval_zero_disables_the_tick() {
-    let mut core = DriverCore::new(WINDOW, Duration::ZERO);
+    let mut core = DriverCore::new(WINDOW, Duration::ZERO, reserved_dir());
     let scope = core
       .on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Fanotify)
       .expect("a fresh scope registers");
@@ -9589,7 +9741,7 @@ mod kernel_recursive_fanotify {
   /// quiet-unmount arm the tick still bounds.)
   #[test]
   fn fid_only_root_death_dies_without_the_liveness_tick() {
-    let mut core = DriverCore::new(WINDOW, Duration::ZERO);
+    let mut core = DriverCore::new(WINDOW, Duration::ZERO, reserved_dir());
     let scope = core
       .on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Fanotify)
       .expect("a fresh scope registers");
@@ -9693,7 +9845,7 @@ mod kernel_recursive_fanotify {
     };
 
     // Drive that admitted event into a fanotify scope whose liveness tick is DISABLED.
-    let mut core = DriverCore::new(WINDOW, Duration::ZERO);
+    let mut core = DriverCore::new(WINDOW, Duration::ZERO, reserved_dir());
     let scope = core
       .on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Fanotify)
       .expect("a fresh scope registers");
@@ -9995,7 +10147,7 @@ mod auto_selection {
   /// the KR profile is the one now running.
   #[test]
   fn auto_provisional_inotify_adopts_probed_fanotify() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = core
       .on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Inotify)
       .expect("a fresh scope registers");
@@ -10056,7 +10208,7 @@ mod auto_selection {
   /// forced inotify would.
   #[test]
   fn auto_provisional_inotify_keeps_inotify_on_fallback() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = core
       .on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Inotify)
       .expect("a fresh scope registers");
@@ -10146,7 +10298,7 @@ mod rdcw_lowering {
 
   #[test]
   fn precise_verbs_lower_at_their_locations() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_scope(&mut core);
 
     core.on_batch(
@@ -10175,7 +10327,7 @@ mod rdcw_lowering {
 
   #[test]
   fn a_pump_paired_rename_becomes_one_moved_change() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_scope(&mut core);
 
     core.on_batch(
@@ -10211,7 +10363,7 @@ mod rdcw_lowering {
       ..rdcw(action, components)
     };
     let moved = |old: RdcwRecord, new: RdcwRecord| {
-      let mut core = DriverCore::new(WINDOW, LIVENESS);
+      let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
       let scope = live_scope(&mut core);
       core.on_batch(scope, payload(vec![RdcwEvent::Renamed { old, new }]), at(1));
       let effects = drain(&mut core);
@@ -10260,7 +10412,7 @@ mod rdcw_lowering {
       attributes: Some(attributes),
       ..rdcw(action, components)
     };
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_scope(&mut core);
 
     core.on_batch(
@@ -10288,7 +10440,7 @@ mod rdcw_lowering {
 
   #[test]
   fn an_escalated_component_covers_its_decodable_ancestor() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_scope(&mut core);
 
     core.on_batch(
@@ -10316,7 +10468,7 @@ mod rdcw_lowering {
 
   #[test]
   fn an_unknown_action_covers_its_target() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_scope(&mut core);
 
     core.on_batch(
@@ -10338,7 +10490,7 @@ mod rdcw_lowering {
 
   #[test]
   fn widows_degrade_immediately_and_never_fabricate_a_moved() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_scope(&mut core);
 
     core.on_batch(
@@ -10379,7 +10531,7 @@ mod rdcw_lowering {
       RdcwAction::StreamRemoved,
       RdcwAction::StreamModified,
     ] {
-      let mut core = DriverCore::new(WINDOW, LIVENESS);
+      let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
       let scope = live_scope(&mut core);
       core.on_batch(
         scope,
@@ -10407,7 +10559,7 @@ mod rdcw_lowering {
   /// about it at all.
   #[test]
   fn a_stream_action_admits_an_attrib_only_subscription() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_scope_with(&mut core, Interest::new().with_attrib());
     core.on_batch(
       scope,
@@ -10435,7 +10587,7 @@ mod rdcw_lowering {
   /// consumer's index does not use.
   #[test]
   fn a_refused_name_covers_its_parent_rather_than_naming_the_object() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_scope(&mut core);
     core.on_batch(
       scope,
@@ -10560,7 +10712,7 @@ mod usn_lowering {
 
   #[test]
   fn deltas_lower_by_the_verb_partition() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_scope(&mut core);
     core.on_batch(
       scope,
@@ -10601,7 +10753,7 @@ mod usn_lowering {
   /// other: an attrib-only subscription is admitted on the fact it asked about.
   #[test]
   fn a_merged_delta_admits_every_interest_it_proves() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_scope_with(&mut core, Interest::new().with_attrib());
     core.on_batch(
       scope,
@@ -10618,7 +10770,7 @@ mod usn_lowering {
     assert_eq!(emitted[0].location(), &loc(&["a", "new.txt"]));
 
     // And the narrowing is still exact where nothing else was proven.
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_scope_with(&mut core, Interest::new().with_attrib());
     core.on_batch(
       scope,
@@ -10635,7 +10787,7 @@ mod usn_lowering {
 
   #[test]
   fn an_admitted_rename_becomes_one_moved() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_scope(&mut core);
     core.on_batch(
       scope,
@@ -10668,7 +10820,7 @@ mod usn_lowering {
   /// witness for the evidence surviving the paired path, not for the pairing.
   #[test]
   fn a_paired_rename_admits_the_content_it_proves() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_scope_with(&mut core, Interest::new().with_modified());
     let mut adm = seeded_admission();
     let mut admitted = Vec::new();
@@ -10719,7 +10871,7 @@ mod usn_lowering {
   /// naming choice must not consume the content evidence either.
   #[test]
   fn a_boundary_rename_admits_the_content_it_proves() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_scope_with(&mut core, Interest::new().with_modified());
     let mut adm = seeded_admission();
     let mut admitted = Vec::new();
@@ -10753,7 +10905,7 @@ mod usn_lowering {
 
   #[test]
   fn hard_links_ground_through_a_located_rescan() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_scope(&mut core);
     core.on_batch(
       scope,
@@ -10775,7 +10927,7 @@ mod usn_lowering {
 
   #[test]
   fn escalations_cover_the_parent() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_scope(&mut core);
     core.on_batch(
       scope,
@@ -10796,7 +10948,7 @@ mod usn_lowering {
 
   #[test]
   fn the_root_death_ends_the_scope_loudly() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_scope(&mut core);
     core.on_batch(scope, payload(vec![UsnAdmitted::RootDeath]), at(1));
     let effects = drain(&mut core);
@@ -10811,7 +10963,7 @@ mod usn_lowering {
 
   #[test]
   fn a_map_overflow_covers_the_root() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_scope(&mut core);
     core.on_batch(scope, payload(vec![UsnAdmitted::MapOverflow]), at(1));
     let effects = drain(&mut core);
@@ -10828,7 +10980,7 @@ mod usn_lowering {
   /// rather than die — which the cover is agnostic to.
   #[test]
   fn a_map_inconsistency_covers_the_root() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_scope(&mut core);
     core.on_batch(scope, payload(vec![UsnAdmitted::MapInconsistent]), at(1));
     let effects = drain(&mut core);
@@ -10850,7 +11002,7 @@ mod usn_lowering {
       reason::FILE_DELETE | reason::RENAME_OLD_NAME,
       reason::FILE_CREATE | reason::RENAME_NEW_NAME,
     ] {
-      let mut core = DriverCore::new(WINDOW, LIVENESS);
+      let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
       let scope = live_scope_with(&mut core, Interest::new().with_moved());
       core.on_batch(
         scope,
@@ -10872,7 +11024,7 @@ mod usn_lowering {
   /// move fact widens admission, it does not rewrite the report.
   #[test]
   fn a_degraded_rename_half_still_names_its_membership_verb() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_scope(&mut core);
     core.on_batch(
       scope,
@@ -10923,7 +11075,7 @@ mod usn_lowering {
       &mut admitted,
     );
 
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_scope(&mut core);
     core.on_batch(scope, payload(admitted), at(1));
     let emitted: Vec<Change> = emits(&drain(&mut core)).into_iter().cloned().collect();
@@ -10961,7 +11113,7 @@ mod usn_lowering {
       admission.admit(usn_record(50, 10, mask, 0x20, "f.txt"), &mut admitted);
     }
 
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_scope_with(&mut core, Interest::new().with_modified());
     for event in admitted {
       core.on_batch(scope, payload(vec![event]), at(1));
@@ -11004,7 +11156,7 @@ mod usn_lowering {
       admission.admit(usn_record(50, 10, mask, 0x20, "f.txt"), &mut admitted);
     }
 
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_scope_with(&mut core, Interest::new().with_modified());
     for event in admitted {
       core.on_batch(scope, payload(vec![event]), at(1));
@@ -11060,7 +11212,7 @@ mod usn_lowering {
       &mut admitted,
     );
 
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_scope_with(&mut core, Interest::new().with_modified());
     for event in admitted {
       core.on_batch(scope, payload(vec![event]), at(1));
@@ -11129,7 +11281,7 @@ mod usn_lowering {
       &mut admitted,
     );
 
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_scope_with(&mut core, Interest::new().with_modified());
     core.on_batch(scope, payload(admitted), at(1));
     let emitted: Vec<Change> = emits(&drain(&mut core)).into_iter().cloned().collect();
@@ -11189,7 +11341,7 @@ mod usn_lowering {
       &mut admitted,
     );
 
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_scope(&mut core);
     core.on_batch(scope, payload(admitted), at(1));
     let emitted: Vec<Change> = emits(&drain(&mut core)).into_iter().cloned().collect();
@@ -11223,7 +11375,7 @@ mod usn_lowering {
   #[test]
   fn a_renamed_watched_hard_link_reaches_the_subscriber_as_a_move() {
     let mut adm = seeded_admission();
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_scope(&mut core);
 
     let created = step(
@@ -11303,7 +11455,7 @@ mod usn_lowering {
   #[test]
   fn a_directory_renamed_outside_the_tree_sends_the_subscriber_nowhere() {
     let mut adm = seeded_admission();
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_scope(&mut core);
 
     let churn = step(
@@ -11354,7 +11506,7 @@ mod usn_lowering {
     map.seed([(10, USN_ROOT, "a".into())]);
     // One live session slot: the next subject's first record evicts this one.
     let mut adm = UsnAdmission::new(map, 1);
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_scope(&mut core);
 
     let moved = step(
@@ -11454,7 +11606,7 @@ mod usn_lowering {
     // One live session slot, and — the ledger takes the same bound — one named
     // orphan debt.
     let mut adm = UsnAdmission::new(map, 1);
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_scope(&mut core);
 
     // Three writers in turn: each evicts its predecessor, which owes a repair to
@@ -11523,7 +11675,7 @@ mod usn_lowering {
     let mut map = FrnMap::new(USN_ROOT, None);
     map.seed([(10, USN_ROOT, "a".into())]);
     let mut adm = UsnAdmission::new(map, 1);
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_scope(&mut core);
 
     // One read's worth: a pure OLD half, then an unrelated subject's write.
@@ -11586,7 +11738,7 @@ mod usn_lowering {
     let mut map = FrnMap::new(USN_ROOT, None);
     map.seed([(10, USN_ROOT, "a".into())]);
     let mut adm = UsnAdmission::new(map, 1);
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_scope(&mut core);
 
     for (frn, name) in [(50u128, "first.txt"), (60, "second.txt"), (70, "third.txt")] {
@@ -11667,7 +11819,7 @@ mod usn_lowering {
   #[test]
   fn a_close_merged_with_its_rename_half_names_both_ends() {
     let mut adm = seeded_admission();
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_scope(&mut core);
 
     let parked = step(
@@ -11726,7 +11878,7 @@ mod usn_lowering {
   #[test]
   fn a_crossing_into_the_root_reports_the_arrival_its_close_carries() {
     let mut adm = seeded_admission();
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_scope(&mut core);
 
     let parked = step(
@@ -11794,7 +11946,7 @@ mod usn_lowering {
       vec![PathBuf::from("/r/a/cache")],
       tributary_proto::glob::Globs::default(),
     ));
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_scope(&mut core);
 
     let parked = step(
@@ -11849,7 +12001,7 @@ mod usn_lowering {
   #[test]
   fn a_close_that_completes_nothing_still_delivers_its_parked_half() {
     let mut adm = seeded_admission();
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_scope(&mut core);
 
     let parked = step(
@@ -11931,7 +12083,7 @@ mod root_replaced {
 
   #[test]
   fn the_commit_swaps_the_world_and_covers_by_domination() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_kr_scope(&mut core);
 
     // Pre-replace: an event lowers under the OLD root.
@@ -11974,7 +12126,7 @@ mod root_replaced {
 
   #[test]
   fn parked_probe_work_is_cut_never_readdressed() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     // An FSEvents scope: its ambiguous flag words PARK batches on probes.
     let scope = core
       .on_watch(
@@ -12033,7 +12185,7 @@ mod root_replaced {
   /// new root's death) and re-reads the live world.
   #[test]
   fn an_in_flight_refresh_across_the_commit_cannot_kill_the_swapped_scope() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = core
       .on_watch(PathBuf::from("/a/b"), Interest::all(), BackendKind::Rdcw)
       .expect("a fresh scope registers");
@@ -12108,7 +12260,7 @@ mod root_replaced {
     }
     use crate::os::linux::WatchOutcome;
 
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = core
       .on_watch(PathBuf::from("/a/b"), Interest::all(), BackendKind::Inotify)
       .expect("a fresh scope registers");
@@ -12305,7 +12457,7 @@ mod root_widened {
   /// read (returned) is fed empty unless `feed_boot` is false — the
   /// outstanding-read survival cell keeps it in flight across the widen.
   fn live_at(root: &str, ino: u128, feed_boot: bool) -> (DriverCore, ScopeId, WatchId, ReqId) {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = core
       .on_watch(PathBuf::from(root), Interest::all(), BackendKind::Inotify)
       .expect("a fresh scope registers");
@@ -12617,7 +12769,7 @@ mod root_widened {
 
   #[test]
   fn a_refused_widen_reports_and_mutates_nothing() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let reserved = core.reserve_watch_id();
     // No such scope: the refusal is REPORTED (never a silent unit return), so
     // the driver's commit can translate it into the loud stream-replace
@@ -13706,7 +13858,7 @@ mod exclusions {
   /// second deadline `poll_timeout` would report, saying nothing about either
   /// subject and hiding the one being asserted.
   fn excluding(paths: &[&str]) -> DriverCore {
-    DriverCore::new(WINDOW, Duration::ZERO)
+    DriverCore::new(WINDOW, Duration::ZERO, reserved_dir())
       .with_exclusions(paths.iter().map(PathBuf::from).collect())
   }
 
@@ -14335,7 +14487,7 @@ mod exclusions {
   /// guard that keeps every existing profile's lowering untouched.
   #[test]
   fn no_exclusions_leaves_every_lowering_untouched() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let (scope, req, root) = live_descending(&mut core);
     core.on_enumerated(req, listed(vec![entry("cache", FileKind::Dir)]));
     let _ = drain(&mut core);
@@ -15623,7 +15775,7 @@ mod exclusions {
   /// pass, and the point is that the set names the tree that exists.
   #[test]
   fn a_rename_with_no_exclusions_still_addresses_the_tree_that_exists() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let (scope, req, root) = live_descending(&mut core);
     core.on_enumerated(req, listed(vec![entry("a", FileKind::Dir)]));
     let effects = drain(&mut core);
@@ -15676,7 +15828,7 @@ mod exclusions {
   /// derived from the one tree, so they cannot.
   #[test]
   fn a_watch_armed_under_a_moved_subtree_is_addressed_at_its_new_path() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let (scope, req, root) = live_descending(&mut core);
     core.on_enumerated(req, listed(vec![entry("a", FileKind::Dir)]));
     let effects = drain(&mut core);
@@ -15918,7 +16070,7 @@ mod prune {
   /// `/r/node_modules` joins the coverage set.
   #[test]
   fn a_cold_listing_never_stages_a_pruned_directory() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let (_scope, req, _root) = live_descending(&mut core, &pruning(&["**/node_modules"]));
     core.on_enumerated(
       req,
@@ -15967,7 +16119,7 @@ mod prune {
   /// `/r/node_modules` and queues its arm.
   #[test]
   fn a_live_create_of_a_pruned_directory_never_enters_coverage() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let (scope, req, root) = live_descending(&mut core, &pruning(&["**/node_modules"]));
     core.on_enumerated(req, listed(Vec::new()));
     let _ = drain(&mut core);
@@ -16006,7 +16158,7 @@ mod prune {
   /// watch reports, and every one of them is dropped.
   #[test]
   fn a_descending_scope_delivers_nothing_from_a_pruned_directory() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let (scope, req, root) = live_descending(&mut core, &pruning(&["**/node_modules"]));
     core.on_enumerated(req, listed(vec![entry("node_modules", FileKind::Dir)]));
     let _ = drain(&mut core);
@@ -16055,7 +16207,7 @@ mod prune {
   /// the exclusion half is gated and `node_modules/deep/o.tmp` is delivered.
   #[test]
   fn a_kernel_recursive_scope_that_enforces_exclusions_still_prunes() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_fsevents(&mut core, &pruning(&["**/node_modules"]));
 
     core.on_batch_events(
@@ -16111,7 +16263,7 @@ mod prune {
   /// `node_modules/deep/o.tmp`.
   #[test]
   fn a_probe_parked_word_inside_a_pruned_subtree_is_fenced_at_its_resolution() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_fsevents(&mut core, &pruning(&["**/node_modules"]));
 
     core.on_batch_events(
@@ -16161,7 +16313,7 @@ mod prune {
   /// still reported as the departure it is from inside the reported tree.
   #[test]
   fn a_rename_onto_a_pruned_name_leaves_coverage() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let (scope, req, root) = live_descending(&mut core, &pruning(&["**/node_modules"]));
     core.on_enumerated(req, listed(vec![entry("other", FileKind::Dir)]));
     let _ = drain(&mut core);
@@ -16206,7 +16358,7 @@ mod prune {
   /// the only one the fence keeps.
   #[test]
   fn a_rename_out_of_a_pruned_name_enters_coverage() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let (scope, req, root) = live_descending(&mut core, &pruning(&["**/node_modules"]));
     core.on_enumerated(req, listed(vec![entry("node_modules", FileKind::Dir)]));
     let _ = drain(&mut core);
@@ -16266,7 +16418,7 @@ mod prune {
   /// `covered_paths` and the creation under it is delivered to no one.
   #[test]
   fn a_rename_out_of_a_pruned_position_arms_the_newly_reportable_subtree() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let (scope, req, root) = live_descending(&mut core, &pruning(&["a/cache"]));
     core.on_enumerated(req, listed(vec![entry("a", FileKind::Dir)]));
     let effects = drain(&mut core);
@@ -16371,7 +16523,7 @@ mod prune {
   /// pruned, while leaving the root-wide cover standing.
   #[test]
   fn no_rescan_ever_names_a_pruned_path() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_fsevents(&mut core, &pruning(&["**/node_modules"]));
 
     core.on_batch_events(
@@ -16423,7 +16575,7 @@ mod prune {
   /// and `.env` — cold and live — disappears with `.git`.
   #[test]
   fn a_file_matching_a_prune_pattern_is_not_pruned_by_it() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let (scope, req, root) = live_descending(&mut core, &pruning(&["**/.*"]));
     core.on_enumerated(
       req,
@@ -16493,7 +16645,7 @@ mod prune {
   #[test]
   fn the_sync_cookie_directory_is_never_pruned() {
     const COOKIE_DIR: &str = ".tributaries-sync-cookies-0";
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let (scope, req, root) = live_descending(&mut core, &pruning(&["**/.*"]));
     core.on_enumerated(
       req,
@@ -16557,7 +16709,7 @@ mod prune {
   /// path without anything having to be armed on the way down.
   #[test]
   fn a_nested_cookie_directory_is_never_pruned() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_fsevents(&mut core, &pruning(&["**/.*"]));
 
     core.on_batch_events(
@@ -16635,7 +16787,7 @@ mod prune {
       core.on_batch(scope, BatchPayload::detached(events), now);
     };
 
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = core
       .on_watch_with(
         PathBuf::from("/r"),
@@ -16753,7 +16905,7 @@ mod prune {
   /// directory rename lands with no cover at its destination.
   #[test]
   fn a_probe_resolved_file_rename_buys_no_destination_cover() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_fsevents(&mut core, &pruning(&["a/cache"]));
 
     // A DIRECTORY rename: the subtree relocated, so the destination is covered.
@@ -16852,7 +17004,7 @@ mod prune {
   /// root's own arm, its enumerate and its scope-wide `Rescan` all vanish.
   #[test]
   fn the_root_is_never_pruned() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let (scope, req, _root) = live_descending(&mut core, &pruning(&["**", "*"]));
     core.on_enumerated(req, listed(vec![entry("src", FileKind::Dir)]));
     let effects = drain(&mut core);
@@ -16888,7 +17040,7 @@ mod prune {
   /// coverage with the proven one.
   #[test]
   fn an_unproven_listing_kind_is_staged_and_prunes_at_its_children() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let (_scope, req, _root) = live_descending(&mut core, &pruning(&["**/cache"]));
     core.on_enumerated(
       req,
@@ -16970,7 +17122,7 @@ mod prune {
       );
     };
 
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = core
       .on_watch_with(PathBuf::from("/r"), &pruning(&["cache"]), BackendKind::Rdcw)
       .expect("a fresh scope registers");
@@ -17063,7 +17215,7 @@ mod prune {
       );
     };
 
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = core
       .on_watch_with(PathBuf::from("/r"), &pruning(&["cache"]), BackendKind::Rdcw)
       .expect("a fresh scope registers");
@@ -17129,7 +17281,7 @@ mod prune {
   #[test]
   fn a_deep_descendant_of_the_cookie_directory_is_pruned_normally() {
     const COOKIE_DIR: &str = ".tributaries-sync-cookies-0";
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_fsevents(&mut core, &pruning(&["**/cache"]));
 
     core.on_batch_events(
@@ -17182,7 +17334,7 @@ mod prune {
   /// with `sub/a.tmp`.
   #[test]
   fn a_located_over_at_a_pruned_leaf_widens_to_its_parent() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_fsevents(&mut core, &pruning(&["**/*.tmp", "**/node_modules"]));
 
     core.on_batch_events(
@@ -17223,7 +17375,7 @@ mod prune {
   /// scope-wide cover — never a quiet drop, and still never a path.
   #[test]
   fn a_pruned_leaf_at_the_watch_widens_to_the_scope_cover() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_fsevents(&mut core, &pruning(&["**/*.tmp"]));
 
     core.on_batch_events(
@@ -17278,7 +17430,7 @@ mod prune {
       core.on_batch(scope, BatchPayload::detached(events), now);
     };
 
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = core
       .on_watch_with(
         PathBuf::from("/r"),
@@ -17352,7 +17504,7 @@ mod prune {
   fn an_active_sync_marker_is_delivered_from_pruned_ground() {
     const MARKER: &str = ".tributaries-sync-1-2-3-abcdef";
     const OWNER: crate::driver::CookieId = crate::driver::CookieId(1);
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_fsevents(&mut core, &pruning(&["blocked"]));
     core.arm_sync_marker(scope, Arc::from(MARKER), OWNER);
 
@@ -17489,7 +17641,7 @@ mod prune {
 
     // fanotify: the admission map forgot the moved subtree, so nothing under the
     // destination can ever resolve again.
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_fanotify(&mut core, &pruning(&["blocked"]));
     core.on_batch(
       scope,
@@ -17521,7 +17673,7 @@ mod prune {
     );
 
     // USN: the same shape through the journal lowering's pair.
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_usn(&mut core, &pruning(&["blocked"]));
     let component = |c: &str| UsnTarget::Resolved(vec![c.to_owned()]);
     core.on_batch(
@@ -17555,7 +17707,7 @@ mod prune {
   /// destination the fence takes is never fed, so no reparent is ever reported.
   #[test]
   fn a_descending_directory_rename_into_pruned_ground_covers_the_scope() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let (scope, req, root) = live_descending(&mut core, &pruning(&["blocked"]));
     core.on_enumerated(req, listed(vec![entry("open", FileKind::Dir)]));
     let effects = drain(&mut core);
@@ -17591,7 +17743,7 @@ mod prune {
   /// ground the caller asked never to hear about.
   #[test]
   fn a_rename_into_deeply_pruned_ground_covers_the_nearest_unpruned_parent() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_fanotify(&mut core, &pruning(&["a/blocked"]));
     core.on_batch(
       scope,
@@ -17762,7 +17914,7 @@ mod include {
   /// `notes.txt` changes are delivered alongside the three `clip.mp4` ones.
   #[test]
   fn a_non_matching_file_is_silent_and_a_matching_one_delivers() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let (scope, root) = live_descending(&mut core, &including(&["**/*.mp4"]));
 
     core.on_inotify_events(
@@ -17799,7 +17951,7 @@ mod include {
   /// would never have delivered is armed exactly as it would be without it.
   #[test]
   fn a_directory_delivers_regardless_of_its_name() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let (scope, root) = live_descending(&mut core, &including(&["**/*.mp4"]));
 
     core.on_inotify_events(
@@ -17846,7 +17998,7 @@ mod include {
   /// rename disappears while the consumer keeps `clip.mp4` forever.
   #[test]
   fn a_move_whose_source_matched_delivers() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let (scope, root) = live_descending(&mut core, &including(&["**/*.mp4"]));
 
     core.on_inotify_events(
@@ -17892,7 +18044,7 @@ mod include {
   /// verb and no class flag is exactly the `is_dir: None` case.
   #[test]
   fn an_unproven_object_class_delivers() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_fsevents(&mut core, &including(&["**/*.mp4"]));
 
     core.on_batch_events(
@@ -17927,7 +18079,7 @@ mod include {
   /// than an object, so no file pattern can speak for it.
   #[test]
   fn a_rescan_always_delivers() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_fsevents(&mut core, &including(&["**/*.mp4"]));
 
     core.on_batch_events(
@@ -17961,7 +18113,7 @@ mod include {
   /// it is not asked for.
   #[test]
   fn an_absent_seat_delivers_everything() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let (scope, root) = live_descending(&mut core, &RootOptions::new());
     assert_eq!(
       RootOptions::new().include(),
@@ -18002,7 +18154,7 @@ mod include {
   #[test]
   fn the_sync_cookie_is_admitted_by_a_restrictive_seat() {
     const COOKIE_DIR: &str = ".tributaries-sync-cookies-0";
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_fsevents(&mut core, &including(&["**/*.mp4"]));
 
     core.on_batch_events(
@@ -18082,7 +18234,7 @@ mod include {
   fn an_active_marker_is_admitted_under_a_renamed_cookie_directory() {
     const MARKER: &str = ".tributaries-sync-1-2-3-abcdef";
     const OWNER: crate::driver::CookieId = crate::driver::CookieId(1);
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_fsevents(&mut core, &including(&["**/*.mp4"]));
     core.arm_sync_marker(scope, Arc::from(MARKER), OWNER);
 
@@ -18157,7 +18309,7 @@ mod include {
     const MARKER: &str = ".tributaries-sync-1-2-3-abcdef";
     const PREDECESSOR: crate::driver::CookieId = crate::driver::CookieId(7);
     const SUCCESSOR: crate::driver::CookieId = crate::driver::CookieId(8);
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_fsevents(&mut core, &including(&["**/*.mp4"]));
 
     // The predecessor's admission, then its retirement — which only QUEUES the
@@ -18222,7 +18374,7 @@ mod include {
   #[test]
   fn a_deep_descendant_of_the_cookie_directory_obeys_the_include_seat() {
     const COOKIE_DIR: &str = ".tributaries-sync-cookies-0";
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_fsevents(&mut core, &including(&["**/*.mp4"]));
 
     core.on_batch_events(
@@ -18282,7 +18434,7 @@ mod include {
   /// its `Created` is dropped by the seat, silently.
   #[test]
   fn a_cross_mount_directory_is_delivered_as_the_directory_it_is() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let (scope, root) = live_descending(&mut core, &including(&[]));
 
     // A directory created live arms and cold-reads, and THAT read announces.
@@ -18380,7 +18532,7 @@ mod include {
   /// `mystery` is dropped by a seat that names only `**/*.mp4`.
   #[test]
   fn an_unclassified_listing_entry_survives_a_restrictive_seat() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let (scope, root) = live_descending(&mut core, &including(&["**/*.mp4"]));
 
     core.on_inotify_events(
@@ -18445,7 +18597,7 @@ mod include {
   /// classes — still deliver.
   #[test]
   fn an_empty_seat_admits_no_file_yet_still_delivers_directories() {
-    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let (scope, root) = live_descending(&mut core, &including(&[]));
 
     core.on_inotify_events(

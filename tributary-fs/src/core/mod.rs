@@ -347,6 +347,28 @@ pub(crate) enum CoverNoop {
   RefusedCover,
 }
 
+/// Why the driver did NOT dispatch a mount refresh the core had armed
+/// ([`on_refresh_declined`](DriverCore::on_refresh_declined)).
+///
+/// The two are not the same fact, and the core answers them differently. One is
+/// a coalescing skip over a probe that IS running; the other is a probe that was
+/// never sent, so nothing is going to prove this root's liveness — and a scope
+/// whose liveness cannot be proven has to say so rather than keep a coverage
+/// claim nobody is checking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeclineReason {
+  /// This scope already has a probe outstanding. A second thread on a root that
+  /// has not answered proves nothing, and the running probe's own completion is
+  /// the answer that clears the mark — so the tick costs one interval and
+  /// nothing else.
+  ScopeBusy,
+  /// The watcher is at its liveness-probe budget
+  /// ([`MAX_LIVENESS_PROBES`](crate::driver::MAX_LIVENESS_PROBES)): every slot is
+  /// held by a probe inside a call that may never return, so THIS scope's root is
+  /// being watched for death by nothing at all.
+  BudgetFull,
+}
+
 /// How one settled set-cover fence reports its window.
 ///
 /// # What a clean settle certifies, and what it cannot
@@ -1389,6 +1411,18 @@ struct ScopeState {
   /// predate the newly-lost window, so its result is discarded and one more
   /// refresh re-arms.
   refresh_stale: bool,
+  /// This scope is inside a probe-BUDGET episode: a refresh it armed was
+  /// declined because every liveness-probe slot in the watcher was held
+  /// ([`DeclineReason::BudgetFull`]), and the covering `Rescan` that says so has
+  /// already been routed.
+  ///
+  /// It is an EPISODE latch, not a counter: the loss is "this root's liveness is
+  /// unproven", one fact that stays true for as long as the budget stays full,
+  /// and a subscriber that re-enumerates on the first `Rescan` learns nothing
+  /// from a second one every interval. Cleared by the next refresh of this scope
+  /// that actually completes — the moment a probe answers, the liveness claim is
+  /// proven again and a later episode is a new fact.
+  budget_lossy: bool,
   /// A root REPLACE committed while a refresh was in flight: that snapshot
   /// describes the replaced world, so EVERYTHING it carries — the liveness
   /// verdict included — is about an object this scope no longer watches.
@@ -1805,13 +1839,38 @@ pub(crate) struct DriverCore {
   /// record, the two places a directory can enter coverage from. Nothing here
   /// refuses an arm, so nothing here can produce that rescan.
   exclusions: Vec<PathBuf>,
+  /// The EXACT directory leaf this process reserves for its sync cookies — the
+  /// one name [`on_set_cover`](Self::on_set_cover) exempts from the shrink.
+  ///
+  /// It is the exact leaf rather than the classifier
+  /// ([`is_sync_cookie_dir_name`](crate::is_sync_cookie_dir_name)) because the
+  /// classifier recognizes a whole NAME SPACE — the bare stem and every canonical
+  /// `u32` qualifier — and any peer that can create directories under the watched
+  /// tree can fill it. Exempting the space would let a covered directory
+  /// populated with `…-0`, `…-1`, `…-2` keep one watch descriptor per forged
+  /// sibling across every shrink, so the set-cover could be defeated as a
+  /// reclamation mechanism until the watch table ran out. Exempting the one leaf
+  /// this process would actually write into keeps the bound the exemption claims:
+  /// at most ONE extra watch per covered directory, by construction.
+  ///
+  /// `None` where the platform reserves no stable leaf — Windows mints a fresh
+  /// directory name per obligation and never looks one up, so there is no name to
+  /// exempt (and its backend is kernel-recursive, which `on_set_cover` refuses
+  /// before the rule is ever reached).
+  reserved_cookie_dir: Option<Arc<str>>,
 }
 
 impl DriverCore {
-  /// Builds a core whose Monitor pairs renames within `move_window` and re-stats
+  /// Builds a core whose Monitor pairs renames within `move_window`, re-stats
   /// each tick-armed scope's root every `root_liveness_interval`
-  /// (`Duration::ZERO` disables that tick).
-  pub(crate) fn new(move_window: Duration, root_liveness_interval: Duration) -> Self {
+  /// (`Duration::ZERO` disables that tick), and exempts exactly
+  /// `reserved_cookie_dir` from a set-cover shrink (see that field for why it is
+  /// one leaf and not the reserved name space).
+  pub(crate) fn new(
+    move_window: Duration,
+    root_liveness_interval: Duration,
+    reserved_cookie_dir: Option<Arc<str>>,
+  ) -> Self {
     let mut monitor = Monitor::new(caps_for(BackendKind::FsEvents));
     monitor.set_move_window(move_window);
     Self {
@@ -1832,6 +1891,7 @@ impl DriverCore {
       cookie_seq: 0,
       root_liveness_interval,
       exclusions: Vec::new(),
+      reserved_cookie_dir,
     }
   }
 
@@ -2108,6 +2168,7 @@ impl DriverCore {
         mounts_authoritative: false,
         refresh_pending: false,
         refresh_stale: false,
+        budget_lossy: false,
         refresh_world_stale: false,
         lag: LagState::Normal,
         park: Park::default(),
@@ -2263,6 +2324,8 @@ impl DriverCore {
     // The cover the previous reconcile settled on: the grow keys its re-arm on the delta
     // against THIS, not on which watches survive.
     let prev_cover = state.applied_cover.clone();
+    // The one exempt leaf, taken out of `self` before the walk borrows it.
+    let reserved = self.reserved_cookie_dir.clone();
 
     // --- PRUNE (the shrink half): drop every descended watch strictly OUTSIDE the cover ---
     // This scope's descended (non-root) watches strictly OUTSIDE every retained prefix,
@@ -2275,10 +2338,43 @@ impl DriverCore {
       .filter(|(watch, watch_scope)| **watch_scope == scope && **watch != root_watch)
       .filter_map(|(watch, _)| {
         let path = self.path_of(state, *watch)?;
-        let strictly_outside = retained
-          .iter()
-          .all(|r| !path.starts_with(r) && !r.starts_with(path.as_path()));
-        strictly_outside.then(|| (path.components().count(), *watch))
+        // The reserved cookie directory of a COVERED directory is not dropped, however far
+        // outside the cover its own name lies. It is a sibling of whatever the cover
+        // retained, so a cover naming a file subscription marks it strictly outside and
+        // takes it — and the next sync into that directory reuses the reserved directory
+        // already standing (the EEXIST arm), so no directory create ever reaches the
+        // parent's watch to re-arm it. On a descending backend the marker is then born in
+        // unarmed ground, no source event exists at all, and the barrier can only time out.
+        //
+        // The exemption is the NAME's and the PARENT's together: the marker's landing
+        // directory is coverage the sync barrier depends on and the cover — which speaks
+        // for the caller's subscriptions — cannot know to name. It keeps at most one watch
+        // per covered directory that already carries a reserved directory, so it is bounded
+        // by what was already armed. A reserved directory under ground the cover genuinely
+        // narrowed away goes with that ground: a sync of an uncovered directory is refused
+        // before birth, so nothing will ever land there. The root needs no case of its own —
+        // it is an ancestor of every retained prefix, so it is never strictly outside.
+        //
+        // This is the set-cover's half of the rule the prune seat already states for
+        // patterns: the marker exemption keeps the record reportable, this keeps it
+        // observable.
+        //
+        // The name is matched for EQUALITY against the one leaf this process
+        // reserves, never against the classifier's whole name space
+        // ([`reserved_cookie_dir`](Self::reserved_cookie_dir)): the space is
+        // predictable and unowned, so any peer could fill a covered directory with
+        // reserved-shaped siblings and keep a watch descriptor per forged name
+        // across every shrink. Equality is what makes "one extra watch per covered
+        // directory" a construction rather than a hope.
+        let reserved_cookie_dir = path
+          .file_name()
+          .and_then(std::ffi::OsStr::to_str)
+          .is_some_and(|leaf| reserved.as_deref() == Some(leaf))
+          && path
+            .parent()
+            .is_some_and(|parent| !strictly_outside(retained, parent));
+        let outside = strictly_outside(retained, &path) && !reserved_cookie_dir;
+        outside.then(|| (path.components().count(), *watch))
       })
       .collect();
     outside.sort_unstable_by_key(|(depth, _)| *depth);
@@ -3573,6 +3669,16 @@ impl DriverCore {
     // cross-world so its completion (liveness verdict included) is discarded
     // rather than judging the new identity by the old object.
     state.refresh_world_stale = state.refresh_pending;
+    // And DISOWN it. Coalescing onto an outstanding refresh is right within one
+    // world and wrong across a commit: the old root's probe may be inside a
+    // `stat` on a wedged mount and never come back, and the replacement would
+    // then wait for it — no refresh of its own, so no mount authority and, worse,
+    // no root-liveness check at all, leaving an unmounted replacement reading
+    // live forever. The arm below therefore issues a REAL refresh rather than
+    // setting the stale bit, and the driver retires the scope's probe tag at the
+    // same commit so the old root's late answer is dropped instead of applied.
+    state.refresh_pending = false;
+    state.refresh_stale = false;
     // A replace commit ends any witnessed widen window outright: the fallback
     // route lands here with the tainted (or refused) window still recorded,
     // and the replacement's own spawn barrier re-established the binding from
@@ -3645,6 +3751,40 @@ impl DriverCore {
       .scopes
       .get(&scope)
       .map_or_else(Globs::default, |state| state.prune.clone())
+  }
+
+  /// Whether `dir` is inside the coverage this scope's applied set-cover still claims —
+  /// the sync admission's membership test, answered lexically because the cover is a
+  /// lexical statement about paths.
+  ///
+  /// `true` whenever there is nothing to be outside of, which is every case but a
+  /// descending scope a caller narrowed:
+  ///
+  /// - an **unknown scope** — the admission's own live-root gate speaks for that, and
+  ///   fail-open is the direction every coverage test here takes;
+  /// - a scope with **no applied cover** (`None`) — never narrowed, so the root's whole
+  ///   subtree is covered. A kernel-recursive scope is permanently here: `on_set_cover`
+  ///   refuses it before recording anything, because a whole-subtree stream has no
+  ///   per-directory coverage to narrow;
+  /// - a scope whose applied cover is **empty** — the degraded claim a standing `Rescan`
+  ///   leaves behind (see [`ScopeState::applied_cover`]). It claims no narrowing at all
+  ///   and is being re-armed from the root, so it fences nothing; reading it as the
+  ///   literal cover would mark every path outside, vacuously.
+  ///
+  /// Otherwise `dir` must be an ancestor or a descendant of some retained prefix. A
+  /// directory strictly outside is ground the caller's own cover asked this scope to stop
+  /// watching, so a marker written there could never be observed — the admission refuses
+  /// it before birth ([`DirUncovered`](crate::error::SyncRootError::DirUncovered)).
+  pub(crate) fn covers(&self, scope: ScopeId, dir: &Path) -> bool {
+    let Some(cover) = self
+      .scopes
+      .get(&scope)
+      .and_then(|state| state.applied_cover.as_deref())
+      .filter(|cover| !cover.is_empty())
+    else {
+      return true;
+    };
+    !strictly_outside(cover, dir)
   }
 
   /// A live scope's mount frame `(root_dev, root_mnt_id)` — the same-frame
@@ -3908,6 +4048,11 @@ impl DriverCore {
     state.identity = Some(meta.identity);
     state.mounts = meta.mounts;
     state.refresh_world_stale = state.refresh_pending;
+    // Disowned for the reason the stream replace disowns it: a widened root is a
+    // different object, and its first refresh must not be one the OLD root's
+    // possibly-wedged probe still owes (see [`Self::on_root_replaced`]).
+    state.refresh_pending = false;
+    state.refresh_stale = false;
     // The witnessed window is CONSUMED by the commit (INV-ROOT): it was clean
     // through the taint gate above, the splice landed, and from here the
     // reserved id is a KNOWN root — its death records run the ordinary
@@ -4005,6 +4150,74 @@ impl DriverCore {
     effects.push_back(Effect::RefreshMounts { scope, root });
   }
 
+  /// Withdraws the refresh `scope` has pending because the driver DECLINED to
+  /// dispatch it, and — where the decline means nothing is proving this root's
+  /// liveness — says so on the scope's own stream.
+  ///
+  /// Coalescing is right only onto a probe that is actually running. A pending
+  /// mark standing for a probe nobody sent would swallow every later arming for
+  /// this scope — `arm_refresh` would set the stale bit and return — and nothing
+  /// would ever clear it, because the completion that clears it is the one that
+  /// was never dispatched. Dropping the mark costs one interval and lets the next
+  /// tick try again, which is exactly what a saturated budget should degrade to.
+  ///
+  /// The liveness deadline is re-armed here too, and that is not decoration: the
+  /// deadline is seeded by a completing refresh, so a scope whose BIRTH refresh is
+  /// the one declined has no deadline yet and would never tick again — the
+  /// silently permanent hole a budget must not open.
+  ///
+  /// # A declined probe is a lost PROOF, and [`BudgetFull`](DeclineReason::BudgetFull)
+  /// says so
+  ///
+  /// Dropping the mark and re-arming the deadline is the whole answer for
+  /// [`ScopeBusy`](DeclineReason::ScopeBusy): a probe of this scope is running,
+  /// and its completion is the proof. At the BUDGET there is no such probe. Every
+  /// slot is held by a call that may never return, so this root's death — which
+  /// on a descending backend can be postponed indefinitely by a descriptor a
+  /// stalled write is holding — has nothing left to detect it, and the next tick
+  /// will be declined for the same reason. Withdrawing the mark alone would leave
+  /// the scope FALSELY LIVE and silent: the subscriber keeps a coverage claim
+  /// nobody is checking and is never told.
+  ///
+  /// So the scope goes through the loss funnel the rest of the core already uses
+  /// — the Monitor turns it into an epoch-bumped covering `Rescan` — and the
+  /// subscriber learns that its coverage is UNPROVEN and must re-enumerate,
+  /// rather than being told a root is alive on no evidence. The retry deadline is
+  /// kept: this is a degradation, not a terminal.
+  ///
+  /// ONCE per episode ([`budget_lossy`](ScopeState::budget_lossy)). The fact is
+  /// "this root's liveness is unproven", which does not become more true each
+  /// interval, and a `Rescan` per tick against a saturated budget would be a
+  /// re-enumeration storm on top of a filesystem that is already wedged. The
+  /// latch clears at the next completing refresh of this scope, so a LATER
+  /// episode reports again.
+  ///
+  /// Deliberately NOT the full [`on_root_overflow`](Self::on_root_overflow)
+  /// treatment: device trust is left alone, because closing it arms another
+  /// refresh — the very effect the budget cannot dispatch — and parked work is
+  /// left alone, because nothing here says a window was dropped.
+  pub(crate) fn on_refresh_declined(
+    &mut self,
+    scope: ScopeId,
+    now: Instant,
+    reason: DeclineReason,
+  ) {
+    let interval = self.root_liveness_interval;
+    let Some(state) = self.scopes.get_mut(&scope) else {
+      return;
+    };
+    state.refresh_pending = false;
+    Self::arm_liveness(state, interval, now);
+    let unproven = match reason {
+      DeclineReason::ScopeBusy => false,
+      DeclineReason::BudgetFull => !std::mem::replace(&mut state.budget_lossy, true),
+    };
+    if unproven {
+      self.monitor.on_overflow(Scope::Root(scope), now);
+      self.drain_monitor();
+    }
+  }
+
   /// (Re)arms the periodic root-liveness deadline for a tick-armed scope whose
   /// root is live, or clears it when the tick does not apply (a backend
   /// [`liveness_ticked`](Self::liveness_ticked) refuses, `Duration::ZERO`, or a
@@ -4039,6 +4252,11 @@ impl DriverCore {
     let Some(state) = self.scopes.get_mut(&scope) else {
       return;
     };
+    // A probe of this scope answered, whatever it answered: the budget episode
+    // that left its liveness unproven is over, so a LATER one is a fresh fact and
+    // reports again ([`on_refresh_declined`]). Cleared ahead of every gate below,
+    // since each of them is a completion too.
+    state.budget_lossy = false;
     // The cross-world gate precedes even the death gate: this completion was
     // addressed to a root this scope REPLACED, so its liveness verdict is
     // about the old object — evidence for a world that ended at the commit,
@@ -6389,6 +6607,20 @@ fn crosses_mount_boundary(state: &ScopeState, entry: &RawDirEntry) -> bool {
     (Some(root_mnt), Some(entry_mnt)) if root_mnt != entry_mnt
   );
   device_boundary || mount_boundary
+}
+
+/// Whether `path` lies STRICTLY OUTSIDE `retained` — neither a descendant of a retained
+/// prefix (its coverage was asked for) nor an ancestor of one (it connects the root to
+/// coverage that was). The set-cover's prune predicate, and the membership test the sync
+/// admission asks the applied cover; lexical, exactly as the cover itself is.
+///
+/// An EMPTY `retained` marks every path outside, vacuously — which is why the empty cover
+/// is never applied as a narrowing (`on_set_cover` refuses it) and never read as one (see
+/// [`DriverCore::covers`]).
+fn strictly_outside(retained: &[PathBuf], path: &Path) -> bool {
+  retained
+    .iter()
+    .all(|r| !path.starts_with(r) && !r.starts_with(path))
 }
 
 /// The retained prefixes in `new` the PREVIOUS applied cover `prev` did not already cover —

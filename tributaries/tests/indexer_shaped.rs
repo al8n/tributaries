@@ -445,7 +445,9 @@ impl<R: RuntimeLite> Source<Comp> for IndexerSource<R> {
       // rather than to a silent success.
       Err(SyncRootDenied { error, .. }) => Err(match error {
         SyncRootError::UnknownRoot | SyncRootError::Retired => SyncError::Retired,
-        SyncRootError::DirOutsideRoot { .. } => SyncError::CookieDirUncovered,
+        SyncRootError::DirOutsideRoot { .. } | SyncRootError::DirUncovered { .. } => {
+          SyncError::CookieDirUncovered
+        }
         // No physical write happened and both are retryable, so they are the dedicated
         // transient refusal rather than a write failure a caller might read as terminal.
         SyncRootError::WriteInFlight | SyncRootError::CleanupBacklog => SyncError::Busy,
