@@ -11438,6 +11438,32 @@ mod replace {
 mod sync_cookie {
   use super::*;
 
+  /// The door's whole sampling, taken here on the test's own thread: the three
+  /// readings a real door runs as three pool jobs, assembled under one permit.
+  ///
+  /// A cell reaching straight for the write wants the VALUE a door would have
+  /// handed the driver, not the door's cancellation shape — so it takes the three
+  /// points in the door's own order through the door's own entry point
+  /// ([`AdmittedDirs::read_one`]), and a reading that fails fails the cell.
+  #[cfg(all(
+    not(miri),
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+  ))]
+  fn sample_admission(root: &Path, dir: &Path) -> crate::driver::AdmittedDirs {
+    use crate::driver::SyncDoorPoint;
+
+    let read = |point| {
+      crate::driver::AdmittedDirs::read_one(point, root, dir)
+        .expect("the staged directories are readable")
+    };
+    crate::driver::AdmittedDirs::held(
+      crate::driver::SyncPinAllowance::permit(),
+      read(SyncDoorPoint::Root),
+      read(SyncDoorPoint::Target),
+      read(SyncDoorPoint::Cookies),
+    )
+  }
+
   /// The rule the Windows marker create is re-read against, asked of names alone
   /// so every host can run it.
   ///
@@ -15989,12 +16015,7 @@ mod sync_cookie {
       let live = crate::driver::LiveRoot::for_tests(&parent);
       let pinned =
         CookieParent::open(live.identity(), &parent, &parent).expect("the scratch parent opens");
-      let admitted = crate::driver::AdmittedDirs::read(
-        crate::driver::SyncPinAllowance::permit(),
-        &parent,
-        &parent,
-      )
-      .expect("the scratch parent's directories are readable");
+      let admitted = sample_admission(&parent, &parent);
       let dir = Arc::new(
         CookieDir::open_or_create(&pinned, admitted.cookies())
           .expect("a cookie directory is minted"),
@@ -17565,8 +17586,7 @@ mod sync_cookie {
     /// the object with it. A cell about a REPLACEMENT binds it earlier instead, at
     /// the moment its sync would have been admitted.
     fn admitted(root: &Path, dir: &Path) -> crate::driver::AdmittedDirs {
-      crate::driver::AdmittedDirs::read(crate::driver::SyncPinAllowance::permit(), root, dir)
-        .expect("the staged directories are readable")
+      sample_admission(root, dir)
     }
 
     /// A cookie directory inside `parent`, reached the way a real write reaches
@@ -18278,6 +18298,682 @@ mod sync_cookie {
       let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Arms the next reading of a minted directory at `point` to FAIL, and
+    /// disarms whatever is left of the arming when the returned guard drops.
+    ///
+    /// One shot, for [`MidMarkerPeer`]'s reason: the cell's second write must see
+    /// the real filesystem, so a fault that outlived the call it was armed for
+    /// would refuse a write that was doing nothing wrong.
+    struct ProofFault;
+
+    impl ProofFault {
+      fn arm(point: crate::driver::CookieProofPoint) -> Self {
+        crate::driver::COOKIE_PROOF_FAULT.set(Some(point));
+        Self
+      }
+    }
+
+    impl Drop for ProofFault {
+      fn drop(&mut self) {
+        crate::driver::COOKIE_PROOF_FAULT.set(None);
+      }
+    }
+
+    /// A post-marker reading that FAILS answers the unproven-directory refusal —
+    /// the retryable one, with the marker withdrawn — and never a write failure.
+    ///
+    /// The distinction is the caller's whole decision. `replaced` is typed
+    /// [`SyncRootError::DirReplaced`] by the driver, which the umbrella classifies
+    /// `Busy`: nothing was created, re-mint and try again. A bare `source` is typed
+    /// `Write`, which the umbrella classifies `CookieWrite` — the shape a caller
+    /// reads as terminal and abandons the sync over. A `readdir` that failed once,
+    /// or a name that could not be read back off a descriptor, is transient, and
+    /// classifying it terminal loses a barrier that would have resolved on the next
+    /// attempt.
+    ///
+    /// Both readings are taken through a descriptor this write is already holding,
+    /// so their failures cannot be provoked by arranging a real tree — a seam is
+    /// the only way to reach the arm at all, and the arm is exactly what the
+    /// classification lives in.
+    ///
+    /// Revert witness: answer either arm with the clean write failure and the
+    /// refusal carries no `replaced` name, so the driver types it `Write` and the
+    /// umbrella hands the caller a terminal-looking `CookieWrite`.
+    #[test]
+    fn an_unreadable_minted_directory_is_refused_as_unproven() {
+      for (point, tag, seq) in [
+        (crate::driver::CookieProofPoint::HoldsOnly, "holds-only", 51),
+        (crate::driver::CookieProofPoint::Landing, "landing", 52),
+      ] {
+        let root = scratch(&std::format!("marker-proof-{tag}"));
+        let target = root.join("a");
+        std::fs::create_dir_all(&target).expect("the directory the sync names");
+        let fs = RealFs::new();
+        let live = crate::driver::LiveRoot::for_tests(&root);
+        let reserved = target.join(cookie_dir_name());
+
+        let fault = ProofFault::arm(point);
+        let written = fs.write_cookie(
+          &live,
+          &target,
+          admitted(&root, &target),
+          &std::format!(".tributaries-sync-1-2-{seq}-00000000000000{seq}"),
+          &tributary_proto::glob::Globs::default(),
+          &[],
+        );
+        drop(fault);
+
+        let refusal =
+          written.expect_err("a directory whose proof could not be read is not one to write in");
+        assert_eq!(
+          refusal.replaced.as_deref(),
+          Some(&reserved),
+          "the {tag} reading refuses as UNPROVEN, naming the directory the marker \
+           went in — which is what the driver types `DirReplaced` on: {refusal:?}"
+        );
+        assert!(
+          refusal.residue.is_none(),
+          "the marker was withdrawn, so this write owes nothing: {refusal:?}"
+        );
+        assert!(
+          refusal.source.to_string().contains("could not be read"),
+          "and it carries the READING's own failure rather than the manufactured \
+           message the object-changed verdict renders: {refusal:?}"
+        );
+        assert!(
+          leaves_in(&reserved).is_empty(),
+          "and nothing of this write is left on disk: {:?}",
+          leaves_in(&reserved)
+        );
+
+        // The fault was one shot, so the retry the refusal invites reads the real
+        // filesystem and writes — which is the whole point of classifying it
+        // retryable.
+        let name = std::format!(
+          ".tributaries-sync-1-2-{}-00000000000000{}",
+          seq + 10,
+          seq + 10
+        );
+        fs.write_cookie(
+          &live,
+          &target,
+          admitted(&root, &target),
+          &name,
+          &tributary_proto::glob::Globs::default(),
+          &[],
+        )
+        .expect("the retry the refusal invites succeeds");
+        assert_eq!(
+          leaves_in(&reserved),
+          vec![name],
+          "and the marker is the only thing in the directory"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+      }
+    }
+
+    /// Arms `peer` to run ONCE in the window between a post-create refusal and
+    /// the withdrawal that answers it, and disarms it again when the returned
+    /// guard drops.
+    ///
+    /// One shot, for [`MidMarkerPeer`]'s reason: the peer must act in that one
+    /// window and on no later withdrawal this cell provokes.
+    struct MidWithdrawalPeer;
+
+    impl MidWithdrawalPeer {
+      fn arm(peer: impl FnOnce() + 'static) -> Self {
+        let mut peer = Some(peer);
+        crate::driver::COOKIE_WITHDRAW_STEP.with_borrow_mut(|slot| {
+          *slot = Some(Box::new(move || {
+            if let Some(peer) = peer.take() {
+              peer();
+            }
+          }));
+        });
+        Self
+      }
+    }
+
+    impl Drop for MidWithdrawalPeer {
+      fn drop(&mut self) {
+        crate::driver::COOKIE_WITHDRAW_STEP.with_borrow_mut(|slot| *slot = None);
+      }
+    }
+
+    /// The file half of a refusal's residue, for the cells that then run the
+    /// driver's own retry against it. Panics on a refusal that claims to owe
+    /// nothing, because that claim is exactly what those cells are about.
+    fn owed_file(refusal: crate::driver::CookieWriteError) -> crate::driver::CookieResidue {
+      match refusal.residue {
+        Some(residue) => *residue,
+        None => panic!(
+          "this write left a file on disk and must hand it back as a counted \
+           residue: {refusal:?}"
+        ),
+      }
+    }
+
+    /// A marker RENAMED between the post-create refusal and the withdrawal is
+    /// still owed — and the driver's own retry finds it again by IDENTITY.
+    ///
+    /// The window is narrow and entirely real: the marker exists, a post-create
+    /// proof has refused, and the write is about to destroy what it made. A trusted
+    /// same-uid peer that renames the marker to another leaf inside that window
+    /// makes the destroy's `unlinkat` answer `ENOENT` — for a file that is still
+    /// perfectly linked. Reading that as "the object is gone" retires the
+    /// obligation as never-created, releases its marker exemption and frees the cap
+    /// slot that was supposed to bound exactly this, while the file sits in the
+    /// reserved directory outside every ledger cap; repeat it and the residue
+    /// accumulates with nothing counting it.
+    ///
+    /// So the held descriptor decides, not the name. The link count says the object
+    /// is still named somewhere, the refusal comes back carrying the file, and the
+    /// retry — the very call [`reap_residue`] makes — enumerates the reserved
+    /// directory through its own descriptor and unlinks the entry whose object IS
+    /// this one. The record retires only once that is done.
+    ///
+    /// Revert witness: answer the destroy's `NotFound` with the clean refusal and
+    /// this cell's first assertion fails — the write reports owing nothing while
+    /// the renamed marker is still on disk.
+    #[test]
+    fn a_marker_renamed_before_its_withdrawal_is_owed_and_reaped_by_identity() {
+      let root = scratch("marker-renamed-withdraw");
+      let target = root.join("a");
+      std::fs::create_dir_all(&target).expect("the directory the sync names");
+      let fs = RealFs::new();
+      let live = crate::driver::LiveRoot::for_tests(&root);
+      let reserved = target.join(cookie_dir_name());
+      let name = ".tributaries-sync-1-2-61-0000000000000061";
+
+      // The refusal that sends the write to the withdrawal, and the peer that acts
+      // in the window that withdrawal opens: one rename, inside the reserved
+      // directory, onto a leaf nothing recorded.
+      let fault = ProofFault::arm(crate::driver::CookieProofPoint::HoldsOnly);
+      let (minted, renamed) = (reserved.join(name), reserved.join("stolen"));
+      let peer = MidWithdrawalPeer::arm(move || {
+        std::fs::rename(&minted, &renamed).expect("the peer renames the marker aside");
+      });
+      let written = fs.write_cookie(
+        &live,
+        &target,
+        admitted(&root, &target),
+        name,
+        &tributary_proto::glob::Globs::default(),
+        &[],
+      );
+      drop(peer);
+      drop(fault);
+
+      let refusal = written.expect_err("the armed proof refuses this write");
+      assert_eq!(
+        leaves_in(&reserved),
+        vec!["stolen".to_owned()],
+        "staging: the peer's rename landed, so the destroy found nothing at the \
+         marker's own name"
+      );
+      let mut residue = owed_file(refusal);
+      assert!(
+        matches!(residue, crate::driver::CookieResidue::File(_)),
+        "an entry gone at the name is not an object gone: the write still owes the \
+         FILE it created, pin and all"
+      );
+
+      // The driver's own retry, run exactly as `reap_residue` runs it. The name the
+      // record carries is empty now, so the only thing that can find this object is
+      // its identity.
+      crate::driver::reap_residue(&fs, &mut residue)
+        .expect("the retry removes the renamed marker by identity");
+      assert!(
+        leaves_in(&reserved).is_empty(),
+        "and the reserved directory ends empty: {:?}",
+        leaves_in(&reserved)
+      );
+
+      let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The same rename, but OUT of the reserved directory: the record does not
+    /// retire, because nothing this driver may unlink names the object any more.
+    ///
+    /// The removal is anchored to one directory by design — it addresses entries of
+    /// the descriptor the create was made through and resolves no path — so an
+    /// object linked outside that directory is one it must not delete. What it must
+    /// also not do is claim to have. The honest outcome is the FAILED removal a
+    /// refused unlink already produces: the record stays counted, the ledger's
+    /// attempt budget carries it, and close reports it under a typed terminal
+    /// instead of retiring it as never-created over a file still on disk.
+    ///
+    /// Revert witness: answer the empty name `AlreadyGone` and the retry below
+    /// succeeds while the escaped marker is still in the target.
+    #[test]
+    fn a_marker_renamed_out_of_the_reserved_directory_never_retires_as_gone() {
+      let root = scratch("marker-escaped-withdraw");
+      let target = root.join("a");
+      std::fs::create_dir_all(&target).expect("the directory the sync names");
+      let fs = RealFs::new();
+      let live = crate::driver::LiveRoot::for_tests(&root);
+      let reserved = target.join(cookie_dir_name());
+      let name = ".tributaries-sync-1-2-62-0000000000000062";
+      let escaped = target.join("escaped");
+
+      let fault = ProofFault::arm(crate::driver::CookieProofPoint::HoldsOnly);
+      let (minted, out) = (reserved.join(name), escaped.clone());
+      let peer = MidWithdrawalPeer::arm(move || {
+        std::fs::rename(&minted, &out).expect("the peer renames the marker out of reach");
+      });
+      let written = fs.write_cookie(
+        &live,
+        &target,
+        admitted(&root, &target),
+        name,
+        &tributary_proto::glob::Globs::default(),
+        &[],
+      );
+      drop(peer);
+      drop(fault);
+
+      let refusal = written.expect_err("the armed proof refuses this write");
+      assert!(
+        escaped.exists(),
+        "staging: the peer's rename put the marker outside the anchored directory"
+      );
+      let mut residue = owed_file(refusal);
+
+      let failed = crate::driver::reap_residue(&fs, &mut residue).expect_err(
+        "a removal that cannot reach the object reports a FAILURE, so the record \
+         stays counted rather than retiring over a live file",
+      );
+      assert!(
+        failed.to_string().contains("still linked"),
+        "and the failure names what happened: {failed}"
+      );
+      assert!(
+        escaped.exists(),
+        "the file is still there — nothing outside the anchored directory was touched"
+      );
+      assert!(
+        leaves_in(&reserved).is_empty(),
+        "and nothing of this write remains inside it either"
+      );
+
+      let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A reserved directory already read to its END is walked again from the
+    /// START — and so is the walk after that.
+    ///
+    /// One descriptor serves an obligation for its whole life, and more than one
+    /// walk runs through it: the sole-entry proof reads it to the end at the
+    /// create, and every later locate-by-identity reads it again. A read POSITION
+    /// belongs to the open file description rather than to the descriptor, so a
+    /// `dup` of a directory the proof has already finished hands `fdopendir` a
+    /// stream that is ALREADY at the end — it enumerates nothing, the locate
+    /// reports no match, and the retry that follows inherits the very same position
+    /// and reports the very same nothing. The obligation then parks over a marker
+    /// sitting in that directory the whole time, plainly visible to anything that
+    /// opened it fresh.
+    ///
+    /// Opening `.` relative to the held descriptor is what makes each walk its own:
+    /// the same object, no path resolved, a position of its own at zero.
+    ///
+    /// Two hunts, because one proves only that a single walk survives the proof's
+    /// position. The second is what a driver actually does when a peer moves a
+    /// marker twice, and a position carried forward would leave it blind exactly as
+    /// it left the first.
+    ///
+    /// Revert witness: hand `fdopendir` a `try_clone` of the held descriptor again
+    /// and the first removal below fails — the duplicate opens at the proof's
+    /// end-of-directory and the renamed marker is never found.
+    #[test]
+    fn a_finished_walk_does_not_leave_the_next_one_at_the_end() {
+      let root = scratch("walk-restarts");
+      let target = root.join("a");
+      std::fs::create_dir_all(&target).expect("the directory the sync names");
+      let fs = RealFs::new();
+      let live = crate::driver::LiveRoot::for_tests(&root);
+      let reserved = target.join(cookie_dir_name());
+      let name = ".tributaries-sync-1-2-63-0000000000000063";
+
+      // The write mints the reserved directory and proves it holds nothing but this
+      // marker — an enumeration that runs to the END of the very descriptor the
+      // record keeps for every walk after it.
+      let cookie = fs
+        .write_cookie(
+          &live,
+          &target,
+          admitted(&root, &target),
+          name,
+          &tributary_proto::glob::Globs::default(),
+          &[],
+        )
+        .expect("a directory holding nothing but this write's marker is entered");
+      assert_eq!(
+        leaves_in(&reserved),
+        vec![name.to_owned()],
+        "staging: the proof ran, so the directory has been read to its end"
+      );
+
+      // A peer renames the marker aside. Its own name is empty now, so the only
+      // thing that can still reach it is a walk of that same descriptor.
+      std::fs::rename(reserved.join(name), reserved.join("stolen"))
+        .expect("the peer renames the marker aside");
+      assert_eq!(
+        fs.remove_cookie(&cookie)
+          .expect("the removal walks the directory again and finds the marker"),
+        CookieRemoval::Unlinked,
+        "the walk started over, so the renamed marker was there to be found"
+      );
+      assert!(
+        leaves_in(&reserved).is_empty(),
+        "and it is gone: {:?}",
+        leaves_in(&reserved)
+      );
+
+      // And the walk AFTER that one starts over too. A fresh object in the same
+      // directory, hunted through the same descriptor the two finished walks ran
+      // on.
+      let anchor = cookie
+        .dir
+        .as_deref()
+        .expect("the record is anchored to the reserved directory");
+      let planted = std::fs::File::create(reserved.join("planted"))
+        .expect("a second object inside the reserved directory");
+      let identity = identity_of_handle(&planted)
+        .expect("its identity reads off the descriptor")
+        .expect("this platform answers one");
+      assert!(
+        unlink_entry_by_identity(anchor, identity).expect("the second hunt walks the directory"),
+        "the third walk started over as well, so it found the planted object"
+      );
+      assert!(
+        leaves_in(&reserved).is_empty(),
+        "and unlinked it: {:?}",
+        leaves_in(&reserved)
+      );
+
+      let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A marker this write really created, in a reserved directory this write
+    /// really minted, recorded exactly as the ledger records one — the staging the
+    /// cleanup cells below all start from, so what they then provoke is provoked
+    /// against a real record and not a synthesized stand-in.
+    fn landed_marker(fs: &RealFs, root: &Path, target: &Path, name: &str) -> CookieFile {
+      let live = crate::driver::LiveRoot::for_tests(root);
+      fs.write_cookie(
+        &live,
+        target,
+        admitted(root, target),
+        name,
+        &tributary_proto::glob::Globs::default(),
+        &[],
+      )
+      .expect("a directory holding nothing but this write's marker is entered")
+    }
+
+    /// A marker RENAMED aside with a peer's own file left standing at its leaf is
+    /// still unlinked — the name says displaced, and the name is not what settles
+    /// this.
+    ///
+    /// `Displaced` is a true and useful verdict about a leaf: something that is not
+    /// this cookie is at the name, and deleting it would destroy data this driver
+    /// never made. What it is NOT is a verdict about the cookie. A trusted same-uid
+    /// peer that renames the marker to another leaf and drops an ordinary file at
+    /// the one it came from produces exactly this reading over a marker that is
+    /// sitting in the same directory, fully linked — and answering the obligation
+    /// with it retires the record `ConfirmedGone`, spends the pin, releases the
+    /// marker exemption and frees the cap slot that was supposed to bound this very
+    /// thing. Close then reports a quiescent tree over a file the reserved
+    /// namespace suppresses and nothing counts, and repeating the sequence piles
+    /// them up outside every ledger bound.
+    ///
+    /// The pin's LINK COUNT is what the terminal is taken on instead: still linked
+    /// means still owed, so the removal hunts the object down by identity through
+    /// the directory it is anchored to and answers only once nothing names it.
+    ///
+    /// Revert witness: settle the name's verdict without consulting the pin and
+    /// this cell's removal answers `Displaced` with the renamed marker still on
+    /// disk.
+    #[test]
+    fn a_marker_renamed_under_a_peers_file_is_still_unlinked_by_identity() {
+      let root = scratch("marker-renamed-under-file");
+      let target = root.join("a");
+      std::fs::create_dir_all(&target).expect("the directory the sync names");
+      let fs = RealFs::new();
+      let reserved = target.join(cookie_dir_name());
+      let name = ".tributaries-sync-1-2-64-0000000000000064";
+      let cookie = landed_marker(&fs, &root, &target, name);
+
+      // The peer moves the marker aside and stands a file of its OWN at the leaf it
+      // came from, so the name now denotes an ordinary object this driver neither
+      // created nor may delete.
+      std::fs::rename(reserved.join(name), reserved.join("stolen"))
+        .expect("the peer renames the marker aside");
+      std::fs::write(reserved.join(name), STRANGER)
+        .expect("and stands a file of its own at the leaf");
+
+      assert_eq!(
+        fs.remove_cookie(&cookie)
+          .expect("the cleanup settles rather than failing"),
+        CookieRemoval::Unlinked,
+        "the marker was found by identity and unlinked, whatever the name said"
+      );
+      assert_eq!(
+        leaves_in(&reserved),
+        vec![name.to_owned()],
+        "and the peer's own file is all that is left — untouched, at its own name"
+      );
+
+      let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The same rename with a SYMLINK at the leaf: the arm that never opens
+    /// anything is gated on the pin exactly as the mismatch arm is.
+    ///
+    /// A symlink at the name is refused by `O_NOFOLLOW` before any identity is
+    /// read, so this displacement is reached by an `ELOOP` rather than by a
+    /// comparison — a different arm, the same false claim about the object. It is
+    /// the cheapest displacement for a peer to stage, needing no file of its own,
+    /// and the link count answers it the same way.
+    ///
+    /// Revert witness: return `Displaced` straight off the `ELOOP` and the renamed
+    /// marker survives the cleanup that reported success over it.
+    #[test]
+    fn a_marker_renamed_under_a_peers_symlink_is_still_unlinked_by_identity() {
+      let root = scratch("marker-renamed-under-symlink");
+      let target = root.join("a");
+      std::fs::create_dir_all(&target).expect("the directory the sync names");
+      let fs = RealFs::new();
+      let reserved = target.join(cookie_dir_name());
+      let name = ".tributaries-sync-1-2-65-0000000000000065";
+      let cookie = landed_marker(&fs, &root, &target, name);
+
+      std::fs::rename(reserved.join(name), reserved.join("stolen"))
+        .expect("the peer renames the marker aside");
+      std::os::unix::fs::symlink("elsewhere", reserved.join(name))
+        .expect("and hangs a symlink at the leaf");
+
+      assert_eq!(
+        fs.remove_cookie(&cookie)
+          .expect("the cleanup settles rather than failing"),
+        CookieRemoval::Unlinked,
+        "the marker was found by identity and unlinked, whatever the name said"
+      );
+      assert_eq!(
+        leaves_in(&reserved),
+        vec![name.to_owned()],
+        "and the peer's symlink is all that is left"
+      );
+      assert!(
+        std::fs::symlink_metadata(reserved.join(name))
+          .expect("the symlink is readable")
+          .file_type()
+          .is_symlink(),
+        "still a symlink — nothing followed it and nothing replaced it"
+      );
+
+      let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A marker a peer gave a SECOND name to inside the reserved directory is
+    /// removed from both leaves, because one successful unlink is not one object
+    /// gone.
+    ///
+    /// This is the case no comparison at the name can catch: the name still denotes
+    /// the marker, the identity matches, the unlink succeeds — and the object is
+    /// still there, under the leaf the peer added. Retiring on that verdict leaves
+    /// a file this driver created on disk with its record spent, which is the same
+    /// untracked residue the rename cases leave by a different route.
+    ///
+    /// The loop is bounded by the count itself: each remaining link is one entry,
+    /// each hunt that succeeds drops the count by one, so the removal cannot run
+    /// longer than there are entries to remove.
+    ///
+    /// Revert witness: answer `Unlinked` as soon as the name's unlink succeeds and
+    /// the peer's second leaf survives a cleanup that called itself done.
+    #[test]
+    fn a_hard_linked_marker_is_removed_from_every_leaf_of_its_own_directory() {
+      let root = scratch("marker-hardlinked-inside");
+      let target = root.join("a");
+      std::fs::create_dir_all(&target).expect("the directory the sync names");
+      let fs = RealFs::new();
+      let reserved = target.join(cookie_dir_name());
+      let name = ".tributaries-sync-1-2-66-0000000000000066";
+      let cookie = landed_marker(&fs, &root, &target, name);
+
+      std::fs::hard_link(reserved.join(name), reserved.join("twin"))
+        .expect("the peer gives the marker a second name in the same directory");
+
+      assert_eq!(
+        fs.remove_cookie(&cookie)
+          .expect("the cleanup settles rather than failing"),
+        CookieRemoval::Unlinked,
+        "and it means the OBJECT, not the one entry it started with"
+      );
+      assert!(
+        leaves_in(&reserved).is_empty(),
+        "so both leaves are gone: {:?}",
+        leaves_in(&reserved)
+      );
+
+      let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A marker hard-linked OUTSIDE the reserved directory never settles: the
+    /// removal fails, the record stays counted, and the link nobody anchored is
+    /// left alone.
+    ///
+    /// The removal is confined to one directory by design — it addresses entries of
+    /// the descriptor the create was made through and resolves no path — so a link
+    /// outside it is one this driver must not delete. What it must also not do is
+    /// claim the object is gone. The honest outcome is the FAILED removal a refused
+    /// unlink already produces: the ledger's attempt budget carries the record and
+    /// close reports it under a typed terminal, rather than retiring it over a file
+    /// still on disk.
+    ///
+    /// Revert witness: answer `Unlinked` off the name's own unlink and this cell's
+    /// removal reports success while the outside link is still there.
+    #[test]
+    fn a_marker_hard_linked_outside_the_reserved_directory_never_settles() {
+      let root = scratch("marker-hardlinked-outside");
+      let target = root.join("a");
+      std::fs::create_dir_all(&target).expect("the directory the sync names");
+      let fs = RealFs::new();
+      let reserved = target.join(cookie_dir_name());
+      let name = ".tributaries-sync-1-2-67-0000000000000067";
+      let cookie = landed_marker(&fs, &root, &target, name);
+
+      let outside = target.join("twin");
+      std::fs::hard_link(reserved.join(name), &outside)
+        .expect("the peer gives the marker a name outside the reserved directory");
+
+      let failed = fs.remove_cookie(&cookie).expect_err(
+        "a removal that cannot reach every link of the object reports a FAILURE, so \
+         the record stays counted rather than retiring over a live file",
+      );
+      assert!(
+        failed.to_string().contains("still linked"),
+        "and the failure names what happened: {failed}"
+      );
+      assert!(
+        outside.exists(),
+        "the outside link is still there — nothing beyond the anchored directory was \
+         touched"
+      );
+      assert!(
+        leaves_in(&reserved).is_empty(),
+        "and the entry inside it did go: {:?}",
+        leaves_in(&reserved)
+      );
+
+      let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A marker HARD-LINKED between the post-create refusal and the withdrawal is
+    /// still owed — a destroy that succeeded is not an object gone either.
+    ///
+    /// The rename case makes the withdrawal's `unlinkat` answer `ENOENT` over a live
+    /// file; this one lets it SUCCEED over a live file, which is the arm that used
+    /// to be read as proof that nothing of this write survived. It does not prove
+    /// that: an unlink removes one entry, and the peer added a second. Reporting the
+    /// clean refusal there retires the obligation as never-created and releases the
+    /// exemption and the cap slot while the marker sits in the reserved directory
+    /// under the peer's leaf.
+    ///
+    /// So the same descriptor decides here as everywhere else, and the residue it
+    /// hands back is reaped the same way — by identity, until nothing names the
+    /// object.
+    ///
+    /// Revert witness: answer the successful destroy with the clean refusal and this
+    /// cell's first assertion fails: the write reports owing nothing while the twin
+    /// leaf still holds the marker.
+    #[test]
+    fn a_marker_hard_linked_before_its_withdrawal_is_owed_and_reaped_from_both_leaves() {
+      let root = scratch("marker-hardlinked-withdraw");
+      let target = root.join("a");
+      std::fs::create_dir_all(&target).expect("the directory the sync names");
+      let fs = RealFs::new();
+      let live = crate::driver::LiveRoot::for_tests(&root);
+      let reserved = target.join(cookie_dir_name());
+      let name = ".tributaries-sync-1-2-68-0000000000000068";
+
+      let fault = ProofFault::arm(crate::driver::CookieProofPoint::HoldsOnly);
+      let (minted, twin) = (reserved.join(name), reserved.join("twin"));
+      let peer = MidWithdrawalPeer::arm(move || {
+        std::fs::hard_link(&minted, &twin).expect("the peer gives the marker a second name");
+      });
+      let written = fs.write_cookie(
+        &live,
+        &target,
+        admitted(&root, &target),
+        name,
+        &tributary_proto::glob::Globs::default(),
+        &[],
+      );
+      drop(peer);
+      drop(fault);
+
+      let refusal = written.expect_err("the armed proof refuses this write");
+      assert_eq!(
+        leaves_in(&reserved),
+        vec!["twin".to_owned()],
+        "staging: the destroy took the minted leaf and the peer's second one \
+         outlived it"
+      );
+      let mut residue = owed_file(refusal);
+
+      crate::driver::reap_residue(&fs, &mut residue)
+        .expect("the retry removes the surviving link by identity");
+      assert!(
+        leaves_in(&reserved).is_empty(),
+        "and the reserved directory ends empty: {:?}",
+        leaves_in(&reserved)
+      );
+
+      let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The inode number the admission's identity is taken on cannot be handed to
     /// another object while the sync is in flight, because the admission is
     /// HOLDING the object rather than remembering its number.
@@ -18484,24 +19180,83 @@ mod sync_cookie {
       (watcher, handle)
     }
 
+    /// Drives every call in `pending` to a standstill, waiting for the descriptors
+    /// naming `path` to settle at `want` and asserting the whole way that they
+    /// never pass `ceiling`.
+    ///
+    /// The door samples in THREE pool jobs run one after another, so "one poll
+    /// each" is nowhere near "after the opens": a call reaches its second job only
+    /// once its first has answered and the caller has polled it again. Driving is
+    /// therefore part of the wait, not something the cell did before it.
+    ///
+    /// Nothing here AWAITS, and that is load-bearing. These cells count what the
+    /// door let through BEFORE the driver had an opinion, and the driver is a task
+    /// on this same current-thread runtime: one `sleep().await` hands it the thread
+    /// and it drains the mailbox the cells are about. The sampling jobs run on real
+    /// pool threads, so they make progress across the busy wait regardless.
+    ///
+    /// The ceiling is what keeps the wait honest — an over-admission is caught
+    /// while it is happening rather than waited out and then missed because the
+    /// count came back down. And the settle is followed by `QUIET` further rounds
+    /// that must not move it: a count that reached `want` while samplings were
+    /// still landing is not a count that settled there.
+    async fn pins_settle_at<F: std::future::Future>(
+      pending: &mut [std::pin::Pin<Box<F>>],
+      path: &Path,
+      want: usize,
+      ceiling: usize,
+    ) {
+      const ROUNDS: u32 = 20_000;
+      const QUIET: u32 = 200;
+
+      let mut quiet = 0;
+      for _ in 0..ROUNDS {
+        for call in pending.iter_mut() {
+          let _ = futures_util::poll!(call.as_mut());
+        }
+        let held = descriptors_naming(path);
+        assert!(
+          held <= ceiling,
+          "the door never holds more than {ceiling} pins at once, and it held {held}"
+        );
+        if held == want {
+          quiet += 1;
+          if quiet == QUIET {
+            return;
+          }
+        } else {
+          quiet = 0;
+        }
+        std::thread::sleep(Duration::from_micros(100));
+      }
+      panic!(
+        "the door's pins never settled at {want} — {} held",
+        descriptors_naming(path)
+      );
+    }
+
     /// However many callers poll their `sync_root` futures together, the door
     /// holds no more admission pins than its allowance.
     ///
-    /// The door opens up to three directories per call, on the CALLER's thread,
-    /// before the command carrying them can reach the driver — and the driver's
-    /// caps are counted when it reads that command. So an unbounded door is
-    /// unbounded in exactly the way that matters: a caller that polls thousands of
-    /// these futures together opens every pin on the first poll, and the sends
-    /// past a sixteen-deep mailbox then sit there holding them. That is `EMFILE`
-    /// for the whole process — the watcher's own reads and the application's
-    /// unrelated I/O failing — reached before a single cap had an opinion.
+    /// The door opens up to three directories per call, before the command
+    /// carrying them can reach the driver — and the driver's caps are counted
+    /// when it reads that command. So an unbounded door is unbounded in exactly
+    /// the way that matters: a caller that polls thousands of these futures
+    /// together gets every one of their samplings dispatched, and the sends past a
+    /// sixteen-deep mailbox then sit there holding what those samplings opened.
+    /// That is `EMFILE` for the whole process — the
+    /// watcher's own reads and the application's unrelated I/O failing — reached
+    /// before a single cap had an opinion. The allowance is taken BEFORE the
+    /// dispatch for that reason, so the pool is bounded by it too.
     ///
     /// Single-threaded on purpose. The driver task cannot run while this cell's
-    /// own polling loop holds the thread, so the count below is exactly what the
-    /// door let through rather than a race with whatever the driver has drained.
+    /// own polling loop holds the thread, and nothing has been sent to it in any
+    /// case, so the count below is exactly what the door let through rather than
+    /// a race with whatever the driver has drained.
     ///
     /// Revert witness: open the pins before taking a slot and all `CALLERS` of
-    /// them are held at once.
+    /// them are held at once — caught by the ceiling inside the wait, not merely
+    /// by its final reading.
     #[tokio::test]
     async fn concurrent_first_polls_hold_no_more_pins_than_the_door_allows() {
       const ALLOWED: usize = 4;
@@ -18524,17 +19279,10 @@ mod sync_cookie {
           .expect("this host seeds a watcher");
         pending.push(Box::pin(watcher.sync_root(handle, &target, admission)));
       }
-      for call in &mut pending {
-        // ONE poll each, which is all a flood needs: everything up to the first
-        // pending await runs, and that is where the pins used to be opened.
-        let _ = futures_util::poll!(call.as_mut());
-      }
-      assert_eq!(
-        descriptors_naming(&target),
-        ALLOWED,
-        "{CALLERS} callers polled together hold exactly the allowance's worth of \
-         pins, and the rest are waiting for a slot"
-      );
+      // Driven to a standstill: every call is polled every round, so each one
+      // reaches its next sampling job the moment the last has answered, and the
+      // count is read once nothing is moving any more.
+      pins_settle_at(&mut pending, &target, ALLOWED, ALLOWED).await;
 
       drop(pending);
       drop(watcher);
@@ -18547,18 +19295,18 @@ mod sync_cookie {
     /// A caller that abandons a sync — its own timeout, a close winning the race —
     /// drops the future wherever it stood, and the state that has to survive that
     /// is the one between the pins and the send: the command has not been queued,
-    /// so nothing downstream will ever drop them for it. The permit is carried
-    /// INSIDE the sampling for exactly this reason, so releasing one is releasing
-    /// the other.
+    /// so nothing downstream will ever drop them for it. The readings are owned by
+    /// the door's own frame for exactly this reason, and the permit is shared with
+    /// them, so releasing the future releases both.
     ///
     /// The allowance is deliberately wider than the driver's sixteen-deep mailbox
     /// (a change to that depth is meant to fail this cell rather than pass it
     /// quietly): the callers past the mailbox are the ones parked with their pins
     /// open, and they are what this drops.
     ///
-    /// Revert witness: leak the permit or the pins past the future — hold them in
-    /// the door's frame instead of in the sampling — and the second count still
-    /// reads the allowance.
+    /// Revert witness: leak the permit or the pins past the future — hold them in a
+    /// pool closure the caller cannot reach instead of in the door's own frame —
+    /// and the second count still reads the allowance.
     #[tokio::test]
     async fn a_door_future_dropped_before_its_send_gives_back_its_pins() {
       const MAILBOX: usize = 16;
@@ -18577,9 +19325,10 @@ mod sync_cookie {
           .expect("this host seeds a watcher");
         pending.push(Box::pin(watcher.sync_root(handle, &target, admission)));
       }
-      for call in &mut pending {
-        let _ = futures_util::poll!(call.as_mut());
-      }
+      // Driven to a standstill with no await anywhere, so the driver never gets
+      // the thread and never drains: every admitted sampling is complete, the
+      // mailbox holds what fits, and the rest are parked on a send.
+      pins_settle_at(&mut pending, &target, ALLOWED, ALLOWED).await;
       assert_eq!(
         descriptors_naming(&target),
         ALLOWED,
@@ -18588,9 +19337,16 @@ mod sync_cookie {
         ALLOWED - MAILBOX
       );
 
-      // Everything that never reached the driver: the callers parked on the send
-      // with their pins open, and the callers still waiting for a slot.
-      pending.truncate(MAILBOX);
+      // Everything that never reached the driver goes with the futures: the
+      // callers parked on the send with their pins open, and the callers still
+      // waiting for a slot. What is left is exactly the mailbox — samplings whose
+      // command has been queued, whose pins the command itself now owns, and which
+      // no abandoned caller can take back.
+      //
+      // WHICH callers those are is the pool's business, not this cell's: the
+      // samplings complete in whatever order the pool answers them, so the claim is
+      // made over the whole set rather than over an index range.
+      drop(pending);
       assert_eq!(
         descriptors_naming(&target),
         MAILBOX,
@@ -18598,8 +19354,267 @@ mod sync_cookie {
          driver is holding are left"
       );
 
-      drop(pending);
       drop(watcher);
+      let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Arms `step` to run ONCE at the top of the door's sampling of `dir`, and
+    /// takes the arming back down when the returned guard drops.
+    ///
+    /// One shot, one directory and one POINT, for [`MidMarkerPeer`]'s reason and
+    /// one more: the list is process-global (the sampling runs on a pool thread),
+    /// so a step that is not addressed to both would be run by whichever door in
+    /// the process reached it first
+    /// ([`SYNC_DOOR_STEP`](crate::driver::SYNC_DOOR_STEP)).
+    struct SyncDoorStep {
+      dir: PathBuf,
+      point: crate::driver::SyncDoorPoint,
+    }
+
+    impl SyncDoorStep {
+      fn arm(
+        dir: &Path,
+        point: crate::driver::SyncDoorPoint,
+        step: impl FnOnce() + Send + 'static,
+      ) -> Self {
+        crate::driver::SYNC_DOOR_STEP
+          .lock()
+          .unwrap_or_else(std::sync::PoisonError::into_inner)
+          .push((dir.to_path_buf(), point, Box::new(step)));
+        Self {
+          dir: dir.to_path_buf(),
+          point,
+        }
+      }
+    }
+
+    impl Drop for SyncDoorStep {
+      fn drop(&mut self) {
+        // Only THIS cell's arming: a step already spent is no longer in the list,
+        // and one another cell armed is not ours to take down.
+        crate::driver::SYNC_DOOR_STEP
+          .lock()
+          .unwrap_or_else(std::sync::PoisonError::into_inner)
+          .retain(|(armed_for, armed_at, _)| *armed_for != self.dir || *armed_at != self.point);
+      }
+    }
+
+    /// A sampling that never returns holds neither the caller's future, nor the
+    /// close behind it, nor the allowance slot.
+    ///
+    /// This is the door's whole reason for sampling on the blocking pool. The
+    /// caller is not polled in a vacuum: the umbrella owner polls `sync_root`
+    /// inside the `select_biased!` whose entire argument is that a stalled sync is
+    /// a PENDING future its close and cancellation arms can win over. An `openat`
+    /// taken inline against a mount that never answers is a poll that never
+    /// returns — so neither arm runs, the owner wedges, and it wedges on exactly
+    /// the mount that race exists to survive.
+    ///
+    /// The hang itself cannot be staged (no test may mount a filesystem that
+    /// stops answering), so a step parked at the top of the sampling stands in for
+    /// one: the pool thread is inside the door's I/O and will not come out. What
+    /// is asserted around it is the whole of what the caller is owed — control
+    /// back at once, an orderly close that does not wait, and the allowance's slot
+    /// returned when the syscalls finally do.
+    ///
+    /// The allowance is ONE, so the third assertion is exact: a slot that never
+    /// came back is a door that never opens again, and the acquire below would
+    /// wait out its timeout instead.
+    ///
+    /// Revert witness: sample inline on the polling thread and the first
+    /// assertion's timeout never fires at all — the cell hangs where it used to
+    /// pass, which is precisely what a wedged owner does.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_parked_sampling_holds_neither_the_caller_nor_the_close() {
+      let root = scratch("door-pin-parked");
+      let target = root.join("a");
+      std::fs::create_dir_all(&target).expect("the directory the sync names");
+
+      let fs = FakeFs::new(1);
+      fs.put(&root, FileKind::Dir, 1);
+      let watcher = crate::Watcher::<TokioRuntime>::new_with_cookie_cap(
+        crate::WatcherOptions::new(),
+        fs.clone(),
+        1,
+      )
+      .expect("the watcher builds");
+      let handle = watcher
+        .watch(&root, crate::Interest::all())
+        .await
+        .expect("the scratch root is watchable");
+
+      let (entered, sampling_entered) = std::sync::mpsc::channel::<()>();
+      let (release, released) = std::sync::mpsc::channel::<()>();
+      // Parked at the FIRST of the door's three samplings, which is what this cell
+      // has always meant by "the sampling": the pool thread is inside the door's
+      // very first `openat` and will not come out.
+      let _step = SyncDoorStep::arm(&target, crate::driver::SyncDoorPoint::Root, move || {
+        let _ = entered.send(());
+        // Returns when the cell drops its sender, and not before: for as long as
+        // this call is here, the door's I/O has not come back.
+        let _ = released.recv();
+      });
+
+      let (admission, _ticket) = watcher
+        .mint_sync_ticket()
+        .expect("this host seeds a watcher");
+      let mut call = Box::pin(watcher.sync_root(handle, &target, admission));
+      let _ = futures_util::poll!(call.as_mut());
+      sampling_entered
+        .recv_timeout(Duration::from_secs(30))
+        .expect("staging: the door's sampling reached the parked step");
+
+      // The caller's own future is PENDING, not blocked — the timeout is what
+      // proves the poll returned at all.
+      assert!(
+        tokio::time::timeout(Duration::from_millis(250), &mut call)
+          .await
+          .is_err(),
+        "a sampling that never answers leaves the door pending, and a pending \
+         future is one its caller can time out or drop"
+      );
+      drop(call);
+
+      // ...and an orderly close does not wait for it either.
+      tokio::time::timeout(Duration::from_secs(30), watcher.close_in_place())
+        .await
+        .expect("close is not waiting on a sampling nobody is waiting for")
+        .expect("the watcher closes");
+
+      // The slot comes back with the pins, on the pool thread, once the sampling
+      // finally returns. The allowance is one, so an acquire that resolves is the
+      // abandoned sampling's own slot and nothing else.
+      drop(release);
+      tokio::time::timeout(Duration::from_secs(30), watcher.pin_allowance().acquire())
+        .await
+        .expect("the abandoned sampling gave its slot back with the descriptors it opened");
+
+      assert!(
+        fs.files_under(&root).is_empty(),
+        "and nothing was created: the command never left the door"
+      );
+      let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A sampling that hangs on its SECOND open does not hold the pin its first
+    /// one already took.
+    ///
+    /// This is what makes the door's three jobs three jobs. One closure taking all
+    /// three opens keeps whatever it has already opened for as long as the next one
+    /// hangs, and a caller that drops its future cannot reach into a pool closure to
+    /// let go of anything: the root descriptor stays open for the whole hang, which
+    /// on Linux defers the kernel's own deletion notice for the watched root, and
+    /// the slot stays consumed. Held by the DOOR instead, every completed reading
+    /// drops with the caller's future and only the job still inside a syscall keeps
+    /// what it has not yet handed back — which is the one descriptor nothing could
+    /// have taken from it anyway.
+    ///
+    /// The step parks at [`SyncDoorPoint::Target`](crate::driver::SyncDoorPoint),
+    /// so reaching it is itself the proof that the ROOT job answered: the second
+    /// sampling is not dispatched until the first one has.
+    ///
+    /// The allowance is ONE, so both slot assertions are exact — it is still taken
+    /// while a job may be holding a descriptor, and it comes back when that job
+    /// finally returns.
+    ///
+    /// Revert witness: take the three opens in one closure again and the root pin
+    /// survives the drop — the count after it reads unchanged.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_parked_later_sampling_gives_back_the_pin_already_taken() {
+      let root = scratch("door-pin-parked-target");
+      let target = root.join("a");
+      std::fs::create_dir_all(&target).expect("the directory the sync names");
+
+      let fs = FakeFs::new(1);
+      fs.put(&root, FileKind::Dir, 1);
+      let watcher = crate::Watcher::<TokioRuntime>::new_with_cookie_cap(
+        crate::WatcherOptions::new(),
+        fs.clone(),
+        1,
+      )
+      .expect("the watcher builds");
+      let handle = watcher
+        .watch(&root, crate::Interest::all())
+        .await
+        .expect("the scratch root is watchable");
+
+      let (entered, sampling_entered) = std::sync::mpsc::channel::<()>();
+      let (release, released) = std::sync::mpsc::channel::<()>();
+      let _step = SyncDoorStep::arm(&target, crate::driver::SyncDoorPoint::Target, move || {
+        let _ = entered.send(());
+        // Returns when the cell drops its sender, and not before: for as long as
+        // this call is here, the door's SECOND open has not come back.
+        let _ = released.recv();
+      });
+
+      let (admission, _ticket) = watcher
+        .mint_sync_ticket()
+        .expect("this host seeds a watcher");
+      let mut call = Box::pin(watcher.sync_root(handle, &target, admission));
+      // One job per poll: the first poll dispatches the root sampling, and the
+      // door is polled again only when that job answers. Short timeouts are what
+      // do that polling — each returns as soon as the future is pending again.
+      let mut reached = false;
+      for _ in 0..600 {
+        if tokio::time::timeout(Duration::from_millis(50), &mut call)
+          .await
+          .is_ok()
+        {
+          break;
+        }
+        if sampling_entered.try_recv().is_ok() {
+          reached = true;
+          break;
+        }
+      }
+      assert!(
+        reached,
+        "staging: the door's ROOT sampling answered and its TARGET sampling reached \
+         the parked step"
+      );
+
+      let while_parked = descriptors_naming(&root);
+      assert!(
+        while_parked >= 1,
+        "staging: the door is holding the root pin its first job handed back"
+      );
+      drop(call);
+      assert_eq!(
+        descriptors_naming(&root),
+        while_parked - 1,
+        "the pin the first job completed is the DOOR's, and it goes with the \
+         caller's future — never held hostage by the job still inside its own open"
+      );
+
+      // The slot, by contrast, is still taken: a job that may yet open a descriptor
+      // is exactly what the allowance bounds, and the bound would be a lie if the
+      // slot came back before it did.
+      assert!(
+        tokio::time::timeout(
+          Duration::from_millis(250),
+          watcher.pin_allowance().acquire()
+        )
+        .await
+        .is_err(),
+        "the parked job still holds its share of the allowance"
+      );
+
+      // ...and an orderly close does not wait for it either.
+      tokio::time::timeout(Duration::from_secs(30), watcher.close_in_place())
+        .await
+        .expect("close is not waiting on a sampling nobody is waiting for")
+        .expect("the watcher closes");
+
+      // The slot comes back on the pool thread once that job finally returns.
+      drop(release);
+      tokio::time::timeout(Duration::from_secs(30), watcher.pin_allowance().acquire())
+        .await
+        .expect("the abandoned sampling gave its slot back when its last job returned");
+
+      assert!(
+        fs.files_under(&root).is_empty(),
+        "and nothing was created: the command never left the door"
+      );
       let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -18663,6 +19678,376 @@ mod sync_cookie {
       let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A watcher over the fake platform whose REAL scratch `root` is watched
+    /// under `options`, with `exclusions` in force watcher-wide.
+    ///
+    /// The split is what the cut-time ground cells need: the tree is real, so the
+    /// door's pins and the landings read off them are real answers about real
+    /// symlinks and real directories, while a write that ever reached the pool
+    /// would land in the model — so a refusal is provably the admission's, and a
+    /// model holding nothing proves no write was dispatched at all.
+    async fn grounded_watcher(
+      root: &Path,
+      exclusions: Vec<PathBuf>,
+      options: crate::options::RootOptions,
+    ) -> (FakeFs, crate::Watcher<TokioRuntime>, crate::RootHandle) {
+      let fs = FakeFs::new(1);
+      fs.put(root, FileKind::Dir, 1);
+      let watcher = crate::Watcher::<TokioRuntime>::new_with(
+        crate::WatcherOptions::new().with_exclusions(exclusions),
+        fs.clone(),
+      )
+      .expect("the watcher builds");
+      let handle = watcher
+        .watch_with(root, options)
+        .await
+        .expect("the scratch root is watchable");
+      (fs, watcher, handle)
+    }
+
+    /// The subtree a cut-time ground cell hides under `ground`: a target `T`, the
+    /// reserved cookie directory standing inside it, and an entry `deep/old`
+    /// inside THAT — the descendants no queue of this scope ever carried — plus an
+    /// in-root symlink `link` naming `ground` so the caller's own spelling reaches
+    /// `T` without ever mentioning it.
+    ///
+    /// Returns the spelling a caller passes and the location the door's pins
+    /// actually answer for.
+    fn stage_hidden_target(root: &Path, ground: &str) -> (PathBuf, PathBuf) {
+      let landing = root.join(ground).join("T");
+      std::fs::create_dir_all(landing.join(cookie_dir_name()).join("deep").join("old"))
+        .expect("the hidden target, its reserved directory and an older entry inside it");
+      std::os::unix::fs::symlink(root.join(ground), root.join("link"))
+        .expect("the in-root symlink the caller's spelling goes through");
+      (root.join("link").join("T"), landing)
+    }
+
+    /// What stands in the reserved cookie directory of `landing`, by name.
+    fn reserved_entries(landing: &Path) -> Vec<String> {
+      let mut names: Vec<String> = std::fs::read_dir(landing.join(cookie_dir_name()))
+        .expect("the reserved directory is readable")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+      names.sort();
+      names
+    }
+
+    /// A sync whose pinned objects stood in PRUNED ground when the cut was taken
+    /// is refused at the admission, before any fence opens.
+    ///
+    /// The escape this closes. A pin proves object SAMENESS across the sync's
+    /// window and nothing else, and it carries the object through a move — so a
+    /// peer could prepare a target and its reserved cookie directory under
+    /// never-armed ground, hold descendants in them that no queue of this scope
+    /// ever reported, and let the caller reach them through an in-root symlink
+    /// whose spelling clears every lexical test the admission had. After the
+    /// coverage cut it moves that same subtree into unpruned ground and repoints
+    /// the link: the identities still match, the write's own ground verdicts now
+    /// pass, and the EEXIST arm owes no sole-entry proof because the directory was
+    /// not minted. The marker lands beside `deep/old`, and the cold enumeration
+    /// the move-in triggers may deliver it FIRST — a barrier certifying an
+    /// ordering nobody proved.
+    ///
+    /// So the door reads WHERE each pin stands, on the pool beside the pin, and the
+    /// admission judges that location against the scope's own prune seat before it
+    /// opens anything. The move never gets a window, because the sync it would have
+    /// exploited was never admitted.
+    ///
+    /// The second call is what proves nothing was minted: a refusal taken before
+    /// the single-flight gate leaves no obligation standing, so the next caller
+    /// reads the same ground verdict rather than `WriteInFlight`.
+    ///
+    /// Revert witness: drop the landing from the admission (or judge it only at the
+    /// write) and the sync is admitted, its fence opens, and the refusal — if any —
+    /// arrives from the pool after the window the move needs has already been
+    /// handed out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_target_pinned_in_pruned_ground_is_refused_at_the_admission() {
+      let root = scratch("cut-ground-pruned");
+      let (spelling, landing) = stage_hidden_target(&root, "blocked");
+      let prune = tributary_proto::glob::Globs::new([
+        tributary_proto::glob::Glob::new("blocked").expect("a valid pattern compiles")
+      ])
+      .expect("a one-word seat compiles");
+      assert!(
+        crate::driver::pruned_dir_by(&root, &prune, &spelling).is_none(),
+        "staging: the caller's spelling names no pruned prefix — {spelling:?}"
+      );
+      assert!(
+        crate::driver::pruned_dir_by(&root, &prune, &landing).is_some(),
+        "staging: the object it reaches stands squarely in pruned ground"
+      );
+
+      let (fs, watcher, handle) = grounded_watcher(
+        &root,
+        Vec::new(),
+        crate::options::RootOptions::new()
+          .with_prune([
+            tributary_proto::glob::Glob::new("blocked").expect("a valid pattern compiles")
+          ]),
+      )
+      .await;
+
+      for attempt in 0..2 {
+        let (admission, _ticket) = watcher
+          .mint_sync_ticket()
+          .expect("this host seeds a watcher");
+        let denied = watcher
+          .sync_root(handle, &spelling, admission)
+          .await
+          .expect_err("a pin taken in pruned ground is not an admissible sync");
+        match denied.error {
+          crate::SyncRootError::DirPruned { dir, pattern } => {
+            assert_eq!(
+              dir, landing,
+              "the refusal names WHERE the pinned object stood, not the spelling it \
+               was reached by"
+            );
+            assert_eq!(pattern.as_str(), "blocked");
+          }
+          other => panic!("attempt {attempt}: the ground verdict is the prune seat's: {other:?}"),
+        }
+      }
+
+      assert!(
+        fs.files_under(&root).is_empty(),
+        "nothing was written: the refusal is taken before the fence, so no write \
+         was ever dispatched"
+      );
+      assert_eq!(
+        reserved_entries(&landing),
+        vec!["deep".to_owned()],
+        "and no marker stands anywhere under the pruned ground"
+      );
+
+      watcher.close().await.expect("the watcher closes");
+      let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The exclusions' twin, through the other seat: a pin taken inside an
+    /// EXCLUDED subtree is refused from its landing, though the caller's spelling
+    /// is excluded by nothing.
+    ///
+    /// One rule, two seats, and the same reason at both — a marker under either is
+    /// a marker the source is instructed never to report, so a barrier placed
+    /// there could only time out. What this cell adds over the prune one is that
+    /// the LEXICAL exclusion check the admission has always taken passes here: the
+    /// spelling goes nowhere near `blocked`, and only the location read off the
+    /// pin says otherwise.
+    ///
+    /// Revert witness: the same as its prune twin — judge the spelling alone and
+    /// the sync is admitted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_target_pinned_in_excluded_ground_is_refused_at_the_admission() {
+      let root = scratch("cut-ground-excluded");
+      let (spelling, landing) = stage_hidden_target(&root, "blocked");
+      let exclusion = root.join("blocked");
+      assert!(
+        crate::driver::cookie_dir_excluded(std::slice::from_ref(&exclusion), &spelling).is_none(),
+        "staging: the caller's spelling clears the lexical exclusion check — {spelling:?}"
+      );
+
+      let (fs, watcher, handle) = grounded_watcher(
+        &root,
+        vec![exclusion.clone()],
+        crate::options::RootOptions::new(),
+      )
+      .await;
+
+      for attempt in 0..2 {
+        let (admission, _ticket) = watcher
+          .mint_sync_ticket()
+          .expect("this host seeds a watcher");
+        let denied = watcher
+          .sync_root(handle, &spelling, admission)
+          .await
+          .expect_err("a pin taken inside an exclusion is not an admissible sync");
+        match denied.error {
+          crate::SyncRootError::DirExcluded {
+            dir,
+            exclusion: covered,
+          } => {
+            assert_eq!(
+              dir, landing,
+              "the refusal names WHERE the pinned object stood, not the spelling it \
+               was reached by"
+            );
+            assert_eq!(covered, exclusion);
+          }
+          other => panic!("attempt {attempt}: the ground verdict is the exclusions': {other:?}"),
+        }
+      }
+
+      assert!(
+        fs.files_under(&root).is_empty(),
+        "nothing was written: the refusal is taken before the fence"
+      );
+      assert_eq!(
+        reserved_entries(&landing),
+        vec!["deep".to_owned()],
+        "and no marker stands anywhere under the excluded ground"
+      );
+
+      watcher.close().await.expect("the watcher closes");
+      let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The contrast that keeps the verdict a verdict: a symlink into COVERED
+    /// ground still syncs, reserved directory and all.
+    ///
+    /// The staging is the refusing cells' exactly — the same in-root symlink, the
+    /// same standing reserved cookie directory with an older entry inside it — with
+    /// the one difference that decides the question: the ground the pins land in is
+    /// ground this scope reports. A landing check that answered on the SPELLING, or
+    /// that refused a symlink for being one, would fail here; only "where the object
+    /// stood, judged by the scope's own seats" passes both cells.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_symlink_into_covered_ground_still_syncs() {
+      let root = scratch("cut-ground-covered");
+      let (spelling, landing) = stage_hidden_target(&root, "open");
+
+      let (fs, watcher, handle) = grounded_watcher(
+        &root,
+        Vec::new(),
+        crate::options::RootOptions::new()
+          .with_prune([
+            tributary_proto::glob::Glob::new("blocked").expect("a valid pattern compiles")
+          ]),
+      )
+      .await;
+      // The modelled twin of the directory the caller names: the write is the
+      // fake's, so this is where its marker goes once the admission lets it
+      // through.
+      fs.put(&spelling, FileKind::Dir, 2);
+
+      let (admission, ticket) = watcher
+        .mint_sync_ticket()
+        .expect("this host seeds a watcher");
+      let placed = watcher
+        .sync_root(handle, &spelling, admission)
+        .await
+        .expect("a pin taken in covered ground is an admissible sync");
+      assert_eq!(
+        placed.file_name().and_then(|leaf| leaf.to_str()),
+        Some(ticket.leaf().as_str()),
+        "the marker lands under the leaf the ticket answers"
+      );
+      assert_eq!(
+        reserved_entries(&landing),
+        vec!["deep".to_owned()],
+        "and the real reserved directory is untouched — the write was the fake's"
+      );
+
+      watcher.close().await.expect("the watcher closes");
+      let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The admission's own ground verdict refuses a pin standing in a DIFFERENT
+    /// MOUNT — the one fact about a location that neither the spelling, the
+    /// landing, nor the identity can carry.
+    ///
+    /// The sequence this closes. A same-superblock `mount --bind` of ground
+    /// outside the root, mounted at an in-root name, is reached by a perfectly
+    /// contained spelling, lands at a perfectly contained path, is covered by no
+    /// seat, and preserves `(dev, ino)` through the alias — so the pins match and
+    /// every landing test passes. The crawl still fences its descent on the mount
+    /// and arms nothing inside it. And the origin can then be moved into ordinary
+    /// covered ground before the write, which puts the write on the non-mount path
+    /// where its own frame checks pass honestly. Only a frame read at the CUT sees
+    /// it, and only if the admission asks.
+    ///
+    /// Asked here of the rule itself rather than of a tree, because the tree that
+    /// stages it needs `CAP_SYS_ADMIN` and a platform that has bind mounts:
+    /// `tests/linux_inotify.rs` stages the real one under privilege, and this cell
+    /// pins the verdict on every host, in both of the fence's halves — the mount
+    /// id, which is the only thing that sees a bind, and the device belt, which is
+    /// the whole of the rule where no mount id can be read.
+    ///
+    /// Revert witness: drop the frames from the admission's verdict and the first
+    /// three arms answer `None` — a sync admitted onto ground no queue of this
+    /// scope reads.
+    #[test]
+    fn a_pin_standing_in_another_mount_is_refused_at_the_admission() {
+      // Names only: no path here is ever resolved and none needs to exist. The
+      // verdict is lexical over the landings and arithmetic over the frames.
+      let root = PathBuf::from("/watched");
+      let landing = root.join("mounted").join("T");
+      let reserved = landing.join(cookie_dir_name());
+      let quiet = tributary_proto::glob::Globs::default();
+
+      // The root's own frame, and the readings the door would have handed back for
+      // a target and a reserved directory standing wherever the arm says.
+      let judged = |target: (u64, Option<u64>), cookies: (u64, Option<u64>)| {
+        crate::driver::AdmittedDirs::held(
+          crate::driver::SyncPinAllowance::permit(),
+          crate::driver::AdmittedDir::framed_at(None, 40, Some(11)),
+          crate::driver::AdmittedDir::framed_at(Some(landing.clone()), target.0, target.1),
+          crate::driver::AdmittedDir::framed_at(Some(reserved.clone()), cookies.0, cookies.1),
+        )
+      };
+      let verdict = |admitted: &crate::driver::AdmittedDirs| {
+        crate::driver::admitted_ground_refusal(&root, admitted, &quiet, &[])
+      };
+
+      // The bind exactly: same device, different mount, contained landing.
+      match verdict(&judged((40, Some(12)), (40, Some(12)))) {
+        Some(crate::SyncRootError::DirCrossesMount { dir }) => assert_eq!(
+          dir, landing,
+          "the refusal names WHERE the pinned target stood, which is the alias's \
+           own in-root name"
+        ),
+        other => panic!("a bind alias of outside ground is a mount crossing: {other:?}"),
+      }
+
+      // One level down: the target is on the root's mount and only the RESERVED
+      // directory — the object the marker's own create comes off — is bound.
+      match verdict(&judged((40, Some(11)), (40, Some(12)))) {
+        Some(crate::SyncRootError::DirCrossesMount { dir }) => assert_eq!(
+          dir, reserved,
+          "the verdict is taken on each pinned object, not on the shallowest one"
+        ),
+        other => panic!("a bound reserved directory is a mount crossing: {other:?}"),
+      }
+
+      // The degrade, and the whole of the rule on a host that reports no mount id:
+      // a differing device is a boundary whether or not either side named a mount.
+      match verdict(&judged((41, None), (41, None))) {
+        Some(crate::SyncRootError::DirCrossesMount { dir }) => assert_eq!(dir, landing),
+        other => panic!("a differing device is a boundary on its own: {other:?}"),
+      }
+
+      // And the contrast that keeps it a verdict: one frame, no refusal. The
+      // landings are contained and no seat names them, so nothing is left to
+      // refuse.
+      assert!(
+        verdict(&judged((40, Some(11)), (40, Some(11)))).is_none(),
+        "pins that stood in the root's own mount, on covered ground, are admitted"
+      );
+
+      // The frame is asked BEFORE the landings, and this is what that order buys:
+      // an alias whose landing ALSO trips a seat still answers the mount, which is
+      // the fact a retry cannot change. A caller told `DirPruned` about a bind
+      // would take the word off its seat and find the sync refused again.
+      let pruned = tributary_proto::glob::Globs::new([
+        tributary_proto::glob::Glob::new("mounted").expect("a valid pattern compiles")
+      ])
+      .expect("a one-word seat compiles");
+      assert!(
+        matches!(
+          crate::driver::admitted_ground_refusal(
+            &root,
+            &judged((40, Some(12)), (40, Some(12))),
+            &pruned,
+            &[],
+          ),
+          Some(crate::SyncRootError::DirCrossesMount { .. })
+        ),
+        "the mount verdict is taken first, so a bind is never reported as a seat \
+         the caller could retract"
+      );
+    }
+
     /// A reserved directory standing across a MOUNT BOUNDARY is refused, even
     /// where its identity is the one the admission read.
     ///
@@ -18671,8 +20056,10 @@ mod sync_cookie {
     /// descend across a mount, and no per-directory watch is armed beyond one, so
     /// a marker created there produces no event at all — the barrier would wait
     /// out its whole deadline for something that was never going to be reported.
-    /// The parent's own device is what tells the two apart, and the refusal is its
-    /// own verdict rather than the replacement one: nothing was replaced.
+    /// The parent's own MOUNT FRAME is what tells the two apart — the bind below
+    /// shares the parent's device exactly, which is why a device comparison could
+    /// not — and the refusal is its own verdict rather than the replacement one:
+    /// nothing was replaced.
     ///
     /// Linux-only and privileged — a bind mount is the one way to stand a mount at
     /// an arbitrary in-root name, and the integration suites' own bind fixtures are
@@ -20093,8 +21480,7 @@ mod sync_cookie {
     /// the object with it. A cell about a REPLACEMENT binds it earlier instead, at
     /// the moment its sync would have been admitted.
     fn admitted(root: &Path, dir: &Path) -> crate::driver::AdmittedDirs {
-      crate::driver::AdmittedDirs::read(crate::driver::SyncPinAllowance::permit(), root, dir)
-        .expect("the staged directories are readable")
+      sample_admission(root, dir)
     }
 
     /// `parent`, opened the way a real write opens it — the handle the mint is

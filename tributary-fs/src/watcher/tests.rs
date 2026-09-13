@@ -1,5 +1,6 @@
 use super::*;
-use agnostic_lite::tokio::TokioRuntime;
+// The pool half of the runtime trait, which the sync door's spawner is built from.
+use agnostic_lite::{LocalRuntimeLite as _, tokio::TokioRuntime};
 
 /// Locks in `Watcher<R>: Sync`: the umbrella's single-owner actor awaits the
 /// `&self` `watch`/`unwatch` futures inside a `Send` spawned owner, which
@@ -29,6 +30,7 @@ fn manual_watcher() -> (Watcher<TokioRuntime>, async_channel::Receiver<Command>)
       pins: crate::driver::SyncPinAllowance::new(
         crate::driver::DriverConfig::DEFAULT_COOKIE_GLOBAL_CAP,
       ),
+      blocking: Arc::new(TokioRuntime::spawn_blocking_detach),
       events: Box::pin(event_rx),
       roots: Arc::new(RwLock::new(RootSet::default())),
       _runtime: PhantomData,

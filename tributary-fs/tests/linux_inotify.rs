@@ -5,7 +5,8 @@
 //! extra events — coalesced kinds, additional `Rescan`s — are always legal.
 //!
 //! The privileged cells (queue overflow, watch-limit exhaustion, the bind-mount
-//! boundary) self-probe and skip loudly without `CAP_SYS_ADMIN`; the
+//! scope fence and the three bind-mount sync-cookie refusals) self-probe and skip
+//! loudly without `CAP_SYS_ADMIN`; the
 //! `inotify-priv` suite of `ci/linux-verify.sh` (or `sudo -E` in CI) unlocks
 //! them.
 //!
@@ -30,8 +31,8 @@ use std::{
 };
 
 use tributary_fs::{
-  Backend, CoverOutcome, Event, Interest, ProbeStage, ReplaceRootError, SourceError, TokioWatcher,
-  WatchRootError, WatcherOptions,
+  Backend, CoverOutcome, Event, Interest, ProbeStage, ReplaceRootError, SourceError, SyncRootError,
+  TokioWatcher, WatchRootError, WatcherOptions,
 };
 
 mod common;
@@ -973,6 +974,266 @@ async fn bind_mount_inside_root_is_a_boundary() {
     !leaked_b,
     "the bind point is a mount boundary — no event surfaces under its spelling"
   );
+}
+
+/// The reserved cookie-directory name this crate mints under a root owned by this
+/// process: the documented `.tributaries-sync-cookies-<uid>` shape, qualified by
+/// the effective uid.
+///
+/// The uid is read off a directory the test itself just created rather than
+/// through a `geteuid` FFI call — a new object's owner IS the effective uid, and
+/// the filesystem answers it with no `unsafe` block. The result is checked against
+/// the crate's own public classifier below, so a cell staging this name is staging
+/// the name the write will actually reach for and not a private guess about it.
+fn reserved_cookie_dir_name(owned: &Path) -> String {
+  use std::os::unix::fs::MetadataExt;
+
+  let uid = std::fs::metadata(owned)
+    .expect("the scratch directory this test created")
+    .uid();
+  let name = format!(".tributaries-sync-cookies-{uid}");
+  assert!(
+    tributary_fs::is_sync_cookie_dir_name(&name),
+    "staging: {name} is the reserved cookie-directory shape this crate mints"
+  );
+  name
+}
+
+/// Every entry `dir` holds, as full paths. Panics rather than answering an empty
+/// set on a read failure: an absence this cell asserts on must be an absence it
+/// actually read.
+fn entries_of(dir: &Path) -> Vec<PathBuf> {
+  std::fs::read_dir(dir)
+    .unwrap_or_else(|err| panic!("enumerate {}: {err}", dir.display()))
+    .map(|entry| entry.expect("a directory entry").path())
+    .collect()
+}
+
+/// Suite 7 (privileged): a same-filesystem BIND MOUNT standing at the reserved
+/// cookie-directory name is refused, with nothing created anywhere.
+///
+/// This is the case a device comparison cannot see. A `mount --bind` of a
+/// directory on the SAME superblock shares its parent's device exactly, so the
+/// only fence that marks it a boundary is the mount id — which is precisely the
+/// fence the crawl uses, and precisely why the crawl arms no watch inside it. A
+/// write admitted here would create its marker on ground no queue of this scope
+/// reads, report success, and leave the caller's barrier to wait out its whole
+/// deadline for an event that could never be reported.
+///
+/// The bind's ORIGIN is enumerated as well as its mount point: the two names reach
+/// one object, and a marker created through either spelling stands in both. An
+/// assertion over the mount point alone would be satisfied by a lazy unmount as
+/// much as by a refusal.
+#[tokio::test]
+async fn a_bound_cookie_directory_refuses_the_sync_before_any_marker() {
+  use std::os::unix::fs::PermissionsExt;
+
+  const CELL: &str = "a_bound_cookie_directory_refuses_the_sync_before_any_marker";
+  if !privileged_or_skip(CELL) {
+    return;
+  }
+
+  let root = scratch_root("cookie-bind-reserved");
+  let target = root.join("a");
+  let reserved = target.join(reserved_cookie_dir_name(&root));
+  let origin = root.join("origin");
+  std::fs::create_dir_all(&reserved).expect("the reserved name's mount point");
+  std::fs::create_dir_all(&origin).expect("the directory to bind onto it");
+  // 0700 and this process's own uid on both, so the write's ownership and mode
+  // checks have nothing of their own to refuse on: whatever refusal comes back is
+  // the mount's.
+  for dir in [&reserved, &origin] {
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+      .expect("the reserved directory is owner-only");
+  }
+  let Some(bind) = common::bind_mount(&origin, &reserved) else {
+    common::skip_notice(format_args!("{CELL}: bind mount refused"));
+    let _ = std::fs::remove_dir_all(&root);
+    return;
+  };
+
+  let w = watcher();
+  let handle = w.watch(&root, Interest::all()).await.expect("watch");
+  let (admission, _ticket) = w.mint_sync_ticket().expect("this host seeds a watcher");
+  let denied = tokio::time::timeout(scaled(DEADLINE), w.sync_root(handle, &target, admission))
+    .await
+    .expect("the sync answers its caller rather than parking")
+    .expect_err("a marker inside a bind mount is a marker nothing reports");
+  assert!(
+    matches!(denied.error, SyncRootError::DirCrossesMount { .. }),
+    "the reserved name stands across a mount boundary, however equal the devices \
+     are: {:?}",
+    denied.error
+  );
+
+  // Nothing was created — through the bind's own name or through the origin's,
+  // which are two spellings of one object.
+  for dir in [&reserved, &origin] {
+    assert_eq!(
+      entries_of(dir),
+      Vec::<PathBuf>::new(),
+      "the refusal is taken before any create, so {} holds nothing",
+      dir.display()
+    );
+  }
+
+  drop(bind);
+  let _ = w.close().await;
+  let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Suite 7 (privileged): the same fence one level up — the directory the sync
+/// NAMES is itself a bind mount inside the root.
+///
+/// The descent from the verified root to that directory checks each component's
+/// identity, which a bind mount passes: it is a real directory, reached by a real
+/// `openat`, standing at a perfectly contained in-root name. What it is not is
+/// ground this root's crawl descends into, so a marker written anywhere beneath it
+/// is unreportable for exactly the reason one inside a bound reserved directory
+/// is — and it is refused under the same word, naming the component that crossed.
+///
+/// The origin is OUTSIDE the root and on the same superblock, which is the shape
+/// that makes the device belt inert: same device, different mount.
+#[tokio::test]
+async fn a_bound_sync_target_refuses_the_sync_before_any_marker() {
+  const CELL: &str = "a_bound_sync_target_refuses_the_sync_before_any_marker";
+  if !privileged_or_skip(CELL) {
+    return;
+  }
+
+  let root = scratch_root("cookie-bind-target");
+  let target = root.join("b");
+  let origin = scratch_root("cookie-bind-target-origin");
+  std::fs::create_dir_all(&target).expect("the in-root mount point the sync names");
+  let Some(bind) = common::bind_mount(&origin, &target) else {
+    common::skip_notice(format_args!("{CELL}: bind mount refused"));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&origin);
+    return;
+  };
+
+  let w = watcher();
+  let handle = w.watch(&root, Interest::all()).await.expect("watch");
+  let (admission, _ticket) = w.mint_sync_ticket().expect("this host seeds a watcher");
+  let denied = tokio::time::timeout(scaled(DEADLINE), w.sync_root(handle, &target, admission))
+    .await
+    .expect("the sync answers its caller rather than parking")
+    .expect_err("a marker under a bind mount is a marker nothing reports");
+  match &denied.error {
+    SyncRootError::DirCrossesMount { dir } => assert_eq!(
+      dir, &target,
+      "the refusal names the first component of the descent that left the root's \
+       mount frame"
+    ),
+    other => panic!("a bound sync target is a mount crossing, got {other:?}"),
+  }
+
+  // And the walk refused before it opened anything inside that component, so
+  // neither spelling of the bound object holds a reserved directory or a marker.
+  for dir in [&target, &origin] {
+    assert_eq!(
+      entries_of(dir),
+      Vec::<PathBuf>::new(),
+      "the refusal is taken before any create, so {} holds nothing",
+      dir.display()
+    );
+  }
+
+  drop(bind);
+  let _ = w.close().await;
+  let _ = std::fs::remove_dir_all(&root);
+  let _ = std::fs::remove_dir_all(&origin);
+}
+
+/// Suite 7 (privileged): a same-superblock BIND ALIAS of ground outside the root,
+/// mounted inside it, is refused at the ADMISSION — before the coverage window
+/// this sync would have opened.
+///
+/// This is the sequence every other fence on the cookie path lets through. The
+/// alias is a real directory at a perfectly contained in-root name; the caller
+/// reaches it through an in-root symlink, so the spelling clears every lexical
+/// test; the location the door reads off its own pin is contained too, and no
+/// seat names it; and a bind preserves `(dev, ino)` exactly, so the write's
+/// identity comparisons match whatever happens next. What the alias is NOT is
+/// ground the crawl descends: the descent is fenced on the mount, so nothing
+/// beneath it is ever armed and the marker's own create could never be reported.
+///
+/// And the write cannot be the one to catch it. Once the sync is admitted the
+/// origin can be moved into ordinary covered ground and the link repointed, which
+/// puts the write on the non-mount path where every frame check it takes passes
+/// honestly — over a subtree holding entries (`deep/old` below) that no queue of
+/// this scope ever carried. So the only reading that sees it is the frame taken
+/// at the CUT, off the pin, and the refusal has to come from the admission.
+///
+/// The origin is enumerated rather than the mount point: the two names reach one
+/// object, and an assertion over the mount point alone would be satisfied by a
+/// lazy unmount as much as by a refusal.
+#[tokio::test]
+async fn a_bound_alias_of_outside_ground_refuses_the_sync_at_the_admission() {
+  const CELL: &str = "a_bound_alias_of_outside_ground_refuses_the_sync_at_the_admission";
+  if !privileged_or_skip(CELL) {
+    return;
+  }
+
+  let root = scratch_root("cookie-bind-admission");
+  // The subtree prepared OUTSIDE the root: a target, the reserved cookie
+  // directory already standing inside it, and an entry under THAT — the
+  // descendants no queue of this scope ever reported.
+  let origin = scratch_root("cookie-bind-admission-origin");
+  let reserved_name = reserved_cookie_dir_name(&root);
+  let hidden = origin.join("T");
+  let reserved = hidden.join(&reserved_name);
+  std::fs::create_dir_all(reserved.join("deep").join("old"))
+    .expect("the hidden target, its reserved directory and an older entry inside it");
+
+  let mounted = root.join("mounted");
+  std::fs::create_dir(&mounted).expect("the in-root mount point");
+  let Some(bind) = common::bind_mount(&origin, &mounted) else {
+    common::skip_notice(format_args!("{CELL}: bind mount refused"));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&origin);
+    return;
+  };
+  // The spelling the caller passes: an in-root symlink onto the alias, so nothing
+  // the caller says ever mentions a mount.
+  std::os::unix::fs::symlink(&mounted, root.join("link")).expect("the in-root symlink");
+  let spelling = root.join("link").join("T");
+  let landing = mounted.join("T");
+
+  let w = watcher();
+  let handle = w.watch(&root, Interest::all()).await.expect("watch");
+  let (admission, _ticket) = w.mint_sync_ticket().expect("this host seeds a watcher");
+  let denied = tokio::time::timeout(scaled(DEADLINE), w.sync_root(handle, &spelling, admission))
+    .await
+    .expect("the sync answers its caller rather than parking")
+    .expect_err("a pin taken inside a bind alias is not an admissible sync");
+  match &denied.error {
+    SyncRootError::DirCrossesMount { dir } => assert_eq!(
+      dir, &landing,
+      "the refusal names WHERE the pinned object stood — the alias's own in-root \
+       name — not the symlink spelling it was reached by"
+    ),
+    other => panic!("a bind alias of outside ground is a mount crossing, got {other:?}"),
+  }
+
+  // Nothing was created anywhere under the ORIGIN, which is the one object both
+  // names reach: the refusal is taken before the fence, so no write was ever
+  // dispatched and the reserved directory still holds only what was staged in it.
+  assert_eq!(
+    entries_of(&reserved),
+    vec![reserved.join("deep")],
+    "no marker stands beside the entries this scope never carried"
+  );
+  assert_eq!(
+    entries_of(&hidden),
+    vec![hidden.join(&reserved_name)],
+    "and nothing was minted beside the reserved directory either"
+  );
+
+  drop(bind);
+  let _ = w.close().await;
+  let _ = std::fs::remove_dir_all(&root);
+  let _ = std::fs::remove_dir_all(&origin);
 }
 
 /// §7's documented limitation, pinned end to end: a non-UTF-8 name cannot

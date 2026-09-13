@@ -1734,39 +1734,6 @@ async fn file_churn_keeps_a_bounded_map() {
   let _ = w.close().await;
 }
 
-/// Bind-mounts `src` at `dst` (both must already exist), returning a guard that
-/// unmounts on drop — so a `--test-threads=1` run never leaks a bind even when the
-/// test body panics (the guard's `Drop` runs on unwind). `None` when the bind is
-/// refused (no privilege / no mount support — the caller skips loudly).
-fn bind_mount(src: &Path, dst: &Path) -> Option<BindGuard> {
-  let status = Command::new("mount")
-    .arg("--bind")
-    .arg(src)
-    .arg(dst)
-    .status();
-  if !status.map(|s| s.success()).unwrap_or(false) {
-    return None;
-  }
-  Some(BindGuard {
-    at: dst.to_path_buf(),
-  })
-}
-
-/// Unmounts a bind on drop, best-effort but retried lazily (a still-busy bind is
-/// caught on the next umount attempt). Keeps a `--test-threads=1` fanotify run from
-/// leaving stray binds under the shared loopback for a later test to trip over.
-struct BindGuard {
-  at: PathBuf,
-}
-
-impl Drop for BindGuard {
-  fn drop(&mut self) {
-    // `-l` (lazy) so a bind still referenced by an fd detaches once quiescent,
-    // rather than wedging the ephemeral container's teardown.
-    let _ = Command::new("umount").arg("-l").arg(&self.at).status();
-  }
-}
-
 /// A `mount --bind` of an OUTSIDE-root directory (same superblock, SAME device) at
 /// a point INSIDE the watched root is a mount boundary the seed walk must NOT
 /// descend: the bind shares the root's device, so a device-only fence would descend
@@ -1793,7 +1760,7 @@ async fn bind_mount_of_outside_dir_is_a_boundary() {
   std::fs::create_dir_all(origin.join("nested")).unwrap();
   let bind_point = root.join("bound");
   std::fs::create_dir_all(&bind_point).unwrap();
-  let Some(_bind) = bind_mount(&origin, &bind_point) else {
+  let Some(_bind) = common::bind_mount(&origin, &bind_point) else {
     common::skip_notice(format_args!(
       "bind_mount_of_outside_dir_is_a_boundary: bind mount refused (--privileged)"
     ));
@@ -1884,7 +1851,7 @@ async fn ancestor_self_bind_cycle_terminates() {
   // Bind the ROOT onto a directory inside itself: `root/sub/loop` now re-exposes
   // the whole root (including `sub/loop` again — an unbounded descent without the
   // visited-handle guard).
-  let Some(_bind) = bind_mount(&root, &loop_point) else {
+  let Some(_bind) = common::bind_mount(&root, &loop_point) else {
     common::skip_notice(format_args!(
       "ancestor_self_bind_cycle_terminates: bind mount refused (--privileged)"
     ));
