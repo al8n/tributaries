@@ -327,10 +327,12 @@ fn watch_options_clone_shares_the_filter_slot() {
 #[test]
 fn a_programmatic_seat_is_bounded_at_collection() {
   let cap = RootGlobs::MAX_SEAT_PATTERNS;
+  // One compiled pattern, cloned: the ceiling counts entries, not distinct
+  // automatons, and cloning is an `Arc` pointer copy — 257 SEPARATELY compiled
+  // globs cross 32-bit Miri's address-space limit.
   let many = |count: usize| {
-    (0..count)
-      .map(|n| glob(&std::format!("**/w{n}")))
-      .collect::<Vec<_>>()
+    let pattern = glob("**/w");
+    std::iter::repeat_n(pattern, count).collect::<Vec<_>>()
   };
   let over = || std::iter::repeat(glob("**/w"));
 

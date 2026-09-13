@@ -112,18 +112,18 @@ run_shard() {
 }
 
 # The suite runs one shard per process, and the partition covers every workspace
-# test exactly once: the four `fs-*` groups partition tributary-fs by test-name
+# test exactly once: the six `fs-*` groups partition tributary-fs by test-name
 # prefix, the two `proto-monitor-*` groups partition the monitor suite,
 # `proto-rest` is everything else in tributary-proto, and the two `umbrella-*`
 # groups partition the tributaries crate's own suite.
 #
-# All four `fs-*` shards pass `--features tokio`, and they must agree on it: the
+# All six `fs-*` shards pass `--features tokio`, and they must agree on it: the
 # test modules under `driver::` and `watcher::` are gated
 # `#[cfg(all(test, feature = "tokio"))]`, so without the feature the three
-# `driver::` filters match nothing and `fs-rest`'s `--skip driver::` skips
-# nothing. With it the four are a true partition — 699 + 89 + 93 + 75 = 956, the
-# whole tokio-enabled lib suite (counts from a native run; miri drops the
-# `not(miri)` cells from each side alike).
+# `driver::` filters match nothing and `watcher::`'s slice of `fs-rest` goes
+# with them. With it the six are a true partition — 301 + 404 + 60 + 139 + 97 +
+# 77 = 1078, the whole tokio-enabled lib suite (counts from a native run; miri
+# drops the `not(miri)` cells from each side alike).
 #
 # `proto-rest`, `umbrella-head` and `umbrella-tail` deliberately keep the default
 # feature set. None is vacuous, but the umbrella's own `driver::tests`/
@@ -155,6 +155,23 @@ run_shard() {
 # expressed as skips of the same three names — the same asymmetry as the monitor
 # split: a module added tomorrow, or a test added to a module already on one
 # side, lands in `umbrella-tail` rather than falling through a gap.
+#
+# `tributary-fs`'s own suite (minus `driver::`) splits by top-level module the
+# same way: `core::` (301 cells) and `os::` (404) are its two heaviest
+# non-driver modules by native count, each big enough to be its own shard, so
+# `fs-core` and `fs-os` each enumerate exactly one of them and the narrower
+# `fs-rest` is their complement, expressed as skips of `driver::`, `core::` and
+# `os::` together — a module added tomorrow lands in `fs-rest` rather than
+# falling through a gap. This is what took the old `fs-rest` off the critical
+# path: on CI run 34430926057 (a523620) the single `fs-rest` shard (`--skip
+# driver::`) ran 45-72 min stacked and 69-90+ min tree borrows, and
+# `miri-tb-x86_64 [fs-rest]` hit the 90-minute timeout while still inside
+# `watcher::tests` at 86 min — the shard had grown with this branch's cells
+# (options faces, glob seats, watcher lifecycle and door cells) past what one
+# process fits. Pulling `core::` and `os::` into their own shards leaves the
+# renamed `fs-rest` at just `watcher::` + `options::` + `event::` (60 cells),
+# so the module that stalled now runs early in a short shard instead of late in
+# a long one.
 case "$TEST_GROUP" in
   "")
     run_shard cargo miri test --all-targets --target "$TARGET"
@@ -187,9 +204,17 @@ case "$TEST_GROUP" in
     run_shard cargo miri test -p tributaries --all-targets --target "$TARGET" -- \
       --skip coalesce:: --skip subsume:: --skip route::
     ;;
+  fs-core)
+    run_shard cargo miri test -p tributary-fs --lib --features tokio --target "$TARGET" -- \
+      core::
+    ;;
+  fs-os)
+    run_shard cargo miri test -p tributary-fs --lib --features tokio --target "$TARGET" -- \
+      os::
+    ;;
   fs-rest)
     run_shard cargo miri test -p tributary-fs --all-targets --features tokio --target "$TARGET" -- \
-      --skip driver::
+      --skip driver:: --skip core:: --skip os::
     ;;
   fs-cookie)
     run_shard cargo miri test -p tributary-fs --lib --features tokio --target "$TARGET" -- \

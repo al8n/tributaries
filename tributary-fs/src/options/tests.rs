@@ -274,6 +274,105 @@ mod serde_face {
     assert_eq!(parsed, WatcherOptions::new().with_latency(parsed.latency()));
   }
 
+  /// Every bounded key is judged WHERE IT IS READ: the bound itself parses, and one
+  /// step past it is refused by the document.
+  ///
+  /// A face that only PARSES an out-of-range number defers the refusal to
+  /// `Watcher::new`, and an application then cannot read a successful load as
+  /// acceptance — the configuration layer reports the document as read, and the
+  /// watcher refuses it later with nothing left pointing at the key that was
+  /// wrong. The rule each key is judged by is the very one
+  /// [`WatcherOptions::validate`] asks, so the two can never come to mean
+  /// different things by the same number.
+  ///
+  /// Revert witness: drop a key's `deserialize_with` and its over-bound document
+  /// parses into a household `validate` then has to catch.
+  #[test]
+  fn every_bounded_key_accepts_its_bound_and_refuses_one_step_past_it() {
+    /// A key's name, a document naming its exact bound, the household that
+    /// document means, a document one step past the bound, and the words the
+    /// refusal must carry.
+    type Case = (
+      &'static str,
+      &'static str,
+      fn(WatcherOptions) -> WatcherOptions,
+      &'static str,
+      &'static str,
+    );
+
+    let cases: [Case; 6] = [
+      (
+        "latency",
+        r#"{"latency": "60s"}"#,
+        |o| o.with_latency(WatcherOptions::MAX_LATENCY),
+        r#"{"latency": "61s"}"#,
+        "exceeds",
+      ),
+      (
+        "event_capacity",
+        r#"{"event_capacity": 1048576}"#,
+        |o| o.with_event_capacity(WatcherOptions::MAX_EVENT_CAPACITY),
+        r#"{"event_capacity": 1048577}"#,
+        "exceeds",
+      ),
+      (
+        "os_batch_capacity",
+        r#"{"os_batch_capacity": 65536}"#,
+        |o| o.with_os_batch_capacity(WatcherOptions::MAX_OS_BATCH_CAPACITY),
+        r#"{"os_batch_capacity": 65537}"#,
+        "exceeds",
+      ),
+      (
+        "os_buffer_bytes at its ceiling",
+        r#"{"os_buffer_bytes": 1048576}"#,
+        |o| o.with_os_buffer_bytes(WatcherOptions::MAX_OS_BUFFER_BYTES),
+        r#"{"os_buffer_bytes": 1048577}"#,
+        "outside",
+      ),
+      (
+        "os_buffer_bytes at its floor",
+        r#"{"os_buffer_bytes": 4096}"#,
+        |o| o.with_os_buffer_bytes(WatcherOptions::MIN_OS_BUFFER_BYTES),
+        r#"{"os_buffer_bytes": 4095}"#,
+        "outside",
+      ),
+      (
+        "root_liveness_interval",
+        r#"{"root_liveness_interval": "24h"}"#,
+        |o| o.with_root_liveness_interval(WatcherOptions::MAX_ROOT_LIVENESS_INTERVAL),
+        r#"{"root_liveness_interval": "25h"}"#,
+        "exceeds",
+      ),
+    ];
+
+    for (key, at_bound, expected, past_bound, words) in cases {
+      let parsed = serde_json::from_str::<WatcherOptions>(at_bound)
+        .unwrap_or_else(|err| panic!("{key}: the bound itself is admissible, got {err}"));
+      assert_eq!(parsed, expected(WatcherOptions::new()), "{key}");
+      parsed
+        .validate()
+        .unwrap_or_else(|err| panic!("{key}: and the household it builds validates, got {err}"));
+
+      // And the value the document carried survives a round trip unchanged — the
+      // range rule is a gate, never a rewrite.
+      let json = serde_json::to_string(&parsed).unwrap();
+      assert_eq!(
+        serde_json::from_str::<WatcherOptions>(&json).unwrap(),
+        parsed,
+        "{key} round-trips"
+      );
+
+      let refusal = serde_json::from_str::<WatcherOptions>(past_bound)
+        .map(|_| ())
+        .expect_err(key)
+        .to_string();
+      assert!(
+        refusal.contains(words),
+        "{key}: the refusal names the bound, got {refusal}"
+      );
+    }
+  }
+
   /// The capacities are non-zero TYPES, so a zero is refused by the format rather
   /// than normalized into a channel nobody can push through.
   #[test]
@@ -460,18 +559,43 @@ mod serde_face {
     );
   }
 
-  /// Loading is exactly as unchecked as the builders are: an out-of-range knob
-  /// loads and is refused by the one explicit step, `validate`.
+  /// A bounded knob is refused BY THE DOCUMENT, not left for `validate` to catch —
+  /// the value the builders would take is exactly the value a key will.
+  ///
+  /// This is the claim the key-by-key cell above makes for every bounded field;
+  /// stated once here on the field whose out-of-range value used to load.
   #[test]
-  fn deserializing_does_not_validate() {
-    let parsed: WatcherOptions = serde_json::from_str(r#"{"latency": "10min"}"#).unwrap();
-    assert_eq!(parsed.latency(), Duration::from_secs(600));
+  fn deserializing_a_bounded_key_validates_it() {
+    let refusal = serde_json::from_str::<WatcherOptions>(r#"{"latency": "10min"}"#)
+      .map(|_| ())
+      .expect_err("a ten-minute latency is past the ceiling and the key says so");
+    assert!(
+      refusal.to_string().contains("exceeds"),
+      "the document names the ceiling: {refusal}"
+    );
+    // And the builder that would carry the same value still reaches the same
+    // verdict through `validate` — one rule, both doors.
     assert_eq!(
-      parsed.validate(),
+      WatcherOptions::new()
+        .with_latency(Duration::from_secs(600))
+        .validate(),
       Err(OptionsError::LatencyTooLarge {
         supplied: Duration::from_secs(600)
       })
     );
+  }
+
+  /// The one knob a document may carry to any value is the one that HAS no range:
+  /// `move_window`'s derivation saturates and caps for every input, so nothing
+  /// judges its key and nothing needs to.
+  #[test]
+  fn the_unbounded_key_loads_whatever_it_names() {
+    let parsed: WatcherOptions =
+      serde_json::from_str(r#"{"move_window": "10min"}"#).expect("no rule refuses it");
+    assert_eq!(parsed.move_window(), Duration::from_secs(600));
+    parsed
+      .validate()
+      .expect("and validation has no opinion on it either");
   }
 }
 
@@ -539,6 +663,90 @@ mod clap_face {
     ];
     for (args, expected) in cases {
       assert_eq!(parse(args), expected(WatcherOptions::new()), "{args:?}");
+    }
+  }
+
+  /// Every bounded flag is judged WHERE THE VALUE IS WRITTEN: the bound itself
+  /// parses, and one step past it is the flag's own `ValueValidation`.
+  ///
+  /// A flag with an unrestricted parser defers the refusal to `Watcher::new`, so a
+  /// command line hears about the ceiling at the watcher rather than at the
+  /// argument that carried it — and an application cannot read a successful parse
+  /// as acceptance. The rule each flag is judged by is the very one
+  /// [`WatcherOptions::validate`] asks.
+  ///
+  /// Revert witness: drop a flag's `value_parser` and its over-bound value parses
+  /// into a household `validate` then has to catch.
+  #[test]
+  fn every_bounded_flag_accepts_its_bound_and_refuses_one_step_past_it() {
+    /// A flag at its exact bound, the household that means, the same flag one step
+    /// past the bound, and the words the refusal must carry.
+    type Case = (
+      &'static [&'static str],
+      fn(WatcherOptions) -> WatcherOptions,
+      &'static [&'static str],
+      &'static str,
+    );
+
+    let cases: [Case; 6] = [
+      (
+        &["--latency", "60s"],
+        |o| o.with_latency(WatcherOptions::MAX_LATENCY),
+        &["--latency", "61s"],
+        "exceeds",
+      ),
+      (
+        &["--watcher-event-capacity", "1048576"],
+        |o| o.with_event_capacity(WatcherOptions::MAX_EVENT_CAPACITY),
+        &["--watcher-event-capacity", "1048577"],
+        "exceeds",
+      ),
+      (
+        &["--os-batch-capacity", "65536"],
+        |o| o.with_os_batch_capacity(WatcherOptions::MAX_OS_BATCH_CAPACITY),
+        &["--os-batch-capacity", "65537"],
+        "exceeds",
+      ),
+      (
+        &["--os-buffer-bytes", "1048576"],
+        |o| o.with_os_buffer_bytes(WatcherOptions::MAX_OS_BUFFER_BYTES),
+        &["--os-buffer-bytes", "1048577"],
+        "outside",
+      ),
+      (
+        &["--os-buffer-bytes", "4096"],
+        |o| o.with_os_buffer_bytes(WatcherOptions::MIN_OS_BUFFER_BYTES),
+        &["--os-buffer-bytes", "4095"],
+        "outside",
+      ),
+      (
+        &["--root-liveness-interval", "24h"],
+        |o| o.with_root_liveness_interval(WatcherOptions::MAX_ROOT_LIVENESS_INTERVAL),
+        &["--root-liveness-interval", "25h"],
+        "exceeds",
+      ),
+    ];
+
+    for (at_bound, expected, past_bound, words) in cases {
+      let parsed = parse(at_bound);
+      assert_eq!(parsed, expected(WatcherOptions::new()), "{at_bound:?}");
+      parsed
+        .validate()
+        .unwrap_or_else(|err| panic!("{at_bound:?}: and it validates, got {err}"));
+
+      let err = Cli::try_parse_from(std::iter::once("app").chain(past_bound.iter().copied()))
+        .err()
+        .unwrap_or_else(|| panic!("{past_bound:?} is refused"));
+      assert_eq!(
+        err.kind(),
+        clap::error::ErrorKind::ValueValidation,
+        "{past_bound:?}"
+      );
+      let rendered = err.render().to_string();
+      assert!(
+        rendered.contains(words),
+        "{past_bound:?}: the refusal names the bound, got {rendered}"
+      );
     }
   }
 
@@ -869,10 +1077,12 @@ mod root_options {
   /// supplied so a person can act on it.
   #[test]
   fn a_seat_past_the_pattern_cap_is_a_typed_refusal() {
+    // One compiled pattern, cloned: the ceiling counts entries, not distinct
+    // automatons, and cloning is an `Arc` pointer copy — 257 SEPARATELY
+    // compiled globs cross 32-bit Miri's address-space limit.
     let many = |count: usize| {
-      (0..count)
-        .map(|n| glob(&std::format!("**/w{n}")))
-        .collect::<std::vec::Vec<_>>()
+      let pattern = glob("**/w");
+      std::iter::repeat_n(pattern, count).collect::<std::vec::Vec<_>>()
     };
     let cap = RootOptions::MAX_SEAT_PATTERNS;
 
@@ -920,10 +1130,12 @@ mod root_options {
   #[test]
   fn a_programmatic_seat_is_bounded_at_collection() {
     let cap = RootOptions::MAX_SEAT_PATTERNS;
+    // One compiled pattern, cloned: the ceiling counts entries, not distinct
+    // automatons, and cloning is an `Arc` pointer copy — 257 SEPARATELY
+    // compiled globs cross 32-bit Miri's address-space limit.
     let many = |count: usize| {
-      (0..count)
-        .map(|n| glob(&std::format!("**/w{n}")))
-        .collect::<std::vec::Vec<_>>()
+      let pattern = glob("**/w");
+      std::iter::repeat_n(pattern, count).collect::<std::vec::Vec<_>>()
     };
     let over = || std::iter::repeat(glob("**/w"));
 
