@@ -435,7 +435,24 @@ pub(crate) type BackendStatsHandle = std::sync::Arc<BackendStatsShared>;
 /// USN journal — the first failing precondition is a typed spawn error, never a
 /// fallback). On any other platform a forced variant fails the spawn with
 /// [`ForeignBackend`](SourceError::ForeignBackend) — never a silent ignore.
+///
+/// # Configuration faces
+///
+/// Both faces spell a variant exactly as [`as_str`](Self::as_str) does — one
+/// stable lowercase tag per variant, `usn-journal` included — so a log line, a
+/// configuration document and a command line all name a backend the same way:
+///
+/// ```json
+/// { "backend": "fanotify" }
+/// ```
+///
+/// ```text
+/// $ app --backend usn-journal
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 #[non_exhaustive]
 pub enum Backend {
   /// Resolve the host's primitive at the spawn barrier — the per-root default.

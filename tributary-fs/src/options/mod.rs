@@ -124,17 +124,143 @@ pub(crate) fn derive_move_window(move_window: Duration, latency: Duration) -> Du
 /// Each ceiling names a value no downstream use site can carry — an eager
 /// channel allocation, a native buffer length, a cadence that would never come
 /// round — and a typed refusal at construction is the only honest answer to one.
+///
+/// # Configuration faces
+///
+/// With the `serde` feature the household is one object keyed by the field names.
+/// Every key is optional: an absent one takes the value [`new`](Self::new) gives
+/// it, so a document names only what it overrides, and an unknown key is ignored
+/// (a document written for a later version still loads). Durations are humantime
+/// text (`"10ms"`, `"2s"`), the capacities plain integers (a `0` is refused — they
+/// are non-zero types), the exclusions plain paths, and `max_map_directories` is
+/// either an integer cap or `null` for uncapped.
+///
+/// ```json
+/// {
+///   "latency": "25ms",
+///   "event_capacity": 4096,
+///   "backend": "fanotify",
+///   "exclusions": ["/repo/target"],
+///   "max_map_directories": 250000
+/// }
+/// ```
+///
+/// Deserializing is exactly as unchecked as the builders are: it never runs
+/// [`validate`](Self::validate). A configuration layer that wants a bad setting
+/// refused where the setting is READ calls it on the loaded value — the same one
+/// explicit step [`Watcher::new`](crate::Watcher::new) runs.
+///
+/// With the `clap` feature it is a `clap::Args` group of one `--<field>` flag
+/// per knob, each defaulting to the same value [`new`](Self::new) gives it, so a
+/// flagless command line is the default household. `--exclusions` repeats, once
+/// per path.
+///
+/// ```text
+/// $ app --latency 25ms --watcher-event-capacity 4096 --backend fanotify \
+///       --exclusions /repo/target --max-map-directories 250000
+/// ```
+///
+/// ## The one flag that is not its field's name
+///
+/// [`event_capacity`](Self::event_capacity) is `--watcher-event-capacity`.
+///
+/// This household and the umbrella's own `TributariesOptions` both carry an
+/// `event_capacity` — two different channels one level apart — and a command line
+/// that flattens both (the shape a consumer configuring the whole stack has) cannot
+/// carry the same flag twice: clap refuses a duplicate argument id outright. The
+/// INNER, OS-layer household yields, so the flag a reader reaches for first,
+/// `--event-capacity`, still means the outer channel it is named after.
+///
+/// The `serde` key is **unchanged** — a document nests the two households under
+/// their own keys, so nothing there ever collides, and this exception is the CLI's
+/// alone.
+///
+/// Uncapped (`max_map_directories = None`) is deliberately NOT expressible from a
+/// flag — its own documentation explains why the default is finite — nor from a
+/// document format without a null literal; a caller that wants it says so in code.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[cfg_attr(feature = "clap", derive(clap::Args))]
 pub struct WatcherOptions {
+  #[cfg_attr(feature = "serde", serde(with = "humantime_serde"))]
+  #[cfg_attr(
+    feature = "clap",
+    arg(
+      long,
+      value_parser = humantime::parse_duration,
+      default_value = clap_duration_default(WatcherOptions::DEFAULT_LATENCY),
+    )
+  )]
   latency: Duration,
+  #[cfg_attr(feature = "serde", serde(with = "humantime_serde"))]
+  #[cfg_attr(
+    feature = "clap",
+    arg(
+      long,
+      value_parser = humantime::parse_duration,
+      default_value = clap_duration_default(WatcherOptions::DEFAULT_MOVE_WINDOW),
+    )
+  )]
   move_window: Duration,
+  // The ONE flag that is not its field's name — see the type docs. Both the id and
+  // the long form move: clap rejects a duplicate ID, so renaming only the long form
+  // would leave the very collision this avoids.
+  #[cfg_attr(
+    feature = "clap",
+    arg(
+      id = "watcher_event_capacity",
+      long = "watcher-event-capacity",
+      default_value_t = WatcherOptions::DEFAULT_EVENT_CAPACITY,
+    )
+  )]
   event_capacity: NonZeroUsize,
+  #[cfg_attr(feature = "clap", arg(long, default_value_t = WatcherOptions::DEFAULT_OS_BATCH_CAPACITY))]
   os_batch_capacity: NonZeroUsize,
+  #[cfg_attr(feature = "clap", arg(long, default_value_t = WatcherOptions::DEFAULT_OS_BUFFER_BYTES))]
   os_buffer_bytes: NonZeroU32,
+  #[cfg_attr(feature = "clap", arg(long))]
   exclusions: Vec<PathBuf>,
+  #[cfg_attr(feature = "clap", arg(long, value_enum, default_value_t = WatcherOptions::DEFAULT_BACKEND))]
   backend: Backend,
+  #[cfg_attr(feature = "serde", serde(with = "humantime_serde"))]
+  #[cfg_attr(
+    feature = "clap",
+    arg(
+      long,
+      value_parser = humantime::parse_duration,
+      default_value = clap_duration_default(WatcherOptions::DEFAULT_ROOT_LIVENESS_INTERVAL),
+    )
+  )]
   root_liveness_interval: Duration,
+  #[cfg_attr(feature = "clap", arg(long, default_value = clap_default_max_map_directories()))]
   max_map_directories: Option<usize>,
+}
+
+/// A flag default rendered from the constant it mirrors, so the flag and the
+/// constructor can never drift.
+#[cfg(feature = "clap")]
+fn clap_default(text: String) -> clap::builder::OsStr {
+  clap::builder::Str::from(text).into()
+}
+
+/// The humantime text of a `Duration` default — what a `--<duration-flag>` falls
+/// back to, in the same spelling its `value_parser` reads.
+#[cfg(feature = "clap")]
+fn clap_duration_default(duration: Duration) -> clap::builder::OsStr {
+  clap_default(humantime::format_duration(duration).to_string())
+}
+
+/// The clap default for [`WatcherOptions::max_map_directories`], derived from
+/// [`WatcherOptions::DEFAULT_MAX_MAP_DIRECTORIES`] itself: a cap becomes the flag's
+/// default text, and an uncapped default would leave the flag with no default at
+/// all.
+#[cfg(feature = "clap")]
+fn clap_default_max_map_directories() -> clap::builder::Resettable<clap::builder::OsStr> {
+  match WatcherOptions::DEFAULT_MAX_MAP_DIRECTORIES {
+    Some(cap) => clap::builder::Resettable::Value(clap_default(cap.to_string())),
+    None => clap::builder::Resettable::Reset,
+  }
 }
 
 impl WatcherOptions {

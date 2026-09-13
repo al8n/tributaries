@@ -8,13 +8,46 @@
 /// FSEvents stream flags). A field set to `false` means "do not subscribe", but
 /// note that some backends cannot mask individual kinds — the driver may deliver
 /// a superset, which the core's delivery filter then narrows.
+///
+/// # Configuration faces
+///
+/// With the `serde` feature the mask is a plain object of its own field names,
+/// every key optional and defaulted from [`Interest::new`] (the EMPTY mask), so a
+/// document names only what it subscribes to. Unknown keys are ignored — a
+/// document written for a later version still loads.
+///
+/// ```json
+/// { "created": true, "removed": true, "moved": true }
+/// ```
+///
+/// It is deliberately NOT a list of kind names: [`ondir`](Self::ondir) is a
+/// target-class modifier rather than an event subscription (see
+/// [`is_empty`](Self::is_empty)), so a flat set of names would misrepresent it as a
+/// kind.
+///
+/// With the `clap` feature it is a `clap::Args` group of one `--<field>` flag per
+/// bit. Every bit defaults to `false`, so a bare flag SETS it and the flagless
+/// command line is [`Interest::new`]:
+///
+/// ```text
+/// $ app --created --removed --moved
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[cfg_attr(feature = "clap", derive(clap::Args))]
 pub struct Interest {
+  #[cfg_attr(feature = "clap", arg(long))]
   created: bool,
+  #[cfg_attr(feature = "clap", arg(long))]
   removed: bool,
+  #[cfg_attr(feature = "clap", arg(long))]
   modified: bool,
+  #[cfg_attr(feature = "clap", arg(long))]
   moved: bool,
+  #[cfg_attr(feature = "clap", arg(long))]
   attrib: bool,
+  #[cfg_attr(feature = "clap", arg(long))]
   ondir: bool,
 }
 
