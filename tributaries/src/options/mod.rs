@@ -496,14 +496,17 @@ where
 ///
 /// With the `serde` feature the policy is one object keyed by the field names, every
 /// key optional and defaulted from [`new`](Self::new), unknown keys ignored. The two
-/// windows are humantime text:
+/// windows are humantime text, refused past a small byte ceiling before humantime
+/// ever parses it (a fixed message naming the bound and the length, never the
+/// text):
 ///
 /// ```json
 /// { "quiet_window": "100ms", "max_hold": "2s", "max_buffered": 4096 }
 /// ```
 ///
 /// With the `clap` feature it is a `clap::Args` group of one `--<field>` flag per
-/// knob, defaulted the same way:
+/// knob, defaulted the same way, and `--quiet-window`/`--max-hold` carry the same
+/// duration-text ceiling the serde face judges against:
 ///
 /// ```text
 /// $ app --quiet-window 100ms --max-hold 2s --max-buffered 4096
@@ -524,9 +527,21 @@ where
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(default))]
 pub struct DebounceConfig {
-  #[cfg_attr(feature = "serde", serde(with = "humantime_serde"))]
+  #[cfg_attr(
+    feature = "serde",
+    serde(
+      serialize_with = "humantime_serde::serialize",
+      deserialize_with = "deserialize_bounded_duration"
+    )
+  )]
   quiet_window: Duration,
-  #[cfg_attr(feature = "serde", serde(with = "humantime_serde"))]
+  #[cfg_attr(
+    feature = "serde",
+    serde(
+      serialize_with = "humantime_serde::serialize",
+      deserialize_with = "deserialize_bounded_duration"
+    )
+  )]
   max_hold: Duration,
   #[cfg_attr(feature = "serde", serde(deserialize_with = "de_max_buffered"))]
   max_buffered: usize,
@@ -543,13 +558,13 @@ pub struct DebounceConfig {
 struct DebounceConfigArgs {
   #[arg(
     long,
-    value_parser = humantime::parse_duration,
+    value_parser = parse_bounded_duration,
     default_value = clap_duration_default(DebounceConfig::DEFAULT_QUIET_WINDOW),
   )]
   quiet_window: Duration,
   #[arg(
     long,
-    value_parser = humantime::parse_duration,
+    value_parser = parse_bounded_duration,
     default_value = clap_duration_default(DebounceConfig::DEFAULT_MAX_HOLD),
   )]
   max_hold: Duration,
@@ -637,6 +652,92 @@ impl clap::Args for DebounceConfig {
 #[cfg(feature = "clap")]
 fn clap_duration_default(duration: Duration) -> clap::builder::OsStr {
   clap::builder::Str::from(humantime::format_duration(duration).to_string()).into()
+}
+
+/// The byte ceiling every duration TEXT is measured against before humantime
+/// ever sees it — a small private duplicate of `tributary_fs`'s own bound
+/// (the umbrella's `serde` face compiles without `fs`, and `tributary_proto`
+/// carries no `humantime` dependency to host a shared one, so duplicating the
+/// visitor and this const is the smallest correct fix).
+///
+/// Derived the same way: the two windows [`DebounceConfig`] carries are policy
+/// in the milliseconds-to-seconds range, and humantime's own longest spelling
+/// for any value up to a day — every unit it knows, down to nanoseconds
+/// (`"23h 59m 59s 999ms 999us 999ns"`, under 30 bytes) — leaves more than
+/// double that as margin. 64 bytes is generous for any legitimate value these
+/// faces admit and small enough that a rejected one costs nothing worth
+/// measuring.
+#[cfg(any(feature = "serde", feature = "clap"))]
+const MAX_DURATION_TEXT_LEN: usize = 64;
+
+/// The serde face of a bounded duration ([`DebounceConfig::quiet_window`],
+/// [`DebounceConfig::max_hold`]): reads the text through `deserialize_str` —
+/// the door BORROWED text reaches without being copied, and owned text
+/// reaches before anything is done with it (`visit_borrowed_str` and
+/// `visit_string` are serde's own forwards to `visit_str`) — refuses
+/// anything past [`MAX_DURATION_TEXT_LEN`] bytes with a fixed message naming
+/// the bound and the length, never the text, and otherwise hands the
+/// (bounded) text to `humantime::parse_duration`.
+///
+/// # Errors
+///
+/// The fixed over-length message past [`MAX_DURATION_TEXT_LEN`] bytes;
+/// humantime's own error for text within the bound that is not a legal
+/// duration spelling.
+#[cfg(feature = "serde")]
+fn deserialize_bounded_duration<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+where
+  D: serde::Deserializer<'de>,
+{
+  struct BoundedDuration;
+
+  impl serde::de::Visitor<'_> for BoundedDuration {
+    type Value = Duration;
+
+    fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+      write!(f, "duration text of at most {MAX_DURATION_TEXT_LEN} bytes")
+    }
+
+    fn visit_str<E>(self, text: &str) -> Result<Self::Value, E>
+    where
+      E: serde::de::Error,
+    {
+      if text.len() > MAX_DURATION_TEXT_LEN {
+        return Err(E::custom(format_args!(
+          "duration text longer than the {MAX_DURATION_TEXT_LEN}-byte bound ({} bytes)",
+          text.len()
+        )));
+      }
+      humantime::parse_duration(text).map_err(E::custom)
+    }
+  }
+
+  deserializer.deserialize_str(BoundedDuration)
+}
+
+/// The clap face of the same bound ([`DebounceConfig`]'s `--quiet-window` and
+/// `--max-hold`): judged on the `&str` clap already holds, before
+/// `humantime::parse_duration` is asked to read any of it.
+///
+/// # Errors
+///
+/// The fixed over-length message past [`MAX_DURATION_TEXT_LEN`] bytes;
+/// humantime's own error for text within the bound that is not a legal
+/// duration spelling.
+#[cfg(feature = "clap")]
+fn parse_bounded_duration(
+  text: &str,
+) -> Result<Duration, Box<dyn std::error::Error + Send + Sync + 'static>> {
+  if text.len() > MAX_DURATION_TEXT_LEN {
+    return Err(
+      format!(
+        "duration text longer than the {MAX_DURATION_TEXT_LEN}-byte bound ({} bytes)",
+        text.len()
+      )
+      .into(),
+    );
+  }
+  Ok(humantime::parse_duration(text)?)
 }
 
 #[cfg(feature = "serde")]

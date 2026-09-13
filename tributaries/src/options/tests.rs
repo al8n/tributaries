@@ -616,6 +616,56 @@ mod serde_face {
     assert_eq!(parsed.max_hold(), Duration::from_secs(2));
   }
 
+  /// An enormous rejected duration costs the FIXED message, not an allocation
+  /// proportional to its own size — refused before `humantime`, or the serde
+  /// adapter's own formatter, ever sees it.
+  ///
+  /// Revert witness: route this key back through `humantime_serde::deserialize`
+  /// and the megabyte of text is copied whole into the parser's error, then
+  /// copied again into the format error it wraps.
+  #[test]
+  fn an_over_long_duration_costs_the_fixed_message_not_the_text() {
+    let text = "x".repeat(1024 * 1024);
+
+    let err = serde_json::from_str::<DebounceConfig>(&format!(r#"{{"quiet_window": "{text}"}}"#))
+      .expect_err("a megabyte of duration text is far past the 64-byte bound");
+    let message = err.to_string();
+    assert!(
+      message.contains("64-byte bound") && message.contains(&format!("{} bytes", text.len())),
+      "the refusal names the bound and the length: {message}"
+    );
+    assert!(
+      !message.contains(&text),
+      "and never the text itself: {message}"
+    );
+  }
+
+  /// Text well within the bound that is not a legal humantime spelling still
+  /// surfaces humantime's OWN error — the bound refuses length, not content.
+  #[test]
+  fn a_junk_duration_within_the_bound_still_surfaces_humantimes_own_error() {
+    let err = serde_json::from_str::<DebounceConfig>(r#"{"max_hold": "not-a-duration"}"#)
+      .expect_err("not a legal humantime spelling");
+    assert!(
+      !err.to_string().contains("byte bound"),
+      "well inside the ceiling, so the refusal is humantime's own: {err}"
+    );
+  }
+
+  /// A legitimate value still round-trips through the bounded visitor exactly
+  /// as it did through `humantime_serde` directly.
+  #[test]
+  fn a_legitimate_duration_still_round_trips_through_the_bounded_visitor() {
+    let config = DebounceConfig::new()
+      .with_quiet_window(Duration::from_millis(250))
+      .with_max_hold(Duration::from_secs(2));
+    let json = serde_json::to_string(&config).unwrap();
+    assert_eq!(
+      serde_json::from_str::<DebounceConfig>(&json).unwrap(),
+      config
+    );
+  }
+
   /// The three-way posture keeps all three states across the wire.
   #[test]
   fn every_debounce_posture_spells_itself() {
@@ -1161,6 +1211,48 @@ mod clap_face {
       .config
       .max_buffered(),
       DebounceConfig::MAX_BUFFERED_ENTRIES
+    );
+  }
+
+  /// A duration flag's TEXT is bounded before `humantime` ever parses it — the
+  /// flag's own `ValueValidation`, naming the bound and the length, never the
+  /// text.
+  ///
+  /// Revert witness: drop `parse_bounded_duration` back to
+  /// `humantime::parse_duration` and an over-long value is copied whole into
+  /// humantime's own error instead of being refused before parsing runs.
+  #[test]
+  fn an_over_long_quiet_window_value_is_refused_with_the_fixed_message() {
+    let text = "x".repeat(65);
+
+    let err = DebounceCli::try_parse_from(args(&["--quiet-window", &text]))
+      .err()
+      .expect("65 bytes of duration text is one past the 64-byte bound");
+    assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    let rendered = err.render().to_string();
+    assert!(
+      rendered.contains("64-byte bound") && rendered.contains("65 bytes"),
+      "the refusal names the bound and the length: {rendered}"
+    );
+    assert!(
+      !rendered.contains(&text),
+      "and never the text itself: {rendered}"
+    );
+  }
+
+  /// The same bound, at `--max-hold`.
+  #[test]
+  fn an_over_long_max_hold_value_is_refused_with_the_fixed_message() {
+    let text = "x".repeat(65);
+
+    let err = DebounceCli::try_parse_from(args(&["--max-hold", &text]))
+      .err()
+      .expect("65 bytes of duration text is one past the 64-byte bound");
+    assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    assert!(
+      err.render().to_string().contains("64-byte bound"),
+      "{}",
+      err.render()
     );
   }
 

@@ -284,14 +284,19 @@ const fn check_cookie_global_cap(cap: NonZeroUsize) -> Result<NonZeroUsize, Opti
 /// }
 /// ```
 ///
-/// The exclusion list is the one key with ceilings of its own on this face, and
-/// both bind WHILE the document is read rather than after it:
-/// [`MAX_EXCLUSIONS`](Self::MAX_EXCLUSIONS) paths, refused at the element past it,
-/// and [`MAX_EXCLUSION_LEN`](Self::MAX_EXCLUSION_LEN) bytes per path, refused on
-/// the bytes the format is holding before a path is built out of them. The element
-/// past the ceiling is refused by its COUNT without being read as a path at all.
-/// So neither an enormous entry nor an enormous list can spend the process's
-/// memory on exclusions no watcher would accept.
+/// The exclusion list and the duration keys (`latency`, `move_window`,
+/// `root_liveness_interval`) carry ceilings of their own on this face, and all
+/// bind WHILE the document is read rather than after it:
+/// [`MAX_EXCLUSIONS`](Self::MAX_EXCLUSIONS) paths,
+/// refused at the element past it, [`MAX_EXCLUSION_LEN`](Self::MAX_EXCLUSION_LEN)
+/// bytes per path, and a duration's own byte ceiling, each refused on the bytes
+/// the format is holding before a path or a value is built out of them. The
+/// element past the exclusion-count ceiling is refused by its COUNT without
+/// being read as a path at all, and an over-long duration is refused with a
+/// fixed message naming the bound and the length before humantime ever parses
+/// it. So neither an enormous entry nor an enormous list, nor an enormous
+/// duration spelling, can spend the process's memory on a key no watcher would
+/// accept.
 ///
 /// Deserializing is otherwise exactly as unchecked as the builders are: it never
 /// runs [`validate`](Self::validate). A configuration layer that wants a bad setting
@@ -305,7 +310,10 @@ const fn check_cookie_global_cap(cap: NonZeroUsize) -> Result<NonZeroUsize, Opti
 /// value longer than [`MAX_EXCLUSION_LEN`](Self::MAX_EXCLUSION_LEN) bytes is
 /// refused as the parse reads it, and the occurrence past
 /// [`MAX_EXCLUSIONS`](Self::MAX_EXCLUSIONS) is refused before the household is
-/// built.
+/// built. Every duration flag (`--latency`, `--move-window`,
+/// `--root-liveness-interval`) carries the same byte ceiling the serde face
+/// judges duration text against, refused with the same fixed message before
+/// the value is parsed.
 ///
 /// ```text
 /// $ app --latency 25ms --watcher-event-capacity 4096 --backend fanotify \
@@ -359,7 +367,13 @@ pub struct WatcherOptions {
     )
   )]
   latency: Duration,
-  #[cfg_attr(feature = "serde", serde(with = "humantime_serde"))]
+  #[cfg_attr(
+    feature = "serde",
+    serde(
+      serialize_with = "humantime_serde::serialize",
+      deserialize_with = "de_move_window"
+    )
+  )]
   move_window: Duration,
   #[cfg_attr(feature = "serde", serde(deserialize_with = "de_event_capacity"))]
   event_capacity: NonZeroUsize,
@@ -553,6 +567,89 @@ fn bounded_exclusion() -> impl clap::builder::TypedValueParser<Value = PathBuf> 
   })
 }
 
+/// The byte ceiling every duration TEXT is measured against before humantime
+/// ever sees it — [`deserialize_bounded_duration`] on the serde face,
+/// [`parse_bounded_duration`] on the clap face, both refusing anything past it
+/// with a FIXED message naming the bound and the length, never the text.
+///
+/// Derived from the longest spelling these faces' durations plausibly need: a
+/// value up to a day — the ceiling both [`WatcherOptions::MAX_ROOT_LIVENESS_INTERVAL`]
+/// and [`MAX_MOVE_WINDOW`] hold to — spelled with every unit humantime knows
+/// down to nanoseconds (`"23h 59m 59s 999ms 999us 999ns"`, under 30 bytes)
+/// leaves more than double that as margin. 64 bytes is generous for any
+/// legitimate value these faces admit and small enough that a rejected one
+/// costs nothing worth measuring.
+#[cfg(any(feature = "serde", feature = "clap"))]
+const MAX_DURATION_TEXT_LEN: usize = 64;
+
+/// The serde face of a bounded duration: reads the text through
+/// `deserialize_str` — the door BORROWED text reaches without being copied,
+/// and owned text reaches before anything is done with it (`visit_borrowed_str`
+/// and `visit_string` are serde's own forwards to `visit_str`) — refuses
+/// anything past [`MAX_DURATION_TEXT_LEN`] bytes with a fixed message naming
+/// the bound and the length, never the text, and otherwise hands the (bounded)
+/// text to `humantime::parse_duration`.
+///
+/// # Errors
+///
+/// The fixed over-length message past [`MAX_DURATION_TEXT_LEN`] bytes;
+/// humantime's own error for text within the bound that is not a legal
+/// duration spelling.
+#[cfg(feature = "serde")]
+fn deserialize_bounded_duration<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+where
+  D: serde::Deserializer<'de>,
+{
+  struct BoundedDuration;
+
+  impl serde::de::Visitor<'_> for BoundedDuration {
+    type Value = Duration;
+
+    fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+      write!(f, "duration text of at most {MAX_DURATION_TEXT_LEN} bytes")
+    }
+
+    fn visit_str<E>(self, text: &str) -> Result<Self::Value, E>
+    where
+      E: serde::de::Error,
+    {
+      if text.len() > MAX_DURATION_TEXT_LEN {
+        return Err(E::custom(format_args!(
+          "duration text longer than the {MAX_DURATION_TEXT_LEN}-byte bound ({} bytes)",
+          text.len()
+        )));
+      }
+      humantime::parse_duration(text).map_err(E::custom)
+    }
+  }
+
+  deserializer.deserialize_str(BoundedDuration)
+}
+
+/// The clap face of the same bound: judged on the `&str` clap already holds,
+/// before `humantime::parse_duration` is asked to read any of it.
+///
+/// # Errors
+///
+/// The fixed over-length message past [`MAX_DURATION_TEXT_LEN`] bytes;
+/// humantime's own error for text within the bound that is not a legal
+/// duration spelling.
+#[cfg(feature = "clap")]
+fn parse_bounded_duration(
+  text: &str,
+) -> Result<Duration, Box<dyn core::error::Error + Send + Sync>> {
+  if text.len() > MAX_DURATION_TEXT_LEN {
+    return Err(
+      format!(
+        "duration text longer than the {MAX_DURATION_TEXT_LEN}-byte bound ({} bytes)",
+        text.len()
+      )
+      .into(),
+    );
+  }
+  Ok(humantime::parse_duration(text)?)
+}
+
 /// The COUNT bound on the command line, asked of the OCCURRENCE COUNT before a
 /// single path is taken out of the parse and into this crate's own list.
 ///
@@ -587,7 +684,20 @@ where
 {
   use serde::de::Error as _;
 
-  check_latency(humantime_serde::deserialize(deserializer)?).map_err(D::Error::custom)
+  check_latency(deserialize_bounded_duration(deserializer)?).map_err(D::Error::custom)
+}
+
+/// The `move_window` key: bounded the same way every other duration key is —
+/// its TEXT is judged before humantime ever parses it — but with no range
+/// rule after: [`validate`](WatcherOptions::validate) deliberately carries none
+/// for this knob, since [`derive_move_window`] saturates and caps for every
+/// input, so no value of it is out of range.
+#[cfg(feature = "serde")]
+fn de_move_window<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+where
+  D: serde::Deserializer<'de>,
+{
+  deserialize_bounded_duration(deserializer)
 }
 
 /// The same, for the `root_liveness_interval` key.
@@ -598,7 +708,7 @@ where
 {
   use serde::de::Error as _;
 
-  check_root_liveness_interval(humantime_serde::deserialize(deserializer)?)
+  check_root_liveness_interval(deserialize_bounded_duration(deserializer)?)
     .map_err(D::Error::custom)
 }
 
@@ -653,7 +763,7 @@ where
 /// naming the argument that carried it.
 #[cfg(feature = "clap")]
 fn parse_latency(text: &str) -> Result<Duration, Box<dyn core::error::Error + Send + Sync>> {
-  Ok(check_latency(humantime::parse_duration(text)?)?)
+  Ok(check_latency(parse_bounded_duration(text)?)?)
 }
 
 /// The same, for `--root-liveness-interval`.
@@ -661,9 +771,7 @@ fn parse_latency(text: &str) -> Result<Duration, Box<dyn core::error::Error + Se
 fn parse_root_liveness_interval(
   text: &str,
 ) -> Result<Duration, Box<dyn core::error::Error + Send + Sync>> {
-  Ok(check_root_liveness_interval(humantime::parse_duration(
-    text,
-  )?)?)
+  Ok(check_root_liveness_interval(parse_bounded_duration(text)?)?)
 }
 
 /// The same, for `--watcher-event-capacity`.
@@ -731,7 +839,7 @@ struct WatcherOptionsArgs {
   latency: Duration,
   #[arg(
     long,
-    value_parser = humantime::parse_duration,
+    value_parser = parse_bounded_duration,
     default_value = clap_duration_default(WatcherOptions::DEFAULT_MOVE_WINDOW),
   )]
   move_window: Duration,
