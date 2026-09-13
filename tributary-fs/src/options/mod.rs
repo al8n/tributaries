@@ -442,13 +442,29 @@ fn bounded_exclusion() -> impl clap::builder::TypedValueParser<Value = PathBuf> 
 }
 
 /// The COUNT bound on the command line, asked of the OCCURRENCE COUNT before a
-/// single path is taken out of the parse.
+/// single path is taken out of the parse and into this crate's own list.
 ///
-/// `--exclusions` repeats, and a programmatic `parse_from` can hand it an
-/// arbitrarily long iterator: reading the values into the household first and
-/// measuring them afterwards builds the whole owned list the bound exists to
-/// refuse. Counting the matches costs one pass over borrowed values and clones
-/// nothing, so the ninth occurrence is refused before the household exists.
+/// `--exclusions` repeats, so the count is taken over the matches clap has
+/// already built: one pass over BORROWED values that clones nothing, which is
+/// what lets the ninth occurrence be refused before the [`WatcherOptions`] this
+/// parse is building holds any of them.
+///
+/// # What this bounds, and what nothing here can
+///
+/// It bounds what the CRATE owns: the household's own `Vec<PathBuf>`, and every
+/// per-exclusion cost the watcher pays afterwards (the driver's copy of the list,
+/// and the lexical prefix test each event and each walked directory is measured
+/// against). That is the resource this ceiling exists for, and it is refused
+/// before a single one of those is paid.
+///
+/// It does NOT bound clap's own retention, and no face of this kind can. clap 4
+/// has no per-argument occurrence cap, and an [`Args`](clap::Args) implementation
+/// never sees the raw iterator — only the caller's own
+/// [`Command`](clap::Command) does — so by the time any hook of ours runs, the
+/// matches already hold whatever argv the caller handed
+/// [`parse_from`](clap::Parser::parse_from). For a real command line that is
+/// bounded by the operating system (`ARG_MAX`); for a programmatic iterator it is
+/// the caller's own memory, spent by the caller, before this crate is reached.
 #[cfg(feature = "clap")]
 fn refuse_over_full_exclusions(matches: &clap::ArgMatches) -> Result<(), clap::Error> {
   let supplied = matches

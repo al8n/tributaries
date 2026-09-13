@@ -271,7 +271,11 @@ pub enum SyncRootError {
   /// The cookie directory is not inside the root's coverage — a cookie
   /// written there could never be reported on this root's stream. Also raised
   /// when the directory only *appears* inside the root through `..` traversal
-  /// (`<root>/../outside`), which a lexical `starts_with` would accept.
+  /// (`<root>/../outside`), which a lexical `starts_with` would accept, and when
+  /// the directory the admission actually reached — every symlink in the
+  /// spelling followed — stands outside the root, in which case
+  /// [`dir`](Self::DirOutsideRoot::dir) is that location rather than the
+  /// spelling.
   #[error("cookie directory {} is outside root {}", dir.display(), root.display())]
   DirOutsideRoot {
     /// The requested cookie directory.
@@ -290,16 +294,19 @@ pub enum SyncRootError {
   /// same everywhere — it does not depend on which backend resolved, and it is
   /// made before the write rather than discovered by waiting.
   ///
-  /// The verdict is taken TWICE, because a spelling is not a location. The
-  /// admission judges `dir` as supplied, which costs nothing and refuses the
-  /// common case synchronously; the write then judges the directory it actually
-  /// resolved — every symlink on the way followed, and the
-  /// cookie-goes-beside-a-file rule applied — because only that one is where the
-  /// marker would land. A link whose spelling clears every exclusion and whose
-  /// target sits inside one is refused by the second check, with
-  /// [`dir`](Self::DirExcluded::dir) naming the resolved directory rather than
-  /// the spelling. Since the caller cannot tell which check refused, the
-  /// admission's sequence is treated as spent for both — re-mint to retry.
+  /// The verdict is taken THREE times, because a spelling is not a location and
+  /// a location is not a history. The admission judges `dir` as supplied, which
+  /// costs nothing and refuses the common case synchronously; it then judges
+  /// where the directory it opened for this sync actually STOOD when the
+  /// barrier's coverage was cut — every symlink in the spelling followed, and
+  /// the cookie-goes-beside-a-file rule applied — because a directory that was
+  /// unreportable then carries descendants no stream of this root ever reported;
+  /// and the write judges the directory it resolves at the moment it creates,
+  /// because that is where the marker lands. A link whose spelling clears every
+  /// exclusion and whose target sits inside one is refused by the second check,
+  /// with [`dir`](Self::DirExcluded::dir) naming the resolved directory rather
+  /// than the spelling. Since the caller cannot tell which check refused, the
+  /// admission's sequence is treated as spent for all three — re-mint to retry.
   #[error(
     "cookie directory {} is under excluded directory {}",
     dir.display(),
@@ -334,6 +341,13 @@ pub enum SyncRootError {
   /// speaks for directories, and the file's parent is what the cookie goes in).
   /// The refusal is taken there, before anything is created — which is also why
   /// the admission's sequence is spent by it.
+  ///
+  /// It is taken at the ADMISSION too, on the same resolved form: where the
+  /// directory opened for this sync stood at the moment the barrier's coverage
+  /// was cut. Ground the seat covered then is ground whose descendants no stream
+  /// of this root ever reported, so a marker placed among them could be ordered
+  /// ahead of changes that truly preceded it — a refusal, and one taken before
+  /// any coverage window is opened.
   ///
   /// Unlike the exclusions this is per ROOT, so the same directory may be
   /// perfectly writable for a sync on another root of the same watcher.
@@ -379,32 +393,54 @@ pub enum SyncRootError {
     /// at, as the descriptor answered it.
     dir: PathBuf,
   },
-  /// A directory was already standing at the reserved cookie-directory name — the
-  /// private directory this watcher's markers go in, one level inside the
-  /// directory the sync named — on a DEVICE other than its parent's: a mount
-  /// boundary.
+  /// A directory on the chain from the watched root down to the marker stands
+  /// across a MOUNT BOUNDARY: either a component of the descent from the root to
+  /// the directory the sync named, or the reserved cookie-directory name itself —
+  /// the private directory this watcher's markers go in, one level inside the
+  /// directory the sync named.
   ///
-  /// A root's crawl does not descend across a mount, so the reserved directory
-  /// beyond one is never enumerated and no watch is ever armed inside it. A marker
-  /// created there is unreportable however it is ordered, and the barrier waiting
-  /// on its event could only time out — so the write is refused with nothing
-  /// created, exactly as [`DirPruned`](Self::DirPruned) and
-  /// [`DirExcluded`](Self::DirExcluded) are, and for the same reason: a barrier no
-  /// source can report is not a barrier.
+  /// The rule is the mount FRAME, not the device. A `mount --bind` of a
+  /// same-superblock directory shares its parent's device exactly, so a device
+  /// comparison cannot see one at all, while the root's crawl — which fences its
+  /// descent on the mount id — treats it as a boundary and never enumerates
+  /// anything beneath it. Where no mount id can be read (Linux below 5.8, and
+  /// macOS, which has no bind mounts and gives every mount its own device) the
+  /// device is the whole of the rule, which is the same honest degrade the crawl
+  /// takes.
+  ///
+  /// A root's crawl does not descend across a mount, so ground beyond one is never
+  /// enumerated and no watch is ever armed inside it. A marker created there is
+  /// unreportable however it is ordered, and the barrier waiting on its event could
+  /// only time out — so the write is refused with nothing created, exactly as
+  /// [`DirPruned`](Self::DirPruned) and [`DirExcluded`](Self::DirExcluded) are, and
+  /// for the same reason: a barrier no source can report is not a barrier.
   ///
   /// Unlike those two this is not a configuration word but the shape of the tree,
   /// and it is not transient either — a retry finds the same mount. Sync a
-  /// directory on the root's own mount instead, or take the mount off the reserved
-  /// name.
+  /// directory on the root's own mount instead, or take the mount off the name.
   ///
-  /// The admission's sequence is SPENT: the verdict needs the object only the
-  /// write's own descriptor walk can reach, so it is taken after the sync was
-  /// admitted. Re-mint through
-  /// [`mint_sync_ticket`](crate::Watcher::mint_sync_ticket) to retry.
+  /// # Two origins, and one of them precedes the sync's own sequence
+  ///
+  /// The verdict is reached at the WRITE, on the objects that write's descriptor
+  /// walk reaches, and at the ADMISSION, on the mounts the door read off the pins
+  /// it took — the same rule at both ends, for the reason every ground verdict is
+  /// asked twice: the objects must stand in reportable ground when the coverage cut
+  /// is taken AND when the marker is created. The admission's reading is what
+  /// refuses a bind alias of outside ground standing inside the root, which is
+  /// lexically contained, covered by no seat, and identical to its origin through
+  /// the alias — so nothing else the door can read names it.
+  ///
+  /// Either way the admission's sequence is SPENT, so a retry re-mints through
+  /// [`mint_sync_ticket`](crate::Watcher::mint_sync_ticket). A refusal from the
+  /// admission is taken before any coverage window opens and creates nothing at
+  /// all; a refusal from the write leaves nothing on disk either.
   #[error("cookie directory {} lies across a mount boundary", dir.display())]
   DirCrossesMount {
-    /// The reserved cookie directory the write reached — the name the mount
-    /// stands at, as the descriptor answered it.
+    /// The directory that crossed, as the descriptor holding it answered its name:
+    /// the FIRST component of the descent to stand outside the root's mount frame,
+    /// the reserved cookie directory standing at the reserved name when the whole
+    /// descent stayed inside it, or — from the admission — the place the pinned
+    /// target or reserved directory was standing when the door sampled it.
     dir: PathBuf,
   },
   /// The cookie name is not a single normal filename component — it holds a

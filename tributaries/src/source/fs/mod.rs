@@ -974,8 +974,9 @@ fn watch_error_from_fs(err: WatchRootError) -> WatchError {
 /// The line it draws is between a barrier that FAILED and one that could never have been met:
 ///
 /// - **the cookie directory is not covered** — outside the root, under a watcher exclusion, under
-///   this root's own `prune` seat, or across a mount boundary at the reserved cookie directory's
-///   own name. All four are refused before any write, and all four mean the same thing to the
+///   this root's own `prune` seat, or across a mount boundary anywhere on the chain from the
+///   watched root down to the reserved cookie directory's own name. All four are refused before
+///   any write, and all four mean the same thing to the
 ///   caller: a cookie written there would produce no event on this subscription's stream, so the
 ///   barrier would wait for something that cannot arrive. The glob-shaped one
 ///   ([`DirPruned`](SyncRootError::DirPruned)) and the mount-shaped one
@@ -994,8 +995,9 @@ fn sync_error_from_fs(error: SyncRootError) -> SyncError {
   match error {
     SyncRootError::UnknownRoot | SyncRootError::Retired => SyncError::Retired,
     // The fourth of the uncovered shapes, and the only one the TREE decides rather
-    // than a configuration word: a mount standing at the reserved cookie
-    // directory's name. No crawl of the root descends across it, so a marker there
+    // than a configuration word: a mount standing anywhere between the watched root
+    // and the reserved cookie directory's name — a same-superblock bind mount
+    // included. No crawl of the root descends across it, so a marker there
     // produces no event on this subscription's stream — the same "the barrier could
     // never be met" the other three mean, and just as permanent, so it is not the
     // retryable `Busy` its sibling `DirReplaced` is.

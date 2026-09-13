@@ -460,3 +460,47 @@ pub async fn reconcile(
   })
   .await
 }
+
+/// Bind-mounts `src` at `dst` (both must already exist), returning a guard that
+/// unmounts on drop — so a `--test-threads=1` run never leaks a bind even when the
+/// test body panics (the guard's `Drop` runs on unwind). `None` when the bind is
+/// refused (no privilege / no mount support — the caller skips loudly).
+///
+/// Shared rather than per-binary because a bind mount is the ONE way to stand a
+/// mount at an arbitrary in-root name, which is what both the scope fence and the
+/// sync-cookie mount refusal have to be staged against — and a second copy of the
+/// guard is a second place for the unmount discipline to drift.
+#[cfg(target_os = "linux")]
+pub fn bind_mount(src: &Path, dst: &Path) -> Option<BindGuard> {
+  let status = std::process::Command::new("mount")
+    .arg("--bind")
+    .arg(src)
+    .arg(dst)
+    .status();
+  if !status.map(|s| s.success()).unwrap_or(false) {
+    return None;
+  }
+  Some(BindGuard {
+    at: dst.to_path_buf(),
+  })
+}
+
+/// Unmounts a bind on drop, best-effort but retried lazily (a still-busy bind is
+/// caught on the next umount attempt). Keeps a `--test-threads=1` run from leaving
+/// stray binds under a shared scratch tree for a later test to trip over.
+#[cfg(target_os = "linux")]
+pub struct BindGuard {
+  at: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for BindGuard {
+  fn drop(&mut self) {
+    // `-l` (lazy) so a bind still referenced by an fd detaches once quiescent,
+    // rather than wedging the ephemeral container's teardown.
+    let _ = std::process::Command::new("umount")
+      .arg("-l")
+      .arg(&self.at)
+      .status();
+  }
+}
