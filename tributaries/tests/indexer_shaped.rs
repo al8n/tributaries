@@ -40,17 +40,18 @@ use agnostic_lite::{RuntimeLite, tokio::TokioRuntime};
 use futures_util::FutureExt;
 use tempfile::TempDir;
 use tributaries::{
-  Armed, DebounceConfig, Epoch, Event, EventKind, FaultKind, Source, SourceEvent, SourceFault,
-  Subscription, SyncError, SyncToken, Tributaries, TributariesOptions, WatchError, WatchOptions,
-  WatchView,
+  Armed, DebounceConfig, Epoch, Event, EventKind, FaultKind, Glob, RootGlobs, Source, SourceEvent,
+  SourceFault, Subscription, SyncError, SyncToken, Tributaries, TributariesOptions, WatchError,
+  WatchOptions, WatchView,
 };
 // The fs types come from the `tributary-fs` DEV-dependency, not the umbrella: this
 // suite is the custom-source proof, compiled and run with the umbrella's `fs` feature
 // OFF (its test target requires only `tokio`), exactly as a downstream crate binding
 // its own transport would depend on the stack.
 use tributary_fs::{
-  EventKind as FsEventKind, Interest as FsInterest, RootHandle, SyncRootDenied, SyncRootError,
-  SyncTicket, WatchRootError, Watcher, WatcherOptions, is_sync_cookie_dir_name,
+  EventKind as FsEventKind, Interest as FsInterest, RootHandle, RootOptions as FsRootOptions,
+  SyncRootDenied, SyncRootError, SyncTicket, WatchRootError, Watcher, WatcherOptions,
+  is_sync_cookie_dir_name,
 };
 
 /// The custom, **non-`OsString`** key component: an indexer-shaped location coordinate.
@@ -275,7 +276,11 @@ impl<R: RuntimeLite> Source<Comp> for IndexerSource<R> {
     Ok(key.to_vec())
   }
 
-  async fn arm(&mut self, key: &[Comp]) -> Result<Armed<Comp, RootHandle>, WatchError> {
+  async fn arm(
+    &mut self,
+    key: &[Comp],
+    globs: &RootGlobs,
+  ) -> Result<Armed<Comp, RootHandle>, WatchError> {
     // Mirror the fs source's release application: (a) opportunistically unwatch the OLDEST few queued
     // releases up front (bounded per-arm cost, keeps clause 5 eventual), then (b)+(c) attempt the watch
     // and resolve on demand any `Overlaps` the watcher NAMES against a released-but-lingering root. The
@@ -296,6 +301,18 @@ impl<R: RuntimeLite> Source<Comp> for IndexerSource<R> {
     let path = self
       .key_to_path(key)
       .expect("indexer source: every armed key lies under a registered mount");
+    // The per-root words ride straight down to the fs household this binding drives —
+    // the same forwarding the shipped `FsSource` does. `Some([])` and `None` are
+    // different seats, so the include half is only engaged when the umbrella engaged it.
+    let root_options = {
+      let options = FsRootOptions::new()
+        .with_interest(FsInterest::all())
+        .with_prune(globs.prune().iter().cloned());
+      match globs.include() {
+        Some(include) => options.with_include(include.iter().cloned()),
+        None => options,
+      }
+    };
     #[cfg(debug_assertions)]
     let initial_pending = self.pending_releases.len();
     #[cfg(debug_assertions)]
@@ -310,7 +327,11 @@ impl<R: RuntimeLite> Source<Comp> for IndexerSource<R> {
            shrink each retry (structural progress bound)"
         );
       }
-      match self.watcher.watch(path.clone(), FsInterest::all()).await {
+      match self
+        .watcher
+        .watch_with(path.clone(), root_options.clone())
+        .await
+      {
         Ok(handle) => break handle,
         Err(WatchRootError::Overlaps {
           path: rejected,
@@ -561,6 +582,11 @@ fn rig(prefix: &str, volume: u64, options: TributariesOptions) -> Rig {
     volume: volume_key,
     w,
   }
+}
+
+/// One validated glob pattern for the per-root seat cells.
+fn glob(pattern: &str) -> Glob {
+  pattern.parse().expect("a valid pattern compiles")
 }
 
 /// A located key under `volume`: `[Volume(v), Seg(seg0), …]`.
@@ -1465,6 +1491,181 @@ async fn sync_barrier_resolves_over_the_custom_binding() {
       seen.contains(&name) || rescanned,
       "the barrier promised {name} was deliverable, but a plain drain missed it (seen: {seen:?})"
     );
+  }
+
+  w.close().await.expect("close");
+}
+
+/// (k.1) The `prune` seat over this custom binding: the words a subscription carries reach
+/// [`Source::arm`] as [`RootGlobs`], this binding forwards them to its watcher, and the
+/// pruned subtree is never watched at all — while a sibling under the same root still
+/// delivers.
+///
+/// The silence is asserted against a BARRIER rather than a bare timeout: the write into
+/// the pruned subtree happens FIRST, so a delivery from the sibling behind it proves the
+/// root's ordered queue has already passed the window the pruned one would have occupied.
+/// Both subtrees pre-exist the watch, so the delivery handshake settles the sibling's
+/// coverage before the probe (the descending-backend registration window).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prune_keeps_a_subtree_off_the_stream_while_a_sibling_delivers() {
+  let outer = rig("prune", 20, TributariesOptions::new());
+  std::fs::create_dir_all(outer.root.join("node_modules")).expect("create the pruned subtree");
+  std::fs::create_dir_all(outer.root.join("src")).expect("create the sibling");
+  let Rig {
+    _dir,
+    root,
+    volume,
+    mut w,
+  } = outer;
+
+  let root_key = volume.clone();
+  let src_key = key(&volume, &["src"]);
+  let pruned_key = key(&volume, &["node_modules", "dep.js"]);
+  let sibling_key = key(&volume, &["src", "main.rs"]);
+
+  let sub = w
+    .watch(
+      root_key.clone(),
+      Loc { id: 1 },
+      WatchOptions::new().with_prune([glob("**/node_modules")]),
+    )
+    .await
+    .expect("watch the volume with a pruned subtree");
+
+  // The sibling pre-exists the watch, so settle ITS coverage before probing delivery.
+  settle_delivery_under(&mut w, &root.join("src"), &src_key).await;
+
+  std::fs::write(root.join("node_modules").join("dep.js"), b"x").expect("write under the prune");
+  std::fs::write(root.join("src").join("main.rs"), b"x").expect("write the sibling");
+
+  let mut pruned_reached = false;
+  let delivered = wait_for(&mut w, |event| {
+    pruned_reached |= !event.is_rescan() && event.reaches(&pruned_key);
+    event.subscription() == sub && !event.is_rescan() && event.reaches(&sibling_key)
+  })
+  .await;
+  assert!(
+    delivered.is_some(),
+    "a change outside the pruned subtree still reaches the subscription"
+  );
+  assert!(
+    !pruned_reached,
+    "`prune` must keep the subtree out of the watch: nothing under it may be delivered"
+  );
+
+  w.close().await.expect("close");
+}
+
+/// (k.2) The `include` seat over this custom binding: a file no pattern names is silent, a
+/// matching one is delivered case-INSENSITIVELY (`clip.MP4` against `**/*.mp4`), and a
+/// DIRECTORY change lands whatever its name — the seat fails open on anything that is not
+/// a proven non-directory, because a folder the consumer never hears about is a hole in
+/// its view.
+///
+/// The directory removal's class is asserted only where a backend proves it: on Linux's
+/// inotify it is [`Some(true)`]; on macOS FSEvents the same removal is delivered but the
+/// class may be unproven, and `None` is the honest third answer rather than a defaulted
+/// `false`. What both platforms owe — and what this cell requires of both — is the
+/// DELIVERY.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn include_silences_a_non_matching_file_but_never_a_directory() {
+  let outer = rig("include", 21, TributariesOptions::new());
+  std::fs::create_dir_all(outer.root.join("media")).expect("create the media dir");
+  let Rig {
+    _dir,
+    root,
+    volume,
+    mut w,
+  } = outer;
+
+  let root_key = volume.clone();
+  let notes_key = key(&volume, &["media", "notes.txt"]);
+  let clip_key = key(&volume, &["media", "clip.MP4"]);
+  let doomed_key = key(&volume, &["media", "doomed"]);
+
+  let sub = w
+    .watch(
+      root_key.clone(),
+      Loc { id: 1 },
+      WatchOptions::new().with_include([glob("**/*.mp4")]),
+    )
+    .await
+    .expect("watch the volume with delivery narrowed to media files");
+
+  // `media` pre-exists the watch, so its coverage must settle before the probe (the
+  // descending-backend registration window — see `settle_delivery_under`). That helper's
+  // own probe is a FILE the engaged seat is supposed to silence, so this handshake probes
+  // with a DIRECTORY create instead, which the seat admits whatever its name.
+  let settled = tokio::time::timeout(DEADLINE, async {
+    let mut attempt = 0u32;
+    loop {
+      let name = format!("settle-{attempt}");
+      attempt += 1;
+      let probe_key = key(&volume, &["media", name.as_str()]);
+      std::fs::create_dir(root.join("media").join(&name)).expect("create the settle probe dir");
+      let seen = tokio::time::timeout(SETTLE_STEP, async {
+        while let Some(event) = w.next().await {
+          if !event.is_rescan() && event.reaches(&probe_key) {
+            return true;
+          }
+        }
+        false
+      })
+      .await
+      .unwrap_or(false);
+      if seen {
+        return;
+      }
+    }
+  })
+  .await;
+  assert!(
+    settled.is_ok(),
+    "coverage under `media` never settled: no directory change there came back"
+  );
+
+  // The non-included file first, so the two admitted changes behind it are barriers.
+  std::fs::write(root.join("media").join("notes.txt"), b"x").expect("write the silent file");
+  std::fs::write(root.join("media").join("clip.MP4"), b"x").expect("write the media file");
+  std::fs::create_dir(root.join("media").join("doomed")).expect("create the doomed dir");
+  std::fs::remove_dir(root.join("media").join("doomed")).expect("remove the doomed dir");
+
+  let mut notes_reached = false;
+  let mut clip_seen = false;
+  let mut directory_class: Option<Option<bool>> = None;
+  let landed = wait_for(&mut w, |event| {
+    if event.is_rescan() || event.subscription() != sub {
+      return false;
+    }
+    notes_reached |= event.reaches(&notes_key);
+    clip_seen |= event.reaches(&clip_key);
+    if event.reaches(&doomed_key) {
+      directory_class = Some(event.is_dir());
+      return true;
+    }
+    false
+  })
+  .await;
+
+  assert!(
+    landed.is_some(),
+    "a directory change is never silenced by `include`, whatever its name"
+  );
+  assert!(
+    clip_seen,
+    "`**/*.mp4` admits `clip.MP4` — the vocabulary is case-insensitive"
+  );
+  assert!(
+    !notes_reached,
+    "a file no pattern names is silent under an engaged `include` seat"
+  );
+  match directory_class.expect("the directory change was observed") {
+    // Linux inotify proves the class on the record itself.
+    Some(true) => {}
+    // FSEvents may report the removal without proving the class; `None` is the honest
+    // answer, and the seat admitted it for exactly that reason.
+    None => {}
+    other => panic!("a directory change must never be reported as a proven file: {other:?}"),
   }
 
   w.close().await.expect("close");

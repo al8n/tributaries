@@ -1041,6 +1041,7 @@ fn covering_merge_joins_coverage_and_adopts_the_newest_mint() {
       location,
       ChangeKind::Rescan,
       Epoch::new(epoch),
+      None,
     )
   };
   let cases: &[(&[&str], &[&str], &[&str])] = &[
@@ -1205,6 +1206,8 @@ fn identity_minting_respects_devices_and_mounts() {
     applied_cover: None,
     settle_floor: None,
     pending_widen: None,
+    prune: Globs::default(),
+    include: None,
   };
   let fid = NonZeroU64::new(7);
   assert!(mint(&state, Path::new("/r/a"), fid, None).is_some());
@@ -1244,6 +1247,8 @@ fn blind_mount_table_refuses_event_side_trust() {
     applied_cover: None,
     settle_floor: None,
     pending_widen: None,
+    prune: Globs::default(),
+    include: None,
   };
   let fid = NonZeroU64::new(7);
   assert!(
@@ -3005,6 +3010,8 @@ mod lowering {
       applied_cover: None,
       settle_floor: None,
       pending_widen: None,
+      prune: Globs::default(),
+      include: None,
     }
   }
 
@@ -15526,6 +15533,1128 @@ mod exclusions {
       armed_paths(&effects),
       vec![PathBuf::from("/r/b/deep/newdir")],
       "and the arm addresses the same object the delivery named: {effects:?}"
+    );
+  }
+}
+
+mod prune {
+  //! The per-ROOT prune seat: the same common-layer fence the exclusions run
+  //! through, matched by glob against a root-relative path instead of by subtree
+  //! against an absolute one — and, unlike the exclusions, never stood down for a
+  //! backend that decides exclusions itself, because no OS API takes a glob.
+  //!
+  //! The assertion discipline is the exclusions module's, for the same reasons: a
+  //! claim that ground was never ARMED reads `covered_paths()`, because a
+  //! delivery-only assertion cannot tell a directory that was never armed from one
+  //! that was armed and had nothing to say; a claim that nothing EMERGED from
+  //! pruned ground reads deliveries, because a leak can happen over coverage that
+  //! is legitimately still held when the record is classified.
+
+  use super::*;
+  use crate::{
+    core::{RawDirEntry, RawEnumerate},
+    options::RootOptions,
+    os::linux::{RawInotifyEvent, RawLinuxEvent, WatchOutcome, inotify::decode::InotifyMask},
+  };
+  use tributary_proto::glob::Glob;
+
+  const IN_CREATE: u32 = 0x0000_0100;
+  const IN_MODIFY: u32 = 0x0000_0002;
+  const IN_MOVED_FROM: u32 = 0x0000_0040;
+  const IN_MOVED_TO: u32 = 0x0000_0080;
+  const IN_ISDIR: u32 = 0x4000_0000;
+
+  /// The per-root household a root is armed with, built exactly as the driver
+  /// builds one from the watcher's command.
+  fn pruning(patterns: &[&str]) -> RootOptions {
+    RootOptions::new().with_prune(
+      patterns
+        .iter()
+        .map(|pattern| Glob::new(pattern).expect("a valid pattern compiles")),
+    )
+  }
+
+  fn entry(name: &str, kind: FileKind) -> RawDirEntry {
+    RawDirEntry {
+      name: name.as_bytes().to_vec(),
+      kind,
+      dev: 1,
+      ino: 10 + u64::from(name.as_bytes()[0]),
+      mnt_id: None,
+    }
+  }
+
+  fn listed(entries: Vec<RawDirEntry>) -> RawEnumerate {
+    RawEnumerate::Listed {
+      entries,
+      complete: true,
+    }
+  }
+
+  fn inotify(anchor: WatchId, mask: u32, cookie: u32, name: Option<&str>) -> RawLinuxEvent {
+    RawLinuxEvent::Inotify {
+      anchors: vec![anchor],
+      event: RawInotifyEvent {
+        wd: 1,
+        mask: InotifyMask(mask),
+        cookie,
+        name: name.map(|n| n.as_bytes().to_vec()),
+      },
+    }
+  }
+
+  /// Registers, spawns and arms a DESCENDING root at `/r` under `options`,
+  /// returning its scope, the root's cold-enumerate request and the root watch.
+  fn live_descending(core: &mut DriverCore, options: &RootOptions) -> (ScopeId, ReqId, WatchId) {
+    let scope = core
+      .on_watch_with(PathBuf::from("/r"), options, BackendKind::Inotify)
+      .expect("a fresh scope registers");
+    let _ = drain(core);
+    core.on_stream_spawned(
+      scope,
+      Ok(RootMeta {
+        root: PathBuf::from("/r"),
+        root_dev: 1,
+        root_mnt_id: None,
+        mounts: Vec::new(),
+        identity: crate::os::RootIdentity::new(1, 1),
+        ancestors: Vec::new(),
+        backend: BackendKind::Inotify,
+      }),
+    );
+    let root_watch = drain(core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch {
+          watch,
+          parent,
+          path,
+          ..
+        } if path.as_path() == Path::new("/r") && watch == parent => Some(*watch),
+        _ => None,
+      })
+      .expect("the descending root arms through the effect path");
+    core.on_watch_installed(
+      root_watch,
+      core.arm_attempt(root_watch),
+      WatchOutcome::Installed(1),
+    );
+    let req = drain(core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, path, .. } if path.as_path() == Path::new("/r") => Some(*req),
+        _ => None,
+      })
+      .expect("the armed root cold-enumerates");
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(0));
+    let _ = drain(core);
+    (scope, req, root_watch)
+  }
+
+  /// A live FSEvents (kernel-recursive) root at `/r` under `options`.
+  ///
+  /// FSEvents is the profile that decides EXCLUSIONS itself, so the common fence
+  /// stands down for that half here — which is exactly what makes it the witness
+  /// that the prune half does not.
+  fn live_fsevents(core: &mut DriverCore, options: &RootOptions) -> ScopeId {
+    let scope = core
+      .on_watch_with(PathBuf::from("/r"), options, BackendKind::FsEvents)
+      .expect("a fresh scope registers");
+    let _ = drain(core);
+    core.on_stream_spawned(
+      scope,
+      Ok(RootMeta {
+        root: PathBuf::from("/r"),
+        root_dev: 1,
+        root_mnt_id: None,
+        mounts: Vec::new(),
+        identity: crate::os::RootIdentity::new(1, 1),
+        ancestors: Vec::new(),
+        backend: BackendKind::FsEvents,
+      }),
+    );
+    let _ = drain(core);
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(0));
+    let _ = drain(core);
+    scope
+  }
+
+  /// An entry with an explicit inode, so a re-arm listing can present the SAME
+  /// object under a new name — which is what makes the Monitor treat a renamed
+  /// directory as a survivor to cascade into rather than a replacement to rebuild.
+  fn entry_ino(name: &str, kind: FileKind, ino: u64) -> RawDirEntry {
+    RawDirEntry {
+      name: name.as_bytes().to_vec(),
+      kind,
+      dev: 1,
+      ino,
+      mnt_id: None,
+    }
+  }
+
+  /// The inode [`entry`] mints for `name`, so a rename can restate it.
+  fn ino_of(name: &str) -> u64 {
+    10 + u64::from(name.as_bytes()[0])
+  }
+
+  /// Installs the queued arm for `path` and returns its watch together with the
+  /// cold-enumerate request the install dispatches.
+  fn arm(core: &mut DriverCore, effects: &[Effect], path: &str) -> (WatchId, ReqId) {
+    let watch = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch { watch, path: p, .. } if p.as_path() == Path::new(path) => Some(*watch),
+        _ => None,
+      })
+      .unwrap_or_else(|| panic!("{path} is armed: {effects:?}"));
+    core.on_watch_installed(watch, core.arm_attempt(watch), WatchOutcome::Installed(1));
+    let req = drain(core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, path: p, .. } if p.as_path() == Path::new(path) => Some(*req),
+        _ => None,
+      })
+      .unwrap_or_else(|| panic!("{path} enumerates once armed"));
+    (watch, req)
+  }
+
+  /// Whether any delivered change names `first` as its leading segment, on either
+  /// end of a move — "did the caller hear the pruned path at all".
+  fn mentions(changes: &[&Change], first: &str) -> bool {
+    let heads = |location: &Location| {
+      location
+        .segments()
+        .first()
+        .is_some_and(|segment| segment.as_str() == first)
+    };
+    changes
+      .iter()
+      .any(|change| heads(change.location()) || change.kind().moved_from().is_some_and(heads))
+  }
+
+  /// The cold half: a pruned entry never leaves the listing, so the Monitor never
+  /// stages it, never announces it and never arms it — while `node_modules_old`
+  /// proves the match is a whole COMPONENT, not a name prefix.
+  ///
+  /// Revert witness: drop the `prune_root` test in `on_enumerated` and
+  /// `/r/node_modules` joins the coverage set.
+  #[test]
+  fn a_cold_listing_never_stages_a_pruned_directory() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let (_scope, req, _root) = live_descending(&mut core, &pruning(&["**/node_modules"]));
+    core.on_enumerated(
+      req,
+      listed(vec![
+        entry("node_modules", FileKind::Dir),
+        entry("node_modules_old", FileKind::Dir),
+        entry("src", FileKind::Dir),
+      ]),
+    );
+    let effects = drain(&mut core);
+
+    assert_eq!(
+      core.covered_paths(),
+      vec![
+        PathBuf::from("/r"),
+        PathBuf::from("/r/node_modules_old"),
+        PathBuf::from("/r/src"),
+      ],
+      "the pruned directory never entered coverage, and the name-prefix \
+       neighbour did: {effects:?}"
+    );
+    let changes = emits(&effects);
+    assert!(
+      !mentions(&changes, "node_modules"),
+      "nothing about the pruned directory is announced: {changes:?}"
+    );
+    assert!(
+      !changes.iter().any(|change| change.kind().is_rescan()),
+      "a filtered listing is not a partial one — no covering rescan is owed, and \
+       above all none naming the pruned path: {changes:?}"
+    );
+    assert!(
+      !effects.iter().any(|e| matches!(
+        e,
+        Effect::Enumerate { path, .. } if path.as_path() == Path::new("/r/node_modules")
+      )),
+      "and the pruned directory is never read, so its subtree is unreachable: \
+       {effects:?}"
+    );
+  }
+
+  /// The live half, in its create shape: a directory created on a pruned name
+  /// after the cold read is fenced by the same rule the listing was.
+  ///
+  /// Revert witness: drop the prune half of `fence_root` and the create installs
+  /// `/r/node_modules` and queues its arm.
+  #[test]
+  fn a_live_create_of_a_pruned_directory_never_enters_coverage() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let (scope, req, root) = live_descending(&mut core, &pruning(&["**/node_modules"]));
+    core.on_enumerated(req, listed(Vec::new()));
+    let _ = drain(&mut core);
+
+    core.on_inotify_events(
+      scope,
+      vec![
+        inotify(root, IN_CREATE | IN_ISDIR, 0, Some("node_modules")),
+        inotify(root, IN_CREATE | IN_ISDIR, 0, Some("src")),
+      ],
+      at(1),
+    );
+    let effects = drain(&mut core);
+
+    assert_eq!(
+      core.covered_paths(),
+      vec![PathBuf::from("/r"), PathBuf::from("/r/src")],
+      "the live create on the pruned name armed nothing: {effects:?}"
+    );
+    assert!(
+      !effects.iter().any(|e| matches!(
+        e,
+        Effect::AddWatch { path, .. } if path.as_path() == Path::new("/r/node_modules")
+      )),
+      "no arm is even attempted for the pruned directory: {effects:?}"
+    );
+    let changes = emits(&effects);
+    assert!(
+      !mentions(&changes, "node_modules"),
+      "and nothing about it is delivered: {changes:?}"
+    );
+  }
+
+  /// A DESCENDING scope delivers nothing from pruned ground: the pruned directory
+  /// is never armed, so the only records that can name it are the ones its parent
+  /// watch reports, and every one of them is dropped.
+  #[test]
+  fn a_descending_scope_delivers_nothing_from_a_pruned_directory() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let (scope, req, root) = live_descending(&mut core, &pruning(&["**/node_modules"]));
+    core.on_enumerated(req, listed(vec![entry("node_modules", FileKind::Dir)]));
+    let _ = drain(&mut core);
+
+    for round in 0..64 {
+      core.on_inotify_events(
+        scope,
+        vec![
+          inotify(root, IN_MODIFY, 0, Some("node_modules")),
+          inotify(root, IN_CREATE | IN_ISDIR, 0, Some("node_modules")),
+        ],
+        at(2 + round),
+      );
+    }
+    core.on_inotify_events(
+      scope,
+      vec![inotify(root, IN_CREATE, 0, Some("keep.txt"))],
+      at(80),
+    );
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+
+    assert!(
+      !mentions(&changes, "node_modules"),
+      "a hundred and twenty-eight pruned records later, nothing from inside is \
+       delivered: {changes:?}"
+    );
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.location() == &loc(&["keep.txt"])),
+      "non-vacuity: the reported sibling still arrives: {changes:?}"
+    );
+    assert_eq!(
+      core.covered_paths(),
+      vec![PathBuf::from("/r")],
+      "and the pruned churn consumed no coverage: {effects:?}"
+    );
+  }
+
+  /// The prune half NEVER stands down for a backend that enforces exclusions
+  /// itself: no OS API takes a glob, so FSEvents cannot have decided this question
+  /// at admission the way it decides the exclusion set.
+  ///
+  /// Revert witness: gate the prune half on `backend_enforces_exclusions` the way
+  /// the exclusion half is gated and `node_modules/deep/o.tmp` is delivered.
+  #[test]
+  fn a_kernel_recursive_scope_that_enforces_exclusions_still_prunes() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_fsevents(&mut core, &pruning(&["**/node_modules"]));
+
+    core.on_batch_events(
+      scope,
+      vec![
+        ev(
+          "/r/node_modules/deep/o.tmp",
+          flags(&[FsEventFlags::ITEM_CREATED, FsEventFlags::ITEM_IS_FILE]),
+          1,
+          10,
+        ),
+        ev(
+          "/r/node_modules",
+          flags(&[FsEventFlags::ITEM_MODIFIED, FsEventFlags::ITEM_IS_DIR]),
+          2,
+          11,
+        ),
+        ev(
+          "/r/node_modules_old/kept.txt",
+          flags(&[FsEventFlags::ITEM_CREATED, FsEventFlags::ITEM_IS_FILE]),
+          3,
+          12,
+        ),
+      ],
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+
+    assert!(
+      !mentions(&changes, "node_modules"),
+      "the pruned subtree and its own directory are both silent: {changes:?}"
+    );
+    assert_eq!(
+      changes.len(),
+      1,
+      "only the name-prefix neighbour survives — a component test, not a prefix \
+       one: {changes:?}"
+    );
+    assert_eq!(
+      changes[0].location(),
+      &loc(&["node_modules_old", "kept.txt"])
+    );
+  }
+
+  /// The probe-parked half of the same claim, which the batch-time fence alone
+  /// cannot make: an FSEvents word carrying several verbs is a PLACEHOLDER when
+  /// the fence runs — its planned inputs are minted only when the probe answers —
+  /// so a second judgement is owed at that resolution.
+  ///
+  /// Revert witness: drop `fence_resolved` from `on_probe_result` and the
+  /// multi-verb word inside the pruned subtree is delivered at
+  /// `node_modules/deep/o.tmp`.
+  #[test]
+  fn a_probe_parked_word_inside_a_pruned_subtree_is_fenced_at_its_resolution() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_fsevents(&mut core, &pruning(&["**/node_modules"]));
+
+    core.on_batch_events(
+      scope,
+      vec![ev(
+        "/r/node_modules/deep/o.tmp",
+        flags(&[
+          FsEventFlags::ITEM_CREATED,
+          FsEventFlags::ITEM_REMOVED,
+          FsEventFlags::ITEM_MODIFIED,
+        ]),
+        1,
+        7,
+      )],
+      at(1),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).is_empty(),
+      "nothing emits before the probe: {effects:?}"
+    );
+    let reqs = probes(&effects);
+    assert_eq!(
+      reqs.len(),
+      1,
+      "non-vacuity: the word really did park for a probe: {effects:?}"
+    );
+
+    core.on_probe_result(
+      reqs[0].0,
+      ProbeOutcome::Present {
+        kind: FileKind::File,
+        file_id: NonZeroU64::new(7),
+        dev: 1,
+      },
+      at(2),
+    );
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+    assert!(
+      changes.is_empty(),
+      "the resolution is judged by the same fence the batch was: {changes:?}"
+    );
+  }
+
+  /// A directory renamed ONTO a pruned name leaves coverage, and the crossing is
+  /// still reported as the departure it is from inside the reported tree.
+  #[test]
+  fn a_rename_onto_a_pruned_name_leaves_coverage() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let (scope, req, root) = live_descending(&mut core, &pruning(&["**/node_modules"]));
+    core.on_enumerated(req, listed(vec![entry("other", FileKind::Dir)]));
+    let _ = drain(&mut core);
+    assert_eq!(
+      core.covered_paths(),
+      vec![PathBuf::from("/r"), PathBuf::from("/r/other")],
+      "staging: the reported directory is covered"
+    );
+
+    core.on_inotify_events(
+      scope,
+      vec![
+        inotify(root, IN_MOVED_FROM | IN_ISDIR, 7, Some("other")),
+        inotify(root, IN_MOVED_TO | IN_ISDIR, 7, Some("node_modules")),
+      ],
+      at(1),
+    );
+    core.on_timeout(at(1_000));
+    let effects = drain(&mut core);
+
+    assert_eq!(
+      core.covered_paths(),
+      vec![PathBuf::from("/r")],
+      "the moved directory left the reported tree — it is uncovered, and the \
+       pruned destination never took its place: {effects:?}"
+    );
+    let changes = emits(&effects);
+    assert!(
+      !mentions(&changes, "node_modules"),
+      "the pruned destination is never named: {changes:?}"
+    );
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.kind().is_removed() && change.location() == &loc(&["other"])),
+      "the crossing is still reported, as the half inside the reported tree: {changes:?}"
+    );
+  }
+
+  /// And the other direction: a directory renamed OUT of a pruned name enters
+  /// coverage through the ordinary create path, because the destination half is
+  /// the only one the fence keeps.
+  #[test]
+  fn a_rename_out_of_a_pruned_name_enters_coverage() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let (scope, req, root) = live_descending(&mut core, &pruning(&["**/node_modules"]));
+    core.on_enumerated(req, listed(vec![entry("node_modules", FileKind::Dir)]));
+    let _ = drain(&mut core);
+    assert_eq!(
+      core.covered_paths(),
+      vec![PathBuf::from("/r")],
+      "staging: the pruned directory is not covered"
+    );
+
+    core.on_inotify_events(
+      scope,
+      vec![
+        inotify(root, IN_MOVED_FROM | IN_ISDIR, 9, Some("node_modules")),
+        inotify(root, IN_MOVED_TO | IN_ISDIR, 9, Some("src")),
+      ],
+      at(1),
+    );
+    core.on_timeout(at(1_000));
+    let effects = drain(&mut core);
+
+    assert!(
+      core.covered_paths().contains(&PathBuf::from("/r/src")),
+      "the newly reportable directory entered coverage: {:?} / {effects:?}",
+      core.covered_paths()
+    );
+    let changes = emits(&effects);
+    assert!(
+      !mentions(&changes, "node_modules"),
+      "without ever naming where it came from: {changes:?}"
+    );
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.location() == &loc(&["src"])),
+      "and the arrival is reported at its reportable name: {changes:?}"
+    );
+  }
+
+  /// A pattern can be POSITION-SENSITIVE (`a/cache` names one place, not a name at
+  /// any depth), and then a rename that relocates a subtree changes which of its
+  /// descendants are pruned — a change the record-by-record fence structurally
+  /// cannot see, because both of the rename's own endpoints are reported.
+  ///
+  /// With `a/cache` pruned, the cold walk of `/r/a` armed nothing at `cache`.
+  /// Renaming `/r/a` to `/r/b` makes that directory reportable at `/r/b/cache`,
+  /// and a bare O(1) re-parent would leave it unwatched forever — silent,
+  /// permanent loss under a path the caller IS watching. The repair is the one the
+  /// exclusions already get: a located `Rescan` at the destination and a re-arm
+  /// read whose fresh listing settles the membership.
+  ///
+  /// Asserted on COVERAGE and then on DELIVERY: the defect is a subtree left
+  /// unarmed, which a delivery-only assertion cannot distinguish from a subtree
+  /// that simply had nothing to say.
+  ///
+  /// Revert witness: leave `fence_under` answering `false` for the prune seat and
+  /// no re-enumeration of `/r` is dispatched at all, so `/r/b/cache` never enters
+  /// `covered_paths` and the creation under it is delivered to no one.
+  #[test]
+  fn a_rename_out_of_a_pruned_position_arms_the_newly_reportable_subtree() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let (scope, req, root) = live_descending(&mut core, &pruning(&["a/cache"]));
+    core.on_enumerated(req, listed(vec![entry("a", FileKind::Dir)]));
+    let effects = drain(&mut core);
+    let (_a, a_req) = arm(&mut core, &effects, "/r/a");
+    core.on_enumerated(
+      a_req,
+      listed(vec![
+        entry("cache", FileKind::Dir),
+        entry("keep", FileKind::Dir),
+      ]),
+    );
+    let effects = drain(&mut core);
+    assert_eq!(
+      core.covered_paths(),
+      vec![
+        PathBuf::from("/r"),
+        PathBuf::from("/r/a"),
+        PathBuf::from("/r/a/keep"),
+      ],
+      "staging: the pattern kept `/r/a/cache` out of coverage: {effects:?}"
+    );
+
+    // `/r/a` -> `/r/b`. Both endpoints are reported, so the fence preserves the
+    // pair and the Monitor re-parents; the geometry escalation rides after it.
+    core.on_inotify_events(
+      scope,
+      vec![
+        inotify(root, IN_MOVED_FROM | IN_ISDIR, 7, Some("a")),
+        inotify(root, IN_MOVED_TO | IN_ISDIR, 7, Some("b")),
+      ],
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let root_reread = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, path, .. } if path.as_path() == Path::new("/r") => Some(*req),
+        _ => None,
+      })
+      .expect("the geometry change re-enumerates from the destination");
+    let changes = emits(&effects);
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.kind().is_rescan() && change.location() == &loc(&["b"])),
+      "the repair covers the destination it is about to re-read: {changes:?}"
+    );
+
+    // The re-arm read of `/r` finds the same object under its new name, so the
+    // Monitor keeps the node and cascades the re-arm into it.
+    core.on_enumerated(
+      root_reread,
+      listed(vec![entry_ino("b", FileKind::Dir, ino_of("a"))]),
+    );
+    let effects = drain(&mut core);
+    let moved_reread = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, path, .. } if path.as_path() == Path::new("/r/b") => Some(*req),
+        _ => None,
+      })
+      .expect("the cascade re-reads the moved directory at its NEW path");
+
+    // Lowered against `/r/b`, so `cache` no longer matches `a/cache`.
+    core.on_enumerated(
+      moved_reread,
+      listed(vec![
+        entry("cache", FileKind::Dir),
+        entry_ino("keep", FileKind::Dir, ino_of("keep")),
+      ]),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      core.covered_paths().contains(&PathBuf::from("/r/b/cache")),
+      "the newly reportable directory entered coverage: {:?} / {effects:?}",
+      core.covered_paths()
+    );
+
+    // Coverage is only half the claim: prove a change under it now reaches the
+    // caller, which is exactly what the defect lost.
+    let (cache, cache_req) = arm(&mut core, &effects, "/r/b/cache");
+    core.on_enumerated(cache_req, listed(Vec::new()));
+    let _ = drain(&mut core);
+    core.on_inotify_events(
+      scope,
+      vec![inotify(cache, IN_CREATE, 0, Some("fresh.o"))],
+      at(2),
+    );
+    let changes = drain(&mut core);
+    let changes = emits(&changes);
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.location() == &loc(&["b", "cache", "fresh.o"])),
+      "and a change under it is delivered: {changes:?}"
+    );
+  }
+
+  /// A pruned directory must never turn into a rescan naming it — the same
+  /// invariant the exclusions carry. The fence never refuses an arm (the one route
+  /// that produces such a rescan) and it drops a located rescan whose subtree is
+  /// pruned, while leaving the root-wide cover standing.
+  #[test]
+  fn no_rescan_ever_names_a_pruned_path() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_fsevents(&mut core, &pruning(&["**/node_modules"]));
+
+    core.on_batch_events(
+      scope,
+      vec![
+        // A flagless word inside the pruned subtree: the lowering covers it with a
+        // located rescan there, which the fence drops.
+        ev("/r/node_modules/deep", FsEventFlags::new(0), 1, 0),
+        // The same word OUTSIDE still covers.
+        ev("/r/src", FsEventFlags::new(0), 2, 0),
+      ],
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+
+    assert!(
+      !mentions(&changes, "node_modules"),
+      "no rescan names the path the caller asked never to hear about: {changes:?}"
+    );
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.kind().is_rescan() && change.location() == &loc(&["src"])),
+      "a located rescan outside the prune still covers its subtree: {changes:?}"
+    );
+
+    // A scope-wide loss is never suppressed, whatever the seat covers.
+    core.on_root_overflow(scope, at(2));
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.kind().is_rescan() && change.location().is_empty()),
+      "the root-wide cover stands: it covers reported ground too: {changes:?}"
+    );
+  }
+
+  /// The ROOT is never pruned, however total the pattern: its root-relative path
+  /// is empty, and the match needs a prefix of length at least one. A seat can
+  /// silence everything below the root and still not silence the root itself.
+  ///
+  /// Revert witness: start the ancestor walk at the empty relative path and the
+  /// root's own arm, its enumerate and its scope-wide `Rescan` all vanish.
+  #[test]
+  fn the_root_is_never_pruned() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let (scope, req, _root) = live_descending(&mut core, &pruning(&["**", "*"]));
+    core.on_enumerated(req, listed(vec![entry("src", FileKind::Dir)]));
+    let effects = drain(&mut core);
+
+    assert_eq!(
+      core.covered_paths(),
+      vec![PathBuf::from("/r")],
+      "a total pattern subtracts everything BELOW the root, and nothing else: \
+       {effects:?}"
+    );
+
+    core.on_root_overflow(scope, at(2));
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.kind().is_rescan() && change.location().is_empty()),
+      "and the root's own coverage loss is still reported: {changes:?}"
+    );
+  }
+}
+
+mod include {
+  //! The per-ROOT include seat: a DELIVERY narrowing and nothing else. It arms
+  //! nothing differently, so every claim here is a claim about what reached the
+  //! consumer — coverage is deliberately untouched and is asserted to be so.
+  //!
+  //! Every clause of the admission rule widens rather than narrows, so the cells
+  //! come in pairs: one shows the file the seat silences, its partner shows the
+  //! thing the seat must never silence — a directory, a rename whose SOURCE
+  //! matched, an object no backend classified, a `Rescan`.
+
+  use super::*;
+  use crate::{
+    core::{RawDirEntry, RawEnumerate},
+    options::RootOptions,
+    os::linux::{RawInotifyEvent, RawLinuxEvent, WatchOutcome, inotify::decode::InotifyMask},
+  };
+  use tributary_proto::glob::Glob;
+
+  const IN_CREATE: u32 = 0x0000_0100;
+  const IN_DELETE: u32 = 0x0000_0200;
+  const IN_MODIFY: u32 = 0x0000_0002;
+  const IN_MOVED_FROM: u32 = 0x0000_0040;
+  const IN_MOVED_TO: u32 = 0x0000_0080;
+  const IN_ISDIR: u32 = 0x4000_0000;
+
+  /// The per-root household a root is armed with, narrowed to `patterns`.
+  fn including(patterns: &[&str]) -> RootOptions {
+    RootOptions::new().with_include(
+      patterns
+        .iter()
+        .map(|pattern| Glob::new(pattern).expect("a valid pattern compiles")),
+    )
+  }
+
+  fn listed(entries: Vec<RawDirEntry>) -> RawEnumerate {
+    RawEnumerate::Listed {
+      entries,
+      complete: true,
+    }
+  }
+
+  fn inotify(anchor: WatchId, mask: u32, cookie: u32, name: Option<&str>) -> RawLinuxEvent {
+    RawLinuxEvent::Inotify {
+      anchors: vec![anchor],
+      event: RawInotifyEvent {
+        wd: 1,
+        mask: InotifyMask(mask),
+        cookie,
+        name: name.map(|n| n.as_bytes().to_vec()),
+      },
+    }
+  }
+
+  /// A live DESCENDING root at `/r` under `options`, its cold read already
+  /// answered with an empty listing: inotify is the profile that reports an
+  /// object's class on EVERY record, which is what lets these cells name
+  /// `is_dir` exactly.
+  fn live_descending(core: &mut DriverCore, options: &RootOptions) -> (ScopeId, WatchId) {
+    let scope = core
+      .on_watch_with(PathBuf::from("/r"), options, BackendKind::Inotify)
+      .expect("a fresh scope registers");
+    let _ = drain(core);
+    core.on_stream_spawned(
+      scope,
+      Ok(RootMeta {
+        root: PathBuf::from("/r"),
+        root_dev: 1,
+        root_mnt_id: None,
+        mounts: Vec::new(),
+        identity: crate::os::RootIdentity::new(1, 1),
+        ancestors: Vec::new(),
+        backend: BackendKind::Inotify,
+      }),
+    );
+    let root_watch = drain(core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch {
+          watch,
+          parent,
+          path,
+          ..
+        } if path.as_path() == Path::new("/r") && watch == parent => Some(*watch),
+        _ => None,
+      })
+      .expect("the descending root arms through the effect path");
+    core.on_watch_installed(
+      root_watch,
+      core.arm_attempt(root_watch),
+      WatchOutcome::Installed(1),
+    );
+    let req = drain(core)
+      .iter()
+      .find_map(|e| match e {
+        Effect::Enumerate { req, path, .. } if path.as_path() == Path::new("/r") => Some(*req),
+        _ => None,
+      })
+      .expect("the armed root cold-enumerates");
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(0));
+    core.on_enumerated(req, listed(Vec::new()));
+    let _ = drain(core);
+    (scope, root_watch)
+  }
+
+  /// A live FSEvents root at `/r` under `options` — the profile whose flag words
+  /// are hints, so a word carrying a verb and no class flag produces a record
+  /// whose `is_dir` is genuinely unknown.
+  fn live_fsevents(core: &mut DriverCore, options: &RootOptions) -> ScopeId {
+    let scope = core
+      .on_watch_with(PathBuf::from("/r"), options, BackendKind::FsEvents)
+      .expect("a fresh scope registers");
+    let _ = drain(core);
+    core.on_stream_spawned(
+      scope,
+      Ok(RootMeta {
+        root: PathBuf::from("/r"),
+        root_dev: 1,
+        root_mnt_id: None,
+        mounts: Vec::new(),
+        identity: crate::os::RootIdentity::new(1, 1),
+        ancestors: Vec::new(),
+        backend: BackendKind::FsEvents,
+      }),
+    );
+    let _ = drain(core);
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(0));
+    let _ = drain(core);
+    scope
+  }
+
+  fn located(changes: &[&Change]) -> Vec<Location> {
+    changes.iter().map(|c| c.location().clone()).collect()
+  }
+
+  /// A PROVEN non-directory whose name does not match is silent in all three of
+  /// its verbs, while its matching neighbour delivers each of them.
+  ///
+  /// Revert witness: drop the `admits` call in `route_event` and the three
+  /// `notes.txt` changes are delivered alongside the three `clip.mp4` ones.
+  #[test]
+  fn a_non_matching_file_is_silent_and_a_matching_one_delivers() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let (scope, root) = live_descending(&mut core, &including(&["**/*.mp4"]));
+
+    core.on_inotify_events(
+      scope,
+      vec![
+        inotify(root, IN_CREATE, 0, Some("notes.txt")),
+        inotify(root, IN_MODIFY, 0, Some("notes.txt")),
+        inotify(root, IN_DELETE, 0, Some("notes.txt")),
+        inotify(root, IN_CREATE, 0, Some("clip.mp4")),
+        inotify(root, IN_MODIFY, 0, Some("clip.mp4")),
+        inotify(root, IN_DELETE, 0, Some("clip.mp4")),
+      ],
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+
+    assert_eq!(
+      located(&changes),
+      vec![loc(&["clip.mp4"]), loc(&["clip.mp4"]), loc(&["clip.mp4"])],
+      "every verb of the matching file delivers and every verb of the other is \
+       silent: {changes:?}"
+    );
+    assert!(changes[0].kind().is_created());
+    assert!(changes[1].kind().is_modified());
+    assert!(changes[2].kind().is_removed());
+  }
+
+  /// A DIRECTORY delivers whatever its name is: a moved or removed folder the
+  /// consumer never hears about is a hole in its view, so the seat speaks for
+  /// files alone.
+  ///
+  /// Coverage is asserted too: the seat is a delivery gate, so the directory it
+  /// would never have delivered is armed exactly as it would be without it.
+  #[test]
+  fn a_directory_delivers_regardless_of_its_name() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let (scope, root) = live_descending(&mut core, &including(&["**/*.mp4"]));
+
+    core.on_inotify_events(
+      scope,
+      vec![inotify(root, IN_CREATE | IN_ISDIR, 0, Some("clips"))],
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+    assert_eq!(
+      located(&changes),
+      vec![loc(&["clips"])],
+      "the directory's creation is delivered: {changes:?}"
+    );
+    assert!(
+      effects.iter().any(|e| matches!(
+        e,
+        Effect::AddWatch { path, .. } if path.as_path() == Path::new("/r/clips")
+      )),
+      "and the seat changed no coverage: the directory arms as it always did: \
+       {effects:?}"
+    );
+
+    core.on_inotify_events(
+      scope,
+      vec![inotify(root, IN_DELETE | IN_ISDIR, 0, Some("clips"))],
+      at(2),
+    );
+    let changes = drain(&mut core);
+    let changes = emits(&changes);
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.kind().is_removed() && change.location() == &loc(&["clips"])),
+      "and so is its removal: {changes:?}"
+    );
+  }
+
+  /// A rename is admitted when EITHER end matches: a media file renamed to a
+  /// non-media name is still reported, so the consumer can drop what it was
+  /// holding instead of keeping a name that no longer exists.
+  ///
+  /// Revert witness: drop clause (e) — the `moved_from` half of `admits` — and the
+  /// rename disappears while the consumer keeps `clip.mp4` forever.
+  #[test]
+  fn a_move_whose_source_matched_delivers() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let (scope, root) = live_descending(&mut core, &including(&["**/*.mp4"]));
+
+    core.on_inotify_events(
+      scope,
+      vec![
+        inotify(root, IN_MOVED_FROM, 7, Some("clip.mp4")),
+        inotify(root, IN_MOVED_TO, 7, Some("clip.bak")),
+      ],
+      at(1),
+    );
+    let changes = drain(&mut core);
+    let changes = emits(&changes);
+
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.location() == &loc(&["clip.bak"])
+          && change.kind().moved_from() == Some(&loc(&["clip.mp4"]))),
+      "the rename off the matching name is reported at its new one: {changes:?}"
+    );
+
+    // And a rename between two names the seat does not admit stays silent.
+    core.on_inotify_events(
+      scope,
+      vec![
+        inotify(root, IN_MOVED_FROM, 8, Some("a.txt")),
+        inotify(root, IN_MOVED_TO, 8, Some("b.txt")),
+      ],
+      at(2),
+    );
+    let changes = drain(&mut core);
+    let changes = emits(&changes);
+    assert!(
+      changes.is_empty(),
+      "a rename neither of whose ends matches is silent: {changes:?}"
+    );
+  }
+
+  /// An object whose class NO backend proved fails OPEN: an unproven class is not
+  /// a proven non-directory, so it delivers even though its name does not match.
+  ///
+  /// FSEvents is the witness — its flag words are hints, and a word carrying a
+  /// verb and no class flag is exactly the `is_dir: None` case.
+  #[test]
+  fn an_unproven_object_class_delivers() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_fsevents(&mut core, &including(&["**/*.mp4"]));
+
+    core.on_batch_events(
+      scope,
+      vec![
+        ev("/r/mystery", flags(&[FsEventFlags::ITEM_REMOVED]), 1, 0),
+        ev(
+          "/r/notes.txt",
+          flags(&[FsEventFlags::ITEM_REMOVED, FsEventFlags::ITEM_IS_FILE]),
+          2,
+          0,
+        ),
+      ],
+      at(1),
+    );
+    let changes = drain(&mut core);
+    let changes = emits(&changes);
+
+    assert_eq!(
+      located(&changes),
+      vec![loc(&["mystery"])],
+      "the unclassified object delivers and the proven file does not: {changes:?}"
+    );
+    assert_eq!(
+      changes[0].is_dir(),
+      None,
+      "and it delivers precisely because nothing classified it"
+    );
+  }
+
+  /// A `Rescan` is the no-silent-loss escape: it names a subtree to re-read rather
+  /// than an object, so no file pattern can speak for it.
+  #[test]
+  fn a_rescan_always_delivers() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let scope = live_fsevents(&mut core, &including(&["**/*.mp4"]));
+
+    core.on_batch_events(
+      scope,
+      vec![ev("/r/notes.txt", FsEventFlags::new(0), 1, 0)],
+      at(1),
+    );
+    let changes = drain(&mut core);
+    let changes = emits(&changes);
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.kind().is_rescan() && change.location() == &loc(&["notes.txt"])),
+      "a located rescan over a non-matching name still covers its subtree: \
+       {changes:?}"
+    );
+
+    core.on_root_overflow(scope, at(2));
+    let changes = drain(&mut core);
+    let changes = emits(&changes);
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.kind().is_rescan() && change.location().is_empty()),
+      "and so does the root-wide one: {changes:?}"
+    );
+  }
+
+  /// The unengaged seat is the old path exactly: `None` delivers everything, which
+  /// is what makes every existing suite a witness that the seat costs nothing when
+  /// it is not asked for.
+  #[test]
+  fn an_absent_seat_delivers_everything() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let (scope, root) = live_descending(&mut core, &RootOptions::new());
+    assert_eq!(
+      RootOptions::new().include(),
+      None,
+      "staging: the default seat is the absent one"
+    );
+
+    core.on_inotify_events(
+      scope,
+      vec![
+        inotify(root, IN_CREATE, 0, Some("notes.txt")),
+        inotify(root, IN_CREATE, 0, Some("clip.mp4")),
+        inotify(root, IN_CREATE | IN_ISDIR, 0, Some("clips")),
+      ],
+      at(1),
+    );
+    let changes = drain(&mut core);
+    let changes = emits(&changes);
+
+    assert_eq!(
+      located(&changes),
+      vec![loc(&["notes.txt"]), loc(&["clip.mp4"]), loc(&["clips"])],
+      "every change reaches the consumer: {changes:?}"
+    );
+  }
+
+  /// An EMPTY seat is not an absent one: it admits no file at all, while the
+  /// clauses that never speak for files — directories, `Rescan`s, unproven
+  /// classes — still deliver.
+  #[test]
+  fn an_empty_seat_admits_no_file_yet_still_delivers_directories() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS);
+    let (scope, root) = live_descending(&mut core, &including(&[]));
+
+    core.on_inotify_events(
+      scope,
+      vec![
+        inotify(root, IN_CREATE, 0, Some("clip.mp4")),
+        inotify(root, IN_CREATE | IN_ISDIR, 0, Some("clips")),
+      ],
+      at(1),
+    );
+    let changes = drain(&mut core);
+    let changes = emits(&changes);
+
+    assert_eq!(
+      located(&changes),
+      vec![loc(&["clips"])],
+      "no file is admitted, and the directory is not a file: {changes:?}"
     );
   }
 }

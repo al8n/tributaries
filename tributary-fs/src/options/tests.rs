@@ -478,3 +478,220 @@ mod clap_face {
     }
   }
 }
+
+/// The per-ROOT household: its defaults, its builders and its two faces.
+mod root_options {
+  use super::*;
+
+  fn glob(pattern: &str) -> Glob {
+    Glob::new(pattern).expect("a valid pattern compiles")
+  }
+
+  fn patterns(globs: &[Glob]) -> Vec<&str> {
+    globs.iter().map(Glob::as_str).collect()
+  }
+
+  /// The defaults are the behaviour the interest-only shorthand always had:
+  /// deliver everything, prune nothing, include everything.
+  #[test]
+  fn default_delegates_to_new() {
+    assert_eq!(RootOptions::default(), RootOptions::new());
+    let opts = RootOptions::new();
+    assert_eq!(opts.interest(), RootOptions::DEFAULT_INTEREST);
+    assert_eq!(opts.interest(), Interest::all());
+    assert!(opts.prune().is_empty());
+    assert_eq!(
+      opts.include(),
+      None,
+      "an ABSENT include seat delivers every file; an empty one would deliver none"
+    );
+  }
+
+  #[test]
+  fn builders_and_setters_agree() {
+    let built = RootOptions::new()
+      .with_interest(Interest::new().with_created())
+      .with_prune([glob("**/node_modules"), glob("**/.git")])
+      .with_include([glob("**/*.mp4")]);
+
+    let mut set = RootOptions::new();
+    set
+      .set_interest(Interest::new().with_created())
+      .set_prune([glob("**/node_modules"), glob("**/.git")])
+      .set_include([glob("**/*.mp4")]);
+
+    assert_eq!(built, set);
+    assert_eq!(patterns(built.prune()), ["**/node_modules", "**/.git"]);
+    assert_eq!(
+      built.include().map(patterns),
+      Some(std::vec!["**/*.mp4"]),
+      "the include seat keeps the patterns it was given"
+    );
+  }
+
+  /// The include seat has THREE states and the API keeps them apart: absent
+  /// (every file), empty (no file), and populated.
+  #[test]
+  fn the_include_seat_keeps_absent_and_empty_apart() {
+    let engaged = RootOptions::new().with_include([glob("**/*.mp4")]);
+    assert!(engaged.include().is_some());
+
+    let empty = RootOptions::new().with_include(std::iter::empty());
+    assert_eq!(
+      empty.include(),
+      Some(&[][..]),
+      "an empty seat is ENGAGED and admits no file"
+    );
+    assert_ne!(empty, RootOptions::new());
+
+    assert_eq!(engaged.without_include(), RootOptions::new());
+    let mut cleared = empty;
+    cleared.clear_include();
+    assert_eq!(cleared, RootOptions::new());
+  }
+
+  /// The `serde` face: one object keyed by the field names, the seats lists of
+  /// plain strings, every key optional.
+  #[cfg(feature = "serde")]
+  mod serde_face {
+    use super::*;
+
+    #[test]
+    fn default_round_trips() {
+      let json = serde_json::to_string(&RootOptions::new()).unwrap();
+      assert_eq!(
+        serde_json::from_str::<RootOptions>(&json).unwrap(),
+        RootOptions::new()
+      );
+    }
+
+    #[test]
+    fn a_fully_overridden_household_round_trips() {
+      let options = RootOptions::new()
+        .with_interest(Interest::new().with_created().with_moved())
+        .with_prune([glob("**/node_modules"), glob("**/.git")])
+        .with_include([glob("**/*.{mp4,mov}")]);
+      let json = serde_json::to_string(&options).unwrap();
+      assert_eq!(serde_json::from_str::<RootOptions>(&json).unwrap(), options);
+    }
+
+    /// The seats are lists of STRINGS, in both directions.
+    #[test]
+    fn the_seats_are_lists_of_strings() {
+      let options = RootOptions::new()
+        .with_prune([glob("**/node_modules")])
+        .with_include([glob("**/*.mp4")]);
+      let json = serde_json::to_value(&options).unwrap();
+      assert_eq!(json["prune"], serde_json::json!(["**/node_modules"]));
+      assert_eq!(json["include"], serde_json::json!(["**/*.mp4"]));
+
+      let parsed: RootOptions =
+        serde_json::from_str(r#"{"prune": ["**/Caches"], "include": ["**/*.mkv"]}"#).unwrap();
+      assert_eq!(patterns(parsed.prune()), ["**/Caches"]);
+      assert_eq!(parsed.include().map(patterns), Some(std::vec!["**/*.mkv"]));
+    }
+
+    /// A document naming ONE key leaves every other knob at the value `new()`
+    /// gives it — the struct-level `#[serde(default)]`.
+    #[test]
+    fn a_partial_document_defaults_every_absent_key() {
+      let parsed: RootOptions = serde_json::from_str(r#"{"prune": ["**/target"]}"#).unwrap();
+      assert_eq!(
+        parsed,
+        RootOptions::new().with_prune([glob("**/target")]),
+        "the absent interest is Interest::all() and the absent include is None"
+      );
+      assert_eq!(parsed.include(), None);
+    }
+
+    /// `null` and an absent key are the same absent seat; an empty LIST is the
+    /// engaged-but-empty one.
+    #[test]
+    fn the_include_seat_survives_the_round_trip_in_all_three_states() {
+      let absent: RootOptions = serde_json::from_str("{}").unwrap();
+      assert_eq!(absent.include(), None);
+      let null: RootOptions = serde_json::from_str(r#"{"include": null}"#).unwrap();
+      assert_eq!(null.include(), None);
+      let empty: RootOptions = serde_json::from_str(r#"{"include": []}"#).unwrap();
+      assert_eq!(empty.include(), Some(&[][..]));
+    }
+
+    /// Forward compatibility: no `deny_unknown_fields`.
+    #[test]
+    fn an_unknown_key_is_accepted() {
+      let parsed: RootOptions =
+        serde_json::from_str(r#"{"prune": [], "some_future_seat": 7}"#).unwrap();
+      assert_eq!(parsed, RootOptions::new());
+    }
+
+    /// An invalid pattern is refused by the DOCUMENT, not carried as a seat that
+    /// silently matches nothing.
+    #[test]
+    fn an_invalid_pattern_is_a_document_error() {
+      assert!(serde_json::from_str::<RootOptions>(r#"{"prune": ["[unclosed"]}"#).is_err());
+    }
+  }
+
+  /// The `clap` face: repeatable `--prune` / `--include` flags, and an absent
+  /// `--include` is the absent seat.
+  #[cfg(feature = "clap")]
+  mod clap_face {
+    use super::*;
+    use clap::Parser as _;
+
+    #[derive(Debug, clap::Parser)]
+    struct Cli {
+      #[command(flatten)]
+      options: RootOptions,
+    }
+
+    fn parse(args: &[&str]) -> RootOptions {
+      Cli::parse_from(std::iter::once("app").chain(args.iter().copied())).options
+    }
+
+    /// `--prune` repeats, once per pattern, in the order given.
+    #[test]
+    fn the_prune_flag_repeats() {
+      let parsed = parse(&["--prune", "**/node_modules", "--prune", "**/.git"]);
+      assert_eq!(patterns(parsed.prune()), ["**/node_modules", "**/.git"]);
+      assert!(parse(&[]).prune().is_empty());
+    }
+
+    /// `--include` repeats too — and given no times at all it is the ABSENT seat
+    /// (every file), which is what makes the seat's absence expressible from a
+    /// command line rather than collapsing into an empty list that admits none.
+    #[test]
+    fn an_absent_include_flag_is_the_absent_seat() {
+      assert_eq!(parse(&[]).include(), None);
+      let parsed = parse(&["--include", "**/*.mp4", "--include", "**/*.mov"]);
+      assert_eq!(
+        parsed.include().map(patterns),
+        Some(std::vec!["**/*.mp4", "**/*.mov"])
+      );
+    }
+
+    /// The flattened `Interest` flags default to the EMPTY mask, exactly as they
+    /// do everywhere `Interest` is flattened: a bare flag SETS a bit, so a
+    /// flagless command line subscribes to nothing rather than to `Interest::all`.
+    #[test]
+    fn the_flattened_interest_flags_default_empty() {
+      assert_eq!(parse(&[]).interest(), Interest::new());
+      assert_eq!(
+        parse(&["--created", "--moved"]).interest(),
+        Interest::new().with_created().with_moved()
+      );
+    }
+
+    /// An invalid pattern is refused at the FLAG, with the type's own message.
+    #[test]
+    fn an_invalid_pattern_is_refused_at_the_flag() {
+      let err = Cli::try_parse_from(["app", "--prune", "[unclosed"]).unwrap_err();
+      assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+      assert!(
+        err.render().to_string().contains("invalid glob"),
+        "the type's own message reaches the command line: {}",
+        err.render()
+      );
+    }
+  }
+}

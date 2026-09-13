@@ -35,8 +35,8 @@ use std::{
 use futures_util::FutureExt;
 use tempfile::TempDir;
 use tributaries::{
-  Debounce, DebounceConfig, Event, Filter, Subscription, TokioTributaries, TributariesOptions,
-  WatchOptions, WatcherOptions,
+  Debounce, DebounceConfig, Event, Filter, Glob, Subscription, TokioTributaries,
+  TributariesOptions, WatchOptions, WatcherOptions,
 };
 
 /// The concrete delivered-event type of the local-fs driver (`C = OsString`, `V = ()`).
@@ -126,6 +126,11 @@ async fn wait_until_all(
 /// key IS the path's components).
 fn reaches(event: &Ev, path: &Path) -> bool {
   event.reaches(&key(path))
+}
+
+/// One validated glob pattern for the per-root seat cells.
+fn glob(pattern: &str) -> Glob {
+  pattern.parse().expect("a valid pattern compiles")
 }
 
 /// One settle probe's window; the handshake below re-probes until [`DEADLINE`].
@@ -948,6 +953,160 @@ async fn sync_flushes_the_debounce_for_its_subscription() {
     seen || rescanned,
     "the barrier must flush the sub's debounced deltas, not promise over them"
   );
+
+  w.close().await.expect("close");
+}
+
+/// The `prune` seat through the public API on the pure-fs stack: a subtree the
+/// subscription named is never watched, while a sibling under the same root still
+/// delivers.
+///
+/// The silence rides a BARRIER rather than a bare timeout: the write into the pruned
+/// subtree happens FIRST, so the sibling's delivery behind it proves the root's ordered
+/// queue has already passed the window the pruned write would have occupied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prune_keeps_a_subtree_off_the_stream_while_a_sibling_delivers() {
+  let (_dir, root) = scratch("prune");
+  let pruned_dir = root.join("node_modules");
+  let kept_dir = root.join("src");
+  std::fs::create_dir_all(&pruned_dir).expect("create the pruned subtree");
+  std::fs::create_dir_all(&kept_dir).expect("create the sibling");
+
+  let mut w = watcher(TributariesOptions::new());
+  let sub = w
+    .watch(
+      key(&root),
+      (),
+      WatchOptions::new().with_prune([glob("**/node_modules")]),
+    )
+    .await
+    .expect("watch the root with a pruned subtree");
+
+  // The sibling pre-exists the watch, so settle ITS coverage before probing delivery.
+  settle_delivery_under(&mut w, &kept_dir).await;
+
+  let pruned = pruned_dir.join("dep.js");
+  let kept = kept_dir.join("main.rs");
+  std::fs::write(&pruned, b"x").expect("write under the prune");
+  std::fs::write(&kept, b"x").expect("write the sibling");
+
+  let mut pruned_reached = false;
+  let delivered = wait_for(&mut w, |event| {
+    pruned_reached |= !event.is_rescan() && reaches(event, &pruned);
+    event.subscription() == sub && !event.is_rescan() && reaches(event, &kept)
+  })
+  .await;
+  assert!(
+    delivered.is_some(),
+    "a change outside the pruned subtree still reaches the subscription"
+  );
+  assert!(
+    !pruned_reached,
+    "`prune` must keep the subtree out of the watch: nothing under it may be delivered"
+  );
+
+  w.close().await.expect("close");
+}
+
+/// The `include` seat through the public API: a file no pattern names is silent, a
+/// matching one is delivered case-INSENSITIVELY (`clip.MP4` against `**/*.mp4`), and a
+/// DIRECTORY change lands whatever its name — the seat fails open on anything that is not
+/// a proven non-directory.
+///
+/// The directory removal's class is asserted only where a backend proves it: Linux's
+/// inotify reports `Some(true)`, while FSEvents may leave it unproven, and `None` is the
+/// honest third answer rather than a defaulted `false`. What both platforms owe — and what
+/// this cell requires of both — is the DELIVERY.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn include_silences_a_non_matching_file_but_never_a_directory() {
+  let (_dir, root) = scratch("include");
+  let media = root.join("media");
+  std::fs::create_dir_all(&media).expect("create the media dir");
+
+  let mut w = watcher(TributariesOptions::new());
+  let sub = w
+    .watch(
+      key(&root),
+      (),
+      WatchOptions::new().with_include([glob("**/*.mp4")]),
+    )
+    .await
+    .expect("watch the root with delivery narrowed to media files");
+
+  // `media` pre-exists the watch, so its coverage must settle first. The shared
+  // handshake's probe is a FILE the engaged seat is supposed to silence, so this one
+  // probes with a DIRECTORY create, which the seat admits whatever its name.
+  let settled = tokio::time::timeout(DEADLINE, async {
+    let mut attempt = 0u32;
+    loop {
+      let probe = media.join(format!("settle-{attempt}"));
+      attempt += 1;
+      std::fs::create_dir(&probe).expect("create the settle probe dir");
+      let seen = tokio::time::timeout(SETTLE_STEP, async {
+        while let Some(event) = w.next().await {
+          if !event.is_rescan() && reaches(&event, &probe) {
+            return true;
+          }
+        }
+        false
+      })
+      .await
+      .unwrap_or(false);
+      if seen {
+        return;
+      }
+    }
+  })
+  .await;
+  assert!(
+    settled.is_ok(),
+    "coverage under {} never settled: no directory change there came back",
+    media.display()
+  );
+
+  // The non-included file first, so the two admitted changes behind it are barriers.
+  let silent = media.join("notes.txt");
+  let clip = media.join("clip.MP4");
+  let doomed = media.join("doomed");
+  std::fs::write(&silent, b"x").expect("write the silent file");
+  std::fs::write(&clip, b"x").expect("write the media file");
+  std::fs::create_dir(&doomed).expect("create the doomed dir");
+  std::fs::remove_dir(&doomed).expect("remove the doomed dir");
+
+  let mut silent_reached = false;
+  let mut clip_seen = false;
+  let mut directory_class: Option<Option<bool>> = None;
+  let landed = wait_for(&mut w, |event| {
+    if event.is_rescan() || event.subscription() != sub {
+      return false;
+    }
+    silent_reached |= reaches(event, &silent);
+    clip_seen |= reaches(event, &clip);
+    if reaches(event, &doomed) {
+      directory_class = Some(event.is_dir());
+      return true;
+    }
+    false
+  })
+  .await;
+
+  assert!(
+    landed.is_some(),
+    "a directory change is never silenced by `include`, whatever its name"
+  );
+  assert!(
+    clip_seen,
+    "`**/*.mp4` admits `clip.MP4` — the vocabulary is case-insensitive"
+  );
+  assert!(
+    !silent_reached,
+    "a file no pattern names is silent under an engaged `include` seat"
+  );
+  match directory_class.expect("the directory change was observed") {
+    Some(true) => {}
+    None => {}
+    other => panic!("a directory change must never be reported as a proven file: {other:?}"),
+  }
 
   w.close().await.expect("close");
 }

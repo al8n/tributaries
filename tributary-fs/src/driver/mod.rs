@@ -42,7 +42,7 @@ use std::{
 use agnostic_lite::{RuntimeLite, time::Instant as _};
 use futures_util::{FutureExt, StreamExt, stream::SelectAll};
 use tributary_proto::{
-  ArmAttempt, Change, Instant, Interest, IoClass, ReqId, ScopeId, Segment, WatchError, WatchId,
+  ArmAttempt, Change, Instant, IoClass, ReqId, ScopeId, Segment, WatchError, WatchId,
 };
 
 use crate::{
@@ -3587,8 +3587,9 @@ pub(crate) enum Command {
   Watch {
     /// The root to watch.
     root: PathBuf,
-    /// The delivery interest for the new scope.
-    interest: Interest,
+    /// The per-root household the new scope is armed with: its delivery
+    /// interest and its two glob seats.
+    options: crate::options::RootOptions,
     /// Resolved once the stream is live, with the scope handle and the
     /// canonical root path event paths will arrive under.
     reply: WatchReply,
@@ -8375,7 +8376,7 @@ pub(crate) async fn run<R, F>(
         dispatch_due_cookie_retries::<R, F>(&cookies, &op_tx, now());
       },
       cmd = commands.recv().fuse() => match cmd {
-        Ok(Command::Watch { root, interest, reply }) => {
+        Ok(Command::Watch { root, options, reply }) => {
           // A new root is a new native stream, and every stream this driver ever
           // admits is a teardown it will one day owe. Refuse while the retired
           // ones cannot be reclaimed: watch + reply-less `request_unwatch` is one
@@ -8408,7 +8409,7 @@ pub(crate) async fn run<R, F>(
             // is answered rather than asserted so an out-of-tree driver reusing
             // this core learns of the collision instead of taking a panic.
             // Nothing was registered, so there is no teardown to owe.
-            match core.on_watch(root, interest, config.profile) {
+            match core.on_watch_with(root, &options, config.profile) {
               Ok(scope) => {
                 watch_replies.insert(scope, PendingWatch { requested, reply });
               }

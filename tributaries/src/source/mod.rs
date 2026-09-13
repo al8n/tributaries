@@ -40,6 +40,7 @@ use tributary_proto::{ChangeId, Epoch, Location};
 use crate::{
   error::{SourceCloseError, SyncError, WatchError},
   event::EventKind,
+  options::RootGlobs,
 };
 
 #[cfg(feature = "fs")]
@@ -286,13 +287,33 @@ pub trait LocalSource<C> {
   /// the umbrella keys its subsumption index on that, not on the requested `key`, so
   /// subsequent events — reported in canonical coordinates — always route (design §4).
   ///
+  /// # The `globs` are PER-ROOT words, and honouring them is the source's job
+  ///
+  /// [`RootGlobs`] carries the two glob seats the subscription this arm serves asked for
+  /// — the subtrees the root must never enter ([`prune`](RootGlobs::prune)) and the
+  /// files it may deliver ([`include`](RootGlobs::include)) — matched against paths
+  /// relative to THIS root. They scope the watch itself, which is why they arrive here
+  /// rather than at a filter above the seam: nothing above re-checks them, so a source
+  /// that ignores one watches or delivers what the caller asked it not to, with nothing
+  /// anywhere to notice. A source that cannot honour a seat MUST say so in its own docs
+  /// (see [`RootGlobs`]). The default words — both seats unengaged — ask for exactly the
+  /// behaviour every source had before the seats existed.
+  ///
+  /// Everything else about the arm is unchanged by them: the canonical key a source
+  /// adopts is the key it armed, never a glob-narrowed one, and the umbrella's
+  /// subsumption index is keyed on that coordinate exactly as before.
+  ///
   /// # Errors
   ///
   /// A [`WatchError`] when the concrete watch cannot be armed.
   ///
   /// The returned future carries no `Send` requirement; [`Source::arm`] is the
   /// `Send`-promising twin.
-  fn arm(&mut self, key: &[C]) -> impl Future<Output = Result<Armed<C, Self::Handle>, WatchError>>;
+  fn arm(
+    &mut self,
+    key: &[C],
+    globs: &RootGlobs,
+  ) -> impl Future<Output = Result<Armed<C, Self::Handle>, WatchError>>;
 
   /// Requests release of the root named by `handle`. Synchronous and non-blocking: this is a
   /// fire-and-forget release **request**, not an awaited teardown.
@@ -782,10 +803,12 @@ pub trait Source<C> {
   /// [`LocalSource::canonicalize_key`]).
   fn canonicalize_key(&self, key: &[C]) -> Result<Vec<C>, WatchError>;
 
-  /// Arms a concrete watch for `key`, returning the armed-root token plus the
-  /// **canonical** key the source actually armed. Contract-identical to
-  /// [`LocalSource::arm`] (canonical-key adoption, caller-bounded liveness); the future
-  /// here additionally promises `Send` (see the `Send` bounds note on the [trait](Self)).
+  /// Arms a concrete watch for `key` under the per-root `globs`, returning the
+  /// armed-root token plus the **canonical** key the source actually armed.
+  /// Contract-identical to [`LocalSource::arm`] (canonical-key adoption, caller-bounded
+  /// liveness, and the obligation to honour both glob seats or document that it cannot);
+  /// the future here additionally promises `Send` (see the `Send` bounds note on the
+  /// [trait](Self)).
   ///
   /// # Errors
   ///
@@ -793,6 +816,7 @@ pub trait Source<C> {
   fn arm(
     &mut self,
     key: &[C],
+    globs: &RootGlobs,
   ) -> impl Future<Output = Result<Armed<C, Self::Handle>, WatchError>> + Send;
 
   /// Requests release of the root named by `handle` — synchronous, non-blocking,
@@ -1040,8 +1064,12 @@ impl<C, T: Source<C>> LocalSource<C> for T {
     <T as Source<C>>::canonicalize_key(self, key)
   }
 
-  fn arm(&mut self, key: &[C]) -> impl Future<Output = Result<Armed<C, Self::Handle>, WatchError>> {
-    <T as Source<C>>::arm(self, key)
+  fn arm(
+    &mut self,
+    key: &[C],
+    globs: &RootGlobs,
+  ) -> impl Future<Output = Result<Armed<C, Self::Handle>, WatchError>> {
+    <T as Source<C>>::arm(self, key, globs)
   }
 
   fn disarm(&mut self, handle: Self::Handle) {
@@ -1285,6 +1313,10 @@ pub struct SourceEvent<C, H> {
   move_from_location: Option<Location>,
   epoch: Epoch,
   change_id: Option<ChangeId>,
+  /// The affected object's CLASS where the source proved it, `None` where nothing did
+  /// — stated with [`with_is_dir`](Self::with_is_dir), read by
+  /// [`is_dir`](Self::is_dir).
+  is_dir: Option<bool>,
 }
 
 impl<C, H> SourceEvent<C, H> {
@@ -1334,6 +1366,7 @@ impl<C, H> SourceEvent<C, H> {
       move_from_location: None,
       epoch,
       change_id,
+      is_dir: None,
     }
   }
 
@@ -1368,6 +1401,28 @@ impl<C, H> SourceEvent<C, H> {
   #[must_use]
   pub fn with_move_from_location(mut self, location: Location) -> Self {
     self.move_from_location = Some(location);
+    self
+  }
+
+  /// States the affected object's CLASS: `true` for a directory, `false` for a
+  /// non-directory (builder form). A source that did not prove either omits it, and
+  /// [`is_dir`](Self::is_dir) reports `None`.
+  ///
+  /// # Only state what the source PROVED
+  ///
+  /// The three-valued answer is the point. `None` is the honest reading of "the backend
+  /// reported a bare path" and of a removal whose object is already gone, and no
+  /// consumer of this fact may read it as "not a directory": a delivery whose class is
+  /// unknown is admitted wherever a directory would be, because a folder a caller never
+  /// hears about is a hole in its view while an extra event is one it can drop. A source
+  /// that guesses `false` to fill the field in therefore does not supply information —
+  /// it silences deliveries that would otherwise have been made.
+  ///
+  /// It is a plain report, never a stat: nothing on this path touches the filesystem to
+  /// resolve an unknown class.
+  #[must_use]
+  pub const fn with_is_dir(mut self, is_dir: bool) -> Self {
+    self.is_dir = Some(is_dir);
     self
   }
 
@@ -1412,6 +1467,9 @@ impl<C, H> SourceEvent<C, H> {
       move_from_location: None,
       epoch: self.epoch,
       change_id: self.change_id,
+      // The class is a fact about the OBJECT, not about the coordinate it is
+      // reported at, so it survives a re-key untouched.
+      is_dir: self.is_dir,
     }
   }
 
@@ -1490,6 +1548,17 @@ impl<C, H> SourceEvent<C, H> {
   #[must_use]
   pub const fn change_id(&self) -> Option<ChangeId> {
     self.change_id
+  }
+
+  /// The affected object's CLASS where the source proved it — `Some(true)` for a
+  /// directory, `Some(false)` for a non-directory — and `None` where nothing did.
+  ///
+  /// `None` is a genuine third answer, not a defaulted `false`: see
+  /// [`with_is_dir`](Self::with_is_dir) for the rule a consumer of this fact owes it.
+  #[inline]
+  #[must_use]
+  pub const fn is_dir(&self) -> Option<bool> {
+    self.is_dir
   }
 
   /// Whether this is a [`Rescan`](EventKind::Rescan) — the coverage-loss signal the

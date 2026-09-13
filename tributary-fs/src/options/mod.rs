@@ -6,6 +6,11 @@ use std::{
   time::Duration,
 };
 
+use tributary_proto::{
+  Interest,
+  glob::{Glob, Globs},
+};
+
 use crate::os::Backend;
 
 #[cfg(test)]
@@ -783,6 +788,198 @@ impl WatcherOptions {
 }
 
 impl Default for WatcherOptions {
+  #[inline]
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+/// Per-ROOT configuration for one [`Watcher::watch_with`](crate::Watcher::watch_with).
+///
+/// [`WatcherOptions`] configures the watcher; this configures a single root
+/// armed on it, and every knob here rides that root alone. [`new`](Self::new)
+/// returns the defaults — deliver everything, prune nothing, include
+/// everything — which is exactly the behaviour
+/// [`Watcher::watch`](crate::Watcher::watch) has always had.
+///
+/// # The two glob seats
+///
+/// Both are matched against a **root-relative** path: the segments between the
+/// watched root and the object, joined with `/`, never with a leading
+/// separator. The root itself is the empty path and matches neither seat, so a
+/// pattern can never silence the root it is configured on. Patterns are
+/// case-insensitive and a `*` never crosses a `/` (see
+/// [`Glob`](tributary_proto::glob::Glob)).
+///
+/// - [`prune`](Self::prune) subtracts SUBTREES: a directory whose root-relative
+///   path — or any ancestor's, below the root — matches is never enumerated,
+///   never armed, never descended, and nothing at or under it is delivered.
+///   It is the per-root, glob-shaped twin of
+///   [`WatcherOptions::exclusions_slice`], and unlike that option it is enforced
+///   on EVERY backend: no OS API takes a glob, so the enforcement never stands
+///   down to one.
+/// - [`include`](Self::include) narrows DELIVERY to files whose last path
+///   segment matches. [`None`] — the default — delivers everything. It never
+///   changes coverage: the tree is watched exactly as it would be without it, so
+///   a pattern can be widened later without re-arming anything.
+///
+/// A directory change is never silenced by `include`, and neither is a
+/// [`Rescan`](crate::EventKind::Rescan) or a change whose object class the
+/// source did not prove — the seat fails OPEN, because a moved or removed folder
+/// the consumer never hears about is a hole in its view, while an extra event is
+/// one it can drop. A rename is admitted when EITHER end matches, so a media
+/// file renamed to a non-media name is still reported.
+///
+/// # Configuration faces
+///
+/// With the `serde` feature the household is one object keyed by the field
+/// names, every key optional and defaulted from [`new`](Self::new); the two glob
+/// seats are lists of plain strings, and an invalid pattern is a document error.
+///
+/// ```json
+/// { "prune": ["**/node_modules", "**/.git"], "include": ["**/*.{mp4,mov}"] }
+/// ```
+///
+/// With the `clap` feature it is a `clap::Args` group whose `--prune` and
+/// `--include` flags repeat, once per pattern. `--include` given no times at all
+/// is [`None`] (deliver everything) — which is what makes the seat's absence
+/// expressible from a command line at all.
+///
+/// ```text
+/// $ app --prune '**/node_modules' --prune '**/.git' --include '**/*.mp4'
+/// ```
+///
+/// The flattened [`Interest`] flags default to the EMPTY mask on that face,
+/// exactly as they do everywhere `Interest` is flattened: a bare flag sets a
+/// bit, so a flagless command line subscribes to nothing rather than to
+/// [`Interest::all`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[cfg_attr(feature = "clap", derive(clap::Args))]
+pub struct RootOptions {
+  #[cfg_attr(feature = "clap", command(flatten))]
+  interest: Interest,
+  #[cfg_attr(feature = "clap", arg(long))]
+  prune: Vec<Glob>,
+  #[cfg_attr(feature = "clap", arg(long))]
+  include: Option<Vec<Glob>>,
+}
+
+impl RootOptions {
+  /// The default per-root delivery interest: [`Interest::all`] — narrowing is
+  /// the opt-in act, matching the shorthand
+  /// [`Watcher::watch`](crate::Watcher::watch) took before this household
+  /// existed.
+  pub const DEFAULT_INTEREST: Interest = Interest::all();
+
+  /// The default options: deliver every kind, prune nothing, include
+  /// everything.
+  #[inline]
+  pub const fn new() -> Self {
+    Self {
+      interest: Self::DEFAULT_INTEREST,
+      prune: Vec::new(),
+      include: None,
+    }
+  }
+
+  /// The root's delivery interest.
+  #[inline]
+  pub const fn interest(&self) -> Interest {
+    self.interest
+  }
+
+  /// Returns these options with the delivery interest set.
+  #[inline]
+  #[must_use]
+  pub const fn with_interest(mut self, interest: Interest) -> Self {
+    self.interest = interest;
+    self
+  }
+
+  /// Sets the delivery interest.
+  #[inline]
+  pub const fn set_interest(&mut self, interest: Interest) -> &mut Self {
+    self.interest = interest;
+    self
+  }
+
+  /// The subtrees this root never descends into, as a slice. Empty is the
+  /// default — nothing is pruned. See the type docs for what a match subtracts.
+  #[inline]
+  pub fn prune(&self) -> &[Glob] {
+    self.prune.as_slice()
+  }
+
+  /// Returns these options with the pruned subtrees set.
+  #[inline]
+  #[must_use]
+  pub fn with_prune(mut self, prune: impl IntoIterator<Item = Glob>) -> Self {
+    self.prune = prune.into_iter().collect();
+    self
+  }
+
+  /// Sets the pruned subtrees.
+  #[inline]
+  pub fn set_prune(&mut self, prune: impl IntoIterator<Item = Glob>) -> &mut Self {
+    self.prune = prune.into_iter().collect();
+    self
+  }
+
+  /// The file patterns delivery is narrowed to, or [`None`] — the default — for
+  /// every file. An EMPTY list is not the same thing: it is a seat that admits
+  /// no file at all (directories and `Rescan`s still deliver).
+  #[inline]
+  pub fn include(&self) -> Option<&[Glob]> {
+    self.include.as_deref()
+  }
+
+  /// Returns these options with delivery narrowed to the given file patterns.
+  #[inline]
+  #[must_use]
+  pub fn with_include(mut self, include: impl IntoIterator<Item = Glob>) -> Self {
+    self.include = Some(include.into_iter().collect());
+    self
+  }
+
+  /// Sets the file patterns delivery is narrowed to.
+  #[inline]
+  pub fn set_include(&mut self, include: impl IntoIterator<Item = Glob>) -> &mut Self {
+    self.include = Some(include.into_iter().collect());
+    self
+  }
+
+  /// Returns these options delivering every file again — the [`None`] seat.
+  #[inline]
+  #[must_use]
+  pub fn without_include(mut self) -> Self {
+    self.include = None;
+    self
+  }
+
+  /// Clears the include seat, delivering every file again.
+  #[inline]
+  pub fn clear_include(&mut self) -> &mut Self {
+    self.include = None;
+    self
+  }
+
+  /// The compiled seats this household names, in the shape the driver stores
+  /// them on a scope: the pruned subtrees and, when the seat is engaged, the
+  /// included files.
+  pub(crate) fn compile(&self) -> (Globs, Option<Globs>) {
+    (
+      Globs::new(self.prune.iter().cloned()),
+      self
+        .include
+        .as_ref()
+        .map(|include| Globs::new(include.iter().cloned())),
+    )
+  }
+}
+
+impl Default for RootOptions {
   #[inline]
   fn default() -> Self {
     Self::new()

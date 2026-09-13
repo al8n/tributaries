@@ -1,6 +1,7 @@
 use super::{Snapshot, WatchView};
 use crate::{
   interest::Interest,
+  options::RootGlobs,
   subscription::Subscription,
   subsume::{Subsumer, WatchOutcome},
 };
@@ -20,7 +21,8 @@ fn install(s: &mut S, handle: u32, key: &[u8], value: u32) -> Subscription {
     | WatchOutcome::Widen { sub, .. }
     | WatchOutcome::Disjoint { sub, .. } => *sub,
   };
-  s.commit_watch(&outcome, handle, key).release();
+  s.commit_watch(&outcome, handle, key, &RootGlobs::new())
+    .release();
   sub
 }
 

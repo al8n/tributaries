@@ -265,6 +265,7 @@ async fn a_real_fs_move_carries_its_source_coordinate_into_the_move_out_projecti
     loc(&["new", "name"]),
     ChangeKind::Moved(loc(&["old", "name"])),
     Epoch::new(3),
+    Some(false),
   );
 
   // NON-VACUITY PRECONDITION, asserted before anything below leans on it: the presented
@@ -366,8 +367,14 @@ mod integration {
   use super::super::{FsSource, OPPORTUNISTIC_RELEASE_HANDOFFS, key_to_path};
   use crate::{
     event::path_components,
+    options::RootGlobs,
     source::{Source, SourceEvent, SyncToken},
   };
+
+  /// One validated pattern for the glob-seat cells.
+  fn glob(pattern: &str) -> tributary_proto::glob::Glob {
+    pattern.parse().expect("a valid pattern compiles")
+  }
 
   /// Generous ceiling for one expected observation; CI runners are slow and FSEvents
   /// batches on its own latency timer.
@@ -430,6 +437,74 @@ mod integration {
     .flatten()
   }
 
+  /// The per-root words the umbrella hands [`Source::arm`] reach the fs household: this
+  /// binding's whole job for them is to forward them to
+  /// [`watch_with`](tributary_fs::Watcher::watch_with), so the cell asserts on what the
+  /// watcher was ASKED for by observing what the armed root does.
+  ///
+  /// `prune` subtracts a subtree and `include` narrows file delivery, so with both
+  /// engaged exactly one of three writes may surface. The `.MP4` is deliberately
+  /// upper-case: the vocabulary is case-insensitive, so a forwarding that reached the
+  /// watcher through some other, case-sensitive path would drop it.
+  ///
+  /// The two silences are proven against a BARRIER rather than a bare timeout: the
+  /// pruned and non-included writes happen FIRST, so the delivered `.MP4` behind them
+  /// proves the root's ordered queue has already passed the window they would have
+  /// occupied. The grace drain after it is belt-and-suspenders for a backend that
+  /// batches on its own timer.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn fs_source_arm_forwards_the_root_globs_to_the_watcher() {
+    let (_dir, root) = scratch();
+    let root_key = path_components(&root);
+    std::fs::create_dir(root.join("keep")).expect("create the kept subtree");
+    std::fs::create_dir(root.join("skip")).expect("create the pruned subtree");
+
+    let mut source = FsSource::<TokioRuntime>::new(WatcherOptions::new()).expect("build FsSource");
+    let globs = RootGlobs::new()
+      .with_prune([glob("**/skip")])
+      .with_include([glob("**/*.mp4")]);
+    let armed = source
+      .arm(&root_key, &globs)
+      .await
+      .expect("arm the tempdir under both seats");
+
+    let silent_kind = root.join("keep").join("notes.txt");
+    let pruned = root.join("skip").join("clip.mp4");
+    let delivered = root.join("keep").join("clip.MP4");
+    std::fs::write(&silent_kind, b"x").expect("write the non-included file");
+    std::fs::write(&pruned, b"x").expect("write under the pruned subtree");
+    std::fs::write(&delivered, b"x").expect("write the included file");
+
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let observed = wait_for(&mut source, DEADLINE, |event| {
+      let path = key_to_path(event.key());
+      seen.push(path.clone());
+      event.handle() == armed.handle() && path == delivered
+    })
+    .await;
+    assert!(
+      observed.is_some(),
+      "the included file must be delivered; saw {seen:?}"
+    );
+
+    // Anything the two silenced writes could still produce would arrive after the
+    // barrier, so drain a grace window and fold it into the same set.
+    let _ = wait_for(&mut source, Duration::from_millis(500), |event| {
+      seen.push(key_to_path(event.key()));
+      false
+    })
+    .await;
+
+    assert!(
+      !seen.iter().any(|path| path == &silent_kind),
+      "`include` must silence a file no pattern names; saw {seen:?}"
+    );
+    assert!(
+      !seen.iter().any(|path| path.starts_with(root.join("skip"))),
+      "`prune` must keep the subtree out of the watch entirely; saw {seen:?}"
+    );
+  }
+
   /// The fs binding end to end: arm a tempdir (and confirm the reported canonical key), a
   /// change under it surfaces as a [`SourceEvent`] owned by the armed handle at the file's
   /// key, and after `disarm` a subsequent change no longer surfaces for that root.
@@ -442,7 +517,10 @@ mod integration {
 
     // Arm the tempdir; the source reports the fs-canonical key it committed to, which for
     // an already-canonical root is the root's own components.
-    let armed = source.arm(&root_key).await.expect("arm the tempdir");
+    let armed = source
+      .arm(&root_key, &RootGlobs::new())
+      .await
+      .expect("arm the tempdir");
     assert_eq!(
       armed.canonical_key(),
       root_key.as_slice(),
@@ -492,7 +570,10 @@ mod integration {
     let mut source = FsSource::<TokioRuntime>::new(WatcherOptions::new()).expect("build FsSource");
 
     // Arm the tempdir → the first handle, live.
-    let first = source.arm(&root_key).await.expect("arm the tempdir");
+    let first = source
+      .arm(&root_key, &RootGlobs::new())
+      .await
+      .expect("arm the tempdir");
     assert_eq!(
       source.root_key(first.handle()),
       Some(root_key.clone()),
@@ -511,7 +592,7 @@ mod integration {
     // application BEFORE the new watch, so the real `Watcher` never surfaces `Overlaps` against the
     // just-released root (contract clause 2).
     let second = source
-      .arm(&root_key)
+      .arm(&root_key, &RootGlobs::new())
       .await
       .expect("re-arm of the same key succeeds — the pending release applied before the watch");
     assert_ne!(
@@ -576,7 +657,7 @@ mod integration {
       let sub = parent.join(name);
       std::fs::create_dir_all(&sub).expect("create subroot");
       let armed = source
-        .arm(&path_components(&sub))
+        .arm(&path_components(&sub), &RootGlobs::new())
         .await
         .expect("arm subroot");
       handles.push(armed.handle());
@@ -599,7 +680,10 @@ mod integration {
     let d = parent.join("d");
     std::fs::create_dir_all(&d).expect("create d");
     let d_key = path_components(&d);
-    let armed_d = source.arm(&d_key).await.expect("arm disjoint D");
+    let armed_d = source
+      .arm(&d_key, &RootGlobs::new())
+      .await
+      .expect("arm disjoint D");
     assert_eq!(
       source.pending_releases.len(),
       1,
@@ -647,7 +731,7 @@ mod integration {
       let sub = parent.join(format!("r{i}"));
       std::fs::create_dir_all(&sub).expect("create subroot");
       let armed = source
-        .arm(&path_components(&sub))
+        .arm(&path_components(&sub), &RootGlobs::new())
         .await
         .expect("arm subroot");
       handles.push(armed.handle());
@@ -668,7 +752,7 @@ mod integration {
     std::fs::create_dir_all(&other).expect("create other");
     let other_key = path_components(&other);
     let armed = source
-      .arm(&other_key)
+      .arm(&other_key, &RootGlobs::new())
       .await
       .expect("arm the extra disjoint subroot");
     assert_eq!(
@@ -718,7 +802,7 @@ mod integration {
       let sub = parent.join(format!("d{i}"));
       std::fs::create_dir_all(&sub).expect("create descendant");
       let armed = source
-        .arm(&path_components(&sub))
+        .arm(&path_components(&sub), &RootGlobs::new())
         .await
         .expect("arm descendant");
       handles.push(armed.handle());
@@ -736,7 +820,7 @@ mod integration {
     // names each conflict and the conflict-triggered retry unwatches exactly it and re-attempts — so
     // the parent arms with NO `Overlaps` surfaced to the caller (contract clause 2).
     let parent_key = path_components(&parent);
-    let armed = source.arm(&parent_key).await.expect(
+    let armed = source.arm(&parent_key, &RootGlobs::new()).await.expect(
       "the ancestor arm resolves each named descendant conflict and succeeds — no Overlaps",
     );
     assert_eq!(
@@ -815,7 +899,7 @@ mod integration {
     // A LIVE child watch — the genuine overlap the ancestor arm below hits (never released, so never
     // pending).
     source
-      .arm(&path_components(&child))
+      .arm(&path_components(&child), &RootGlobs::new())
       .await
       .expect("arm the live child");
 
@@ -830,7 +914,7 @@ mod integration {
     for _ in 0..3 {
       let (dir, root) = scratch();
       let armed = source
-        .arm(&path_components(&root))
+        .arm(&path_components(&root), &RootGlobs::new())
         .await
         .expect("arm a disjoint root");
       handles.push(armed.handle());
@@ -844,7 +928,7 @@ mod integration {
     // Arm the child's ANCESTOR: it overlaps the LIVE child (which the watcher names), and the child is
     // NOT a pending entry — so the arm surfaces `Overlaps` immediately.
     let err = source
-      .arm(&path_components(&parent))
+      .arm(&path_components(&parent), &RootGlobs::new())
       .await
       .expect_err("the ancestor arm surfaces the live-child overlap");
     assert!(
@@ -883,7 +967,10 @@ mod integration {
     let mut source = FsSource::<TokioRuntime>::new(WatcherOptions::new()).expect("build FsSource");
 
     // Arm the root, then disarm it → one queued release, still live at the watcher.
-    let first = source.arm(&root_key).await.expect("arm the root");
+    let first = source
+      .arm(&root_key, &RootGlobs::new())
+      .await
+      .expect("arm the root");
     source.disarm(first.handle());
     assert_eq!(source.pending_releases.len(), 1, "one release queued");
 
@@ -891,7 +978,7 @@ mod integration {
     // in-flight sidecar but the driver has NOT run (no await since the `try_send`), so the re-watch's
     // disjointness check still sees the root live and the watcher NAMES it. The named conflict is in
     // the sidecar (not the queue), so the in-flight fallback awaits its `unwatch` and retries.
-    let second = source.arm(&root_key).await.expect(
+    let second = source.arm(&root_key, &RootGlobs::new()).await.expect(
       "the in-flight-release conflict resolves via the sidecar fallback — no Overlaps surfaced",
     );
     assert_ne!(
@@ -924,7 +1011,10 @@ mod integration {
     let root_key = path_components(&root);
     let mut source = FsSource::<TokioRuntime>::new(WatcherOptions::new()).expect("build FsSource");
 
-    let armed = source.arm(&root_key).await.expect("arm the tempdir");
+    let armed = source
+      .arm(&root_key, &RootGlobs::new())
+      .await
+      .expect("arm the tempdir");
     let kernel_recursive = source
       .watcher
       .backend_of(armed.handle())
@@ -963,7 +1053,10 @@ mod integration {
     let root_key = path_components(&root);
     let mut source = FsSource::<TokioRuntime>::new(WatcherOptions::new()).expect("build FsSource");
 
-    let armed = source.arm(&root_key).await.expect("arm the watched root");
+    let armed = source
+      .arm(&root_key, &RootGlobs::new())
+      .await
+      .expect("arm the watched root");
     std::fs::remove_dir_all(&root).expect("delete the watched root");
 
     // Wait (bounded) until the watcher's registry forgets the dead root — the driver tears it
@@ -1010,7 +1103,10 @@ mod integration {
     std::fs::create_dir_all(&drop_dir).expect("create drop");
     let root_key = path_components(&root);
     let mut source = FsSource::<TokioRuntime>::new(WatcherOptions::new()).expect("build FsSource");
-    let armed = source.arm(&root_key).await.expect("arm the tempdir");
+    let armed = source
+      .arm(&root_key, &RootGlobs::new())
+      .await
+      .expect("arm the tempdir");
 
     // Prompt path: with channel room the prune is handed over immediately — nothing defers.
     source.set_cover(armed.handle(), &[path_components(&keep)]);
@@ -1076,7 +1172,7 @@ mod integration {
     source.defer_prune(armed.handle(), vec![keep.clone()]);
     let (_dir2, other) = scratch();
     source
-      .arm(&path_components(&other))
+      .arm(&path_components(&other), &RootGlobs::new())
       .await
       .expect("arm a disjoint second root");
     assert!(
@@ -1100,7 +1196,7 @@ mod integration {
     let mut source = FsSource::<TokioRuntime>::new(WatcherOptions::new()).expect("build FsSource");
 
     let err = source
-      .arm(&path_components(&missing))
+      .arm(&path_components(&missing), &RootGlobs::new())
       .await
       .expect_err("arming a non-existent path fails");
     assert!(err.is_source(), "the arm failure is a fault, got {err:?}");
@@ -1143,7 +1239,7 @@ mod integration {
     let mut source =
       FsSource::<TokioRuntime>::new(WatcherOptions::new()).expect("build FsSource A");
     source
-      .arm(&path_components(&own))
+      .arm(&path_components(&own), &RootGlobs::new())
       .await
       .expect("arm the one own root");
 
@@ -1160,7 +1256,7 @@ mod integration {
       let sub = parent_b.join(format!("f{i}"));
       std::fs::create_dir_all(&sub).expect("create foreign subroot");
       let handle = foreign
-        .arm(&path_components(&sub))
+        .arm(&path_components(&sub), &RootGlobs::new())
         .await
         .expect("arm foreign subroot")
         .handle();
@@ -1221,7 +1317,7 @@ mod integration {
       FsSource::<TokioRuntime>::new(WatcherOptions::new()).expect("build FsSource A");
     // A GENUINE own live root to release.
     let genuine = source
-      .arm(&path_components(&root_a))
+      .arm(&path_components(&root_a), &RootGlobs::new())
       .await
       .expect("arm the genuine root")
       .handle();
@@ -1231,7 +1327,7 @@ mod integration {
     let mut foreign_src =
       FsSource::<TokioRuntime>::new(WatcherOptions::new()).expect("build FsSource B");
     let foreign = foreign_src
-      .arm(&path_components(&root_b))
+      .arm(&path_components(&root_b), &RootGlobs::new())
       .await
       .expect("arm the foreign root")
       .handle();
@@ -1253,7 +1349,7 @@ mod integration {
     // over the genuine (Enqueued) on this same arm.
     let (_dir_d, d) = scratch();
     source
-      .arm(&path_components(&d))
+      .arm(&path_components(&d), &RootGlobs::new())
       .await
       .expect("arm the disjoint trigger");
 
@@ -1285,7 +1381,7 @@ mod integration {
     let mut source = FsSource::<TokioRuntime>::new(WatcherOptions::new()).expect("build FsSource");
 
     let handle = source
-      .arm(&path_components(&root))
+      .arm(&path_components(&root), &RootGlobs::new())
       .await
       .expect("arm the watched root")
       .handle();
@@ -1348,12 +1444,12 @@ mod integration {
     let trig1 = make("trig1");
     let trig2 = make("trig2");
     let fill_h = source
-      .arm(&path_components(&fill))
+      .arm(&path_components(&fill), &RootGlobs::new())
       .await
       .expect("arm the fill root")
       .handle();
     let rel_h = source
-      .arm(&path_components(&rel))
+      .arm(&path_components(&rel), &RootGlobs::new())
       .await
       .expect("arm the release root")
       .handle();
@@ -1384,7 +1480,7 @@ mod integration {
     // release (it is NOT dropped). The watch's own blocking send then drains the channel (the driver
     // runs during that await), but the drain already broke — the release stays queued.
     source
-      .arm(&path_components(&trig1))
+      .arm(&path_components(&trig1), &RootGlobs::new())
       .await
       .expect("arm the first trigger");
     assert!(
@@ -1399,7 +1495,7 @@ mod integration {
     // Arm another disjoint trigger: the channel drained during the previous arm, so the drain now
     // gets `Enqueued` and hands the genuine release over — the retry succeeds (semantics unchanged).
     source
-      .arm(&path_components(&trig2))
+      .arm(&path_components(&trig2), &RootGlobs::new())
       .await
       .expect("arm the second trigger");
     assert!(
@@ -1421,7 +1517,7 @@ mod integration {
     let (_dir, root) = scratch();
     let mut source = FsSource::<TokioRuntime>::new(WatcherOptions::new()).expect("build FsSource");
     let handle = source
-      .arm(&path_components(&root))
+      .arm(&path_components(&root), &RootGlobs::new())
       .await
       .expect("arm the root")
       .handle();
@@ -1920,7 +2016,7 @@ mod the_invalid_uid_sentinel {
   use crate::{
     error::WatchError,
     event::{EventKind, path_components},
-    options::{TributariesOptions, WatchOptions},
+    options::{RootGlobs, TributariesOptions, WatchOptions},
     source::{Armed, FsSource, Source, SourceEvent},
   };
 
@@ -1963,7 +2059,11 @@ mod the_invalid_uid_sentinel {
       Ok(key.to_vec())
     }
 
-    async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+    async fn arm(
+      &mut self,
+      key: &[OsString],
+      _globs: &RootGlobs,
+    ) -> Result<Armed<OsString, u32>, WatchError> {
       self.next_handle += 1;
       let handle = self.next_handle;
       self.live.insert(handle, key.to_vec());

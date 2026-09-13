@@ -8,6 +8,41 @@ All notable changes to this workspace are documented here. The format is based o
 
 ### Added
 
+- **`tributary-fs`**, **`tributary-proto`** — two per-ROOT **glob seats**, carried by a
+  new `tributary_fs::RootOptions` and armed through `Watcher::watch_with(root, options)`.
+  `Watcher::watch(root, interest)` stays, unchanged, as the shorthand for
+  `watch_with(root, RootOptions::new().with_interest(interest))`, and the default
+  household is byte-for-byte the behaviour it always had.
+
+  - **`prune`** subtracts SUBTREES from the watch itself: a directory whose
+    root-relative path — or any ancestor's, below the root — matches is never
+    enumerated, never armed, never descended, and nothing at or under it is
+    delivered. It is the per-root, glob-shaped twin of `WatcherOptions::exclusions`,
+    and unlike that option it never stands down to a backend: no OS API takes a
+    glob, so the enforcement is the common layer's on every backend, FSEvents and
+    fanotify included. No `Rescan` ever names a pruned path, and the watched root
+    itself can never be pruned.
+  - **`include`** narrows file DELIVERY only, changing no coverage, so it can be
+    widened later without re-arming anything. `None` — the default — delivers
+    everything. Directories, `Rescan`s, objects whose class no backend proved, and
+    renames whose SOURCE matched are always delivered: the seat fails OPEN, because
+    a folder the consumer never hears about is a hole in its view.
+
+  Patterns are `tributary_proto::glob::Glob` (re-exported as `tributary_fs::Glob`),
+  matched case-insensitively against a `/`-joined root-relative path with
+  `literal_separator` — `*.mp4` does not match `a/b.mp4`, `**/*.mp4` does, and
+  `**/node_modules` matches `node_modules` at any depth. They live behind
+  `tributary-proto`'s new `glob` feature, which `tributary-fs` and `tributaries`
+  enable unconditionally; both faces carry them (serde: lists of plain strings;
+  clap: repeatable `--prune` / `--include` flags, an absent `--include` being the
+  absent seat).
+
+- **`tributary-proto`** — `Change::is_dir()`: the object's class where the source
+  proved it, `None` where nothing did. The same three-valued fact the OS records
+  already carried, threaded through the emission path unchanged — no stat is
+  performed for it, and a consumer filtering on it must treat `None` as unknown.
+  `Change::new` takes it as a new final argument.
+
 - **`tributaries`**, **`tributary-fs`**, **`tributary-proto`** — optional **`serde`**
   and **`clap`** faces on the option households, both off by default and neither
   changing anything when off. `serde` gives every household one document keyed by its
@@ -32,6 +67,38 @@ All notable changes to this workspace are documented here. The format is based o
     `--watcher-event-capacity`, so the three households can be flattened onto ONE
     `clap::Command` beside `TributariesOptions`'s `--event-capacity`. The `serde` key
     is unchanged.
+
+- **`tributaries`** — the two glob seats reach the umbrella, so a subscription carries
+  them and every source is armed with them.
+
+  - `WatchOptions::prune` / `WatchOptions::include`, with `with_prune`/`set_prune`,
+    `with_include`/`set_include`/`without_include`/`clear_include` and getters. They
+    are the one pair of knobs on that household that re-scopes the WATCH rather than
+    narrowing this subscription's delivery: `prune` subtracts coverage, so a pruned
+    subtree is never entered at all, while `interest`, the `Filter` and the `Debounce`
+    posture stay per-subscription gates over a root armed at the source's widest
+    policy. Both faces carry them (serde: lists of plain strings, an invalid pattern
+    being a document error; clap: repeatable `--prune` / `--include`, an absent
+    `--include` being the absent seat), and neither constrains `C`.
+  - `RootGlobs` — the per-root words a source receives, `WatchOptions::root_globs`
+    extracts them, and a root remembers the ones it was ARMED with, so a widen's
+    restore re-arms a survivor under its own words rather than the newcomer's.
+  - `Event::is_dir()`: the affected object's class where the source proved it, `None`
+    where nothing did. A move's two projections carry it (both endpoints are one
+    object); a synthesized delivery reports `None`. `SourceEvent` carries it too, stated
+    by the new `SourceEvent::with_is_dir` and read by `SourceEvent::is_dir`;
+    `tributary_fs::Event::is_dir()` is the fs layer's own accessor behind it.
+
+### Changed
+
+- **`tributaries`** — **BREAKING for a custom `Source`**: `Source::arm` and
+  `LocalSource::arm` take the per-root `&RootGlobs` as a third argument
+  (`arm(&mut self, key: &[C], globs: &RootGlobs)`). An out-of-tree source must accept
+  the parameter and either honour both seats or document in its own docs that it cannot
+  — nothing above the seam re-checks them, so a source that ignores one silently
+  watches or delivers what the caller asked it not to. `RootGlobs::new()` (both seats
+  unengaged) asks for exactly the behaviour every source had before the seats existed.
+  Every other seam item is unchanged, including canonical-key adoption.
 
 ## [0.1.0]
 
