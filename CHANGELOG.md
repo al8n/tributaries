@@ -624,6 +624,14 @@ All notable changes to this workspace are documented here. The format is based o
   of the previous door; raising either back is one call, with the host's descriptor
   budget in mind.
 
+### Fixed
+
+- **`tributary-fs`**, **`tributary-proto`** — a directory rename whose destination a root's
+  `prune` seat covers now consumes the Monitor half its source parked and tears the subtree
+  that half was holding down at once (the new `Monitor::consume_pending_move`), instead of
+  retaining those watches — and the scope's move settle with them — until the pairing window
+  elapsed.
+
 ### Known limitations
 
 - **`tributary-fs`**, **`tributaries`** — on Windows, `Watcher::sync_root` and

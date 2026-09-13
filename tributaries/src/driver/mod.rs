@@ -1074,8 +1074,10 @@ where
   /// kernel-recursive backend (FSEvents, fanotify) there are no per-directory
   /// watches to transition, so the certificate rests where it always did — on the
   /// descriptors the watcher pins for the sync target and the reserved cookie
-  /// directory until the marker is created. The assumption below is the same one
-  /// this note always stated; it does not widen.
+  /// directory, held from the admission until the write has opened the cookie
+  /// directory it will create in, which is the last thing the admission is read
+  /// for. The assumption below is the same one this note always stated; it does
+  /// not widen.
   ///
   /// Identity, mount frame and landing are re-verified at the write on every
   /// backend, a minted reserved directory is proved to hold only its marker, every

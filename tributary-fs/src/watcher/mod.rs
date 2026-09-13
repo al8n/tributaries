@@ -1078,9 +1078,9 @@ pub struct Watcher<R> {
   /// syncs together waits at this door instead of exhausting the process's
   /// descriptor table on the way to one that counts them. The slot's own
   /// lifetime past that point is profile-split: on a descending profile it
-  /// comes back the moment admission finishes sampling, before the pins reach
-  /// a claim; on a kernel-recursive profile it travels with the pins all the
-  /// way to the claim.
+  /// comes back the moment admission finishes sampling; on a kernel-recursive
+  /// profile it travels with the pins into the write and comes back where they
+  /// do, at the cookie directory's open.
   ///
   /// Shared across clones of one watcher, like the mint above: the bound belongs
   /// to the watcher, not to a handle.
@@ -2107,8 +2107,10 @@ impl<R> Watcher<R> {
   /// retires the barriers standing on it. On a kernel-recursive backend (FSEvents,
   /// fanotify) there are no per-directory watches to transition, so the certificate
   /// rests where it always did — on the descriptors this call pins for `dir` and
-  /// the reserved cookie directory until the marker is created. The assumption
-  /// below is the same one this note always stated; it does not widen.
+  /// the reserved cookie directory, held from the admission until the write has
+  /// opened the cookie directory it will create in, which is the last thing the
+  /// admission is read for. The assumption below is the same one this note always
+  /// stated; it does not widen.
   ///
   /// Identity, mount frame and landing are re-verified at the write on every
   /// backend, a minted reserved directory is proved to hold only its marker, every

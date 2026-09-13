@@ -9215,7 +9215,7 @@ mod descending {
   }
 
   mod barrier {
-    //! The barrier epoch and the eight funnels that move it, the deliberate
+    //! The barrier epoch and the nine funnels that move it, the deliberate
     //! non-bumps, and the drain-order substitution a retirement is built on.
     //!
     //! Every cell here is sans-I/O and reads the stamp through
@@ -9254,7 +9254,7 @@ mod descending {
       (core, scope, root)
     }
 
-    // ---- the eight funnels -------------------------------------------------
+    // ---- the nine funnels --------------------------------------------------
 
     /// Funnel 1. Every route into the watch map — a crawl, a cascade, a cold
     /// enumeration, a `set_cover` grow, the slot reconcile's move-in arm — lands
@@ -9527,8 +9527,10 @@ mod descending {
       core.on_refresh_declined(scope, at(1), DeclineReason::BudgetFull);
       assert_eq!(
         epoch(&core, scope).0,
-        before.0 + 1,
-        "the degrade moved the stamp exactly once"
+        before.0 + 2,
+        "twice on a NARROWED scope: the decline's own whole-scope move (funnel 9) \
+         and then this degrade, which is the idempotent overlap the funnel list \
+         documents"
       );
       assert_eq!(
         core.take_barrier_moves(),
@@ -9537,12 +9539,89 @@ mod descending {
           location: BarrierLocation::Scope,
           rescan_stands: true,
         }],
-        "at the root ground the `Rescan` names, which is the whole scope"
+        "folded to ONE whole-scope move: at the root ground the `Rescan` names"
       );
       assert_eq!(
         core.scopes[&scope].applied_cover,
         Some(Vec::new()),
         "non-vacuity: the claim really did degrade"
+      );
+    }
+
+    /// Funnel 9. A declined probe at a full budget leaves this root's liveness
+    /// UNPROVEN — a window nothing accounts for — so it is a move about the whole
+    /// scope, standing the overflow `Rescan` the decline mints.
+    ///
+    /// It is NOT subsumed by funnel 7: that funnel is gated on a recorded cover
+    /// claim, and a never-narrowed scope has none to degrade — as every
+    /// kernel-recursive scope permanently has none. Without this funnel such a
+    /// scope's in-pool write claims AFTER the `Rescan` and certifies across the
+    /// unproven window.
+    ///
+    /// Revert witness: drop the `barrier_moved` call from the `unproven` arm and
+    /// the stamp stands still and the drain is empty.
+    #[test]
+    fn a_probe_budget_loss_bumps_a_never_narrowed_scope() {
+      let (mut core, scope) = live_core();
+      assert!(
+        core.scopes[&scope].applied_cover.is_none(),
+        "staging: never narrowed, so funnel 7 cannot stand in for this one"
+      );
+      let before = quiesce(&mut core, scope);
+      core.on_refresh_declined(scope, at(1), DeclineReason::BudgetFull);
+      assert_eq!(
+        epoch(&core, scope).0,
+        before.0 + 1,
+        "the unproven window moved the stamp exactly once"
+      );
+      assert_eq!(
+        core.take_barrier_moves(),
+        vec![BarrierMove {
+          scope,
+          location: BarrierLocation::Scope,
+          rescan_stands: true,
+        }],
+        "under the overflow `Rescan` the decline mints for it"
+      );
+    }
+
+    /// ONCE per episode, like the loss it rides: the fact is "this root's
+    /// liveness is unproven", which does not become more true each interval, and
+    /// a move per tick against a saturated budget would retire every barrier a
+    /// wedged filesystem admits.
+    #[test]
+    fn a_second_probe_budget_loss_in_one_episode_bumps_nothing() {
+      let (mut core, scope) = live_core();
+      core.on_refresh_declined(scope, at(1), DeclineReason::BudgetFull);
+      let before = quiesce(&mut core, scope);
+      core.on_refresh_declined(scope, at(2), DeclineReason::BudgetFull);
+      assert_eq!(
+        epoch(&core, scope).0,
+        before.0,
+        "the episode's latch already reported: the stamp stands still"
+      );
+      assert!(
+        core.take_barrier_moves().is_empty(),
+        "and nothing is recorded for a window already covered"
+      );
+    }
+
+    /// NON-BUMP. A decline for a BUSY scope loses no proof: a probe of this
+    /// scope is running and its completion is the proof, so there is no
+    /// unaccounted window and nothing to retire.
+    #[test]
+    fn a_busy_declined_probe_bumps_nothing() {
+      let (mut core, scope) = live_core();
+      let before = quiesce(&mut core, scope);
+      core.on_refresh_declined(scope, at(1), DeclineReason::ScopeBusy);
+      assert_eq!(
+        epoch(&core, scope).0,
+        before.0,
+        "a probe that is running is a proof that is coming"
+      );
+      assert!(
+        core.take_barrier_moves().is_empty(),
+        "and no barrier of this scope stands on ground that moved"
       );
     }
 
@@ -9592,6 +9671,49 @@ mod descending {
       assert!(
         emitted[0].kind().is_rescan(),
         "the consumer sees the Rescan, never the marker: {effects:?}"
+      );
+    }
+
+    /// A `Rescan` a fed-back funnel stands never precedes the move that retires
+    /// the barriers it covers: the move is IN HAND — queued, and so available to
+    /// the drain the executor runs before each effect — while that `Rescan` is
+    /// still an unpolled effect.
+    ///
+    /// This is the core-side half of the invariant the driver's per-poll drain
+    /// makes total. The funnel fires from inside a pass the executor is still
+    /// draining, so "the next loop top" is not soon enough; what the core owes is
+    /// that the move exists no later than the `Rescan` does, which is what lets
+    /// the executor close the window by draining before it takes the next effect
+    /// off this queue.
+    ///
+    /// Revert witness: move the `barrier_moved` call in `on_refresh_declined`'s
+    /// `unproven` arm below the `drain_monitor` that queues the `Rescan` and the
+    /// emit is pollable while `barrier_moves` is still empty — which is exactly
+    /// the state an in-pool writer claims `Ok` in.
+    #[test]
+    fn a_fed_back_funnels_move_is_in_hand_before_its_rescan_can_be_polled() {
+      let (mut core, scope) = live_core();
+      let _ = drain(&mut core);
+
+      core.on_refresh_declined(scope, at(1), DeclineReason::BudgetFull);
+
+      assert!(
+        core.effects.iter().any(|effect| matches!(
+          effect,
+          Effect::Emit { scope: on, change, .. } if *on == scope && change.kind().is_rescan()
+        )),
+        "staging: the funnel stood its covering `Rescan`, still unpolled: {:?}",
+        core.effects
+      );
+      assert_eq!(
+        core.take_barrier_moves(),
+        vec![BarrierMove {
+          scope,
+          location: BarrierLocation::Scope,
+          rescan_stands: true,
+        }],
+        "and its move is already in hand, so a drain placed before the poll \
+         retires every barrier that `Rescan` covers"
       );
     }
 
@@ -19142,6 +19264,150 @@ mod prune {
     assert!(
       !mentions(&changes, "blocked"),
       "and no cover names the pruned destination: {changes:?}"
+    );
+  }
+
+  /// And it leaves NO pending half behind.
+  ///
+  /// The destination this fence replaces never reaches the Monitor, so the source
+  /// half has nothing to pair with — and an unpaired half holds the subtree it
+  /// detached for an O(1) reparent, and the scope's move settle with it, until the
+  /// pairing window elapses. The fence consumes the half in the same breath as it
+  /// widens the record, so the departure is reported at once and the window has
+  /// nothing left to expire. The widened cover stands unchanged beside it.
+  ///
+  /// The DESCENDING profile is where this bites: it is the one that feeds as it
+  /// classifies, so the source is parked before the destination is judged — and it
+  /// is the one with per-directory watches for a half to be holding.
+  ///
+  /// Revert witness: drop the `consume_pending_move` call and the `Removed` below
+  /// arrives only at the timeout, which then has work to do again.
+  #[test]
+  fn a_descending_rename_into_pruned_ground_leaves_no_pending_half() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
+    let (scope, req, root) = live_descending(&mut core, &pruning(&["blocked"]));
+    core.on_enumerated(req, listed(vec![entry("open", FileKind::Dir)]));
+    let effects = drain(&mut core);
+    let (_, open_req) = arm(&mut core, &effects, "/r/open");
+    core.on_enumerated(open_req, listed(Vec::new()));
+    let _ = drain(&mut core);
+
+    core.on_inotify_events(
+      scope,
+      vec![
+        inotify(root, IN_MOVED_FROM | IN_ISDIR, 9, Some("open")),
+        inotify(root, IN_MOVED_TO | IN_ISDIR, 9, Some("blocked")),
+      ],
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.kind().is_removed() && change.location() == &loc(&["open"])),
+      "the source-side departure is reported at once, with no window to wait \
+       out: {changes:?}"
+    );
+    assert!(
+      rescans(&changes).contains(&loc(&[])),
+      "and the widened cover still stands beside it: {changes:?}"
+    );
+
+    core.on_timeout(at(1_000));
+    let effects = drain(&mut core);
+    assert!(
+      !emits(&effects)
+        .iter()
+        .any(|change| change.kind().is_removed()),
+      "the window has nothing left to expire: {effects:?}"
+    );
+  }
+
+  /// And the BATCH-CLASSIFYING profile leaves none either, though its ordering is
+  /// the opposite one.
+  ///
+  /// On FSEvents every fence runs ahead of every feed: the destination is judged
+  /// at its probe's resolution, where the widening consumption finds no half
+  /// because the source is fed only later, when the batch's settlement grants it
+  /// its pairing cookie. The destination's EVIDENCE survives the fence, so that
+  /// grant still happens — and the half it feeds has nothing left to pair with.
+  /// Parked, it would hold the scope's move settle, and with it every cover fence
+  /// and every new sync of this root, for the whole pairing window, which the
+  /// option bounds at a day. The Monitor remembers the consumption instead and
+  /// resolves the half on arrival.
+  ///
+  /// A DAY of move window, so nothing here can be settled by an expiry: whatever
+  /// this cell observes, it observes because the consumption was remembered.
+  ///
+  /// Revert witness: drop the remembered consumption and the `Removed` below is
+  /// absent, `poll_timeout` names a deadline a day out, and the scope's barrier
+  /// is unsettled until it elapses.
+  #[test]
+  fn a_same_batch_rename_into_pruned_ground_leaves_no_pending_half() {
+    const DAY: Duration = Duration::from_secs(86_400);
+    let mut core = DriverCore::new(DAY, LIVENESS, reserved_dir());
+    let scope = live_fsevents(&mut core, &pruning(&["blocked"]));
+    assert!(
+      core.barrier_settled(scope),
+      "staging: the root is settled before the pair arrives"
+    );
+
+    core.on_batch_events(
+      scope,
+      vec![
+        ev(
+          "/r/open",
+          flags(&[FsEventFlags::ITEM_RENAMED, FsEventFlags::ITEM_IS_DIR]),
+          10,
+          42,
+        ),
+        ev(
+          "/r/blocked",
+          flags(&[FsEventFlags::ITEM_RENAMED, FsEventFlags::ITEM_IS_DIR]),
+          11,
+          42,
+        ),
+      ],
+      at(1),
+    );
+    let reqs = probes(&drain(&mut core));
+    assert_eq!(reqs.len(), 2, "both halves of a same-batch pair probe");
+    // The source vanished; the destination is present on the root device under
+    // the same fileID its event word carried — the grant's whole proof.
+    core.on_probe_result(reqs[0].0, ProbeOutcome::Missing, at(2));
+    core.on_probe_result(
+      reqs[1].0,
+      ProbeOutcome::Present {
+        kind: FileKind::Dir,
+        file_id: NonZeroU64::new(42),
+        dev: 1,
+      },
+      at(2),
+    );
+
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.kind().is_removed() && change.location() == &loc(&["open"])),
+      "the source-side departure is reported at once, with no window to wait \
+       out: {changes:?}"
+    );
+    assert!(
+      !mentions(&changes, "blocked"),
+      "and no cover names the pruned destination: {changes:?}"
+    );
+    assert_eq!(
+      core.poll_timeout(),
+      None,
+      "nothing is parked on the pairing window"
+    );
+    assert!(
+      core.barrier_settled(scope),
+      "so the scope's moves are settled, and its cover fences and new syncs \
+       with them"
     );
   }
 
