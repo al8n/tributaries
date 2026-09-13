@@ -300,10 +300,35 @@ jobs:
       run: rustup update stable --no-self-update && rustup default stable
     - name: Install cargo-hack
       run: cargo install cargo-hack
+    - name: Free the hosted runner's disk for the feature powerset
+      # Only ubuntu-latest needs this: the powerset below accumulates 143
+      # combinations' worth of debug test artifacts in one target directory
+      # and exceeds the hosted runner's ~14 GB disk around combination 100 of
+      # 143 — at which point the runner's own worker crashes with "No space
+      # left on device" and the step just stops, with no Rust-side error line
+      # to point at. macOS and Windows runners carry far more disk and never
+      # hit this. Clearing toolsets this job never touches (dotnet, Android,
+      # GHC, CodeQL) and any cached Docker images buys back enough room to
+      # finish.
+      if: runner.os == 'Linux'
+      run: |
+        df -h /
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force >/dev/null 2>&1 || true
+        df -h /
     - name: Run test
       # `_integration` gates the privileged, single-threaded Linux integration
       # suites (see tributary-fs/Cargo.toml); this parallel powerset run must not
       # build or run them — the `linux-integration` job owns them.
+      # Debug info is most of a test binary's size and incremental caches
+      # multiply across all 143 combinations; neither buys anything for a
+      # powerset that only needs each combination to build and run once, so
+      # both are off here to keep the artifacts from filling right back up
+      # the disk the step above just cleared.
+      env:
+        CARGO_INCREMENTAL: "0"
+        CARGO_PROFILE_DEV_DEBUG: "0"
+        CARGO_PROFILE_TEST_DEBUG: "0"
       run: cargo hack test --feature-powerset --exclude-no-default-features --exclude-features _integration
     - name: Check featureless tributaries
       # The blanket --exclude-no-default-features above never builds the FEATURELESS
