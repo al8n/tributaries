@@ -88,10 +88,12 @@ use std::{
   time::Duration,
 };
 
+#[cfg(feature = "sync")]
+use tributary_proto::ChangeId;
 use tributary_proto::{
-  ArmAttempt, Capabilities, Change, ChangeId, ChangeKind, DirEntry, EnumerateResult, Evidence,
-  FileKind, Identity, Instant, IoClass, Location, Monitor, MoveCookie, OsRecord, RecordKind, ReqId,
-  Scope, ScopeId, Segment, StatEntry, StatResult, SubtreeScope, WatchError, WatchId,
+  ArmAttempt, Capabilities, Change, ChangeKind, DirEntry, EnumerateResult, Evidence, FileKind,
+  Identity, Instant, IoClass, Location, Monitor, MoveCookie, OsRecord, RecordKind, ReqId, Scope,
+  ScopeId, Segment, StatEntry, StatResult, SubtreeScope, WatchError, WatchId,
   glob::Globs,
   monitor::{CoverageWorkEpoch, RecordOutcome},
 };
@@ -393,6 +395,7 @@ impl BarrierLocation {
   /// one direction only would spare exactly the half whose watch actually
   /// changed. A whole-scope move is on every obligation's ground by
   /// construction.
+  #[cfg(feature = "sync")]
   pub(crate) fn intersects(&self, cover_dir: &Path) -> bool {
     match self {
       Self::Scope => true,
@@ -2936,6 +2939,7 @@ impl DriverCore {
   ///
   /// The stamp's reader is the cookie ledger's dispatch; the cells read it as the
   /// witness that a funnel bumped.
+  #[cfg(any(test, feature = "sync"))]
   pub(crate) fn barrier_epoch(&self, scope: ScopeId) -> Option<BarrierEpoch> {
     self.scopes.get(&scope).map(|state| state.barrier_epoch)
   }
@@ -3991,6 +3995,7 @@ impl DriverCore {
   /// effects are queued BEFORE the caller dispatches the parked cookie write.
   /// Returns whether anything was re-signaled; a no-op for a scope with no
   /// deficit or a kernel-recursive one.
+  #[cfg(any(test, feature = "sync"))]
   pub(crate) fn resignal_coverage_deficits(&mut self, scope: ScopeId) -> bool {
     let signaled = self.monitor.resignal_coverage_deficits(scope);
     if signaled {
@@ -4637,6 +4642,7 @@ impl DriverCore {
   /// directory strictly outside is ground the caller's own cover asked this scope to stop
   /// watching, so a marker written there could never be observed — the admission refuses
   /// it before birth ([`DirUncovered`](crate::error::SyncRootError::DirUncovered)).
+  #[cfg(feature = "sync")]
   pub(crate) fn covers(&self, scope: ScopeId, dir: &Path) -> bool {
     let Some(cover) = self
       .scopes

@@ -6,11 +6,14 @@ use std::{
   path::{Path, PathBuf},
   pin::Pin,
   sync::{
-    Arc, Mutex, PoisonError, RwLock,
+    Arc, PoisonError, RwLock,
     atomic::{AtomicU64, Ordering},
   },
   task::{Context, Poll},
 };
+
+#[cfg(feature = "sync")]
+use std::sync::Mutex;
 
 use agnostic_lite::RuntimeLite;
 use futures_core::Stream;

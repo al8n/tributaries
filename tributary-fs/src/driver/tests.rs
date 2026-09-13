@@ -17535,8 +17535,9 @@ mod sync_cookie {
     /// never returns, so that batch holds the scope's queue for good; the create
     /// injected behind it derives coverage work that crosses the ceiling and folds
     /// into the root overflow, installing the latch over a batch whose end will
-    /// never come. The overflow's own cold re-read of `/old` is what says the fold
-    /// really fired.
+    /// never come. The overflow's covering `Rescan` at the scope root is minted
+    /// synchronously with the fold, so seeing it says the fold fired and the
+    /// scope is latched; the cold re-read is owed at the latch's release.
     ///
     /// The request seam is thread-local and this runtime is single-threaded, so
     /// the driver task reads the ceiling this cell sets.
@@ -17586,19 +17587,19 @@ mod sync_cookie {
           },
         }],
       );
+      let mut root_rescan = false;
+      for _ in 0..16 {
+        let (_scope, change) = next_event(&rig).await;
+        if change.kind().is_rescan() && *change.location() == loc(&[]) {
+          root_rescan = true;
+          break;
+        }
+      }
       assert!(
-        settle(|| {
-          rig
-            .fs
-            .enumerates()
-            .iter()
-            .filter(|(_, path)| path == std::path::Path::new("/old"))
-            .count()
-            >= 2
-        })
-        .await,
-        "staging: the fold took the root-overflow path, which re-reads the root \
-         cold — so the scope is LATCHED"
+        root_rescan,
+        "staging: the overflow's covering Rescan at the scope root is minted \
+         synchronously with the fold — seeing it says the fold fired and the \
+         scope is LATCHED; the cold re-read is owed at the latch's release"
       );
 
       replace_root(&rig, scope, "/new")

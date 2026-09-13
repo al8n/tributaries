@@ -318,6 +318,7 @@ struct FakeSource {
   boom_on_cancel_grow: Option<Boom>,
   /// `begin_sync` parks FOREVER holding a [`PanicsWhenCancelled`] guard — the cookie write
   /// [`Owner::on_sync`]'s close race cancels.
+  #[cfg(feature = "sync")]
   boom_on_cancel_begin_sync: Option<Boom>,
   /// Cleanup obligations the cancelled FUTURES above still owe, booked by each
   /// [`PanicsWhenCancelled`] guard and discharged by none of them.
@@ -368,6 +369,7 @@ struct FakeSource {
   /// misbehaving, which on the close-win arm runs while the owner holds a CONSUMED [`CloseReply`].
   /// Recorded and applied first, so the ledger still attributes the unwind to a reclamation the
   /// source did perform.
+  #[cfg(feature = "sync")]
   panic_cancel_sync: Option<Boom>,
   /// How many of the next `replace` calls refuse with [`FaultKind::Capacity`] — the in-place
   /// retarget's admission refusal (`ReplaceRootError::CleanupBacklog`), which the widen must
@@ -467,6 +469,7 @@ impl FakeSource {
       boom_on_cancel_arms: HashMap::new(),
       boom_on_cancel_replace: None,
       boom_on_cancel_grow: None,
+      #[cfg(feature = "sync")]
       boom_on_cancel_begin_sync: None,
       dominate_syncs: false,
       future_owed: std::sync::Arc::new(core::sync::atomic::AtomicUsize::new(0)),
@@ -477,6 +480,7 @@ impl FakeSource {
       panic_join_close_call: false,
       panic_join_close_poll: false,
       panic_join_close_drop: false,
+      #[cfg(feature = "sync")]
       panic_cancel_sync: None,
       refuse_replaces: 0,
       replace_calls: 0,
@@ -639,6 +643,7 @@ impl FakeSource {
   }
 
   /// `begin_sync` parks FOREVER and unwinds with `boom` when the cookie write is CANCELLED.
+  #[cfg(feature = "sync")]
   fn boom_on_cancel_begin_sync(&mut self, boom: Boom) {
     self.boom_on_cancel_begin_sync = Some(boom);
   }
@@ -698,6 +703,7 @@ impl FakeSource {
   /// [`Source::cancel_sync`] PANICS with `boom` from now on — the by-name reclamation of an
   /// abandoned in-flight [`Source::begin_sync`], misbehaving on the one arm that issues it while
   /// holding a consumed [`CloseReply`].
+  #[cfg(feature = "sync")]
   fn panic_cancel_sync(&mut self, boom: Boom) {
     self.panic_cancel_sync = Some(boom);
   }
@@ -1661,7 +1667,9 @@ impl Harness {
       pending_syncs: Vec::new(),
       #[cfg(feature = "sync")]
       sync_seq: 0,
+      #[cfg(feature = "sync")]
       loss_serial: HashMap::new(),
+      #[cfg(feature = "sync")]
       loss_gen: std::sync::Arc::new(core::sync::atomic::AtomicU64::new(0)),
       #[cfg(feature = "sync")]
       nonces: sync_nonces(),
@@ -9356,7 +9364,9 @@ impl OwnerU64 {
       pending_syncs: Vec::new(),
       #[cfg(feature = "sync")]
       sync_seq: 0,
+      #[cfg(feature = "sync")]
       loss_serial: HashMap::new(),
+      #[cfg(feature = "sync")]
       loss_gen: std::sync::Arc::new(core::sync::atomic::AtomicU64::new(0)),
       #[cfg(feature = "sync")]
       nonces: sync_nonces(),
@@ -13664,7 +13674,9 @@ impl<V: Clone> OwnerOverValue<V> {
       pending_syncs: Vec::new(),
       #[cfg(feature = "sync")]
       sync_seq: 0,
+      #[cfg(feature = "sync")]
       loss_serial: HashMap::new(),
+      #[cfg(feature = "sync")]
       loss_gen: std::sync::Arc::new(core::sync::atomic::AtomicU64::new(0)),
       #[cfg(feature = "sync")]
       nonces: sync_nonces(),
@@ -15282,7 +15294,9 @@ impl OwnerOverHostileKeys {
       pending_syncs: Vec::new(),
       #[cfg(feature = "sync")]
       sync_seq: 0,
+      #[cfg(feature = "sync")]
       loss_serial: HashMap::new(),
+      #[cfg(feature = "sync")]
       loss_gen: std::sync::Arc::new(core::sync::atomic::AtomicU64::new(0)),
       #[cfg(feature = "sync")]
       nonces: sync_nonces(),
@@ -17220,7 +17234,9 @@ async fn release_marks_handle_logically_dead_immediately_even_with_transport_pen
     pending_syncs: Vec::new(),
     #[cfg(feature = "sync")]
     sync_seq: 0,
+    #[cfg(feature = "sync")]
     loss_serial: HashMap::new(),
+    #[cfg(feature = "sync")]
     loss_gen: std::sync::Arc::new(core::sync::atomic::AtomicU64::new(0)),
     #[cfg(feature = "sync")]
     nonces: sync_nonces(),
@@ -17399,7 +17415,9 @@ async fn unclaimed_orphans_parked_rescan_is_suppressed_by_state_in_the_run_loop(
     pending_syncs: Vec::new(),
     #[cfg(feature = "sync")]
     sync_seq: 0,
+    #[cfg(feature = "sync")]
     loss_serial: HashMap::new(),
+    #[cfg(feature = "sync")]
     loss_gen: std::sync::Arc::new(core::sync::atomic::AtomicU64::new(0)),
     #[cfg(feature = "sync")]
     nonces: sync_nonces(),

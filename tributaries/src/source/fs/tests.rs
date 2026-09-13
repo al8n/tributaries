@@ -2036,6 +2036,7 @@ fn a_seq_field_of_zero_is_a_user_file_not_a_cookie() {
 /// FAIL-ON-REVERT: tighten the seq floor past its minter — `is_minted_decimal(seq, 2, ..)` — and
 /// the first marker of every watcher stops being recognized.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn the_classifier_accepts_the_name_the_first_sync_of_an_owner_mints() {
   use agnostic_lite::tokio::TokioRuntime;
   use tributary_fs::{Watcher, WatcherOptions};
