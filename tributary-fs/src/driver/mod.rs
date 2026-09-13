@@ -117,14 +117,11 @@ pub(crate) struct DriverConfig {
   /// First-retry delay for a failed cookie unlink; the backoff doubles per
   /// attempt up to [`cookie_retry_cap`](Self::cookie_retry_cap).
   // `WatcherOptions` keeps every cookie knob on both configuration faces
-  // whatever the gate (A26.1), so the lowering keeps carrying them; with the
-  // barrier gated out the ledger that would read this one is not compiled.
+  // whatever the gate, so the lowering keeps carrying each of them; with the
+  // barrier gated out the ledger that would read them is not compiled.
   #[cfg_attr(not(feature = "sync"), allow(dead_code))]
   pub(crate) cookie_retry_base: Duration,
   /// The cookie-unlink backoff ceiling.
-  // `WatcherOptions` keeps every cookie knob on both configuration faces
-  // whatever the gate (A26.1), so the lowering keeps carrying them; with the
-  // barrier gated out the ledger that would read this one is not compiled.
   #[cfg_attr(not(feature = "sync"), allow(dead_code))]
   pub(crate) cookie_retry_cap: Duration,
   /// Max unlink attempts per arming; then an UNMARKED record PARKS
@@ -133,17 +130,11 @@ pub(crate) struct DriverConfig {
   /// serviced into one fresh arming at that exhaustion instead (see
   /// [`CookieRegistry::schedule_retry`]). Never a spin — the fresh arming
   /// consumes the mark.
-  // `WatcherOptions` keeps every cookie knob on both configuration faces
-  // whatever the gate (A26.1), so the lowering keeps carrying them; with the
-  // barrier gated out the ledger that would read this one is not compiled.
   #[cfg_attr(not(feature = "sync"), allow(dead_code))]
   pub(crate) cookie_retry_budget: u8,
   /// Per-scope unremoved-cookie cap: at or above it, a new `SyncRoot` command
   /// is refused [`CleanupBacklog`](crate::error::SyncRootError::CleanupBacklog)
   /// — the per-scope memory bound on the ledger.
-  // `WatcherOptions` keeps every cookie knob on both configuration faces
-  // whatever the gate (A26.1), so the lowering keeps carrying them; with the
-  // barrier gated out the ledger that would read this one is not compiled.
   #[cfg_attr(not(feature = "sync"), allow(dead_code))]
   pub(crate) cookie_backlog_cap: usize,
   /// GLOBAL unremoved-cookie cap across every scope, live or retired: at or
@@ -152,9 +143,6 @@ pub(crate) struct DriverConfig {
   /// a sync→failing-cleanup→unwatch→rewatch churn would grow `owned` without
   /// bound across RETIRED scopes; this ceiling makes total ledger memory bounded
   /// regardless of churn, and self-heals as the cleanup retries drain.
-  // `WatcherOptions` keeps every cookie knob on both configuration faces
-  // whatever the gate (A26.1), so the lowering keeps carrying them; with the
-  // barrier gated out the ledger that would read this one is not compiled.
   #[cfg_attr(not(feature = "sync"), allow(dead_code))]
   pub(crate) cookie_global_cap: usize,
 }

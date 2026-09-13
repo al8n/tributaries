@@ -956,14 +956,14 @@ jobs:
     # cells), `umbrella-head` (92) and `umbrella-tail` (66) — ran 40-60 min
     # stacked and 80-90+ min tree borrows on CI run 34376836146 (865ec7d): five
     # of seven tree-borrows `rest` shards hit this timeout outright, because
-    # the umbrella's suite grew on this branch (options faces, glob seats,
-    # sync cells) past what one shard fits. `fs-rest` — split into `fs-core`
+    # the umbrella's suite grew with the options faces, glob seats and
+    # sync cells past what one shard fits. `fs-rest` — split into `fs-core`
     # (301 cells), `fs-os` (404) and a narrower `fs-rest` (60, `watcher::` +
     # `options::` + `event::`) — ran 45-72 min stacked and 69-90+ min tree
     # borrows on CI run 34430926057 (a523620): `miri-tb-x86_64 [fs-rest]` hit
     # this timeout while still inside `watcher::tests` at 86 min, because the
-    # shard grew with this branch's cells (options faces, glob seats, watcher
-    # lifecycle and door cells) past what one process fits. Both splits target
+    # shard grew with the options faces, glob seats, watcher lifecycle
+    # and door cells past what one process fits. Both splits target
     # ≤ 45 min per shard under tree borrows, the same bound the other shards
     # above already clear. Tree borrows costs 1.2-1.7x its stacked counterpart
     # and reorders the middle of the table, so the bound is sized from it;
@@ -1050,14 +1050,14 @@ jobs:
     # cells), `umbrella-head` (92) and `umbrella-tail` (66) — ran 40-60 min
     # stacked and 80-90+ min tree borrows on CI run 34376836146 (865ec7d): five
     # of seven tree-borrows `rest` shards hit this timeout outright, because
-    # the umbrella's suite grew on this branch (options faces, glob seats,
-    # sync cells) past what one shard fits. `fs-rest` — split into `fs-core`
+    # the umbrella's suite grew with the options faces, glob seats and
+    # sync cells past what one shard fits. `fs-rest` — split into `fs-core`
     # (301 cells), `fs-os` (404) and a narrower `fs-rest` (60, `watcher::` +
     # `options::` + `event::`) — ran 45-72 min stacked and 69-90+ min tree
     # borrows on CI run 34430926057 (a523620): `miri-tb-x86_64 [fs-rest]` hit
     # this timeout while still inside `watcher::tests` at 86 min, because the
-    # shard grew with this branch's cells (options faces, glob seats, watcher
-    # lifecycle and door cells) past what one process fits. Both splits target
+    # shard grew with the options faces, glob seats, watcher lifecycle
+    # and door cells past what one process fits. Both splits target
     # ≤ 45 min per shard under tree borrows, the same bound the other shards
     # above already clear. Tree borrows costs 1.2-1.7x its stacked counterpart
     # and reorders the middle of the table, so the bound is sized from it;

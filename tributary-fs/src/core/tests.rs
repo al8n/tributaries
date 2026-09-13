@@ -952,7 +952,7 @@ fn the_core_raises_a_bound_scope_flag_at_the_removal_that_ends_it() {
   }
 }
 
-// A19.1: the cell above proves the flag reads `true` and the scope is gone
+// The cell above proves the flag reads `true` and the scope is gone
 // once `on_unwatch` returns — which the store landing right after EITHER
 // removal would also satisfy. This one pins the ORDER directly, through the
 // test-only seam at the removal site: the hook fires exactly once, between
@@ -9565,7 +9565,7 @@ mod descending {
       );
     }
 
-    /// Drives A15.1's sequence in ONE `BatchPayload` and reports what it
+    /// Drives the pairing sequence in ONE `BatchPayload` and reports what it
     /// emitted: `MovedFrom` detaches and holds `/r/sub`; a non-UTF-8 child
     /// record on the retained watch escalates to a located `Rescan` INSIDE the
     /// held subtree, which the Monitor stands at the scope's ROOT — the located
@@ -9612,7 +9612,7 @@ mod descending {
       (core, scope, fed)
     }
 
-    /// A15.1, the same-batch pairing: the covering `Rescan` is on the stream
+    /// The same-batch pairing: the covering `Rescan` is on the stream
     /// before the `Moved` delta the pairing queues.
     ///
     /// The barrier this retires is answered `Dominated`, and the public promise
@@ -9881,7 +9881,7 @@ mod descending {
     /// one would otherwise certify across it.
     ///
     /// Revert witness: skip the funnel when the report is owed and the stamp
-    /// stands still — which is the A5.2 hole, one interval wide.
+    /// stands still — which is the hole this closes, one interval wide.
     #[test]
     fn a_second_probe_budget_loss_before_delivery_stands_no_second_instruction() {
       let (mut core, scope) = live_core();
@@ -11901,7 +11901,7 @@ mod kernel_recursive_fanotify {
   /// terminal death lifecycle an in-tree `DELETE_SELF` uses, with NO dependence on
   /// the periodic liveness tick. This drives that forwarded event into a scope whose
   /// `root_liveness_interval` is `ZERO` (the tick disabled) and asserts it STILL
-  /// reaches terminal Removed + Rescan + teardown — the fix does not lean on the
+  /// reaches terminal Removed + Rescan + teardown — the death path does not lean on the
   /// tick. (The classifier half — that the FID-only shape becomes exactly this
   /// `RootDeath(root path)`, not a drop — is pinned in the fanotify
   /// `classification_totality` suite; the container unmount cell covers the
@@ -15808,7 +15808,7 @@ mod root_widened {
     assert_eq!(change.location(), &loc(&["after.txt"]));
   }
 
-  /// W2 — the R2 counterexample at its root: the reserved root is swapped
+  /// W2 — the counterexample at its root: the reserved root is swapped
   /// away inside the window. Its `IN_MOVE_SELF` taints and the commit refuses
   /// at once — no refresh round-trip, no held fences.
   #[test]
@@ -15896,7 +15896,7 @@ mod root_widened {
     let reserved = open_window(&mut core, scope);
     core.on_root_overflow(scope, at(1));
     let _ = drain(&mut core);
-    // The loss-armed refresh completes alive-and-matching — the R3-2 shape.
+    // The loss-armed refresh completes alive-and-matching.
     core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(2));
     let _ = drain(&mut core);
     assert_eq!(
@@ -17312,7 +17312,7 @@ mod exclusions {
 
   /// The geometry rule is asked of BOTH endpoints and of nothing else: a rename
   /// with no exclusion at or under either end leaves the O(1) re-parent alone.
-  /// Without this the fix would be "re-enumerate on every directory rename in an
+  /// Without this the rule would be "re-enumerate on every directory rename in an
   /// excluded scope", which is a different and much more expensive rule.
   #[test]
   fn a_geometry_neutral_rename_still_reparents_without_a_re_read() {
@@ -20762,7 +20762,7 @@ mod prune {
   /// The pre-probe seat, in its plainest shape: a rename word whose ground the
   /// seat closes and whose class the word itself proves not to be a directory
   /// has no verdict left for a probe to establish, so none is minted and the
-  /// batch is never parked. That is the whole content of the fix — an awaited
+  /// batch is never parked. That is the whole content of the guard — an awaited
   /// `lstat` over ground the fence discards parks the batch, and every later
   /// batch of the root queues behind it.
   ///

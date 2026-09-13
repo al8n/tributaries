@@ -1924,7 +1924,7 @@ fn xorshift(s: &mut u64) -> u64 {
 }
 
 /// The standing end-to-end no-silent-loss storm — the one property every
-/// historical finding violated: under random mutations, decode losses, budget
+/// historical loss bug violated: under random mutations, decode losses, budget
 /// pressure, and a lagging consumer, the view reconstructed from delivered
 /// events (honoring Rescans as re-reads) converges to the tree, with
 /// per-scope epochs monotone. `TRIBUTARY_FS_STORM_SEEDS` scales the seed
@@ -5212,7 +5212,7 @@ mod descending {
     /// A reprove re-add racing a set-cover prune's disarm of the SAME watch —
     /// the two dispatched on independent blocking-pool workers — must not leave
     /// the watch armed with no disarm to follow (the orphaned kernel watch +
-    /// O_PATH anchor the finding names). Per-scope emission-order serialization
+    /// O_PATH anchor it leaves behind). Per-scope emission-order serialization
     /// holds them in order: the disarm runs strictly AFTER the re-add and
     /// reclaims it. Mutation witness: without the serialization the disarm runs
     /// FIRST (removing nothing — the re-add is still parked), the released
@@ -8658,7 +8658,7 @@ mod descending {
     /// own loop inside a SECOND scope's birth publication — the one seam that
     /// stops the loop rather than a pool worker — and both the old lane's
     /// `Overflow` and the replacement's pre-arm answer are landed inside that
-    /// freeze, so the pass that resumes is the pass the finding describes.
+    /// freeze, so the pass that resumes is the pass described above.
     ///
     /// MUST FAIL where the poll site tests only teardown before claiming: `/r2`
     /// is never refreshed at all, and `/r` — the root this commit retired — is
@@ -11364,7 +11364,7 @@ mod descending {
     #[cfg(feature = "sync")]
     const IN_MOVE_SELF: u32 = 0x0000_0800;
 
-    /// The Codex R1 finding-1 cell: a sync admitted after a widen PARKS
+    /// A sync admitted after a widen PARKS
     /// until the adoption tripwire resolves. The old root moved during the
     /// dark window with nothing observing the adopted slot, so the move is
     /// unrecorded — without the
@@ -11492,7 +11492,7 @@ mod descending {
       assert_eq!(rig.fs.cookie_writes(), vec![path]);
     }
 
-    /// The Codex R1 finding-2 cell: the ADOPTED SLOT replaced by a FILE during
+    /// The ADOPTED SLOT replaced by a FILE during
     /// the dark window. The widened root's cold listing reconciles the slot and
     /// tears down the adopted old tree and the pending
     /// tripwire in one drop — which must stand the closing covering Rescan
@@ -11500,8 +11500,8 @@ mod descending {
     /// old watches in silence. The scope stays serviceable: a later sync
     /// resolves.
     ///
-    /// At the one depth the splice serves this slot IS the adopted edge, so the
-    /// finding's shape — an unverified adoption erased by a reconcile, driven by
+    /// At the one depth the splice serves this slot IS the adopted edge, so that
+    /// shape — an unverified adoption erased by a reconcile, driven by
     /// the widened root's own first listing — is reached directly rather than
     /// through an intermediate connector.
     #[tokio::test(flavor = "multi_thread")]
@@ -12770,9 +12770,9 @@ mod descending {
       );
     }
 
-    /// R5 regression — the per-scope CONTROL QUEUE must not leak state for a
+    /// The per-scope CONTROL QUEUE must not leak state for a
     /// scope torn down in the SAME effect drain that also carried a control op
-    /// for it. The finding: an `AddWatch`/`RemoveWatch` collected for a scope
+    /// for it. The leak: an `AddWatch`/`RemoveWatch` collected for a scope
     /// BEFORE its `TeardownStream` — one decoded inotify batch losing a child
     /// binding (`IN_IGNORED`) then killing the root (`IN_DELETE_SELF`) — left
     /// the post-drain dispatch re-marking the now-dead scope in-flight (and
@@ -12900,7 +12900,7 @@ mod descending {
       );
       // Dead scope: the child binding is lost (`IN_IGNORED`) and THEN the root
       // dies (`IN_DELETE_SELF`) — `RemoveWatch(dead)` queued immediately ahead of
-      // `TeardownStream(dead)`, the finding's exact same-drain shape.
+      // `TeardownStream(dead)`, the exact same-drain shape.
       crate::driver::apply_source_message(
         &mut core,
         dead,
@@ -15749,7 +15749,7 @@ mod sync_cookie {
     panic!("the single-flight gate never admitted the sync");
   }
 
-  /// The finding-2 retain cells' config: a retry delay comfortably inside a [`settle`] window's
+  /// The retain cells' config: a retry delay comfortably inside a [`settle`] window's
   /// budget, so the driver's own retry still confirms without a hang. The cells bracket their
   /// retained-state observation with holds rather than timing it against this delay, so no
   /// specific value is load-bearing for their determinism.
@@ -17943,7 +17943,7 @@ mod sync_cookie {
   // A transient unlink failure must not orphan the cookie: the record is
   // RETAINED (dropped only when the unlink confirms) so the path stays eligible
   // for a later sweep, and the DRIVER'S OWN backed-off retry — not a second
-  // request from the caller — eventually removes it (finding 3). The old
+  // request from the caller — eventually removes it. The old
   // fire-and-forget unlink ignored every error, silently stranding the file.
   #[tokio::test(flavor = "multi_thread")]
   async fn a_transient_unlink_failure_retains_the_cookie_until_it_succeeds() {
@@ -17997,7 +17997,7 @@ mod sync_cookie {
       "exactly two dispatches so far: the failed attempt and the driver's own retry, held before it runs"
     );
 
-    // No second request is needed: the DRIVER OWNS the retry (finding 3). Released, it succeeds
+    // No second request is needed: the DRIVER OWNS the retry. Released, it succeeds
     // and drops the record — the requester never asks twice (the old design's requester-driven
     // re-reap is gone).
     settle(|| rig.fs.cookie_removes().contains(&path)).await;
@@ -18401,7 +18401,7 @@ mod sync_cookie {
     assert!(rig.fs.cookie_removes().contains(&path));
   }
 
-  // Finding 1 (fs half): a cancel for a cookie whose write LANDED and CLAIMED — its
+  // A cancel for a cookie whose write LANDED and CLAIMED — its
   // `reply.send(Ok)` succeeded because the caller's receiver was alive, so the write's own
   // send-failure self-reap did NOT run — but the caller never read it reaps the OWNED cookie
   // through the ledger. This is the delivered-but-unread cookie the umbrella's abandon arm names
@@ -18668,7 +18668,7 @@ mod sync_cookie {
     assert_census_balances(&rig, "a mark serviced at write-done exhaustion").await;
   }
 
-  // Finding 1 (fs half): a cancel that arrives while the write is STILL IN THE POOL marks that
+  // A cancel that arrives while the write is STILL IN THE POOL marks that
   // write's own obligation; when the write lands, its claim reads the mark and is REFUSED, so the
   // write self-reaps the file it just created. The refusal is driven by the mark alone (the caller
   // is kept alive), which is why the reply reads `Retired`.
@@ -18969,7 +18969,7 @@ mod sync_cookie {
     assert_census_balances(&rig, "a delayed path remove reaps a same-path successor").await;
   }
 
-  // Finding 2: a self-reap for an ABANDONED caller (its `reply.send(Ok)` fails) whose own unlink
+  // A self-reap for an ABANDONED caller (its `reply.send(Ok)` fails) whose own unlink
   // FAILS must RE-ASSERT ownership, never discard it — the record is retained as failed WHILE the
   // file is still on disk, and the DRIVER'S OWN retry (no external request) later confirms it.
   //
@@ -19032,7 +19032,7 @@ mod sync_cookie {
     );
   }
 
-  // Finding 2: a self-reap for a REFUSED claim (the scope retired under the in-flight write)
+  // A self-reap for a REFUSED claim (the scope retired under the in-flight write)
   // whose unlink FAILS is OWNED as failed, and the retry that removes it is scope-INDEPENDENT —
   // the scope is already gone, yet the driver still owns and drives the file to removal.
   //
@@ -19181,9 +19181,9 @@ mod sync_cookie {
     );
   }
 
-  // Finding 3: duplicate reap requests against a HUNG unlink coalesce to ONE job — the
+  // Duplicate reap requests against a HUNG unlink coalesce to ONE job — the
   // single-flight-per-path invariant. A caller that times out and storms 50 reaps against a wedged
-  // mount cannot pile 50 blocking unlink jobs (the pool-exhaustion re-creation Codex named).
+  // mount cannot pile 50 blocking unlink jobs (the pool-exhaustion shape).
   //
   // Fail-on-old (no coalescing): 50 dispatches.
   #[tokio::test(flavor = "multi_thread")]
@@ -19219,7 +19219,7 @@ mod sync_cookie {
     assert_eq!(cookie_count(&rig).await, 0);
   }
 
-  // Finding 3: a transient unlink failure is retried by the DRIVER, not the requester — ONE reap
+  // A transient unlink failure is retried by the DRIVER, not the requester — ONE reap
   // request suffices, and the driver's own backed-off retry drives the confirm.
   //
   // Fail-on-old (no retry owner): the file persists forever after its single failed dispatch.
@@ -19251,7 +19251,7 @@ mod sync_cookie {
     );
   }
 
-  // Finding 3: past its attempt budget a failing unlink PARKS — it stops retrying (no CPU-spin)
+  // Past its attempt budget a failing unlink PARKS — it stops retrying (no CPU-spin)
   // yet stays honestly OWNED, and an explicit reap RE-ARMS it with a fresh budget (T9).
   #[tokio::test(flavor = "multi_thread")]
   async fn the_retry_budget_parks_without_spinning() {
@@ -19299,7 +19299,7 @@ mod sync_cookie {
       "an explicit reap re-arms a parked record (T9)"
     );
 
-    // Close bridges to finding 4: the still-owned, unremovable cookie holds close in NotQuiesced.
+    // Close: the still-owned, unremovable cookie holds close in NotQuiesced.
     let (close_reply, on_close) = futures_channel::oneshot::channel();
     rig
       .commands
@@ -19464,7 +19464,7 @@ mod sync_cookie {
     assert_eq!(rig.fs.shutdowns(), 1, "and the stream was torn down");
   }
 
-  // Finding 3: a scope whose cookie cleanup is BACKLOGGED past the per-scope cap refuses new syncs
+  // A scope whose cookie cleanup is BACKLOGGED past the per-scope cap refuses new syncs
   // with the retryable `CleanupBacklog` — the hard memory bound. On a recovered fs the backlog
   // would drain and syncs resume; here it stays wedged so the cap is provably hit.
   #[tokio::test(flavor = "multi_thread")]
@@ -19517,7 +19517,7 @@ mod sync_cookie {
     );
   }
 
-  // Finding 4: close reports NotQuiesced BECAUSE a cookie is still owned — a mount whose unlinks
+  // Close reports NotQuiesced BECAUSE a cookie is still owned — a mount whose unlinks
   // fail through every grace retry leaves the file, and close counts the LIVE LEDGER, not a job
   // count that a failed unlink would have drained.
   //
@@ -19556,7 +19556,7 @@ mod sync_cookie {
     );
   }
 
-  // Finding 4: a transiently-failing terminal unlink is RETRIED by the close drain INSIDE the
+  // A transiently-failing terminal unlink is RETRIED by the close drain INSIDE the
   // grace — reply `Ok(0)` with the file already gone AT reply time, driven by the drain's own
   // retry, not the registry `Drop`'s post-reply detached tail (whose completion the reply never
   // waits for). The dispatch count is the discriminator: exactly the failed attempt plus the
@@ -20105,7 +20105,7 @@ mod sync_cookie {
     );
   }
 
-  // ==== R11-3: the forced same-path ABA and the id guards (cells 1–4) ====
+  // The forced same-path ABA and the id guards.
 
   // The flagship id guard, pinned at the registry harness. Public admission now
   // refuses a second live obligation under a held name (`NameInUse`), so two live
@@ -21002,7 +21002,7 @@ mod sync_cookie {
     }
   }
 
-  // ==== R11-1: fair, refusing-scope-first recovery re-arm (cells 5–7) ====
+  // Fair, refusing-scope-first recovery re-arm.
 
   /// How many of `scope`'s records are PARKED (`RemoveFailed`, unscheduled) — the
   /// recovery-fairness oracle.
@@ -21016,7 +21016,7 @@ mod sync_cookie {
     on_reply.await.expect("the driver replies")
   }
 
-  // The deterministic pin for R11-1's selection order (cell 6). `rearm_parked_batch`
+  // The deterministic pin for the re-arm's selection order. `rearm_parked_batch`
   // serves the REFUSING scope first (its own budget) and then the rest
   // least-recently-FAILED-first — with `last_failure_seq` refreshed on every
   // failure so repeat offenders sink behind records that have not failed since a
@@ -21168,7 +21168,7 @@ mod sync_cookie {
     hold2.release();
   }
 
-  /// The R11-1 recovery-fairness config: a low per-scope backlog cap, a budget of
+  /// The recovery-fairness config: a low per-scope backlog cap, a budget of
   /// one, and a fast retry so records park and re-arm in real (multi-thread) time.
   fn rearm_fairness_config() -> DriverConfig {
     DriverConfig {
@@ -21183,7 +21183,7 @@ mod sync_cookie {
 
   // A cap refusal re-arms the REFUSING scope's own parked backlog FIRST, so a
   // scope whose mount recovered drains its backlog and is re-admitted even while
-  // OTHER scopes' still-failing residue dominates the ledger — the R11-1 property
+  // OTHER scopes' still-failing residue dominates the ledger — the recovery-fairness property
   // end-to-end through the rig. `/rb` recovers; `/ra` (and a churned pad) keep
   // failing; `/rb` is served within a few refusals regardless.
   //
@@ -21279,14 +21279,7 @@ mod sync_cookie {
     );
   }
 
-  // Cell 7: the R10 recovery/global-cap cells
-  // (`churn_across_retired_scopes_is_bounded_by_the_global_cap`,
-  // `a_recovered_fs_drains_the_backlog_and_admits_new_syncs`) stay green
-  // UNMODIFIED — R11-1 is a strict superset (still re-armed on every refusal,
-  // still bounded, now prioritized + starvation-free). No new cell; validated by
-  // the full-suite run.
-
-  // ==== R11-2: the whole-lifecycle global cap (cells 8–10) ====
+  // The whole-lifecycle global cap.
 
   // Hung (blocking, unclaimed) cookie WRITES count against the global cap: the
   // admission gauge Φ is the whole lifecycle in one term — every dispatched write
@@ -21443,7 +21436,7 @@ mod sync_cookie {
     drop(pending);
   }
 
-  /// Cell 10's config: a global cap of 2 (backlog never binds), so one claimed
+  /// The double-bar cell's config: a global cap of 2 (backlog never binds), so one claimed
   /// self-reap plus one fresh sync sit exactly at the boundary the dedup governs.
   fn double_bar_config() -> DriverConfig {
     DriverConfig {
