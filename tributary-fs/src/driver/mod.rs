@@ -1540,6 +1540,7 @@ thread_local! {
   ///
   /// Thread-local, like the marker step above and for the same reason: the cells
   /// that arm it call the write on their own thread.
+  #[cfg(feature = "sync")]
   pub(crate) static COOKIE_PROOF_FAULT: std::cell::Cell<Option<CookieProofPoint>> =
     const { std::cell::Cell::new(None) };
 
@@ -6164,7 +6165,7 @@ pub(crate) enum Command {
   /// funnel's covering `Rescan` and the retirement of the barriers that funnel
   /// covers can only stage it this way — any command between the two forces a
   /// loop top, and the loop top is itself a drain.
-  #[cfg(all(test, feature = "tokio", not(miri)))]
+  #[cfg(all(test, feature = "tokio", not(miri), feature = "sync"))]
   DebugArmLivenessDue {
     /// The scope whose liveness deadline is forced due.
     scope: ScopeId,
@@ -14378,7 +14379,7 @@ pub(crate) async fn run<R, F>(
         Ok(Command::DebugLaneCount { reply }) => {
           let _ = reply.send(lanes.len());
         }
-        #[cfg(all(test, feature = "tokio"))]
+        #[cfg(all(test, feature = "tokio", feature = "sync"))]
         Ok(Command::DebugCookieCount { reply }) => {
           let _ = reply.send(cookies.len());
         }
@@ -14398,15 +14399,15 @@ pub(crate) async fn run<R, F>(
         Ok(Command::DebugProbesOutstanding { reply }) => {
           let _ = reply.send(probes.outstanding());
         }
-        #[cfg(all(test, feature = "tokio"))]
+        #[cfg(all(test, feature = "tokio", feature = "sync"))]
         Ok(Command::DebugCookieReapMarks { reply }) => {
           let _ = reply.send(cookies.reap_marks());
         }
-        #[cfg(all(test, feature = "tokio"))]
+        #[cfg(all(test, feature = "tokio", feature = "sync"))]
         Ok(Command::DebugCookieParkedFor { scope, reply }) => {
           let _ = reply.send(cookies.parked_for(scope));
         }
-        #[cfg(all(test, feature = "tokio"))]
+        #[cfg(all(test, feature = "tokio", feature = "sync"))]
         Ok(Command::DebugCookieCensus { reply }) => {
           let _ = reply.send(cookies.census());
         }
@@ -14486,7 +14487,7 @@ pub(crate) async fn run<R, F>(
           );
           let _ = reply.send(());
         }
-        #[cfg(all(test, feature = "tokio", not(miri)))]
+        #[cfg(all(test, feature = "tokio", not(miri), feature = "sync"))]
         Ok(Command::DebugArmLivenessDue { scope, reply }) => {
           // Arm and answer, nothing else: the tick itself belongs to the loop's
           // own timer arm, which fires on the very next pass because the

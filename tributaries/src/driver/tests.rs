@@ -107,8 +107,11 @@ enum SourceCall {
   SetCover(u32),
   Next,
   Replace(u32),
+  #[cfg(feature = "sync")]
   BeginSync(u32),
+  #[cfg(feature = "sync")]
   EndSync(Vec<OsString>),
+  #[cfg(feature = "sync")]
   CancelSync(u32),
   IsSyncArtifact(Vec<OsString>),
   RootKey(u32),
@@ -237,16 +240,19 @@ struct FakeSource {
   /// default is `Unsupported`), so the cells that push a [`super::PendingSync`] directly are
   /// unaffected; a cell driving the real `on_sync`/end-to-end install path turns it on, and
   /// `begin_sync` then returns a deterministic `<dir>/cookie-<seq>` key the test can deliver.
+  #[cfg(feature = "sync")]
   supports_sync: bool,
   /// When set, every `begin_sync` answers [`Begun::Dominated`](crate::source::Begun::Dominated):
   /// a coverage transition on the barrier's ground retired it before the marker was installed.
   /// OFF by default, so every other sync cell keeps exercising the installed arm.
+  #[cfg(feature = "sync")]
   dominate_syncs: bool,
   /// When set, `grow` never resolves — a coverage widening against a hung mount,
   /// the state the close race exists for.
   grow_pending: bool,
   /// Cookie writes this source actually performed, so a cell can prove a REFUSED
   /// barrier left no marker behind.
+  #[cfg(feature = "sync")]
   begun_syncs: usize,
   /// Cookie keys handed to `end_sync` — the reap ledger (F5).
   #[cfg(feature = "sync")]
@@ -270,6 +276,7 @@ struct FakeSource {
   /// Cookie keys the scripted `begin_sync` SIDE-EFFECT-DELIVERED (a
   /// [`ScriptStep::PendingThenComplete`] poll): the fs worker's `reply.send(Ok)`
   /// landing modeled as a physical delivery that the `select` pass never reads.
+  #[cfg(feature = "sync")]
   fs_delivered: Vec<Vec<OsString>>,
   /// How many of the next `arm` calls to fail, decremented on each failed arm.
   fail_arms: u32,
@@ -449,8 +456,10 @@ impl FakeSource {
       live: HashMap::new(),
       canonical: HashMap::new(),
       supports_replace: false,
+      #[cfg(feature = "sync")]
       supports_sync: false,
       grow_pending: false,
+      #[cfg(feature = "sync")]
       begun_syncs: 0,
       #[cfg(feature = "sync")]
       ended_syncs: Vec::new(),
@@ -460,6 +469,7 @@ impl FakeSource {
       begun_token: None,
       #[cfg(feature = "sync")]
       sync_script: VecDeque::new(),
+      #[cfg(feature = "sync")]
       fs_delivered: Vec::new(),
       fail_arms: 0,
       capacity_refusals: HashMap::new(),
@@ -471,6 +481,7 @@ impl FakeSource {
       boom_on_cancel_grow: None,
       #[cfg(feature = "sync")]
       boom_on_cancel_begin_sync: None,
+      #[cfg(feature = "sync")]
       dominate_syncs: false,
       future_owed: std::sync::Arc::new(core::sync::atomic::AtomicUsize::new(0)),
       panic_begin_close: None,
@@ -620,6 +631,7 @@ impl FakeSource {
   /// Every `arm` of `path` from now on PANICS — the misbehaving extension point whose unwind leaves
   /// the [`run`](super::run) future through its `poll`, so the owner is dropped by a task destruction
   /// rather than by its own teardown tail.
+  #[cfg(feature = "sync")]
   fn panic_arm(&mut self, path: &str) {
     self.panic_arms.insert(PathBuf::from(path));
   }
@@ -633,11 +645,13 @@ impl FakeSource {
   }
 
   /// `replace` parks FOREVER and unwinds with `boom` when the retarget future is CANCELLED.
+  #[cfg(feature = "sync")]
   fn boom_on_cancel_replace(&mut self, boom: Boom) {
     self.boom_on_cancel_replace = Some(boom);
   }
 
   /// `grow` parks FOREVER and unwinds with `boom` when the coverage-widening future is CANCELLED.
+  #[cfg(feature = "sync")]
   fn boom_on_cancel_grow(&mut self, boom: Boom) {
     self.boom_on_cancel_grow = Some(boom);
   }
@@ -650,6 +664,7 @@ impl FakeSource {
 
   /// The obligation counter every [`PanicsWhenCancelled`] guard books against, for a cell that
   /// wants to read it after the source itself is gone.
+  #[cfg(feature = "sync")]
   fn future_owed(&self) -> std::sync::Arc<core::sync::atomic::AtomicUsize> {
     std::sync::Arc::clone(&self.future_owed)
   }
@@ -657,6 +672,7 @@ impl FakeSource {
   /// [`Source::begin_close`] PANICS with `boom` from now on — the teardown seam's initiation as a
   /// misbehaving extension point, which is the ONE `Source` call that stands ahead of every reap,
   /// the bounded wait and the acknowledgement in [`run`](super::run)'s tail.
+  #[cfg(feature = "sync")]
   fn panic_begin_close(&mut self, boom: Boom) {
     self.panic_begin_close = Some(boom);
   }
@@ -683,12 +699,14 @@ impl FakeSource {
 
   /// [`Source::join_close`] PANICS at the CALL from now on — the bounded quiescence wait's
   /// extension point unwinding before it has produced a future to await.
+  #[cfg(feature = "sync")]
   fn panic_join_close_call(&mut self) {
     self.panic_join_close_call = true;
   }
 
   /// The future [`Source::join_close`] returns PANICS at its first POLL from now on — the same
   /// extension point misbehaving at the other of its two instants.
+  #[cfg(feature = "sync")]
   fn panic_join_close_poll(&mut self) {
     self.panic_join_close_poll = true;
   }
@@ -696,6 +714,7 @@ impl FakeSource {
   /// The future [`Source::join_close`] returns resolves `Ok(())` and then PANICS in its own `Drop`
   /// from now on — the wait's third piece of implementor code, running behind the verdict the first
   /// two produced.
+  #[cfg(feature = "sync")]
   fn panic_join_close_drop(&mut self) {
     self.panic_join_close_drop = true;
   }
@@ -712,6 +731,7 @@ impl FakeSource {
   /// every handle retired while that retarget is in flight. See
   /// [`close_signal_during_replace`](Self::close_signal_during_replace) for why the fake has to be the
   /// one to do it, and why it must park rather than return.
+  #[cfg(feature = "sync")]
   fn close_signal_during_replace(
     &mut self,
     during: u32,
@@ -1518,18 +1538,21 @@ static STRANDED: std::sync::Mutex<Vec<StrandedRecord>> = std::sync::Mutex::new(V
 /// A process-wide counter because the ledger it would otherwise use lives inside the source,
 /// inside the owner being DROPPED — the very destructor under test. Only the owner-teardown
 /// reap cell writes the `cookie-boom` leaf, so no other cell can move it.
+#[cfg(feature = "sync")]
 static BOOM_COOKIES_REAPED: core::sync::atomic::AtomicUsize =
   core::sync::atomic::AtomicUsize::new(0);
 
 /// The stranded-allocation tag the `cookie-costly-boom` leaf mints against, read by
 /// [`the_destructors_reap_strands_one_allocation_however_many_cookies_are_pending`] alone — see
 /// [`Boom::Costly`] for why the book is counted per tag.
+#[cfg(feature = "sync")]
 const DESTRUCTOR_REAP_STRANDED: &str = "destructor-reap";
 
 /// The tag the `cookie-total-boom` leaf mints against, read by
 /// [`the_forgotten_payload_total_is_a_constant_of_the_code_not_of_what_the_caller_drove`] alone.
 /// Its churn and its seam entry mint against it too, which is what makes that cell's reading a
 /// TOTAL across every site it drove rather than a count of any one of them.
+#[cfg(feature = "sync")]
 const BOUND_TOTAL_STRANDED: &str = "bound-total";
 
 fn source_modified(handle: u32, path: &str, epoch: u64) -> SourceEvent<OsString, u32> {
@@ -13578,6 +13601,7 @@ async fn a_skipped_offer_that_forgets_a_payload_strands_exactly_one_allocation()
 /// The stranded-allocation tag the skipped-offer disposal mints against, read by
 /// [`a_skipped_offer_that_forgets_a_payload_strands_exactly_one_allocation`] alone — see
 /// [`Boom::Costly`] for why the book is counted per tag, and why every tag belongs to one cell.
+#[cfg(feature = "sync")]
 const SKIPPED_OFFER_STRANDED: &str = "skipped-offer";
 
 /// How many [`Source::disarm`] calls a ledger has recorded — the entry count the quarantine cells
@@ -13597,8 +13621,10 @@ fn disarms(seam: &SeamLedger) -> usize {
 /// reachable through the owner could not testify about it. Only
 /// [`owner_teardown_enters_the_seam_although_releasing_the_displaced_plane_unwinds`] constructs a
 /// [`PlaneValue`] at all, so nothing else can move either counter.
+#[cfg(feature = "sync")]
 static PLANE_VALUE_DROP_UNWINDS: core::sync::atomic::AtomicBool =
   core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "sync")]
 static PLANE_VALUE_UNWOUND: core::sync::atomic::AtomicUsize =
   core::sync::atomic::AtomicUsize::new(0);
 
@@ -13613,9 +13639,11 @@ static PLANE_VALUE_UNWOUND: core::sync::atomic::AtomicUsize =
 /// destructor that unwound on every drop would unwind in a frame the cell is only passing through.
 /// A ZST, so a panicking release retains no allocation of its own for a whole-process leak check to
 /// report — see [`ForgottenPayload`].
+#[cfg(feature = "sync")]
 #[derive(Clone)]
 struct PlaneValue;
 
+#[cfg(feature = "sync")]
 impl Drop for PlaneValue {
   fn drop(&mut self) {
     if PLANE_VALUE_DROP_UNWINDS.load(core::sync::atomic::Ordering::SeqCst) {
@@ -13629,6 +13657,7 @@ impl Drop for PlaneValue {
 /// teardown cell that needs the read plane to own a caller `V` with a destructor of its own
 /// ([`PlaneValue`], which unwinds; [`WitnessValue`], which reports). Mirrors [`OwnerU64`]; the value
 /// type is the only difference that matters.
+#[cfg(feature = "sync")]
 struct OwnerOverValue<V> {
   owner: Owner<OsString, V, TokioRuntime, FakeSource>,
   /// Kept alive so the owner's event sender never observes a closed channel.
@@ -13636,13 +13665,13 @@ struct OwnerOverValue<V> {
   /// Kept alive so the owner's command receiver never observes a closed channel.
   _commands: async_channel::Sender<super::Command<OsString, V>>,
   /// Kept alive so the owner's sync-admission receiver never observes a closed channel.
-  #[cfg(feature = "sync")]
   _sync_commands: async_channel::Sender<super::SyncRequest>,
   /// Kept alive so the owner's close receiver never observes a closed channel. The teardown cells
   /// that drive [`run`](super::run) rather than the destructor send their close request on it.
   _closes: async_channel::Sender<super::CloseReply>,
 }
 
+#[cfg(feature = "sync")]
 impl<V: Clone> OwnerOverValue<V> {
   fn new() -> Self {
     let (event_tx, event_rx) = async_channel::unbounded();
@@ -13859,6 +13888,7 @@ async fn owner_teardown_enters_the_seam_although_releasing_the_displaced_plane_u
 }
 
 /// What a [`WitnessValue`] saw at the instant the teardown released it.
+#[cfg(feature = "sync")]
 #[derive(Debug)]
 struct ReleaseObservation {
   /// Every [`Source`] call the teardown had made by then, in order.
@@ -13877,19 +13907,23 @@ thread_local! {
   /// (which is what [`PLANE_VALUE_UNWOUND`] must be, being read across a `catch_unwind`) because
   /// libtest gives each cell its own thread and both teardowns run on the cell's own: no parallel
   /// cell can perturb these, and none needs to.
+  #[cfg(feature = "sync")]
   static RELEASE_WITNESS: core::cell::RefCell<Option<SeamLedger>> =
     const { core::cell::RefCell::new(None) };
   /// The close acknowledgement's receiver, parked where the released value's destructor can ask it
   /// whether the reply has landed YET. Left empty by the destructor path, which has no reply.
+  #[cfg(feature = "sync")]
   static ACK_PROBE: core::cell::RefCell<
     Option<futures_channel::oneshot::Receiver<Result<(), crate::error::CloseError>>>,
   > = const { core::cell::RefCell::new(None) };
   /// What the FIRST released witness saw. The first release is the earliest instant a caller
   /// destructor could unwind, so it is the strictest reading of what the teardown still owed.
+  #[cfg(feature = "sync")]
   static RELEASE_OBSERVATION: core::cell::RefCell<Option<ReleaseObservation>> =
     const { core::cell::RefCell::new(None) };
   /// How many witnesses the teardown released, so a cell can pin that ONE displaced snapshot really
   /// does hold SEVERAL departed caller values — the premise the ordering rests on.
+  #[cfg(feature = "sync")]
   static RELEASED_WITNESSES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 }
 
@@ -13909,9 +13943,11 @@ thread_local! {
 /// same reason: the staging itself moves the value — registering and retiring a subscription
 /// copies-on-write the radix node that holds it and disposes of the copy — so an unarmed witness
 /// stays silent through frames the cell is only passing through.
+#[cfg(feature = "sync")]
 #[derive(Clone)]
 struct WitnessValue;
 
+#[cfg(feature = "sync")]
 impl Drop for WitnessValue {
   fn drop(&mut self) {
     let Some(calls) = RELEASE_WITNESS.with_borrow(|ledger| ledger.as_ref().map(SeamLedger::calls))
@@ -13998,6 +14034,7 @@ async fn stage_departed_plane_values(
 
 /// The teardown seam's ledger as the establishing two watches leave it, which every release
 /// observation below opens with.
+#[cfg(feature = "sync")]
 fn establishing_calls() -> Vec<SourceCall> {
   vec![
     SourceCall::CanonicalizeKey(key("/a")),
@@ -14027,6 +14064,7 @@ fn establishing_calls() -> Vec<SourceCall> {
 /// no `EndSync` in it; fuse it into the swap as a `store` would and the ledger has no `BeginClose`
 /// either.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn owner_teardown_releases_the_displaced_plane_below_every_cookie_it_owes() {
   let mut rig = OwnerOverValue::<WitnessValue>::new();
   let sync_response = stage_departed_plane_values(&mut rig).await;
@@ -14095,6 +14133,7 @@ async fn owner_teardown_releases_the_displaced_plane_below_every_cookie_it_owes(
 /// ledger with no `JoinClose` in it; leave it between the wait and the reply and the witness finds
 /// no acknowledgement delivered.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn the_run_tail_releases_the_displaced_plane_below_the_wait_and_the_acknowledgement() {
   let mut rig = OwnerOverValue::<WitnessValue>::new();
   let sync_response = stage_departed_plane_values(&mut rig).await;
@@ -14287,6 +14326,7 @@ async fn the_tails_bounded_wait_survives_a_join_close_that_unwinds_at_the_call()
 /// because the frame carried it off. Contain the poll but move the release above the wait and the
 /// witness reports a ledger with no `JoinClose` in it instead.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn the_run_tail_still_releases_the_displaced_plane_when_the_bounded_wait_unwinds() {
   use std::task::{Context, Poll, Waker};
 
@@ -14677,8 +14717,10 @@ thread_local! {
   /// other's single unwind, which is a flake rather than a defect. Each cell owns its thread, the
   /// values are released by a `run` future this thread polls by hand, and `catch_unwind` never
   /// leaves the thread it was entered on — so the switch is reachable everywhere the cell needs it.
+  #[cfg(feature = "sync")]
   static HOSTILE_VALUE_ARMED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
   /// How many [`HostileValue`] destructors have unwound on this cell's own thread.
+  #[cfg(feature = "sync")]
   static HOSTILE_VALUE_UNWOUND: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 }
 
@@ -14689,11 +14731,13 @@ thread_local! {
 /// read plane it is NOT testing: the establishing subscriptions' values ride the published snapshots
 /// the terminal unwind displaces, and a type that unwound for all of them would spend the single
 /// unwind budget above on a value the cell is only passing through.
+#[cfg(feature = "sync")]
 #[derive(Clone)]
 struct HostileValue {
   unwinds: bool,
 }
 
+#[cfg(feature = "sync")]
 impl HostileValue {
   /// The value a cell hands to the request whose abandonment it is testing.
   fn hostile() -> Self {
@@ -14706,6 +14750,7 @@ impl HostileValue {
   }
 }
 
+#[cfg(feature = "sync")]
 impl Drop for HostileValue {
   fn drop(&mut self) {
     if self.unwinds && HOSTILE_VALUE_ARMED.replace(false) {
@@ -14999,8 +15044,10 @@ thread_local! {
   /// One-shot: the first marked destructor to run clears it, so a cell spends exactly one unwind and
   /// the drop glue that carries on behind it cannot raise the SECOND panic that would abort the
   /// process outright.
+  #[cfg(feature = "sync")]
   static HOSTILE_COMPONENT_ARMED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
   /// How many [`HostileComponent`] destructors have unwound on this cell's own thread.
+  #[cfg(feature = "sync")]
   static HOSTILE_COMPONENT_UNWOUND: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
   /// Which stranded-allocation reading a MARKED destructor's payload belongs to, when the cell is
   /// pricing the leak rather than proving containment.
@@ -15010,6 +15057,7 @@ thread_local! {
   /// payload instead, which mints and books an allocation on its way past, so the forget has a
   /// witness. Set alongside [`HOSTILE_COMPONENT_ARMED`] and spent with it, so a cell prices exactly
   /// one unwind.
+  #[cfg(feature = "sync")]
   static HOSTILE_COMPONENT_COSTLY: core::cell::Cell<Option<&'static str>> =
     const { core::cell::Cell::new(None) };
 }
@@ -15023,12 +15071,14 @@ thread_local! {
 /// and mark only the DUPLICATES — the registrations whose keys a grouping keyed by an owned `Vec<C>`
 /// discards — so a fired destructor names exactly one site instead of the first `C` the teardown
 /// happens to touch.
+#[cfg(feature = "sync")]
 #[derive(Clone, Debug)]
 struct HostileComponent {
   name: &'static str,
   unwinds: bool,
 }
 
+#[cfg(feature = "sync")]
 impl HostileComponent {
   /// The components of `path` — every one of them marked iff `unwinds`.
   fn key(path: &'static str, unwinds: bool) -> Vec<Self> {
@@ -15046,32 +15096,38 @@ impl HostileComponent {
   }
 }
 
+#[cfg(feature = "sync")]
 impl PartialEq for HostileComponent {
   fn eq(&self, other: &Self) -> bool {
     self.name == other.name
   }
 }
 
+#[cfg(feature = "sync")]
 impl Eq for HostileComponent {}
 
+#[cfg(feature = "sync")]
 impl PartialOrd for HostileComponent {
   fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
     Some(self.cmp(other))
   }
 }
 
+#[cfg(feature = "sync")]
 impl Ord for HostileComponent {
   fn cmp(&self, other: &Self) -> core::cmp::Ordering {
     self.name.cmp(other.name)
   }
 }
 
+#[cfg(feature = "sync")]
 impl core::hash::Hash for HostileComponent {
   fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
     self.name.hash(state);
   }
 }
 
+#[cfg(feature = "sync")]
 impl Drop for HostileComponent {
   fn drop(&mut self) {
     if self.unwinds && HOSTILE_COMPONENT_ARMED.replace(false) {
@@ -15096,8 +15152,10 @@ impl Drop for HostileComponent {
 /// subscription therefore runs a caller destructor that is neither a `C` nor a `V`, at a site the
 /// key-shaped fixtures cannot mark. It shares [`HostileComponent`]'s one-shot arming so a cell
 /// spends exactly one unwind however the destructor is reached.
+#[cfg(feature = "sync")]
 struct HostileFilterState;
 
+#[cfg(feature = "sync")]
 impl Drop for HostileFilterState {
   fn drop(&mut self) {
     if HOSTILE_COMPONENT_ARMED.replace(false) {
@@ -15110,6 +15168,7 @@ impl Drop for HostileFilterState {
 /// A [`Filter`] whose predicate captures a [`HostileFilterState`], so DROPPING the filter unwinds.
 /// The predicate itself is inert and admits everything — a cell that never routes an event never
 /// enters it, and the measurement is about the gate's disposal, not its verdict.
+#[cfg(feature = "sync")]
 fn hostile_filter() -> Filter<HostileComponent> {
   let state = HostileFilterState;
   Filter::new(move |_| {
@@ -15120,6 +15179,7 @@ fn hostile_filter() -> Filter<HostileComponent> {
 
 /// One [`Source`] call [`HostileKeySource`] received. Records component NAMES rather than
 /// components, so the ledger a cell reads after the unwind owns no destructor of its own.
+#[cfg(feature = "sync")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum HostileCall {
   Arm(Vec<&'static str>),
@@ -15134,6 +15194,7 @@ enum HostileCall {
 ///
 /// It never DROPS a stored key: a released handle moves to `released` and keeps its entry, so the
 /// only marked destructors that can run are the engine's own, which is the whole measurement.
+#[cfg(feature = "sync")]
 struct HostileKeySource {
   next_handle: u32,
   live: HashMap<u32, Vec<HostileComponent>>,
@@ -15146,6 +15207,7 @@ struct HostileKeySource {
   calls: std::sync::Arc<std::sync::Mutex<Vec<HostileCall>>>,
 }
 
+#[cfg(feature = "sync")]
 impl HostileKeySource {
   fn new() -> Self {
     Self {
@@ -15178,6 +15240,7 @@ impl HostileKeySource {
   }
 }
 
+#[cfg(feature = "sync")]
 impl Source<HostileComponent> for HostileKeySource {
   type Handle = u32;
 
@@ -15242,6 +15305,7 @@ impl Source<HostileComponent> for HostileKeySource {
 
 /// An [`Owner`] over [`HostileKeySource`], plus the channel ends a driven [`run`](super::run) needs
 /// kept open. The [`OwnerOverValue`] of the `C` half.
+#[cfg(feature = "sync")]
 struct OwnerOverHostileKeys {
   owner: Owner<HostileComponent, (), TokioRuntime, HostileKeySource>,
   _events: async_channel::Receiver<Event<HostileComponent, ()>>,
@@ -15249,11 +15313,11 @@ struct OwnerOverHostileKeys {
   /// [`fill_stream`](Self::fill_stream).
   events: async_channel::Sender<Event<HostileComponent, ()>>,
   commands: async_channel::Sender<super::Command<HostileComponent, ()>>,
-  #[cfg(feature = "sync")]
   _sync_commands: async_channel::Sender<super::SyncRequest>,
   closes: async_channel::Sender<super::CloseReply>,
 }
 
+#[cfg(feature = "sync")]
 impl OwnerOverHostileKeys {
   fn new() -> Self {
     Self::bounded(usize::MAX)
@@ -15384,6 +15448,7 @@ impl OwnerOverHostileKeys {
 /// [`Stopped`](crate::error::CloseError::Stopped), and the ledger has neither the cookie reap nor
 /// `JoinClose` behind the seam.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_terminal_disjoint_close_race_places_every_caller_key_it_owns() {
   use std::task::{Context, Poll, Waker};
 
@@ -15511,6 +15576,7 @@ async fn a_terminal_disjoint_close_race_places_every_caller_key_it_owns() {
 /// representative) and the duplicate's destructor fires inside the mutator: the unwind leaves `run`,
 /// `close()` reports `Stopped`, and the ledger has neither the cookie reap nor `JoinClose` in it.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_terminal_retirement_places_the_duplicate_keys_it_removes() {
   use std::task::{Context, Poll, Waker};
 
@@ -15681,6 +15747,7 @@ async fn a_terminal_retirement_places_the_duplicate_keys_it_removes() {
 /// unwind leaves `run`, `close()` reads the dropped sender as
 /// [`Stopped`](crate::error::CloseError::Stopped), and the ledger has the reap but no `JoinClose`.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_terminal_tail_flush_places_the_parked_entry_it_delivers() {
   use std::task::{Context, Poll, Waker};
 
@@ -15822,6 +15889,7 @@ async fn a_terminal_tail_flush_places_the_parked_entry_it_delivers() {
 /// the merge: the unwind leaves `run`, `close()` reports `Stopped`, and the ledger has no
 /// `JoinClose`.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_terminal_merge_places_the_key_tail_it_widens_away() {
   use std::task::{Context, Poll, Waker};
 
@@ -15951,6 +16019,7 @@ async fn a_terminal_merge_places_the_key_tail_it_widens_away() {
 /// predicate's captured state is destroyed inside the retirement: the unwind leaves `run`,
 /// `close()` reports `Stopped`, and the ledger has no `JoinClose`.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_terminal_retirement_places_the_admission_gate_it_reclaims() {
   use std::task::{Context, Poll, Waker};
 
@@ -16075,6 +16144,7 @@ async fn a_terminal_retirement_places_the_admission_gate_it_reclaims() {
 /// predicate's captured state is destroyed inside the abandoned reconcile: the unwind leaves `run`,
 /// `close()` reports `Stopped`, and the ledger has no `JoinClose`.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_terminal_reconcile_places_the_gate_it_never_installed() {
   use std::task::{Context, Poll, Waker};
 
@@ -16189,6 +16259,7 @@ async fn a_terminal_reconcile_places_the_gate_it_never_installed() {
 /// back in place of the placements, and the parked entry's destructor fires inside the release:
 /// the unwind leaves `run`, `close()` reports `Stopped`, and the ledger has no `JoinClose`.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_terminal_grant_cleanup_places_the_parked_debt_it_purges() {
   use std::task::{Context, Poll, Waker};
 
@@ -16315,6 +16386,7 @@ async fn a_terminal_grant_cleanup_places_the_parked_debt_it_purges() {
 
 /// A settle window nothing in a cell can outlive, so an admitted delta is still BUFFERED when the
 /// teardown reaches it.
+#[cfg(feature = "sync")]
 fn parked_debounce() -> DebounceConfig {
   DebounceConfig::new()
     .with_quiet_window(Duration::from_secs(3600))
@@ -16338,6 +16410,7 @@ fn parked_debounce() -> DebounceConfig {
 /// `_path` binding again, and the marked component is destroyed inside the flush: the unwind leaves
 /// `run`, `close()` reports `Stopped`, and the ledger has no `JoinClose`.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_terminal_coalescer_flush_places_the_index_keys_it_empties() {
   use std::task::{Context, Poll, Waker};
 
@@ -16468,6 +16541,7 @@ async fn a_terminal_coalescer_flush_places_the_index_keys_it_empties() {
 /// salvages only afterwards: the unwind leaves `run`, `close()` reports `Stopped`, and the ledger
 /// has no `JoinClose`.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_terminal_purge_places_the_map_owned_key_its_removal_destroyed() {
   use std::task::{Context, Poll, Waker};
 
@@ -16617,6 +16691,7 @@ async fn a_terminal_purge_places_the_map_owned_key_its_removal_destroyed() {
 /// mutator: the unwind leaves `run`, `close()` reports `Stopped`, and the ledger has no
 /// `JoinClose`.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_terminal_cover_re_record_places_the_cover_it_supersedes() {
   use std::task::{Context, Poll, Waker};
 
@@ -19463,6 +19538,7 @@ async fn a_ready_write_still_wins_the_tie_and_is_not_token_cancelled() {
 /// entry points: [`FakeSource`]'s `next` answers `None` at once, which is the source-drained
 /// signal — the owner tears down before a `watch` can be granted, and the caller is answered
 /// `Closed`.
+#[cfg(feature = "sync")]
 struct SyncSource {
   next_handle: u32,
   live: HashMap<u32, Vec<OsString>>,
@@ -19475,6 +19551,7 @@ struct SyncSource {
   dominate: bool,
 }
 
+#[cfg(feature = "sync")]
 impl Source<OsString> for SyncSource {
   type Handle = u32;
 
@@ -19622,6 +19699,7 @@ async fn a_sync_times_out_when_never_observed() {
 /// control-plane pressure that allocates nothing however long it runs. (The shared
 /// [`spawn_command_flood`] gives up on the first full mailbox, so it cannot hold a *prefilled* one
 /// saturated — which is precisely the condition under test here.)
+#[cfg(feature = "sync")]
 fn spawn_saturating_command_flood(
   commands: async_channel::Sender<super::Command<OsString, ()>>,
   retired: Subscription,
@@ -19720,6 +19798,7 @@ async fn a_command_flood_does_not_starve_the_sync_mailbox() {
 /// ([`Source::begin_sync`]), but `begin_sync` first parks on a gate the test holds shut — modelling a
 /// hung backend write (a stuck FUSE/NFS mount) that never returns. `next` parks when idle, keeping the
 /// run loop alive so the race's cancellation and close arms can free the owner.
+#[cfg(feature = "sync")]
 struct HeldBeginSyncSource {
   next_handle: u32,
   live: HashMap<u32, Vec<OsString>>,
@@ -19729,6 +19808,7 @@ struct HeldBeginSyncSource {
   begin_gate: async_channel::Receiver<()>,
 }
 
+#[cfg(feature = "sync")]
 impl Source<OsString> for HeldBeginSyncSource {
   type Handle = u32;
 

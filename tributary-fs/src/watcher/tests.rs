@@ -1,6 +1,8 @@
 use super::*;
 // The pool half of the runtime trait, which the sync door's spawner is built from.
-use agnostic_lite::{LocalRuntimeLite as _, tokio::TokioRuntime};
+#[cfg(feature = "sync")]
+use agnostic_lite::LocalRuntimeLite as _;
+use agnostic_lite::tokio::TokioRuntime;
 
 /// Locks in `Watcher<R>: Sync`: the umbrella's single-owner actor awaits the
 /// `&self` `watch`/`unwatch` futures inside a `Send` spawned owner, which

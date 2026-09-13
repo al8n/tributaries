@@ -54,6 +54,7 @@ fn config() -> DriverConfig {
 /// The cookie-retry cells' config: a fast backoff, a small attempt budget, and a low
 /// per-scope backlog cap, so the driver-owned retry, budget-park, and backlog-refusal
 /// paths run in real (multi-thread) time within a `settle` window.
+#[cfg(feature = "sync")]
 fn tuned_config() -> DriverConfig {
   DriverConfig {
     cookie_retry_base: Duration::from_millis(5),
@@ -71,6 +72,7 @@ fn rig_with_capacity(event_capacity: usize) -> Rig {
 
 /// A rig whose driver runs with an explicit [`DriverConfig`] — the cookie-retry cells override
 /// the backoff/budget/backlog knobs so their timings are fast and deterministic.
+#[cfg(feature = "sync")]
 fn rig_with_config(event_capacity: usize, config: DriverConfig) -> Rig {
   let fs = FakeFs::new(1);
   fs.put("/r", FileKind::Dir, 1);
@@ -1116,7 +1118,7 @@ async fn tick_liveness(rig: &Rig, scope: ScopeId) {
 /// barriers that funnel covers — an observation any command placed between the
 /// two destroys, because a command forces a loop top and the loop top is a
 /// drain.
-#[cfg(not(miri))]
+#[cfg(all(not(miri), feature = "sync"))]
 async fn arm_liveness_due(rig: &Rig, scope: ScopeId) {
   let (reply, on_reply) = futures_channel::oneshot::channel();
   rig
@@ -1133,7 +1135,7 @@ async fn arm_liveness_due(rig: &Rig, scope: ScopeId) {
 /// Reads the event channel and NOTHING else: the channel is the consumer's own
 /// seam, so a cell that must not perturb the driver's loop can wait here where
 /// it could not wait on a `Command` round trip.
-#[cfg(not(miri))]
+#[cfg(all(not(miri), feature = "sync"))]
 #[must_use]
 async fn awaits_rescan_on(rig: &Rig, scope: ScopeId) -> bool {
   tokio::time::timeout(interpreted_secs(10), async {
@@ -2994,6 +2996,8 @@ mod teardown_reaper {
 mod descending {
   //! The descending (inotify-profile) loop, end to end on the fake platform.
 
+  use std::sync::atomic::{AtomicBool, Ordering};
+
   use super::*;
   use crate::os::linux::{RawInotifyEvent, RawLinuxEvent, inotify::decode::InotifyMask};
 
@@ -4321,6 +4325,7 @@ mod descending {
     /// shrink just applied has a hole — so it marks no fence lossy and rewinds
     /// no settle floor. The dominated CALLER is told, on its own reply and its
     /// own stream; the shrinking caller is told its cover applied.
+    #[cfg(feature = "sync")]
     async fn shrink_verdict(rig: &Rig, scope: ScopeId) -> CoverOutcome {
       let ack = send_set_cover(rig, scope, &["/r/keep"]).await;
       resolved(ack).await
@@ -11350,6 +11355,7 @@ mod descending {
       assert_eq!(rig.fs.cookie_writes(), vec![path]);
     }
 
+    #[cfg(feature = "sync")]
     const IN_MOVE_SELF: u32 = 0x0000_0800;
 
     /// The Codex R1 finding-1 cell: a sync admitted after a widen PARKS

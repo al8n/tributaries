@@ -17,9 +17,13 @@ smol = ["agnostic-lite/smol"]
 # The sync BARRIER — `Watcher::{mint_sync_ticket, sync_root, request_cancel_sync,
 # request_remove_cookie}`, `SyncTicket`, `SyncAdmission`, `SyncRootDenied`,
 # `SyncRootError`, and the driver's whole cookie ledger beneath them.
-# EXPERIMENTAL and off by default: with it off no obligation is ever created, so
-# the driver stands no retirement, no domination `Rescan`, no claim and no cookie
-# write, and every other surface behaves exactly as it does with the feature on.
+# EXPERIMENTAL and off by default: with it off no obligation is ever created, so the
+# driver stands no retirement, no domination `Rescan`, no claim and no cookie write,
+# and every other surface behaves exactly as it does with the feature on. The reserved
+# cookie namespace stays reserved with the feature off: a marker written by another
+# watcher on the same tree is still suppressed from every consumer stream and exempt
+# from the prune seats, because the namespace belongs to the barrier of ANY watcher,
+# not to this build's.
 #
 # The two dependencies it takes are the ONE mechanism that makes a marker leaf
 # unguessable: `rand_chacha` is the per-watcher nonce stream and `getrandom` the
@@ -32,7 +36,7 @@ sync = ["dep:rand_chacha", "dep:getrandom"]
 # Optional `serde` face on the configuration households (`WatcherOptions`,
 # `Backend`, and the re-exported `Interest`). Off by default; `Duration` knobs
 # read and write as humantime text ("10ms", "2s").
-serde = ["dep:serde", "dep:humantime-serde", "tributary-proto/serde"]
+serde = ["dep:serde", "dep:humantime", "dep:humantime-serde", "tributary-proto/serde"]
 # Optional `clap` face on the same households: `WatcherOptions` becomes a
 # `clap::Args` group and `Backend` a `clap::ValueEnum`.
 clap = ["dep:clap", "dep:humantime", "tributary-proto/clap"]

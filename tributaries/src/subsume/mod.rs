@@ -841,7 +841,7 @@ impl<C, V, H> Subsumer<C, V, H> {
   /// a call count that is the mutator's own business. A cell that wants the STATE (the published
   /// snapshot as the last owner of a departed `V`) rather than that call count assembles it here:
   /// take the snapshot out with [`swap_in_empty`](Self::swap_in_empty), mutate, put it back.
-  #[cfg(all(test, feature = "tokio"))]
+  #[cfg(all(test, feature = "tokio", feature = "sync"))]
   pub(crate) fn test_reinstall_publication(&self, snapshot: Arc<Published<C, V, H>>) {
     self.shared.store(snapshot);
   }

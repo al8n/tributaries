@@ -909,7 +909,7 @@ impl FakeFs {
   /// stream sweep) part-way through and release an in-pool cookie write inside
   /// that interval. The write's reply oneshot is sent from the pool thread
   /// straight to the caller, so it resolves while the loop is still frozen.
-  #[cfg(not(miri))]
+  #[cfg(all(not(miri), feature = "sync"))]
   pub(crate) fn hold_detaches(&self) -> HoldRelease {
     let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new(), AtomicUsize::new(0)));
     *self.state.detach_hold.lock().unwrap() = Some(Arc::clone(&gate));
@@ -1281,6 +1281,7 @@ impl FakeFs {
   /// every later `lock().unwrap()` in the fake — including the one
   /// [`HoldRelease::release`] needs to free a parked pool job — would panic in
   /// turn, replacing the cell's report with an unrelated cascade.
+  #[cfg(feature = "sync")]
   pub(crate) fn panic_next_control_batch(&self, scope: ScopeId) {
     *self.state.batch_panic_arm.lock().unwrap() = Some(scope);
   }
