@@ -2284,6 +2284,133 @@ mod root_options {
       );
     }
 
+    /// The occurrence past the ceiling is refused before a single value is
+    /// copied off `matches` into this crate's own `Vec<String>` — earlier than
+    /// [`compile_seat`], which only ever sees what that copy already holds — on
+    /// both seat flags and both paths (parse, update).
+    ///
+    /// Every value here is in range on its own, so a refusal that happened to
+    /// be [`compile_seat`]'s post-copy one would still pass a bare
+    /// `ValueValidation` check; the preflight's message is worded to differ
+    /// from it, and this checks for that wording rather than only the error
+    /// kind.
+    #[test]
+    fn an_over_full_seat_is_refused_by_the_preflight_before_any_copy() {
+      let cap = RootOptions::MAX_SEAT_PATTERNS;
+      let matches = |rest: &[&str]| {
+        <RootOptions as clap::Args>::augment_args_for_update(clap::Command::new("app"))
+          .get_matches_from(std::iter::once("app").chain(rest.iter().copied()))
+      };
+
+      for flag in ["--prune", "--include"] {
+        let mut over: std::vec::Vec<std::string::String> = std::vec::Vec::new();
+        for n in 0..=cap {
+          over.push(flag.to_owned());
+          over.push(std::format!("**/w{n}"));
+        }
+
+        // PARSE.
+        let err =
+          Cli::try_parse_from(std::iter::once("app".to_owned()).chain(over.iter().cloned()))
+            .err()
+            .expect("one occurrence past the ceiling is refused");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+        let rendered = err.render().to_string();
+        assert!(
+          rendered.contains(&std::format!("{cap}")),
+          "the refusal names the ceiling: {rendered}"
+        );
+        assert!(
+          rendered.contains("before any of them is copied"),
+          "the refusal is the preflight's, not compile_seat's: {rendered}"
+        );
+
+        // UPDATE.
+        let refs: std::vec::Vec<&str> = over.iter().map(std::string::String::as_str).collect();
+        let mut options = RootOptions::new();
+        let err = clap::FromArgMatches::update_from_arg_matches(&mut options, &matches(&refs))
+          .expect_err("an over-full update is refused before it writes the household");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+        assert!(
+          err
+            .render()
+            .to_string()
+            .contains("before any of them is copied")
+        );
+        assert_eq!(
+          options,
+          RootOptions::new(),
+          "the refused update left the household exactly as it stood"
+        );
+      }
+    }
+
+    /// A value longer than [`tributary_proto::glob::MAX_GLOB_LEN`] is refused
+    /// before a single byte of it is copied off `matches` — earlier than
+    /// `Glob::new`, which [`compile_seat`] only reaches after that copy — on
+    /// both seat flags and both paths (parse, update), and the refusal never
+    /// holds the pattern itself.
+    #[test]
+    fn an_oversized_seat_pattern_is_refused_by_the_preflight_before_any_copy() {
+      let bound = tributary_proto::glob::MAX_GLOB_LEN;
+      let over = "?".repeat(bound + 1);
+      let matches = |rest: &[&str]| {
+        <RootOptions as clap::Args>::augment_args_for_update(clap::Command::new("app"))
+          .get_matches_from(std::iter::once("app").chain(rest.iter().copied()))
+      };
+
+      for flag in ["--prune", "--include"] {
+        // PARSE.
+        let argv = std::vec::Vec::from(["app".to_owned(), flag.to_owned(), over.clone()]);
+        let err = Cli::try_parse_from(argv)
+          .err()
+          .expect("one byte past the length bound is refused");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+        let rendered = err.render().to_string();
+        assert!(
+          rendered.contains(&std::format!("{bound}"))
+            && rendered.contains(&std::format!("{} bytes", over.len())),
+          "the refusal names the bound and the length: {rendered}"
+        );
+        assert!(
+          !rendered.contains(&over),
+          "and never the text itself: {rendered}"
+        );
+        assert!(
+          rendered.contains("before it is copied"),
+          "the refusal is the preflight's, not compile_seat's belt: {rendered}"
+        );
+        assert!(
+          !rendered.contains("invalid glob"),
+          "Glob::new was never reached: {rendered}"
+        );
+
+        // UPDATE.
+        let mut options = RootOptions::new();
+        let err = clap::FromArgMatches::update_from_arg_matches(
+          &mut options,
+          &matches(&[flag, over.as_str()]),
+        )
+        .expect_err("an oversized update value is refused before it writes the household");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+        assert!(err.render().to_string().contains("before it is copied"));
+        assert_eq!(
+          options,
+          RootOptions::new(),
+          "the refused update left the household exactly as it stood"
+        );
+      }
+
+      // A pattern exactly AT the bound still parses.
+      let at_bound = "?".repeat(bound);
+      assert_eq!(
+        parse(&["--prune", at_bound.as_str()]).prune()[0]
+          .as_str()
+          .len(),
+        bound
+      );
+    }
+
     /// An invalid pattern is refused at the FLAG, with the type's own message.
     #[test]
     fn an_invalid_pattern_is_refused_at_the_flag() {
