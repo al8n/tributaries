@@ -72,7 +72,7 @@ futures-util = { version = "0.3", default-features = false, features = [
 # reveals nothing about the seed behind them. Pure computation with no OS
 # dependency, so — unlike `getrandom` below — it needs no target gate and builds
 # for `wasm32-unknown-unknown` unchanged.
-rand_chacha = { version = "0.9", optional = true }
+rand_chacha = { version = "0.10", optional = true }
 thiserror = "2"
 # `glob` is enabled unconditionally: the per-root `prune` / `include` seats are
 # part of this crate's API, not an optional face.
