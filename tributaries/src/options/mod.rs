@@ -364,33 +364,70 @@ struct SeatArgs {
   /// same thing — the same way ([`compile_seat`]).
   #[arg(long, num_args = 0..=1)]
   include: Option<Vec<String>>,
+  /// Reset the prune seat to empty: the one household value `--prune` cannot
+  /// reach on an UPDATE.
+  ///
+  /// `--prune` requires a value per occurrence, and an update that names
+  /// neither flag preserves whatever prune seat already stood — so there was
+  /// no command line that could return an already-pruning household to
+  /// `prune = []`. Conflicts with `--prune`, since a request to prune nothing
+  /// and a request to prune something cannot both stand.
+  #[arg(long, conflicts_with = "prune")]
+  prune_none: bool,
+  /// Reset the include seat to absent (deliver every file): the one household
+  /// value `--include` cannot reach on an UPDATE.
+  ///
+  /// `include = None` is spelled only by omitting `--include` entirely, and on
+  /// an update omission means preserve — so there was no command line that
+  /// could return an already-engaged include seat to `None`. Conflicts with
+  /// `--include`, since a request for every file and a request narrowed to
+  /// some cannot both stand.
+  #[arg(long, conflicts_with = "include")]
+  include_all: bool,
 }
 
 #[cfg(feature = "clap")]
 impl SeatArgs {
   /// The seat flag names — the ONE list, so a seat added to the vocabulary cannot
   /// be forgotten by a household's arg group.
-  const FLAGS: [&'static str; 2] = ["prune", "include"];
+  const FLAGS: [&'static str; 4] = ["prune", "include", "prune_none", "include_all"];
 
   /// Both seats compiled — the one site either household compiles at, and only
   /// after [`compile_seat`] has judged their length.
+  ///
+  /// `prune_none`/`include_all` win over whatever `prune`/`include` carry: the
+  /// two pairs conflict at the parse, so at most one of each pair is ever set,
+  /// and the reset flag is the one spelling that can return an update to the
+  /// empty/absent seat a plain omission cannot reach.
   fn compiled(self) -> Result<(Vec<Glob>, Option<Vec<Glob>>), clap::Error> {
-    Ok((
-      compile_seat(self.prune, "--prune")?,
+    let prune = if self.prune_none {
+      Vec::new()
+    } else {
+      compile_seat(self.prune, "--prune")?
+    };
+    let include = if self.include_all {
+      None
+    } else {
       self
         .include
         .map(|include| compile_seat(include, "--include"))
-        .transpose()?,
-    ))
+        .transpose()?
+    };
+    Ok((prune, include))
   }
 
   /// The way back, for an UPDATE: a compiled seat renders to the patterns it was
-  /// compiled from, which is the spelling the flags carry.
+  /// compiled from, which is the spelling the flags carry. The empty prune seat
+  /// spells as `prune_none: true` and the absent include seat as
+  /// `include_all: true`, so each round-trips like every other value instead of
+  /// reading back as a bare omission an update would then leave untouched.
   fn spelled(prune: &[Glob], include: Option<&[Glob]>) -> Self {
     let pattern = |glob: &Glob| glob.as_str().to_owned();
     Self {
       prune: prune.iter().map(pattern).collect(),
       include: include.map(|include| include.iter().map(pattern).collect()),
+      prune_none: prune.is_empty(),
+      include_all: include.is_none(),
     }
   }
 }
@@ -495,8 +532,8 @@ where
 /// # Configuration faces
 ///
 /// With the `serde` feature the policy is one object keyed by the field names, every
-/// key optional and defaulted from [`new`](Self::new), unknown keys ignored. The two
-/// windows are humantime text, refused past a small byte ceiling before humantime
+/// key optional and defaulted from [`new`](Self::new), unknown keys rejected. The
+/// two windows are humantime text, refused past a small byte ceiling before humantime
 /// ever parses it (a fixed message naming the bound and the length, never the
 /// text):
 ///
@@ -525,7 +562,7 @@ where
 /// the hold ceiling and the buffered cap exactly as they stood.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(default))]
+#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
 pub struct DebounceConfig {
   #[cfg_attr(
     feature = "serde",
@@ -1221,7 +1258,7 @@ impl<'de> serde::Deserialize<'de> for Debounce {
 /// # Configuration faces
 ///
 /// With the `serde` feature the household is one object keyed by the field names,
-/// every key optional and defaulted from [`new`](Self::new), unknown keys ignored.
+/// every key optional and defaulted from [`new`](Self::new), unknown keys rejected.
 /// `debounce` is the opt-in it is: absent (or `null`) leaves the coalescer off, and a
 /// [`DebounceConfig`] object turns it on.
 ///
@@ -1241,17 +1278,28 @@ impl<'de> serde::Deserialize<'de> for Debounce {
 /// $ app --event-capacity 4096 --quiet-window 100ms
 /// ```
 ///
+/// `--no-debounce` has its own flag, conflicting with every one of the flattened
+/// debounce flags: it is the one household value they cannot reach, since they
+/// only ever edit fields inside an ALREADY-EXISTING policy and none of them can
+/// set it back to absent.
+///
+/// ```text
+/// $ app --no-debounce                   # settling off, whatever stood before
+/// ```
+///
 /// An UPDATE (`clap::FromArgMatches::update_from_arg_matches`) changes only what
 /// the command line actually carried: updating `--event-capacity` alone leaves the
-/// command mailbox and the debounce posture exactly as they stood, and an
-/// unrelated flag never switches settling on.
+/// command mailbox and the debounce posture exactly as they stood, an unrelated
+/// flag never switches settling on, and `--no-debounce` on the command line
+/// clears an existing policy the same way a parse would.
 ///
 /// The group is explicitly populated with every argument the household carries, the
-/// nested debounce flags included, so `#[command(flatten)] options:
-/// Option<TributariesOptions>` is `Some` exactly when one of them was given.
+/// nested debounce flags and `--no-debounce` included, so `#[command(flatten)]
+/// options: Option<TributariesOptions>` is `Some` exactly when one of them was
+/// given.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(default))]
+#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
 pub struct TributariesOptions {
   #[cfg_attr(feature = "serde", serde(deserialize_with = "de_event_capacity"))]
   event_capacity: NonZeroUsize,
@@ -1285,6 +1333,13 @@ struct TributariesOptionsArgs {
   command_capacity: NonZeroUsize,
   #[command(flatten)]
   debounce: Option<DebounceConfig>,
+  /// Clears the debounce policy back to [`None`] — the one household value the
+  /// flattened debounce flags cannot reach, since they only ever edit fields
+  /// inside an ALREADY-EXISTING policy. Conflicts with every one of them: a
+  /// request to disable settling and a request to configure it cannot both
+  /// stand.
+  #[arg(long, conflicts_with_all = DebounceConfigArgs::FLAGS)]
+  no_debounce: bool,
 }
 
 /// The `--event-capacity` parser: the flag refuses out of range what
@@ -1335,11 +1390,12 @@ impl clap::FromArgMatches for TributariesOptions {
       event_capacity,
       command_capacity,
       debounce,
+      no_debounce,
     } = TributariesOptionsArgs::from_arg_matches(matches)?;
     Ok(Self {
       event_capacity,
       command_capacity,
-      debounce,
+      debounce: if no_debounce { None } else { debounce },
     })
   }
 
@@ -1357,6 +1413,11 @@ impl clap::FromArgMatches for TributariesOptions {
   /// when one of ITS flags came from the command line, which is the same opt-in
   /// rule a parse follows; an already-configured policy is updated in place, knob
   /// by knob.
+  ///
+  /// `--no-debounce` conflicts with every one of the flattened debounce flags, so
+  /// at most one of them is ever given; naming it clears an existing policy back
+  /// to [`None`] the same way a parse would, and naming neither it nor a debounce
+  /// flag leaves the existing policy exactly as it stood.
   fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
     if let Some(event_capacity) = command_line_value(matches, "event_capacity") {
       self.event_capacity = event_capacity;
@@ -1364,12 +1425,16 @@ impl clap::FromArgMatches for TributariesOptions {
     if let Some(command_capacity) = command_line_value(matches, "command_capacity") {
       self.command_capacity = command_capacity;
     }
-    match &mut self.debounce {
-      Some(config) => config.update_from_arg_matches(matches)?,
-      None if DebounceConfigArgs::given_on_command_line(matches) => {
-        self.debounce = Some(DebounceConfig::from_arg_matches(matches)?);
+    if command_line_value::<bool>(matches, "no_debounce") == Some(true) {
+      self.debounce = None;
+    } else {
+      match &mut self.debounce {
+        Some(config) => config.update_from_arg_matches(matches)?,
+        None if DebounceConfigArgs::given_on_command_line(matches) => {
+          self.debounce = Some(DebounceConfig::from_arg_matches(matches)?);
+        }
+        None => {}
       }
-      None => {}
     }
     Ok(())
   }
@@ -1395,7 +1460,7 @@ impl clap::FromArgMatches for TributariesOptions {
 ///
 /// So the members are named here, and named EXHAUSTIVELY: the debounce flags come
 /// from [`DebounceConfigArgs::FLAGS`] — the one list a new knob must be added to —
-/// and the two capacities are spelled beside them.
+/// and the two capacities and `--no-debounce` are spelled beside them.
 #[cfg(feature = "clap")]
 impl TributariesOptions {
   /// The group's id, stable across releases: a downstream `ArgGroup` that names
@@ -1407,7 +1472,7 @@ impl TributariesOptions {
   fn with_group(cmd: clap::Command) -> clap::Command {
     cmd.group(
       clap::ArgGroup::new(Self::GROUP_ID).multiple(true).args(
-        ["event_capacity", "command_capacity"]
+        ["event_capacity", "command_capacity", "no_debounce"]
           .into_iter()
           .chain(DebounceConfigArgs::FLAGS)
           .map(clap::Id::from),
@@ -1739,17 +1804,30 @@ impl Default for TributariesOptions {
 /// $ app --include                       # directories and Rescans only
 /// ```
 ///
+/// `--prune` requires a value per occurrence and `include = None` is spelled
+/// only by omitting `--include`, so on an UPDATE — where omission means
+/// preserve — neither flag alone can return an already-pruning or
+/// already-narrowed household to the empty/absent seat. `--prune-none`
+/// (conflicts with `--prune`) and `--include-all` (conflicts with `--include`)
+/// are the two reset flags that reach those states:
+///
+/// ```text
+/// $ app --prune-none                    # prune nothing, whatever stood before
+/// $ app --include-all                   # deliver every file again
+/// ```
+///
 /// Those are the SAME flag names [`WatchOptions`] carries, deliberately — one
 /// vocabulary, one spelling — so a single command flattens one household or the
 /// other, never both (clap refuses a duplicate argument id, and a command that
 /// tried would fail its own `debug_assert`). An UPDATE changes only the seat the
-/// command line named: neither flag carries a default, so a seat nobody gave is
-/// left exactly as it stood. The group is explicitly populated, so
-/// `#[command(flatten)] globs: Option<RootGlobs>` is `Some` exactly when one of
-/// the two flags was given.
+/// command line named: `--prune`/`--include` carry no default, and
+/// `--prune-none`/`--include-all` conflict with them, so a seat nobody gave —
+/// through either spelling — is left exactly as it stood. The group is
+/// explicitly populated, so `#[command(flatten)] globs: Option<RootGlobs>` is
+/// `Some` exactly when one of the four flags was given.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(default))]
+#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
 pub struct RootGlobs {
   #[cfg_attr(feature = "serde", serde(deserialize_with = "deserialize_seat"))]
   prune: Vec<Glob>,
@@ -2054,19 +2132,25 @@ impl RootGlobs {
 /// $ app --include                       # directories and Rescans only
 /// ```
 ///
+/// `--prune-none` (conflicts with `--prune`) resets the prune seat to empty and
+/// `--include-all` (conflicts with `--include`) resets the include seat to
+/// absent — the two seat states a plain omission cannot reach on an UPDATE,
+/// since omission there means preserve.
+///
 /// An UPDATE (`clap::FromArgMatches::update_from_arg_matches`) changes only what
 /// the command line actually carried. Each of the three fields the face carries
 /// gets that from a rule of its own: the [`Interest`] gate consults the value
-/// SOURCE of its flags (see [`Interest`]'s own face), and the two glob seats carry
-/// no flag default at all, so a seat nobody named keeps the patterns it had. The
-/// [`Filter`] and the [`Debounce`] posture are on no face, and an update leaves
-/// them untouched.
+/// SOURCE of its flags (see [`Interest`]'s own face), and the two glob seats —
+/// `--prune`/`--include` carrying no flag default, `--prune-none`/
+/// `--include-all` conflicting with them — keep the patterns they had unless the
+/// command line named one of the four. The [`Filter`] and the [`Debounce`]
+/// posture are on no face, and an update leaves them untouched.
 ///
 /// The group is explicitly populated with every argument the household carries, the
 /// nested interest flags included, so `#[command(flatten)] watch:
 /// Option<WatchOptions<C>>` is `Some` exactly when one of them was given.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(default, bound = ""))]
+#[cfg_attr(feature = "serde", serde(default, bound = "", deny_unknown_fields))]
 pub struct WatchOptions<C> {
   interest: Interest,
   #[cfg_attr(feature = "serde", serde(skip))]

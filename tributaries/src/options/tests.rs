@@ -480,16 +480,25 @@ mod serde_face {
     );
   }
 
-  /// Forward compatibility: no `deny_unknown_fields` on any household.
+  /// An unknown key is refused on every household — a typo in a key name must not
+  /// silently drop the knob it was meant to set.
   #[test]
-  fn an_unknown_key_is_accepted() {
-    let parsed: DebounceConfig = serde_json::from_str(r#"{"some_future_knob": 7}"#).unwrap();
-    assert_eq!(parsed, DebounceConfig::new());
-    let parsed: TributariesOptions = serde_json::from_str(r#"{"some_future_knob": 7}"#).unwrap();
-    assert_eq!(parsed, TributariesOptions::new());
-    let parsed: WatchOptions<OsString> =
-      serde_json::from_str(r#"{"some_future_knob": 7}"#).unwrap();
-    assert!(parsed.interest().is_all());
+  fn an_unknown_key_is_refused() {
+    let err = serde_json::from_str::<DebounceConfig>(r#"{"some_future_knob": 7}"#)
+      .expect_err("an unknown key is refused");
+    assert!(err.to_string().contains("some_future_knob"), "{err}");
+
+    let err = serde_json::from_str::<TributariesOptions>(r#"{"some_future_knob": 7}"#)
+      .expect_err("an unknown key is refused");
+    assert!(err.to_string().contains("some_future_knob"), "{err}");
+
+    let err = serde_json::from_str::<WatchOptions<OsString>>(r#"{"some_future_knob": 7}"#)
+      .expect_err("an unknown key is refused");
+    assert!(err.to_string().contains("some_future_knob"), "{err}");
+
+    let err = serde_json::from_str::<RootGlobs>(r#"{"prune": [], "some_future_seat": 7}"#)
+      .expect_err("an unknown key is refused");
+    assert!(err.to_string().contains("some_future_seat"), "{err}");
   }
 
   /// The capacities are non-zero TYPES, so a zero is refused by the format.
@@ -565,6 +574,15 @@ mod serde_face {
       serde_json::from_str::<RootGlobs>(r#"{"prune": ["[unclosed"]}"#).is_err(),
       "an uncompilable pattern is a document error"
     );
+  }
+
+  /// A document naming ONE seat leaves the other at the value `new()` gives it —
+  /// the struct-level `#[serde(default)]`.
+  #[test]
+  fn a_partial_document_defaults_the_absent_seat() {
+    let parsed: RootGlobs = serde_json::from_str(r#"{"prune": ["**/target"]}"#).unwrap();
+    assert_eq!(parsed, RootGlobs::new().with_prune([glob("**/target")]));
+    assert_eq!(parsed.include(), None);
   }
 
   /// The same clamp the builders apply: `0` buffered entries is a buffer nothing can
@@ -1182,6 +1200,28 @@ mod clap_face {
     );
   }
 
+  /// `--no-debounce` spells the one household value the flattened debounce flags
+  /// cannot reach: the disabled coalescer.
+  #[test]
+  fn no_debounce_flag_parses_to_no_policy() {
+    assert_eq!(
+      WatcherCli::parse_from(args(&["--no-debounce"]))
+        .options
+        .debounce_config(),
+      None
+    );
+  }
+
+  /// A request to disable settling and a request to configure it cannot both
+  /// stand.
+  #[test]
+  fn no_debounce_conflicts_with_a_debounce_flag() {
+    let err = WatcherCli::try_parse_from(args(&["--quiet-window", "250ms", "--no-debounce"]))
+      .err()
+      .expect("the two flags conflict");
+    assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+  }
+
   /// The same clamp the builders apply, at the flag.
   #[test]
   fn a_zero_buffered_cap_is_clamped_exactly_as_the_builder_clamps_it() {
@@ -1470,6 +1510,21 @@ mod clap_face {
       "the named knob moves; the other two keep their configured values"
     );
 
+    // `--no-debounce` clears an existing policy back to `None`, and carries
+    // nothing else with it.
+    let mut options = TributariesOptions::new()
+      .with_command_capacity(nonzero(8))
+      .debounce(DebounceConfig::new().with_max_buffered(7));
+    options
+      .update_from_arg_matches(&update_matches::<TributariesOptions>(&["--no-debounce"]))
+      .expect("the update applies");
+    assert_eq!(options.debounce_config(), None);
+    assert_eq!(
+      options.command_capacity(),
+      nonzero(8),
+      "the reset flag carries nothing else with it"
+    );
+
     // The policy household on its own.
     let mut config = DebounceConfig::new().with_max_buffered(7);
     config
@@ -1672,6 +1727,112 @@ mod clap_face {
         .map(texts),
       Some(std::vec![])
     );
+  }
+
+  /// `--prune-none` resets the prune seat to empty on both households: the one
+  /// value `--prune` alone cannot reach on an UPDATE, since `--prune` requires
+  /// a value per occurrence and omission means preserve.
+  #[test]
+  fn prune_none_flag_parses_to_the_empty_seat() {
+    assert!(
+      GlobsCli::parse_from(args(&["--prune-none"]))
+        .globs
+        .prune()
+        .is_empty()
+    );
+    assert!(
+      WatchCli::parse_from(args(&["--prune-none"]))
+        .options
+        .prune()
+        .is_empty()
+    );
+  }
+
+  /// `--prune-none` conflicts with `--prune`: pruning nothing and pruning
+  /// something cannot both stand.
+  #[test]
+  fn prune_none_conflicts_with_prune() {
+    let err = GlobsCli::try_parse_from(args(&["--prune-none", "--prune", "**/x"]))
+      .err()
+      .expect("the flags conflict");
+    assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+  }
+
+  /// An update carrying `--prune-none` resets a persisted prune seat on both
+  /// households, and one without it leaves that seat untouched.
+  #[test]
+  fn an_update_with_prune_none_clears_a_persisted_prune() {
+    let mut cleared = RootGlobs::new().with_prune([glob("**/node_modules")]);
+    cleared
+      .update_from_arg_matches(&update_matches::<RootGlobs>(&["--prune-none"]))
+      .expect("the update applies");
+    assert!(cleared.prune().is_empty());
+
+    let mut kept = RootGlobs::new().with_prune([glob("**/node_modules")]);
+    kept
+      .update_from_arg_matches(&update_matches::<RootGlobs>(&["--include", "*.mp4"]))
+      .expect("the update applies");
+    assert_eq!(texts(kept.prune()), ["**/node_modules"]);
+
+    let mut watch_cleared = WatchOptions::<OsString>::new().with_prune([glob("**/node_modules")]);
+    watch_cleared
+      .update_from_arg_matches(&update_matches::<WatchOptions<OsString>>(&["--prune-none"]))
+      .expect("the update applies");
+    assert!(watch_cleared.prune().is_empty());
+  }
+
+  /// `--include-all` resets the include seat to absent on both households: the
+  /// one value `--include` alone cannot reach on an UPDATE, since
+  /// `include = None` is spelled only by omission and omission means preserve.
+  #[test]
+  fn include_all_flag_parses_to_the_absent_seat() {
+    assert_eq!(
+      GlobsCli::parse_from(args(&["--include-all"]))
+        .globs
+        .include(),
+      None
+    );
+    assert_eq!(
+      WatchCli::parse_from(args(&["--include-all"]))
+        .options
+        .include(),
+      None
+    );
+  }
+
+  /// `--include-all` conflicts with `--include`: delivering every file and
+  /// narrowing delivery cannot both stand.
+  #[test]
+  fn include_all_conflicts_with_include() {
+    let err = GlobsCli::try_parse_from(args(&["--include-all", "--include", "*.mp4"]))
+      .err()
+      .expect("the flags conflict");
+    assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+  }
+
+  /// An update carrying `--include-all` resets a persisted include seat on
+  /// both households, and one without it leaves that seat untouched.
+  #[test]
+  fn an_update_with_include_all_clears_a_persisted_include() {
+    let mut cleared = RootGlobs::new().with_include([glob("*.mp4")]);
+    cleared
+      .update_from_arg_matches(&update_matches::<RootGlobs>(&["--include-all"]))
+      .expect("the update applies");
+    assert_eq!(cleared.include(), None);
+
+    let mut kept = RootGlobs::new().with_include([glob("*.mp4")]);
+    kept
+      .update_from_arg_matches(&update_matches::<RootGlobs>(&["--prune", "**/.git"]))
+      .expect("the update applies");
+    assert_eq!(kept.include().map(texts), Some(std::vec!["*.mp4"]));
+
+    let mut watch_cleared = WatchOptions::<OsString>::new().with_include([glob("*.mp4")]);
+    watch_cleared
+      .update_from_arg_matches(&update_matches::<WatchOptions<OsString>>(&[
+        "--include-all",
+      ]))
+      .expect("the update applies");
+    assert_eq!(watch_cleared.include(), None);
   }
 
   /// Every household composes as an OPTIONAL flatten, which is the one shape that

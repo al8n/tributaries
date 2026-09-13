@@ -16,6 +16,12 @@ use crate::os::Backend;
 #[cfg(test)]
 mod tests;
 
+/// The FIXED message every face refuses an empty or relative exclusion with —
+/// never the value itself, in the same mold as the duration-text faces.
+#[cfg(any(feature = "serde", feature = "clap"))]
+const EXCLUSION_NOT_ABSOLUTE_MESSAGE: &str =
+  "an exclusion directory must be a non-empty absolute path";
+
 /// Why a [`WatcherOptions`] value cannot be honored.
 ///
 /// Every knob is a bounded quantity: an out-of-range value reaches unchecked
@@ -44,6 +50,18 @@ pub enum OptionsError {
   ExclusionTooLong {
     /// How many bytes the offending path carried.
     supplied: usize,
+  },
+  /// One exclusion path is empty or not absolute
+  /// ([`Path::is_absolute`](std::path::Path::is_absolute)).
+  ///
+  /// The driver's own exclusion test is a PREFIX test on lexically folded
+  /// paths: an empty (or `.`-shaped) exclusion folds to the empty path, which
+  /// is a prefix of every directory, so one stray value silently suppresses
+  /// the whole root.
+  #[error("exclusion at index {index} is empty or not absolute")]
+  ExclusionNotAbsolute {
+    /// The index of the offending exclusion within the list.
+    index: usize,
   },
   /// The OS event-coalescing latency exceeds
   /// [`WatcherOptions::MAX_LATENCY`].
@@ -143,6 +161,12 @@ impl OptionsError {
   #[inline]
   pub const fn is_exclusion_too_long(&self) -> bool {
     matches!(self, Self::ExclusionTooLong { .. })
+  }
+
+  /// Whether this is [`ExclusionNotAbsolute`](Self::ExclusionNotAbsolute).
+  #[inline]
+  pub const fn is_exclusion_not_absolute(&self) -> bool {
+    matches!(self, Self::ExclusionNotAbsolute { .. })
   }
 
   /// Whether this is [`TooManyPrunePatterns`](Self::TooManyPrunePatterns).
@@ -267,12 +291,13 @@ const fn check_cookie_global_cap(cap: NonZeroUsize) -> Result<NonZeroUsize, Opti
 ///
 /// With the `serde` feature the household is one object keyed by the field names.
 /// Every key is optional: an absent one takes the value [`new`](Self::new) gives
-/// it, so a document names only what it overrides, and an unknown key is ignored
-/// (a document written for a later version still loads). Durations are humantime
-/// text (`"10ms"`, `"2s"`), the capacities plain integers (a `0` is refused — they
-/// are non-zero types), the exclusions plain paths, `cookie_global_cap` a non-zero
-/// integer whose omitted default is the host platform's, and
-/// `max_map_directories` either an integer cap or `null` for uncapped.
+/// it, so a document names only what it overrides, and an unknown key is rejected
+/// (a typo in a key name must not silently drop the knob it was meant to set).
+/// Durations are humantime text (`"10ms"`, `"2s"`), the capacities plain integers
+/// (a `0` is refused — they are non-zero types), the exclusions plain paths,
+/// `cookie_global_cap` a non-zero integer whose omitted default is the host
+/// platform's, and `max_map_directories` either an integer cap or `null` for
+/// uncapped.
 ///
 /// ```json
 /// {
@@ -318,6 +343,7 @@ const fn check_cookie_global_cap(cap: NonZeroUsize) -> Result<NonZeroUsize, Opti
 /// ```text
 /// $ app --latency 25ms --watcher-event-capacity 4096 --backend fanotify \
 ///       --exclusions /repo/target --max-map-directories 250000
+/// $ app --max-map-directories-unbounded      # no ceiling on the map
 /// ```
 ///
 /// ## The one flag that is not its field's name
@@ -335,9 +361,16 @@ const fn check_cookie_global_cap(cap: NonZeroUsize) -> Result<NonZeroUsize, Opti
 /// their own keys, so nothing there ever collides, and this exception is the CLI's
 /// alone.
 ///
-/// Uncapped (`max_map_directories = None`) is deliberately NOT expressible from a
-/// flag — its own documentation explains why the default is finite — nor from a
-/// document format without a null literal; a caller that wants it says so in code.
+/// Uncapped (`max_map_directories = None`) has its own flag,
+/// `--max-map-directories-unbounded`, conflicting with `--max-map-directories`
+/// since a request for no ceiling and a request for a specific one cannot both
+/// stand; a document format without a null literal still cannot express it, and
+/// a caller on such a format says so in code.
+///
+/// The empty exclusion list has its own flag too, `--exclusions-none`,
+/// conflicting with `--exclusions`: the latter requires a value per occurrence,
+/// so no spelling of it names zero, and the empty list is otherwise reachable
+/// only in code.
 ///
 /// `--cookie-global-cap` is the one flag whose printed default is the HOST's rather
 /// than a constant of this crate: 64 where the watcher is built for macOS and 128
@@ -351,10 +384,15 @@ const fn check_cookie_global_cap(cap: NonZeroUsize) -> Result<NonZeroUsize, Opti
 /// `--exclusions` REPLACES the list it updates — the flag repeats to spell a whole
 /// list, and there is no spelling for "add one to what is already there" — so an
 /// update that names it states the complete set of exclusion paths, and one that
-/// does not name it leaves the existing set alone.
+/// does not name it leaves the existing set alone. `--exclusions-none` on the
+/// command line clears the list to empty the same way; naming neither it nor
+/// `--exclusions` leaves the existing list exactly as it stood.
+/// `--max-map-directories-unbounded` on the command line clears an existing
+/// cap; naming neither it nor `--max-map-directories` leaves the existing one
+/// exactly as it stood.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(default))]
+#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
 pub struct WatcherOptions {
   // The bounded durations keep humantime's SERIALIZER and take a deserializer
   // that reads the same text and then asks the shared range rule — `with` would
@@ -452,7 +490,11 @@ impl<'de> serde::Deserialize<'de> for Exclusion {
             WatcherOptions::MAX_EXCLUSION_LEN
           )));
         }
-        Ok(Exclusion(PathBuf::from(path)))
+        let path = PathBuf::from(path);
+        if !path.is_absolute() {
+          return Err(E::custom(EXCLUSION_NOT_ABSOLUTE_MESSAGE));
+        }
+        Ok(Exclusion(path))
       }
     }
 
@@ -563,7 +605,11 @@ fn bounded_exclusion() -> impl clap::builder::TypedValueParser<Value = PathBuf> 
         WatcherOptions::MAX_EXCLUSION_LEN
       ));
     }
-    Ok(PathBuf::from(value))
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+      return Err(EXCLUSION_NOT_ABSOLUTE_MESSAGE.to_string());
+    }
+    Ok(path)
   })
 }
 
@@ -827,7 +873,7 @@ fn refuse_over_full_exclusions(matches: &clap::ArgMatches) -> Result<(), clap::E
   Ok(())
 }
 
-/// The `clap` face of [`WatcherOptions`]: the same nine flags the household derived
+/// The `clap` face of [`WatcherOptions`]: the same ten flags the household derived
 /// before, kept in a proxy so the UPDATE can be written by hand (see
 /// [`command_line_value`]). The group id is pinned to the household's own name, so a
 /// command that flattens the group is unchanged.
@@ -871,6 +917,12 @@ struct WatcherOptionsArgs {
   os_buffer_bytes: NonZeroU32,
   #[arg(long, value_parser = bounded_exclusion())]
   exclusions: Vec<PathBuf>,
+  /// The empty exclusion list — the one household value `--exclusions` cannot
+  /// reach: it requires a value per occurrence, and there is no spelling of it
+  /// that names zero. Conflicts with `--exclusions`, since a request for no
+  /// exclusions and a request for specific ones cannot both stand.
+  #[arg(long, conflicts_with = "exclusions")]
+  exclusions_none: bool,
   #[arg(long, value_enum, default_value_t = WatcherOptions::DEFAULT_BACKEND)]
   backend: Backend,
   #[arg(
@@ -881,6 +933,15 @@ struct WatcherOptionsArgs {
   root_liveness_interval: Duration,
   #[arg(long, default_value = clap_default_max_map_directories())]
   max_map_directories: Option<usize>,
+  /// No ceiling on the directories the map may hold — the kernel-recursive
+  /// spawns take the tree as it is.
+  ///
+  /// The one household value `--max-map-directories` cannot reach: a cap is
+  /// always a `Some`, so uncapped needs its own flag. Conflicts with
+  /// `--max-map-directories`, since a request for no ceiling and a request for
+  /// a specific one cannot both stand.
+  #[arg(long, conflicts_with = "max_map_directories")]
+  max_map_directories_unbounded: bool,
   #[arg(
     long,
     value_parser = parse_cookie_global_cap,
@@ -938,9 +999,11 @@ impl From<WatcherOptionsArgs> for WatcherOptions {
       os_batch_capacity,
       os_buffer_bytes,
       exclusions,
+      exclusions_none,
       backend,
       root_liveness_interval,
       max_map_directories,
+      max_map_directories_unbounded,
       cookie_global_cap,
     } = args;
     Self {
@@ -949,10 +1012,18 @@ impl From<WatcherOptionsArgs> for WatcherOptions {
       event_capacity,
       os_batch_capacity,
       os_buffer_bytes,
-      exclusions,
+      exclusions: if exclusions_none {
+        Vec::new()
+      } else {
+        exclusions
+      },
       backend,
       root_liveness_interval,
-      max_map_directories,
+      max_map_directories: if max_map_directories_unbounded {
+        None
+      } else {
+        max_map_directories
+      },
       cookie_global_cap,
     }
   }
@@ -990,7 +1061,11 @@ impl clap::FromArgMatches for WatcherOptions {
     if let Some(os_buffer_bytes) = command_line_value(matches, "os_buffer_bytes") {
       self.os_buffer_bytes = os_buffer_bytes;
     }
-    if let Some(exclusions) = command_line_values(matches, "exclusions") {
+    // `--exclusions-none` and `--exclusions` conflict, so at most one of them is
+    // ever given; naming neither leaves the existing list exactly as it stood.
+    if command_line_value::<bool>(matches, "exclusions_none") == Some(true) {
+      self.exclusions = Vec::new();
+    } else if let Some(exclusions) = command_line_values(matches, "exclusions") {
       self.exclusions = exclusions;
     }
     if let Some(backend) = command_line_value(matches, "backend") {
@@ -999,9 +1074,12 @@ impl clap::FromArgMatches for WatcherOptions {
     if let Some(interval) = command_line_value(matches, "root_liveness_interval") {
       self.root_liveness_interval = interval;
     }
-    // Uncapped has no flag (see the type docs), so a named cap can only ever be a
-    // cap — an update never says "remove the ceiling".
-    if let Some(cap) = command_line_value::<usize>(matches, "max_map_directories") {
+    // `--max-map-directories-unbounded` and `--max-map-directories` conflict, so
+    // at most one of them is ever given; naming neither leaves the existing cap
+    // exactly as it stood.
+    if command_line_value::<bool>(matches, "max_map_directories_unbounded") == Some(true) {
+      self.max_map_directories = None;
+    } else if let Some(cap) = command_line_value::<usize>(matches, "max_map_directories") {
       self.max_map_directories = Some(cap);
     }
     if let Some(cap) = command_line_value::<NonZeroUsize>(matches, "cookie_global_cap") {
@@ -1280,6 +1358,13 @@ impl WatcherOptions {
         supplied: exclusion.as_os_str().len(),
       });
     }
+    if let Some(index) = self
+      .exclusions
+      .iter()
+      .position(|exclusion| !exclusion.is_absolute())
+    {
+      return Err(OptionsError::ExclusionNotAbsolute { index });
+    }
     // Each range rule is asked of the SHARED checker, which the serde
     // deserializers and the clap value parsers ask too — so a document or a
     // command line is refused where the value is written, and this validation and
@@ -1497,6 +1582,11 @@ impl WatcherOptions {
   }
 
   /// Returns these options with the exclusion directories set.
+  ///
+  /// Not checked here: an empty or relative element is refused only when
+  /// [`validate`](Self::validate) runs (every [`Watcher`](crate::Watcher)
+  /// constructor calls it before spawning anything), as
+  /// [`OptionsError::ExclusionNotAbsolute`].
   #[inline]
   #[must_use]
   pub fn with_exclusions(mut self, exclusions: Vec<PathBuf>) -> Self {
@@ -1505,6 +1595,11 @@ impl WatcherOptions {
   }
 
   /// Sets the exclusion directories.
+  ///
+  /// Not checked here: an empty or relative element is refused only when
+  /// [`validate`](Self::validate) runs (every [`Watcher`](crate::Watcher)
+  /// constructor calls it before spawning anything), as
+  /// [`OptionsError::ExclusionNotAbsolute`].
   #[inline]
   pub fn set_exclusions(&mut self, exclusions: Vec<PathBuf>) -> &mut Self {
     self.exclusions = exclusions;
@@ -1807,33 +1902,51 @@ impl Default for WatcherOptions {
 /// $ app --include                       # directories and Rescans only
 /// ```
 ///
+/// `--prune` requires a value per occurrence and `include = None` is spelled
+/// only by omitting `--include`, so on an UPDATE — where omission means
+/// preserve — neither flag alone can return an already-pruning or
+/// already-narrowed household to the empty/absent seat. `--prune-none`
+/// (conflicts with `--prune`) and `--include-all` (conflicts with `--include`)
+/// are the two reset flags that reach those states:
+///
+/// ```text
+/// $ app --prune-none                    # prune nothing, whatever stood before
+/// $ app --include-all                   # deliver every file again
+/// ```
+///
 /// The interest flags are `--created`, `--removed`, `--modified`, `--moved`,
 /// `--attrib` and `--ondir`, and a command line that gives NONE of them parses to
 /// [`new`](Self::new) — every kind, the same household the serde face and
 /// [`Watcher::watch`](crate::Watcher::watch) hand back. Giving any of them narrows
-/// to exactly those:
+/// to exactly those. `--interest-none` spells the one household value the six
+/// together cannot reach — the EMPTY interest, subscribing to no event kind so
+/// the root delivers only coverage `Rescan`s — and conflicts with all six, since a
+/// request for no event kind and a request for a specific one cannot both stand:
 ///
 /// ```text
 /// $ app --prune '**/node_modules'            # every kind, node_modules pruned
 /// $ app --created --moved                    # creates and moves alone
+/// $ app --interest-none                      # no event kind, Rescans only
 /// ```
 ///
 /// This is deliberately NOT the standalone [`Interest`] group's own clap face,
-/// where a flagless parse is the EMPTY mask. There, the flags ARE the whole value
-/// and an empty one is a legitimate thing to spell; here they are one field of a
-/// household whose every OTHER face defaults to
-/// [`Interest::all`](tributary_proto::Interest::all), and a flagless
-/// `RootOptions` that silently subscribed to nothing would make the command line
-/// mean something no other face means — creates, modifications, removals and moves
-/// all absent, with only the unmaskable `Rescan`s left. A command line that really
-/// wants the empty mask says so through the [`Interest`] group directly.
+/// where a flagless parse is itself the EMPTY mask. There, the flags ARE the
+/// whole value and an empty one is the flagless spelling; here they are one field
+/// of a household whose every OTHER face defaults to
+/// [`Interest::all`](tributary_proto::Interest::all), so a flagless `RootOptions`
+/// keeps meaning every kind and the empty mask needs its own explicit flag to
+/// mean anything on this face.
 ///
 /// An UPDATE (`clap::FromArgMatches::update_from_arg_matches`) changes only what
 /// the command line actually carried: updating `--prune` alone leaves the
-/// existing interest exactly as it was, the empty one included.
+/// existing interest exactly as it was, the empty one included; `--interest-none`
+/// on the command line empties it. The two seats follow the same rule through
+/// their own reset flags: naming neither `--prune` nor `--prune-none` leaves
+/// the prune seat exactly as it stood, and likewise for `--include` /
+/// `--include-all`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(default))]
+#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
 pub struct RootOptions {
   interest: Interest,
   #[cfg_attr(feature = "serde", serde(deserialize_with = "deserialize_seat"))]
@@ -1960,8 +2073,10 @@ where
 /// the protocol [`Interest`] group straight into [`RootOptions`] made a flagless
 /// parse the EMPTY interest while every other face of the same type defaults to
 /// [`Interest::all`](tributary_proto::Interest::all). The proxy keeps the flags
-/// identical and only reinterprets the flagless case, so the standalone group's own
-/// face is untouched.
+/// identical, reinterprets the flagless case, and adds one flag of its own,
+/// `--interest-none`, so the household value the six kind flags cannot reach —
+/// the empty interest — still has a spelling; the standalone group's own face is
+/// untouched.
 #[cfg(feature = "clap")]
 #[derive(Debug, Clone, clap::Args)]
 struct RootOptionsArgs {
@@ -1987,6 +2102,18 @@ struct RootOptionsArgs {
   /// Raw strings for `prune`'s reason, and bounded the same way.
   #[arg(long, num_args = 0..=1)]
   include: Option<Vec<String>>,
+  /// Reset the prune seat to empty: the one household value `--prune` cannot
+  /// reach on an UPDATE, since `--prune` requires a value per occurrence and an
+  /// update naming neither flag preserves whatever prune seat already stood.
+  /// Conflicts with `--prune`.
+  #[arg(long, conflicts_with = "prune")]
+  prune_none: bool,
+  /// Reset the include seat to absent (deliver every file): the one household
+  /// value `--include` cannot reach on an UPDATE, since `include = None` is
+  /// spelled only by omitting `--include` entirely and an update reads
+  /// omission as preserve. Conflicts with `--include`.
+  #[arg(long, conflicts_with = "include")]
+  include_all: bool,
 }
 
 /// Collects ONE glob seat from a caller's iterator, taking at most
@@ -2071,13 +2198,33 @@ struct RootInterestArgs {
   attrib: bool,
   #[arg(long)]
   ondir: bool,
+  /// Subscribe to no event kind: the root delivers only coverage `Rescan`s.
+  ///
+  /// The one household value the six kind flags above cannot reach: narrowing
+  /// to none of them is exactly the flagless case, which reads back as
+  /// [`RootOptions::DEFAULT_INTEREST`]. Conflicts with all six, since a request
+  /// for no event kind and a request for a specific one cannot both stand.
+  #[arg(
+    long,
+    conflicts_with_all = ["created", "removed", "modified", "moved", "attrib", "ondir"]
+  )]
+  interest_none: bool,
 }
 
 #[cfg(feature = "clap")]
 impl RootInterestArgs {
-  /// The flag names, in the order [`Interest`] reads them — the ONE list, so a
-  /// flag added to the group cannot be forgotten by the update rule.
-  const FLAGS: [&'static str; 6] = ["created", "removed", "modified", "moved", "attrib", "ondir"];
+  /// The flag names, in the order [`Interest`] reads them, plus
+  /// `interest_none` — the ONE list, so a flag added to the group cannot be
+  /// forgotten by the update rule.
+  const FLAGS: [&'static str; 7] = [
+    "created",
+    "removed",
+    "modified",
+    "moved",
+    "attrib",
+    "ondir",
+    "interest_none",
+  ];
 
   /// Whether the parse actually SAW an interest flag on the command line.
   ///
@@ -2095,8 +2242,9 @@ impl RootInterestArgs {
 
 #[cfg(feature = "clap")]
 impl From<RootInterestArgs> for Interest {
-  /// NO flag given is the DEFAULT household ([`Interest::all`]); any flag given
-  /// narrows to exactly the ones that were.
+  /// NO flag given is the DEFAULT household ([`Interest::all`]); `--interest-none`
+  /// yields the EMPTY interest; any kind flag given narrows to exactly the ones
+  /// that were.
   fn from(args: RootInterestArgs) -> Self {
     let RootInterestArgs {
       created,
@@ -2105,7 +2253,11 @@ impl From<RootInterestArgs> for Interest {
       moved,
       attrib,
       ondir,
+      interest_none,
     } = args;
+    if interest_none {
+      return Interest::new();
+    }
     if !(created || removed || modified || moved || attrib || ondir) {
       return RootOptions::DEFAULT_INTEREST;
     }
@@ -2122,9 +2274,9 @@ impl From<RootInterestArgs> for Interest {
 #[cfg(feature = "clap")]
 impl From<Interest> for RootInterestArgs {
   /// The inverse, for `update_from_arg_matches`: the flags an already-built
-  /// household would have been spelled with. The EMPTY interest has no spelling on
-  /// this face — no flag given means "every kind" — so it round-trips back to
-  /// [`Interest::all`], which is the same rule a flagless parse follows.
+  /// household would have been spelled with. The EMPTY interest spells as
+  /// `interest_none: true`, so it round-trips like every other value instead of
+  /// reading back as [`Interest::all`].
   fn from(interest: Interest) -> Self {
     Self {
       created: interest.created(),
@@ -2133,6 +2285,7 @@ impl From<Interest> for RootInterestArgs {
       moved: interest.moved(),
       attrib: interest.attrib(),
       ondir: interest.ondir(),
+      interest_none: interest.is_empty(),
     }
   }
 }
@@ -2141,14 +2294,29 @@ impl From<Interest> for RootInterestArgs {
 impl RootOptionsArgs {
   /// The household these arguments spell — the one site the two seats are compiled
   /// at, and only after [`compile_seat`] has judged their length.
+  ///
+  /// `prune_none`/`include_all` win over whatever `prune`/`include` carry: the
+  /// two pairs conflict at the parse, so at most one of each pair is ever set,
+  /// and the reset flag is the one spelling that can return an update to the
+  /// empty/absent seat a plain omission cannot reach.
   fn into_options(self) -> Result<RootOptions, clap::Error> {
-    Ok(RootOptions {
-      interest: self.interest.into(),
-      prune: compile_seat(self.prune, "--prune")?,
-      include: self
+    let prune = if self.prune_none {
+      Vec::new()
+    } else {
+      compile_seat(self.prune, "--prune")?
+    };
+    let include = if self.include_all {
+      None
+    } else {
+      self
         .include
         .map(|include| compile_seat(include, "--include"))
-        .transpose()?,
+        .transpose()?
+    };
+    Ok(RootOptions {
+      interest: self.interest.into(),
+      prune,
+      include,
     })
   }
 }
@@ -2156,7 +2324,10 @@ impl RootOptionsArgs {
 #[cfg(feature = "clap")]
 impl From<&RootOptions> for RootOptionsArgs {
   /// The way back, for an UPDATE: a compiled seat renders to the patterns it was
-  /// compiled from, which is the spelling the flags carry.
+  /// compiled from, which is the spelling the flags carry. The empty prune seat
+  /// spells as `prune_none: true` and the absent include seat as
+  /// `include_all: true`, so each round-trips like every other value instead of
+  /// reading back as a bare omission an update would then leave untouched.
   fn from(options: &RootOptions) -> Self {
     Self {
       interest: options.interest.into(),
@@ -2165,6 +2336,8 @@ impl From<&RootOptions> for RootOptionsArgs {
         .include
         .as_ref()
         .map(|include| include.iter().map(seat_pattern).collect()),
+      prune_none: options.prune.is_empty(),
+      include_all: options.include.is_none(),
     }
   }
 }
@@ -2185,18 +2358,19 @@ impl clap::FromArgMatches for RootOptions {
   /// existing household exactly as it stood.
   ///
   /// The interest is the field that cannot be updated through the proxy, and the
-  /// reason is the proxy's own rule: no interest flag given means
-  /// [`Interest::all`], which is what makes a flagless `RootOptions` the default
-  /// household. Round-tripping an EXISTING interest through those flags therefore
-  /// erases the empty one — `RootOptions::new().with_interest(Interest::new())`
-  /// has no flag set, so the way back reads it as "every kind" — and an update of
+  /// reason is the proxy's own rule: no interest flag given, `--interest-none`
+  /// included, means [`Interest::all`], which is what makes a flagless
+  /// `RootOptions` the default household. Rebuilding the proxy's flags from
+  /// whatever the command line parsed to and reading them back unconditionally
+  /// would therefore erase an EXISTING narrowed or empty interest — an update of
   /// an unrelated `--prune` would silently broaden what the caller subscribed to.
   ///
   /// So the flags are consulted rather than the value: the interest changes only
-  /// when at least one of them came from the command line, and otherwise the
-  /// existing one is kept whatever it says. That is the same rule the two glob
-  /// seats already get from clap's own update — a repeatable argument nobody gave
-  /// has no values, so it leaves the field alone.
+  /// when at least one of the seven — the six kind flags or `--interest-none` —
+  /// came from the command line, and otherwise the existing one is kept whatever
+  /// it says. That is the same rule the two glob seats already get from clap's
+  /// own update — a repeatable argument nobody gave has no values, so it leaves
+  /// the field alone.
   fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
     let mut args = RootOptionsArgs::from(&*self);
     args.update_from_arg_matches(matches)?;
@@ -2228,19 +2402,22 @@ impl clap::FromArgMatches for RootOptions {
 /// the interest flags. An empty group is never present, so every flag would be
 /// parsed and then silently discarded.
 ///
-/// So the members are named here, and named EXHAUSTIVELY: the six interest flags
-/// come from [`RootInterestArgs::FLAGS`] — the one list a new flag must be added
-/// to — and the two seats are spelled beside them. A flag missing from this group
-/// is a flag whose presence cannot turn an optional household `Some`.
+/// So the members are named here, and named EXHAUSTIVELY: the seven interest
+/// flags (the six kind flags and `--interest-none`) come from
+/// [`RootInterestArgs::FLAGS`] — the one list a new flag must be added to — and
+/// the four seat flags (`--prune`, `--include`, `--prune-none`,
+/// `--include-all`) are spelled beside them. A flag missing from this group is
+/// a flag whose presence cannot turn an optional household `Some`.
 #[cfg(feature = "clap")]
 impl RootOptions {
   /// The group's id, stable across releases: a downstream `ArgGroup` that names
   /// this household refers to it by this string.
   const GROUP_ID: &'static str = "RootOptions";
 
-  /// The arguments the group holds — the two seats, plus every interest flag.
+  /// The arguments the group holds — the two seats and their reset flags, plus
+  /// every interest flag.
   fn group_members() -> impl Iterator<Item = clap::Id> {
-    ["prune", "include"]
+    ["prune", "include", "prune_none", "include_all"]
       .into_iter()
       .chain(RootInterestArgs::FLAGS)
       .map(clap::Id::from)

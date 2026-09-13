@@ -103,13 +103,16 @@ mod serde_face {
     assert!(!parsed.attrib() && !parsed.ondir());
   }
 
-  /// Forward compatibility: no `deny_unknown_fields`, so a document written for a
-  /// later vocabulary still loads.
+  /// A misspelled or future kind name is refused rather than silently ignored — a
+  /// typo must not parse as the EMPTY mask for the kind it meant to admit.
   #[test]
-  fn an_unknown_key_is_accepted() {
-    let parsed: Interest =
-      serde_json::from_str(r#"{"created": true, "some_future_kind": true}"#).unwrap();
-    assert_eq!(parsed, Interest::new().with_created());
+  fn an_unknown_key_is_refused() {
+    let err = serde_json::from_str::<Interest>(r#"{"created": true, "some_future_kind": true}"#)
+      .expect_err("an unknown key is refused");
+    assert!(
+      err.to_string().contains("some_future_kind"),
+      "the error names the unknown key: {err}"
+    );
   }
 
   #[test]
@@ -121,13 +124,15 @@ mod serde_face {
   }
 }
 
-/// The `clap` face: one `--<field>` flag per bit, each defaulting to `false`.
+/// The `clap` face: one `--<field>` flag per bit, each defaulting to `false` and
+/// each also taking an explicit boolean value (`--created`, `--created=true`,
+/// `--created=false`).
 #[cfg(feature = "clap")]
 mod clap_face {
   use super::Interest;
   use clap::Parser as _;
 
-  #[derive(clap::Parser)]
+  #[derive(Debug, clap::Parser)]
   struct Cli {
     #[command(flatten)]
     interest: Interest,
@@ -166,6 +171,52 @@ mod clap_face {
     assert_eq!(
       parse(&["--created", "--moved", "--ondir"]),
       Interest::new().with_created().with_moved().with_ondir()
+    );
+  }
+
+  /// `--<field>=true` is the same as the bare flag.
+  #[test]
+  fn an_explicit_true_value_sets_exactly_its_own_bit() {
+    type Case = (&'static str, fn(Interest) -> Interest);
+
+    let cases: [Case; 6] = [
+      ("--created=true", |i| i.with_created()),
+      ("--removed=true", |i| i.with_removed()),
+      ("--modified=true", |i| i.with_modified()),
+      ("--moved=true", |i| i.with_moved()),
+      ("--attrib=true", |i| i.with_attrib()),
+      ("--ondir=true", |i| i.with_ondir()),
+    ];
+    for (flag, expected) in cases {
+      assert_eq!(parse(&[flag]), expected(Interest::new()), "{flag}");
+    }
+  }
+
+  /// `--<field>=false` on a PARSE leaves that bit false, same as the flag being
+  /// absent — and leaves every other bit false too, since the parse's value is
+  /// the whole mask.
+  #[test]
+  fn an_explicit_false_value_leaves_the_bit_false_on_a_parse() {
+    for flag in [
+      "--created=false",
+      "--removed=false",
+      "--modified=false",
+      "--moved=false",
+      "--attrib=false",
+      "--ondir=false",
+    ] {
+      assert_eq!(parse(&[flag]), Interest::new(), "{flag}");
+    }
+  }
+
+  /// A bare flag followed by a separate token does not swallow that token as the
+  /// value — `require_equals` makes only the `--flag=value` spelling attach a
+  /// value, so a bare `--created` ahead of an unrelated flag parses both.
+  #[test]
+  fn a_bare_flag_does_not_consume_a_following_token_as_its_value() {
+    assert_eq!(
+      parse(&["--created", "--moved"]),
+      Interest::new().with_created().with_moved()
     );
   }
 
@@ -213,11 +264,65 @@ mod clap_face {
     assert_eq!(all, Interest::all());
   }
 
+  /// `--<field>=false` on an UPDATE clears a bit a previous parse had set — the
+  /// defect this group's flags were rewritten to fix — and leaves the bits the
+  /// command line did not name exactly as they stood.
+  #[test]
+  fn an_update_with_an_explicit_false_clears_a_previously_set_bit() {
+    use clap::{CommandFactory as _, FromArgMatches as _};
+
+    fn matches(args: &[&str]) -> clap::ArgMatches {
+      Cli::command_for_update().get_matches_from(std::iter::once("app").chain(args.iter().copied()))
+    }
+
+    let mut interest = Interest::all();
+    interest
+      .update_from_arg_matches(&matches(&["--created=false"]))
+      .expect("the update applies");
+    assert_eq!(
+      interest,
+      Interest::all().maybe_created(false),
+      "created is cleared; every other bit stands"
+    );
+    assert!(!interest.created());
+    assert!(
+      interest.removed()
+        && interest.modified()
+        && interest.moved()
+        && interest.attrib()
+        && interest.ondir()
+    );
+
+    // Two explicit values in one update land on exactly those two bits.
+    let mut interest = Interest::all();
+    interest
+      .update_from_arg_matches(&matches(&["--created=false", "--moved=false"]))
+      .expect("the update applies");
+    assert!(!interest.created());
+    assert!(!interest.moved());
+    assert!(interest.removed() && interest.modified() && interest.attrib() && interest.ondir());
+  }
+
   /// The PARSE rule is unchanged: no flag at all is the empty mask, which is what
   /// makes the group's flags the whole value they are.
   #[test]
   fn the_flagless_parse_is_still_the_empty_mask() {
     assert_eq!(parse(&[]), Interest::new());
     assert!(parse(&[]).is_empty());
+  }
+
+  /// The value-taking rewrite (`ArgAction::Set`, `num_args = 0..=1`,
+  /// `require_equals`) keeps the derived command structurally valid — ids,
+  /// groups and conflicts all resolve. `--help` itself is not asserted here:
+  /// this crate's `clap` dependency deliberately enables only `["std",
+  /// "derive"]`, no `help` feature, since a library crate leaves help
+  /// rendering to the binary that flattens its args in — asking this
+  /// standalone `Cli` for `--help` fails with `UnknownArgument`, not
+  /// `DisplayHelp`.
+  #[test]
+  fn the_derived_command_validates() {
+    use clap::CommandFactory as _;
+
+    Cli::command().debug_assert();
   }
 }

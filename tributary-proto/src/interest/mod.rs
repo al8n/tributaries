@@ -13,8 +13,9 @@
 ///
 /// With the `serde` feature the mask is a plain object of its own field names,
 /// every key optional and defaulted from [`Interest::new`] (the EMPTY mask), so a
-/// document names only what it subscribes to. Unknown keys are ignored — a
-/// document written for a later version still loads.
+/// document names only what it subscribes to. Unknown keys are rejected — a
+/// misspelled kind name (`modifed` for `modified`) must not silently parse as
+/// the EMPTY mask for that kind and drop the deliveries it was meant to admit.
 ///
 /// ```json
 /// { "created": true, "removed": true, "moved": true }
@@ -27,22 +28,25 @@
 ///
 /// With the `clap` feature it is a `clap::Args` group of one `--<field>` flag per
 /// bit. Every bit defaults to `false`, so a bare flag SETS it and the flagless
-/// command line is [`Interest::new`]:
+/// command line is [`Interest::new`]. Each flag also takes an explicit boolean
+/// value — bare `--created` (equivalent to `--created=true`) or `--created=false` —
+/// so the mask can be spelled either way on a PARSE:
 ///
 /// ```text
-/// $ app --created --removed --moved
+/// $ app --created --removed --moved --attrib=false
 /// ```
 ///
-/// An UPDATE (`clap::FromArgMatches::update_from_arg_matches`) sets only the bits
-/// the command line actually named, and leaves every other one as it stood: a
-/// household updated for an unrelated argument keeps the subscription it was
-/// carrying. That is not what the flags mean on a PARSE — there they are the whole
-/// value, and the ones absent are the mask's `false`s — but an update is handed an
-/// existing mask, and writing `false` over a bit nobody mentioned would silently
-/// unsubscribe it.
+/// An UPDATE (`clap::FromArgMatches::update_from_arg_matches`) sets each bit to the
+/// value the command line actually named — true OR false — and leaves every other
+/// one as it stood: a household updated for an unrelated argument keeps the
+/// subscription it was carrying, and `--created=false` now reaches an existing
+/// mask and clears that bit rather than being unreachable. That is not what the
+/// flags mean on a PARSE — there they are the whole value, and the ones absent are
+/// the mask's `false`s — but an update is handed an existing mask, and writing
+/// `false` over a bit nobody mentioned would silently unsubscribe it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(default))]
+#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
 pub struct Interest {
   created: bool,
   removed: bool,
@@ -56,24 +60,78 @@ pub struct Interest {
 /// kept in a proxy so the UPDATE can be written by hand. The group id is pinned to
 /// the type's own name, so a command that flattens the group is unchanged.
 ///
-/// A bare `bool` flag carries clap's own `false` default, which is why the derived
-/// update could not be kept: it asks `contains_id`, and a default satisfies that
-/// exactly as a given flag does.
+/// Each flag takes an optional boolean value (`ArgAction::Set`, `num_args =
+/// 0..=1`, `default_missing_value = "true"`), so `--created`, `--created=true` and
+/// `--created=false` all parse; `require_equals` is set so the value, when given,
+/// must be attached with `=` — a following bare token is never swallowed as the
+/// flag's value, so `--created` ahead of an unrelated positional is unambiguous.
+/// A value-taking flag with a parse default still always has a value present in
+/// `ArgMatches`, which is why the derived update could not be kept: it asks
+/// `contains_id`, and a default satisfies that exactly as a given flag does — the
+/// hand-written update below reads the value's SOURCE instead.
 #[cfg(feature = "clap")]
 #[derive(Debug, Clone, clap::Args)]
 #[group(id = "Interest")]
 struct InterestArgs {
-  #[arg(long)]
+  #[arg(
+    long,
+    value_name = "BOOL",
+    action = clap::ArgAction::Set,
+    num_args = 0..=1,
+    require_equals = true,
+    default_missing_value = "true",
+    default_value_t = false
+  )]
   created: bool,
-  #[arg(long)]
+  #[arg(
+    long,
+    value_name = "BOOL",
+    action = clap::ArgAction::Set,
+    num_args = 0..=1,
+    require_equals = true,
+    default_missing_value = "true",
+    default_value_t = false
+  )]
   removed: bool,
-  #[arg(long)]
+  #[arg(
+    long,
+    value_name = "BOOL",
+    action = clap::ArgAction::Set,
+    num_args = 0..=1,
+    require_equals = true,
+    default_missing_value = "true",
+    default_value_t = false
+  )]
   modified: bool,
-  #[arg(long)]
+  #[arg(
+    long,
+    value_name = "BOOL",
+    action = clap::ArgAction::Set,
+    num_args = 0..=1,
+    require_equals = true,
+    default_missing_value = "true",
+    default_value_t = false
+  )]
   moved: bool,
-  #[arg(long)]
+  #[arg(
+    long,
+    value_name = "BOOL",
+    action = clap::ArgAction::Set,
+    num_args = 0..=1,
+    require_equals = true,
+    default_missing_value = "true",
+    default_value_t = false
+  )]
   attrib: bool,
-  #[arg(long)]
+  #[arg(
+    long,
+    value_name = "BOOL",
+    action = clap::ArgAction::Set,
+    num_args = 0..=1,
+    require_equals = true,
+    default_missing_value = "true",
+    default_value_t = false
+  )]
   ondir: bool,
 }
 
@@ -113,8 +171,10 @@ impl clap::FromArgMatches for Interest {
     InterestArgs::from_arg_matches(matches).map(Into::into)
   }
 
-  /// Sets each bit the COMMAND LINE named, and leaves every other one as it stood
-  /// — one list of flags, so a bit added to the mask cannot be forgotten here.
+  /// Sets each bit to the value the COMMAND LINE named — true or false — and
+  /// leaves every other one as it stood — one list of flags, so a bit added to
+  /// the mask cannot be forgotten here, and `--created=false` clears a bit an
+  /// earlier parse had set.
   fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
     for (flag, bit) in [
       ("created", &mut self.created),

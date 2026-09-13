@@ -32,6 +32,7 @@ use std::{
   time::Duration,
 };
 
+#[cfg(feature = "sync")]
 use futures_util::FutureExt;
 use tempfile::TempDir;
 use tributaries::{
