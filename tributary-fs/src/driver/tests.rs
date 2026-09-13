@@ -1037,7 +1037,7 @@ async fn probes_outstanding(rig: &Rig) -> usize {
 /// interval to land: on a hosted runner with dozens of probe threads parked,
 /// that wait times the runner, not the driver, and can miss every window a
 /// suite is willing to spend. Safe to call on a scope whose probe is already
-/// outstanding, or whose budget decline already latched this episode — both
+/// outstanding, or whose budget decline still owes its covering `Rescan` — both
 /// coalesce exactly as a real tick would.
 #[cfg(not(miri))]
 async fn tick_liveness(rig: &Rig, scope: ScopeId) {
@@ -1488,8 +1488,39 @@ async fn drain_events(rig: &Rig) {
   }
 }
 
+/// The (arms, enumerates) this rig has executed at `path`, read once the pair
+/// has stopped moving.
+///
+/// The baseline a "no further watch-set work" claim is read against: the
+/// executor lands an arm and a read on the blocking pool rather than inside the
+/// tick that asked for them, so an absolute count taken the instant a tick
+/// replies can still be short of what that tick ordered.
+///
+/// not(miri): its only caller is the probe-budget cell below, which is itself
+/// `#[cfg(not(miri))]` — real parked threads, not an interpreter.
+#[cfg(not(miri))]
+async fn watch_work_at(rig: &Rig, path: &str) -> (usize, usize) {
+  let at = std::path::Path::new(path);
+  let mut last = (usize::MAX, usize::MAX);
+  let mut quiet = 0;
+  for _ in 0..interpreted_rounds(400) {
+    let now = (
+      rig.fs.arms().iter().filter(|(_, p)| p == at).count(),
+      rig.fs.enumerates().iter().filter(|(_, p)| p == at).count(),
+    );
+    quiet = if now == last { quiet + 1 } else { 0 };
+    last = now;
+    if quiet >= 10 {
+      return now;
+    }
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+  }
+  last
+}
+
 /// A scope the probe budget turns away is told its coverage is UNPROVEN, and
-/// told once.
+/// told again each time the last instruction has reached the consumer.
 ///
 /// A declined tick that only withdrew the core's pending mark left the scope
 /// falsely live and silent. At the budget there is no probe of this scope to
@@ -1505,14 +1536,28 @@ async fn drain_events(rig: &Rig) {
 /// DELTA — the registrations' own closing covers are drained first — while the
 /// budget is still full, never at the release.
 ///
-/// ONCE is the second half. The fact does not become more true each interval,
-/// and a `Rescan` per tick against a wedged filesystem is a re-enumeration storm
-/// the subscriber pays for. Read against many further ticks of the SAME
-/// declined scope, so a per-tick signal would be counted as such.
+/// RENEWAL is the second half, and it is why one `Rescan` cannot be the whole
+/// answer: the instruction says "re-enumerate now", which a subscriber
+/// discharges by re-enumerating, so a root that dies quietly after the first one
+/// would stay falsely live for as long as the saturation lasts — and a scope the
+/// budget starves can never dispatch the probe that would end the episode. Two
+/// refused ticks with the delivery of the first instruction between them
+/// therefore yield two covering `Rescan`s on this scope's stream. The liveness
+/// interval bounds the rate, and the consumer chose it.
 ///
-/// Revert witness: drop the loss funnel from the budget arm of
+/// What the renewal does NOT do is recover the watch set again. This rig's
+/// profile re-proves every retained binding when a scope-level loss recovers it,
+/// and a declined probe dropped no record at all — so the arms and reads at the
+/// declined root stand still across the renewal, which is what lets a tree whose
+/// reproof outlasts the interval settle instead of restarting under a generation
+/// the next renewal invalidates.
+///
+/// Revert witnesses: drop the loss funnel from the budget arm of
 /// `on_refresh_declined` and no `Rescan` arrives at all until the gate opens;
-/// drop the once-per-episode latch and the count runs with the ticks.
+/// keep the latch one-shot — drop the clear from `on_delivery`'s `Accepted` arm
+/// — and the second refused tick stands nothing; keep ONE latch, so the renewal
+/// re-enters the Monitor's overflow path, and the root is re-added and re-read
+/// at every refused tick.
 ///
 /// not(miri): the claim needs `MAX_LIVENESS_PROBES` real parked threads, exactly
 /// as its sibling above.
@@ -1528,15 +1573,15 @@ async fn drain_events(rig: &Rig) {
 /// budget by waiting on a wall-clock tick racing sixty-four parked OS threads
 /// (`settle_probes_within` against a real `root_liveness_interval`). Three
 /// widenings of that wait's window were not enough — on a slow or loaded
-/// runner a real tick could decline the sixty-fifth scope during STAGING,
-/// before the gate that holds `hold_refreshes` was even installed, consuming
-/// the FIRST claim's own covering `Rescan` in the baseline drain and leaving
-/// nothing for the forced tick below to observe (the decline is latched once
-/// per episode). Reverting the seam-driven fill and the seam-driven repeat
-/// loop below to a wall-clock wait reproduces both failure modes.
+/// runner a real tick could dispatch a probe for the sixty-fifth scope during
+/// STAGING, before the gate that holds `hold_refreshes` was even installed, so
+/// the scope the budget turns away is not the one this cell ticks and the
+/// outstanding count the staging asserts is not the budget. Reverting the
+/// seam-driven fill and the seam-driven ticks below to a wall-clock wait
+/// reproduces both failure modes.
 #[cfg(not(miri))]
 #[tokio::test]
-async fn a_probe_declined_at_the_budget_reports_the_scope_unproven_once() {
+async fn a_probe_declined_at_the_budget_reports_the_scope_unproven_and_renews() {
   let ticked = MAX_LIVENESS_PROBES + 1;
   let registry = RecordingRegistry::default();
   let roots: Vec<String> = (0..ticked).map(|index| format!("/r{index}")).collect();
@@ -1605,24 +1650,47 @@ async fn a_probe_declined_at_the_budget_reports_the_scope_unproven_once() {
     "and it is a degradation, not a terminal — nothing died"
   );
 
-  // THEN: nothing more, across many further ticks of the SAME declined scope in
-  // the same episode. The once-per-episode latch (`budget_lossy`) means a
-  // repeated decline of the scope the budget already turned away mints no
-  // second `Rescan` — driven directly, rather than waiting on further
-  // wall-clock intervals to make the same claim.
-  for _ in 0..16 {
-    tick_liveness(&rig, declined).await;
-  }
-  let mut repeats = 0usize;
+  // THEN: the RENEWAL. The first instruction is already the consumer's — the
+  // read above is what emptied the channel, and the driver reports the delivery
+  // the instant the send succeeds — so the report latch owes nothing and the next
+  // tick of the SAME scope into the SAME full budget stands another covering
+  // `Rescan`. Driven through the seam, so this is the second refused tick and
+  // not a wall-clock interval's.
+  //
+  // The watch set is the other half, and it is owed once per EPISODE: the first
+  // refused tick re-proved every binding under this root, and the renewal must
+  // re-add nothing and re-read nothing — a declined probe dropped no record, and
+  // a reinstall per interval would invalidate the generation the outstanding one
+  // is arming under.
+  let root = &roots[MAX_LIVENESS_PROBES];
+  let recovered = watch_work_at(&rig, root).await;
+  tick_liveness(&rig, declined).await;
+  assert!(
+    probes_hold_at(&rig, MAX_LIVENESS_PROBES).await,
+    "the budget is still full: this tick was refused exactly as the first was"
+  );
+  let mut renewed = 0usize;
   while let Ok((_, _, change)) = rig.events.try_recv() {
     if change.kind().is_rescan() {
-      repeats += 1;
+      renewed += 1;
     }
   }
+  assert!(
+    renewed > 0,
+    "a root the budget starves is told again once the last instruction reached \
+     the consumer — an event is not a state, so one `Rescan` cannot stand for a \
+     death that happens after it"
+  );
   assert_eq!(
-    repeats, 0,
-    "the episode is reported once: every later declined tick of the same budget \
-     adds nothing"
+    watch_work_at(&rig, root).await,
+    recovered,
+    "and it recovers NOTHING: the renewal re-adds no binding and re-reads no \
+     directory, so a tree whose reproof outlasts the interval settles instead \
+     of restarting"
+  );
+  assert!(
+    registry.dead().is_empty(),
+    "still a degradation, not a terminal — nothing died"
   );
 
   // The budget frees: every parked probe answers, the turned-away scope ticks
@@ -2889,6 +2957,43 @@ mod descending {
   /// cell that must observe a REFUSED delivery needs a capacity it can fill and
   /// keep full.
   fn inotify_rig_fs_capacity(fs: FakeFs, event_capacity: usize) -> Rig {
+    inotify_rig_fs_config(fs, event_capacity, inotify_config())
+  }
+
+  /// [`inotify_rig_fs_capacity`] with the driver's whole [`DriverConfig`] chosen by
+  /// the caller: a cell that needs a deadline the loop owes runs the same rig with
+  /// a non-zero `root_liveness_interval`.
+  fn inotify_rig_fs_config(fs: FakeFs, event_capacity: usize, config: DriverConfig) -> Rig {
+    fs.put("/r", FileKind::Dir, 1);
+    fs.spawn_backend(BackendKind::Inotify);
+    let (cmd_tx, cmd_rx) = async_channel::bounded(16);
+    let (cleanup, cookie_wake) = cookie_ingress();
+    let (ev_tx, ev_rx) = async_channel::bounded(event_capacity);
+    tokio::spawn(run::<TokioRuntime, FakeFs>(
+      config,
+      fs.clone(),
+      cmd_rx,
+      cookie_wake,
+      ev_tx,
+      NullRegistry,
+    ));
+    Rig {
+      fs,
+      commands: cmd_tx,
+      cleanup,
+      events: ev_rx,
+    }
+  }
+
+  /// [`inotify_rig_fs_capacity`] over a registry the caller supplies: the cells
+  /// that need the loop FROZEN mid-commit run the descending rig with
+  /// [`GatedRegistry`].
+  #[cfg(not(miri))]
+  fn inotify_rig_fs_registry(
+    fs: FakeFs,
+    event_capacity: usize,
+    registry: impl ScopeRegistry,
+  ) -> Rig {
     fs.put("/r", FileKind::Dir, 1);
     fs.spawn_backend(BackendKind::Inotify);
     let (cmd_tx, cmd_rx) = async_channel::bounded(16);
@@ -2900,7 +3005,7 @@ mod descending {
       cmd_rx,
       cookie_wake,
       ev_tx,
-      NullRegistry,
+      registry,
     ));
     Rig {
       fs,
@@ -3915,6 +4020,26 @@ mod descending {
       children: &[(&str, u64)],
       event_capacity: usize,
     ) -> (Rig, ScopeId) {
+      let fs = seeded_cover_tree(children);
+      staged_cover(inotify_rig_fs_capacity(fs, event_capacity), children).await
+    }
+
+    /// [`covered_rig`] whose driver also runs the root-liveness tick at `interval`,
+    /// so the loop owes a DEADLINE — the one input the select's timer arm is the
+    /// sole consumer of, and the one a cell can watch from outside through the
+    /// refreshes each tick dispatches.
+    #[cfg(not(miri))]
+    async fn ticking_covered_rig(children: &[(&str, u64)], interval: Duration) -> (Rig, ScopeId) {
+      let fs = seeded_cover_tree(children);
+      let config = DriverConfig {
+        root_liveness_interval: interval,
+        ..inotify_config()
+      };
+      staged_cover(inotify_rig_fs_config(fs, 1024, config), children).await
+    }
+
+    /// The tree a covered rig is spawned over: `/r` with `children` beneath it.
+    fn seeded_cover_tree(children: &[(&str, u64)]) -> FakeFs {
       assert!(
         !children.is_empty(),
         "the helper's staging rests on the registration window installing at least one child"
@@ -3923,7 +4048,12 @@ mod descending {
       for (path, ino) in children {
         fs.put(path, FileKind::Dir, *ino);
       }
-      let rig = inotify_rig_fs_capacity(fs, event_capacity);
+      fs
+    }
+
+    /// Registers `/r` on an already-spawned rig and runs [`covered_rig`]'s three
+    /// waits on it — the whole of the staging, shared by every rig flavor.
+    async fn staged_cover(rig: Rig, children: &[(&str, u64)]) -> (Rig, ScopeId) {
       let scope = watch(&rig, "/r").await;
       settle(|| {
         let enumerates = rig.fs.enumerates();
@@ -4245,6 +4375,338 @@ mod descending {
         covering,
         "with the covering `Rescan` its terminal promises on the stream"
       );
+    }
+
+    /// And it reaches the stream with NOTHING to wake the driver afterwards.
+    ///
+    /// The dispatch re-judge stands its covering `Rescan` on the far side of the
+    /// pass's own effect flush — the loop top flushed, then the cover settlements
+    /// resolved — and it raises no stat-specific flag. Root-liveness polling is off
+    /// on this rig, the obligation is retired pre-physically so no unlink retry is
+    /// scheduled, and nothing is parked on the move window: with no further
+    /// command, event or timer the loop had every reason to park in `select` with
+    /// the promised instruction sitting in the core's effect queue, while its
+    /// caller had already been told the instruction was on the stream. The loop now
+    /// re-tops whenever either queue is non-empty, so every producer that runs after
+    /// the flush is flushed before the driver sleeps.
+    ///
+    /// The staging difference from its sibling above is the whole cell: the last
+    /// thing sent to the driver is the ordering round trip BEFORE the arms are
+    /// released, and the channel is drained there, so everything asserted below
+    /// crossed the flush the release itself provoked. `settle` sends nothing — it
+    /// yields and sleeps — and both awaited replies are oneshots.
+    ///
+    /// Revert witness: drop the two-queue re-top before the timer and the `Rescan`
+    /// never arrives — the reply still resolves `Dominated`, because a oneshot needs
+    /// no flush, which is exactly the dishonesty being pinned.
+    #[cfg(not(miri))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dominated_parked_barrier_flushes_its_covering_rescan_before_the_loop_sleeps() {
+      let leaf = ".tributaries-sync-shrink-parked-idle";
+      let (rig, scope) = covered_rig(&[("/r/keep", 11), ("/r/gone", 12)]).await;
+
+      // The fence cannot settle while the arms are held, so the sync admitted
+      // below parks with no write dispatched.
+      let arms = rig.fs.hold_arms();
+      let pending = begin_sync(&rig, scope, "/r/gone", leaf).await;
+      assert!(
+        settle_cookies(&rig, 1).await,
+        "staging: the obligation exists and is parked"
+      );
+
+      // The shrink lands while it is still parked. The round trip after it is what
+      // ORDERS the two — `set_cover` records the applied cover when the driver
+      // PROCESSES the command, and the command channel is FIFO, so a reply to any
+      // later command proves the cover is already recorded — and it is the LAST
+      // thing this cell sends.
+      let ack = send_set_cover(&rig, scope, &["/r/keep"]).await;
+      let _ = cookie_count(&rig).await;
+      while rig.events.try_recv().is_ok() {}
+
+      arms.release();
+      assert_eq!(
+        resolved(ack).await,
+        CoverOutcome::Applied,
+        "staging: the fence settled, which is what re-judges the parked dispatch"
+      );
+      let answer = tokio::time::timeout(interpreted_secs(10), pending)
+        .await
+        .expect("the parked barrier is answered in bounded time")
+        .expect("the driver replies");
+      assert!(
+        matches!(answer, Err(crate::error::SyncRootError::Dominated)),
+        "the caller is told its barrier was dominated: {answer:?}"
+      );
+
+      let mut covering = false;
+      let _ = settle(|| {
+        while let Ok((_, _, change)) = rig.events.try_recv() {
+          covering |= change.kind().is_rescan();
+        }
+        covering
+      })
+      .await;
+      assert!(
+        covering,
+        "and the covering `Rescan` reached the consumer with no further command, \
+         event or timer to flush it"
+      );
+    }
+
+    /// Stops the sustained-churn producer and its consumer however a cell ends: an
+    /// assertion unwinds past any explicit teardown, and a thread left spinning on
+    /// the fake outlives the cell it belongs to.
+    #[cfg(not(miri))]
+    struct ChurnGuard {
+      stop: Arc<std::sync::atomic::AtomicBool>,
+      producer: Option<std::thread::JoinHandle<()>>,
+      consumer: tokio::task::JoinHandle<()>,
+    }
+
+    #[cfg(not(miri))]
+    impl Drop for ChurnGuard {
+      fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(producer) = self.producer.take() {
+          let _ = producer.join();
+        }
+        self.consumer.abort();
+      }
+    }
+
+    /// The regime the two cells below make their assertions inside: a covered,
+    /// TICKING rig whose cover fence is quiesced and HOLDING for an ordering proof
+    /// parked in flight, under source traffic that never lets up.
+    ///
+    /// The fence is what arms the regime. `cover_settlement_due` stays true for as
+    /// long as the proof is unanswered, that arms the settlement drain, and the
+    /// drain ingests another batch and queues its emit on every pass — so the
+    /// queue gate is consulted with a non-empty queue pass after pass, which is the
+    /// state a re-top on the queue alone never leaves. The cover re-issued here
+    /// grows nothing and prunes nothing, so the ONE control batch it dispatches is
+    /// that proof, and holding every batch holds exactly it.
+    ///
+    /// The churn is BUDGET-AWARE, and that is not tuning. A batch refused for the
+    /// transport budget does not wait — it degrades to an in-order `Overflow`, and
+    /// a loss moves the barrier, which would keep the fence from ever quiescing and
+    /// leave these cells pinning nothing. So the producer tops the lane up only
+    /// while `source_in_flight` reads below the budget: the lane stays continuously
+    /// non-empty and no loss is ever elected. It runs on its own OS thread rather
+    /// than a runtime task, so the scheduler cannot deprioritize it behind the very
+    /// loop it is feeding, and a consumer takes every change it produces so the
+    /// loop pays a real delivery's work each pass.
+    ///
+    /// Hands back the rig, the parked proof's gate, the reconcile's acknowledgement
+    /// — which resolves only at the settle that proof gates — and the churn's
+    /// guard. Bound in that order, a cell's locals drop the churn first, the proof
+    /// after it and the rig last.
+    #[cfg(not(miri))]
+    async fn churned_fence_awaiting_its_proof() -> (
+      Rig,
+      ReleasedOnDrop,
+      futures_channel::oneshot::Receiver<CoverOutcome>,
+      ChurnGuard,
+    ) {
+      use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+      /// Batches the churn keeps on the lane. Strictly below the rigs' transport
+      /// budget of eight, so a top-up never elects an `Overflow`.
+      const BACKLOG: usize = 6;
+      /// Modifies per batch: the loop's per-pass cost is this many classifications
+      /// and offers against the producer's single send, so the lane refills far
+      /// faster than a pass can drain it.
+      const WIDTH: usize = 8;
+      const IN_MODIFY: u32 = 0x0000_0002;
+
+      let (rig, scope) = ticking_covered_rig(
+        &[("/r/keep", 11), ("/r/gone", 12)],
+        Duration::from_millis(20),
+      )
+      .await;
+      let root_watch = rig
+        .fs
+        .enumerates()
+        .first()
+        .map(|(watch, _)| *watch)
+        .expect("the root enumerated");
+
+      // The applied cover reaches `{/r/keep}` and its fence settles clean, so the
+      // reconcile below is a RE-ISSUE.
+      shrunk_to_keep(&rig, scope).await;
+
+      // The ground the churn modifies, created and DELIVERED before it starts, so
+      // every churn record names an entry the Monitor already holds: no arm, and
+      // nothing that could move the barrier out from under the fence.
+      let names: Vec<String> = (0..WIDTH).map(|index| format!("c{index}")).collect();
+      for (index, name) in names.iter().enumerate() {
+        rig
+          .fs
+          .put(format!("/r/{name}"), FileKind::File, 900 + index as u64);
+      }
+      rig.fs.send_inotify_batch(
+        "/r",
+        names
+          .iter()
+          .map(|name| attributed(&[root_watch], IN_CREATE, name.as_bytes()))
+          .collect(),
+      );
+      let mut created = 0usize;
+      assert!(
+        settle(|| {
+          while let Ok((_, _, change)) = rig.events.try_recv() {
+            created += usize::from(change.kind().is_created());
+          }
+          created >= WIDTH
+        })
+        .await,
+        "staging: the churn's ground is created and delivered, so the Monitor holds it"
+      );
+
+      let stop = Arc::new(AtomicBool::new(false));
+      let drained = rig.events.clone();
+      let consumer = tokio::spawn(async move { while drained.recv().await.is_ok() {} });
+      let rounds = Arc::new(AtomicU64::new(0));
+      let producer = std::thread::spawn({
+        let fs = rig.fs.clone();
+        let stop = Arc::clone(&stop);
+        let rounds = Arc::clone(&rounds);
+        let names = names.clone();
+        move || {
+          while !stop.load(Ordering::Relaxed) {
+            if fs.source_in_flight("/r") < BACKLOG {
+              fs.send_inotify_batch(
+                "/r",
+                names
+                  .iter()
+                  .map(|name| attributed(&[root_watch], IN_MODIFY, name.as_bytes()))
+                  .collect(),
+              );
+              rounds.fetch_add(1, Ordering::Relaxed);
+            } else {
+              std::thread::yield_now();
+            }
+          }
+        }
+      });
+      let churn = ChurnGuard {
+        stop,
+        producer: Some(producer),
+        consumer,
+      };
+      assert!(
+        settle(|| rounds.load(Ordering::Relaxed) >= 64).await,
+        "staging: the churn is feeding the lane and the driver is draining it"
+      );
+
+      let proof = ReleasedOnDrop(rig.fs.hold_arms());
+      let ack = send_set_cover(&rig, scope, &["/r/keep"]).await;
+      assert!(
+        settle(|| proof.captured() >= 1).await,
+        "staging: the fence's ordering proof is parked in flight, so the fence stays armed"
+      );
+      (rig, proof, ack, churn)
+    }
+
+    /// And flushing what those producers stand still leaves the loop SERVICING the
+    /// inputs only the `select` can reach, under source traffic that never lets up.
+    ///
+    /// The queue gate is a `continue`, and the invariant every re-top in this loop
+    /// owes is that no `continue` may loop indefinitely while an internal
+    /// completion, a grant unwind, a command or the deadline is pending — the
+    /// `select` is the only consumer of all four. Read off ONE pass the queue test
+    /// bounds itself; read off a SEQUENCE it does not, and the regime staged above
+    /// is exactly the sequence: with a producer keeping the lane ready, a gate that
+    /// re-tops on the queue alone flushes and re-drains forever, and the due
+    /// liveness tick, an ordinary command and the `ControlBatchDone` the fence is
+    /// waiting for are never read at all. The gate re-tops only when service is NOT
+    /// ready, so a ready lane never sleeps and the next loop top flushes what the
+    /// fall-through carried.
+    ///
+    /// Three starved lanes, all asserted inside the one regime — the deadline, the
+    /// command channel, and the completion queue — with the churn running under
+    /// every one of them.
+    ///
+    /// Revert witness: drop the readiness leg and the driver never reaches `select`
+    /// while the churn holds the lane, so the tick never fires, the round trip never
+    /// answers and the released proof's completion is never read — each assertion
+    /// here spends its budget instead. The witness is the gate's own loop rather
+    /// than a proof: one pass that happened to snapshot an empty lane is all such a
+    /// gate needs to escape, and what makes that pass unlikely is that each drain is
+    /// bounded by the snapshot it took at its start, so everything the producer
+    /// lands during a pass is still resident at the next one. Under the rule,
+    /// progress is owed whatever the density.
+    ///
+    /// not(miri): sustained churn is a race between a real producer thread and a
+    /// real loop, which is a native fact rather than an arithmetic one, and an
+    /// interpreter would spend a shard timeout on it.
+    #[cfg(not(miri))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sustained_churn_starves_neither_the_timer_nor_a_command_nor_the_cut_proof() {
+      let (rig, proof, ack, _churn) = churned_fence_awaiting_its_proof().await;
+
+      // The DEADLINE lane. The root-liveness tick comes due over and over inside
+      // this regime, and only the `select`'s timer arm can serve it.
+      let ticked = rig.fs.refreshes();
+      assert!(
+        settle(|| rig.fs.refreshes() > ticked).await,
+        "a due liveness timer fires while the churn continues"
+      );
+
+      // The COMMAND lane, on the same regime: an ordinary round trip still answers.
+      // Bounded rather than awaited bare — a starved command lane never answers at
+      // all, and this cell must REPORT that rather than hang on it.
+      assert_eq!(
+        tokio::time::timeout(interpreted_secs(10), cookie_count(&rig))
+          .await
+          .expect("a command is serviced under the same churn"),
+        0,
+        "and it answers the driver's own count"
+      );
+
+      // The COMPLETION lane: release the proof and its `ControlBatchDone` lands in a
+      // queue only the `select` drains, with the churn still filling the lane and
+      // the fence still armed until it is read.
+      //
+      // SETTLED is the claim, not CLEAN. A window held open across sustained traffic
+      // carries classification work of its own, and an outstanding stat at the
+      // resolve degrades the verdict honestly — that is coverage honesty working,
+      // and another cell's subject. What this one pins is that the completion is
+      // read at all: the two verdicts a fence is never opened for (`Recursive`,
+      // `Skipped`) are decided without one, and a starved lane leaves no verdict in
+      // their place at all.
+      proof.release();
+      let settled = tokio::time::timeout(interpreted_secs(10), ack)
+        .await
+        .expect("the completion is consumed while the churn continues")
+        .expect("the driver answers the parked reply");
+      assert!(
+        matches!(settled, CoverOutcome::Applied | CoverOutcome::Degraded),
+        "the fence settles under the churn rather than being answered without one: {settled:?}"
+      );
+    }
+
+    /// `Close` is one of those inputs, and it is the one a starved loop costs most.
+    ///
+    /// Its own cell rather than a fourth assertion on the one above, because the two
+    /// regimes cannot be the same run: the fence settles when its completion is read,
+    /// which ends the regime, and the driver ends when `Close` is read. So this cell
+    /// stages the identical regime and spends it on `Close` alone — the command
+    /// arrives at a loop that, on the queue test alone, would still be flushing and
+    /// re-draining the churn, and the reply comes back from the far side of the
+    /// orderly shutdown that command breaks the loop for.
+    ///
+    /// Revert witness and not(miri): as the cell above.
+    #[cfg(not(miri))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sustained_churn_does_not_starve_close() {
+      let (rig, _proof, _ack, _churn) = churned_fence_awaiting_its_proof().await;
+
+      let (reply, on_close) = futures_channel::oneshot::channel();
+      rig.commands.send(Command::Close { reply }).await.unwrap();
+      let _wedged = tokio::time::timeout(interpreted_secs(10), on_close)
+        .await
+        .expect("`Close` is serviced inside the regime a queue-only re-top would loop in")
+        .expect("the driver answers the close");
     }
 
     /// A watch DROP cannot be placed, so a shrink reaches every barrier on the
@@ -8002,6 +8464,449 @@ mod descending {
         "the core retains at most the parked bound of fence records: {pending}"
       );
     }
+
+    /// [`covered_rig`] over a registry the cell supplies — the freeze seam the
+    /// queued-refresh cell stages its window with.
+    #[cfg(not(miri))]
+    async fn covered_rig_gated(
+      children: &[(&str, u64)],
+      registry: GatedRegistry,
+    ) -> (Rig, ScopeId) {
+      let fs = seeded_cover_tree(children);
+      staged_cover(inotify_rig_fs_registry(fs, 1024, registry), children).await
+    }
+
+    /// Mount refreshes ADDRESSED to `root` so far.
+    #[cfg(not(miri))]
+    fn refreshes_of(rig: &Rig, root: &str) -> usize {
+      rig
+        .fs
+        .refresh_roots()
+        .iter()
+        .filter(|served| served.as_path() == Path::new(root))
+        .count()
+    }
+
+    /// A refresh the POST-FLUSH source drain queued for the OLD world, and a
+    /// replacement commit that follows it with no flush in between.
+    ///
+    /// The loop's only effect flush is at its top. The cover-settlement drain
+    /// runs on its far side and ingests source messages directly, so an
+    /// `Overflow` it takes arms a refresh of the root the scope holds RIGHT THEN
+    /// and leaves it queued; and because service is ready — the replacement's
+    /// result already on the op channel — the pass does not re-top, so the
+    /// op-first select commits with that effect still in the queue. Left
+    /// standing, the old effect is first at the next flush, claims the
+    /// generation the commit just minted, and leaves the replacement's own
+    /// refresh behind it declined `ScopeBusy`; the retiring root's `stat` then
+    /// answers for an identity it never described.
+    ///
+    /// The window is STAGED, not raced. The gated registry freezes the driver's
+    /// own loop inside a SECOND scope's birth publication — the one seam that
+    /// stops the loop rather than a pool worker — and both the old lane's
+    /// `Overflow` and the replacement's pre-arm answer are landed inside that
+    /// freeze, so the pass that resumes is the pass the finding describes.
+    ///
+    /// MUST FAIL where the poll site tests only teardown before claiming: `/r2`
+    /// is never refreshed at all, and `/r` — the root this commit retired — is
+    /// stat'ed once more, which is the completion that would judge the
+    /// replacement.
+    #[cfg(not(miri))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_queued_old_world_refresh_is_dropped_at_the_replacement_commit() {
+      let registry = GatedRegistry::default();
+      let (rig, scope) =
+        covered_rig_gated(&[("/r/keep", 11), ("/r/drop", 12)], registry.clone()).await;
+      rig.fs.put("/r2", FileKind::Dir, 30);
+      rig.fs.put("/b", FileKind::Dir, 40);
+
+      // The fence that ARMS the post-flush drain: the applied cover reaches
+      // `{/r/keep}` and settles clean, then a re-issue whose ordering proof is
+      // parked leaves the fence pending. `cover_settlement_due` holds for as long
+      // as that proof is unanswered, and that is what makes the drain run.
+      shrunk_to_keep(&rig, scope).await;
+      let proof = rig.fs.hold_arms();
+      let _reissue = send_set_cover(&rig, scope, &["/r/keep"]).await;
+      assert!(
+        settle(|| proof.captured() >= 1).await,
+        "staging: the re-issue's ordering proof is parked, so the fence stays pending"
+      );
+      let (pending, on_pending) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::DebugPendingCoverFences {
+          scope,
+          reply: pending,
+        })
+        .await
+        .unwrap();
+      assert!(
+        on_pending.await.expect("the driver answers a debug probe") >= 1,
+        "staging: the scope holds a pending fence, so the settlement drain is armed"
+      );
+
+      // The replacement, held at its pre-arm: its `RebindArmed` is the result the
+      // freeze below lands on the op channel.
+      let prearm = rig.fs.hold_prearms();
+      let (reply, _on_replace) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::Replace {
+          scope,
+          root: PathBuf::from("/r2"),
+          reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from("/r2")),
+          reply,
+        })
+        .await
+        .unwrap();
+      assert!(
+        settle(|| rig.fs.prearm_entries() == 1).await,
+        "staging: the replacement is pre-armed and parked"
+      );
+
+      // Freeze the loop itself, inside a SECOND scope's birth publication.
+      let frozen = registry.hold_scope_live();
+      let (born, _on_born) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::Watch {
+          root: PathBuf::from("/b"),
+          options: crate::options::RootOptions::new(),
+          reply: born,
+        })
+        .await
+        .unwrap();
+      assert!(
+        settle(|| registry.scope_live_frozen()).await,
+        "staging: the loop is frozen inside the second scope's birth"
+      );
+
+      // Inside the freeze: the retiring root's lane takes a loss no drain has
+      // seen, and the pre-arm answers onto the op channel.
+      rig.fs.send_lossy("/r");
+      assert!(
+        rig.fs.overflow_pending("/r"),
+        "staging: the loss is queued on the retiring root's lane, undrained"
+      );
+      prearm.release();
+      assert!(
+        settle(|| rig.fs.arms().iter().any(|(_, p)| p == Path::new("/r2"))).await,
+        "staging: the pre-arm executed, so its outcome is on the op channel"
+      );
+      tokio::time::sleep(Duration::from_millis(50)).await;
+      let retiring_probes = refreshes_of(&rig, "/r");
+      while rig.events.try_recv().is_ok() {}
+
+      frozen.release();
+
+      // NON-VACUITY: the loss really was ingested while the OLD root still
+      // stood. Its covering `Rescan` was queued with the root the scope held at
+      // that instant, so a `/r`-rooted `Rescan` arriving after the freeze is the
+      // proof that the post-flush drain ran ahead of the commit — and not that
+      // the select's source arm took the loss afterwards, which would leave this
+      // cell pinning nothing.
+      let mut old_world_rescan = false;
+      assert!(
+        settle(|| {
+          while let Ok((_, root, change)) = rig.events.try_recv() {
+            old_world_rescan |= change.kind().is_rescan() && root.as_path() == Path::new("/r");
+          }
+          old_world_rescan
+        })
+        .await,
+        "non-vacuity: the drain took the loss while the retiring root still stood"
+      );
+
+      assert!(
+        settle(|| refreshes_of(&rig, "/r2") >= 1).await,
+        "the replacement's own refresh claims the generation: {:?}",
+        rig.fs.refresh_roots()
+      );
+      assert_eq!(
+        refreshes_of(&rig, "/r"),
+        retiring_probes,
+        "and the retiring root is never stat'ed again: {:?}",
+        rig.fs.refresh_roots()
+      );
+
+      proof.release();
+    }
+
+    /// Arms ADDRESSED to `root` so far — recorded by the fake BEFORE any
+    /// path-targeted execution hold, so a parked arm still counts as having
+    /// reached it.
+    #[cfg(not(miri))]
+    fn arms_of(rig: &Rig, root: &str) -> usize {
+      rig
+        .fs
+        .arms()
+        .iter()
+        .filter(|(_, armed)| armed.as_path() == Path::new(root))
+        .count()
+    }
+
+    /// A root-reproof ARM the post-flush source drain queued for the OLD world,
+    /// and a replacement commit that follows it with no flush in between.
+    ///
+    /// The refresh was only the first of these. The same window leaves a queued
+    /// `AddWatch` for the retiring root: the `Overflow` the drain takes runs the
+    /// overflow cut, which resets the root to a counted re-arm, and the commit
+    /// then mints a NEW transport generation. At the next flush the stale arm is
+    /// first, is collected into the scope's batch under the generation the commit
+    /// just minted, passes the transport's own check, and OPENS the retired root
+    /// ahead of the replacement's own reproof.
+    ///
+    /// The window is STAGED exactly as the queued-refresh cell stages it: the
+    /// gated registry freezes the driver's loop inside a SECOND scope's birth
+    /// publication, and both the old lane's `Overflow` and the replacement's
+    /// pre-arm answer are landed inside that freeze.
+    ///
+    /// MUST FAIL where the commit purges only the queued refresh: `/r` — the root
+    /// this commit retired — is armed once more on the replacement's transport.
+    #[cfg(not(miri))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_held_old_root_arm_is_dropped_at_the_replacement_commit() {
+      let registry = GatedRegistry::default();
+      let (rig, scope) =
+        covered_rig_gated(&[("/r/keep", 11), ("/r/drop", 12)], registry.clone()).await;
+      rig.fs.put("/r2", FileKind::Dir, 30);
+      rig.fs.put("/b", FileKind::Dir, 40);
+
+      shrunk_to_keep(&rig, scope).await;
+      let proof = rig.fs.hold_arms();
+      let _reissue = send_set_cover(&rig, scope, &["/r/keep"]).await;
+      assert!(
+        settle(|| proof.captured() >= 1).await,
+        "staging: the re-issue's ordering proof is parked, so the fence stays pending"
+      );
+      let (pending, on_pending) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::DebugPendingCoverFences {
+          scope,
+          reply: pending,
+        })
+        .await
+        .unwrap();
+      assert!(
+        on_pending.await.expect("the driver answers a debug probe") >= 1,
+        "staging: the scope holds a pending fence, so the settlement drain is armed"
+      );
+
+      let prearm = rig.fs.hold_prearms();
+      let (reply, _on_replace) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::Replace {
+          scope,
+          root: PathBuf::from("/r2"),
+          reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from("/r2")),
+          reply,
+        })
+        .await
+        .unwrap();
+      assert!(
+        settle(|| rig.fs.prearm_entries() == 1).await,
+        "staging: the replacement is pre-armed and parked"
+      );
+
+      let frozen = registry.hold_scope_live();
+      let (born, _on_born) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::Watch {
+          root: PathBuf::from("/b"),
+          options: crate::options::RootOptions::new(),
+          reply: born,
+        })
+        .await
+        .unwrap();
+      assert!(
+        settle(|| registry.scope_live_frozen()).await,
+        "staging: the loop is frozen inside the second scope's birth"
+      );
+
+      // Inside the freeze: the retiring root's lane takes a loss no drain has
+      // seen — the overflow cut behind it queues the root's re-arm — and the
+      // pre-arm answers onto the op channel.
+      rig.fs.send_lossy("/r");
+      assert!(
+        rig.fs.overflow_pending("/r"),
+        "staging: the loss is queued on the retiring root's lane, undrained"
+      );
+      prearm.release();
+      assert!(
+        settle(|| rig.fs.arms().iter().any(|(_, p)| p == Path::new("/r2"))).await,
+        "staging: the pre-arm executed, so its outcome is on the op channel"
+      );
+      tokio::time::sleep(Duration::from_millis(50)).await;
+      let retiring_arms = arms_of(&rig, "/r");
+      while rig.events.try_recv().is_ok() {}
+
+      frozen.release();
+
+      // NON-VACUITY: the loss really was ingested while the OLD root still
+      // stood, so the arm the drain queued named the root this commit retired.
+      let mut old_world_rescan = false;
+      assert!(
+        settle(|| {
+          while let Ok((_, root, change)) = rig.events.try_recv() {
+            old_world_rescan |= change.kind().is_rescan() && root.as_path() == Path::new("/r");
+          }
+          old_world_rescan
+        })
+        .await,
+        "non-vacuity: the drain took the loss while the retiring root still stood"
+      );
+
+      // The batches the flush collected run only once the ordering proof lets
+      // them; the stale arm would ride the very first of them.
+      proof.release();
+      assert!(
+        settle(|| arms_of(&rig, "/r2") >= 2).await,
+        "the replacement's own reproof arms the live root: {:?}",
+        rig.fs.arms()
+      );
+      assert_eq!(
+        arms_of(&rig, "/r"),
+        retiring_arms,
+        "and the retired root is never armed again: {:?}",
+        rig.fs.arms()
+      );
+
+      // Events on the NEW root deliver.
+      let mut new_world_change = false;
+      assert!(
+        settle(|| {
+          while let Ok((_, root, _)) = rig.events.try_recv() {
+            new_world_change |= root.as_path() == Path::new("/r2");
+          }
+          new_world_change
+        })
+        .await,
+        "the replacement's own stream delivers"
+      );
+    }
+
+    /// The same window with the retired root's arm WEDGED: a syscall that blocks
+    /// on a retired mount must not be able to hold the replacement's reader.
+    ///
+    /// The scope's arms and disarms are dispatched as ONE batch per scope, served
+    /// in emission order, so a stale arm collected ahead of the replacement's
+    /// reproof is in front of it: an `open` that never returns on the retired
+    /// mount leaves the replacement — whose `Replace` has already answered `Ok` —
+    /// indefinitely unable to arm its own root or serve a control operation.
+    ///
+    /// MUST FAIL where the commit purges only the queued refresh: the `/r` arm
+    /// executes, parks on its wedged mount, and `/r2` is never armed at all.
+    #[cfg(not(miri))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_wedged_old_root_arm_does_not_hold_the_replacement_s_reader() {
+      let registry = GatedRegistry::default();
+      let (rig, scope) =
+        covered_rig_gated(&[("/r/keep", 11), ("/r/drop", 12)], registry.clone()).await;
+      rig.fs.put("/r2", FileKind::Dir, 30);
+      rig.fs.put("/b", FileKind::Dir, 40);
+
+      shrunk_to_keep(&rig, scope).await;
+      let proof = rig.fs.hold_arms();
+      let _reissue = send_set_cover(&rig, scope, &["/r/keep"]).await;
+      assert!(
+        settle(|| proof.captured() >= 1).await,
+        "staging: the re-issue's ordering proof is parked, so the fence stays pending"
+      );
+      let (pending, on_pending) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::DebugPendingCoverFences {
+          scope,
+          reply: pending,
+        })
+        .await
+        .unwrap();
+      assert!(
+        on_pending.await.expect("the driver answers a debug probe") >= 1,
+        "staging: the scope holds a pending fence, so the settlement drain is armed"
+      );
+
+      let prearm = rig.fs.hold_prearms();
+      let (reply, _on_replace) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::Replace {
+          scope,
+          root: PathBuf::from("/r2"),
+          reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from("/r2")),
+          reply,
+        })
+        .await
+        .unwrap();
+      assert!(
+        settle(|| rig.fs.prearm_entries() == 1).await,
+        "staging: the replacement is pre-armed and parked"
+      );
+
+      let frozen = registry.hold_scope_live();
+      let (born, _on_born) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::Watch {
+          root: PathBuf::from("/b"),
+          options: crate::options::RootOptions::new(),
+          reply: born,
+        })
+        .await
+        .unwrap();
+      assert!(
+        settle(|| registry.scope_live_frozen()).await,
+        "staging: the loop is frozen inside the second scope's birth"
+      );
+
+      rig.fs.send_lossy("/r");
+      assert!(
+        rig.fs.overflow_pending("/r"),
+        "staging: the loss is queued on the retiring root's lane, undrained"
+      );
+      prearm.release();
+      assert!(
+        settle(|| rig.fs.arms().iter().any(|(_, p)| p == Path::new("/r2"))).await,
+        "staging: the pre-arm executed, so its outcome is on the op channel"
+      );
+      tokio::time::sleep(Duration::from_millis(50)).await;
+
+      // The retired mount never answers: an arm that reaches it is the wedge.
+      let wedged = rig.fs.hold_arm_exec_at("/r");
+      frozen.release();
+      proof.release();
+
+      assert!(
+        settle(|| arms_of(&rig, "/r2") >= 2).await,
+        "the replacement's reproof runs: no arm of the retired root is in front of it: {:?}",
+        rig.fs.arms()
+      );
+      assert_eq!(
+        wedged.captured(),
+        0,
+        "and nothing ever reached the retired mount"
+      );
+
+      // The scope still serves control operations.
+      let (pending, on_pending) = futures_channel::oneshot::channel();
+      rig
+        .commands
+        .send(Command::DebugPendingCoverFences {
+          scope,
+          reply: pending,
+        })
+        .await
+        .unwrap();
+      assert!(
+        tokio::time::timeout(interpreted_secs(5), on_pending)
+          .await
+          .is_ok(),
+        "the replacement's scope answers rather than waiting behind a wedged arm"
+      );
+    }
   }
 
   /// The descending replace end to end: the new root pre-arms on the NEW
@@ -8584,6 +9489,49 @@ mod descending {
       panic!("the single-flight gate never admitted the sync");
     }
 
+    /// [`sync_ok`] for a sync whose own HEAL may retire it — reporting the
+    /// cookie when the write claimed, and `None` when the barrier was met by
+    /// domination instead.
+    ///
+    /// A sync over a standing SLOT deficit re-signals the hole and kicks the
+    /// parent's re-arm read. That read rediscovers the slot and ARMS it, and a
+    /// child arm is a coverage transition whose located ground lies INSIDE the
+    /// barrier's cover — so the funnel retires the barrier the sync itself
+    /// dispatched, and the retirement stands the covering `Rescan` that
+    /// `SyncOutcome::Dominated` promises. The barrier is MET either way: by
+    /// delivery behind the re-signal's `Rescan`, or by domination under the
+    /// retirement's. Which of the two lands is the scheduler's business — the
+    /// write claims from the pool while the kicked read arms from the loop — so
+    /// a cell that demands the cookie is pinning a race, not a rule, and the
+    /// slow leg (a sanitizer) decides it the other way.
+    ///
+    /// Everything these cells state holds under both: the fresh covering
+    /// `Rescan` above the failure's epoch, the bounded heal re-attempt, the
+    /// strictly rising epochs, and the marker written to disk (a refused claim
+    /// reaps the file it had created, so the write is still recorded). The
+    /// INTERIOR-deficit sibling has no such race and keeps [`sync_ok`]: its heal
+    /// re-reads the dark directory itself and arms no child, so nothing moves
+    /// inside the barrier's ground.
+    async fn sync_settled(rig: &Rig, scope: ScopeId, dir: &str, name: &str) -> Option<PathBuf> {
+      for _ in 0..400 {
+        let pending = sync_pending(rig, scope, dir, name).await;
+        let outcome = tokio::time::timeout(interpreted_secs(10), pending)
+          .await
+          .expect("the sync resolves in bounded time — never parked forever")
+          .expect("the driver replies");
+        match outcome {
+          Ok(path) => return Some(path),
+          Err(crate::error::SyncRootError::Dominated) => return None,
+          Err(crate::error::SyncRootError::WriteInFlight) => {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+          }
+          Err(other) => panic!("unexpected sync error: {other:?}"),
+        }
+      }
+      panic!("the single-flight gate never admitted the sync");
+    }
+
     /// Asserts the parked sync stays pending across generous scheduler slices
     /// with `written` cookie writes on disk — the fence gate observable.
     async fn assert_parked(
@@ -8708,12 +9656,17 @@ mod descending {
 
     /// C2 (F2a, flagship): a sync over a standing arm-refused hole completes
     /// (never parked forever) with a FRESH covering `Rescan` — epoch strictly
-    /// above the failure's — queued ahead of its cookie write, plus a bounded
+    /// above the failure's — queued ahead of its marker, plus a bounded
     /// heal re-attempt of the refused arm; after the hole heals, the healing
     /// window closes with the closing `Rescan`, and a deficit-free sync adds
     /// no `Rescan` at all. Fails on old: after the failure's one edge
     /// `Rescan`, NOTHING precedes any later sync's cookie — the umbrella would
     /// read `Delivered` over changes in the permanently-dark subtree.
+    ///
+    /// The two syncs whose heal re-arms the slot take [`sync_settled`]: the arm
+    /// their own kick provokes may retire them, and a met barrier is a met
+    /// barrier whichever way. The third takes [`sync_ok`] — a deficit-free sync
+    /// kicks nothing, so nothing may dominate it.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_sync_over_an_arm_refused_hole_resignals_then_heals() {
       let fs = FakeFs::new(1);
@@ -8729,13 +9682,20 @@ mod descending {
 
       // Sync #1 over the standing hole: the refreshing Rescan precedes the
       // cookie, and the heal kick re-attempts the arm (which fails again).
-      let path1 = sync_ok(&rig, scope, "/r", ".tributaries-sync-c2-1").await;
+      let path1 = sync_settled(&rig, scope, "/r", ".tributaries-sync-c2-1").await;
       let refreshed = next_rescan_above(&rig, edge).await;
       assert_eq!(
-        rig.fs.cookie_writes(),
-        vec![path1],
-        "the write landed behind the refreshing Rescan"
+        rig.fs.cookie_writes().len(),
+        1,
+        "the marker was written behind the refreshing Rescan"
       );
+      if let Some(path1) = path1 {
+        assert_eq!(
+          rig.fs.cookie_writes(),
+          vec![path1],
+          "and a claimed marker is the one on disk"
+        );
+      }
       settle(|| arms_at(&rig, "/r/a") > arms_before).await;
       assert!(
         arms_at(&rig, "/r/a") > arms_before,
@@ -8746,7 +9706,7 @@ mod descending {
       // Heal, then sync #2: its re-signal + heal kick succeed, and the healing
       // window closes with the closing Rescan.
       rig.fs.heal_watch_at("/r/a");
-      let _path2 = sync_ok(&rig, scope, "/r", ".tributaries-sync-c2-2").await;
+      let _path2 = sync_settled(&rig, scope, "/r", ".tributaries-sync-c2-2").await;
       let after_heal = next_rescan_above(&rig, top).await;
       let quiet = drain_to_quiet(&rig, after_heal).await;
 
@@ -8821,13 +9781,17 @@ mod descending {
       let scope = watch(&rig, "/r").await;
       let edge = next_rescan_above(&rig, Epoch::START).await;
 
-      let _path1 = sync_ok(&rig, scope, "/r", ".tributaries-sync-c4-1").await;
+      let _path1 = sync_settled(&rig, scope, "/r", ".tributaries-sync-c4-1").await;
       let first = next_rescan_above(&rig, edge).await;
       let top = drain_to_quiet(&rig, first).await;
-      let _path2 = sync_ok(&rig, scope, "/r", ".tributaries-sync-c4-2").await;
+      let _path2 = sync_settled(&rig, scope, "/r", ".tributaries-sync-c4-2").await;
       let second = next_rescan_above(&rig, top).await;
       assert!(second > first, "each sync re-signals its own fresh Rescan");
-      assert_eq!(rig.fs.cookie_writes().len(), 2, "both writes landed");
+      assert_eq!(
+        rig.fs.cookie_writes().len(),
+        2,
+        "both syncs wrote their marker"
+      );
     }
 
     /// C5 (P3, hold gate): a sync issued mid-rename-hold parks — the
@@ -14494,6 +15458,133 @@ mod sync_cookie {
     );
   }
 
+  // RETIREMENT IS PUBLISHED BEFORE THE DELIVERY LANE IS DISMANTLED — the teardown
+  // boundary.
+  //
+  // The teardown effect takes the lane, the control port, the source tap, the
+  // registry entry and the source itself, and only then sweeps the scope's
+  // cookies. A write released inside that interval finds every interlock still
+  // reading live — no shutdown, no retirement, an unchanged generation — so it
+  // claims, publishes `Owned` and replies `Ok`; the marker's source message is
+  // then refused for a lane that no longer exists, and the caller holds a
+  // successful barrier nothing can satisfy.
+  //
+  // STAGED, not raced: `detach_scope` is the one call the driver's own task makes
+  // inside that interval, so the hold freezes the loop there, and the write's
+  // reply is sent from the pool thread straight to the caller, so it resolves
+  // while the loop is still frozen.
+  //
+  // MUST FAIL where the flag is raised only by the cookie sweep: the reply is
+  // `Ok(landing)` and the file stands.
+  #[cfg(not(miri))]
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn an_in_pool_write_released_at_the_teardown_boundary_answers_retired() {
+    let rig = rig_with_capacity(64);
+    let scope = watch(&rig, "/r").await;
+
+    let hold = rig.fs.hold_cookie_writes();
+    let on_reply = sync_root_pending(&rig, scope, "/r", ".tributaries-sync-13-2-1").await;
+    assert!(
+      settle(|| rig.fs.cookie_dispatches() == 1).await,
+      "staging: the write is in the pool, its file not yet created"
+    );
+
+    // Freeze the teardown part-way: past the lane, ahead of the cookie sweep.
+    let detach = rig.fs.hold_detaches();
+    let (reply, on_unwatch) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Unwatch {
+        scope,
+        reply: Some(reply),
+      })
+      .await
+      .unwrap();
+    assert!(
+      settle(|| detach.captured() >= 1).await,
+      "staging: the loop is frozen inside the teardown's detach"
+    );
+
+    // Released INSIDE the interval.
+    hold.release();
+    let outcome = on_reply.await.expect("the write replies");
+    assert!(
+      matches!(outcome, Err(crate::error::SyncRootError::Retired)),
+      "a barrier whose lane is already gone is refused, never certified: {outcome:?}"
+    );
+
+    detach.release();
+    assert!(
+      on_unwatch.await.unwrap().is_torn(),
+      "and the teardown completes"
+    );
+    settle(|| !rig.fs.cookie_removes().is_empty()).await;
+    assert_eq!(
+      rig.fs.cookie_removes(),
+      rig.fs.cookie_writes(),
+      "the write reaped the file it had just created"
+    );
+    assert!(
+      rig.fs.files_under("/r").is_empty(),
+      "no cookie outlives the scope it was written for"
+    );
+    assert_eq!(cookie_count(&rig).await, 0, "and no record survives it");
+  }
+
+  // The same rule at the CLOSE boundary: the orderly close's stream sweep
+  // dismantles every scope's lane, source tap and registry entry, so the shutdown
+  // flag has to be up before it runs. Released inside that sweep at the old
+  // ordering, the write reads `shutdown = false` and a scope no teardown effect
+  // will ever retire, claims, and replies `Ok` for a marker whose lane is gone.
+  //
+  // MUST FAIL where `begin_shutdown` follows the sweep: the reply is
+  // `Ok(landing)` and the file stands.
+  #[cfg(not(miri))]
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn an_in_pool_write_released_at_the_close_boundary_answers_retired() {
+    let rig = rig_with_capacity(64);
+    let scope = watch(&rig, "/r").await;
+
+    let hold = rig.fs.hold_cookie_writes();
+    let on_reply = sync_root_pending(&rig, scope, "/r", ".tributaries-sync-13-2-2").await;
+    assert!(
+      settle(|| rig.fs.cookie_dispatches() == 1).await,
+      "staging: the write is in the pool when close begins"
+    );
+
+    let detach = rig.fs.hold_detaches();
+    let (close_reply, on_close) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Close { reply: close_reply })
+      .await
+      .unwrap();
+    assert!(
+      settle(|| detach.captured() >= 1).await,
+      "staging: the loop is frozen inside the close sweep's detach"
+    );
+
+    hold.release();
+    let outcome = on_reply.await.expect("the write replies");
+    assert!(
+      matches!(outcome, Err(crate::error::SyncRootError::Retired)),
+      "a barrier whose stream the close is dismantling is refused: {outcome:?}"
+    );
+
+    detach.release();
+    tokio::time::timeout(interpreted_secs(5), on_close)
+      .await
+      .expect("close resolves at the grace boundary, not an indefinite hang")
+      .expect("the driver replied");
+    settle(|| !rig.fs.cookie_removes().is_empty()).await;
+    assert_eq!(
+      rig.fs.cookie_removes(),
+      rig.fs.cookie_writes(),
+      "the late write reaped the file it created"
+    );
+    assert!(rig.fs.files_under("/r").is_empty());
+  }
+
   // A FILE subscription is validly covered (it commits under an armed
   // ancestor), so the cookie key a sync carries can name a file. Writing inside
   // it would fail ENOTDIR and leave the caller with no barrier at all; the
@@ -15459,6 +16550,312 @@ mod sync_cookie {
     );
 
     refreshes.release();
+  }
+
+  /// The first refresh of a root this scope REPLACED or WIDENED into.
+  ///
+  /// The driver's probe generation is the one owner of the cross-world fence: it
+  /// retires the scope's tag at each commit and forwards only a current-tag
+  /// answer, so the completion that reaches the core is the LIVE world's first
+  /// valid result. It is applied on arrival — an alive verdict is not thrown away
+  /// and re-probed, a missing verdict is death evidence the gate acts on at once
+  /// — and the held old probe's late answer is dropped whichever way it goes.
+  ///
+  /// Every cell here runs with the liveness tick OFF (a zero interval) and drives
+  /// its probes through [`tick_liveness`], so "no second refresh is queued" is an
+  /// observation about what the core armed and never about how fast the host ran.
+  #[cfg(not(miri))]
+  mod first_new_world_refresh {
+    use super::*;
+
+    /// The staging the four cells share: the OLD root's probe is parked inside
+    /// the refresh, and a sync write is parked in the pool. The commit that
+    /// follows therefore finds both a probe whose tag it must retire and a
+    /// barrier it may or may not retire.
+    ///
+    /// Returns the old probe's gate, the write's gate, and the sync's reply.
+    async fn stage_old_world(
+      rig: &Rig,
+      scope: ScopeId,
+      dir: &str,
+      marker: &str,
+    ) -> (
+      HoldRelease,
+      HoldRelease,
+      futures_channel::oneshot::Receiver<Result<PathBuf, crate::error::SyncRootError>>,
+    ) {
+      let old_probe = rig.fs.hold_refreshes();
+      tick_liveness(rig, scope).await;
+      assert!(
+        settle(|| old_probe.captured() == 1).await,
+        "staging: the old root's probe is parked inside the refresh"
+      );
+      let writes = rig.fs.hold_cookie_writes();
+      let on_reply = sync_root_pending(rig, scope, dir, marker).await;
+      assert!(
+        settle(|| rig.fs.cookie_dispatches() == 1).await,
+        "staging: the write is PARKED in the pool across the commit"
+      );
+      (old_probe, writes, on_reply)
+    }
+
+    /// A rig over disjoint roots, so `/old` → `/new` takes the general STREAM
+    /// replace rather than the same-transport widen an `old ⊂ new` pair takes.
+    fn replace_rig(registry: RecordingRegistry) -> Rig {
+      ticking_rig_over(
+        Duration::ZERO,
+        registry,
+        &["/old".to_owned(), "/new".to_owned()],
+      )
+    }
+
+    /// A rig whose `/r/sub` widens to `/r` at depth one on the one transport.
+    /// `/r` holds nothing but `sub`, so the commit's cold read discovers no new
+    /// ground and arms no child watch — the widen really does move nothing.
+    fn widen_rig(registry: RecordingRegistry) -> Rig {
+      ticking_rig_over(
+        Duration::ZERO,
+        registry,
+        &["/r".to_owned(), "/r/sub".to_owned()],
+      )
+    }
+
+    /// The stream replace, alive: the replacement's first refresh is applied at
+    /// once, and the barrier it spans is retired by the COMMIT's own move
+    /// (funnel 4), not by anything the completion does.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replaced_root_s_first_refresh_is_applied_alive() {
+      let registry = RecordingRegistry::default();
+      let rig = replace_rig(registry.clone());
+      let scope = watch(&rig, "/old").await;
+      let (old_probe, writes, on_reply) =
+        stage_old_world(&rig, scope, "/old", ".tributaries-sync-1-9-20").await;
+
+      // The commit's own refresh rides a gate of its own, so the two worlds'
+      // probes stay separable.
+      let first = rig.fs.hold_refreshes();
+      replace_root(&rig, scope, "/new")
+        .await
+        .expect("the replacement commits");
+      assert!(
+        settle(|| first.captured() == 1).await,
+        "the replacement is probed at once, under the fresh tag"
+      );
+      assert_eq!(
+        old_probe.captured(),
+        1,
+        "and the retiring root's probe is still parked where it was"
+      );
+
+      // Whatever a discarded snapshot would re-arm parks here. Nothing does.
+      let second = rig.fs.hold_refreshes();
+      first.release();
+      assert!(
+        settle_probes(&rig, 1).await,
+        "the replacement's first refresh answers, leaving only the parked old probe"
+      );
+      assert!(
+        !settle(|| second.captured() >= 1).await,
+        "the alive verdict is applied at once — no second refresh is queued"
+      );
+      assert!(
+        registry.dead().is_empty(),
+        "and an alive verdict ends nothing"
+      );
+
+      // The barrier's own answer: the commit's whole-scope move retires it,
+      // under the covering `Rescan` the cut already stood.
+      writes.release();
+      let answer = tokio::time::timeout(interpreted_secs(10), on_reply)
+        .await
+        .expect("the sync resolves in bounded time")
+        .expect("the driver replies");
+      assert!(
+        matches!(answer, Err(crate::error::SyncRootError::Dominated)),
+        "the replace's own move retires the barrier it spans: {answer:?}"
+      );
+
+      // The retiring root's answer arrives last, reporting that root gone. It
+      // carries a tag this scope has left behind, so it is dropped.
+      rig.fs.remove("/old");
+      old_probe.release();
+      assert!(
+        settle_probes(&rig, 0).await,
+        "every probe thread has exited"
+      );
+      assert!(
+        !settle(|| !registry.dead().is_empty()).await,
+        "the retiring root's late answer is dropped, not read as the replacement's death"
+      );
+    }
+
+    /// The stream replace, missing: the replacement's first refresh is death
+    /// evidence, and the scope terminates through the death gate AT that
+    /// completion — no round trip stands between the commit and the death.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replaced_root_s_first_refresh_kills_at_that_completion() {
+      let registry = RecordingRegistry::default();
+      let rig = replace_rig(registry.clone());
+      let scope = watch(&rig, "/old").await;
+      let (old_probe, writes, on_reply) =
+        stage_old_world(&rig, scope, "/old", ".tributaries-sync-1-9-21").await;
+
+      let first = rig.fs.hold_refreshes();
+      replace_root(&rig, scope, "/new")
+        .await
+        .expect("the replacement commits");
+      assert!(
+        settle(|| first.captured() == 1).await,
+        "the replacement is probed at once, under the fresh tag"
+      );
+
+      // The replacement's path vanishes while its first probe is parked: the
+      // answer that probe carries is real death evidence for the live world.
+      rig.fs.remove("/new");
+      let completions = rig.fs.refreshes();
+      first.release();
+      assert!(
+        settle(|| registry.dead() == [scope]).await,
+        "the missing verdict runs the death gate and reclaims the entry"
+      );
+      assert_eq!(
+        rig.fs.refreshes(),
+        completions + 1,
+        "at THAT completion: the first answer of the new world is the one that kills"
+      );
+
+      writes.release();
+      let answer = tokio::time::timeout(interpreted_secs(10), on_reply)
+        .await
+        .expect("the sync resolves in bounded time")
+        .expect("the driver replies");
+      assert!(
+        answer.is_err(),
+        "a barrier spanning the death never certifies: {answer:?}"
+      );
+
+      old_probe.release();
+      assert!(
+        settle_probes(&rig, 0).await,
+        "every probe thread has exited"
+      );
+    }
+
+    /// The same-transport widen, alive: the widened root's first refresh is
+    /// applied at once and the widen raises no barrier move, so the write
+    /// dispatched across it PROCEEDS — the deliberate non-bump, said as an
+    /// outcome the caller can see.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_widened_root_s_first_refresh_is_applied_alive() {
+      let registry = RecordingRegistry::default();
+      let rig = widen_rig(registry.clone());
+      let scope = watch(&rig, "/r/sub").await;
+      let (old_probe, writes, on_reply) =
+        stage_old_world(&rig, scope, "/r/sub", ".tributaries-sync-1-9-22").await;
+
+      let first = rig.fs.hold_refreshes();
+      replace_root(&rig, scope, "/r")
+        .await
+        .expect("the widen commits");
+      assert!(
+        settle(|| first.captured() == 1).await,
+        "the widened root is probed at once, under the fresh tag"
+      );
+      assert_eq!(
+        old_probe.captured(),
+        1,
+        "and the old root's probe is still parked where it was"
+      );
+
+      let second = rig.fs.hold_refreshes();
+      first.release();
+      assert!(
+        settle_probes(&rig, 1).await,
+        "the widened root's first refresh answers, leaving only the parked old probe"
+      );
+      assert!(
+        !settle(|| second.captured() >= 1).await,
+        "the alive verdict is applied at once — no second refresh is queued"
+      );
+      assert!(
+        registry.dead().is_empty(),
+        "and an alive verdict ends nothing"
+      );
+
+      // A widen retires nothing: the write claims and the caller is certified.
+      writes.release();
+      let answer = tokio::time::timeout(interpreted_secs(10), on_reply)
+        .await
+        .expect("the sync resolves in bounded time")
+        .expect("the driver replies");
+      assert!(
+        answer.is_ok(),
+        "a widen dominates nothing, so the write it spans proceeds: {answer:?}"
+      );
+
+      // The old root is still THERE — its parked answer reports the object at
+      // `/r/sub`, an identity the widened scope no longer holds, which would
+      // read as the widened root's death if the fence let it through.
+      old_probe.release();
+      assert!(
+        settle_probes(&rig, 0).await,
+        "every probe thread has exited"
+      );
+      assert!(
+        !settle(|| !registry.dead().is_empty()).await,
+        "the old root's late answer is dropped, not read as the widened root's death"
+      );
+    }
+
+    /// The same-transport widen, missing: the widened root's first refresh is
+    /// death evidence, and the scope terminates AT that completion.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_widened_root_s_first_refresh_kills_at_that_completion() {
+      let registry = RecordingRegistry::default();
+      let rig = widen_rig(registry.clone());
+      let scope = watch(&rig, "/r/sub").await;
+      let (old_probe, writes, on_reply) =
+        stage_old_world(&rig, scope, "/r/sub", ".tributaries-sync-1-9-23").await;
+
+      let first = rig.fs.hold_refreshes();
+      replace_root(&rig, scope, "/r")
+        .await
+        .expect("the widen commits");
+      assert!(
+        settle(|| first.captured() == 1).await,
+        "the widened root is probed at once, under the fresh tag"
+      );
+
+      // The widened root vanishes while its first probe is parked.
+      rig.fs.remove("/r");
+      let completions = rig.fs.refreshes();
+      first.release();
+      assert!(
+        settle(|| registry.dead() == [scope]).await,
+        "the missing verdict runs the death gate and reclaims the entry"
+      );
+      assert_eq!(
+        rig.fs.refreshes(),
+        completions + 1,
+        "at THAT completion: the first answer of the widened world is the one that kills"
+      );
+
+      writes.release();
+      let answer = tokio::time::timeout(interpreted_secs(10), on_reply)
+        .await
+        .expect("the sync resolves in bounded time")
+        .expect("the driver replies");
+      assert!(
+        answer.is_err(),
+        "a barrier spanning the death never certifies: {answer:?}"
+      );
+
+      old_probe.release();
+      assert!(
+        settle_probes(&rig, 0).await,
+        "every probe thread has exited"
+      );
+    }
   }
 
   // The completed-cookie reap never touches the command channel, so a saturated

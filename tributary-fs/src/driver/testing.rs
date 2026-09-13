@@ -94,6 +94,10 @@ struct FakeState {
   /// Mount-table refreshes served, plus the configured answer (`None` = an
   /// authoritative empty table).
   refreshes: AtomicUsize,
+  /// The root each served refresh was ADDRESSED to, in dispatch order — the
+  /// observable that separates a refresh of the live world from one armed
+  /// against a root the scope has replaced.
+  refresh_roots: Mutex<Vec<PathBuf>>,
   refresh_answer: Mutex<Option<(Vec<PathBuf>, bool)>>,
   /// Overrides the root-liveness a refresh reports, so the hermetic suites can
   /// drive the root-death-via-refresh path (`None` = derive from the tree: the
@@ -175,6 +179,11 @@ struct FakeState {
   /// a test retires the scope, drops the reply, or tears the driver down while
   /// the write is still in the pool.
   cookie_write_hold: Mutex<Option<HoldGate>>,
+  /// Parks `detach_scope` — the one call the DRIVER'S OWN TASK makes inside the
+  /// interval between a scope's delivery lane going and its retirement being
+  /// published, and again inside the close-time stream sweep. The seam a cell
+  /// stands an in-pool write in when it has to answer from inside that window.
+  detach_hold: Mutex<Option<HoldGate>>,
   /// The next N cookie REMOVES fail with a transient error (a hung/faulty
   /// unlink), so a cell can prove the record is RETAINED and the path retried
   /// rather than orphaned. Decremented per failed remove.
@@ -345,6 +354,7 @@ impl Default for FakeState {
       shutdowns: AtomicUsize::new(0),
       spawns: AtomicUsize::new(0),
       refreshes: AtomicUsize::new(0),
+      refresh_roots: Mutex::default(),
       refresh_answer: Mutex::default(),
       root_liveness: Mutex::default(),
       spawn_mounts: Mutex::default(),
@@ -366,6 +376,7 @@ impl Default for FakeState {
       cookie_write_strand: Mutex::default(),
       cookie_dispatches: AtomicUsize::new(0),
       cookie_write_hold: Mutex::default(),
+      detach_hold: Mutex::default(),
       cookie_remove_failures: AtomicUsize::new(0),
       cookie_remove_dispatches: AtomicUsize::new(0),
       cookie_remove_hold: Mutex::default(),
@@ -528,6 +539,22 @@ impl FakeFs {
     (source.sender.clone(), Arc::clone(&source.transport))
   }
 
+  /// How many forwarded batches this source holds IN FLIGHT — queued on its lane,
+  /// or taken and not yet dropped — against the transport budget its spawn was
+  /// given.
+  ///
+  /// The reading a SUSTAINED-CHURN producer needs. A batch refused for budget does
+  /// not wait, it degrades to an in-order `Overflow`, and a loss moves the scope's
+  /// barrier — so a producer spinning on
+  /// [`send_inotify_batch`](Self::send_inotify_batch) would keep the very fence its
+  /// churn is meant to leave standing from ever quiescing. Topping the lane up only
+  /// while this reads below the budget keeps the lane continuously non-empty and
+  /// elects no loss.
+  #[cfg(not(miri))]
+  pub(crate) fn source_in_flight(&self, root: impl AsRef<Path>) -> usize {
+    self.source_of(root).1.in_flight()
+  }
+
   /// Injects one decoded batch through the REAL forwarding protocol (budget
   /// permit, in-order loss degrade and all).
   ///
@@ -638,6 +665,12 @@ impl FakeFs {
 
   pub(crate) fn refreshes(&self) -> usize {
     self.state.refreshes.load(Ordering::SeqCst)
+  }
+
+  /// The root each served refresh was addressed to, in dispatch order.
+  #[cfg(not(miri))]
+  pub(crate) fn refresh_roots(&self) -> Vec<PathBuf> {
+    self.state.refresh_roots.lock().unwrap().clone()
   }
 
   /// Configures the mount prefixes the next spawn seeds its `RootMeta` with.
@@ -839,6 +872,18 @@ impl FakeFs {
   pub(crate) fn hold_arms(&self) -> HoldRelease {
     let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new(), AtomicUsize::new(0)));
     *self.state.arm_hold.lock().unwrap() = Some(Arc::clone(&gate));
+    HoldRelease { gate }
+  }
+
+  /// Holds every subsequent `detach_scope` until released — the driver's OWN
+  /// task parks there, so a cell can freeze the teardown (or the close-time
+  /// stream sweep) part-way through and release an in-pool cookie write inside
+  /// that interval. The write's reply oneshot is sent from the pool thread
+  /// straight to the caller, so it resolves while the loop is still frozen.
+  #[cfg(not(miri))]
+  pub(crate) fn hold_detaches(&self) -> HoldRelease {
+    let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new(), AtomicUsize::new(0)));
+    *self.state.detach_hold.lock().unwrap() = Some(Arc::clone(&gate));
     HoldRelease { gate }
   }
 
@@ -1755,6 +1800,12 @@ impl FsOps for FakeFs {
   }
 
   fn refresh_mounts(&self, root: &Path) -> MountRefresh {
+    self
+      .state
+      .refresh_roots
+      .lock()
+      .unwrap()
+      .push(root.to_path_buf());
     self.park_on(&self.state.refresh_hold);
     self.state.refreshes.fetch_add(1, Ordering::SeqCst);
     let (mounts, authoritative) = self
@@ -1806,6 +1857,7 @@ impl FsOps for FakeFs {
   }
 
   fn detach_scope(&self, scope: ScopeId) {
+    self.park_on(&self.state.detach_hold);
     self.state.scope_generation.lock().unwrap().remove(&scope);
   }
 

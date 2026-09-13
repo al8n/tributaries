@@ -84,7 +84,7 @@ fn probes(effects: &[Effect]) -> Vec<(ProbeId, PathBuf)> {
   effects
     .iter()
     .filter_map(|e| match e {
-      Effect::Probe { probe, path } => Some((*probe, path.clone())),
+      Effect::Probe { probe, path, .. } => Some((*probe, path.clone())),
       _ => None,
     })
     .collect()
@@ -1201,6 +1201,7 @@ fn identity_minting_respects_devices_and_mounts() {
     root_attempt: None,
     profile: BackendKind::FsEvents,
     requested: PathBuf::from("/r"),
+    incarnation: 0,
     root: Some(Arc::new(PathBuf::from("/r"))),
     root_dev: Some(1),
     root_mnt_id: None,
@@ -1209,8 +1210,8 @@ fn identity_minting_respects_devices_and_mounts() {
     mounts_authoritative: true,
     refresh_pending: false,
     refresh_stale: false,
-    budget_lossy: false,
-    refresh_world_stale: false,
+    budget_recovered: false,
+    budget_report_owed: false,
     lag: LagState::Normal,
     park: Park::default(),
     resume_poisoned: false,
@@ -1246,6 +1247,7 @@ fn blind_mount_table_refuses_event_side_trust() {
     root_attempt: None,
     profile: BackendKind::FsEvents,
     requested: PathBuf::from("/r"),
+    incarnation: 0,
     root: Some(Arc::new(PathBuf::from("/r"))),
     root_dev: Some(1),
     root_mnt_id: None,
@@ -1254,8 +1256,8 @@ fn blind_mount_table_refuses_event_side_trust() {
     mounts_authoritative: false,
     refresh_pending: false,
     refresh_stale: false,
-    budget_lossy: false,
-    refresh_world_stale: false,
+    budget_recovered: false,
+    budget_report_owed: false,
     lag: LagState::Normal,
     park: Park::default(),
     resume_poisoned: false,
@@ -3013,6 +3015,7 @@ mod lowering {
       root_attempt: None,
       profile: BackendKind::FsEvents,
       requested: PathBuf::from(root),
+      incarnation: 0,
       root: Some(Arc::new(PathBuf::from(root))),
       root_dev: Some(1),
       root_mnt_id: None,
@@ -3021,8 +3024,8 @@ mod lowering {
       mounts_authoritative: true,
       refresh_pending: false,
       refresh_stale: false,
-      budget_lossy: false,
-      refresh_world_stale: false,
+      budget_recovered: false,
+      budget_report_owed: false,
       lag: LagState::Normal,
       park: Park::default(),
       resume_poisoned: false,
@@ -3504,9 +3507,9 @@ mod descending {
     let (req, watch) = effects
       .iter()
       .find_map(|e| match e {
-        Effect::Enumerate { req, watch, path } if path.as_path() == Path::new("/r") => {
-          Some((*req, *watch))
-        }
+        Effect::Enumerate {
+          req, watch, path, ..
+        } if path.as_path() == Path::new("/r") => Some((*req, *watch)),
         _ => None,
       })
       .expect("a descending root cold-enumerates after arming");
@@ -4885,7 +4888,7 @@ mod descending {
             core.on_enumerated(*req, listed(entries));
             progressed = true;
           }
-          Effect::Probe { probe, path } => probes.push((*probe, path.clone())),
+          Effect::Probe { probe, path, .. } => probes.push((*probe, path.clone())),
           _ => {}
         }
       }
@@ -5902,7 +5905,7 @@ mod descending {
             core.on_enumerated(*req, listed(entries));
             progressed = true;
           }
-          Effect::Probe { probe, path } => probes.push((*probe, path.clone())),
+          Effect::Probe { probe, path, .. } => probes.push((*probe, path.clone())),
           _ => {}
         }
       }
@@ -6036,7 +6039,7 @@ mod descending {
             core.on_enumerated(*req, listed(entries));
             progressed = true;
           }
-          Effect::Probe { probe, path } => probes.push((*probe, path.clone())),
+          Effect::Probe { probe, path, .. } => probes.push((*probe, path.clone())),
           _ => {}
         }
       }
@@ -6239,7 +6242,7 @@ mod descending {
             core.on_enumerated(*req, listed(entries));
             progressed = true;
           }
-          Effect::Probe { probe, path } => probes.push((*probe, path.clone())),
+          Effect::Probe { probe, path, .. } => probes.push((*probe, path.clone())),
           _ => {}
         }
       }
@@ -9444,49 +9447,6 @@ mod descending {
       );
     }
 
-    /// Funnel 5, the cross-world path: the refresh answering here was addressed
-    /// to a root this scope REPLACED, so its whole snapshot is about a world
-    /// that ended and the live one has not been read.
-    ///
-    /// Unlike the other two verdicts it emits no `Rescan` — it only re-arms the
-    /// read — so it reports standing none, and a retirement under it owes the
-    /// covering instruction itself.
-    #[test]
-    fn a_cross_world_refresh_bumps_the_whole_scope_and_stands_no_rescan() {
-      let (mut core, scope) = live_core();
-      // A loss arms a refresh, and the replace that follows disowns it: the
-      // completion below is the old world's.
-      core.on_root_overflow(scope, at(1));
-      core.on_root_replaced(
-        scope,
-        RootMeta {
-          root: PathBuf::from("/r"),
-          root_dev: 1,
-          root_mnt_id: None,
-          mounts: Vec::new(),
-          identity: crate::os::RootIdentity::new(1, 2),
-          ancestors: Vec::new(),
-          backend: BackendKind::FsEvents,
-        },
-        at(2),
-      );
-      let before = quiesce(&mut core, scope);
-      core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(3));
-      assert_eq!(
-        epoch(&core, scope).0,
-        before.0 + 1,
-        "the discarded snapshot moved the stamp exactly once"
-      );
-      assert_eq!(
-        core.take_barrier_moves(),
-        vec![BarrierMove {
-          scope,
-          location: BarrierLocation::Scope,
-          rescan_stands: false,
-        }],
-      );
-    }
-
     /// Funnel 6. A transport-level loss may have swallowed any coverage
     /// transition at all, so it is one about the whole scope.
     #[test]
@@ -9585,24 +9545,266 @@ mod descending {
       );
     }
 
-    /// ONCE per episode, like the loss it rides: the fact is "this root's
-    /// liveness is unproven", which does not become more true each interval, and
-    /// a move per tick against a saturated budget would retire every barrier a
-    /// wedged filesystem admits.
+    /// A live descending scope whose cold discovery is answered and quiesced.
+    ///
+    /// The probe-budget claims about the WATCH SET are read on this profile and
+    /// not on the kernel-recursive one: inotify re-proves every retained binding
+    /// when a scope-level loss recovers it, so the reinstall the recovery issues
+    /// is an effect a cell can see.
+    fn live_inotify_quiesced() -> (DriverCore, ScopeId) {
+      let (mut core, scope, req, _root) = live_descending();
+      core.on_enumerated(req, listed(Vec::new()));
+      run_cascade(&mut core, &BTreeMap::new());
+      (core, scope)
+    }
+
+    /// NO SECOND INSTRUCTION while the first is still OWED — but still a move. A
+    /// `Rescan` the consumer has not been handed yet already carries the fact
+    /// ("this root's liveness is unproven"), and it stands ahead of everything
+    /// else this scope has queued, so there is nothing to mint and nothing to
+    /// purge. The interval this tick turned away is nevertheless a window of its
+    /// own: a barrier admitted after the previous move and certified before this
+    /// one would otherwise certify across it.
+    ///
+    /// Revert witness: skip the funnel when the report is owed and the stamp
+    /// stands still — which is the A5.2 hole, one interval wide.
     #[test]
-    fn a_second_probe_budget_loss_in_one_episode_bumps_nothing() {
+    fn a_second_probe_budget_loss_before_delivery_stands_no_second_instruction() {
       let (mut core, scope) = live_core();
       core.on_refresh_declined(scope, at(1), DeclineReason::BudgetFull);
+      assert!(
+        core.effects.iter().any(|effect| matches!(
+          effect,
+          Effect::Emit { scope: on, change, .. } if *on == scope && change.kind().is_rescan()
+        )),
+        "staging: the first decline's covering `Rescan` is queued and undelivered: {:?}",
+        core.effects
+      );
       let before = quiesce(&mut core, scope);
       core.on_refresh_declined(scope, at(2), DeclineReason::BudgetFull);
       assert_eq!(
         epoch(&core, scope).0,
-        before.0,
-        "the episode's latch already reported: the stamp stands still"
+        before.0 + 1,
+        "the window this tick could not prove is a transition of its own"
+      );
+      assert_eq!(
+        core.take_barrier_moves(),
+        vec![BarrierMove {
+          scope,
+          location: BarrierLocation::Scope,
+          rescan_stands: true,
+        }],
+        "under the instruction already standing, which the consumer has yet to see"
+      );
+      let effects = drain(&mut core);
+      let emitted = emits(&effects);
+      assert!(
+        emitted.len() == 1 && emitted[0].kind().is_rescan(),
+        "and that queued `Rescan` is still the only one: {effects:?}"
+      );
+    }
+
+    /// RENEWABLE at the delivery seam, and the RECOVERY is not. Once the
+    /// consumer holds the covering `Rescan` the instruction is discharged — an
+    /// event is not a state — and a scope the budget starves can never dispatch
+    /// the probe that would prove its root alive, so a root that dies quietly
+    /// under a lasting saturation must be reported again. The liveness interval
+    /// bounds the rate.
+    ///
+    /// The watch set is a different obligation on a different schedule. A
+    /// declined probe read nothing and dropped nothing, so the renewal re-proves
+    /// no binding: it re-adds nothing and re-reads nothing. Repeating the
+    /// episode's reinstall per interval would bump the loss generation the
+    /// outstanding one is arming under, and a tree whose reproof outlasts the
+    /// interval would restart it for as long as the saturation lasts.
+    ///
+    /// Revert witnesses: keep one latch — clear the recovery at the accepted
+    /// delivery too — and the renewal re-adds the root again; keep the latch
+    /// one-shot instead and the second decline stands nothing, which is exactly
+    /// the silence a quietly unmounted root would keep.
+    #[test]
+    fn a_probe_budget_loss_bumps_again_once_its_rescan_is_delivered() {
+      let (mut core, scope) = live_inotify_quiesced();
+
+      core.on_refresh_declined(scope, at(1), DeclineReason::BudgetFull);
+      let stood = drain(&mut core);
+      let emitted = emits(&stood);
+      assert!(
+        emitted.len() == 1 && emitted[0].kind().is_rescan(),
+        "staging: the first decline stood exactly one covering `Rescan`: {stood:?}"
       );
       assert!(
-        core.take_barrier_moves().is_empty(),
-        "and nothing is recorded for a window already covered"
+        stood
+          .iter()
+          .any(|effect| matches!(effect, Effect::AddWatch { .. })),
+        "staging: and recovered the watch set with it — the episode's one \
+         reinstall: {stood:?}"
+      );
+      // The seam the driver reports at: the consumer's own channel took it.
+      core.on_delivery(scope, Delivery::Accepted, at(2));
+
+      let before = quiesce(&mut core, scope);
+      core.on_refresh_declined(scope, at(3), DeclineReason::BudgetFull);
+      assert_eq!(
+        epoch(&core, scope).0,
+        before.0 + 1,
+        "a fresh unproven window moves the stamp again"
+      );
+      assert_eq!(
+        core.take_barrier_moves(),
+        vec![BarrierMove {
+          scope,
+          location: BarrierLocation::Scope,
+          rescan_stands: true,
+        }],
+        "under the covering `Rescan` the renewal stands for it"
+      );
+      let renewed = drain(&mut core);
+      let again = emits(&renewed);
+      assert!(
+        again.len() == 1 && again[0].kind().is_rescan(),
+        "and the instruction really is a second one: {renewed:?}"
+      );
+      assert!(
+        !renewed
+          .iter()
+          .any(|effect| matches!(effect, Effect::AddWatch { .. } | Effect::Enumerate { .. })),
+        "recovering nothing: no binding is re-proven and no directory re-read \
+         for a decline that dropped no record: {renewed:?}"
+      );
+    }
+
+    /// A probe that ANSWERS ends the episode whatever the first instruction's
+    /// delivery state: the liveness claim is proven again, so a later decline
+    /// opens a new episode and re-proves the watch set once more.
+    #[test]
+    fn a_completed_refresh_clears_the_recovery_for_a_later_episode() {
+      let (mut core, scope) = live_inotify_quiesced();
+      core.on_refresh_declined(scope, at(1), DeclineReason::BudgetFull);
+      assert!(
+        core.scopes[&scope].budget_recovered,
+        "staging: the decline spent the episode's one watch-set recovery"
+      );
+      run_cascade(&mut core, &BTreeMap::new());
+
+      core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(2));
+      assert!(
+        !core.scopes[&scope].budget_recovered,
+        "a probe answered: the episode is over"
+      );
+      let _ = drain(&mut core);
+
+      let before = quiesce(&mut core, scope);
+      core.on_refresh_declined(scope, at(3), DeclineReason::BudgetFull);
+      assert_eq!(
+        epoch(&core, scope).0,
+        before.0 + 1,
+        "so the next decline is a new fact and stands its own instruction"
+      );
+      assert_eq!(
+        core.take_barrier_moves(),
+        vec![BarrierMove {
+          scope,
+          location: BarrierLocation::Scope,
+          rescan_stands: true,
+        }],
+        "under the covering `Rescan` that decline mints for it"
+      );
+      let again = drain(&mut core);
+      assert!(
+        again
+          .iter()
+          .any(|effect| matches!(effect, Effect::AddWatch { .. })),
+        "and the fresh episode re-proves the watch set again: {again:?}"
+      );
+    }
+
+    /// A saturated-budget BIRTH. The spawn arms the birth refresh before a
+    /// descending root arms, so a decline at a full budget lands while the scope
+    /// is not yet publicly live: the never-live fence drops its `Rescan`, and a
+    /// report latched there could never be discharged — nothing can deliver an
+    /// instruction to a caller that holds no handle. The recovery is made as
+    /// usual; the report is owed only once the root arm commits the handle.
+    ///
+    /// Revert witness: latch the report on the pre-public decline and the last
+    /// drain is empty — the newly public scope keeps a coverage claim nobody is
+    /// checking, for as long as the saturation lasts.
+    #[test]
+    fn a_saturated_budget_birth_reports_at_its_first_public_tick() {
+      let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
+      let scope = core
+        .on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Inotify)
+        .expect("a fresh scope registers");
+      let _ = drain(&mut core);
+      core.on_stream_spawned(
+        scope,
+        Ok(RootMeta {
+          root: PathBuf::from("/r"),
+          root_dev: 1,
+          root_mnt_id: None,
+          mounts: Vec::new(),
+          identity: crate::os::RootIdentity::new(1, 1),
+          ancestors: Vec::new(),
+          backend: BackendKind::Inotify,
+        }),
+      );
+      let spawned = drain(&mut core);
+      let root_watch = spawned
+        .iter()
+        .find_map(|effect| match effect {
+          Effect::AddWatch {
+            watch,
+            parent,
+            path,
+            ..
+          } if path.as_path() == Path::new("/r") && watch == parent => Some(*watch),
+          _ => None,
+        })
+        .expect("the spawned descending root arms through the effect path");
+      assert!(
+        !core.scopes[&scope].publicly_live,
+        "staging: the birth refresh is armed before the root arm answers"
+      );
+
+      core.on_refresh_declined(scope, at(1), DeclineReason::BudgetFull);
+      let fenced = drain(&mut core);
+      assert!(
+        emits(&fenced).is_empty(),
+        "the never-live fence drops it: no caller holds a handle yet: {fenced:?}"
+      );
+      assert!(
+        core.scopes[&scope].budget_recovered && !core.scopes[&scope].budget_report_owed,
+        "so the episode's recovery is spent and no report is owed"
+      );
+
+      core.on_watch_installed(
+        root_watch,
+        core.arm_attempt(root_watch),
+        crate::os::linux::WatchOutcome::Installed(1),
+      );
+      assert!(
+        core.scopes[&scope].publicly_live,
+        "staging: the root arm is where the caller's handle commits"
+      );
+      run_cascade(&mut core, &BTreeMap::new());
+
+      let before = quiesce(&mut core, scope);
+      core.on_refresh_declined(scope, at(2), DeclineReason::BudgetFull);
+      assert_eq!(
+        epoch(&core, scope).0,
+        before.0 + 1,
+        "the first refused PUBLIC tick is a window of its own"
+      );
+      let reported = drain(&mut core);
+      let emitted = emits(&reported);
+      assert!(
+        emitted.len() == 1 && emitted[0].kind().is_rescan(),
+        "and it stands the covering `Rescan` the birth decline could not: {reported:?}"
+      );
+      core.on_delivery(scope, Delivery::Accepted, at(3));
+      assert!(
+        !core.scopes[&scope].budget_report_owed,
+        "which the consumer's channel discharges, so a later refused tick reports again"
       );
     }
 
@@ -13674,12 +13876,14 @@ mod root_replaced {
       "no old-world verb is fabricated after the cut: {effects:?}"
     );
   }
-  /// A mount refresh in flight across the commit carries the REPLACED
-  /// world's facts — its liveness verdict included. The cross-world gate
-  /// discards it whole (the old object's identity must never read as the
-  /// new root's death) and re-reads the live world.
+  /// The commit DISOWNS the refresh in flight and arms exactly one of its own,
+  /// whose completion is applied on arrival.
+  ///
+  /// The driver's probe generation is the one owner of the cross-world fence, so
+  /// a completion that reaches the core describes the root this scope watches
+  /// now: its table installs authority at once, and nothing re-reads.
   #[test]
-  fn an_in_flight_refresh_across_the_commit_cannot_kill_the_swapped_scope() {
+  fn the_commit_arms_one_refresh_and_applies_its_completion_on_arrival() {
     let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = core
       .on_watch(PathBuf::from("/a/b"), Interest::all(), BackendKind::Rdcw)
@@ -13689,30 +13893,17 @@ mod root_replaced {
     // The birth refresh is dispatched and STILL OUT when the commit lands.
     let _ = drain(&mut core);
     core.on_root_replaced(scope, meta("/a", 1, 2, BackendKind::Rdcw), at(1));
-    let _ = drain(&mut core);
-
-    // The old-world completion: alive, but at the OLD identity (1, 1) —
-    // without the gate this reads as the (1, 2) root replaced, and kills.
-    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(2));
     let effects = drain(&mut core);
-    assert!(
-      core.scopes.contains_key(&scope),
-      "the swapped scope survives the cross-world verdict"
+    assert_eq!(
+      refresh_requests(&effects),
+      1,
+      "one refresh of the live world, not a stale mark on the old root's: {effects:?}"
     );
-    assert!(
-      effects
-        .iter()
-        .any(|e| matches!(e, Effect::RefreshMounts { scope: s, .. } if *s == scope)),
-      "the live world is re-read: {effects:?}"
-    );
-    assert!(
-      emits(&effects).is_empty(),
-      "no fabricated death or churn: {effects:?}"
-    );
+    // The commit's own funnel-4 move, read and discarded: the assertion below is
+    // about what the COMPLETION raises.
+    let _ = core.take_barrier_moves();
 
-    // The re-read reports the LIVE world — the new identity installs
-    // authority; the same verdict that killed above is now death evidence
-    // no gate discards (same world, real facts).
+    // That refresh answers for the widened root, alive.
     core.on_mounts_refreshed(
       scope,
       MountRefresh {
@@ -13721,14 +13912,30 @@ mod root_replaced {
         root: RootLiveness::Present(crate::os::RootIdentity::new(1, 2)),
         root_mnt_id: None,
       },
-      at(3),
+      at(2),
     );
-    let _ = drain(&mut core);
+    let effects = drain(&mut core);
     assert!(core.scopes.contains_key(&scope));
-    let state = core.scopes.get(&scope).unwrap();
+    assert_eq!(
+      refresh_requests(&effects),
+      0,
+      "no second refresh is queued: {effects:?}"
+    );
     assert!(
-      state.mounts_authoritative,
-      "the live read installed authority"
+      core
+        .scopes
+        .get(&scope)
+        .expect("the swapped scope is live")
+        .mounts_authoritative,
+      "the first completion installed authority"
+    );
+    assert!(
+      core.take_barrier_moves().is_empty(),
+      "an applied alive verdict moves no barrier"
+    );
+    assert!(
+      emits(&effects).is_empty(),
+      "no fabricated death or churn: {effects:?}"
     );
   }
 
@@ -13868,9 +14075,9 @@ mod root_replaced {
     let rebuild = effects
       .iter()
       .find_map(|e| match e {
-        Effect::Enumerate { req, watch, path } if path.as_path() == Path::new("/a") => {
-          Some((*req, *watch))
-        }
+        Effect::Enumerate {
+          req, watch, path, ..
+        } if path.as_path() == Path::new("/a") => Some((*req, *watch)),
         _ => None,
       })
       .expect("the rebuild reads the NEW root: {effects:?}");
@@ -13895,6 +14102,99 @@ mod root_replaced {
         "the rebuild re-arms {path}: {effects:?}"
       );
     }
+  }
+
+  /// A refresh armed against the RETIRING root is purged at the commit, so the
+  /// queue is left holding exactly the live world's.
+  ///
+  /// The driver's probe generation fences probes already DISPATCHED. A
+  /// `RefreshMounts` still QUEUED is not a probe yet — it carries only the root
+  /// path, which a same-path replacement leaves equal — so left standing it is
+  /// first at the next flush, claims the NEW generation, and leaves the
+  /// replacement's own refresh behind it declined `ScopeBusy`. The old root's
+  /// answer would then be judged against the replacement: a false whole-scope
+  /// move, or a hung old `stat` blocking the live world's first liveness proof.
+  ///
+  /// MUST FAIL without the purge: the drain carries TWO refreshes for this scope
+  /// and the first names `/a/b`, the root this commit retired.
+  #[test]
+  fn the_replace_commit_leaves_exactly_the_live_world_s_refresh_queued() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
+    let scope = live_kr_scope(&mut core);
+    let retiring = core.incarnation_of(scope);
+
+    // A loss arms the OLD world's refresh and nothing flushes it: the state the
+    // driver's post-flush source drain leaves behind when a replacement's result
+    // is already waiting on the op channel.
+    core.on_root_overflow(scope, at(1));
+    core.on_root_replaced(scope, meta("/a", 1, 1, BackendKind::Rdcw), at(2));
+
+    let effects = drain(&mut core);
+    let refreshed: Vec<&Path> = effects
+      .iter()
+      .filter_map(|e| match e {
+        Effect::RefreshMounts { scope: s, root, .. } if *s == scope => Some(root.as_path()),
+        _ => None,
+      })
+      .collect();
+    assert_eq!(
+      refreshed,
+      vec![Path::new("/a")],
+      "the queue holds exactly the live world's refresh: {effects:?}"
+    );
+
+    // The incarnation the purge took is refused by the poll site's own test —
+    // the second belt on the same window.
+    let live = core.incarnation_of(scope);
+    assert_ne!(retiring, live, "the commit moved the scope's incarnation");
+    assert!(
+      !core.effect_is_current(scope, retiring),
+      "the retired incarnation is not the world this scope watches now"
+    );
+    assert!(
+      core.effect_is_current(scope, live),
+      "and the replacement's own incarnation is"
+    );
+    assert!(
+      !core.effect_is_current(ScopeId::new(NonZeroU64::new(4_242).unwrap()), live),
+      "a scope this core does not hold watches no world at all"
+    );
+  }
+
+  /// Path equality is never the test: a SAME-PATH replacement retires an
+  /// incarnation whose root bytes compare equal to the replacement's.
+  ///
+  /// MUST FAIL if the poll site compares paths: the retired incarnation would
+  /// read as current, and the old root's `stat` would claim the new world's
+  /// generation.
+  #[test]
+  fn a_same_path_replacement_refuses_the_incarnation_it_retired() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
+    let scope = live_kr_scope(&mut core);
+    let retiring_root = core.root_path(scope).expect("the live scope holds a root");
+    let retiring = core.incarnation_of(scope);
+
+    // The same canonical path, a different object.
+    core.on_root_replaced(scope, meta("/a/b", 1, 2, BackendKind::Rdcw), at(1));
+    let _ = drain(&mut core);
+
+    let live_root = core
+      .root_path(scope)
+      .expect("the replacement installed a root");
+    let live = core.incarnation_of(scope);
+    assert_eq!(
+      retiring_root.as_path(),
+      live_root.as_path(),
+      "the staging: the two worlds' roots compare equal by path"
+    );
+    assert!(
+      !core.effect_is_current(scope, retiring),
+      "the retired incarnation is refused although the paths are equal"
+    );
+    assert!(
+      core.effect_is_current(scope, live),
+      "and the live incarnation is accepted"
+    );
   }
 }
 
@@ -15336,6 +15636,158 @@ mod root_widened {
       WatchId::new(core::num::NonZeroU64::new(9_990).unwrap()),
     );
     core.abort_widen_watch(ghost);
+  }
+
+  /// The widen commit purges the scope's queued refreshes for the reason the
+  /// stream replace does: a refresh armed against the old root belongs to a world
+  /// the widen replaced, and the driver's generation reaches only probes already
+  /// DISPATCHED. It also moves the scope's incarnation, so the stamp the poll site
+  /// compares against is the widened world's and not the spliced-under one's.
+  ///
+  /// MUST FAIL without the purge: the drain carries TWO refreshes and the first
+  /// names `/r/sub`, the root this commit spliced under.
+  #[test]
+  fn the_widen_commit_leaves_exactly_the_widened_world_s_refresh_queued() {
+    let (mut core, scope, _root_watch, _boot) = live_at("/r/sub", 1, true);
+    let spliced_under = core.incarnation_of(scope);
+
+    // The loss arms the OLD world's refresh, and the window opens on its far
+    // side — a loss inside the window taints it instead.
+    core.on_root_overflow(scope, at(1));
+    let _ = widen(&mut core, scope, meta("/r", 9), at(2));
+
+    let effects = drain(&mut core);
+    let refreshed: Vec<&Path> = effects
+      .iter()
+      .filter_map(|e| match e {
+        Effect::RefreshMounts { scope: s, root, .. } if *s == scope => Some(root.as_path()),
+        _ => None,
+      })
+      .collect();
+    assert_eq!(
+      refreshed,
+      vec![Path::new("/r")],
+      "the queue holds exactly the widened world's refresh: {effects:?}"
+    );
+
+    let widened = core.incarnation_of(scope);
+    assert!(
+      !core.effect_is_current(scope, spliced_under),
+      "the widen moves the incarnation, so the spliced-under one is refused"
+    );
+    assert!(
+      core.effect_is_current(scope, widened),
+      "and the widened world's own incarnation is accepted"
+    );
+  }
+
+  /// After each commit hook the scope's queued effects are exactly the world it
+  /// watches NOW.
+  ///
+  /// The two hooks answer that differently, and both answers are the point. A
+  /// REPLACE retires the root: every queued arm, disarm, listing and stat names
+  /// ground the scope no longer watches, and the hook rebuilds each binding it
+  /// owns, so the queue is purged before the rebuild's own work is appended. A
+  /// WIDEN adopts the old root as a child of the new one — same transport, same
+  /// watch ids, nothing re-queued for the subtree — so the same queued arm names
+  /// live ground the commit still owes, and it is CARRIED into the new
+  /// incarnation instead. Taking it would leave its node arming with no arm
+  /// outstanding and nothing to re-issue one.
+  ///
+  /// MUST FAIL where only the queued refresh is purged: the retiring root's arm
+  /// is still in the replace's drain, and it is the effect that would open `/r/sub`
+  /// on the replacement's transport ahead of the corrective reproof.
+  #[test]
+  fn a_commit_leaves_queued_exactly_the_world_it_now_watches() {
+    // NON-VACUITY: the staging really does leave a ground-touching effect of the
+    // old world queued. The overflow cut re-proves the root's binding, so the
+    // queue holds that arm when the commit lands on it.
+    let (mut core, scope, _root_watch, _boot) = live_at("/r/sub", 1, true);
+    core.on_root_overflow(scope, at(1));
+    let staged = drain(&mut core);
+    assert!(
+      staged.iter().any(
+        |e| matches!(e, Effect::AddWatch { path, .. } if path.as_path() == Path::new("/r/sub"))
+      ),
+      "staging: the overflow cut queues the root's own re-proof arm: {staged:?}"
+    );
+
+    // The REPLACE. The loss arms the old world's root re-proof and its refresh,
+    // and nothing flushes them: the state the post-flush source drain leaves
+    // behind when a replacement's result is already waiting on the op channel.
+    let (mut core, scope, _root_watch, _boot) = live_at("/r/sub", 1, true);
+    core.on_root_overflow(scope, at(1));
+    core.on_root_replaced(scope, meta("/w", 7), at(2));
+    let effects = drain(&mut core);
+    let retired: Vec<&Effect> = effects
+      .iter()
+      .filter(|e| match e {
+        Effect::AddWatch { path, .. } | Effect::Enumerate { path, .. } => {
+          path.as_path() == Path::new("/r/sub")
+        }
+        Effect::RefreshMounts { root, .. } => root.as_path() == Path::new("/r/sub"),
+        _ => false,
+      })
+      .collect();
+    assert!(
+      retired.is_empty(),
+      "the retired root owns no obligation in the queue: {retired:?}"
+    );
+    let refreshed: Vec<&Path> = effects
+      .iter()
+      .filter_map(|e| match e {
+        Effect::RefreshMounts { root, .. } => Some(root.as_path()),
+        _ => None,
+      })
+      .collect();
+    assert_eq!(
+      refreshed,
+      vec![Path::new("/w")],
+      "and the queue holds exactly the live world's refresh: {effects:?}"
+    );
+    // The old world's DELIVERY rides across: a delivery carries its own root and
+    // is self-describing, so no commit takes one — the covering `Rescan` this
+    // commit stands is queued behind it.
+    assert!(
+      effects
+        .iter()
+        .any(|e| matches!(e, Effect::Emit { root, .. } if root.as_path() == Path::new("/r/sub"))),
+      "the retired world's queued delivery survives: {effects:?}"
+    );
+
+    // The WIDEN, staged identically. The refresh was armed against a different
+    // object and is replaced; the arm names ground the widen adopted and rides
+    // across, carrying the incarnation the commit minted.
+    let (mut core, scope, _root_watch, _boot) = live_at("/r/sub", 1, true);
+    core.on_root_overflow(scope, at(1));
+    let _ = widen(&mut core, scope, meta("/r", 9), at(2));
+    let effects = drain(&mut core);
+    let widened = core.incarnation_of(scope);
+    let carried = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch {
+          incarnation, path, ..
+        } if path.as_path() == Path::new("/r/sub") => Some(*incarnation),
+        _ => None,
+      })
+      .expect("the adopted root's arm rides the widen: {effects:?}");
+    assert_eq!(
+      carried, widened,
+      "and it belongs to the world the widen minted, so the poll site keeps it"
+    );
+    let refreshed: Vec<&Path> = effects
+      .iter()
+      .filter_map(|e| match e {
+        Effect::RefreshMounts { root, .. } => Some(root.as_path()),
+        _ => None,
+      })
+      .collect();
+    assert_eq!(
+      refreshed,
+      vec![Path::new("/r")],
+      "only the refresh is superseded: {effects:?}"
+    );
   }
 }
 
@@ -19149,13 +19601,23 @@ mod prune {
   }
 
   /// A directory rename INTO pruned ground is not a silent drop: the fence stands
-  /// ONE located `Rescan` at the destination's nearest unpruned parent in the
+  /// a located `Rescan` at the destination's nearest unpruned parent in the
   /// dropped record's place. The subtree really did move somewhere the seat
   /// covers, so every later change under it — this driver's own sync marker
   /// included — is silent from that instant, and the consumer had nothing telling
   /// it to re-read. On a kernel-recursive profile the source has already forgotten
   /// the moved subtree, so the cover is the ONLY thing that can dominate a barrier
   /// still waiting under it.
+  ///
+  /// On a batch-classifying lowering the widened `MovedTo` also consumes the
+  /// source half the same batch's feed parked, and consumes it right after that
+  /// feed — so the source-side departure is resolved in the same drain, exactly
+  /// as the move window's own expiry would resolve it (a `Removed`, plus a
+  /// `Rescan` if the half's window went dirty): torn down at once, the
+  /// source-side departure included, not left pending for a timeout that will
+  /// never come now that the pairing is settled here. That emission names `open`
+  /// — unpruned ground — and is redundant under the root cover, not a second
+  /// leak of the pruned destination.
   ///
   /// Asserted on all three kernel-recursive lowerings that report a rename pair,
   /// because each reaches the fence by its own route.
@@ -19192,14 +19654,21 @@ mod prune {
     );
     let effects = drain(&mut core);
     let changes = emits(&effects);
-    assert_eq!(
-      rescans(&changes),
-      vec![loc(&[])],
+    assert!(
+      rescans(&changes).contains(&loc(&[])),
       "one cover, at the root — the nearest unpruned parent of `/r/blocked`: {changes:?}"
     );
     assert!(
       !mentions(&changes, "blocked"),
       "and it names no pruned ground: {changes:?}"
+    );
+    assert!(
+      changes.iter().any(|change| {
+        (change.kind().is_removed() || change.kind().is_rescan())
+          && change.location() == &loc(&["open"])
+      }),
+      "and the consumed source half's own departure is reported in the same \
+       drain, at `open`: {changes:?}"
     );
 
     // USN: the same shape through the journal lowering's pair.
@@ -19221,14 +19690,21 @@ mod prune {
     );
     let effects = drain(&mut core);
     let changes = emits(&effects);
-    assert_eq!(
-      rescans(&changes),
-      vec![loc(&[])],
+    assert!(
+      rescans(&changes).contains(&loc(&[])),
       "the journal's pair owes the same one cover: {changes:?}"
     );
     assert!(
       !mentions(&changes, "blocked"),
       "and it names no pruned ground either: {changes:?}"
+    );
+    assert!(
+      changes.iter().any(|change| {
+        (change.kind().is_removed() || change.kind().is_rescan())
+          && change.location() == &loc(&["open"])
+      }),
+      "and the consumed source half's own departure is reported in the same \
+       drain, at `open`: {changes:?}"
     );
   }
 
@@ -19328,19 +19804,18 @@ mod prune {
   /// the opposite one.
   ///
   /// On FSEvents every fence runs ahead of every feed: the destination is judged
-  /// at its probe's resolution, where the widening consumption finds no half
-  /// because the source is fed only later, when the batch's settlement grants it
-  /// its pairing cookie. The destination's EVIDENCE survives the fence, so that
-  /// grant still happens — and the half it feeds has nothing left to pair with.
-  /// Parked, it would hold the scope's move settle, and with it every cover fence
-  /// and every new sync of this root, for the whole pairing window, which the
-  /// option bounds at a day. The Monitor remembers the consumption instead and
-  /// resolves the half on arrival.
+  /// at its probe's resolution, where the half cannot be taken because the source
+  /// is fed only later, when the batch's settlement grants it its pairing cookie.
+  /// The destination's EVIDENCE survives the fence, so that grant still happens —
+  /// and the half it feeds has nothing left to pair with. Parked, it would hold the
+  /// scope's move settle, and with it every cover fence and every new sync of this
+  /// root, for the whole pairing window, which the option bounds at a day. The
+  /// consumption rides the batch instead and is taken immediately after that feed.
   ///
   /// A DAY of move window, so nothing here can be settled by an expiry: whatever
-  /// this cell observes, it observes because the consumption was remembered.
+  /// this cell observes, it observes because the consumption rode its batch.
   ///
-  /// Revert witness: drop the remembered consumption and the `Removed` below is
+  /// Revert witness: drop the carried consumption and the `Removed` below is
   /// absent, `poll_timeout` names a deadline a day out, and the scope's barrier
   /// is unsettled until it elapses.
   #[test]
@@ -19411,10 +19886,116 @@ mod prune {
     );
   }
 
+  /// A LONE destination — a directory moved in from outside the scope, so no
+  /// source half of this scope exists — leaves nothing behind at all.
+  ///
+  /// The fence asks for every widened rename it takes, and on the profile that
+  /// feeds as it classifies the source, if it is in the scope, was parked before
+  /// this destination was judged. So a consumption that finds nothing owes
+  /// nothing: there is no half, and none can arrive under this cookie for this
+  /// rename. Nothing is remembered and nothing rides the batch.
+  ///
+  /// Revert witness: remember the consumption and the window's tick below has an
+  /// entry to expire, which is the retention this pins the absence of.
+  #[test]
+  fn a_lone_move_into_pruned_ground_leaves_no_pending_half() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
+    let (scope, req, root) = live_descending(&mut core, &pruning(&["blocked"]));
+    core.on_enumerated(req, listed(Vec::new()));
+    let _ = drain(&mut core);
+
+    core.on_inotify_events(
+      scope,
+      vec![inotify(root, IN_MOVED_TO | IN_ISDIR, 9, Some("blocked"))],
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+    assert!(
+      rescans(&changes).contains(&loc(&[])),
+      "staging: the arrival is covered at the root: {changes:?}"
+    );
+    assert!(
+      !mentions(&changes, "blocked"),
+      "staging: and no cover names the pruned destination: {changes:?}"
+    );
+
+    core.on_timeout(at(1_000));
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).is_empty(),
+      "the window has nothing to expire and the batch left no residue: {effects:?}"
+    );
+  }
+
+  /// And a later rename whose cookie REPEATS that one, inside the move window, is
+  /// still reported as a single `Moved`.
+  ///
+  /// The cookie space a source draws from is finite — 32 bits on inotify — so a
+  /// value recurs well inside a window the option bounds at a day. A consumption
+  /// remembered against `(scope, cookie)` would be taken by this wholly unrelated
+  /// rename: its source would resolve as a departure and its destination as a
+  /// creation, and the `Rescan` the earlier pruned arrival stood precedes it and
+  /// cannot cover it. The consumer would lose an atomic transition silently.
+  ///
+  /// Revert witness: remember the consumption and this rename is reported as a
+  /// `Removed` plus a `Created` instead of the `Moved` below.
+  #[test]
+  fn a_rename_reusing_a_consumed_cookie_is_still_one_move() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
+    let (scope, req, root) = live_descending(&mut core, &pruning(&["blocked"]));
+    core.on_enumerated(req, listed(Vec::new()));
+    let _ = drain(&mut core);
+
+    // A directory moved in from outside the scope onto a pruned name: a lone
+    // destination, whose consumption finds — and must leave — nothing.
+    core.on_inotify_events(
+      scope,
+      vec![inotify(root, IN_MOVED_TO | IN_ISDIR, 9, Some("blocked"))],
+      at(1),
+    );
+    let _ = drain(&mut core);
+
+    // The SAME cookie, well inside the move window, on an unrelated reportable
+    // rename in unpruned ground.
+    core.on_inotify_events(
+      scope,
+      vec![
+        inotify(root, IN_MOVED_FROM, 9, Some("one.txt")),
+        inotify(root, IN_MOVED_TO, 9, Some("two.txt")),
+      ],
+      at(2),
+    );
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.kind().is_moved() && change.location() == &loc(&["two.txt"])),
+      "the rename keeps its atomic transition: {changes:?}"
+    );
+    assert!(
+      !changes
+        .iter()
+        .any(|change| change.kind().is_removed() && change.location() == &loc(&["one.txt"])),
+      "its source is not resolved as a departure: {changes:?}"
+    );
+    assert!(
+      !changes
+        .iter()
+        .any(|change| change.kind().is_created() && change.location() == &loc(&["two.txt"])),
+      "and its destination is not reported as a creation: {changes:?}"
+    );
+  }
+
   /// The cover climbs to the NEAREST unpruned parent, not merely one segment: a
   /// destination under a pruned ancestor several levels down has no unpruned
   /// parent inside the subtree the seat closed, and a `Rescan` there would name
   /// ground the caller asked never to hear about.
+  ///
+  /// The consumed source half's own departure (at `open`, unpruned ground) rides
+  /// the same drain beside the climbed cover, exactly as it does for the
+  /// shallow rename above.
   #[test]
   fn a_rename_into_deeply_pruned_ground_covers_the_nearest_unpruned_parent() {
     let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
@@ -19438,11 +20019,18 @@ mod prune {
     );
     let effects = drain(&mut core);
     let changes = emits(&effects);
-    assert_eq!(
-      rescans(&changes),
-      vec![loc(&["a"])],
+    assert!(
+      rescans(&changes).contains(&loc(&["a"])),
       "the cover stands at `/r/a` — above the pruned `a/blocked`, not beside \
        `deep`: {changes:?}"
+    );
+    assert!(
+      changes.iter().any(|change| {
+        (change.kind().is_removed() || change.kind().is_rescan())
+          && change.location() == &loc(&["open"])
+      }),
+      "and the consumed source half's own departure is reported in the same \
+       drain, at `open`: {changes:?}"
     );
   }
 }

@@ -58,6 +58,7 @@ impl DriverCore {
       trailing: Vec::new(),
       deferred_unmounts: Vec::new(),
       evidenced: BTreeMap::new(),
+      deferred_consumptions: Vec::new(),
       permit: None,
     }
   }
