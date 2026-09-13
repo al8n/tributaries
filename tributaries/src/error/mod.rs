@@ -641,8 +641,12 @@ impl UnwatchError {
 /// queue behind every change the backend reported before it — is what proves
 /// those changes have exited the pipeline. Every variant here is a failure to
 /// establish that proof, never a silent half-barrier.
+///
+/// Requires the experimental `sync` feature.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
+#[cfg(feature = "sync")]
+#[cfg_attr(docsrs, doc(cfg(feature = "sync")))]
 pub enum SyncError {
   /// The handle does not name a live subscription of this watcher.
   #[error("the subscription is not live")]
@@ -762,6 +766,7 @@ pub enum SyncError {
   Closed,
 }
 
+#[cfg(feature = "sync")]
 impl SyncError {
   /// Whether this is [`UnknownSubscription`](Self::UnknownSubscription).
   #[inline]

@@ -117,11 +117,14 @@ run_shard() {
 # `proto-rest` is everything else in tributary-proto, and the two `umbrella-*`
 # groups partition the tributaries crate's own suite.
 #
-# All six `fs-*` shards pass `--features tokio`, and they must agree on it: the
+# All six `fs-*` shards pass `--features tokio,sync`, and they must agree on it: the
 # test modules under `driver::` and `watcher::` are gated
 # `#[cfg(all(test, feature = "tokio"))]`, so without the feature the three
 # `driver::` filters match nothing and `watcher::`'s slice of `fs-rest` goes
-# with them. With it the six are a true partition — 301 + 404 + 60 + 139 + 97 +
+# with them. `sync` is the same condition for the barrier cells: the whole
+# `fs-cookie` shard is `driver::tests::sync_cookie::`, which the `sync` feature
+# gates, so a shard run without it matches nothing at all and `run_shard`'s
+# vacuity guard below turns that into a red job. With it the six are a true partition — 301 + 404 + 60 + 139 + 97 +
 # 77 = 1078, the whole tokio-enabled lib suite (counts from a native run; miri
 # drops the `not(miri)` cells from each side alike).
 #
@@ -205,27 +208,27 @@ case "$TEST_GROUP" in
       --skip coalesce:: --skip subsume:: --skip route::
     ;;
   fs-core)
-    run_shard cargo miri test -p tributary-fs --lib --features tokio --target "$TARGET" -- \
+    run_shard cargo miri test -p tributary-fs --lib --features tokio,sync --target "$TARGET" -- \
       core::
     ;;
   fs-os)
-    run_shard cargo miri test -p tributary-fs --lib --features tokio --target "$TARGET" -- \
+    run_shard cargo miri test -p tributary-fs --lib --features tokio,sync --target "$TARGET" -- \
       os::
     ;;
   fs-rest)
-    run_shard cargo miri test -p tributary-fs --all-targets --features tokio --target "$TARGET" -- \
+    run_shard cargo miri test -p tributary-fs --all-targets --features tokio,sync --target "$TARGET" -- \
       --skip driver:: --skip core:: --skip os::
     ;;
   fs-cookie)
-    run_shard cargo miri test -p tributary-fs --lib --features tokio --target "$TARGET" -- \
+    run_shard cargo miri test -p tributary-fs --lib --features tokio,sync --target "$TARGET" -- \
       driver::tests::sync_cookie::
     ;;
   fs-descending)
-    run_shard cargo miri test -p tributary-fs --lib --features tokio --target "$TARGET" -- \
+    run_shard cargo miri test -p tributary-fs --lib --features tokio,sync --target "$TARGET" -- \
       driver::tests::descending::
     ;;
   fs-driver)
-    run_shard cargo miri test -p tributary-fs --lib --features tokio --target "$TARGET" -- driver:: \
+    run_shard cargo miri test -p tributary-fs --lib --features tokio,sync --target "$TARGET" -- driver:: \
       --skip driver::tests::sync_cookie:: --skip driver::tests::descending::
     ;;
   *)

@@ -18,14 +18,19 @@ use agnostic_lite::RuntimeLite;
 use tributary_fs::{
   CloseError as FsCloseError, CoverOutcome, Event as FsEvent, EventKind as FsEventKind,
   ReplaceRootError, RequestOutcome, RootHandle, RootOptions, SkipReason, SourceError,
-  SyncRootDenied, SyncRootError, SyncTicket, UnwatchError as FsUnwatchError, WatchRootError,
-  Watcher, WatcherOptions,
+  UnwatchError as FsUnwatchError, WatchRootError, Watcher, WatcherOptions,
 };
+#[cfg(feature = "sync")]
+use tributary_fs::{SyncRootDenied, SyncRootError, SyncTicket};
 use tributary_proto::Interest;
 
-use super::{Armed, Begun, Source, SourceEvent, SyncToken};
+use super::{Armed, Source, SourceEvent};
+#[cfg(feature = "sync")]
+use super::{Begun, SyncToken};
+#[cfg(feature = "sync")]
+use crate::error::SyncError;
 use crate::{
-  error::{BuildError, FaultKind, SourceCloseError, SourceFault, SyncError, WatchError},
+  error::{BuildError, FaultKind, SourceCloseError, SourceFault, WatchError},
   event::{EventKind, path_components},
   options::RootGlobs,
 };
@@ -111,6 +116,7 @@ pub struct FsSource<R> {
   /// live-root count, and in practice ≤ 1 (the owner awaits `begin_sync` inline, so
   /// at most one sync is in flight at a time); entries for since-released roots are
   /// pruned at the top of [`arm`](Source::arm) alongside `pending_set`/`enqueued`.
+  #[cfg(feature = "sync")]
   pending_syncs: HashMap<RootHandle, (SyncToken, SyncTicket)>,
   /// Awaited [`Watcher::set_cover`] round-trips [`grow`](Source::grow) actually performed — proves
   /// the kernel-recursive short-circuit skipped the round-trip.
@@ -154,6 +160,7 @@ impl<R: RuntimeLite> FsSource<R> {
       enqueued: Vec::new(),
       pending_set: HashSet::new(),
       deferred_prunes: HashMap::new(),
+      #[cfg(feature = "sync")]
       pending_syncs: HashMap::new(),
       #[cfg(test)]
       cover_round_trips: 0,
@@ -279,6 +286,7 @@ impl<R> Source<OsString> for FsSource<R> {
       // the abandonment path already removes it via `cancel_sync`, and the owner's
       // teardown drops the whole source). Keeps `pending_syncs` bounded by the live
       // handles, exactly like `pending_set`/`enqueued`.
+      #[cfg(feature = "sync")]
       self
         .pending_syncs
         .retain(|handle, _| watcher.root_path(*handle).is_some());
@@ -668,6 +676,7 @@ impl<R> Source<OsString> for FsSource<R> {
     }
   }
 
+  #[cfg(feature = "sync")]
   async fn begin_sync(
     &mut self,
     handle: RootHandle,
@@ -713,6 +722,7 @@ impl<R> Source<OsString> for FsSource<R> {
     }
   }
 
+  #[cfg(feature = "sync")]
   fn end_sync(&mut self, _handle: RootHandle, cookie_key: &[OsString]) {
     // A prompt request to reap the cookie now: it MARKS the obligation the driver
     // has held since it admitted the sync, so admission is guaranteed by type —
@@ -728,6 +738,7 @@ impl<R> Source<OsString> for FsSource<R> {
     self.watcher.request_remove_cookie(path);
   }
 
+  #[cfg(feature = "sync")]
   fn cancel_sync(&mut self, handle: RootHandle, token: SyncToken) {
     // The owner abandoned an in-flight `begin_sync` and never learned the cookie
     // path — but `begin_sync` recorded the watcher-minted ticket for this handle
@@ -982,6 +993,7 @@ fn watch_error_from_fs(err: WatchRootError) -> WatchError {
 /// `SyncError::CookieWrite(FaultKind::Other)`, a filesystem write failure for a write that never
 /// happened, which is precisely the untrue and un-actionable outcome that function's own doc
 /// says it avoids.
+#[cfg(feature = "sync")]
 fn begun_from_fs(error: SyncRootError) -> Result<Begun<OsString>, SyncError> {
   match error {
     SyncRootError::Dominated => Ok(Begun::Dominated),
@@ -1021,6 +1033,7 @@ fn begun_from_fs(error: SyncRootError) -> Result<Begun<OsString>, SyncError> {
 /// The fs error type is `#[non_exhaustive]`, and the wildcard is deliberately the FAILED-write
 /// arm: a variant added later is a refused barrier until it is classified here, never a silent
 /// success.
+#[cfg(feature = "sync")]
 fn sync_error_from_fs(error: SyncRootError) -> SyncError {
   match error {
     SyncRootError::UnknownRoot | SyncRootError::Retired => SyncError::Retired,

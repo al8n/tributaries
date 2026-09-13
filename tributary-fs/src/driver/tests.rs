@@ -17,6 +17,7 @@ struct Rig {
   /// The watcher handle's half of the cookie-cleanup ingress: the suites drive
   /// the PUBLIC reap and cancel through exactly what `Watcher` calls, on the very
   /// ledger this rig's driver admits into.
+  #[cfg(feature = "sync")]
   cleanup: CookieIngress,
   events: async_channel::Receiver<(ScopeId, Arc<PathBuf>, Change)>,
 }
@@ -74,8 +75,10 @@ fn rig_with_config(event_capacity: usize, config: DriverConfig) -> Rig {
   let fs = FakeFs::new(1);
   fs.put("/r", FileKind::Dir, 1);
   let (cmd_tx, cmd_rx) = async_channel::bounded(16);
+  #[cfg(feature = "sync")]
   let (cleanup, cookie_wake) = cookie_ingress();
   let (ev_tx, ev_rx) = async_channel::bounded(event_capacity);
+  #[cfg(feature = "sync")]
   tokio::spawn(run::<TokioRuntime, FakeFs>(
     config,
     fs.clone(),
@@ -84,9 +87,18 @@ fn rig_with_config(event_capacity: usize, config: DriverConfig) -> Rig {
     ev_tx,
     NullRegistry,
   ));
+  #[cfg(not(feature = "sync"))]
+  tokio::spawn(run::<TokioRuntime, FakeFs>(
+    config,
+    fs.clone(),
+    cmd_rx,
+    ev_tx,
+    NullRegistry,
+  ));
   Rig {
     fs,
     commands: cmd_tx,
+    #[cfg(feature = "sync")]
     cleanup,
     events: ev_rx,
   }
@@ -96,8 +108,10 @@ fn rig_with(event_capacity: usize, registry: impl ScopeRegistry) -> Rig {
   let fs = FakeFs::new(1);
   fs.put("/r", FileKind::Dir, 1);
   let (cmd_tx, cmd_rx) = async_channel::bounded(16);
+  #[cfg(feature = "sync")]
   let (cleanup, cookie_wake) = cookie_ingress();
   let (ev_tx, ev_rx) = async_channel::bounded(event_capacity);
+  #[cfg(feature = "sync")]
   tokio::spawn(run::<TokioRuntime, FakeFs>(
     config(),
     fs.clone(),
@@ -106,9 +120,18 @@ fn rig_with(event_capacity: usize, registry: impl ScopeRegistry) -> Rig {
     ev_tx,
     registry,
   ));
+  #[cfg(not(feature = "sync"))]
+  tokio::spawn(run::<TokioRuntime, FakeFs>(
+    config(),
+    fs.clone(),
+    cmd_rx,
+    ev_tx,
+    registry,
+  ));
   Rig {
     fs,
     commands: cmd_tx,
+    #[cfg(feature = "sync")]
     cleanup,
     events: ev_rx,
   }
@@ -174,6 +197,7 @@ fn removed() -> FsEventFlags {
 /// never inspects the brand (the foreign-ticket door is the watcher's), only the
 /// sequence, which `by_ticket`/`TicketInUse` key on. A fresh call is a distinct
 /// incarnation; a cell that needs a reused ticket binds one and passes it twice.
+#[cfg(feature = "sync")]
 fn ticket() -> SyncTicket {
   static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
   let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -823,8 +847,10 @@ fn ticking_descending_rig(interval: Duration, registry: RecordingRegistry) -> Ri
   fs.put("/r", FileKind::Dir, 1);
   fs.spawn_backend(BackendKind::Inotify);
   let (cmd_tx, cmd_rx) = async_channel::bounded(16);
+  #[cfg(feature = "sync")]
   let (cleanup, cookie_wake) = cookie_ingress();
   let (ev_tx, ev_rx) = async_channel::bounded(64);
+  #[cfg(feature = "sync")]
   tokio::spawn(run::<TokioRuntime, FakeFs>(
     DriverConfig {
       profile: BackendKind::Inotify,
@@ -837,9 +863,22 @@ fn ticking_descending_rig(interval: Duration, registry: RecordingRegistry) -> Ri
     ev_tx,
     registry,
   ));
+  #[cfg(not(feature = "sync"))]
+  tokio::spawn(run::<TokioRuntime, FakeFs>(
+    DriverConfig {
+      profile: BackendKind::Inotify,
+      root_liveness_interval: interval,
+      ..config()
+    },
+    fs.clone(),
+    cmd_rx,
+    ev_tx,
+    registry,
+  ));
   Rig {
     fs,
     commands: cmd_tx,
+    #[cfg(feature = "sync")]
     cleanup,
     events: ev_rx,
   }
@@ -994,8 +1033,10 @@ fn ticking_rig_over(interval: Duration, registry: RecordingRegistry, roots: &[St
   }
   fs.spawn_backend(BackendKind::Inotify);
   let (cmd_tx, cmd_rx) = async_channel::bounded(16);
+  #[cfg(feature = "sync")]
   let (cleanup, cookie_wake) = cookie_ingress();
   let (ev_tx, ev_rx) = async_channel::bounded(1024);
+  #[cfg(feature = "sync")]
   tokio::spawn(run::<TokioRuntime, FakeFs>(
     DriverConfig {
       profile: BackendKind::Inotify,
@@ -1008,9 +1049,22 @@ fn ticking_rig_over(interval: Duration, registry: RecordingRegistry, roots: &[St
     ev_tx,
     registry,
   ));
+  #[cfg(not(feature = "sync"))]
+  tokio::spawn(run::<TokioRuntime, FakeFs>(
+    DriverConfig {
+      profile: BackendKind::Inotify,
+      root_liveness_interval: interval,
+      ..config()
+    },
+    fs.clone(),
+    cmd_rx,
+    ev_tx,
+    registry,
+  ));
   Rig {
     fs,
     commands: cmd_tx,
+    #[cfg(feature = "sync")]
     cleanup,
     events: ev_rx,
   }
@@ -2124,8 +2178,10 @@ async fn spawn_seed_carries_a_preexisting_submount() {
   fs.put("/r", FileKind::Dir, 1);
   fs.seed_mounts(vec![PathBuf::from("/r/vol")]);
   let (cmd_tx, cmd_rx) = async_channel::bounded(16);
+  #[cfg(feature = "sync")]
   let (cleanup, cookie_wake) = cookie_ingress();
   let (ev_tx, ev_rx) = async_channel::bounded(64);
+  #[cfg(feature = "sync")]
   tokio::spawn(run::<TokioRuntime, FakeFs>(
     config(),
     fs.clone(),
@@ -2134,9 +2190,18 @@ async fn spawn_seed_carries_a_preexisting_submount() {
     ev_tx,
     NullRegistry,
   ));
+  #[cfg(not(feature = "sync"))]
+  tokio::spawn(run::<TokioRuntime, FakeFs>(
+    config(),
+    fs.clone(),
+    cmd_rx,
+    ev_tx,
+    NullRegistry,
+  ));
   let rig = Rig {
     fs,
     commands: cmd_tx,
+    #[cfg(feature = "sync")]
     cleanup,
     events: ev_rx,
   };
@@ -2967,8 +3032,10 @@ mod descending {
     fs.put("/r", FileKind::Dir, 1);
     fs.spawn_backend(BackendKind::Inotify);
     let (cmd_tx, cmd_rx) = async_channel::bounded(16);
+    #[cfg(feature = "sync")]
     let (cleanup, cookie_wake) = cookie_ingress();
     let (ev_tx, ev_rx) = async_channel::bounded(event_capacity);
+    #[cfg(feature = "sync")]
     tokio::spawn(run::<TokioRuntime, FakeFs>(
       config,
       fs.clone(),
@@ -2977,9 +3044,18 @@ mod descending {
       ev_tx,
       NullRegistry,
     ));
+    #[cfg(not(feature = "sync"))]
+    tokio::spawn(run::<TokioRuntime, FakeFs>(
+      config,
+      fs.clone(),
+      cmd_rx,
+      ev_tx,
+      NullRegistry,
+    ));
     Rig {
       fs,
       commands: cmd_tx,
+      #[cfg(feature = "sync")]
       cleanup,
       events: ev_rx,
     }
@@ -2997,8 +3073,10 @@ mod descending {
     fs.put("/r", FileKind::Dir, 1);
     fs.spawn_backend(BackendKind::Inotify);
     let (cmd_tx, cmd_rx) = async_channel::bounded(16);
+    #[cfg(feature = "sync")]
     let (cleanup, cookie_wake) = cookie_ingress();
     let (ev_tx, ev_rx) = async_channel::bounded(event_capacity);
+    #[cfg(feature = "sync")]
     tokio::spawn(run::<TokioRuntime, FakeFs>(
       inotify_config(),
       fs.clone(),
@@ -3007,9 +3085,18 @@ mod descending {
       ev_tx,
       registry,
     ));
+    #[cfg(not(feature = "sync"))]
+    tokio::spawn(run::<TokioRuntime, FakeFs>(
+      inotify_config(),
+      fs.clone(),
+      cmd_rx,
+      ev_tx,
+      registry,
+    ));
     Rig {
       fs,
       commands: cmd_tx,
+      #[cfg(feature = "sync")]
       cleanup,
       events: ev_rx,
     }
@@ -3634,8 +3721,10 @@ mod descending {
     fs.put("/r", FileKind::Dir, 1);
     fs.spawn_backend(BackendKind::Inotify);
     let (cmd_tx, cmd_rx) = async_channel::bounded(16);
+    #[cfg(feature = "sync")]
     let (cleanup, cookie_wake) = cookie_ingress();
     let (ev_tx, ev_rx) = async_channel::bounded(64);
+    #[cfg(feature = "sync")]
     tokio::spawn(run::<TokioRuntime, FakeFs>(
       inotify_config(),
       fs.clone(),
@@ -3644,9 +3733,18 @@ mod descending {
       ev_tx,
       registry,
     ));
+    #[cfg(not(feature = "sync"))]
+    tokio::spawn(run::<TokioRuntime, FakeFs>(
+      inotify_config(),
+      fs.clone(),
+      cmd_rx,
+      ev_tx,
+      registry,
+    ));
     Rig {
       fs,
       commands: cmd_tx,
+      #[cfg(feature = "sync")]
       cleanup,
       events: ev_rx,
     }
@@ -4104,6 +4202,7 @@ mod descending {
     /// and no queue ordering covers it. Once the re-arm settles, the write
     /// lands and the caller gets the cookie's path.
     #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "sync")]
     async fn a_sync_cookie_write_parks_on_the_settle_fence() {
       let (rig, scope) = covered_rig(&[("/r/keep", 11), ("/r/drop", 12)]).await;
       shrunk_to_keep(&rig, scope).await;
@@ -4160,6 +4259,7 @@ mod descending {
     }
 
     /// The obligations the driver owns right now.
+    #[cfg(feature = "sync")]
     async fn cookie_count(rig: &Rig) -> usize {
       let (reply, on_reply) = futures_channel::oneshot::channel();
       rig
@@ -4174,6 +4274,7 @@ mod descending {
     /// got there — the async analogue of [`settle`] for a count only a `Command`
     /// round trip can read.
     #[must_use = "an expired budget means the obligation never appeared, which is a staging failure"]
+    #[cfg(feature = "sync")]
     async fn settle_cookies(rig: &Rig, target: usize) -> bool {
       for _ in 0..interpreted_rounds(200) {
         if cookie_count(rig).await == target {
@@ -4189,6 +4290,7 @@ mod descending {
     /// Sends one `SyncRoot` for `dir` and hands back the caller's half of the
     /// reply — the cells below race a cover against a sync that has been admitted
     /// and has not yet answered.
+    #[cfg(feature = "sync")]
     async fn begin_sync(
       rig: &Rig,
       scope: ScopeId,
@@ -4242,6 +4344,7 @@ mod descending {
     /// in the `SetCover` handler and the marker survives with its ground retained
     /// — the cover the caller asked for is not the cover that applies.
     #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "sync")]
     async fn a_shrink_dominates_the_owned_barrier_standing_in_the_pruned_ground() {
       let leaf = ".tributaries-sync-shrink-owned";
       let (rig, scope) = covered_rig(&[("/r/keep", 11), ("/r/gone", 12)]).await;
@@ -4311,6 +4414,7 @@ mod descending {
     /// write's own descent refuses it `DirPruned`; either way the caller is told
     /// something other than that its barrier was dominated.
     #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "sync")]
     async fn a_shrink_under_a_parked_barrier_dominates_it_at_its_dispatch() {
       let leaf = ".tributaries-sync-shrink-parked";
       let (rig, scope) = covered_rig(&[("/r/keep", 11), ("/r/gone", 12)]).await;
@@ -4401,6 +4505,7 @@ mod descending {
     /// no flush, which is exactly the dishonesty being pinned.
     #[cfg(not(miri))]
     #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "sync")]
     async fn a_dominated_parked_barrier_flushes_its_covering_rescan_before_the_loop_sleeps() {
       let leaf = ".tributaries-sync-shrink-parked-idle";
       let (rig, scope) = covered_rig(&[("/r/keep", 11), ("/r/gone", 12)]).await;
@@ -4641,6 +4746,7 @@ mod descending {
     /// interpreter would spend a shard timeout on it.
     #[cfg(not(miri))]
     #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "sync")]
     async fn sustained_churn_starves_neither_the_timer_nor_a_command_nor_the_cut_proof() {
       let (rig, proof, ack, _churn) = churned_fence_awaiting_its_proof().await;
 
@@ -4723,6 +4829,7 @@ mod descending {
     /// A GROW is placeable and does narrow, which is the contrast
     /// `a_move_on_disjoint_ground_leaves_the_barrier_standing` holds.
     #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "sync")]
     async fn a_shrink_reaches_a_barrier_the_cover_kept_because_a_drop_has_no_place() {
       let leaf = ".tributaries-sync-shrink-kept-ground";
       let (rig, scope) = covered_rig(&[("/r/keep", 11), ("/r/gone", 12)]).await;
@@ -4749,6 +4856,7 @@ mod descending {
 
     /// Sends one `SyncRoot` and returns the driver's verdict verbatim — no
     /// retry, no unwrap, because these cells are about the REFUSAL.
+    #[cfg(feature = "sync")]
     async fn sync_dir(
       rig: &Rig,
       scope: ScopeId,
@@ -4789,6 +4897,7 @@ mod descending {
     /// Non-vacuity: the retained side of the very same cover still syncs, so the
     /// refusal is the COVER's verdict and not a sync path that stopped working.
     #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "sync")]
     async fn a_sync_outside_the_applied_cover_is_refused_before_birth() {
       let (rig, scope) = covered_rig(&[("/r/keep", 11), ("/r/drop", 12)]).await;
       shrunk_to_keep(&rig, scope).await;
@@ -4981,6 +5090,7 @@ mod descending {
     /// the cookie are both stranded and the cell spends its deadline. This is a
     /// LIVENESS failure, and the one a caller can inflict on itself.
     #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "sync")]
     async fn a_stat_loss_degrade_answers_over_a_full_consumer_channel() {
       let (rig, scope) = covered_rig_capacity(&[("/r/keep", 11), ("/r/drop", 12)], 1).await;
       assert_eq!(
@@ -5079,7 +5189,8 @@ mod descending {
       let Rig {
         fs: _fs,
         commands: _commands,
-        cleanup: _cleanup,
+        #[cfg(feature = "sync")]
+          cleanup: _cleanup,
         events,
       } = rig;
       drop(events);
@@ -5161,8 +5272,10 @@ mod descending {
       fs.put("/r", FileKind::Dir, 1);
       fs.spawn_backend(BackendKind::Inotify);
       let (cmd_tx, cmd_rx) = async_channel::bounded(16);
+      #[cfg(feature = "sync")]
       let (cleanup, cookie_wake) = cookie_ingress();
       let (ev_tx, ev_rx) = async_channel::bounded(64);
+      #[cfg(feature = "sync")]
       tokio::spawn(run::<NonFifoRuntime, FakeFs>(
         inotify_config(),
         fs.clone(),
@@ -5171,9 +5284,18 @@ mod descending {
         ev_tx,
         NullRegistry,
       ));
+      #[cfg(not(feature = "sync"))]
+      tokio::spawn(run::<NonFifoRuntime, FakeFs>(
+        inotify_config(),
+        fs.clone(),
+        cmd_rx,
+        ev_tx,
+        NullRegistry,
+      ));
       Rig {
         fs,
         commands: cmd_tx,
+        #[cfg(feature = "sync")]
         cleanup,
         events: ev_rx,
       }
@@ -6866,6 +6988,7 @@ mod descending {
     // discriminator for every cell below.
 
     /// The ledger's live obligation count, read end to end (the global gauge Φ).
+    #[cfg(feature = "sync")]
     async fn debug_cookie_count(rig: &Rig) -> usize {
       let (reply, on_reply) = futures_channel::oneshot::channel();
       rig
@@ -6877,6 +7000,7 @@ mod descending {
     }
 
     /// The birth/terminal census paired with the live record count.
+    #[cfg(feature = "sync")]
     async fn debug_census(rig: &Rig) -> (Census, usize) {
       let (reply, on_reply) = futures_channel::oneshot::channel();
       rig
@@ -6888,6 +7012,7 @@ mod descending {
     }
 
     /// Settles until the ledger holds exactly `target` obligations.
+    #[cfg(feature = "sync")]
     async fn settle_count(rig: &Rig, target: usize) {
       for _ in 0..200 {
         if debug_cookie_count(rig).await == target {
@@ -6915,6 +7040,7 @@ mod descending {
     /// record, so this count stays 0 and every cell below fails.
     /// Parks a sync under a fresh ticket (see [`park_a_sync_keyed`] for the
     /// cancel-by-ticket form).
+    #[cfg(feature = "sync")]
     async fn park_a_sync(
       rig: &Rig,
       scope: ScopeId,
@@ -6926,6 +7052,7 @@ mod descending {
       park_a_sync_keyed(rig, scope, name, ticket()).await
     }
 
+    #[cfg(feature = "sync")]
     async fn park_a_sync_keyed(
       rig: &Rig,
       scope: ScopeId,
@@ -6971,6 +7098,7 @@ mod descending {
     /// Fail-on-old (birth-at-dispatch): while parked there is no record, so
     /// `park_a_sync`'s `count == 1` — and the census `births == 1` here — both fail.
     #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "sync")]
     async fn a_parked_sync_is_one_counted_obligation_and_dispatch_only_transitions_it() {
       let (rig, scope) = covered_rig(&[("/r/keep", 11), ("/r/drop", 12)]).await;
       shrunk_to_keep(&rig, scope).await;
@@ -7019,6 +7147,7 @@ mod descending {
     /// count, so the census `(births, never_created) == (1, 1)` fails (it is
     /// `(0, 0)`), as does `park_a_sync`'s count.
     #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "sync")]
     async fn a_cancel_of_a_parked_sync_retires_it_never_created() {
       let (rig, scope) = covered_rig(&[("/r/keep", 11), ("/r/drop", 12)]).await;
       shrunk_to_keep(&rig, scope).await;
@@ -7102,6 +7231,7 @@ mod descending {
     /// verdict): they still read live, so the cookie write dispatches and
     /// `cookie_writes()` is no longer empty.
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    #[cfg(feature = "sync")]
     async fn an_in_band_fatal_under_a_parked_sync_retires_it_from_the_verdict() {
       let (rig, dying) = covered_rig(&[("/r/keep", 11), ("/r/drop", 12)]).await;
 
@@ -7209,6 +7339,7 @@ mod descending {
     /// Fail-on-old (birth-at-dispatch): no record is born or counted for the parked
     /// sync, so the census `(births, never_created) == (1, 1)` fails.
     #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "sync")]
     async fn unwatching_a_scope_with_a_parked_sync_retires_it_never_created() {
       let (rig, scope) = covered_rig(&[("/r/keep", 11), ("/r/drop", 12)]).await;
       shrunk_to_keep(&rig, scope).await;
@@ -7267,6 +7398,7 @@ mod descending {
     /// Fail-on-old (birth-at-dispatch): the parked sync has no record, so
     /// `park_a_sync`'s `count == 1` before close fails.
     #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "sync")]
     async fn closing_with_a_parked_sync_retires_it_and_reports_quiescent() {
       let (rig, scope) = covered_rig(&[("/r/keep", 11), ("/r/drop", 12)]).await;
       shrunk_to_keep(&rig, scope).await;
@@ -7365,6 +7497,7 @@ mod descending {
     /// the injected death, not a failure. Tokio catches it in the task harness, the
     /// pool thread survives, and the one-shot arm is spent.
     #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "sync")]
     async fn a_dead_control_batch_fails_the_scope_closed_and_answers_what_it_owed() {
       let (rig, scope) = covered_rig(&[("/r/keep", 11), ("/r/drop", 12)]).await;
       shrunk_to_keep(&rig, scope).await;
@@ -7556,6 +7689,7 @@ mod descending {
     /// FAILS: the cut is proven, the cover ack comes back `Applied`, the sync's
     /// cookie is written, and the scope stays live.
     #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "sync")]
     async fn an_unanswered_control_batch_grants_no_proof_and_fails_the_scope_closed() {
       let (rig, scope) = covered_rig(&[("/r/keep", 11), ("/r/drop", 12)]).await;
       shrunk_to_keep(&rig, scope).await;
@@ -9341,6 +9475,7 @@ mod descending {
   /// (`dominate_pending_syncs`, the `loss_gen` install snapshot), so the
   /// queue-order facts pinned here are exactly the inputs barrier honesty
   /// needs.
+  #[cfg(feature = "sync")]
   mod barrier_honesty {
     use super::*;
     use crate::os::linux::{RawInotifyEvent, RawLinuxEvent, inotify::decode::InotifyMask};
@@ -9823,8 +9958,10 @@ mod descending {
       fs.put("/r/d", FileKind::Dir, 11);
       fs.spawn_backend(BackendKind::Inotify);
       let (cmd_tx, cmd_rx) = async_channel::bounded(16);
+      #[cfg(feature = "sync")]
       let (cleanup, cookie_wake) = cookie_ingress();
       let (ev_tx, ev_rx) = async_channel::bounded(64);
+      #[cfg(feature = "sync")]
       tokio::spawn(run::<TokioRuntime, FakeFs>(
         DriverConfig {
           move_window: Duration::from_secs(60),
@@ -9836,9 +9973,21 @@ mod descending {
         ev_tx,
         NullRegistry,
       ));
+      #[cfg(not(feature = "sync"))]
+      tokio::spawn(run::<TokioRuntime, FakeFs>(
+        DriverConfig {
+          move_window: Duration::from_secs(60),
+          ..inotify_config()
+        },
+        fs.clone(),
+        cmd_rx,
+        ev_tx,
+        NullRegistry,
+      ));
       let rig = Rig {
         fs,
         commands: cmd_tx,
+        #[cfg(feature = "sync")]
         cleanup,
         events: ev_rx,
       };
@@ -11159,6 +11308,7 @@ mod descending {
     /// write's claim generation is still current. (A stream replace bumps the
     /// generation at its lane swap and such a write self-reaps instead.)
     #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "sync")]
     async fn a_pre_widen_cookie_write_claims_after_the_commit() {
       let rig = inotify_rig();
       rig.fs.put("/r/sub", FileKind::Dir, 2);
@@ -11220,6 +11370,7 @@ mod descending {
     /// under a counted covering root `Rescan` — so the release resolves on that
     /// rebuild and not on a listing whose restored occupancy would have confirmed.
     #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "sync")]
     async fn a_sync_across_an_unverified_adoption_parks_until_the_tripwire_resolves() {
       let rig = inotify_rig();
       rig.fs.put("/r/sub", FileKind::Dir, 11);
@@ -11342,6 +11493,7 @@ mod descending {
     /// the widened root's own first listing — is reached directly rather than
     /// through an intermediate connector.
     #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "sync")]
     async fn an_adopted_slot_turned_file_tears_down_loudly() {
       let rig = inotify_rig();
       rig.fs.put("/r/sub", FileKind::Dir, 11);
@@ -11429,6 +11581,7 @@ mod descending {
     /// this behind a refresh round-trip; the deleted `root_verified`
     /// conjunct must not silently return.
     #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "sync")]
     async fn a_clean_widen_window_certifies_without_the_refresh() {
       let rig = inotify_rig();
       rig.fs.put("/r/sub", FileKind::Dir, 2);
@@ -11486,6 +11639,7 @@ mod descending {
     /// Mutation witness: resolve the seals after the cover-fence demand instead of
     /// before it, and this sync never answers.
     #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "sync")]
     async fn a_sync_opened_under_a_staged_adoption_still_answers() {
       let rig = inotify_rig();
       rig.fs.put("/r/sub", FileKind::Dir, 2);
@@ -11638,8 +11792,10 @@ mod descending {
       fs.put("/r", FileKind::Dir, 1);
       fs.spawn_backend(BackendKind::Inotify);
       let (cmd_tx, cmd_rx) = async_channel::bounded(16);
+      #[cfg(feature = "sync")]
       let (cleanup, cookie_wake) = cookie_ingress();
       let (ev_tx, ev_rx) = async_channel::bounded(64);
+      #[cfg(feature = "sync")]
       tokio::spawn(run::<TokioRuntime, FakeFs>(
         inotify_config(),
         fs.clone(),
@@ -11648,9 +11804,18 @@ mod descending {
         ev_tx,
         registry,
       ));
+      #[cfg(not(feature = "sync"))]
+      tokio::spawn(run::<TokioRuntime, FakeFs>(
+        inotify_config(),
+        fs.clone(),
+        cmd_rx,
+        ev_tx,
+        registry,
+      ));
       Rig {
         fs,
         commands: cmd_tx,
+        #[cfg(feature = "sync")]
         cleanup,
         events: ev_rx,
       }
@@ -12616,6 +12781,7 @@ mod descending {
     /// scope's stale disarm batch re-marks it in-flight — the
     /// `!control_inflight.contains(dead)` assertion fails with a residual entry.
     #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "sync")]
     async fn a_control_op_and_teardown_in_one_drain_leaks_no_chain_tail() {
       const IN_CREATE: u32 = 0x0000_0100;
       const IN_ISDIR: u32 = 0x4000_0000;
@@ -12745,6 +12911,7 @@ mod descending {
       let fs = FakeFs::new(1);
       let (op_tx, _op_rx) = async_channel::unbounded::<OpResult<FakeHandle>>();
       let (events_tx, _events_rx) = async_channel::unbounded::<(ScopeId, Arc<PathBuf>, Change)>();
+      #[cfg(feature = "sync")]
       let (_ingress, wake) = crate::driver::cookie_ingress();
       let mut cookies = CookieRegistry::new::<TokioRuntime>(fs.clone(), wake.ledger);
       let mut handles: BTreeMap<ScopeId, FakeHandle> = BTreeMap::new();
@@ -14524,6 +14691,7 @@ mod replace {
 /// so no interleaving strands a file: an abandoned reply, a scope retiring under
 /// an in-flight write, a failed write, and the driver's own death (close OR
 /// cancellation) each leave zero cookies on disk and zero records behind.
+#[cfg(feature = "sync")]
 mod sync_cookie {
   use super::*;
 
@@ -14963,6 +15131,7 @@ mod sync_cookie {
   /// A registry over a ledger nothing else holds — the cells that drive the
   /// registry directly and never exercise the public cleanup ingress.
   fn registry(fs: FakeFs) -> CookieRegistry<FakeFs> {
+    #[cfg(feature = "sync")]
     let (_, wake) = cookie_ingress();
     CookieRegistry::<FakeFs>::new::<TokioRuntime>(fs, wake.ledger)
   }
@@ -14972,6 +15141,7 @@ mod sync_cookie {
   /// public request against real records with no driver loop in between (the wake
   /// half is returned so the cell owns the token stream).
   fn registry_with_ingress(fs: FakeFs) -> (CookieRegistry<FakeFs>, CookieIngress, CookieWake) {
+    #[cfg(feature = "sync")]
     let (cleanup, wake) = cookie_ingress();
     let reg = CookieRegistry::<FakeFs>::new::<TokioRuntime>(fs, Arc::clone(&wake.ledger));
     (reg, cleanup, wake)
@@ -15463,6 +15633,7 @@ mod sync_cookie {
   /// ends a cookie's life must leave this back where it found it — an unlinked
   /// file with a live record is a slow leak, and a record per failed attempt is
   /// unbounded growth.
+  #[cfg(feature = "sync")]
   async fn cookie_count(rig: &Rig) -> usize {
     let (reply, on_reply) = futures_channel::oneshot::channel();
     rig
@@ -15588,8 +15759,10 @@ mod sync_cookie {
     let fs = FakeFs::new(1);
     fs.put("/r", FileKind::Dir, 1);
     let (cmd_tx, cmd_rx) = async_channel::bounded(16);
+    #[cfg(feature = "sync")]
     let (cleanup, cookie_wake) = cookie_ingress();
     let (ev_tx, ev_rx) = async_channel::bounded(64);
+    #[cfg(feature = "sync")]
     let driver = tokio::spawn(run::<TokioRuntime, FakeFs>(
       config(),
       fs.clone(),
@@ -15598,10 +15771,19 @@ mod sync_cookie {
       ev_tx,
       NullRegistry,
     ));
+    #[cfg(not(feature = "sync"))]
+    let driver = tokio::spawn(run::<TokioRuntime, FakeFs>(
+      config(),
+      fs.clone(),
+      cmd_rx,
+      ev_tx,
+      NullRegistry,
+    ));
     (
       Rig {
         fs,
         commands: cmd_tx,
+        #[cfg(feature = "sync")]
         cleanup,
         events: ev_rx,
       },
@@ -17140,8 +17322,10 @@ mod sync_cookie {
     fs.put("/r", FileKind::Dir, 1);
     fs.spawn_backend(BackendKind::Inotify);
     let (cmd_tx, cmd_rx) = async_channel::bounded(16);
+    #[cfg(feature = "sync")]
     let (cleanup, cookie_wake) = cookie_ingress();
     let (ev_tx, ev_rx) = async_channel::bounded(event_capacity);
+    #[cfg(feature = "sync")]
     tokio::spawn(run::<TokioRuntime, FakeFs>(
       DriverConfig {
         profile: BackendKind::Inotify,
@@ -17153,9 +17337,21 @@ mod sync_cookie {
       ev_tx,
       NullRegistry,
     ));
+    #[cfg(not(feature = "sync"))]
+    tokio::spawn(run::<TokioRuntime, FakeFs>(
+      DriverConfig {
+        profile: BackendKind::Inotify,
+        ..config()
+      },
+      fs.clone(),
+      cmd_rx,
+      ev_tx,
+      NullRegistry,
+    ));
     Rig {
       fs,
       commands: cmd_tx,
+      #[cfg(feature = "sync")]
       cleanup,
       events: ev_rx,
     }
@@ -27922,8 +28118,10 @@ mod retention {
     fs.put("/r", FileKind::Dir, 1);
     fs.spawn_backend(BackendKind::Inotify);
     let (cmd_tx, cmd_rx) = async_channel::bounded(16);
+    #[cfg(feature = "sync")]
     let (cleanup, cookie_wake) = cookie_ingress();
     let (ev_tx, ev_rx) = async_channel::bounded(64);
+    #[cfg(feature = "sync")]
     tokio::spawn(run::<TokioRuntime, FakeFs>(
       DriverConfig {
         profile: BackendKind::Inotify,
@@ -27935,9 +28133,21 @@ mod retention {
       ev_tx,
       NullRegistry,
     ));
+    #[cfg(not(feature = "sync"))]
+    tokio::spawn(run::<TokioRuntime, FakeFs>(
+      DriverConfig {
+        profile: BackendKind::Inotify,
+        ..config()
+      },
+      fs.clone(),
+      cmd_rx,
+      ev_tx,
+      NullRegistry,
+    ));
     Rig {
       fs,
       commands: cmd_tx,
+      #[cfg(feature = "sync")]
       cleanup,
       events: ev_rx,
     }
@@ -28791,8 +29001,10 @@ mod abnormal_exit {
   ) -> (Rig, tokio::task::JoinHandle<()>) {
     fs.put("/r", FileKind::Dir, 1);
     let (cmd_tx, cmd_rx) = async_channel::bounded(16);
+    #[cfg(feature = "sync")]
     let (cleanup, cookie_wake) = cookie_ingress();
     let (ev_tx, ev_rx) = async_channel::bounded(64);
+    #[cfg(feature = "sync")]
     let driver = tokio::spawn(run::<TokioRuntime, FakeFs>(
       config,
       fs.clone(),
@@ -28801,10 +29013,19 @@ mod abnormal_exit {
       ev_tx,
       registry,
     ));
+    #[cfg(not(feature = "sync"))]
+    let driver = tokio::spawn(run::<TokioRuntime, FakeFs>(
+      config,
+      fs.clone(),
+      cmd_rx,
+      ev_tx,
+      registry,
+    ));
     (
       Rig {
         fs,
         commands: cmd_tx,
+        #[cfg(feature = "sync")]
         cleanup,
         events: ev_rx,
       },
@@ -28984,8 +29205,10 @@ mod abnormal_exit {
     let fs = FakeFs::new(1);
     fs.put("/r", FileKind::Dir, 1);
     let (cmd_tx, cmd_rx) = async_channel::bounded(16);
+    #[cfg(feature = "sync")]
     let (cleanup, cookie_wake) = cookie_ingress();
     let (ev_tx, ev_rx) = async_channel::bounded(64);
+    #[cfg(feature = "sync")]
     runtime.spawn(run::<TokioRuntime, FakeFs>(
       config(),
       fs.clone(),
@@ -28994,9 +29217,18 @@ mod abnormal_exit {
       ev_tx,
       NullRegistry,
     ));
+    #[cfg(not(feature = "sync"))]
+    runtime.spawn(run::<TokioRuntime, FakeFs>(
+      config(),
+      fs.clone(),
+      cmd_rx,
+      ev_tx,
+      NullRegistry,
+    ));
     let rig = Rig {
       fs: fs.clone(),
       commands: cmd_tx,
+      #[cfg(feature = "sync")]
       cleanup,
       events: ev_rx,
     };

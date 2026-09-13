@@ -46,6 +46,8 @@ use tributary_proto::{
   glob::{Glob, Globs},
 };
 
+#[cfg(feature = "sync")]
+use crate::watcher::SyncTicket;
 use crate::{
   core::{
     BarrierEpoch, BarrierEvent, BarrierLocation, BarrierMove, CoverNoop, CoverReconcile,
@@ -58,7 +60,7 @@ use crate::{
     Backend, BackendKind, EventReceiver, RootIdentity, RootMeta, ScopePort, SourceConfig,
     SourceError, SourceHandle, SourceMessage, SpawnFailed, linux::WatchOutcome,
   },
-  watcher::{CoverOutcome, SkipReason, SyncTicket},
+  watcher::{CoverOutcome, SkipReason},
 };
 
 #[cfg(all(test, feature = "tokio"))]
@@ -110,8 +112,16 @@ pub(crate) struct DriverConfig {
   pub(crate) max_map_directories: Option<usize>,
   /// First-retry delay for a failed cookie unlink; the backoff doubles per
   /// attempt up to [`cookie_retry_cap`](Self::cookie_retry_cap).
+  // `WatcherOptions` keeps every cookie knob on both configuration faces
+  // whatever the gate (A26.1), so the lowering keeps carrying them; with the
+  // barrier gated out the ledger that would read this one is not compiled.
+  #[cfg_attr(not(feature = "sync"), allow(dead_code))]
   pub(crate) cookie_retry_base: Duration,
   /// The cookie-unlink backoff ceiling.
+  // `WatcherOptions` keeps every cookie knob on both configuration faces
+  // whatever the gate (A26.1), so the lowering keeps carrying them; with the
+  // barrier gated out the ledger that would read this one is not compiled.
+  #[cfg_attr(not(feature = "sync"), allow(dead_code))]
   pub(crate) cookie_retry_cap: Duration,
   /// Max unlink attempts per arming; then an UNMARKED record PARKS
   /// (`RemoveFailed`, unscheduled) until an explicit re-arm (a fresh reap/cancel,
@@ -119,10 +129,18 @@ pub(crate) struct DriverConfig {
   /// serviced into one fresh arming at that exhaustion instead (see
   /// [`CookieRegistry::schedule_retry`]). Never a spin — the fresh arming
   /// consumes the mark.
+  // `WatcherOptions` keeps every cookie knob on both configuration faces
+  // whatever the gate (A26.1), so the lowering keeps carrying them; with the
+  // barrier gated out the ledger that would read this one is not compiled.
+  #[cfg_attr(not(feature = "sync"), allow(dead_code))]
   pub(crate) cookie_retry_budget: u8,
   /// Per-scope unremoved-cookie cap: at or above it, a new `SyncRoot` command
   /// is refused [`CleanupBacklog`](crate::error::SyncRootError::CleanupBacklog)
   /// — the per-scope memory bound on the ledger.
+  // `WatcherOptions` keeps every cookie knob on both configuration faces
+  // whatever the gate (A26.1), so the lowering keeps carrying them; with the
+  // barrier gated out the ledger that would read this one is not compiled.
+  #[cfg_attr(not(feature = "sync"), allow(dead_code))]
   pub(crate) cookie_backlog_cap: usize,
   /// GLOBAL unremoved-cookie cap across every scope, live or retired: at or
   /// above it a new `SyncRoot` is refused `CleanupBacklog` whatever scope owns
@@ -130,6 +148,10 @@ pub(crate) struct DriverConfig {
   /// a sync→failing-cleanup→unwatch→rewatch churn would grow `owned` without
   /// bound across RETIRED scopes; this ceiling makes total ledger memory bounded
   /// regardless of churn, and self-heals as the cleanup retries drain.
+  // `WatcherOptions` keeps every cookie knob on both configuration faces
+  // whatever the gate (A26.1), so the lowering keeps carrying them; with the
+  // barrier gated out the ledger that would read this one is not compiled.
+  #[cfg_attr(not(feature = "sync"), allow(dead_code))]
   pub(crate) cookie_global_cap: usize,
 }
 
@@ -172,6 +194,7 @@ impl DriverConfig {
   /// 32` ≈ 144 + walk, inside a 256 soft limit. With `cap = 128` and `door =
   /// min(cap, 32) = 32` on Linux: `cap × 2 + door × 4` = `256 + 128` ≈ 384 +
   /// walk, inside a 1024 default.
+  #[cfg(feature = "sync")]
   pub(crate) const fn sync_door_allowance(cap: usize) -> usize {
     // [`MAX_SYNC_SAMPLINGS`] is the ceiling the common 1024-descriptor budget has
     // always carried. macOS's default soft limit is 256 — a QUARTER of it — and
@@ -224,6 +247,7 @@ pub(crate) type WatchReply = futures_channel::oneshot::Sender<Result<WatchGrant,
 /// from the ledger, so no gauge, cancel, or sweep depends on this local. The
 /// driver is the only mutator of both sides and moves them in lockstep — an
 /// entry here exists exactly while its obligation is `Parked`.
+#[cfg(feature = "sync")]
 struct ParkedCookie {
   dir: PathBuf,
   /// What the admission read about the two directories the marker's ordering
@@ -252,7 +276,14 @@ struct ParkedCookie {
 /// [`arm_sync_marker`](crate::core::DriverCore::arm_sync_marker)). It is a token
 /// to COMPARE, never a number to interpret: nothing outside the mint reads the
 /// counter, and the order it happens to carry means nothing.
+///
+/// NOT gated with the ledger that mints it: the core's per-scope marker map is
+/// keyed by leaf and VALUED by this id, and that map stays compiled because the
+/// routing seat's active-marker exemption reads it. With the barrier gated out
+/// nothing ever mints one, so the map is permanently empty and the counter is
+/// never read.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[cfg_attr(not(feature = "sync"), allow(dead_code))]
 pub(crate) struct CookieId(pub(crate) u64);
 
 /// A test-only tally of every obligation BIRTH and every typed terminal, kept
@@ -263,6 +294,7 @@ pub(crate) struct CookieId(pub(crate) u64);
 /// went through [`LedgerInner::retire`] naming its evidence.
 #[cfg(all(test, feature = "tokio"))]
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+#[cfg(feature = "sync")]
 pub(crate) struct Census {
   births: u64,
   confirmed_gone: u64,
@@ -271,6 +303,7 @@ pub(crate) struct Census {
 }
 
 #[cfg(all(test, feature = "tokio"))]
+#[cfg(feature = "sync")]
 impl Census {
   fn count(&mut self, reaped: Reaped) {
     let counter = match reaped {
@@ -294,6 +327,7 @@ impl Census {
 /// with the watcher handle as the cleanup ingress ([`cookie_ingress`]), so a
 /// public reap or cancel is a transition on this same state. Replaces the bare
 /// `HashMap<PathBuf, ScopeId>` the ledger was before the lifecycle state machine.
+#[cfg(feature = "sync")]
 struct LedgerInner {
   /// Every cookie obligation the driver has admitted and not yet retired, keyed
   /// by its immutable incarnation id. The ONE insert site is the sync's ADMISSION
@@ -393,6 +427,7 @@ struct LedgerInner {
   census: Census,
 }
 
+#[cfg(feature = "sync")]
 impl LedgerInner {
   fn new() -> Self {
     Self {
@@ -631,6 +666,7 @@ const COOKIE_NONCE_DIGITS: usize = 16;
 ///
 /// [`is_sync_cookie_name`] is the classifier that must accept exactly what this
 /// renders; the two are changed together, and a cell pins that they agree.
+#[cfg(feature = "sync")]
 pub(crate) fn sync_cookie_name(instance: u64, pid: u32, seq: u64, nonce: u64) -> String {
   format!(
     "{COOKIE_NAME_PREFIX}{instance}-{pid}-{seq}-{nonce:0width$x}",
@@ -944,6 +980,7 @@ fn is_minted_decimal(field: &str, min: u64, max: u64) -> bool {
 /// comparison in [`CookieProof::Object`] buys is the honest verdict for the
 /// ORDINARY races, not a defence against that peer.
 #[derive(Debug)]
+#[cfg(feature = "sync")]
 pub(crate) struct CookieDir {
   path: PathBuf,
   /// Every `openat`/`unlinkat` runs against this, never against `path`.
@@ -1097,12 +1134,14 @@ pub(crate) struct CookieDir {
 /// directory is ours — an ADOPTION VERDICT, the one thing this architecture exists
 /// to never render.
 #[cfg(all(target_os = "windows", not(miri)))]
+#[cfg(feature = "sync")]
 impl Drop for CookieDir {
   fn drop(&mut self) {
     let _ = self.dispose();
   }
 }
 
+#[cfg(feature = "sync")]
 impl CookieDir {
   /// The directory's own path, for reporting a cookie's landing.
   pub(crate) fn path(&self) -> &Path {
@@ -1145,11 +1184,13 @@ impl CookieDir {
 /// not at the name at all and the open itself fails. Both are fail-closed, and
 /// both surface as the ordinary write failure a caller already handles.
 #[derive(Clone)]
+#[cfg(feature = "sync")]
 pub(crate) struct LiveRoot {
   path: PathBuf,
   identity: RootIdentity,
 }
 
+#[cfg(feature = "sync")]
 impl LiveRoot {
   pub(crate) fn new(path: PathBuf, identity: RootIdentity) -> Self {
     Self { path, identity }
@@ -1227,6 +1268,7 @@ impl LiveRoot {
   target_os = "macos",
   all(target_os = "windows", not(miri))
 ))]
+#[cfg(feature = "sync")]
 fn open_verified_root(
   root: &Path,
   identity: RootIdentity,
@@ -1244,6 +1286,7 @@ fn open_verified_root(
 /// resolution a scope's cookies ever depend on, taken per write and immediately
 /// proven by [`open_verified_root`].
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(feature = "sync")]
 fn open_root_object(root: &Path) -> Result<std::fs::File, std::io::Error> {
   open_dir_no_follow(root)
 }
@@ -1253,6 +1296,7 @@ fn open_root_object(root: &Path) -> Result<std::fs::File, std::io::Error> {
 /// neither read has a documented access requirement, while any bit beyond zero
 /// can turn an open this process is permitted to make into `ACCESS_DENIED`.
 #[cfg(all(target_os = "windows", not(miri)))]
+#[cfg(feature = "sync")]
 fn open_root_object(root: &Path) -> Result<std::fs::File, std::io::Error> {
   crate::os::windows::ffi::open_cookie_parent(root).map(std::fs::File::from)
 }
@@ -1310,6 +1354,7 @@ fn open_root_object(root: &Path) -> Result<std::fs::File, std::io::Error> {
 ///
 /// **Everything else** cannot bind a cookie's removal to the object created (see
 /// the third [`CookieDir::open_or_create`] arm) and so never opens one.
+#[cfg(feature = "sync")]
 struct CookieParent {
   /// The opened object's OWN current name, read off the descriptor — the string
   /// every verdict is taken on, and the prefix a cookie's landing path is reported
@@ -1357,6 +1402,7 @@ struct CookieParent {
   handle: std::os::windows::io::OwnedHandle,
 }
 
+#[cfg(feature = "sync")]
 impl CookieParent {
   /// The opened object's own name — what the containment and `prune` verdicts
   /// are taken on.
@@ -1519,6 +1565,7 @@ thread_local! {
   any(target_os = "linux", target_os = "macos")
 ))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "sync")]
 pub(crate) enum CookieProofPoint {
   /// The enumeration proving the minted directory holds nothing but the marker.
   HoldsOnly,
@@ -1534,6 +1581,7 @@ pub(crate) enum CookieProofPoint {
   not(miri),
   any(target_os = "linux", target_os = "macos")
 ))]
+#[cfg(feature = "sync")]
 fn armed_proof_fault(point: CookieProofPoint) -> Option<std::io::Error> {
   COOKIE_PROOF_FAULT.with(|armed| {
     (armed.get() == Some(point)).then(|| {
@@ -1544,6 +1592,7 @@ fn armed_proof_fault(point: CookieProofPoint) -> Option<std::io::Error> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(feature = "sync")]
 impl CookieParent {
   /// Walks from the VERIFIED root down to `dir`, one pinned `openat` per
   /// component.
@@ -1669,6 +1718,7 @@ impl CookieParent {
 /// second rule that happens to agree in the cases anyone tested.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, Copy)]
+#[cfg(feature = "sync")]
 struct MountFrame {
   /// The device the sample reported.
   dev: u64,
@@ -1692,6 +1742,7 @@ struct MountFrame {
 /// say the marker it is about to place is reportable — the same fail-closed shape
 /// [`identity_of_dir`] takes beside it.
 #[cfg(all(target_os = "linux", not(miri)))]
+#[cfg(feature = "sync")]
 fn frame_of_dir(fd: &std::os::fd::OwnedFd) -> Result<MountFrame, std::io::Error> {
   use rustix::fs::{AtFlags, StatxFlags, makedev, statx};
 
@@ -1722,6 +1773,7 @@ fn frame_of_dir(fd: &std::os::fd::OwnedFd) -> Result<MountFrame, std::io::Error>
 /// the frame there. Under Miri the interpreter executes no `statx`, and the degrade
 /// is the same honest one the core takes below Linux 5.8.
 #[cfg(any(target_os = "macos", all(target_os = "linux", miri)))]
+#[cfg(feature = "sync")]
 fn frame_of_dir(fd: &std::os::fd::OwnedFd) -> Result<MountFrame, std::io::Error> {
   use std::os::unix::fs::MetadataExt;
 
@@ -1754,6 +1806,7 @@ fn frame_of_dir(fd: &std::os::fd::OwnedFd) -> Result<MountFrame, std::io::Error>
 ///   directory shares the device exactly, so nothing but the mount id marks it a
 ///   boundary.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(feature = "sync")]
 fn leaves_mount_frame(root: &MountFrame, standing: &MountFrame) -> bool {
   let device_boundary = root.dev != standing.dev;
   let mount_boundary = matches!(
@@ -1773,6 +1826,7 @@ fn leaves_mount_frame(root: &MountFrame, standing: &MountFrame) -> bool {
 /// the walk's own descriptor is neither consumed nor closed. It resolves no
 /// pathname, so the one-sample rule the module doc states is kept.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(feature = "sync")]
 fn identity_of_dir(fd: &std::os::fd::OwnedFd) -> Result<Option<RootIdentity>, std::io::Error> {
   identity_of_handle(&std::fs::File::from(fd.try_clone()?))
 }
@@ -1798,6 +1852,7 @@ fn identity_of_dir(fd: &std::os::fd::OwnedFd) -> Result<Option<RootIdentity>, st
 /// the verdict is taken about where the object is at the moment of the read rather
 /// than about where the walk was asked to go.
 #[cfg(target_os = "linux")]
+#[cfg(feature = "sync")]
 fn current_path_of_dir(fd: &std::os::fd::OwnedFd) -> Result<PathBuf, std::io::Error> {
   use std::os::fd::AsRawFd;
 
@@ -1805,6 +1860,7 @@ fn current_path_of_dir(fd: &std::os::fd::OwnedFd) -> Result<PathBuf, std::io::Er
 }
 
 #[cfg(target_os = "macos")]
+#[cfg(feature = "sync")]
 fn current_path_of_dir(fd: &std::os::fd::OwnedFd) -> Result<PathBuf, std::io::Error> {
   use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
 
@@ -1835,6 +1891,7 @@ fn current_path_of_dir(fd: &std::os::fd::OwnedFd) -> Result<PathBuf, std::io::Er
 }
 
 #[cfg(all(target_os = "windows", not(miri)))]
+#[cfg(feature = "sync")]
 impl CookieParent {
   /// Opens `dir` once, answers the name that HANDLE holds, and requires that
   /// name to lie under the name the VERIFIED ROOT holds.
@@ -1881,6 +1938,7 @@ impl CookieParent {
   target_os = "macos",
   all(target_os = "windows", not(miri))
 )))]
+#[cfg(feature = "sync")]
 impl CookieParent {
   /// The same refusal [`CookieDir::open_or_create`] answers on this platform,
   /// taken one step earlier so nothing is opened at all — not even the root this
@@ -1902,6 +1960,7 @@ impl CookieParent {
 ///
 /// The walk's first step, and the only one that resolves a pathname.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(feature = "sync")]
 fn open_dir_no_follow(path: &Path) -> Result<std::fs::File, std::io::Error> {
   use std::os::unix::fs::OpenOptionsExt;
 
@@ -1925,6 +1984,7 @@ fn open_dir_no_follow(path: &Path) -> Result<std::fs::File, std::io::Error> {
 /// resolution lands somewhere else is refused by the comparison rather than
 /// admitted by it.
 #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+#[cfg(feature = "sync")]
 fn open_dir_pin(path: &Path) -> Result<std::fs::File, std::io::Error> {
   use std::os::unix::fs::OpenOptionsExt;
 
@@ -1941,6 +2001,7 @@ fn open_dir_pin(path: &Path) -> Result<std::fs::File, std::io::Error> {
 /// the parent's own entry names and on no other — which is what makes the walked
 /// name a true name of what the walk ends holding.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(feature = "sync")]
 fn open_dir_at(
   parent: &std::os::fd::OwnedFd,
   name: &std::ffi::OsStr,
@@ -1973,6 +2034,7 @@ fn open_dir_at(
 ///
 /// [`AlreadyExists`]: std::io::ErrorKind::AlreadyExists
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(feature = "sync")]
 fn make_dir_at(parent: &std::os::fd::OwnedFd, name: &str) -> Result<(), std::io::Error> {
   use std::os::fd::AsRawFd;
 
@@ -1997,6 +2059,7 @@ fn make_dir_at(parent: &std::os::fd::OwnedFd, name: &str) -> Result<(), std::io:
 /// documents, both of which answer a pointer valid for the life of the calling
 /// thread.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(feature = "sync")]
 fn errno_slot() -> *mut libc::c_int {
   #[cfg(target_os = "linux")]
   {
@@ -2037,6 +2100,7 @@ fn errno_slot() -> *mut libc::c_int {
 /// ABSENCE is as much an anomaly as a stranger's entry and is answered the same
 /// way.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(feature = "sync")]
 fn dir_holds_only(fd: &std::os::fd::OwnedFd, marker: &str) -> Result<bool, std::io::Error> {
   let mut marker_found = false;
   // One stranger is the whole answer, so the walk stops at the first — which is
@@ -2085,6 +2149,7 @@ fn dir_holds_only(fd: &std::os::fd::OwnedFd, marker: &str) -> Result<bool, std::
 /// position, at zero — and it resolves no component of any path, so a directory
 /// renamed or replaced under this driver's feet still cannot redirect it.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(feature = "sync")]
 fn walk_dir_entries<T>(
   fd: &std::os::fd::OwnedFd,
   mut visit: impl FnMut(&[u8]) -> std::ops::ControlFlow<T>,
@@ -2152,6 +2217,7 @@ fn walk_dir_entries<T>(
 
 /// One path component as the NUL-terminated C string an `*at` call takes.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(feature = "sync")]
 fn component_c_name(name: &std::ffi::OsStr) -> Result<std::ffi::CString, std::io::Error> {
   use std::os::unix::ffi::OsStrExt;
 
@@ -2175,6 +2241,7 @@ fn component_c_name(name: &std::ffi::OsStr) -> Result<std::ffi::CString, std::io
 /// this write exists on disk, the directory the create may have minted included
 /// (a `mkdirat` that succeeded is never one of these).
 #[derive(Debug)]
+#[cfg(feature = "sync")]
 enum CookieDirRefusal {
   /// The create, the open, or one of the descriptor reads failed.
   Io(std::io::Error),
@@ -2215,6 +2282,7 @@ enum CookieDirRefusal {
   CrossesMount(PathBuf),
 }
 
+#[cfg(feature = "sync")]
 impl From<std::io::Error> for CookieDirRefusal {
   fn from(source: std::io::Error) -> Self {
     Self::Io(source)
@@ -2222,6 +2290,7 @@ impl From<std::io::Error> for CookieDirRefusal {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(feature = "sync")]
 impl CookieDir {
   /// Creates (or re-opens) the cookie directory inside `parent` and verifies what
   /// it opened. Every check reads the OPENED DESCRIPTOR, never a second lookup of
@@ -2523,6 +2592,7 @@ impl CookieDir {
 }
 
 #[cfg(all(target_os = "windows", not(miri)))]
+#[cfg(feature = "sync")]
 impl CookieDir {
   /// CREATES the cookie directory inside `parent`. Never re-opens one, never
   /// adopts one, and never looks at what may already be standing at a candidate
@@ -2820,6 +2890,7 @@ impl CookieDir {
   not(all(target_os = "windows", not(miri))),
   allow(dead_code, reason = "the leaf create it guards is Windows' alone")
 )]
+#[cfg(feature = "sync")]
 fn marker_stands_in(dir: &Path, marker: &Path, name: &str) -> bool {
   marker.parent() == Some(dir) && marker.file_name() == Some(std::ffi::OsStr::new(name))
 }
@@ -2836,6 +2907,7 @@ fn marker_stands_in(dir: &Path, marker: &Path, name: &str) -> bool {
   target_os = "macos",
   all(target_os = "windows", not(miri))
 )))]
+#[cfg(feature = "sync")]
 impl CookieDir {
   fn open_or_create(
     _parent: &CookieParent,
@@ -2965,6 +3037,7 @@ fn reserved_cookie_dir_leaf() -> Option<Arc<str>> {
 /// typed write failure the obligation can retire on, rather than spinning forever
 /// inside a blocking-pool thread.
 #[cfg_attr(not(all(target_os = "windows", not(miri))), allow(dead_code))]
+#[cfg(feature = "sync")]
 const COOKIE_DIR_MINT_ATTEMPTS: usize = 8;
 
 /// What one create attempt in the mint loop means.
@@ -2974,6 +3047,7 @@ const COOKIE_DIR_MINT_ATTEMPTS: usize = 8;
 /// therefore pinned by cells on every host, not only where a Windows kernel runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(all(target_os = "windows", not(miri))), allow(dead_code))]
+#[cfg(feature = "sync")]
 enum MintStep {
   /// The create bound the name: this call owns the directory standing there.
   Bound,
@@ -2996,6 +3070,7 @@ enum MintStep {
 /// than the candidate, so another name would fail identically and reporting the
 /// first failure is both faster and more honest.
 #[cfg_attr(not(all(target_os = "windows", not(miri))), allow(dead_code))]
+#[cfg(feature = "sync")]
 fn mint_step(failure: Option<std::io::ErrorKind>, attempt: usize) -> MintStep {
   match failure {
     None => MintStep::Bound,
@@ -3026,6 +3101,7 @@ fn mint_step(failure: Option<std::io::ErrorKind>, attempt: usize) -> MintStep {
 /// and the value that comes back — a handle in production, nothing in a cell —
 /// stays the injected call's business.
 #[cfg_attr(not(all(target_os = "windows", not(miri))), allow(dead_code))]
+#[cfg(feature = "sync")]
 fn bind_fresh_cookie_dir<T>(
   parent: &Path,
   mint: &mut dyn FnMut() -> u32,
@@ -3080,6 +3156,7 @@ fn bind_fresh_cookie_dir<T>(
 /// this can produce is a name a consumer suppresses (see
 /// [`admissible_token`](crate::os::windows::security::admissible_token)).
 #[cfg_attr(not(all(target_os = "windows", not(miri))), allow(dead_code))]
+#[cfg(feature = "sync")]
 fn mint_cookie_dir_token() -> u32 {
   use std::hash::{BuildHasher, Hasher};
 
@@ -3100,6 +3177,7 @@ fn mint_cookie_dir_token() -> u32 {
 /// A cookie name as a C string, for the `*at` calls. An interior NUL is refused
 /// rather than silently truncating the name a removal would then address.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(feature = "sync")]
 fn cookie_c_name(name: &str) -> Result<std::ffi::CString, std::io::Error> {
   std::ffi::CString::new(name).map_err(|_| {
     std::io::Error::new(
@@ -3116,6 +3194,7 @@ fn cookie_c_name(name: &str) -> Result<std::ffi::CString, std::io::Error> {
 /// this is what the removal additionally proves — or declines to prove — about
 /// the object it finds there.
 #[derive(Clone, Copy, Debug)]
+#[cfg(feature = "sync")]
 pub(crate) enum CookieProof {
   /// The create read this identity off its OWN descriptor.
   ///
@@ -3237,6 +3316,7 @@ pub(crate) enum CookieProof {
 /// hold. A real removal handed such a record refuses rather than falling back to a
 /// pathname.
 #[derive(Clone, Debug)]
+#[cfg(feature = "sync")]
 pub(crate) struct CookieFile {
   path: PathBuf,
   /// Never read on Unix, and that is the point: its whole contribution there is its
@@ -3266,6 +3346,7 @@ pub(crate) struct CookieFile {
   proof: CookieProof,
 }
 
+#[cfg(feature = "sync")]
 impl CookieFile {
   /// Pairs a landed cookie's path with the identity of the object the create
   /// returned, anchoring NOTHING: for a cookie with no real descriptor behind it.
@@ -3361,6 +3442,7 @@ impl CookieFile {
 /// directory-only obligation holds neither, so the call cannot be written — not
 /// "is refused by a check inside it", but has no argument to be made with.
 #[derive(Clone, Debug)]
+#[cfg(feature = "sync")]
 pub(crate) enum CookieResidue {
   /// BOTH halves are owed: the cookie file — its anchor, its name inside that
   /// anchor, what authorizes its removal and the create's retained descriptor —
@@ -3379,6 +3461,7 @@ pub(crate) enum CookieResidue {
 /// The directory half of one obligation's debt: the landing the record was
 /// claimed under, and the directory still to destroy.
 #[derive(Clone, Debug)]
+#[cfg(feature = "sync")]
 pub(crate) struct CookieDirDebt {
   /// The record's landing path, carried UNCHANGED across the file half's
   /// settlement. `by_path` is keyed by it from the claim
@@ -3393,6 +3476,7 @@ pub(crate) struct CookieDirDebt {
   dir: Arc<CookieDir>,
 }
 
+#[cfg(feature = "sync")]
 impl CookieResidue {
   /// Where this obligation's cookie landed — the `by_path` key, and what a
   /// path-addressed removal resolves through. Stable across the file half's
@@ -3468,6 +3552,7 @@ impl CookieResidue {
   allow(dead_code)
 )]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(feature = "sync")]
 pub(crate) enum CookieRemoval {
   /// The cookie is unlinked: the name still denoted it, or — where the record
   /// kept its pin — an entry that did was found and removed.
@@ -3525,6 +3610,7 @@ pub(crate) enum CookieRemoval {
 /// rather than retiring `NeverCreated` and leaving the directory to
 /// [`CookieDir`]'s `Drop`, whose failure is discarded by design.
 #[derive(Debug)]
+#[cfg(feature = "sync")]
 pub(crate) struct CookieWriteError {
   /// The failure the sync reports, verbatim.
   pub(crate) source: std::io::Error,
@@ -3590,6 +3676,7 @@ pub(crate) struct CookieWriteError {
 /// file-target-goes-beside-it rule already applied) and the pattern that closed
 /// it.
 #[derive(Debug)]
+#[cfg(feature = "sync")]
 pub(crate) struct PrunedCookieDir {
   /// The canonical cookie parent the write resolved.
   pub(crate) dir: PathBuf,
@@ -3601,6 +3688,7 @@ pub(crate) struct PrunedCookieDir {
 /// actually resolved (symlinks followed and the file-target-goes-beside-it rule
 /// already applied) and the watcher exclusion that covers it.
 #[derive(Debug)]
+#[cfg(feature = "sync")]
 pub(crate) struct ExcludedCookieDir {
   /// The cookie parent the write resolved.
   pub(crate) dir: PathBuf,
@@ -3608,6 +3696,7 @@ pub(crate) struct ExcludedCookieDir {
   pub(crate) exclusion: PathBuf,
 }
 
+#[cfg(feature = "sync")]
 impl CookieWriteError {
   /// The pre-physical failure: nothing of this write is on disk.
   ///
@@ -3715,6 +3804,7 @@ impl CookieWriteError {
 ///
 /// [`retire`]: LedgerInner::retire
 #[derive(Clone, Copy, Debug)]
+#[cfg(feature = "sync")]
 enum Reaped {
   /// The cookie is confirmed absent from its name: the unlink returned `Ok`, or
   /// the name was already empty, or it now holds a DIFFERENT object
@@ -3735,6 +3825,7 @@ enum Reaped {
 /// keying it (kept for the same reason on the `by_ticket` index), its immutable
 /// incarnation identity, the path it landed at, the reap mark, its LRU re-arm
 /// key, and its lifecycle phase.
+#[cfg(feature = "sync")]
 struct Obligation {
   scope: ScopeId,
   /// WHERE this obligation's marker actually lands: the admission's PINNED
@@ -3885,6 +3976,7 @@ struct Obligation {
 /// Every phase is an honest obligation: each is counted by the global gauge and
 /// by the close reply, so no phase transition can make a physical cookie — or a
 /// write that may be about to create one — vanish from the accounting.
+#[cfg(feature = "sync")]
 enum Phase {
   /// Admitted and parked on its coverage-settle fence: no write has been
   /// dispatched, so this obligation is PRE-PHYSICAL — no file can exist for it
@@ -3920,6 +4012,7 @@ enum Phase {
   },
 }
 
+#[cfg(feature = "sync")]
 type CookieLedger = Arc<Mutex<LedgerInner>>;
 
 /// Mints the cookie-cleanup ingress: ONE ledger, shared between the watcher
@@ -3938,6 +4031,7 @@ type CookieLedger = Arc<Mutex<LedgerInner>>;
 /// admission to its typed terminal ([`CookieRegistry::admit_parked`]), a cleanup
 /// request has somewhere to LIVE: it is one bool on already-counted state, so
 /// there is no queue to bound and no admission to refuse.
+#[cfg(feature = "sync")]
 pub(crate) fn cookie_ingress() -> (CookieIngress, CookieWake) {
   let ledger: CookieLedger = Arc::new(Mutex::new(LedgerInner::new()));
   // Capacity 1, and the token is a bare `()`: it carries no request — it only says
@@ -4018,6 +4112,7 @@ pub(crate) fn cookie_ingress() -> (CookieIngress, CookieWake) {
 /// Cloneable: it is a handle over shared state, and every clone addresses the one
 /// ledger. Nothing about the mechanism is per-holder.
 #[derive(Clone)]
+#[cfg(feature = "sync")]
 pub(crate) struct CookieIngress {
   ledger: CookieLedger,
   /// The capacity-1 wake. `Sender`, so the driver's `recv` observes the close
@@ -4051,11 +4146,13 @@ pub(crate) struct CookieIngress {
 ///
 /// The retire and close sweeps remain the promptness backstop for every residual
 /// scheduling gap, exactly as before.
+#[cfg(feature = "sync")]
 pub(crate) struct CookieWake {
   ledger: CookieLedger,
   wake: async_channel::Receiver<()>,
 }
 
+#[cfg(feature = "sync")]
 impl CookieIngress {
   /// Marks the obligation `resolve` names — the whole ingress. The lookup and the
   /// store are ONE critical section, so no claim can interleave between them: a
@@ -4133,12 +4230,14 @@ impl CookieIngress {
 /// captured closure is zero-capture, so it is both) keeps [`CookieRegistry`]
 /// itself `Sync`, so `&cookies` can be read inside the `Send` close-drain future
 /// where the LIVE ledger is the drain's quiescence condition (§5.2).
+#[cfg(feature = "sync")]
 type DetachedSpawner = Box<dyn Fn(Box<dyn FnOnce() + Send>) + Send + Sync>;
 
 /// Locks the ledger, ignoring poisoning: every critical section is a small,
 /// invariant-preserving mutation that cannot leave the maps half-written, and
 /// the terminal sweep runs from a [`Drop`] — where unwrapping a poisoned lock
 /// would abort the process mid-unwind instead of reaping the cookies.
+#[cfg(feature = "sync")]
 fn lock_ledger(ledger: &CookieLedger) -> MutexGuard<'_, LedgerInner> {
   ledger.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -4146,6 +4245,7 @@ fn lock_ledger(ledger: &CookieLedger) -> MutexGuard<'_, LedgerInner> {
 /// `backoff(k) = min(base · 2^(k-1), cap)` — the cookie-unlink retry delay for
 /// the `k`-th attempt of the current arming (`k` ≥ 1). Saturating so a large
 /// attempt count can never overflow the shift.
+#[cfg(feature = "sync")]
 fn cookie_backoff(base: Duration, cap: Duration, attempt: u8) -> Duration {
   let shift = attempt.saturating_sub(1).min(31);
   base.saturating_mul(1u32 << shift).min(cap)
@@ -4154,6 +4254,7 @@ fn cookie_backoff(base: Duration, cap: Duration, attempt: u8) -> Duration {
 /// The ownership half one dispatched cookie write carries into the blocking
 /// pool: the ledger holding the record born for it, and the two flags that can
 /// refuse the handover.
+#[cfg(feature = "sync")]
 struct CookieGuard {
   /// This write's incarnation id (§1.1), minted at DISPATCH under the ledger lock
   /// together with the record it keys — the SINGLE birth site — and carried from
@@ -4183,6 +4284,7 @@ struct CookieGuard {
   dispatched_generation: u64,
 }
 
+#[cfg(feature = "sync")]
 impl CookieGuard {
   /// Hands what a just-finished write left on disk to the registry, which then
   /// owns it — the cookie itself, or (where the write failed after minting its
@@ -4312,6 +4414,7 @@ impl CookieGuard {
 /// What [`CookieGuard::precedence`] says about the terminal a dispatched write
 /// may report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "sync")]
 enum ClaimPrecedence {
   /// The stream this cookie would have been reported on is ending: a cancel named
   /// the obligation, the registry is gone, or the scope is retiring.
@@ -4325,6 +4428,7 @@ enum ClaimPrecedence {
   Proceed,
 }
 
+#[cfg(feature = "sync")]
 impl ClaimPrecedence {
   /// The refusal this precedence carries, if it refuses at all — the one seam
   /// between the precedence and [`ClaimRefused`], so the claim and the completion
@@ -4356,6 +4460,7 @@ impl ClaimPrecedence {
 /// stop existing: the marker LEAF names the emit that has to be purged before
 /// the flush (a certificate the consumer would otherwise match first), and the
 /// ground names what the covering `Rescan` has to cover.
+#[cfg(feature = "sync")]
 struct DominatedBarrier {
   /// The rendered marker leaf whose queued emit the purge takes.
   name: Arc<str>,
@@ -4372,6 +4477,7 @@ struct DominatedBarrier {
 /// Why [`CookieGuard::claim`] refused a handover — the two facts a caller learns
 /// APART, because their answers to the barrier differ.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "sync")]
 enum ClaimRefused {
   /// The obligation is gone or its scope is: a cancel named it, the registry is
   /// gone, or the scope is retiring. There is no stream left to report the cookie
@@ -4386,6 +4492,7 @@ enum ClaimRefused {
   Dominated,
 }
 
+#[cfg(feature = "sync")]
 impl ClaimRefused {
   /// The barrier's answer to this refusal.
   fn terminal(self) -> crate::error::SyncRootError {
@@ -4427,6 +4534,7 @@ impl ClaimRefused {
 /// alone a record leaves the ledger with no unlink having confirmed, and
 /// `Obligation::residue` states what such a job still holds open once the record
 /// counting it is gone.
+#[cfg(feature = "sync")]
 struct CookieRegistry<F: FsOps> {
   ops: F,
   /// Raised before the registry stops accepting handovers — at the orderly
@@ -4470,6 +4578,7 @@ struct CookieRegistry<F: FsOps> {
   spawn_detached: DetachedSpawner,
 }
 
+#[cfg(feature = "sync")]
 impl<F: FsOps> CookieRegistry<F> {
   /// Takes the ledger rather than minting one: it is created at the watcher's
   /// spawn ([`cookie_ingress`]) and shared with the handle, whose public cleanup
@@ -5420,6 +5529,7 @@ impl<F: FsOps> CookieRegistry<F> {
 /// the public path-addressed request resolves its path to an id at the door, so
 /// no path-addressed removal decision survives here.
 #[derive(Clone)]
+#[cfg(feature = "sync")]
 enum RemovalRequest {
   /// A targeted request — a marked record on the wake sweep, a retire sweep, the
   /// close sweep, a recovery re-arm: addresses one incarnation by id, and a no-op
@@ -5436,6 +5546,7 @@ enum RemovalRequest {
   RetryDue(CookieId),
 }
 
+#[cfg(feature = "sync")]
 impl<F: FsOps> Drop for CookieRegistry<F> {
   fn drop(&mut self) {
     // The ABNORMAL-path backstop — a panic or a task cancellation, where no
@@ -5865,6 +5976,7 @@ pub(crate) enum Command {
   /// settled, so the write dispatches at once. A `Degraded` settle still
   /// writes: the covering `Rescan` the loss already emitted rides the queue
   /// ahead of the cookie, so the barrier is met by domination.
+  #[cfg(feature = "sync")]
   SyncRoot {
     /// The root the cookie must be reported on.
     scope: ScopeId,
@@ -5939,13 +6051,13 @@ pub(crate) enum Command {
   /// completed-cookie reap each leave the registry exactly as they found it — a
   /// leak (or unbounded growth under repeated failure) is then provable rather
   /// than inferred from the unlinks.
-  #[cfg(all(test, feature = "tokio"))]
+  #[cfg(all(test, feature = "tokio", feature = "sync"))]
   DebugCookieCount {
     reply: futures_channel::oneshot::Sender<usize>,
   },
   /// A test-only count of the obligations carrying a reap mark, so a suite can
   /// prove a mark never survives the obligation it names (the boundedness rule).
-  #[cfg(all(test, feature = "tokio"))]
+  #[cfg(all(test, feature = "tokio", feature = "sync"))]
   DebugCookieReapMarks {
     reply: futures_channel::oneshot::Sender<usize>,
   },
@@ -5960,7 +6072,7 @@ pub(crate) enum Command {
   /// A test-only count of `scope`'s PARKED removal records (`RemoveFailed`
   /// carrying no deadline), so the recovery-fairness suites can assert which
   /// scope's backlog a cap refusal re-armed and which stayed parked.
-  #[cfg(all(test, feature = "tokio"))]
+  #[cfg(all(test, feature = "tokio", feature = "sync"))]
   DebugCookieParkedFor {
     scope: ScopeId,
     reply: futures_channel::oneshot::Sender<usize>,
@@ -5969,7 +6081,7 @@ pub(crate) enum Command {
   /// a suite can assert the census equation over a whole scenario: every
   /// obligation ever born is either still live or accounted for by exactly one
   /// typed terminal.
-  #[cfg(all(test, feature = "tokio"))]
+  #[cfg(all(test, feature = "tokio", feature = "sync"))]
   DebugCookieCensus {
     reply: futures_channel::oneshot::Sender<(Census, usize)>,
   },
@@ -6095,6 +6207,7 @@ const fn settle_outcome(settle: CoverSettle) -> CoverOutcome {
 /// standing, which is a met barrier and not a dead root — the same split
 /// [`CookieGuard::precedence`] applies to a write already in the pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "sync")]
 enum ParkedTerminal {
   /// The stream ends with the obligation.
   Retired,
@@ -6102,6 +6215,7 @@ enum ParkedTerminal {
   Dominated,
 }
 
+#[cfg(feature = "sync")]
 impl ParkedTerminal {
   /// The barrier's answer to this terminal.
   const fn error(self) -> crate::error::SyncRootError {
@@ -6135,6 +6249,7 @@ impl ParkedTerminal {
 /// mark) and the plumbing (the target dir) in one place. Record, reply and fence
 /// move together here, so the routing local and the ledger can never disagree
 /// about which syncs are parked.
+#[cfg(feature = "sync")]
 fn retire_parked_cookies<F: FsOps>(
   core: &mut DriverCore,
   parked_cookies: &mut BTreeMap<FenceId, ParkedCookie>,
@@ -6195,14 +6310,14 @@ fn retire_parked_cookies<F: FsOps>(
 #[allow(clippy::too_many_arguments)]
 fn resolve_cover_settlements<R, F>(
   core: &mut DriverCore,
-  ops: &F,
-  op_tx: &async_channel::Sender<OpResult<F::Handle>>,
+  #[cfg(feature = "sync")] ops: &F,
+  #[cfg(feature = "sync")] op_tx: &async_channel::Sender<OpResult<F::Handle>>,
   cover_replies: &mut BTreeMap<FenceId, futures_channel::oneshot::Sender<CoverOutcome>>,
-  parked_cookies: &mut BTreeMap<FenceId, ParkedCookie>,
-  cookies: &mut CookieRegistry<F>,
-  exclusions: &[PathBuf],
-  live: &dyn Fn(ScopeId) -> bool,
-  now: &impl Fn() -> Instant,
+  #[cfg(feature = "sync")] parked_cookies: &mut BTreeMap<FenceId, ParkedCookie>,
+  #[cfg(feature = "sync")] cookies: &mut CookieRegistry<F>,
+  #[cfg(feature = "sync")] exclusions: &[PathBuf],
+  #[cfg(feature = "sync")] live: &dyn Fn(ScopeId) -> bool,
+  #[cfg(feature = "sync")] now: &impl Fn() -> Instant,
   pass: SettlePass<'_>,
 ) -> bool
 where
@@ -6222,6 +6337,7 @@ where
   // way — and, since the cookie is simply never written, its obligation reaches
   // the pre-physical terminal with it rather than lingering in the ledger for a
   // write that will never be dispatched.
+  #[cfg(feature = "sync")]
   retire_parked_cookies(
     core,
     parked_cookies,
@@ -6251,6 +6367,7 @@ where
     // ordering proof: the cut puts whatever the kernel held — a root's own
     // death among it — on the lane ahead of the verdict, so a scope that reads
     // live to the dispatch below was live at the cut rather than merely unread.
+    #[cfg(feature = "sync")]
     if let Some(cookie) = parked_cookies.remove(&fence) {
       // The obligation this fence carries: born at its sync's admission, so it is
       // always here — the routing entry above and the record move in lockstep,
@@ -6672,6 +6789,7 @@ where
 /// The verdict itself is not returned. Every caller acts on the `Result` alone —
 /// `Ok` retires the record, `Err` parks it — and `Displaced` is a success like the
 /// other two, so a returned verdict would be a value no caller could use.
+#[cfg(feature = "sync")]
 fn reap_residue<F: FsOps>(ops: &F, residue: &mut CookieResidue) -> Result<(), std::io::Error> {
   let file = match residue {
     // A DIRECTORY-ONLY obligation. Its file half settled on an earlier attempt and
@@ -6742,6 +6860,7 @@ fn reap_residue<F: FsOps>(ops: &F, residue: &mut CookieResidue) -> Result<(), st
 /// An ABSENT record (only the abnormal-path `Drop`'s take) leaves the refusal
 /// case a bare best-effort reap of what this write itself created, and the
 /// reply-fail case yielding: the record's fate is no longer ours to write.
+#[cfg(feature = "sync")]
 fn self_reap<F: FsOps>(
   ops: &F,
   guard: &CookieGuard,
@@ -6883,6 +7002,7 @@ fn self_reap<F: FsOps>(
 /// the pool — is revoked instead by the generation the same commit bumped,
 /// checked when it claims, and answers the same word for the same reason
 /// ([`CookieGuard::precedence`]).
+#[cfg(feature = "sync")]
 fn revoke_or_rebind_parked_cookies<F: FsOps>(
   core: &mut DriverCore,
   parked_cookies: &mut BTreeMap<FenceId, ParkedCookie>,
@@ -7276,6 +7396,7 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
   /// crawl of this root descends into, and the refusal for it is
   /// [`CookieWriteError::crosses_mount`]
   /// ([`SyncRootError::DirCrossesMount`](crate::SyncRootError::DirCrossesMount)).
+  #[cfg(feature = "sync")]
   fn write_cookie(
     &self,
     root: &LiveRoot,
@@ -7338,6 +7459,7 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
   /// [`CookieResidue::Dir`], which is not one, so this call cannot be made for it
   /// at all. See [`CookieResidue`] for why a record in that state must never reach
   /// an identity comparison.
+  #[cfg(feature = "sync")]
   fn remove_cookie(&self, cookie: &CookieFile) -> Result<CookieRemoval, std::io::Error>;
 
   /// Destroys the directory an obligation MINTED for its cookie (blocking) — the
@@ -7357,6 +7479,7 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
   /// RETURNED, so the obligation stays in the ledger — counted by both caps,
   /// parked `RemoveFailed`, retried on the same budget — rather than leaving a
   /// residue nothing tracks.
+  #[cfg(feature = "sync")]
   fn dispose_cookie_dir(&self, dir: &CookieDir) -> Result<(), std::io::Error>;
 
   /// Re-reads the live mount table strictly under `root` AND re-stats the root
@@ -8148,6 +8271,7 @@ enum Publication {
 /// here, and deliberately so — a cookie written through it would be created
 /// under the link's TARGET and its event reported outside this root, never
 /// meeting the barrier.
+#[cfg(feature = "sync")]
 fn cookie_dir<'a>(root: &Path, dir: &'a Path) -> &'a Path {
   match std::fs::symlink_metadata(dir) {
     Ok(meta) if meta.is_dir() => dir,
@@ -8242,14 +8366,17 @@ fn cookie_dir<'a>(root: &Path, dir: &'a Path) -> &'a Path {
 /// `stat`. Never past that: the write releases the pins and the permit the
 /// instant it holds descriptors of its own, so nothing a stalled post-create
 /// syscall does can keep the door shut.
+#[cfg(feature = "sync")]
 pub(crate) const MAX_SYNC_SAMPLINGS: usize = 32;
 
 #[derive(Debug, Clone)]
+#[cfg(feature = "sync")]
 pub(crate) struct SyncPinAllowance {
   taken: async_channel::Sender<()>,
   freed: Arc<async_channel::Receiver<()>>,
 }
 
+#[cfg(feature = "sync")]
 impl SyncPinAllowance {
   /// An allowance of `permits` concurrent samplings. A zero would be a door that
   /// admits nothing, so the floor is one — the caps this is sized from are
@@ -8342,10 +8469,12 @@ impl SyncPinAllowance {
 /// `Arc`, and the slot returns when the last of them drops ([`AdmittedDirs`]
 /// carries it onwards, and drops it with the pins).
 #[derive(Debug)]
+#[cfg(feature = "sync")]
 pub(crate) struct SyncPinPermit {
   freed: Arc<async_channel::Receiver<()>>,
 }
 
+#[cfg(feature = "sync")]
 impl Drop for SyncPinPermit {
   fn drop(&mut self) {
     // The slot this permit occupies. Every permit put exactly one token in, so a
@@ -8388,6 +8517,7 @@ impl Drop for SyncPinPermit {
 /// same `(dev, ino)` reading this type kept before it began holding objects, with
 /// the same meaning and the same stated weakness.
 #[derive(Debug, Default)]
+#[cfg(feature = "sync")]
 pub(crate) struct AdmittedDir {
   /// The descriptor the door opened, held until the admission record is dropped.
   ///
@@ -8452,6 +8582,7 @@ pub(crate) struct AdmittedDir {
 }
 
 #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+#[cfg(feature = "sync")]
 impl AdmittedDir {
   /// The object the door is HOLDING, read off that descriptor now.
   ///
@@ -8530,6 +8661,7 @@ impl AdmittedDir {
   not(miri),
   any(target_os = "linux", target_os = "macos")
 ))]
+#[cfg(feature = "sync")]
 impl AdmittedDir {
   pub(crate) fn framed_at(landing: Option<PathBuf>, dev: u64, mnt_id: Option<u64>) -> Self {
     Self {
@@ -8542,6 +8674,7 @@ impl AdmittedDir {
 }
 
 #[cfg(not(all(any(target_os = "linux", target_os = "macos"), not(miri))))]
+#[cfg(feature = "sync")]
 impl AdmittedDir {
   /// The identity the door read, unchanged — there is no descriptor here to
   /// re-read it from.
@@ -8605,6 +8738,7 @@ impl AdmittedDir {
 /// One open per job on the blocking POOL, in the [`watch`](crate::Watcher::watch)
 /// door's mold — never on the driver's owner loop, which must not resolve a
 /// pathname against a mount that can hang.
+#[cfg(feature = "sync")]
 pub(crate) fn cookie_target_identity(
   root: &Path,
   dir: &Path,
@@ -8656,6 +8790,7 @@ pub(crate) fn cookie_target_identity(
 /// absence, and every other error goes back to the door, which refuses that one
 /// sync instead of flooding on.
 #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+#[cfg(feature = "sync")]
 fn definite_pin(
   opened: Result<std::fs::File, std::io::Error>,
 ) -> Result<Option<std::os::fd::OwnedFd>, std::io::Error> {
@@ -8688,6 +8823,7 @@ fn definite_pin(
 /// that is absent has nothing to have a location; that is a reading, and it
 /// carries `None`.
 #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+#[cfg(feature = "sync")]
 fn pinned_where_it_stands(
   opened: Result<std::fs::File, std::io::Error>,
 ) -> Result<AdmittedDir, std::io::Error> {
@@ -8735,6 +8871,7 @@ fn pinned_where_it_stands(
 /// cut-time ground the barrier's ordering actually rests on — and an exclusion or a
 /// prune word naming the reserved directory itself leaves the target above it
 /// perfectly reportable.
+#[cfg(feature = "sync")]
 fn reserved_cookie_dir_identity(root: &Path, dir: &Path) -> Result<AdmittedDir, std::io::Error> {
   #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
   {
@@ -8783,6 +8920,7 @@ fn reserved_cookie_dir_identity(root: &Path, dir: &Path) -> Result<AdmittedDir, 
 /// thing that matters — an open descriptor on the root defers its
 /// `IN_DELETE_SELF`, so a barrier that held one could postpone the notice of its
 /// own root's death for as long as the sync lasted.
+#[cfg(feature = "sync")]
 fn watched_root_identity(root: &Path) -> Result<AdmittedDir, std::io::Error> {
   #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
   {
@@ -8887,6 +9025,7 @@ fn watched_root_identity(root: &Path) -> Result<AdmittedDir, std::io::Error> {
 /// window under the caps that bound parked syncs, and the price of a comparison
 /// that means what it says.
 #[derive(Debug, Default)]
+#[cfg(feature = "sync")]
 pub(crate) struct AdmittedDirs {
   root: AdmittedDir,
   target: AdmittedDir,
@@ -8920,6 +9059,7 @@ pub(crate) struct AdmittedDirs {
 /// door, which is why it is asserted here rather than assumed there: a field that
 /// stopped being `Send` is then a type error beside the type that lost the
 /// property, not inside the caller that needed it.
+#[cfg(feature = "sync")]
 const _: () = {
   const fn crosses_threads<T: Send>() {}
   crosses_threads::<AdmittedDir>();
@@ -8960,6 +9100,7 @@ const _: () = {
   not(miri),
   any(target_os = "linux", target_os = "macos")
 ))]
+#[cfg(feature = "sync")]
 pub(crate) static SYNC_DOOR_STEP: Mutex<Vec<ArmedDoorStep>> = Mutex::new(Vec::new());
 
 /// One [`SYNC_DOOR_STEP`] arming: the directory it speaks for, WHICH of the door's
@@ -8970,6 +9111,7 @@ pub(crate) static SYNC_DOOR_STEP: Mutex<Vec<ArmedDoorStep>> = Mutex::new(Vec::ne
   not(miri),
   any(target_os = "linux", target_os = "macos")
 ))]
+#[cfg(feature = "sync")]
 type ArmedDoorStep = (PathBuf, SyncDoorPoint, Box<dyn FnOnce() + Send>);
 
 /// The same seam one phase later: a one-shot step at the top of the real cookie
@@ -8994,6 +9136,7 @@ type ArmedDoorStep = (PathBuf, SyncDoorPoint, Box<dyn FnOnce() + Send>);
   not(miri),
   any(target_os = "linux", target_os = "macos")
 ))]
+#[cfg(feature = "sync")]
 pub(crate) static COOKIE_WRITE_STEP: Mutex<Vec<ArmedWriteStep>> = Mutex::new(Vec::new());
 
 /// One [`COOKIE_WRITE_STEP`] arming: the directory it speaks for, and the
@@ -9004,6 +9147,7 @@ pub(crate) static COOKIE_WRITE_STEP: Mutex<Vec<ArmedWriteStep>> = Mutex::new(Vec
   not(miri),
   any(target_os = "linux", target_os = "macos")
 ))]
+#[cfg(feature = "sync")]
 type ArmedWriteStep = (PathBuf, Box<dyn FnOnce() + Send>);
 
 /// Which of the door's three samplings is being spoken about.
@@ -9014,6 +9158,7 @@ type ArmedWriteStep = (PathBuf, Box<dyn FnOnce() + Send>);
 /// so the door can say which reading it is asking for and a test seam can say which
 /// one it stands in front of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "sync")]
 pub(crate) enum SyncDoorPoint {
   /// The watched root every descent of the write starts from.
   Root,
@@ -9023,6 +9168,7 @@ pub(crate) enum SyncDoorPoint {
   Cookies,
 }
 
+#[cfg(feature = "sync")]
 impl AdmittedDirs {
   /// Samples — and holds — ONE of the three directories a sync of `dir` under
   /// `root` is judged against.
@@ -9218,6 +9364,7 @@ impl AdmittedDirs {
 /// frame question at all, which is the same silence they already keep about
 /// landings and about the write's own read-backs.
 #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+#[cfg(feature = "sync")]
 impl AdmittedDirs {
   /// The watched root's mount — the frame every other reading is judged against,
   /// exactly as it is the frame the crawl fences its own descent on.
@@ -9250,6 +9397,7 @@ impl AdmittedDirs {
 /// construction, so the check is a fail-closed invariant rather than a door;
 /// keeping it is what makes the record caps real memory caps even if the mint's
 /// shape ever changes.
+#[cfg(feature = "sync")]
 pub(crate) const MAX_COOKIE_NAME_LEN: usize = 255;
 
 /// Whether a minted cookie NAME is exactly one normal filename component — no
@@ -9262,6 +9410,7 @@ pub(crate) const MAX_COOKIE_NAME_LEN: usize = 255;
 /// guards is unforgiving — an absolute or `..` name escapes the directory the
 /// barrier was validated for the moment it reaches a path join, and an unbounded
 /// one defeats the ledger's caps the moment it is stored.
+#[cfg(feature = "sync")]
 pub(crate) fn is_normal_cookie_name(name: &str) -> bool {
   if name.len() > MAX_COOKIE_NAME_LEN {
     return false;
@@ -9298,6 +9447,7 @@ fn lexically_normalized(path: &Path) -> Option<PathBuf> {
 /// (component-wise, `/r/../outside` does start with `/r`) and would place a
 /// barrier outside the watched tree. `root` is canonical (no `.`/`..`), so a
 /// lexical prefix test on the folded `dir` is exact.
+#[cfg(feature = "sync")]
 pub(crate) fn cookie_dir_within_root(root: &Path, dir: &Path) -> bool {
   lexically_normalized(dir).is_some_and(|dir| dir.starts_with(root))
 }
@@ -9546,6 +9696,7 @@ pub(crate) fn pruned_ancestor_depth(
 /// it: it describes ground, not a file, so a caller that has already created
 /// something must destroy that first ([`withdraw_marker`]) rather than return one
 /// of these as it stands.
+#[cfg(feature = "sync")]
 fn cookie_ground_refusal(
   floor: &Path,
   dir: &Path,
@@ -9622,6 +9773,7 @@ fn cookie_ground_refusal(
 /// cover's membership test ([`DriverCore::covers`]), passed in because it is the
 /// core's fact and this runs beside the core rather than inside it, and it is as
 /// lexical as everything else here.
+#[cfg(feature = "sync")]
 fn admitted_ground_refusal(
   root: &Path,
   admitted: &AdmittedDirs,
@@ -9717,11 +9869,13 @@ fn admitted_ground_refusal(
 /// until the directory exists. That platform's cookie path is fenced as a whole
 /// (<https://github.com/al8n/tributaries/issues/134>).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(feature = "sync")]
 fn reserved_cookie_dir(parent: &CookieParent) -> Option<PathBuf> {
   Some(parent.path().join(cookie_dir_name()))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(feature = "sync")]
 fn reserved_cookie_dir(parent: &CookieParent) -> Option<PathBuf> {
   let _ = parent;
   None
@@ -9743,6 +9897,7 @@ fn reserved_cookie_dir(parent: &CookieParent) -> Option<PathBuf> {
 /// directory is a per-obligation debt a typed ground refusal has no way to hand
 /// back, and the remaining targets mint no cookie directory at all.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(feature = "sync")]
 fn current_cookie_dir_path(dir: &CookieDir) -> Option<Result<PathBuf, std::io::Error>> {
   #[cfg(all(
     test,
@@ -9757,6 +9912,7 @@ fn current_cookie_dir_path(dir: &CookieDir) -> Option<Result<PathBuf, std::io::E
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(feature = "sync")]
 fn current_cookie_dir_path(dir: &CookieDir) -> Option<Result<PathBuf, std::io::Error>> {
   let _ = dir;
   None
@@ -9797,6 +9953,7 @@ fn current_cookie_dir_path(dir: &CookieDir) -> Option<Result<PathBuf, std::io::E
 /// minted per obligation inside the call that creates it — and the remaining
 /// targets, which mint no cookie directory at all.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(feature = "sync")]
 fn minted_dir_holds_only_marker(
   dir: &CookieDir,
   name: &str,
@@ -9816,6 +9973,7 @@ fn minted_dir_holds_only_marker(
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(feature = "sync")]
 fn minted_dir_holds_only_marker(
   dir: &CookieDir,
   name: &str,
@@ -9880,6 +10038,7 @@ impl FsOps for RealFs {
     }
   }
 
+  #[cfg(feature = "sync")]
   fn write_cookie(
     &self,
     root: &LiveRoot,
@@ -10315,6 +10474,7 @@ impl FsOps for RealFs {
     }
   }
 
+  #[cfg(feature = "sync")]
   fn remove_cookie(&self, cookie: &CookieFile) -> Result<CookieRemoval, std::io::Error> {
     let Some(dir) = cookie.dir.as_deref() else {
       // A record minted below the real write carries no anchor, so there is no
@@ -10328,6 +10488,7 @@ impl FsOps for RealFs {
     remove_anchored(dir, &cookie.name, cookie.proof, cookie.pin.as_deref())
   }
 
+  #[cfg(feature = "sync")]
   fn dispose_cookie_dir(&self, dir: &CookieDir) -> Result<(), std::io::Error> {
     dir.dispose()
   }
@@ -10803,6 +10964,7 @@ fn identity_of_handle(file: &std::fs::File) -> Result<Option<RootIdentity>, std:
 /// so its `NotFound` already IS the object's own and there is nothing for a link
 /// count to add.
 #[cfg(unix)]
+#[cfg(feature = "sync")]
 fn handle_still_named(handle: &std::fs::File) -> bool {
   links_of_handle(handle).is_none_or(|links| links > 0)
 }
@@ -10815,6 +10977,7 @@ fn handle_still_named(handle: &std::fs::File) -> bool {
 /// entry has to stop, and the count of links left is exactly how many entries there
 /// are still to remove ([`remove_anchored`]).
 #[cfg(unix)]
+#[cfg(feature = "sync")]
 fn links_of_handle(handle: &std::fs::File) -> Option<u64> {
   use std::os::unix::fs::MetadataExt;
 
@@ -10822,6 +10985,7 @@ fn links_of_handle(handle: &std::fs::File) -> Option<u64> {
 }
 
 #[cfg(not(unix))]
+#[cfg(feature = "sync")]
 fn handle_still_named(handle: &std::fs::File) -> bool {
   let _ = handle;
   false
@@ -10847,6 +11011,7 @@ fn handle_still_named(handle: &std::fs::File) -> bool {
 /// [`Anchor`](CookieProof::Anchor) and carrying the create's descriptor — which
 /// keeps the object's identity slot reserved AND is what a later removal reads to
 /// promote the record to a real identity rather than retry a bare name.
+#[cfg(feature = "sync")]
 fn destroy_unidentified(
   dir: Arc<CookieDir>,
   name: &str,
@@ -10939,6 +11104,7 @@ fn destroy_unidentified(
 /// a clean typed refusal is not a true statement about the write (see
 /// [`post_mint_failure`]) and the ground is not re-read at all
 /// ([`current_cookie_dir_path`]).
+#[cfg(feature = "sync")]
 fn withdraw_marker(
   dir: Arc<CookieDir>,
   name: &str,
@@ -11015,6 +11181,7 @@ fn withdraw_marker(
 /// Where NO directory is owed — the shared Unix directory that no obligation may
 /// destroy, a target that mints none at all — `clean` is the literal truth and is
 /// what this returns. [`CookieDir::owed`] is where each platform answers that.
+#[cfg(feature = "sync")]
 fn post_mint_failure(dir: &Arc<CookieDir>, name: &str, source: std::io::Error) -> CookieWriteError {
   match dir.owed(dir.path().join(name)) {
     Some(owed) => CookieWriteError {
@@ -11125,6 +11292,7 @@ fn post_mint_failure(dir: &Arc<CookieDir>, name: &str, source: std::io::Error) -
 ///
 /// [`Displaced`]: CookieRemoval::Displaced
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(feature = "sync")]
 fn remove_anchored(
   dir: &CookieDir,
   name: &str,
@@ -11193,6 +11361,7 @@ fn remove_anchored(
 /// about the object, and reading this answer as one is the whole defect that
 /// section describes.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(feature = "sync")]
 fn remove_at_name(
   dir: &CookieDir,
   name: &str,
@@ -11269,6 +11438,7 @@ fn remove_at_name(
 /// an unknown part of the directory, and "not found" would be a claim it never
 /// earned.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(feature = "sync")]
 fn unlink_entry_by_identity(
   dir: &CookieDir,
   identity: RootIdentity,
@@ -11364,6 +11534,7 @@ fn unlink_entry_by_identity(
 /// because unlinking a name this record can say nothing about is the deletion the
 /// whole design refuses to perform.
 #[cfg(all(target_os = "windows", not(miri)))]
+#[cfg(feature = "sync")]
 fn remove_anchored(
   dir: &CookieDir,
   name: &str,
@@ -11402,6 +11573,7 @@ fn remove_anchored(
   target_os = "macos",
   all(target_os = "windows", not(miri))
 )))]
+#[cfg(feature = "sync")]
 fn remove_anchored(
   _dir: &CookieDir,
   _name: &str,
@@ -11659,6 +11831,7 @@ enum OpResult<H> {
   /// job under the ledger lock. The driver's one job here is SCHEDULING — if the
   /// write's self-reap left the record parked as failed, stamp its retry deadline
   /// (the driver owns the clock).
+  #[cfg(feature = "sync")]
   CookieWriteDone {
     id: CookieId,
   },
@@ -11669,6 +11842,7 @@ enum OpResult<H> {
   /// `!confirmed` = a transient failure of EITHER (the record is parked
   /// `RemoveFailed`). As above, the driver only schedules — and a report whose
   /// incarnation has since been retired or re-armed touches nothing.
+  #[cfg(feature = "sync")]
   CookieRemoveDone {
     id: CookieId,
     confirmed: bool,
@@ -11716,6 +11890,7 @@ enum OpResult<H> {
 
 /// The earlier of two optional deadlines (the core's timer and the earliest due
 /// cookie retry), in proto-`Instant` space.
+#[cfg(feature = "sync")]
 fn min_instant(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
   match (a, b) {
     (Some(a), Some(b)) => Some(a.min(b)),
@@ -11729,6 +11904,7 @@ fn min_instant(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
 /// the budget and drops the deadline with the transition out of `RemoveFailed`.
 /// A record retired between the scan and its dispatch is a no-op — the deadline
 /// rides the record, so it can never fire against another incarnation.
+#[cfg(feature = "sync")]
 fn dispatch_due_cookie_retries<R, F>(
   cookies: &CookieRegistry<F>,
   op_tx: &async_channel::Sender<OpResult<F::Handle>>,
@@ -11770,6 +11946,7 @@ fn dispatch_due_cookie_retries<R, F>(
 ///   fence, answering its barrier `Retired` and abandoning the fence — so a sync
 ///   cancelled before its write was ever dispatched creates no file at all, which
 ///   is the same refusal its claim would have made, one phase earlier.
+#[cfg(feature = "sync")]
 fn sweep_reap_requests<R, F>(
   cookies: &CookieRegistry<F>,
   op_tx: &async_channel::Sender<OpResult<F::Handle>>,
@@ -11796,6 +11973,7 @@ fn sweep_reap_requests<R, F>(
 /// its backed-off retry deadline, or leaves it parked past the budget (no
 /// schedule, zero CPU). A confirm has nothing left to do. `flat` uses the flat
 /// base delay during the close drain (the 1 s grace bounds attempts there).
+#[cfg(feature = "sync")]
 fn on_cookie_remove_done<F: FsOps>(
   cookies: &CookieRegistry<F>,
   config: &DriverConfig,
@@ -11824,7 +12002,7 @@ pub(crate) async fn run<R, F>(
   config: DriverConfig,
   ops: F,
   commands: async_channel::Receiver<Command>,
-  cleanup: CookieWake,
+  #[cfg(feature = "sync")] cleanup: CookieWake,
   events: async_channel::Sender<(ScopeId, Arc<PathBuf>, Change)>,
   registry: impl ScopeRegistry,
 ) where
@@ -11842,10 +12020,19 @@ pub(crate) async fn run<R, F>(
   let Ok(reaper) = TeardownReaper::new() else {
     return;
   };
+  #[cfg(feature = "sync")]
   let CookieWake {
     ledger,
     wake: reap_wake,
   } = cleanup;
+  // With the barrier gated out there is no ledger to mark and no wake to ring.
+  // The two `select_biased!` blocks below are macro-built, and a macro's arms
+  // cannot carry a `#[cfg]` — the attribute would be passed through as tokens —
+  // so the arm stays and is fed a receiver whose sender is held right here and
+  // never rings. Its `recv()` therefore pends for the driver's whole life, which
+  // is exactly what an ingress nobody can address would do.
+  #[cfg(not(feature = "sync"))]
+  let (_reap_wake_held_open, reap_wake) = async_channel::bounded::<()>(1);
   let mut core = DriverCore::new(
     config.effective_move_window(),
     config.root_liveness_interval,
@@ -11996,6 +12183,7 @@ pub(crate) async fn run<R, F>(
   // Sync-cookie writes parked under the SAME settlement fences (see
   // `Command::SyncRoot`): the write dispatches to the blocking pool once the
   // scope's re-arm work quiesces, whatever the settle's verdict.
+  #[cfg(feature = "sync")]
   let mut parked_cookies: BTreeMap<FenceId, ParkedCookie> = BTreeMap::new();
   // The OWNER of every cookie this driver writes, from its sync's ADMISSION —
   // before any file can exist — until that obligation earns a typed terminal, its
@@ -12014,6 +12202,7 @@ pub(crate) async fn run<R, F>(
   // set has. It outlives this task inside the handle's `Arc`, which is inert: with
   // the driver gone, a mark lands on an empty ledger (the terminal sweep already
   // retired everything) and the wake `try_send` finds a closed channel.
+  #[cfg(feature = "sync")]
   let mut cookies = CookieRegistry::new::<R>(ops.clone(), ledger);
   // Uncommitted watch grants unwind through here (see `WatchGrant`); the
   // driver keeps a sender so grants can always be minted, which is fine —
@@ -12021,7 +12210,11 @@ pub(crate) async fn run<R, F>(
   let (unwind_tx, unwind_rx) = async_channel::unbounded::<ScopeId>();
 
   let close_reply = loop {
+    #[cfg(feature = "sync")]
     drain_barrier_moves::<R, F>(&mut core, &mut cookies, &op_tx, &now);
+    #[cfg(not(feature = "sync"))]
+    drain_barrier_moves(&mut core);
+    #[cfg(feature = "sync")]
     execute_effects::<R, F>(
       &mut core,
       &ops,
@@ -12044,13 +12237,39 @@ pub(crate) async fn run<R, F>(
       &registry,
       &now,
     );
+    #[cfg(not(feature = "sync"))]
+    execute_effects::<R, F>(
+      &mut core,
+      &ops,
+      &config,
+      &op_tx,
+      &reaper,
+      &mut streams.handles,
+      &mut pending_spawns,
+      &mut pending_teardowns,
+      &mut scope_backends,
+      &mut lanes,
+      &mut source_taps,
+      &events,
+      &mut unwatch_replies,
+      &mut deferred_grants,
+      &mut pending_control,
+      &mut control_inflight,
+      &mut probes,
+      &registry,
+      &now,
+    );
 
     // Widen catch-up commits resolve HERE — strictly after the effect flush
     // above, which is load-bearing: the prefix's deliveries have already
     // reached the consumer at their pre-commit (old-root) coordinates, so
     // the root flip below can never precede a delivery it re-frames (G3-1
     // by construction; see `resolve_widen_catchups`).
-    if resolve_widen_catchups::<R, F>(
+    // The widen resolution needs the ledger only to re-bind the cookies parked
+    // on the widening scope; with the barrier gated out there are none, and a
+    // `#[cfg]` cannot be written on one argument of a call.
+    #[cfg(feature = "sync")]
+    let widened = resolve_widen_catchups::<R, F>(
       &mut core,
       &ops,
       &config,
@@ -12068,7 +12287,26 @@ pub(crate) async fn run<R, F>(
       &registry,
       &mut probes,
       &now,
-    ) {
+    );
+    #[cfg(not(feature = "sync"))]
+    let widened = resolve_widen_catchups::<R, F>(
+      &mut core,
+      &ops,
+      &config,
+      &op_tx,
+      &reaper,
+      &streams.handles,
+      &mut pending_spawns,
+      &pending_teardowns,
+      &scope_backends,
+      &source_taps,
+      &mut streams.replace_states,
+      &mut unwatch_replies,
+      &registry,
+      &mut probes,
+      &now,
+    );
+    if widened {
       // A commit just enqueued its own post-splice effects (the widened
       // root's cold-read enumerate above all) AFTER the flush above ran —
       // flush once more so a quiescent widen cannot park with the newly
@@ -12077,7 +12315,11 @@ pub(crate) async fn run<R, F>(
       // so this second flush carries only post-commit (new-world) effects —
       // the G3-1 pre/post ordering is untouched. Conditional: one extra
       // flush per RESOLVED widen, never a steady-state cost.
+      #[cfg(feature = "sync")]
       drain_barrier_moves::<R, F>(&mut core, &mut cookies, &op_tx, &now);
+      #[cfg(not(feature = "sync"))]
+      drain_barrier_moves(&mut core);
+      #[cfg(feature = "sync")]
       execute_effects::<R, F>(
         &mut core,
         &ops,
@@ -12100,17 +12342,41 @@ pub(crate) async fn run<R, F>(
         &registry,
         &now,
       );
+      #[cfg(not(feature = "sync"))]
+      execute_effects::<R, F>(
+        &mut core,
+        &ops,
+        &config,
+        &op_tx,
+        &reaper,
+        &mut streams.handles,
+        &mut pending_spawns,
+        &mut pending_teardowns,
+        &mut scope_backends,
+        &mut lanes,
+        &mut source_taps,
+        &events,
+        &mut unwatch_replies,
+        &mut deferred_grants,
+        &mut pending_control,
+        &mut control_inflight,
+        &mut probes,
+        &registry,
+        &now,
+      );
     }
 
     // Service any cookie-unlink retries now due, opportunistically at the loop
     // top so a busy loop that never parks still drives them promptly (T8) — the
     // belt-and-suspenders the timer arm below shares.
+    #[cfg(feature = "sync")]
     dispatch_due_cookie_retries::<R, F>(&cookies, &op_tx, now());
 
     // Retired obligations release their marker exemptions here, at the one place
     // the core and the ledger are both in hand. Late costs only an over-delivery
     // of this driver's own artifact — the exemption never narrows anything — so
     // the drain rides the loop rather than a wake of its own.
+    #[cfg(feature = "sync")]
     core.release_sync_markers(cookies.take_released_markers());
 
     // Fairness for the cleanup ingress: the select below is command-biased (it
@@ -12121,6 +12387,7 @@ pub(crate) async fn run<R, F>(
     // preserving the command/close priority the biased select gives. Cheap by
     // construction: no wake pending means no request has landed since the last
     // sweep, so this is one non-blocking probe.
+    #[cfg(feature = "sync")]
     if reap_wake.try_recv().is_ok() {
       sweep_reap_requests::<R, F>(&cookies, &op_tx, &mut parked_cookies, &mut core);
     }
@@ -12297,6 +12564,7 @@ pub(crate) async fn run<R, F>(
         scope,
       );
     }
+    #[cfg(feature = "sync")]
     let cover_flush_due = resolve_cover_settlements::<R, F>(
       &mut core,
       &ops,
@@ -12307,6 +12575,14 @@ pub(crate) async fn run<R, F>(
       &config.exclusions,
       &|scope| streams.handles.contains_key(&scope),
       &now,
+      SettlePass::Live {
+        unspent: &source_unspent,
+      },
+    );
+    #[cfg(not(feature = "sync"))]
+    let cover_flush_due = resolve_cover_settlements::<R, F>(
+      &mut core,
+      &mut cover_replies,
       SettlePass::Live {
         unspent: &source_unspent,
       },
@@ -12343,7 +12619,10 @@ pub(crate) async fn run<R, F>(
     // catch-up poll re-tops instead of falling through, so a pass that reaches
     // the timer has ingested nothing since this read. Both arms live in proto-
     // `Instant` space; the runtime conversion happens once, at the arm.
+    #[cfg(feature = "sync")]
     let due_at = min_instant(core.poll_timeout(), cookies.min_retry_at());
+    #[cfg(not(feature = "sync"))]
+    let due_at = core.poll_timeout();
 
     // THE BOUNDED-SERVICE INVARIANT, which both source-drain phases below owe:
     // internal completions (`op_rx`), grant unwinds, commands, and the deadline
@@ -12652,13 +12931,16 @@ pub(crate) async fn run<R, F>(
               }
               if backend.is_kernel_recursive() {
                 let replace = streams.replace_states.remove(&scope).expect("just checked");
+                #[cfg(feature = "sync")]
                 let widened = spawned.meta.root.clone();
                 // The new stream's OWN root identity, taken before the spawn
                 // moves into the commit: the cookie floor and the object every
                 // write proves that floor against are re-recorded together, so a
                 // barrier dispatched after this replace can never descend from
                 // the retired root.
+                #[cfg(feature = "sync")]
                 let widened_identity = spawned.meta.identity;
+                #[cfg(feature = "sync")]
                 let outcome = commit_replace::<F>(
                   &mut core,
                   &ops,
@@ -12681,8 +12963,31 @@ pub(crate) async fn run<R, F>(
                   None,
                   &now,
                 );
+                #[cfg(not(feature = "sync"))]
+                let outcome = commit_replace::<F>(
+                  &mut core,
+                  &ops,
+                  &op_tx,
+                  &reaper,
+                  &mut streams.handles,
+                  &mut lanes,
+                  &mut next_lane,
+                  &mut pending_teardowns,
+                  &mut os,
+                  &mut source_taps,
+                  &registry,
+                  &mut probes,
+                  &mut pending_control,
+                  &mut control_inflight,
+                  scope,
+                  spawned,
+                  replace.reservation.path(),
+                  None,
+                  &now,
+                );
                 if let Ok(backend) = &outcome {
                   scope_backends.insert(scope, *backend);
+                  #[cfg(feature = "sync")]
                   let live = LiveRoot::new(widened, widened_identity);
                   // Any barrier still parked under coverage the new root has
                   // moved out from under is revoked BEFORE the commit records the
@@ -12691,13 +12996,17 @@ pub(crate) async fn run<R, F>(
                   // generation that revokes writes already in the pool under the
                   // old root was bumped inside `commit_replace`, at the lane swap.
                   // This only RE-records the cookie floor for the widened root.
+                  #[cfg(feature = "sync")]
                   revoke_or_rebind_parked_cookies(&mut core, &mut parked_cookies, &cookies, scope, &live);
                   // The retirement interlock travels with the floor: the same
                   // flag the scope has carried since it went live is re-bound to
                   // the core, which stores `true` into it at the instant it
                   // removes the scope.
-                  let retiring = cookies.scope_live(scope, live);
-                  core.bind_retiring(scope, retiring);
+                  #[cfg(feature = "sync")]
+                  {
+                    let retiring = cookies.scope_live(scope, live);
+                    core.bind_retiring(scope, retiring);
+                  }
                 }
                 // The reservation releases HERE — commit or failure alike —
                 // after the registry overwrite (commit) has already made the
@@ -12844,9 +13153,12 @@ pub(crate) async fn run<R, F>(
                 // removes the scope — so a writer released between that removal
                 // and the drain that publishes the retirement reads the flag
                 // already raised instead of a live world.
-                let retiring =
-                  cookies.scope_live(scope, LiveRoot::new(canonical_root.clone(), identity));
-                core.bind_retiring(scope, retiring);
+                #[cfg(feature = "sync")]
+                {
+                  let retiring =
+                    cookies.scope_live(scope, LiveRoot::new(canonical_root.clone(), identity));
+                  core.bind_retiring(scope, retiring);
+                }
                 match backend {
                   // Descending: the stream is live but covers NOTHING until
                   // the root's kernel watch arms; the grant defers to the
@@ -12999,9 +13311,11 @@ pub(crate) async fn run<R, F>(
           // Straight from the reservoir into an escrow: the liveness check and
           // the commit below are both on the far side of the handoff.
           let spawned = EscrowedSpawn::new(spawned, reaper.sink());
+          #[cfg(feature = "sync")]
           let widened = spawned.meta.root.clone();
           // The new stream's own root identity, taken before the spawn moves into
           // the commit — see the kernel-recursive arm above.
+          #[cfg(feature = "sync")]
           let widened_identity = spawned.meta.identity;
           let outcome = if !streams.handles.contains_key(&scope) {
             // Death wins: the scope ended while the pre-arm was in flight.
@@ -13019,7 +13333,8 @@ pub(crate) async fn run<R, F>(
               },
             ))
           } else {
-            commit_replace::<F>(
+            #[cfg(feature = "sync")]
+            let committed = commit_replace::<F>(
               &mut core,
               &ops,
               &op_tx,
@@ -13040,21 +13355,49 @@ pub(crate) async fn run<R, F>(
               replace.reservation.path(),
               Some(outcome),
               &now,
-            )
+            );
+            #[cfg(not(feature = "sync"))]
+            let committed = commit_replace::<F>(
+              &mut core,
+              &ops,
+              &op_tx,
+              &reaper,
+              &mut streams.handles,
+              &mut lanes,
+              &mut next_lane,
+              &mut pending_teardowns,
+              &mut os,
+              &mut source_taps,
+              &registry,
+              &mut probes,
+              &mut pending_control,
+              &mut control_inflight,
+              scope,
+              spawned,
+              replace.reservation.path(),
+              Some(outcome),
+              &now,
+            );
+            committed
           };
           if let Ok(backend) = &outcome {
             scope_backends.insert(scope, *backend);
+            #[cfg(feature = "sync")]
             let live = LiveRoot::new(widened, widened_identity);
             // The cookie floor follows the committed root (see the kernel-
             // recursive commit above); the generation that revokes in-flight
             // writes under the old root was already bumped inside `commit_replace`
             // at the lane swap. Parked barriers the new root no longer covers are
             // revoked first, and the ones it covers are rebound to it.
+            #[cfg(feature = "sync")]
             revoke_or_rebind_parked_cookies(&mut core, &mut parked_cookies, &cookies, scope, &live);
             // The retirement interlock travels with the floor (see the
             // kernel-recursive commit above).
-            let retiring = cookies.scope_live(scope, live);
-            core.bind_retiring(scope, retiring);
+            #[cfg(feature = "sync")]
+            {
+              let retiring = cookies.scope_live(scope, live);
+              core.bind_retiring(scope, retiring);
+            }
           }
           drop(replace.reservation);
           let _ = replace.reply.send(outcome.map(|_| ()));
@@ -13330,6 +13673,7 @@ pub(crate) async fn run<R, F>(
               resolve_unwatch_waiters(&mut unwatch_replies, scope);
             }
           }
+        #[cfg(feature = "sync")]
         OpResult::CookieWriteDone { id } => {
           // The write already wrote its own verdict to its record: nothing to
           // reopen (the gate is the phase) and nothing to sweep (a reap mark dies
@@ -13337,6 +13681,7 @@ pub(crate) async fn run<R, F>(
           // is parked `RemoveFailed` — schedule its retry.
           cookies.schedule_retry(&config, id, now(), false);
         }
+        #[cfg(feature = "sync")]
         OpResult::CookieRemoveDone { id, confirmed } => {
           on_cookie_remove_done(&cookies, &config, id, confirmed, now(), false);
         }
@@ -13498,6 +13843,7 @@ pub(crate) async fn run<R, F>(
         // The one wake also services due cookie retries (T8); firing both is
         // harmless — `on_timeout` before its deadline just re-arms, and a retry
         // pass with nothing due is a no-op.
+        #[cfg(feature = "sync")]
         dispatch_due_cookie_retries::<R, F>(&cookies, &op_tx, now());
       },
       cmd = commands.recv().fuse() => match cmd {
@@ -13690,6 +14036,7 @@ pub(crate) async fn run<R, F>(
             // then reaps — a successful barrier nothing can satisfy. Raised
             // here it answers `Retired` and self-reaps. Only the ACCEPTED arm
             // publishes: a backlogged, parked or unknown unwatch ends no scope.
+            #[cfg(feature = "sync")]
             cookies.publish_retiring(scope);
             core.on_unwatch(scope);
           } else if pending_spawns.contains(&scope)
@@ -13779,6 +14126,7 @@ pub(crate) async fn run<R, F>(
             }
           }
         }
+        #[cfg(feature = "sync")]
         Ok(Command::SyncRoot {
           scope,
           dir,
@@ -14011,6 +14359,7 @@ pub(crate) async fn run<R, F>(
           // shutdown flag goes up in this arm rather than further down the
           // orderly shutdown. The tail's call stays as the idempotent backstop
           // ahead of the stream sweep.
+          #[cfg(feature = "sync")]
           cookies.begin_shutdown();
           break Some(reply);
         }
@@ -14075,7 +14424,11 @@ pub(crate) async fn run<R, F>(
           // in it — replying only once the dispatch (or the decline and its
           // covering `Rescan`) has actually run, so the caller never races
           // the effect this tick produced.
+          #[cfg(feature = "sync")]
           drain_barrier_moves::<R, F>(&mut core, &mut cookies, &op_tx, &now);
+          #[cfg(not(feature = "sync"))]
+          drain_barrier_moves(&mut core);
+          #[cfg(feature = "sync")]
           execute_effects::<R, F>(
             &mut core,
             &ops,
@@ -14098,6 +14451,28 @@ pub(crate) async fn run<R, F>(
             &registry,
             &now,
           );
+          #[cfg(not(feature = "sync"))]
+          execute_effects::<R, F>(
+            &mut core,
+            &ops,
+            &config,
+            &op_tx,
+            &reaper,
+            &mut streams.handles,
+            &mut pending_spawns,
+            &mut pending_teardowns,
+            &mut scope_backends,
+            &mut lanes,
+            &mut source_taps,
+            &events,
+            &mut unwatch_replies,
+            &mut deferred_grants,
+            &mut pending_control,
+            &mut control_inflight,
+            &mut probes,
+            &registry,
+            &now,
+          );
           let _ = reply.send(());
         }
         #[cfg(all(test, feature = "tokio", not(miri)))]
@@ -14112,6 +14487,7 @@ pub(crate) async fn run<R, F>(
         // The watcher facade dropped: same orderly teardown, nobody to tell —
         // and the same terminal transition, so the same publication.
         Err(_) => {
+          #[cfg(feature = "sync")]
           cookies.begin_shutdown();
           break None;
         }
@@ -14125,9 +14501,12 @@ pub(crate) async fn run<R, F>(
       // selected on the way out, and the terminal sweep below owns every record
       // regardless of any mark.
       wake = reap_wake.recv().fuse() => {
+        #[cfg(feature = "sync")]
         if wake.is_ok() {
           sweep_reap_requests::<R, F>(&cookies, &op_tx, &mut parked_cookies, &mut core);
         }
+        #[cfg(not(feature = "sync"))]
+        let _ = wake;
       },
       msg = os.next() => {
         if let Some(item) = msg {
@@ -14161,6 +14540,7 @@ pub(crate) async fn run<R, F>(
   //
   // The idempotent backstop: the exit arms above already published at the close's
   // own linearization point, and this covers any future exit that does not.
+  #[cfg(feature = "sync")]
   cookies.begin_shutdown();
   while let Some((scope, stream)) = streams.take_live() {
     registry.scope_dead(scope);
@@ -14200,6 +14580,7 @@ pub(crate) async fn run<R, F>(
   // a cookie owned but unswept behind this sweep. A straggler write's FAILED
   // self-reap landing mid-drain re-inserts a `RemoveFailed` record — the
   // live-ledger drain condition below cannot miss it.
+  #[cfg(feature = "sync")]
   cookies.sweep_owned::<R>(&op_tx);
   // A sync still PARKED at close never had a write dispatched, so there is nothing
   // to sweep for it and nothing to wait on: it reaches the pre-physical terminal
@@ -14207,6 +14588,7 @@ pub(crate) async fn run<R, F>(
   // Retiring them BEFORE the drain is what keeps the drain's ledger-quiescence
   // condition honest — a pre-physical obligation nothing will ever complete must
   // not hold close open for the grace, nor be reported as a non-quiesced cookie.
+  #[cfg(feature = "sync")]
   retire_parked_cookies(
     &mut core,
     &mut parked_cookies,
@@ -14221,6 +14603,7 @@ pub(crate) async fn run<R, F>(
   // deadline forward to one base delay so the drain's retry arm services it in
   // time (the design's flat-base-during-close intent); a still-failing unlink
   // still ends `NotQuiesced`, only never spuriously.
+  #[cfg(feature = "sync")]
   cookies.pull_retries_forward(now() + config.cookie_retry_base);
   // The grace is ONE budget, and the drain below spends it in two places, so it
   // is anchored once here on the clock the blocking work it is waiting for
@@ -14236,7 +14619,11 @@ pub(crate) async fn run<R, F>(
       // in the one ledger, so the drain cannot exit while any stands. A post-sweep
       // straggler is impossible to miss: its record was born before its write
       // could create anything, and only a typed terminal removes it.
-      if pending_teardowns.is_empty() && pending_spawns.is_empty() && cookies.unremoved() == 0 {
+      #[cfg(feature = "sync")]
+      let ledger_quiesced = cookies.unremoved() == 0;
+      #[cfg(not(feature = "sync"))]
+      let ledger_quiesced = true;
+      if pending_teardowns.is_empty() && pending_spawns.is_empty() && ledger_quiesced {
         break;
       }
       // Teardown completions arrive over `op_rx` like every other result, but
@@ -14353,6 +14740,7 @@ pub(crate) async fn run<R, F>(
           // `RemoveFailed`, schedule its retry at the flat base so the drain's own
           // retry arm drives it to confirmation inside the grace (T3 caught by the
           // live ledger).
+          #[cfg(feature = "sync")]
           Ok(OpResult::CookieWriteDone { id }) => {
             cookies.schedule_retry(&config, id, now(), true);
           }
@@ -14360,6 +14748,7 @@ pub(crate) async fn run<R, F>(
           // it, id-keyed); a transient failure parked it, and this re-schedules at
           // the flat base (the 1 s grace bounds attempts here — §5.2) or leaves it
           // parked past the budget.
+          #[cfg(feature = "sync")]
           Ok(OpResult::CookieRemoveDone { id, confirmed }) => {
             on_cookie_remove_done(&cookies, &config, id, confirmed, now(), true);
           }
@@ -14373,14 +14762,18 @@ pub(crate) async fn run<R, F>(
         // Service due cookie-unlink retries inside the grace. No arm fires when
         // the schedule is empty (a `pending()` future), so this can never spin.
         () = async {
+          #[cfg(feature = "sync")]
           match cookies.min_retry_at() {
             Some(at) => {
               R::sleep_until(origin + at.elapsed_since_origin()).await;
             }
             None => futures_util::future::pending::<()>().await,
           }
+          #[cfg(not(feature = "sync"))]
+          futures_util::future::pending::<()>().await;
         }
         .fuse() => {
+          #[cfg(feature = "sync")]
           dispatch_due_cookie_retries::<R, F>(&cookies, &op_tx, now());
         },
         // Ends the round while a teardown is outstanding, so the drain goes back
@@ -14416,7 +14809,11 @@ pub(crate) async fn run<R, F>(
   // unwedges with more time, so a longer window would only delay the honest
   // signal.
   let _ = R::timeout(grace, drain).await;
+  #[cfg(feature = "sync")]
   drain_barrier_moves::<R, F>(&mut core, &mut cookies, &op_tx, &now);
+  #[cfg(not(feature = "sync"))]
+  drain_barrier_moves(&mut core);
+  #[cfg(feature = "sync")]
   execute_effects::<R, F>(
     &mut core,
     &ops,
@@ -14436,6 +14833,28 @@ pub(crate) async fn run<R, F>(
     &mut control_inflight,
     &mut probes,
     &mut cookies,
+    &registry,
+    &now,
+  );
+  #[cfg(not(feature = "sync"))]
+  execute_effects::<R, F>(
+    &mut core,
+    &ops,
+    &config,
+    &op_tx,
+    &reaper,
+    &mut streams.handles,
+    &mut pending_spawns,
+    &mut pending_teardowns,
+    &mut scope_backends,
+    &mut lanes,
+    &mut source_taps,
+    &events,
+    &mut unwatch_replies,
+    &mut deferred_grants,
+    &mut pending_control,
+    &mut control_inflight,
+    &mut probes,
     &registry,
     &now,
   );
@@ -14482,6 +14901,7 @@ pub(crate) async fn run<R, F>(
   }
   // The close pass never holds a tranche over (see
   // [`SettlePass::orders_stat_cover`]), so it reports no flush to owe.
+  #[cfg(feature = "sync")]
   let _ = resolve_cover_settlements::<R, F>(
     &mut core,
     &ops,
@@ -14494,6 +14914,8 @@ pub(crate) async fn run<R, F>(
     &now,
     SettlePass::Closing,
   );
+  #[cfg(not(feature = "sync"))]
+  let _ = resolve_cover_settlements::<R, F>(&mut core, &mut cover_replies, SettlePass::Closing);
   // The close reply counts every distinct outstanding obligation exactly once:
   // a straggler teardown/spawn, and every cookie obligation the ledger still
   // holds — a write in the pool, an owned cookie, an unconfirmed removal — each
@@ -14509,9 +14931,13 @@ pub(crate) async fn run<R, F>(
   // obligation owed) also keeps the drain BOUNDED: the loop's exit condition is
   // an empty `pending_teardowns`, which a permanently-owed entry would never
   // satisfy.
+  #[cfg(feature = "sync")]
+  let unremoved_cookies = cookies.unremoved();
+  #[cfg(not(feature = "sync"))]
+  let unremoved_cookies = 0;
   let outstanding = pending_teardowns.values().sum::<usize>()
     + pending_spawns.len()
-    + cookies.unremoved()
+    + unremoved_cookies
     + unproven_teardowns;
   // Drop the registry LAST. The orderly sweep above already dispatched an unlink
   // for every owned cookie under the grace, so on a healthy fs this finds the
@@ -14520,6 +14946,7 @@ pub(crate) async fn run<R, F>(
   // retry without blocking. The `Drop` is the guarantee's backstop: a panicking
   // or cancelled driver — one that never reaches this line — still runs it,
   // detached, on exit.
+  #[cfg(feature = "sync")]
   drop(cookies);
   if let Some(reply) = close_reply {
     let _ = reply.send(outstanding);
@@ -16278,8 +16705,8 @@ fn resolve_widen_catchups<R, F>(
     ScopeId,
     Vec<(futures_channel::oneshot::Sender<UnwatchAck>, UnwatchAck)>,
   >,
-  parked_cookies: &mut BTreeMap<FenceId, ParkedCookie>,
-  cookies: &mut CookieRegistry<F>,
+  #[cfg(feature = "sync")] parked_cookies: &mut BTreeMap<FenceId, ParkedCookie>,
+  #[cfg(feature = "sync")] cookies: &mut CookieRegistry<F>,
   registry: &impl ScopeRegistry,
   probes: &mut LivenessProbes,
   now: &impl Fn() -> Instant,
@@ -16350,9 +16777,11 @@ where
       continue;
     };
     resolved_any = true;
+    #[cfg(feature = "sync")]
     let widened = meta.root.clone();
     // Read before the meta moves into the commit: the widened floor and the
     // identity every later write proves it against are recorded together.
+    #[cfg(feature = "sync")]
     let widened_identity = meta.identity;
     let outcome = if dead {
       // Death won during the catch-up: the arm's one end-marker/death path
@@ -16384,6 +16813,7 @@ where
     };
     let resolution = match outcome {
       Ok(WidenOutcome::Committed) => {
+        #[cfg(feature = "sync")]
         let live = LiveRoot::new(widened, widened_identity);
         // The cookie floor follows the committed root. The widen uncovers
         // nothing (old ⊂ new), so the REVOKING half is a provable no-op —
@@ -16395,11 +16825,15 @@ where
         // stream did not retire, and an in-flight cookie write under the
         // old root must still claim on it. Such a write keeps the narrower
         // floor it was dispatched with, which the widened root contains.
+        #[cfg(feature = "sync")]
         revoke_or_rebind_parked_cookies(core, parked_cookies, cookies, scope, &live);
         // The retirement interlock travels with the floor: the scope survives a
         // widen, so this re-binds the flag it has carried since it went live.
-        let retiring = cookies.scope_live(scope, live);
-        core.bind_retiring(scope, retiring);
+        #[cfg(feature = "sync")]
+        {
+          let retiring = cookies.scope_live(scope, live);
+          core.bind_retiring(scope, retiring);
+        }
         Ok(())
       }
       Ok(WidenOutcome::FallBack(taint)) => {
@@ -16510,7 +16944,7 @@ fn commit_replace<F>(
   >,
   source_taps: &mut BTreeMap<ScopeId, EventReceiver>,
   registry: &impl ScopeRegistry,
-  cookies: &CookieRegistry<F>,
+  #[cfg(feature = "sync")] cookies: &CookieRegistry<F>,
   probes: &mut LivenessProbes,
   pending_control: &mut PendingControl,
   control_inflight: &mut ControlInflight,
@@ -16586,6 +17020,7 @@ where
   // that already claimed belongs to the still-current old stream. This IS the
   // swap's linearization point — the transport generation mint below is its
   // control-plane twin.
+  #[cfg(feature = "sync")]
   cookies.advance_generation_locked(scope);
   // Mint the replacement's transport generation FIRST, then detach the old
   // port and attach the new one under it: any old-generation control batch
@@ -17430,6 +17865,7 @@ fn kick_control_queue<R, F>(
 /// exactly what the terminal promises. A panic or a cancellation between the two
 /// ends the driver, and with it every stream this `Rescan` could have been owed
 /// on — so there is no surviving consumer left to be owed one.
+#[cfg(feature = "sync")]
 fn drain_barrier_moves<R, F>(
   core: &mut DriverCore,
   cookies: &mut CookieRegistry<F>,
@@ -17494,6 +17930,21 @@ fn drain_barrier_moves<R, F>(
   }
 }
 
+/// The same drain with the barrier gated out: no obligation can exist, so no
+/// barrier stands on the ground these entries name and there is nothing to
+/// retire, nothing to purge and no covering `Rescan` to stand.
+///
+/// The queues are still FILLED — the ten funnels and the epoch counter are the
+/// coverage machinery itself and are compiled in both states — so they are still
+/// TAKEN here, at every place the retiring drain runs, and dropped. That is what
+/// keeps them bounded; skipping the call is what would make a long-lived scope's
+/// event queue grow for the life of the driver.
+#[cfg(not(feature = "sync"))]
+fn drain_barrier_moves(core: &mut DriverCore) {
+  drop(core.take_ended_scopes());
+  drop(core.take_barrier_events());
+}
+
 /// Executes the core's queued effects, feeding each outcome straight back.
 #[allow(clippy::too_many_arguments)]
 fn execute_effects<R, F>(
@@ -17517,7 +17968,7 @@ fn execute_effects<R, F>(
   pending_control: &mut PendingControl,
   control_inflight: &mut ControlInflight,
   probes: &mut LivenessProbes,
-  cookies: &mut CookieRegistry<F>,
+  #[cfg(feature = "sync")] cookies: &mut CookieRegistry<F>,
   registry: &impl ScopeRegistry,
   now: &impl Fn() -> Instant,
 ) where
@@ -17561,7 +18012,10 @@ fn execute_effects<R, F>(
     // inside the drain appends to this same queue and raises a move of its own,
     // but the barriers it covers are already flagged and `invalidate_barriers`
     // is idempotent, so the next turn reports none and stands nothing.
+    #[cfg(feature = "sync")]
     drain_barrier_moves::<R, F>(core, cookies, op_tx, now);
+    #[cfg(not(feature = "sync"))]
+    drain_barrier_moves(core);
     let Some(effect) = core.poll_effect() else {
       break;
     };
@@ -17606,6 +18060,7 @@ fn execute_effects<R, F>(
         // accepted `Unwatch` arm, or through the barrier drain for a scope an
         // event ended — and this covers any future producer of this effect that
         // does not.
+        #[cfg(feature = "sync")]
         cookies.publish_retiring(scope);
         scope_backends.remove(&scope);
         // The delivery lane (the transport generation) is reclaimed with the
@@ -17653,6 +18108,7 @@ fn execute_effects<R, F>(
         // stream left to report one on. The registry raises the scope's flag
         // before it dispatches its tracked unlinks, so a write still in the pool
         // reaps itself rather than landing a file behind this sweep.
+        #[cfg(feature = "sync")]
         cookies.retire_scope::<R>(scope, op_tx);
         if let Some(DeferredGrant { pending, root }) = deferred_grants.remove(&scope) {
           let _ = pending

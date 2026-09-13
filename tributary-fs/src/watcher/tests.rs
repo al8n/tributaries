@@ -18,18 +18,24 @@ fn _assert_watcher_sync<R: RuntimeLite>() {
 fn manual_watcher() -> (Watcher<TokioRuntime>, async_channel::Receiver<Command>) {
   let (command_tx, command_rx) = async_channel::bounded(16);
   // No driver task holds the other half; these protocol tests never reap a cookie.
+  #[cfg(feature = "sync")]
   let (cleanup, _cookie_wake) = crate::driver::cookie_ingress();
   let (_event_tx, event_rx) = async_channel::bounded::<(ScopeId, Arc<PathBuf>, Change)>(4);
   (
     Watcher {
       instance: WATCHER_INSTANCES.fetch_add(1, Ordering::Relaxed),
       commands: command_tx,
+      #[cfg(feature = "sync")]
       cleanup,
+      #[cfg(feature = "sync")]
       sync_tickets: Arc::new(AtomicU64::new(1)),
+      #[cfg(feature = "sync")]
       nonces: super::sync_nonce_generator().map(|generator| Arc::new(Mutex::new(generator))),
+      #[cfg(feature = "sync")]
       pins: crate::driver::SyncPinAllowance::new(
         crate::WatcherOptions::DEFAULT_COOKIE_GLOBAL_CAP.get(),
       ),
+      #[cfg(feature = "sync")]
       blocking: Arc::new(TokioRuntime::spawn_blocking_detach),
       events: Box::pin(event_rx),
       roots: Arc::new(RwLock::new(RootSet::default())),
@@ -408,6 +414,7 @@ async fn request_set_cover_is_reply_less_and_reports_channel_capacity() {
 /// Fail-on-revert: start `sync_tickets` at 0 again and the first mint's leaf stops being a name the
 /// classifier recognizes — every marker this watcher writes would reach consumers as a user create.
 #[test]
+#[cfg(feature = "sync")]
 fn a_minted_marker_leaf_is_never_a_name_a_caller_could_have_chosen() {
   let (watcher, _commands) = manual_watcher();
   let (other, _other_commands) = manual_watcher();
@@ -490,6 +497,7 @@ fn a_minted_marker_leaf_is_never_a_name_a_caller_could_have_chosen() {
 /// handle reaches it. Both door refusals are pre-birth, so each hands the admission back
 /// ([`SyncRootDenied::admission`] is `Some`) for a same-sequence retry.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn sync_root_refuses_a_foreign_ticket_at_the_door() {
   let (watcher, commands) = manual_watcher();
   let (other, _other_commands) = manual_watcher();
@@ -548,6 +556,7 @@ async fn sync_root_refuses_a_foreign_ticket_at_the_door() {
 /// the returned set) and its assertion flips immediately — this match is the only place the
 /// classification can drift.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn sync_root_denied_classifies_each_variant_pre_or_post_birth() {
   let (watcher, _commands) = manual_watcher();
 
@@ -632,6 +641,7 @@ async fn sync_root_denied_classifies_each_variant_pre_or_post_birth() {
 /// `sync_root`'s await
 /// without perturbing the future's `Send` — the seam the umbrella's owner-send asserts depend on.
 #[allow(dead_code)]
+#[cfg(feature = "sync")]
 fn _assert_sync_admission_is_send_sync() {
   fn is_send_sync<T: Send + Sync>() {}
   is_send_sync::<SyncAdmission>();
@@ -1816,6 +1826,7 @@ mod lifecycle {
   /// shape — enqueue anything, resolve later), the wake grows to one entry per
   /// call and the `<= 1` assertion fails on the very first check.
   #[tokio::test(flavor = "current_thread")]
+  #[cfg(feature = "sync")]
   async fn a_hostile_cleanup_flood_retains_nothing_with_the_driver_unscheduled() {
     let fs = FakeFs::new(1);
     let watcher =
@@ -1892,6 +1903,7 @@ mod lifecycle {
   /// returned admission fails FAST — there is nothing to retry with, and the move-only admission
   /// cannot be reconstructed.
   #[tokio::test(flavor = "multi_thread")]
+  #[cfg(feature = "sync")]
   async fn a_pre_birth_refusal_returns_the_admission_for_a_same_sequence_retry() {
     let (dir, canonical) = scratch("admission-retry");
     let fs = FakeFs::new(1);

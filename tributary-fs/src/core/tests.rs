@@ -915,6 +915,7 @@ fn a_root_death_by_event_reports_its_ended_scope() {
 // when the scope is removed, so every read below is `false` and the window a
 // writer claims in is still open.
 #[test]
+#[cfg(feature = "sync")]
 fn the_core_raises_a_bound_scope_flag_at_the_removal_that_ends_it() {
   for by_event in [false, true] {
     let (mut core, scope) = live_core();
@@ -960,6 +961,7 @@ fn the_core_raises_a_bound_scope_flag_at_the_removal_that_ends_it() {
 // prior shape): the hook would observe the scope, or its mapping, already
 // gone.
 #[test]
+#[cfg(feature = "sync")]
 fn the_core_stores_the_retirement_flag_before_it_removes_the_scope() {
   let (mut core, scope) = live_core();
   let flag = Arc::new(AtomicBool::new(false));
@@ -1429,6 +1431,7 @@ fn identity_minting_respects_devices_and_mounts() {
     include: None,
     markers: BTreeMap::new(),
     barrier_epoch: BarrierEpoch::BIRTH,
+    #[cfg(feature = "sync")]
     dominating_rescans: BTreeSet::new(),
   };
   let fid = NonZeroU64::new(7);
@@ -1476,6 +1479,7 @@ fn blind_mount_table_refuses_event_side_trust() {
     include: None,
     markers: BTreeMap::new(),
     barrier_epoch: BarrierEpoch::BIRTH,
+    #[cfg(feature = "sync")]
     dominating_rescans: BTreeSet::new(),
   };
   let fid = NonZeroU64::new(7);
@@ -3245,6 +3249,7 @@ mod lowering {
       include: None,
       markers: BTreeMap::new(),
       barrier_epoch: BarrierEpoch::BIRTH,
+      #[cfg(feature = "sync")]
       dominating_rescans: BTreeSet::new(),
     }
   }
@@ -9424,6 +9429,7 @@ mod descending {
     );
   }
 
+  #[cfg(feature = "sync")]
   mod barrier {
     //! The barrier epoch and the ten funnels that move it, the deliberate
     //! non-bumps, and the drain-order substitution a retirement is built on.
@@ -19945,6 +19951,7 @@ mod prune {
   /// Revert witness: drop the marker clause from the record arm of `fenced` and
   /// the marker's `Created` never leaves the core.
   #[test]
+  #[cfg(feature = "sync")]
   fn an_active_sync_marker_is_delivered_from_pruned_ground() {
     const MARKER: &str = ".tributaries-sync-1-2-3-abcdef";
     const OWNER: crate::driver::CookieId = crate::driver::CookieId(1);
@@ -21189,6 +21196,7 @@ mod include {
   /// Revert witness: drop the marker clause from `admits` and the renamed
   /// parent's marker is silenced by `**/*.mp4`.
   #[test]
+  #[cfg(feature = "sync")]
   fn an_active_marker_is_admitted_under_a_renamed_cookie_directory() {
     const MARKER: &str = ".tributaries-sync-1-2-3-abcdef";
     const OWNER: crate::driver::CookieId = crate::driver::CookieId(1);
@@ -21263,6 +21271,7 @@ mod include {
   /// Revert witness: drop the owner comparison from `release_sync_markers` and
   /// the successor's marker is silenced by `**/*.mp4`.
   #[test]
+  #[cfg(feature = "sync")]
   fn a_stale_release_never_disarms_a_same_name_successor() {
     const MARKER: &str = ".tributaries-sync-1-2-3-abcdef";
     const PREDECESSOR: crate::driver::CookieId = crate::driver::CookieId(7);

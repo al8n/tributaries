@@ -835,6 +835,7 @@ async fn stalled_then_resumed_consumer_gets_a_rescan_no_silent_loss() {
 /// that establishes the barrier is itself never delivered (the reserved
 /// namespace is suppressed), and the barrier resolves `Delivered`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "sync")]
 async fn sync_resolves_once_pre_call_changes_are_deliverable() {
   let (_tmp, root) = scratch("sync-barrier");
   let mut w = watcher(TributariesOptions::new());
@@ -889,6 +890,7 @@ async fn sync_resolves_once_pre_call_changes_are_deliverable() {
 /// a caller-unwatch owes no `Rescan`, so the barrier could never be met
 /// honestly, and the API says so rather than hanging or lying.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "sync")]
 async fn sync_on_a_dead_subscription_refuses_typed() {
   let (_tmp, root) = scratch("sync-dead");
   let w = watcher(TributariesOptions::new());
@@ -911,6 +913,7 @@ async fn sync_on_a_dead_subscription_refuses_typed() {
 /// delivery the consumer could not yet read. After `sync`, the pre-call writes
 /// are deliverable immediately — no waiting for the settle window.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "sync")]
 async fn sync_flushes_the_debounce_for_its_subscription() {
   let (_tmp, root) = scratch("sync-debounce");
   // A long settle window: without the barrier's flush, nothing would be

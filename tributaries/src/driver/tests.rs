@@ -9,6 +9,7 @@ use std::{
 };
 
 use agnostic_lite::tokio::TokioRuntime;
+#[cfg(feature = "sync")]
 use rand_chacha::{
   ChaCha20Rng,
   rand_core::{RngCore, SeedableRng},
@@ -16,6 +17,8 @@ use rand_chacha::{
 use tributary_proto::{ChangeId, Epoch, Location};
 
 use super::{Filters, Owner, ParkedRescans, epoch::EpochLedger};
+#[cfg(feature = "sync")]
+use crate::source::SyncToken;
 use crate::{
   coalesce::Coalescer,
   error::{FaultKind, SourceFault, UnwatchError, WatchError},
@@ -23,7 +26,7 @@ use crate::{
   filter::Filter,
   interest::Interest,
   options::{Debounce, DebounceConfig, RootGlobs, TributariesOptions, WatchOptions},
-  source::{Armed, Source, SourceEvent, SyncToken},
+  source::{Armed, Source, SourceEvent},
   subscription::Subscription,
   subsume::Subsumer,
 };
@@ -59,6 +62,7 @@ const COOKIE_DIR: &str = ".tributaries-sync-cookies-501";
 /// past the [`Entropy`](crate::error::SyncError::Entropy) refusal. The cell that has anything
 /// to say about the values themselves is
 /// [`the_sync_nonce_draw_is_not_constant_stuck_or_cyclic`], which builds the real one.
+#[cfg(feature = "sync")]
 fn sync_nonces() -> Option<ChaCha20Rng> {
   Some(ChaCha20Rng::from_seed([0x5e; 32]))
 }
@@ -156,6 +160,7 @@ impl SeamLedger {
 /// One step of a scripted [`FakeSource::begin_sync`] poll: consumed one-per-poll of the
 /// scripted future so a cell can force finding 1's inter-arm race deterministically under
 /// manual noop-waker polling.
+#[cfg(feature = "sync")]
 enum ScriptStep {
   /// The poll returns `Pending` — the write is still in flight.
   Pending,
@@ -173,12 +178,14 @@ enum ScriptStep {
 /// [`ScriptStep`], so polling the enclosing `on_sync` future advances the write one arm-race pass
 /// at a time. Borrows the source's script and its delivery sink (disjoint fields) for the life of
 /// the `begin_sync` call.
+#[cfg(feature = "sync")]
 struct ScriptedBegin<'a> {
   script: &'a mut VecDeque<ScriptStep>,
   delivered: &'a mut Vec<Vec<OsString>>,
   cookie_key: Vec<OsString>,
 }
 
+#[cfg(feature = "sync")]
 impl std::future::Future for ScriptedBegin<'_> {
   type Output = Vec<OsString>;
 
@@ -242,19 +249,23 @@ struct FakeSource {
   /// barrier left no marker behind.
   begun_syncs: usize,
   /// Cookie keys handed to `end_sync` — the reap ledger (F5).
+  #[cfg(feature = "sync")]
   ended_syncs: Vec<Vec<OsString>>,
   /// Tokens handed to `cancel_sync` — the abandon-arm ledger. Records the
   /// token an `on_sync` abandon (a caller timeout or a close) hands the source
   /// so a cell can prove a delivered-but-unread cookie is freed by TOKEN, not
   /// by the path the owner never learned.
+  #[cfg(feature = "sync")]
   cancelled_syncs: Vec<SyncToken>,
   /// The token the most recent `begin_sync` was minted with — the same token an
   /// abandon then cancels, recorded so a cell can assert the cancel names EXACTLY
   /// the sync that began (the nonce is owner-random and unreconstructable).
+  #[cfg(feature = "sync")]
   begun_token: Option<SyncToken>,
   /// A hand-driven `begin_sync` poll schedule (empty = the ordinary immediate
   /// `Ok(cookie_key)`). Each step drives ONE poll of the scripted future so a
   /// cell can force finding 1's inter-arm race under manual noop-waker polling.
+  #[cfg(feature = "sync")]
   sync_script: VecDeque<ScriptStep>,
   /// Cookie keys the scripted `begin_sync` SIDE-EFFECT-DELIVERED (a
   /// [`ScriptStep::PendingThenComplete`] poll): the fs worker's `reply.send(Ok)`
@@ -439,9 +450,13 @@ impl FakeSource {
       supports_sync: false,
       grow_pending: false,
       begun_syncs: 0,
+      #[cfg(feature = "sync")]
       ended_syncs: Vec::new(),
+      #[cfg(feature = "sync")]
       cancelled_syncs: Vec::new(),
+      #[cfg(feature = "sync")]
       begun_token: None,
+      #[cfg(feature = "sync")]
       sync_script: VecDeque::new(),
       fs_delivered: Vec::new(),
       fail_arms: 0,
@@ -885,6 +900,7 @@ impl Source<OsString> for FakeSource {
       .is_some_and(|leaf| leaf.starts_with("cookie-") || leaf == COOKIE_DIR)
   }
 
+  #[cfg(feature = "sync")]
   fn end_sync(&mut self, _handle: u32, cookie_key: &[OsString]) {
     self.note(SourceCall::EndSync(cookie_key.to_vec()));
     self.ended_syncs.push(cookie_key.to_vec());
@@ -933,6 +949,7 @@ impl Source<OsString> for FakeSource {
     }
   }
 
+  #[cfg(feature = "sync")]
   fn cancel_sync(&mut self, handle: u32, token: SyncToken) {
     self.note(SourceCall::CancelSync(handle));
     // The abandon-arm ledger: an `on_sync` timeout or close hands the token here, and only
@@ -948,6 +965,7 @@ impl Source<OsString> for FakeSource {
     }
   }
 
+  #[cfg(feature = "sync")]
   async fn begin_sync(
     &mut self,
     handle: u32,
@@ -1570,6 +1588,7 @@ struct Harness {
   _commands: async_channel::Sender<super::Command<OsString, ()>>,
   /// Kept alive so the owner's sync-admission receiver never observes a closed channel (the loop
   /// is not run here; the sync primitives are driven directly).
+  #[cfg(feature = "sync")]
   _sync_commands: async_channel::Sender<super::SyncRequest>,
   /// The dedicated close signal's sender: kept alive so the owner's close receiver
   /// never observes a closed channel, and used by the close-under-teardown tests to inject a close
@@ -1615,6 +1634,7 @@ impl Harness {
       Some(cap) => async_channel::bounded(cap),
       None => async_channel::unbounded(),
     };
+    #[cfg(feature = "sync")]
     let (sync_command_tx, sync_command_rx) = async_channel::unbounded::<super::SyncRequest>();
     let (close_tx, close_rx) = async_channel::bounded(1);
     let (cleanup_tx, cleanup_rx) = async_channel::unbounded();
@@ -1637,14 +1657,18 @@ impl Harness {
       test_pre_cut_claims: Vec::new(),
       debounce: None,
       coalescer,
+      #[cfg(feature = "sync")]
       pending_syncs: Vec::new(),
+      #[cfg(feature = "sync")]
       sync_seq: 0,
       loss_serial: HashMap::new(),
       loss_gen: std::sync::Arc::new(core::sync::atomic::AtomicU64::new(0)),
+      #[cfg(feature = "sync")]
       nonces: sync_nonces(),
       cleanup_tx,
       cleanup_rx,
       commands: command_rx,
+      #[cfg(feature = "sync")]
       sync_commands: sync_command_rx,
       closes: close_rx,
       events: event_tx,
@@ -1656,6 +1680,7 @@ impl Harness {
       owner,
       events: event_rx,
       _commands: command_tx,
+      #[cfg(feature = "sync")]
       _sync_commands: sync_command_tx,
       closes: close_tx,
     }
@@ -4608,6 +4633,7 @@ async fn a_command_buffered_when_the_handles_dropped_never_reaches_the_source() 
     owner,
     events,
     _commands: commands,
+    #[cfg(feature = "sync")]
     _sync_commands,
     closes,
   } = h;
@@ -4724,6 +4750,7 @@ async fn a_command_buffered_when_the_handles_dropped_never_reaches_the_source() 
 /// `… Arm(/a/b), EndSync(…), BeginClose, JoinClose` — the reap ahead of the seam, which is the
 /// defect itself.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_retired_root_with_a_pending_sync_reaps_its_cookie_only_past_the_seam() {
   use crate::source::SyncOutcome;
   use std::task::{Context, Poll, Waker};
@@ -4767,6 +4794,7 @@ async fn a_retired_root_with_a_pending_sync_reaps_its_cookie_only_past_the_seam(
     owner,
     events,
     _commands: commands,
+    #[cfg(feature = "sync")]
     _sync_commands,
     closes,
   } = h;
@@ -4891,6 +4919,7 @@ async fn a_retired_root_with_a_pending_sync_reaps_its_cookie_only_past_the_seam(
 /// `… Arm(/a/b), EndSync(…), Disarm(3), SetCover(4), BeginClose, JoinClose` — all three source calls
 /// ahead of the seam.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn queued_orphan_cleanup_touches_the_source_only_past_the_seam() {
   use std::task::{Context, Poll, Waker};
 
@@ -4942,6 +4971,7 @@ async fn queued_orphan_cleanup_touches_the_source_only_past_the_seam() {
     owner,
     events: _events,
     _commands: commands,
+    #[cfg(feature = "sync")]
     _sync_commands,
     closes,
   } = h;
@@ -5083,6 +5113,7 @@ async fn the_teardown_seam_is_entered_exactly_once_on_every_terminal_path() {
       owner,
       events: _events,
       _commands: commands,
+      #[cfg(feature = "sync")]
       _sync_commands,
       closes,
     } = h;
@@ -5124,6 +5155,7 @@ async fn the_teardown_seam_is_entered_exactly_once_on_every_terminal_path() {
       owner,
       events: _events,
       _commands: commands,
+      #[cfg(feature = "sync")]
       _sync_commands,
       closes,
     } = h;
@@ -5166,6 +5198,7 @@ async fn the_teardown_seam_is_entered_exactly_once_on_every_terminal_path() {
       owner,
       events: _events,
       _commands: commands,
+      #[cfg(feature = "sync")]
       _sync_commands,
       closes,
     } = h;
@@ -5193,6 +5226,7 @@ async fn the_teardown_seam_is_entered_exactly_once_on_every_terminal_path() {
       owner,
       events: _events,
       _commands: commands,
+      #[cfg(feature = "sync")]
       _sync_commands,
       closes,
     } = h;
@@ -5216,6 +5250,7 @@ async fn the_teardown_seam_is_entered_exactly_once_on_every_terminal_path() {
       owner,
       events,
       _commands: commands,
+      #[cfg(feature = "sync")]
       _sync_commands,
       closes,
     } = h;
@@ -5274,6 +5309,7 @@ async fn the_teardown_seam_is_entered_exactly_once_on_every_terminal_path() {
 /// arm and the second poll is `Pending` — the loop dispatched the wedged watch and the run future
 /// never completes.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn an_in_place_retarget_losing_every_handle_breaks_the_loop_at_the_seam() {
   use std::task::{Context, Poll, Waker};
 
@@ -5316,6 +5352,7 @@ async fn an_in_place_retarget_losing_every_handle_breaks_the_loop_at_the_seam() 
     owner,
     events: _events,
     _commands: commands,
+    #[cfg(feature = "sync")]
     _sync_commands,
     closes,
   } = h;
@@ -5427,6 +5464,7 @@ async fn an_in_place_retarget_losing_every_handle_breaks_the_loop_at_the_seam() 
 /// arm and the second poll is `Pending` — the loop dispatched the wedged watch buffered behind the
 /// widen and parked on a mount that never answers.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn an_in_place_rollback_losing_every_handle_breaks_the_loop_at_the_seam() {
   use std::task::{Context, Poll, Waker};
 
@@ -5464,6 +5502,7 @@ async fn an_in_place_rollback_losing_every_handle_breaks_the_loop_at_the_seam() 
     owner,
     events: _events,
     _commands: commands,
+    #[cfg(feature = "sync")]
     _sync_commands,
     closes,
   } = h;
@@ -5565,6 +5604,7 @@ async fn an_in_place_rollback_losing_every_handle_breaks_the_loop_at_the_seam() 
 /// a `Source` call past a cancelled arm with the source never told to wind down, and
 /// `begin_closes()` reads 0 against a once-per-source contract.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn dropping_the_driver_future_enters_the_seam_before_its_cookie_reap() {
   use std::task::{Context, Waker};
 
@@ -5598,6 +5638,7 @@ async fn dropping_the_driver_future_enters_the_seam_before_its_cookie_reap() {
     owner,
     events: _events,
     _commands: commands,
+    #[cfg(feature = "sync")]
     _sync_commands,
     closes: _closes,
   } = h;
@@ -5675,6 +5716,7 @@ async fn dropping_the_driver_future_enters_the_seam_before_its_cookie_reap() {
 /// with `begin_closes()` at 0 — a `Source` call on an unwinding owner's way out with the source never
 /// told to wind down.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_panic_unwinding_through_the_driver_future_enters_the_seam_before_its_cookie_reap() {
   use std::task::{Context, Waker};
 
@@ -5705,6 +5747,7 @@ async fn a_panic_unwinding_through_the_driver_future_enters_the_seam_before_its_
     owner,
     events: _events,
     _commands: commands,
+    #[cfg(feature = "sync")]
     _sync_commands,
     closes: _closes,
   } = h;
@@ -9274,6 +9317,7 @@ struct OwnerU64 {
   /// Kept alive so the owner's command receiver never observes a closed channel.
   _commands: async_channel::Sender<super::Command<OsString, u64>>,
   /// Kept alive so the owner's sync-admission receiver never observes a closed channel.
+  #[cfg(feature = "sync")]
   _sync_commands: async_channel::Sender<super::SyncRequest>,
   /// Kept alive so the owner's close receiver never observes a closed channel (these rigs drive
   /// primitives directly and never inject a close).
@@ -9285,6 +9329,7 @@ impl OwnerU64 {
   fn new(capacity: usize, coalescer: Option<Coalescer<OsString, u64>>) -> Self {
     let (event_tx, event_rx) = async_channel::bounded(capacity);
     let (command_tx, command_rx) = async_channel::unbounded();
+    #[cfg(feature = "sync")]
     let (sync_command_tx, sync_command_rx) = async_channel::unbounded::<super::SyncRequest>();
     let (close_tx, close_rx) = async_channel::bounded(1);
     let (cleanup_tx, cleanup_rx) = async_channel::unbounded();
@@ -9307,14 +9352,18 @@ impl OwnerU64 {
       test_pre_cut_claims: Vec::new(),
       debounce: None,
       coalescer,
+      #[cfg(feature = "sync")]
       pending_syncs: Vec::new(),
+      #[cfg(feature = "sync")]
       sync_seq: 0,
       loss_serial: HashMap::new(),
       loss_gen: std::sync::Arc::new(core::sync::atomic::AtomicU64::new(0)),
+      #[cfg(feature = "sync")]
       nonces: sync_nonces(),
       cleanup_tx,
       cleanup_rx,
       commands: command_rx,
+      #[cfg(feature = "sync")]
       sync_commands: sync_command_rx,
       closes: close_rx,
       events: event_tx,
@@ -9326,6 +9375,7 @@ impl OwnerU64 {
       owner,
       events: event_rx,
       _commands: command_tx,
+      #[cfg(feature = "sync")]
       _sync_commands: sync_command_tx,
       _closes: close_tx,
     }
@@ -9607,6 +9657,7 @@ async fn owner_drop_publishes_empty_read_plane_on_a_panicking_caller_callback() 
 /// [`call_source`](super::call_source) instead, and the fourth cookie is reaped as well: the ledger
 /// grows an entry and the loop is once more unbounded in what it can be made to forget.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn owner_teardown_contains_each_reap_apart_and_stops_at_a_payload_it_had_to_forget() {
   let mut h = Harness::new();
   let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
@@ -9704,6 +9755,7 @@ async fn owner_teardown_contains_each_reap_apart_and_stops_at_a_payload_it_had_t
 /// its outcome instead of recording it, and every ledger claim still holds while the caller is told
 /// the shutdown was clean over a reap the owner watched fail.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn the_tails_cookie_reap_survives_a_panicking_end_sync_and_still_carries_the_verdict() {
   use std::task::{Context, Poll, Waker};
 
@@ -9737,6 +9789,7 @@ async fn the_tails_cookie_reap_survives_a_panicking_end_sync_and_still_carries_t
     owner,
     events: _events,
     _commands,
+    #[cfg(feature = "sync")]
     _sync_commands,
     closes,
   } = h;
@@ -9852,6 +9905,7 @@ async fn the_tails_cookie_reap_survives_a_panicking_end_sync_and_still_carries_t
 /// every ledger claim still holds while the caller is told the source shut down cleanly over an
 /// initiation that never completed.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn the_tails_seam_entry_survives_a_panicking_begin_close_and_still_reaps_and_answers() {
   use std::task::{Context, Poll, Waker};
 
@@ -9887,6 +9941,7 @@ async fn the_tails_seam_entry_survives_a_panicking_begin_close_and_still_reaps_a
     owner,
     events: _events,
     _commands,
+    #[cfg(feature = "sync")]
     _sync_commands,
     closes,
   } = h;
@@ -9993,6 +10048,7 @@ async fn the_tails_seam_entry_survives_a_panicking_begin_close_and_still_reaps_a
 /// `close()` answers off a dropped sender. Put a boundary back at `run`'s tail INSTEAD and nothing
 /// changes: this entry is not the tail's.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_mid_reconcile_seam_entry_survives_a_panicking_begin_close_and_still_reaps_and_answers() {
   use std::task::{Context, Poll, Waker};
 
@@ -10036,6 +10092,7 @@ async fn a_mid_reconcile_seam_entry_survives_a_panicking_begin_close_and_still_r
     owner,
     events: _events,
     _commands: commands,
+    #[cfg(feature = "sync")]
     _sync_commands,
     closes,
   } = h;
@@ -10163,6 +10220,7 @@ async fn a_mid_reconcile_seam_entry_survives_a_panicking_begin_close_and_still_r
 /// funnel HERE with a bare `self.source.end_sync(…)` and the same thing happens, which is what
 /// attributes the claim to this caller rather than to the funnel serving all of them.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_failed_widens_terminal_retirement_survives_a_panicking_cookie_reap_and_still_answers() {
   use std::task::{Context, Poll, Waker};
 
@@ -10204,6 +10262,7 @@ async fn a_failed_widens_terminal_retirement_survives_a_panicking_cookie_reap_an
     owner,
     events: _events,
     _commands: commands,
+    #[cfg(feature = "sync")]
     _sync_commands,
     closes,
   } = h;
@@ -10332,6 +10391,7 @@ async fn a_failed_widens_terminal_retirement_survives_a_panicking_cookie_reap_an
 /// still holds while the caller is told the source shut down cleanly over a write it never
 /// reclaimed.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn on_syncs_close_win_survives_a_panicking_cancel_sync_and_still_reaps_and_answers() {
   use core::sync::atomic::Ordering;
   use std::task::{Context, Poll, Waker};
@@ -10367,7 +10427,8 @@ async fn on_syncs_close_win_survives_a_panicking_cancel_sync_and_still_reaps_and
     owner,
     events: _events,
     _commands,
-    _sync_commands: sync_commands,
+    #[cfg(feature = "sync")]
+      _sync_commands: sync_commands,
     closes,
   } = h;
 
@@ -10499,6 +10560,7 @@ async fn on_syncs_close_win_survives_a_panicking_cancel_sync_and_still_reaps_and
 /// the cell's own boundary reports `Err`: the ledger ends without `JoinClose`, and `close()`
 /// answers off the reply this arm was holding.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn arms_close_win_survives_a_cancelled_arm_whose_destructor_panics() {
   use std::task::{Context, Poll, Waker};
 
@@ -10534,6 +10596,7 @@ async fn arms_close_win_survives_a_cancelled_arm_whose_destructor_panics() {
     owner,
     events: _events,
     _commands: commands,
+    #[cfg(feature = "sync")]
     _sync_commands,
     closes,
   } = h;
@@ -10643,6 +10706,7 @@ async fn arms_close_win_survives_a_cancelled_arm_whose_destructor_panics() {
 /// cell's own boundary reports `Err` — the ledger ends without `JoinClose`, and `close()` answers off
 /// the consumed reply.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn grows_close_win_survives_a_cancelled_grow_whose_destructor_panics() {
   use std::task::{Context, Poll, Waker};
 
@@ -10679,6 +10743,7 @@ async fn grows_close_win_survives_a_cancelled_grow_whose_destructor_panics() {
     owner,
     events: _events,
     _commands: commands,
+    #[cfg(feature = "sync")]
     _sync_commands,
     closes,
   } = h;
@@ -10767,6 +10832,7 @@ async fn grows_close_win_survives_a_cancelled_grow_whose_destructor_panics() {
 /// funnel a `false` instead and the cell's own boundary reports `Err` — the ledger ends without
 /// `JoinClose`, and `close()` answers off the consumed reply.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn replaces_close_win_survives_a_cancelled_retarget_whose_destructor_panics() {
   use std::task::{Context, Poll, Waker};
 
@@ -10799,6 +10865,7 @@ async fn replaces_close_win_survives_a_cancelled_retarget_whose_destructor_panic
     owner,
     events: _events,
     _commands: commands,
+    #[cfg(feature = "sync")]
     _sync_commands,
     closes,
   } = h;
@@ -10893,6 +10960,7 @@ async fn replaces_close_win_survives_a_cancelled_retarget_whose_destructor_panic
 /// instead and the cell's own boundary reports `Err` — the roots are never retired, the ledger ends
 /// without `JoinClose`, and `close()` answers off the consumed reply.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_restores_raced_rearm_survives_a_cancellation_whose_destructor_panics() {
   use std::task::{Context, Poll, Waker};
 
@@ -10926,6 +10994,7 @@ async fn a_restores_raced_rearm_survives_a_cancellation_whose_destructor_panics(
     owner,
     events: _events,
     _commands: commands,
+    #[cfg(feature = "sync")]
     _sync_commands,
     closes,
   } = h;
@@ -11028,6 +11097,7 @@ async fn a_restores_raced_rearm_survives_a_cancellation_whose_destructor_panics(
 /// `EndSync`. Hand the funnel a `false` instead and the cell's own boundary reports `Err`: the
 /// ledger ends without `JoinClose`, and `close()` answers off the consumed reply.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn on_syncs_close_win_survives_a_cancelled_write_whose_destructor_panics() {
   use core::sync::atomic::Ordering;
   use std::task::{Context, Poll, Waker};
@@ -11062,7 +11132,8 @@ async fn on_syncs_close_win_survives_a_cancelled_write_whose_destructor_panics()
     owner,
     events: _events,
     _commands,
-    _sync_commands: sync_commands,
+    #[cfg(feature = "sync")]
+      _sync_commands: sync_commands,
     closes,
   } = h;
 
@@ -11204,6 +11275,7 @@ async fn the_tails_grant_cleanup_survives_a_panicking_disarm_and_still_releases_
     owner,
     events: _events,
     _commands,
+    #[cfg(feature = "sync")]
     _sync_commands,
     closes,
   } = h;
@@ -11286,6 +11358,7 @@ async fn the_tails_grant_cleanup_survives_a_panicking_disarm_and_still_releases_
 /// `Err` — the second cookie is never reaped and the emptied root is never disarmed. The second form
 /// is what attributes the claim to this caller rather than to the funnel serving all of them.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_grant_cleanups_cookie_reap_survives_a_panicking_end_sync_and_still_disarms() {
   let mut h = Harness::new();
   let sa = h.watch("/a", Interest::all()).await.expect("watch /a"); // handle 1
@@ -11381,6 +11454,7 @@ async fn a_grant_cleanups_cookie_reap_survives_a_panicking_end_sync_and_still_di
 /// boundary but discard its outcome and every ledger claim still holds while the caller is told the
 /// source shut down cleanly over a prune it never completed.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn the_tails_coverage_prune_survives_a_panicking_set_cover_and_still_waits_and_answers() {
   use std::task::{Context, Poll, Waker};
 
@@ -11417,6 +11491,7 @@ async fn the_tails_coverage_prune_survives_a_panicking_set_cover_and_still_waits
     owner,
     events: _events,
     _commands,
+    #[cfg(feature = "sync")]
     _sync_commands,
     closes,
   } = h;
@@ -11779,6 +11854,7 @@ async fn a_forgotten_payload_from_a_cancelled_future_shuts_the_optional_plane() 
       owner,
       events: _events,
       _commands: commands,
+      #[cfg(feature = "sync")]
       _sync_commands,
       closes,
     } = h;
@@ -11900,6 +11976,7 @@ async fn a_forgotten_payload_from_a_cancelled_future_shuts_the_optional_plane() 
 /// entered with an allocation stranded per entry — `COOKIES` of each, out of one owner's
 /// destruction, which is the escape the gate closes.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn the_destructors_reap_strands_one_allocation_however_many_cookies_are_pending() {
   /// Enough pending cookies that a per-cookie leak is unmistakable against a per-plane one, and far
   /// enough below [`MAX_PENDING_SYNCS`](super::MAX_PENDING_SYNCS) that the number is this cell's
@@ -12000,6 +12077,7 @@ async fn the_destructors_reap_strands_one_allocation_however_many_cookies_are_pe
 /// total falls to one while the teardown loses the seam entry it owes the source exactly once, which
 /// is the trade the mandatory half refuses.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn the_forgotten_payload_total_is_a_constant_of_the_code_not_of_what_the_caller_drove() {
   /// Releases the caller drives, and cookies it leaves pending. Both are chosen well above one so
   /// that a per-call leak names them and a bounded one does not.
@@ -12133,6 +12211,7 @@ async fn the_forgotten_payload_total_is_a_constant_of_the_code_not_of_what_the_c
 /// answers off a verdict nobody produced. Make the quarantine skip the acknowledgement and the
 /// caller waits forever on a watcher that has already gone.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_quarantined_source_plane_still_tears_down_and_answers_close() {
   use std::task::{Context, Poll, Waker};
 
@@ -12168,6 +12247,7 @@ async fn a_quarantined_source_plane_still_tears_down_and_answers_close() {
     owner,
     events: _events,
     _commands,
+    #[cfg(feature = "sync")]
     _sync_commands,
     closes,
   } = h;
@@ -12259,6 +12339,7 @@ async fn a_quarantined_source_plane_still_tears_down_and_answers_close() {
 /// destructor. Route the release through `call_source` instead and the staging's second orphan
 /// re-enters `disarm`, which is the same bound going away one function earlier.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_quarantine_armed_on_a_live_path_also_stops_the_destructors_cookie_reap() {
   let mut h = Harness::new();
 
@@ -12414,6 +12495,7 @@ async fn a_quarantine_armed_on_a_live_path_also_stops_the_destructors_cookie_rea
 /// both climb by `CYCLES`; without the sync gate `begun_syncs` climbs by `CYCLES`, one marker file
 /// per cycle, with nothing left that ever unlinks one.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_quarantined_plane_refuses_new_acquisition_so_its_retained_set_cannot_grow() {
   use futures_util::FutureExt;
 
@@ -12604,6 +12686,7 @@ async fn a_quarantined_plane_refuses_new_acquisition_so_its_retained_set_cannot_
 /// two roots behind the hostile reap then never arm again: the ordered ledger loses their re-arms,
 /// their subscriptions stop naming a live root, and the live root count falls to one.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_quarantine_armed_mid_restore_still_re_arms_within_the_pre_widen_population() {
   use futures_util::FutureExt;
 
@@ -12791,6 +12874,7 @@ async fn a_quarantine_armed_mid_restore_still_re_arms_within_the_pre_widen_popul
 /// count climbs by one, the source holds a live root it will never be asked to release, and the
 /// watch returns `Ok` instead of `SourceRetired`.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_quarantine_armed_by_a_dead_covering_roots_reap_refuses_the_replanned_arm() {
   use futures_util::FutureExt;
 
@@ -13249,6 +13333,7 @@ async fn a_quarantine_armed_mid_reconcile_refuses_a_covered_newcomers_grow() {
 /// the closure fall out of scope — and the marked destructor unwinds out of `Owner::drop`, which
 /// the cell's own boundary around the teardown then reports as a teardown that did not return.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_quarantined_skip_contains_the_component_destructor_of_the_cookie_it_declined() {
   let mut rig = OwnerOverHostileKeys::new();
 
@@ -13388,6 +13473,7 @@ async fn a_quarantined_skip_contains_the_component_destructor_of_the_cookie_it_d
 /// containment disposes of the payload the owner's should have. The count is the PRICE this cell
 /// exists to state; the contained teardown is the CLAIM that makes the price a bound.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_skipped_offer_that_forgets_a_payload_strands_exactly_one_allocation() {
   let mut rig = OwnerOverHostileKeys::new();
 
@@ -13540,6 +13626,7 @@ struct OwnerOverValue<V> {
   /// Kept alive so the owner's command receiver never observes a closed channel.
   _commands: async_channel::Sender<super::Command<OsString, V>>,
   /// Kept alive so the owner's sync-admission receiver never observes a closed channel.
+  #[cfg(feature = "sync")]
   _sync_commands: async_channel::Sender<super::SyncRequest>,
   /// Kept alive so the owner's close receiver never observes a closed channel. The teardown cells
   /// that drive [`run`](super::run) rather than the destructor send their close request on it.
@@ -13550,6 +13637,7 @@ impl<V: Clone> OwnerOverValue<V> {
   fn new() -> Self {
     let (event_tx, event_rx) = async_channel::unbounded();
     let (command_tx, command_rx) = async_channel::unbounded();
+    #[cfg(feature = "sync")]
     let (sync_command_tx, sync_command_rx) = async_channel::unbounded::<super::SyncRequest>();
     let (close_tx, close_rx) = async_channel::bounded(1);
     let (cleanup_tx, cleanup_rx) = async_channel::unbounded();
@@ -13572,14 +13660,18 @@ impl<V: Clone> OwnerOverValue<V> {
       test_pre_cut_claims: Vec::new(),
       debounce: None,
       coalescer: None,
+      #[cfg(feature = "sync")]
       pending_syncs: Vec::new(),
+      #[cfg(feature = "sync")]
       sync_seq: 0,
       loss_serial: HashMap::new(),
       loss_gen: std::sync::Arc::new(core::sync::atomic::AtomicU64::new(0)),
+      #[cfg(feature = "sync")]
       nonces: sync_nonces(),
       cleanup_tx,
       cleanup_rx,
       commands: command_rx,
+      #[cfg(feature = "sync")]
       sync_commands: sync_command_rx,
       closes: close_rx,
       events: event_tx,
@@ -13591,6 +13683,7 @@ impl<V: Clone> OwnerOverValue<V> {
       owner,
       _events: event_rx,
       _commands: command_tx,
+      #[cfg(feature = "sync")]
       _sync_commands: sync_command_tx,
       _closes: close_tx,
     }
@@ -13637,6 +13730,7 @@ impl<V: Clone> OwnerOverValue<V> {
 /// and the caller destructor unwinds out of the destructor's first statement — `teardown` is `Err`,
 /// the ledger has no `BeginClose` and no `EndSync` at all, and the cookie survives its owner.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn owner_teardown_enters_the_seam_although_releasing_the_displaced_plane_unwinds() {
   let mut rig = OwnerOverValue::<PlaneValue>::new();
 
@@ -13836,6 +13930,7 @@ impl Drop for WitnessValue {
 /// through a real mutator would key the cell on a call count internal to that mutator. Take the
 /// publication out of the slot, retire both subscriptions from the authoritative plane (whose own
 /// publish then lands on the emptied slot), and put the stale publication back.
+#[cfg(feature = "sync")]
 async fn stage_departed_plane_values(
   rig: &mut OwnerOverValue<WitnessValue>,
 ) -> futures_channel::oneshot::Receiver<Result<super::SyncOutcome, crate::error::SyncError>> {
@@ -13998,6 +14093,7 @@ async fn the_run_tail_releases_the_displaced_plane_below_the_wait_and_the_acknow
     owner,
     _events,
     _commands,
+    #[cfg(feature = "sync")]
     _sync_commands,
     _closes: closes,
   } = rig;
@@ -14072,6 +14168,7 @@ async fn the_run_tail_releases_the_displaced_plane_below_the_wait_and_the_acknow
 /// the cell's own boundary reports `Err`, and `close()` resolves `Stopped` off the dropped sender
 /// rather than carrying a source-side verdict.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn the_tails_bounded_wait_survives_a_join_close_that_unwinds_at_the_call() {
   use std::task::{Context, Poll, Waker};
 
@@ -14102,6 +14199,7 @@ async fn the_tails_bounded_wait_survives_a_join_close_that_unwinds_at_the_call()
     owner,
     events: _events,
     _commands,
+    #[cfg(feature = "sync")]
     _sync_commands,
     closes,
   } = h;
@@ -14189,6 +14287,7 @@ async fn the_run_tail_still_releases_the_displaced_plane_when_the_bounded_wait_u
     owner,
     _events,
     _commands,
+    #[cfg(feature = "sync")]
     _sync_commands,
     _closes: closes,
   } = rig;
@@ -14278,6 +14377,7 @@ async fn the_run_tail_still_releases_the_displaced_plane_when_the_bounded_wait_u
 /// unwind leaves `run`'s poll: the first assertion below reports it, and the acknowledgement goes
 /// with the frame.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn the_tails_bounded_wait_reports_a_join_close_that_unwinds_in_its_own_drop() {
   use std::task::{Context, Poll, Waker};
 
@@ -14308,6 +14408,7 @@ async fn the_tails_bounded_wait_reports_a_join_close_that_unwinds_in_its_own_dro
     owner,
     events: _events,
     _commands,
+    #[cfg(feature = "sync")]
     _sync_commands,
     closes,
   } = h;
@@ -14638,6 +14739,7 @@ impl Drop for HostileValue {
 /// the dropped sender as `Stopped`, the drive assertion sees the escape, and the ledger has neither
 /// the cookie reap nor `JoinClose` in it.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_terminal_reconciles_caller_destructor_cannot_answer_close_for_the_source() {
   use std::task::{Context, Poll, Waker};
 
@@ -14682,6 +14784,7 @@ async fn a_terminal_reconciles_caller_destructor_cannot_answer_close_for_the_sou
     owner,
     _events,
     _commands: commands,
+    #[cfg(feature = "sync")]
     _sync_commands,
     _closes: closes,
   } = rig;
@@ -14775,6 +14878,7 @@ async fn a_terminal_reconciles_caller_destructor_cannot_answer_close_for_the_sou
 /// and the latch is unset when the plan is aborted: the reservation's caller destructor runs inside
 /// the reconcile, the unwind leaves `run`, and `close()` reports `Stopped`.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_disjoint_arm_losing_the_close_race_enters_the_seam_before_it_abandons_the_plan() {
   use std::task::{Context, Poll, Waker};
 
@@ -14810,6 +14914,7 @@ async fn a_disjoint_arm_losing_the_close_race_enters_the_seam_before_it_abandons
     owner,
     _events,
     _commands: commands,
+    #[cfg(feature = "sync")]
     _sync_commands,
     _closes: closes,
   } = rig;
@@ -15101,6 +15206,7 @@ impl Source<HostileComponent> for HostileKeySource {
     core::future::pending().await
   }
 
+  #[cfg(feature = "sync")]
   fn end_sync(&mut self, _handle: u32, cookie_key: &[HostileComponent]) {
     self.note(HostileCall::EndSync(HostileComponent::names(cookie_key)));
   }
@@ -15131,6 +15237,7 @@ struct OwnerOverHostileKeys {
   /// [`fill_stream`](Self::fill_stream).
   events: async_channel::Sender<Event<HostileComponent, ()>>,
   commands: async_channel::Sender<super::Command<HostileComponent, ()>>,
+  #[cfg(feature = "sync")]
   _sync_commands: async_channel::Sender<super::SyncRequest>,
   closes: async_channel::Sender<super::CloseReply>,
 }
@@ -15148,6 +15255,7 @@ impl OwnerOverHostileKeys {
       async_channel::bounded(capacity)
     };
     let (command_tx, command_rx) = async_channel::unbounded();
+    #[cfg(feature = "sync")]
     let (sync_command_tx, sync_command_rx) = async_channel::unbounded::<super::SyncRequest>();
     let (close_tx, close_rx) = async_channel::bounded(1);
     let (cleanup_tx, cleanup_rx) = async_channel::unbounded();
@@ -15170,14 +15278,18 @@ impl OwnerOverHostileKeys {
       test_pre_cut_claims: Vec::new(),
       debounce: None,
       coalescer: None,
+      #[cfg(feature = "sync")]
       pending_syncs: Vec::new(),
+      #[cfg(feature = "sync")]
       sync_seq: 0,
       loss_serial: HashMap::new(),
       loss_gen: std::sync::Arc::new(core::sync::atomic::AtomicU64::new(0)),
+      #[cfg(feature = "sync")]
       nonces: sync_nonces(),
       cleanup_tx,
       cleanup_rx,
       commands: command_rx,
+      #[cfg(feature = "sync")]
       sync_commands: sync_command_rx,
       closes: close_rx,
       events: event_tx.clone(),
@@ -15190,6 +15302,7 @@ impl OwnerOverHostileKeys {
       _events: event_rx,
       events: event_tx,
       commands: command_tx,
+      #[cfg(feature = "sync")]
       _sync_commands: sync_command_tx,
       closes: close_tx,
     }
@@ -15211,6 +15324,7 @@ impl OwnerOverHostileKeys {
 
   /// Hangs a still-pending barrier off `sub`'s root, so the teardown tail owes a cookie reap the
   /// deferred release must stand behind.
+  #[cfg(feature = "sync")]
   fn park_cookie(
     &mut self,
     sub: Subscription,
@@ -15284,6 +15398,7 @@ async fn a_terminal_disjoint_close_race_places_every_caller_key_it_owns() {
     _events,
     events: _events_tx,
     commands,
+    #[cfg(feature = "sync")]
     _sync_commands,
     closes,
   } = rig;
@@ -15459,6 +15574,7 @@ async fn a_terminal_retirement_places_the_duplicate_keys_it_removes() {
     _events,
     events: _events_tx,
     commands,
+    #[cfg(feature = "sync")]
     _sync_commands,
     closes,
   } = rig;
@@ -15594,6 +15710,7 @@ async fn a_terminal_tail_flush_places_the_parked_entry_it_delivers() {
     _events,
     events: _events_tx,
     commands,
+    #[cfg(feature = "sync")]
     _sync_commands,
     closes,
   } = rig;
@@ -15739,6 +15856,7 @@ async fn a_terminal_merge_places_the_key_tail_it_widens_away() {
     _events,
     events: _events_tx,
     commands,
+    #[cfg(feature = "sync")]
     _sync_commands,
     closes,
   } = rig;
@@ -15855,6 +15973,7 @@ async fn a_terminal_retirement_places_the_admission_gate_it_reclaims() {
     _events,
     events: _events_tx,
     commands,
+    #[cfg(feature = "sync")]
     _sync_commands,
     closes,
   } = rig;
@@ -15970,6 +16089,7 @@ async fn a_terminal_reconcile_places_the_gate_it_never_installed() {
     _events,
     events: _events_tx,
     commands,
+    #[cfg(feature = "sync")]
     _sync_commands,
     closes,
   } = rig;
@@ -16107,6 +16227,7 @@ async fn a_terminal_grant_cleanup_places_the_parked_debt_it_purges() {
     _events,
     events: _events_tx,
     commands,
+    #[cfg(feature = "sync")]
     _sync_commands,
     closes,
   } = rig;
@@ -16247,6 +16368,7 @@ async fn a_terminal_coalescer_flush_places_the_index_keys_it_empties() {
     _events,
     events: _events_tx,
     commands,
+    #[cfg(feature = "sync")]
     _sync_commands,
     closes,
   } = rig;
@@ -16386,6 +16508,7 @@ async fn a_terminal_purge_places_the_map_owned_key_its_removal_destroyed() {
     _events,
     events: _events_tx,
     commands,
+    #[cfg(feature = "sync")]
     _sync_commands,
     closes,
   } = rig;
@@ -16571,6 +16694,7 @@ async fn a_terminal_cover_re_record_places_the_cover_it_supersedes() {
     _events,
     events: _events_tx,
     commands,
+    #[cfg(feature = "sync")]
     _sync_commands,
     closes,
   } = rig;
@@ -17063,6 +17187,7 @@ async fn release_marks_handle_logically_dead_immediately_even_with_transport_pen
 
   let (event_tx, _event_rx) = async_channel::unbounded::<Event<OsString, ()>>();
   let (command_tx, command_rx) = async_channel::unbounded::<super::Command<OsString, ()>>();
+  #[cfg(feature = "sync")]
   let (_sync_command_tx, sync_command_rx) = async_channel::unbounded::<super::SyncRequest>();
   let (_close_tx, close_rx) = async_channel::bounded::<super::CloseReply>(1);
   let (cleanup_tx, cleanup_rx) = async_channel::unbounded::<super::Cleanup>();
@@ -17091,14 +17216,18 @@ async fn release_marks_handle_logically_dead_immediately_even_with_transport_pen
     test_pre_cut_claims: Vec::new(),
     debounce: None,
     coalescer: None,
+    #[cfg(feature = "sync")]
     pending_syncs: Vec::new(),
+    #[cfg(feature = "sync")]
     sync_seq: 0,
     loss_serial: HashMap::new(),
     loss_gen: std::sync::Arc::new(core::sync::atomic::AtomicU64::new(0)),
+    #[cfg(feature = "sync")]
     nonces: sync_nonces(),
     cleanup_tx,
     cleanup_rx,
     commands: command_rx,
+    #[cfg(feature = "sync")]
     sync_commands: sync_command_rx,
     closes: close_rx,
     events: event_tx,
@@ -17236,6 +17365,7 @@ async fn unclaimed_orphans_parked_rescan_is_suppressed_by_state_in_the_run_loop(
 
   let (event_tx, event_rx) = async_channel::unbounded::<Event<OsString, ()>>();
   let (command_tx, command_rx) = async_channel::unbounded::<super::Command<OsString, ()>>();
+  #[cfg(feature = "sync")]
   let (_sync_command_tx, sync_command_rx) = async_channel::unbounded::<super::SyncRequest>();
   let (close_tx, close_rx) = async_channel::bounded::<super::CloseReply>(1);
   let (cleanup_tx, cleanup_rx) = async_channel::unbounded::<super::Cleanup>();
@@ -17265,14 +17395,18 @@ async fn unclaimed_orphans_parked_rescan_is_suppressed_by_state_in_the_run_loop(
     test_pre_cut_claims: Vec::new(),
     debounce: None,
     coalescer: None,
+    #[cfg(feature = "sync")]
     pending_syncs: Vec::new(),
+    #[cfg(feature = "sync")]
     sync_seq: 0,
     loss_serial: HashMap::new(),
     loss_gen: std::sync::Arc::new(core::sync::atomic::AtomicU64::new(0)),
+    #[cfg(feature = "sync")]
     nonces: sync_nonces(),
     cleanup_tx,
     cleanup_rx,
     commands: command_rx,
+    #[cfg(feature = "sync")]
     sync_commands: sync_command_rx,
     closes: close_rx,
     events: event_tx,
@@ -18085,6 +18219,7 @@ async fn source_drain_close_is_surfaced_under_sustained_command_flood() {
 /// `Dominated` AND the covering `Rescan` is drainable, never a reply that
 /// outran its cover.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_rescan_dominates_a_pending_sync_and_the_rescan_is_published() {
   use futures_util::FutureExt;
 
@@ -18125,6 +18260,7 @@ async fn a_rescan_dominates_a_pending_sync_and_the_rescan_is_published() {
 /// the caller must re-enumerate, so reporting a clean delivery would risk
 /// stale state.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_cookie_delivered_over_existing_rescan_debt_resolves_dominated() {
   use futures_util::FutureExt;
 
@@ -18177,6 +18313,7 @@ async fn a_cookie_delivered_over_existing_rescan_debt_resolves_dominated() {
 /// which two prior Monitor-level reviews assumed "converged the consumer" —
 /// provably could not.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_covering_rescan_dominates_a_modified_only_sync_a_removed_cannot() {
   use futures_util::FutureExt;
 
@@ -18235,6 +18372,7 @@ async fn a_covering_rescan_dominates_a_modified_only_sync_a_removed_cannot() {
 /// barrier `Retired` AND reaps its cookie file (the root is still live, so the
 /// marker is real and must not leak).
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn an_unwatched_subscription_reaps_its_pending_cookie() {
   use futures_util::FutureExt;
 
@@ -18275,6 +18413,7 @@ async fn an_unwatched_subscription_reaps_its_pending_cookie() {
 /// (never disarms it while old subscribers are committed) and refuses the
 /// newcomer with a canonicalization race.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_diverging_in_place_widen_rolls_back_and_keeps_old_coverage() {
   use futures_util::FutureExt;
 
@@ -18378,6 +18517,7 @@ async fn a_diverging_in_place_widen_rolls_back_and_keeps_old_coverage() {
 /// even with no debt left parked at resolution the caller is told to
 /// re-enumerate rather than trust a false `Delivered`.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_loss_published_before_the_cookie_still_resolves_dominated() {
   use futures_util::FutureExt;
 
@@ -18429,6 +18569,7 @@ async fn a_loss_published_before_the_cookie_still_resolves_dominated() {
 /// `Dominated` at commit time (its stream re-based onto the wider root), never
 /// waiting for a cookie on the old handle.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_widen_resolves_the_repointed_subscriptions_pending_sync() {
   use futures_util::FutureExt;
 
@@ -18473,6 +18614,7 @@ async fn a_widen_resolves_the_repointed_subscriptions_pending_sync() {
 /// Fail-on-old (no `dominated_at_install`): the published-and-cleared debt leaves a clean flush and
 /// an unchanged serial, so the barrier reports `Delivered` — the bug.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_barrier_installed_over_existing_debt_resolves_dominated() {
   use futures_util::FutureExt;
 
@@ -18535,6 +18677,7 @@ async fn a_barrier_installed_over_existing_debt_resolves_dominated() {
 /// Fail-on-old (drop the caller-gone check in `admit_begun_cookie`): the completed cookie is parked as
 /// a `PendingSync` no one waits on and its file is never `end_sync`ed here — both assertions fail.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_completed_cookie_for_a_gone_caller_is_reaped_not_installed() {
   use crate::{error::SyncError, source::SyncOutcome};
 
@@ -18562,6 +18705,7 @@ async fn a_completed_cookie_for_a_gone_caller_is_reaped_not_installed() {
 /// The companion: a completed cookie for a caller still waiting IS parked (and not reaped), so the
 /// caller-gone reap above is genuinely gated on the cancellation, not unconditional.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_completed_cookie_for_a_live_caller_is_parked_not_reaped() {
   use crate::{error::SyncError, source::SyncOutcome};
 
@@ -18595,6 +18739,7 @@ async fn a_completed_cookie_for_a_live_caller_is_parked_not_reaped() {
 /// maps stay empty and the per-subscription `loss_serial` never moves. Only the shared generation,
 /// advanced at the domination choke point, still carries it.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_delivered_rescan_between_the_call_and_the_install_resolves_dominated() {
   use core::sync::atomic::Ordering;
 
@@ -18657,6 +18802,7 @@ async fn a_delivered_rescan_between_the_call_and_the_install_resolves_dominated(
 /// Fail-on-old (no `loss_gen` term in `dominated_at_install`): both install-time probes read a
 /// pristine state and the cookie's flush is clean, so the barrier reports `Delivered` — the bug.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_loss_between_the_call_and_the_install_resolves_dominated() {
   use core::sync::atomic::Ordering;
 
@@ -18717,6 +18863,7 @@ async fn a_loss_between_the_call_and_the_install_resolves_dominated() {
 /// flush is clean, so the barrier reports `Delivered` for a pre-call re-enumeration the caller must
 /// still process.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_parked_rescan_published_in_the_call_window_resolves_dominated() {
   use core::sync::atomic::Ordering;
 
@@ -18774,6 +18921,7 @@ async fn a_parked_rescan_published_in_the_call_window_resolves_dominated() {
 /// `/r/.cookie` does not start with `/r/x`, so the barrier is not dominated and falsely resolves
 /// `Delivered` (here the reply is simply left unresolved).
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn an_installed_barrier_is_dominated_by_a_descendant_rescan() {
   use futures_util::FutureExt;
 
@@ -18878,6 +19026,7 @@ async fn a_transient_root_rescan_after_a_widen_rollback_is_clamped_to_the_live_r
 /// admission — dropping the response receiver — the owner must not mint a token, await `begin_sync`,
 /// or park a PendingSync for a reply nobody will read.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn on_sync_skips_an_already_canceled_barrier() {
   use crate::{error::SyncError, source::SyncOutcome};
 
@@ -18931,6 +19080,7 @@ async fn on_sync_skips_an_already_canceled_barrier() {
 /// the outcome assertion fails — a caller whose barrier is already met by re-enumeration would
 /// be told to retry, and a tree churning faster than one round trip livelocks it.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_pre_install_domination_resolves_the_caller_dominated() {
   use core::sync::atomic::Ordering;
 
@@ -19003,6 +19153,7 @@ async fn a_pre_install_domination_resolves_the_caller_dominated() {
 /// fails, this time proven through the real mailbox and run loop rather than a directly-driven
 /// `on_sync`.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_forced_domination_resolves_through_the_public_sync_entry_point() {
   use crate::source::SyncOutcome;
 
@@ -19052,6 +19203,7 @@ async fn a_forced_domination_resolves_through_the_public_sync_entry_point() {
 /// FAIL-ON-REVERT: take the counter's OLD value (`let seq = self.sync_seq; self.sync_seq +=
 /// 1;` and mint from `seq`) and the first token carries 0.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn the_first_sync_an_owner_admits_mints_seq_one() {
   use core::sync::atomic::Ordering;
 
@@ -19094,6 +19246,7 @@ async fn the_first_sync_an_owner_admits_mints_seq_one() {
 /// Fail-on-old (drop the `cancel_sync` on the cancellation arm): `cancelled_syncs` is empty and the
 /// delivered cookie is orphaned — the leak the whole token-cancel handshake exists to close.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_write_completing_between_its_poll_and_the_cancel_poll_is_cancelled_by_token() {
   use core::sync::atomic::Ordering;
   use std::task::{Context, Poll, Waker};
@@ -19162,6 +19315,7 @@ async fn a_write_completing_between_its_poll_and_the_cancel_poll_is_cancelled_by
 /// Fail-on-old (drop the `cancel_sync` on the close arm): `cancelled_syncs` is empty and the
 /// delivered cookie is orphaned across the close.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_write_completing_between_its_poll_and_the_cancel_poll_is_cancelled_by_token_close_arm() {
   use core::sync::atomic::Ordering;
   use std::task::{Context, Poll, Waker};
@@ -19230,6 +19384,7 @@ async fn a_write_completing_between_its_poll_and_the_cancel_poll_is_cancelled_by
 /// is reaped by PATH (`end_sync`), never token-cancelled. This proves the cancel is confined to the
 /// abandon arms, not the admit path.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_ready_write_still_wins_the_tie_and_is_not_token_cancelled() {
   use core::sync::atomic::Ordering;
   use std::task::{Context, Poll, Waker};
@@ -19331,6 +19486,7 @@ impl Source<OsString> for SyncSource {
       .is_some_and(|leaf| leaf.starts_with("cookie-"))
   }
 
+  #[cfg(feature = "sync")]
   async fn begin_sync(
     &mut self,
     handle: u32,
@@ -19377,6 +19533,7 @@ impl Source<OsString> for SyncSource {
 /// `SyncRequest`, the run loop's sync arm dispatches `on_sync`, the cookie's own event arrives, and
 /// the barrier resolves `Delivered` on a clean flush — proving the rewired admission+observation path.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_sync_admitted_through_the_dedicated_mailbox_still_resolves() {
   use crate::source::SyncOutcome;
 
@@ -19408,6 +19565,7 @@ async fn a_sync_admitted_through_the_dedicated_mailbox_still_resolves() {
 /// F4 — the caller's deadline bounds the barrier: a sync whose cookie is never observed resolves
 /// `Err(Timeout)` (the `R::timeout` wrapping admission-plus-observation fires), never a hang.
 #[tokio::test]
+#[cfg(feature = "sync")]
 async fn a_sync_times_out_when_never_observed() {
   use crate::error::SyncError;
 
@@ -19482,6 +19640,7 @@ fn spawn_saturating_command_flood(
 /// Fail-on-old (no loop-top sync drain): the sync arm never wins against the saturated mailbox, so
 /// the barrier starves and the caller's `R::timeout` fires — `Err(Timeout)`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "sync")]
 async fn a_command_flood_does_not_starve_the_sync_mailbox() {
   use crate::source::SyncOutcome;
 
@@ -19581,6 +19740,7 @@ impl Source<OsString> for HeldBeginSyncSource {
       .is_some_and(|leaf| leaf.starts_with("cookie-"))
   }
 
+  #[cfg(feature = "sync")]
   async fn begin_sync(
     &mut self,
     _handle: u32,
@@ -19612,6 +19772,7 @@ impl Source<OsString> for HeldBeginSyncSource {
 /// Fail-on-old (the inline `begin_sync().await`): after the caller is gone the owner stays parked in
 /// the held write forever, so the follow-up watch never resolves and this test hangs to its bound.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "sync")]
 async fn a_timed_out_sync_frees_the_owner_when_the_caller_drops() {
   use crate::error::SyncError;
 
@@ -19669,6 +19830,7 @@ async fn a_timed_out_sync_frees_the_owner_when_the_caller_drops() {
 /// This is the close-race form's guarantee: with a cancellation-only race, this close would instead
 /// block behind the held write until the sync's own (long-lived) caller went away.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "sync")]
 async fn a_close_during_a_held_sync_tears_down_promptly() {
   use crate::error::SyncError;
 
@@ -20021,6 +20183,7 @@ mod rescan_geometry {
   /// Fail-on-old (domination keyed on physical-root equality): the disjoint sibling's
   /// barrier resolves `Dominated` for a recovery event it never receives.
   #[tokio::test]
+  #[cfg(feature = "sync")]
   async fn a_disjoint_rescan_does_not_dominate_an_unaffected_barrier() {
     use futures_util::FutureExt;
 
@@ -20566,6 +20729,7 @@ mod location_coordinate {
 /// | user     | artifact | `Removed`, keyed and located at the SOURCE |
 /// | artifact | user     | `Created`, keyed and located at the DESTINATION |
 /// | user     | user     | the whole `Moved`, unchanged |
+#[cfg(feature = "sync")]
 mod reserved_namespace {
   use futures_util::FutureExt;
 
@@ -20993,6 +21157,7 @@ mod reserved_namespace {
   /// whole change; the fix keeps the resolution AND delivers the user endpoint, so this
   /// cell asserts both halves — a resolution that came at the price of the `Removed` would
   /// be the same loss with a certificate on top.
+  #[cfg(feature = "sync")]
   async fn assert_a_cookie_arriving_by_rename_resolves_its_barrier(
     cookie: &str,
     cookie_location: &str,
@@ -21079,6 +21244,7 @@ mod reserved_namespace {
   /// FAIL-ON-REVERT: compare the pending key WHOLE against the event's key and the reply
   /// stays pending — `now_or_never()` answers `None` — while the caller waits out its entire
   /// deadline over a source that did nothing wrong.
+  #[cfg(feature = "sync")]
   async fn assert_a_marker_under_a_renamed_ancestor_resolves_its_barrier(
     written_at: &str,
     observed_at: &str,
@@ -21143,6 +21309,7 @@ mod reserved_namespace {
   /// as in every other row here — a resolution bought by swallowing the user endpoint would
   /// be a silent loss with a certificate on top.
   #[tokio::test]
+  #[cfg(feature = "sync")]
   async fn a_marker_leaving_the_namespace_under_a_renamed_ancestor_resolves_its_barrier() {
     let mut h = Harness::new();
     let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
@@ -21201,6 +21368,7 @@ mod reserved_namespace {
   /// FAIL-ON-REVERT: drop the root-handle test from the match and this barrier resolves
   /// `Delivered` on a change from a tree it has nothing to do with.
   #[tokio::test]
+  #[cfg(feature = "sync")]
   async fn a_marker_under_another_root_leaves_the_barrier_pending() {
     let mut h = Harness::new();
     let mine = h.watch("/a", Interest::all()).await.expect("watch /a");
@@ -21255,6 +21423,7 @@ mod reserved_namespace {
   /// Both halves are asserted, as in the destination row: the barrier resolves AND the user
   /// endpoint — here the move's destination, an ordinary name the artifact was adopted into
   /// — is still delivered as its own projection.
+  #[cfg(feature = "sync")]
   async fn assert_a_cookie_leaving_the_reserved_namespace_resolves_its_barrier(
     cookie: &str,
     cookie_location: &str,
@@ -21341,6 +21510,7 @@ mod reserved_namespace {
   /// FAIL-ON-REVERT: as above — restore the `event.key()`-only match and the reply stays
   /// pending, because the key names the reserved DESTINATION and the cookie is at the source.
   #[tokio::test]
+  #[cfg(feature = "sync")]
   async fn a_cookie_renamed_between_two_reserved_names_resolves_at_its_source_endpoint() {
     let mut h = Harness::new();
     let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
@@ -21413,6 +21583,7 @@ mod reserved_namespace {
   ///   it down into the slot the cursor abandoned — so it is never reaped, never answered, and
   ///   is still sitting in `pending_syncs` at the end.
   #[tokio::test]
+  #[cfg(feature = "sync")]
   async fn one_move_naming_two_pending_cookies_resolves_both_barriers() {
     let mut h = Harness::new();
     let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
@@ -21516,6 +21687,7 @@ mod reserved_namespace {
   /// `self.fan_out_and_push(event)` and the outcome flips to `Delivered` — a clean-delivery
   /// certificate handed out over a subscription that owes a re-enumeration.
   #[tokio::test]
+  #[cfg(feature = "sync")]
   async fn a_barrier_resolves_only_after_its_own_change_is_durably_parked() {
     let mut h = Harness::bounded(1);
     let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
@@ -22045,6 +22217,7 @@ mod reserved_namespace {
 /// a `Source` method, a subscription's `Filter` predicate — and it retains
 /// admitted control requests past a bounded ingress. Every cell here pins one of
 /// those seams against the failure state that exploits it.
+#[cfg(feature = "sync")]
 mod ownership {
   use super::*;
   use crate::driver::{MAX_PENDING_SYNCS, ReconcileStop};
@@ -22740,6 +22913,7 @@ mod ownership {
   /// `on_sync` and every admission parks — the pending population grows with total
   /// admitted calls and nothing is refused.
   #[tokio::test]
+  #[cfg(feature = "sync")]
   async fn sync_admission_stops_at_the_in_flight_bound() {
     let mut h = Harness::new();
     h.owner.source.supports_sync = true;
@@ -22890,6 +23064,7 @@ mod ownership {
 /// That is a claim about a dependency and a missing branch, not something a
 /// signature can enforce and not something this cell can check.
 #[test]
+#[cfg(feature = "sync")]
 fn the_sync_nonce_draw_is_not_constant_stuck_or_cyclic() {
   const DRAWS: usize = 4096;
   // One generator, drawn from repeatedly — exactly the shape an owner holds: seeded once at

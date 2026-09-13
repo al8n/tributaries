@@ -37,8 +37,10 @@ use std::vec::Vec;
 
 use tributary_proto::{ChangeId, Epoch, Location};
 
+#[cfg(feature = "sync")]
+use crate::error::SyncError;
 use crate::{
-  error::{SourceCloseError, SyncError, WatchError},
+  error::{SourceCloseError, WatchError},
   event::EventKind,
   options::RootGlobs,
 };
@@ -651,6 +653,7 @@ pub trait LocalSource<C> {
   /// A source that must park the write behind its own coverage-settle machinery does so INSIDE
   /// this await (the fs binding parks on the per-directory re-arm fence), which is exactly why the
   /// initiation is awaited and bounded like [`grow`](Self::grow).
+  #[cfg(feature = "sync")]
   fn begin_sync(
     &mut self,
     handle: Self::Handle,
@@ -668,6 +671,7 @@ pub trait LocalSource<C> {
   /// The unlink mints its own event; that event is suppressed by the reserved-namespace rule
   /// ([`is_sync_artifact`](Self::is_sync_artifact)), NOT by any pending-sync bookkeeping — by
   /// the time it arrives, the sync it belonged to is already resolved and forgotten.
+  #[cfg(feature = "sync")]
   fn end_sync(&mut self, handle: Self::Handle, cookie_key: &[C]) {
     let _ = (handle, cookie_key);
   }
@@ -683,6 +687,7 @@ pub trait LocalSource<C> {
   /// never read — is eventually removed, and that a write still in flight leaves no cookie behind when
   /// it lands. Idempotent; a token whose sync already fully resolved is a no-op. Best-effort on an
   /// abnormal teardown, exactly like `end_sync`.
+  #[cfg(feature = "sync")]
   fn cancel_sync(&mut self, handle: Self::Handle, token: SyncToken) {
     let _ = (handle, token);
   }
@@ -1019,6 +1024,7 @@ pub trait Source<C> {
   /// A source that must park the write behind its own coverage-settle machinery does so INSIDE
   /// this await (the fs binding parks on the per-directory re-arm fence), which is exactly why the
   /// initiation is awaited and bounded like [`grow`](Self::grow).
+  #[cfg(feature = "sync")]
   fn begin_sync(
     &mut self,
     handle: Self::Handle,
@@ -1036,6 +1042,7 @@ pub trait Source<C> {
   /// The unlink mints its own event; that event is suppressed by the reserved-namespace rule
   /// ([`is_sync_artifact`](Self::is_sync_artifact)), NOT by any pending-sync bookkeeping — by
   /// the time it arrives, the sync it belonged to is already resolved and forgotten.
+  #[cfg(feature = "sync")]
   fn end_sync(&mut self, handle: Self::Handle, cookie_key: &[C]) {
     let _ = (handle, cookie_key);
   }
@@ -1051,6 +1058,7 @@ pub trait Source<C> {
   /// never read — is eventually removed, and that a write still in flight leaves no cookie behind when
   /// it lands. Idempotent; a token whose sync already fully resolved is a no-op. Best-effort on an
   /// abnormal teardown, exactly like `end_sync`.
+  #[cfg(feature = "sync")]
   fn cancel_sync(&mut self, handle: Self::Handle, token: SyncToken) {
     let _ = (handle, token);
   }
@@ -1201,6 +1209,7 @@ impl<C, T: Source<C>> LocalSource<C> for T {
     <T as Source<C>>::replace(self, handle, new_key)
   }
 
+  #[cfg(feature = "sync")]
   fn begin_sync(
     &mut self,
     handle: Self::Handle,
@@ -1210,10 +1219,12 @@ impl<C, T: Source<C>> LocalSource<C> for T {
     <T as Source<C>>::begin_sync(self, handle, dir_key, token)
   }
 
+  #[cfg(feature = "sync")]
   fn end_sync(&mut self, handle: Self::Handle, cookie_key: &[C]) {
     <T as Source<C>>::end_sync(self, handle, cookie_key)
   }
 
+  #[cfg(feature = "sync")]
   fn cancel_sync(&mut self, handle: Self::Handle, token: SyncToken) {
     <T as Source<C>>::cancel_sync(self, handle, token)
   }
@@ -1242,6 +1253,7 @@ impl<C, T: Source<C>> LocalSource<C> for T {
 /// admission. [`Source::begin_sync`] states both routes, the obligation they
 /// discharge, and what a co-user does with a marker identity it can predict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg(feature = "sync")]
 pub struct SyncToken {
   instance: u64,
   pid: u32,
@@ -1249,6 +1261,7 @@ pub struct SyncToken {
   nonce: u64,
 }
 
+#[cfg(feature = "sync")]
 impl SyncToken {
   /// Mints a token from the owner's instance brand, the process id, a
   /// per-owner monotonic sequence number, and an **unguessable per-sync
@@ -1313,6 +1326,7 @@ impl SyncToken {
 /// later observation to mint the outcome from.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
+#[cfg(feature = "sync")]
 pub enum Begun<C> {
   /// The marker is placed: its canonical key, whose LAST component is the name
   /// the owner resolves the barrier by.
@@ -1332,6 +1346,7 @@ pub enum Begun<C> {
   Dominated,
 }
 
+#[cfg(feature = "sync")]
 impl<C> Begun<C> {
   /// Whether the marker was placed.
   #[inline]
@@ -1379,6 +1394,7 @@ impl<C> Begun<C> {
 /// stream to find out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
+#[cfg(feature = "sync")]
 pub enum SyncOutcome {
   /// The cookie's own event was observed: every change that happened before
   /// the sync call has been emitted to the stream (subject to the
@@ -1401,6 +1417,7 @@ pub enum SyncOutcome {
   Dominated,
 }
 
+#[cfg(feature = "sync")]
 impl SyncOutcome {
   /// Whether the cookie itself was observed.
   #[inline]
