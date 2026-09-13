@@ -1792,6 +1792,7 @@ where
   /// The ROOT a live subscription rides — the handle its events (and its sync
   /// cookie) belong to. One subscription never spans roots, so this is total
   /// for a live sub and `None` once it is gone.
+  #[cfg(any(all(test, feature = "tokio"), feature = "sync"))]
   pub(crate) fn subscription_root(&self, sub: Subscription) -> Option<H>
   where
     H: Copy,

@@ -129,7 +129,7 @@ pub struct FsSource<R> {
   /// [`Watcher::request_cancel_sync`] calls [`cancel_sync`](Source::cancel_sync) actually issued —
   /// distinguishes a stale/mismatched-token cancel (touches nothing) from a matching-token cancel of
   /// a live entry, which removes it and fires the watcher-side cancel.
-  #[cfg(test)]
+  #[cfg(all(test, feature = "sync"))]
   sync_cancels_requested: usize,
 }
 
@@ -166,7 +166,7 @@ impl<R: RuntimeLite> FsSource<R> {
       cover_round_trips: 0,
       #[cfg(test)]
       deferred_forwards: 0,
-      #[cfg(test)]
+      #[cfg(all(test, feature = "sync"))]
       sync_cancels_requested: 0,
     })
   }

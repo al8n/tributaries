@@ -25,17 +25,24 @@
 //! one `tributary-fs` watcher (the [`TokioTributaries`] / [`SmolTributaries`] aliases).
 
 use std::{
-  collections::HashMap,
   ffi::OsString,
   hash::Hash,
   marker::PhantomData,
   ops::Bound,
+  time::{Duration, Instant},
+  vec::Vec,
+};
+
+// The barrier's two loss clocks are the only users of these four names: the per-subscription
+// serial's map, and the shared generation's `Arc<AtomicU64>` with the ordering it is read and
+// bumped under. Gated out with the barrier, they are not compiled.
+#[cfg(feature = "sync")]
+use std::{
+  collections::HashMap,
   sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
   },
-  time::{Duration, Instant},
-  vec::Vec,
 };
 
 use agnostic_lite::RuntimeLite;
@@ -400,6 +407,10 @@ pub struct Tributaries<C, V, R, H> {
   /// opens at the caller's call rather than at the owner's install — closing the window in which
   /// the owner processes a loss for the sub (whose kernel event predates the call), publishes and
   /// clears it, and only then dispatches the queued request onto a state that looks pristine.
+  ///
+  /// The generation is the barrier's own clock and has no reader outside it, so with the barrier
+  /// gated out it is not compiled: the default handle carries neither the `Arc` nor its clone.
+  #[cfg(feature = "sync")]
   loss_gen: Arc<AtomicU64>,
   /// The dedicated **high-priority shutdown signal**: [`close`](Self::close) sends its
   /// [`CloseReply`] here, never the command mailbox, so a requested shutdown can never be starved
@@ -449,6 +460,7 @@ impl<C, V, R, H> Clone for Tributaries<C, V, R, H> {
       commands: self.commands.clone(),
       #[cfg(feature = "sync")]
       sync_commands: self.sync_commands.clone(),
+      #[cfg(feature = "sync")]
       loss_gen: Arc::clone(&self.loss_gen),
       closes: self.closes.clone(),
       events: self.events.clone(),
@@ -657,6 +669,8 @@ where
     // The shared coverage-loss generation, minted ONCE here and held by both planes: the owner
     // bumps it at its single loss choke point (`note_loss`), and every handle clone reads it in
     // `sync` to stamp the barrier's window with the caller's call instead of the owner's install.
+    // It is the barrier's clock, so without the barrier it is never minted.
+    #[cfg(feature = "sync")]
     let loss_gen = Arc::new(AtomicU64::new(0));
     let owner = Owner {
       source,
@@ -683,7 +697,9 @@ where
       pending_syncs: Vec::new(),
       #[cfg(feature = "sync")]
       sync_seq: 0,
+      #[cfg(feature = "sync")]
       loss_serial: HashMap::new(),
+      #[cfg(feature = "sync")]
       loss_gen: Arc::clone(&loss_gen),
       // The ONE OS entropy draw in this driver's life happens right here — synchronously, on the
       // CONSTRUCTING thread, while the owner is still a value and its future does not yet exist,
@@ -707,6 +723,7 @@ where
         commands: command_tx,
         #[cfg(feature = "sync")]
         sync_commands: sync_command_tx,
+        #[cfg(feature = "sync")]
         loss_gen,
         closes: close_tx,
         events: event_rx,
@@ -1474,6 +1491,7 @@ where
   /// barrier is `Dominated` even if the parked debt has since been published
   /// and cleared from `needs_rescan`. Bounded by live subs (cleaned on
   /// retirement).
+  #[cfg(feature = "sync")]
   loss_serial: HashMap<Subscription, u64>,
   /// The **shared coverage-loss generation**: a global monotonic counter bumped by
   /// [`note_loss`](Self::note_loss) — the same choke point that bumps the per-subscription
@@ -1494,6 +1512,7 @@ where
   /// re-enumerates — safe), never a false `Delivered`, and the imprecision is bounded by a window of
   /// a few owner-loop iterations. The precise per-subscription `loss_serial` still governs the long
   /// install-to-resolve window, where precision is worth having. Correctness beats precision here.
+  #[cfg(feature = "sync")]
   loss_gen: Arc<AtomicU64>,
   /// The driver's **cookie-nonce generator**: a ChaCha20 stream seeded ONCE, from the OS, when
   /// the driver was assembled — or nothing at all, when that seed could not be taken.
@@ -4866,8 +4885,8 @@ where
     // (published or parked by `push_all`): resolve any barrier riding it
     // `Dominated`, so a pending sync does not wait for a cookie on a stream
     // that just re-based onto the wider root.
+    #[cfg(feature = "sync")]
     for &moved in repointed {
-      #[cfg(feature = "sync")]
       self.dominate_syncs_of_subscription(moved);
     }
   }
@@ -5364,6 +5383,7 @@ where
     let salvage = self.suppressed_rescan.take(sub);
     self.retire_salvage(salvage);
     self.unclaimed.remove(&sub);
+    #[cfg(feature = "sync")]
     self.loss_serial.remove(&sub);
     if let Some(coalescer) = self.coalescer.as_mut() {
       // FORGET, not drop: the subscription is ending, so its registered debounce policy
@@ -5553,6 +5573,7 @@ where
     let salvage = self.filters.take(sub);
     self.retire_salvage(salvage);
     self.epochs.remove(sub);
+    #[cfg(feature = "sync")]
     self.loss_serial.remove(&sub);
   }
 
@@ -5715,8 +5736,8 @@ where
           // `Rescan`: resolve any barrier riding it `Dominated` (its stream
           // re-based onto the fresh handle), rather than waiting for a cookie
           // whose old handle is dead.
+          #[cfg(feature = "sync")]
           for &sub in &subscribers {
-            #[cfg(feature = "sync")]
             self.dominate_syncs_of_subscription(sub);
           }
         }
@@ -6370,9 +6391,17 @@ where
   /// every subscriber of a root ([`rescan_live_root`](Self::rescan_live_root)). A `Rescan` that is
   /// successfully DELIVERED is not a loss to note here — it is on the stream, and the
   /// `dominate_syncs_*` family resolves the barriers riding it.
+  ///
+  /// With the barrier gated out the clocks this moves are not compiled, and the choke point stays,
+  /// so every loss path is still one path.
   fn note_loss(&mut self, sub: Subscription) {
-    *self.loss_serial.entry(sub).or_insert(0) += 1;
-    self.loss_gen.fetch_add(1, Ordering::SeqCst);
+    #[cfg(feature = "sync")]
+    {
+      *self.loss_serial.entry(sub).or_insert(0) += 1;
+      self.loss_gen.fetch_add(1, Ordering::SeqCst);
+    }
+    #[cfg(not(feature = "sync"))]
+    let _ = sub;
   }
 
   /// Advances ONLY the shared generation — never a subscription's `loss_serial` — for a `Rescan`
@@ -6387,7 +6416,11 @@ where
   /// so bumping the serial here would move it for SIBLING subscriptions and silently redefine
   /// their install-to-resolve window; the shared generation only governs the call-to-install
   /// window, where over-domination costs a caller nothing but a re-enumeration.
+  ///
+  /// With the barrier gated out the clock this moves is not compiled, and the choke point stays, so
+  /// every loss path is still one path.
   fn note_domination(&self) {
+    #[cfg(feature = "sync")]
     self.loss_gen.fetch_add(1, Ordering::SeqCst);
   }
 
@@ -7682,6 +7715,7 @@ where
   /// full event channel forced `try_emit` to shed a delta to a parked `Rescan`
   /// during this very flush. A `false` means the barrier is met by
   /// re-enumeration, not by delivery, so the caller must be told `Dominated`.
+  #[cfg(feature = "sync")]
   fn flush_subscription_now(&mut self, sub: Subscription) -> bool {
     let now: Instant = R::now().into();
     let mut due = Vec::new();

@@ -25,6 +25,7 @@ pub struct InstanceId(NonZeroU64);
 impl InstanceId {
   /// The raw brand — the component a sync cookie's name carries so two watcher
   /// instances in one process never mint colliding markers.
+  #[cfg(feature = "sync")]
   pub(crate) const fn get(&self) -> u64 {
     self.0.get()
   }

@@ -27,33 +27,37 @@
 //! and the core fences that object on the device belt — so the rule holds either
 //! way: one object, one sample.
 
+#[cfg(feature = "sync")]
 use std::{
-  collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+  collections::HashMap,
+  sync::atomic::{AtomicBool, AtomicU64, Ordering},
+};
+use std::{
+  collections::{BTreeMap, BTreeSet, VecDeque},
   io::Write as _,
   num::NonZeroUsize,
   path::{Path, PathBuf},
-  sync::{
-    Arc, Mutex, MutexGuard, PoisonError,
-    atomic::{AtomicBool, AtomicU64, Ordering},
-  },
+  sync::{Arc, Mutex, MutexGuard, PoisonError},
   time::Duration,
 };
 
 use agnostic_lite::{RuntimeLite, time::Instant as _};
 use futures_util::{FutureExt, StreamExt, stream::SelectAll};
+#[cfg(feature = "sync")]
+use tributary_proto::glob::Glob;
 use tributary_proto::{
-  ArmAttempt, Change, Instant, IoClass, ReqId, ScopeId, Segment, WatchError, WatchId,
-  glob::{Glob, Globs},
+  ArmAttempt, Change, Instant, IoClass, ReqId, ScopeId, Segment, WatchError, WatchId, glob::Globs,
 };
 
+#[cfg(feature = "sync")]
+use crate::core::{BarrierEpoch, BarrierEvent, BarrierLocation, BarrierMove};
 #[cfg(feature = "sync")]
 use crate::watcher::SyncTicket;
 use crate::{
   core::{
-    BarrierEpoch, BarrierEvent, BarrierLocation, BarrierMove, CoverNoop, CoverReconcile,
-    CoverSettle, DeclineReason, Delivery, DriverCore, Effect, ExpectedObject, FenceId,
-    MountRefresh, ProbeId, ProbeOutcome, RawDirEntry, RawEnumerate, RootLiveness, SettlePass,
-    WidenCommit, WidenTaint,
+    CoverNoop, CoverReconcile, CoverSettle, DeclineReason, Delivery, DriverCore, Effect,
+    ExpectedObject, FenceId, MountRefresh, ProbeId, ProbeOutcome, RawDirEntry, RawEnumerate,
+    RootLiveness, SettlePass, WidenCommit, WidenTaint,
   },
   error::WatchRootError,
   os::{
@@ -2974,6 +2978,7 @@ impl CookieDir {
 /// runs and found by name, so a change here abandons every directory a previous
 /// release minted. On Windows nothing is ever found by name, so nothing there
 /// depends on this rendering staying put — only the classifier does.
+#[cfg(any(target_os = "linux", target_os = "macos", feature = "sync"))]
 fn cookie_dir_name_for(user: u32) -> String {
   format!("{COOKIE_DIR_PREFIX}-{user}")
 }
@@ -6324,6 +6329,10 @@ where
   R: RuntimeLite,
   F: FsOps,
 {
+  // The runtime is the cookie retirement's, which is not compiled here; the
+  // parameter stays so the two states share one signature.
+  #[cfg(not(feature = "sync"))]
+  let _ = core::marker::PhantomData::<R>;
   let mut abandoned = std::collections::BTreeSet::new();
   cover_replies.retain(|fence, reply| {
     let alive = !reply.is_canceled();
@@ -9627,6 +9636,7 @@ pub(crate) fn pruned(root: &Path, prune: &Globs, directory: bool, path: &Path) -
 ///
 /// Always asked about a DIRECTORY, because with the seat evaluated on directory
 /// prefixes that is the only thing a pattern can prune.
+#[cfg(feature = "sync")]
 pub(crate) fn pruned_dir_by(root: &Path, prune: &Globs, dir: &Path) -> Option<Glob> {
   prune_prefixes(root, prune, true, dir, |prefix| {
     prune.matched(prefix).cloned()
@@ -10906,6 +10916,7 @@ fn inode_of(meta: &std::fs::Metadata) -> (Option<std::num::NonZeroU64>, u64) {
 /// avoid. A synthesized stand-in would be worse still — it compares EQUAL
 /// between two unrelated objects, licensing exactly the deletion the proof
 /// refuses.
+#[cfg(feature = "sync")]
 fn identity_of_handle(file: &std::fs::File) -> Result<Option<RootIdentity>, std::io::Error> {
   #[cfg(unix)]
   {
@@ -16777,7 +16788,6 @@ where
       continue;
     };
     resolved_any = true;
-    #[cfg(feature = "sync")]
     let widened = meta.root.clone();
     // Read before the meta moves into the commit: the widened floor and the
     // identity every later write proves it against are recorded together.

@@ -1,5 +1,7 @@
 use super::*;
-use std::{sync::Mutex, time::Duration};
+#[cfg(feature = "sync")]
+use std::sync::Mutex;
+use std::time::Duration;
 
 const WINDOW: Duration = Duration::from_millis(100);
 /// The root-liveness tick interval the shared harness cores run with. Only the
@@ -20576,6 +20578,7 @@ mod prune {
   /// Revert witness: record the rename at its destination instead and the
   /// location intersects nothing the ledger holds.
   #[test]
+  #[cfg(feature = "sync")]
   fn a_rename_of_the_reserved_cookie_directory_names_the_ground_it_moved() {
     let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_fanotify(&mut core, &pruning(&[]));
@@ -20695,10 +20698,23 @@ mod prune {
   /// move's ground is the Monitor's own reconstruction of the parked half.
   ///
   /// Its widened cover is the SCOPE cover here — a leaf pruned by its own name
-  /// has no unpruned parent to climb to below the root — and the rename's located
-  /// move FOLDS into it, claim and all: a whole-scope move retires a superset of
-  /// what it absorbs, and the root `Rescan` behind it covers every ground either
-  /// of them named.
+  /// has no unpruned parent to climb to below the root — so everything the batch
+  /// records FOLDS into one whole-scope move.
+  ///
+  /// And that fold stands NO `Rescan`, which is the whole difference from the
+  /// kernel-recursive sibling above. This profile holds a per-directory watch on
+  /// the source, so consuming the parked half TEARS THAT WATCH DOWN, and the
+  /// drop passes funnel 2 — which records the whole scope (a dropped node is no
+  /// longer placeable) and stands no `Rescan` of its own by construction. The
+  /// fold's rule is an AND over everything it absorbs, so one absorbed move that
+  /// stood nothing clears the claim however scope-wide the incoming cover is:
+  /// `rescan_stands: true` on a whole-scope move says "a `Rescan` stands for the
+  /// ground I named", and `Scope` is the fail-WIDE degrade rather than a promise
+  /// that the instruction is scope-wide (`barrier_ground` answers `Scope` for
+  /// any anchor the Monitor cannot place, while the mint behind it may be
+  /// located). So each retirement stands its own covering instruction here — a
+  /// redundant re-read, never a miss — which is the direction every barrier
+  /// question takes.
   ///
   /// Revert witness: the same one. Leave this seat to the funnel's own report and
   /// the fold is all the queue carries, with nothing having named the ground the
@@ -20730,10 +20746,12 @@ mod prune {
       vec![BarrierEvent::Move(BarrierMove {
         scope,
         location: BarrierLocation::Scope,
-        rescan_stands: true,
+        rescan_stands: false,
       })],
-      "the scope-wide cover subsumes the rename's own move and carries its \
-       claim: {events:?}"
+      "the scope-wide cover subsumes the rename's own move, and the source \
+       watch's own drop folds in beside it standing nothing — so the fold \
+       claims nothing and every retirement owes its own covering `Rescan`: \
+       {events:?}"
     );
   }
 }

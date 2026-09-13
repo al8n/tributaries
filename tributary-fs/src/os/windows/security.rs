@@ -29,6 +29,11 @@
 /// deterministically; it costs exactly one extra collision pair in a space of
 /// 2^32, and a collision costs one retry rather than a wrong answer (see
 /// `driver::bind_fresh_cookie_dir`).
+///
+/// The mint that consumes it is the cookie directory's, so it is compiled with
+/// the barrier — and with the cells below, which are what exercise the rule on
+/// every host whether or not the barrier is on.
+#[cfg(any(test, feature = "sync"))]
 pub(crate) const fn admissible_token(hash: u32) -> u32 {
   if hash == u32::MAX { u32::MAX - 1 } else { hash }
 }
