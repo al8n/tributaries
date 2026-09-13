@@ -154,7 +154,11 @@ All notable changes to this workspace are documented here. The format is based o
     identifier visitor: refused with a fixed message naming the bound and the
     length past the longest legal field name, and never echoed into the
     `unknown_field` refusal a longer key would otherwise cost an allocation
-    proportional to its own size to produce.
+    proportional to its own size to produce. Both wire forms a document may take
+    are accepted: the keyed map every self-describing format uses, and the
+    sequence form the derived `Serialize` itself emits for a non-self-describing
+    format — its fields in declaration order through the same bounded wrappers,
+    a short sequence defaulting its tail exactly as a missing key does.
 
 - **`tributaries`** — the two glob seats reach the umbrella, so a subscription carries
   them and every source is armed with them.

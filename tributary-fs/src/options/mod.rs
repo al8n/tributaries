@@ -894,6 +894,11 @@ fn parse_cookie_global_cap(
 /// map's value has no attribute of its own to carry a function name), every
 /// key is optional and defaulted from [`WatcherOptions::new`], and a repeated
 /// key is refused with `duplicate_field`.
+///
+/// The visitor also accepts, through `visit_seq`, the SEQUENCE form the
+/// derived `Serialize` itself emits for a non-self-describing format — the
+/// ten fields in declaration order through the same bounded wrappers, a
+/// short sequence defaulting its tail exactly as a missing key does.
 #[cfg(feature = "serde")]
 impl<'de> serde::Deserialize<'de> for WatcherOptions {
   fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -1224,6 +1229,189 @@ impl<'de> serde::Deserialize<'de> for WatcherOptions {
           root_liveness_interval: root_liveness_interval.unwrap_or(default.root_liveness_interval),
           max_map_directories: max_map_directories.unwrap_or(default.max_map_directories),
           cookie_global_cap: cookie_global_cap.unwrap_or(default.cookie_global_cap),
+        })
+      }
+
+      /// The derive's own SEQUENCE form, for a non-self-describing format: the
+      /// ten fields in declaration order through the same bounded wrappers the
+      /// map arm uses, a `None` (short sequence) filling that field and every
+      /// later one from [`WatcherOptions::default`], and nothing read past the
+      /// last field.
+      fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+      where
+        A: serde::de::SeqAccess<'de>,
+      {
+        let default = WatcherOptions::default();
+
+        let latency = match seq.next_element::<LatencyValue>()? {
+          Some(value) => value.0,
+          None => {
+            return Ok(WatcherOptions {
+              latency: default.latency,
+              move_window: default.move_window,
+              event_capacity: default.event_capacity,
+              os_batch_capacity: default.os_batch_capacity,
+              os_buffer_bytes: default.os_buffer_bytes,
+              exclusions: default.exclusions,
+              backend: default.backend,
+              root_liveness_interval: default.root_liveness_interval,
+              max_map_directories: default.max_map_directories,
+              cookie_global_cap: default.cookie_global_cap,
+            });
+          }
+        };
+        let move_window = match seq.next_element::<MoveWindowValue>()? {
+          Some(value) => value.0,
+          None => {
+            return Ok(WatcherOptions {
+              latency,
+              move_window: default.move_window,
+              event_capacity: default.event_capacity,
+              os_batch_capacity: default.os_batch_capacity,
+              os_buffer_bytes: default.os_buffer_bytes,
+              exclusions: default.exclusions,
+              backend: default.backend,
+              root_liveness_interval: default.root_liveness_interval,
+              max_map_directories: default.max_map_directories,
+              cookie_global_cap: default.cookie_global_cap,
+            });
+          }
+        };
+        let event_capacity = match seq.next_element::<EventCapacityValue>()? {
+          Some(value) => value.0,
+          None => {
+            return Ok(WatcherOptions {
+              latency,
+              move_window,
+              event_capacity: default.event_capacity,
+              os_batch_capacity: default.os_batch_capacity,
+              os_buffer_bytes: default.os_buffer_bytes,
+              exclusions: default.exclusions,
+              backend: default.backend,
+              root_liveness_interval: default.root_liveness_interval,
+              max_map_directories: default.max_map_directories,
+              cookie_global_cap: default.cookie_global_cap,
+            });
+          }
+        };
+        let os_batch_capacity = match seq.next_element::<OsBatchCapacityValue>()? {
+          Some(value) => value.0,
+          None => {
+            return Ok(WatcherOptions {
+              latency,
+              move_window,
+              event_capacity,
+              os_batch_capacity: default.os_batch_capacity,
+              os_buffer_bytes: default.os_buffer_bytes,
+              exclusions: default.exclusions,
+              backend: default.backend,
+              root_liveness_interval: default.root_liveness_interval,
+              max_map_directories: default.max_map_directories,
+              cookie_global_cap: default.cookie_global_cap,
+            });
+          }
+        };
+        let os_buffer_bytes = match seq.next_element::<OsBufferBytesValue>()? {
+          Some(value) => value.0,
+          None => {
+            return Ok(WatcherOptions {
+              latency,
+              move_window,
+              event_capacity,
+              os_batch_capacity,
+              os_buffer_bytes: default.os_buffer_bytes,
+              exclusions: default.exclusions,
+              backend: default.backend,
+              root_liveness_interval: default.root_liveness_interval,
+              max_map_directories: default.max_map_directories,
+              cookie_global_cap: default.cookie_global_cap,
+            });
+          }
+        };
+        let exclusions = match seq.next_element::<ExclusionsValue>()? {
+          Some(value) => value.0,
+          None => {
+            return Ok(WatcherOptions {
+              latency,
+              move_window,
+              event_capacity,
+              os_batch_capacity,
+              os_buffer_bytes,
+              exclusions: default.exclusions,
+              backend: default.backend,
+              root_liveness_interval: default.root_liveness_interval,
+              max_map_directories: default.max_map_directories,
+              cookie_global_cap: default.cookie_global_cap,
+            });
+          }
+        };
+        let backend = match seq.next_element::<Backend>()? {
+          Some(value) => value,
+          None => {
+            return Ok(WatcherOptions {
+              latency,
+              move_window,
+              event_capacity,
+              os_batch_capacity,
+              os_buffer_bytes,
+              exclusions,
+              backend: default.backend,
+              root_liveness_interval: default.root_liveness_interval,
+              max_map_directories: default.max_map_directories,
+              cookie_global_cap: default.cookie_global_cap,
+            });
+          }
+        };
+        let root_liveness_interval = match seq.next_element::<RootLivenessIntervalValue>()? {
+          Some(value) => value.0,
+          None => {
+            return Ok(WatcherOptions {
+              latency,
+              move_window,
+              event_capacity,
+              os_batch_capacity,
+              os_buffer_bytes,
+              exclusions,
+              backend,
+              root_liveness_interval: default.root_liveness_interval,
+              max_map_directories: default.max_map_directories,
+              cookie_global_cap: default.cookie_global_cap,
+            });
+          }
+        };
+        let max_map_directories = match seq.next_element::<Option<usize>>()? {
+          Some(value) => value,
+          None => {
+            return Ok(WatcherOptions {
+              latency,
+              move_window,
+              event_capacity,
+              os_batch_capacity,
+              os_buffer_bytes,
+              exclusions,
+              backend,
+              root_liveness_interval,
+              max_map_directories: default.max_map_directories,
+              cookie_global_cap: default.cookie_global_cap,
+            });
+          }
+        };
+        let cookie_global_cap = match seq.next_element::<CookieGlobalCapValue>()? {
+          Some(value) => value.0,
+          None => default.cookie_global_cap,
+        };
+
+        Ok(WatcherOptions {
+          latency,
+          move_window,
+          event_capacity,
+          os_batch_capacity,
+          os_buffer_bytes,
+          exclusions,
+          backend,
+          root_liveness_interval,
+          max_map_directories,
+          cookie_global_cap,
         })
       }
     }
@@ -2470,6 +2658,11 @@ where
 /// value has no attribute of its own to carry a function name), every key is
 /// optional and defaulted from [`RootOptions::new`], and a repeated key is
 /// refused with `duplicate_field`.
+///
+/// The visitor also accepts, through `visit_seq`, the SEQUENCE form the
+/// derived `Serialize` itself emits for a non-self-describing format — the
+/// three fields in declaration order, a short sequence defaulting its tail
+/// exactly as a missing key does.
 #[cfg(feature = "serde")]
 impl<'de> serde::Deserialize<'de> for RootOptions {
   fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -2645,6 +2838,49 @@ impl<'de> serde::Deserialize<'de> for RootOptions {
           interest: interest.unwrap_or(default.interest),
           prune: prune.unwrap_or(default.prune),
           include: include.unwrap_or(default.include),
+        })
+      }
+
+      /// The derive's own SEQUENCE form, for a non-self-describing format: the
+      /// three fields in declaration order through the same bounded wrappers
+      /// the map arm uses, a `None` (short sequence) filling that field and
+      /// every later one from [`RootOptions::default`], and nothing read past
+      /// the last field.
+      fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+      where
+        A: serde::de::SeqAccess<'de>,
+      {
+        let default = RootOptions::default();
+
+        let interest = match seq.next_element::<Interest>()? {
+          Some(value) => value,
+          None => {
+            return Ok(RootOptions {
+              interest: default.interest,
+              prune: default.prune,
+              include: default.include,
+            });
+          }
+        };
+        let prune = match seq.next_element::<PruneValue>()? {
+          Some(value) => value.0,
+          None => {
+            return Ok(RootOptions {
+              interest,
+              prune: default.prune,
+              include: default.include,
+            });
+          }
+        };
+        let include = match seq.next_element::<IncludeValue>()? {
+          Some(value) => value.0,
+          None => default.include,
+        };
+
+        Ok(RootOptions {
+          interest,
+          prune,
+          include,
         })
       }
     }

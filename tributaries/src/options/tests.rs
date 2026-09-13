@@ -1127,6 +1127,194 @@ mod serde_face {
     assert_eq!(texts(parsed.prune()), ["**/node_modules"]);
     assert_eq!(parsed.include().map(texts), Some(std::vec!["**/*.mp4"]));
   }
+
+  /// Yields exactly one element (deserialized through `serde_json::Value`, so
+  /// any field's shape can be produced without a second wire format) and then
+  /// `None` for every call after — the tail-default rule every household's
+  /// `visit_seq` carries is pinned directly against it, since a
+  /// non-self-describing format's own struct decoding has no length prefix to
+  /// shorten (a short buffer there is an EOF error, never a clean end of
+  /// sequence).
+  struct OneThenDone(Option<serde_json::Value>);
+
+  impl<'de> serde::de::SeqAccess<'de> for OneThenDone {
+    type Error = serde_json::Error;
+
+    fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>, Self::Error>
+    where
+      T: serde::de::DeserializeSeed<'de>,
+    {
+      match self.0.take() {
+        Some(value) => seed.deserialize(value).map(Some),
+        None => Ok(None),
+      }
+    }
+  }
+
+  /// The one door back to a struct visitor's private `visit_seq`: every other
+  /// `Deserializer` method is unreachable, since every household here calls
+  /// `deserialize_struct` directly and nothing it reads recurses back into a
+  /// top-level deserializer.
+  struct StructAsSeq(OneThenDone);
+
+  impl<'de> serde::Deserializer<'de> for StructAsSeq {
+    type Error = serde_json::Error;
+
+    fn deserialize_struct<V>(
+      self,
+      _name: &'static str,
+      _fields: &'static [&'static str],
+      visitor: V,
+    ) -> Result<V::Value, Self::Error>
+    where
+      V: serde::de::Visitor<'de>,
+    {
+      visitor.visit_seq(self.0)
+    }
+
+    fn deserialize_any<V>(self, _visitor: V) -> Result<V::Value, Self::Error>
+    where
+      V: serde::de::Visitor<'de>,
+    {
+      unreachable!("this fixture only exercises deserialize_struct")
+    }
+
+    serde::forward_to_deserialize_any! {
+      bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+      bytes byte_buf option unit unit_struct newtype_struct seq tuple
+      tuple_struct map enum identifier ignored_any
+    }
+  }
+
+  /// The derived `Serialize` writes a non-self-describing format's struct as a
+  /// plain SEQUENCE, not the map this face otherwise documents — each
+  /// household's own fields, read out of a self-describing document in their
+  /// declaration order and driven through serde_json's array deserializer,
+  /// exercise that same `visit_seq` arm a non-self-describing format's decoder
+  /// would.
+  #[test]
+  fn a_debounce_config_full_value_round_trips_through_the_sequence_form() {
+    const FIELDS: &[&str] = &["quiet_window", "max_hold", "max_buffered"];
+
+    let config = DebounceConfig::new()
+      .with_quiet_window(Duration::from_millis(250))
+      .with_max_hold(Duration::from_secs(2))
+      .with_max_buffered(64);
+    let json = serde_json::to_value(&config).unwrap();
+    let values: Vec<serde_json::Value> = FIELDS
+      .iter()
+      .map(|field| json.get(field).unwrap().clone())
+      .collect();
+    let parsed =
+      serde_json::from_value::<DebounceConfig>(serde_json::Value::Array(values)).unwrap();
+    assert_eq!(parsed, config);
+  }
+
+  #[test]
+  fn a_debounce_config_short_sequence_defaults_the_tail() {
+    let deserializer = StructAsSeq(OneThenDone(Some(serde_json::json!("250ms"))));
+    let parsed: DebounceConfig = serde::Deserialize::deserialize(deserializer).unwrap();
+    assert_eq!(
+      parsed,
+      DebounceConfig::new().with_quiet_window(Duration::from_millis(250))
+    );
+  }
+
+  #[test]
+  fn a_tributaries_options_full_value_round_trips_through_the_sequence_form() {
+    const FIELDS: &[&str] = &["event_capacity", "command_capacity", "debounce"];
+
+    let options = TributariesOptions::new()
+      .with_event_capacity(NonZeroUsize::new(4096).unwrap())
+      .with_command_capacity(NonZeroUsize::new(8).unwrap())
+      .debounce(
+        DebounceConfig::new()
+          .with_quiet_window(Duration::from_millis(250))
+          .with_max_hold(Duration::from_secs(2))
+          .with_max_buffered(64),
+      );
+    let json = serde_json::to_value(&options).unwrap();
+    let values: Vec<serde_json::Value> = FIELDS
+      .iter()
+      .map(|field| json.get(field).unwrap().clone())
+      .collect();
+    let parsed =
+      serde_json::from_value::<TributariesOptions>(serde_json::Value::Array(values)).unwrap();
+    assert_eq!(parsed, options);
+  }
+
+  #[test]
+  fn a_tributaries_options_short_sequence_defaults_the_tail() {
+    let deserializer = StructAsSeq(OneThenDone(Some(serde_json::json!(4096))));
+    let parsed: TributariesOptions = serde::Deserialize::deserialize(deserializer).unwrap();
+    assert_eq!(
+      parsed,
+      TributariesOptions::new().with_event_capacity(NonZeroUsize::new(4096).unwrap())
+    );
+  }
+
+  #[test]
+  fn a_root_globs_full_value_round_trips_through_the_sequence_form() {
+    const FIELDS: &[&str] = &["prune", "include"];
+
+    let words = RootGlobs::new()
+      .with_prune([glob("**/node_modules"), glob("**/.git")])
+      .with_include([glob("*.mp4")]);
+    let json = serde_json::to_value(&words).unwrap();
+    let values: Vec<serde_json::Value> = FIELDS
+      .iter()
+      .map(|field| json.get(field).unwrap().clone())
+      .collect();
+    let parsed = serde_json::from_value::<RootGlobs>(serde_json::Value::Array(values)).unwrap();
+    assert_eq!(parsed, words);
+  }
+
+  #[test]
+  fn a_root_globs_short_sequence_defaults_the_tail() {
+    let deserializer = StructAsSeq(OneThenDone(Some(serde_json::json!(["**/node_modules"]))));
+    let parsed: RootGlobs = serde::Deserialize::deserialize(deserializer).unwrap();
+    assert_eq!(
+      parsed,
+      RootGlobs::new().with_prune([glob("**/node_modules")])
+    );
+  }
+
+  #[test]
+  fn a_watch_options_full_value_round_trips_through_the_sequence_form() {
+    const FIELDS: &[&str] = &["interest", "debounce", "prune", "include"];
+
+    let options: WatchOptions<OsString> = WatchOptions::new()
+      .with_interest(Interest::none().with_created().with_moved())
+      .with_debounce(Debounce::Custom(
+        DebounceConfig::new()
+          .with_quiet_window(Duration::from_millis(250))
+          .with_max_hold(Duration::from_secs(2))
+          .with_max_buffered(64),
+      ))
+      .with_prune([glob("**/node_modules")])
+      .with_include([glob("**/*.mp4")]);
+    let json = serde_json::to_value(&options).unwrap();
+    let values: Vec<serde_json::Value> = FIELDS
+      .iter()
+      .map(|field| json.get(field).unwrap().clone())
+      .collect();
+    let parsed =
+      serde_json::from_value::<WatchOptions<OsString>>(serde_json::Value::Array(values)).unwrap();
+    assert_eq!(parsed.interest(), options.interest());
+    assert_eq!(parsed.debounce(), options.debounce());
+    assert_eq!(texts(parsed.prune()), texts(options.prune()));
+    assert_eq!(parsed.include().map(texts), options.include().map(texts));
+  }
+
+  #[test]
+  fn a_watch_options_short_sequence_defaults_the_tail() {
+    let deserializer = StructAsSeq(OneThenDone(Some(serde_json::json!(["created"]))));
+    let parsed: WatchOptions<OsString> = serde::Deserialize::deserialize(deserializer).unwrap();
+    assert_eq!(parsed.interest(), Interest::none().with_created());
+    assert_eq!(parsed.debounce(), Debounce::default());
+    assert!(parsed.prune().is_empty());
+    assert_eq!(parsed.include(), None);
+  }
 }
 
 /// The `clap` face on the umbrella's own option households.
