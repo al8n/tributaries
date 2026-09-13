@@ -404,6 +404,12 @@ pub enum RequestOutcome {
 /// back for them — and a shrink touches every barrier on the root, for the reason
 /// [`Watcher::set_cover`] gives. No variant here reports it — the barrier's own
 /// caller is the one told, on its own reply or its own stream.
+///
+/// A domination does NOT degrade this outcome. A domination `Rescan` is not a
+/// coverage loss of the applied cover: it tells the dominated barrier's caller
+/// to re-read, it does not say the cover just applied has a hole. A shrink that
+/// retires every barrier on the root still settles
+/// [`Applied`](Self::Applied) when its own window was otherwise clean.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CoverOutcome {
@@ -416,11 +422,7 @@ pub enum CoverOutcome {
   /// The reconcile settled, but coverage loss was signaled since the root's
   /// last settled window (a failed re-arm, an unreadable re-arm read, an
   /// overflow, an unclassifiable directory entry the root does not yet cover,
-  /// the root tearing down mid-fence, OR a shrink that DOMINATES a barrier
-  /// [`sync_root`](Watcher::sync_root) currently has in flight on the pruned
-  /// ground — the retirement stands its covering `Rescan` INSIDE this
-  /// reconcile's own settle window, and a `Rescan` in the window is exactly
-  /// the loss this outcome reports) — the loss memory is
+  /// the root tearing down mid-fence) — the loss memory is
   /// per-root, so a loss landing just BEFORE the reconcile degrades it too:
   /// coverage may be partial, and a covering
   /// [`Rescan`](crate::EventKind::Rescan) dominating the gap has been

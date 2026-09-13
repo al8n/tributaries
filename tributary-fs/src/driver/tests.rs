@@ -1286,9 +1286,30 @@ async fn a_retired_scope_s_probe_stays_counted_until_its_thread_exits() {
 /// samples the root through the crawl's own path, not through `hold_refreshes`.
 /// It is told its coverage is unproven, and with the root already `Missing` it
 /// may legitimately die from that recovery before the gate ever releases —
-/// natively the decline usually lands after the staging assertion below, but
-/// under a slower binary it can land before. So the staging assertion bounds
-/// only the parked population, not that scope.
+/// the decline is driven from this test's own thread, but the crawl its
+/// covering `Rescan` arms is a separate dispatched effect and can still land
+/// before or after the staging assertion below settles. So the staging
+/// assertion bounds only the parked population, not that scope.
+///
+/// The rig's `root_liveness_interval` is `Duration::ZERO` — the tick is OFF —
+/// and every probe here is driven through [`tick_liveness`]:
+/// [`Command::DebugTickLiveness`] forces one scope's deadline due and runs it
+/// through the same `on_timeout` the driver's own periodic timer would, and
+/// its reply barriers on the resulting dispatch (or decline) actually landing
+/// in `DriverCore`'s bookkeeping. `LivenessProbes::claim` runs synchronously
+/// inside that dispatch, so the OUTSTANDING count is exact the instant the
+/// budget-filling loop below returns — no settle, no wall clock, and no race
+/// over which of the `ticked` roots finds the budget full: it is always the
+/// last one ticked, because the first `MAX_LIVENESS_PROBES` are ticked first
+/// and every one of their probes parks on the held gate before this test ticks
+/// the next.
+///
+/// Revert witness: this cell used to stage the budget by waiting on
+/// `MAX_LIVENESS_PROBES` real wall-clock ticks racing sixty-four parked OS
+/// threads (`settle_probes_within`) — on a slow (sanitizer-instrumented)
+/// binary the 400-round window it was widened to could still expire before
+/// all sixty-four ticks and thread-parks landed. Reverting the seam-driven
+/// fill below to that wait reproduces the timeout.
 ///
 /// not(miri): the claim needs `MAX_LIVENESS_PROBES` real parked threads, and
 /// sixty-four of them under an interpreter is a shard timeout rather than a test.
@@ -1301,38 +1322,42 @@ async fn a_tick_at_the_probe_budget_dispatches_nothing_and_retries_later() {
   let registry = RecordingRegistry::default();
   let mut roots: Vec<String> = (0..ticked).map(|index| format!("/r{index}")).collect();
   roots.push("/late".to_owned());
-  let rig = ticking_rig_over(Duration::from_millis(20), registry.clone(), &roots);
+  let rig = ticking_rig_over(Duration::ZERO, registry.clone(), &roots);
+  let mut scopes = Vec::with_capacity(ticked);
   for root in &roots[..ticked] {
-    let _ = watch(&rig, root).await;
+    scopes.push(watch(&rig, root).await);
   }
 
   // Every root vanishes, and every probe from here parks before it can say so.
   let gate = rig.fs.hold_refreshes();
   rig.fs.set_root_liveness(RootLiveness::Missing);
 
-  // Widened past the shared 200-round window: this stages sixty-four real OS
-  // threads actually reaching a parked state inside the fake's refresh, and
-  // under a slow (sanitizer-instrumented) binary that outruns the round
-  // count's fixed budget well before it outruns wall-clock patience. The
-  // round count is what has to grow here — see `settle_probes_within` — the
-  // same reasoning `interpreted_rounds` documents for an interpreter, applied
-  // to a different kind of slow binary. Mirrors this same test's own final
-  // assertion, which already spends this wider budget.
+  // Fill the budget deterministically: tick exactly the first
+  // `MAX_LIVENESS_PROBES` scopes through the seam, one dispatch each. Every one
+  // of those probes parks on the held gate before it can answer, so none frees
+  // a slot for the next — the outstanding count is exactly the budget the
+  // instant this loop returns.
+  for &scope in &scopes[..MAX_LIVENESS_PROBES] {
+    tick_liveness(&rig, scope).await;
+  }
   assert!(
-    settle_probes_within(&rig, 400, MAX_LIVENESS_PROBES).await,
+    probes_hold_at(&rig, MAX_LIVENESS_PROBES).await,
     "staging: the budget fills"
   );
+  // The one scope left with no slot: with the budget already exactly full,
+  // ticking it is deterministically declined rather than dispatched.
+  let declined = scopes[MAX_LIVENESS_PROBES];
+  tick_liveness(&rig, declined).await;
   assert!(
     probes_hold_at(&rig, MAX_LIVENESS_PROBES).await,
     "and it holds: the scope whose tick found the budget full dispatched nothing"
   );
-  // No PARKED scope can die while its probe is parked, but the one scope whose
-  // tick finds the budget full (which of the `ticked` roots that is is a race,
-  // not fixed) is never parked on this gate at all: its decline is routed
-  // through the loss funnel's covering Rescan (c5a1a68), sampled through the
-  // crawl's own path, so with the root already Missing it may legitimately die
-  // from that recovery before this gate ever releases. That declined scope is
-  // the only candidate; every other (parked) scope must still be alive.
+  // No PARKED scope can die while its probe is parked, but the declined scope
+  // is never parked on this gate at all: its decline is routed through the
+  // loss funnel's covering Rescan (c5a1a68), sampled through the crawl's own
+  // path, so with the root already Missing it may legitimately die from that
+  // recovery before this gate ever releases. That declined scope is the only
+  // candidate; every other (parked) scope must still be alive.
   assert!(
     registry.dead().len() <= 1,
     "no scope with a parked probe can die while every probe is parked (dead: {:?})",
@@ -1359,14 +1384,32 @@ async fn a_tick_at_the_probe_budget_dispatches_nothing_and_retries_later() {
     .await
     .unwrap()
     .expect("a root registers even with every probe parked");
+  let late = grant.scope();
   grant.defuse();
 
   gate.release();
+  // Two scopes have no probe of their own outstanding to answer on release:
+  // `declined` (the budget turned it away) and `late` (its birth refresh was
+  // the one declined, so it never had a deadline at all) — and with the tick
+  // off (`Duration::ZERO`), neither one re-arms itself. Both are re-ticked
+  // through the seam until every death is observed; the sixty-four already
+  // parked need no help, since the gate's release is what lets their own real
+  // threads answer. That answer is still a genuine eventual wait — real OS
+  // threads exiting after the release — never a wall-clock TICK.
   let expected = ticked + 1;
+  let mut settled = false;
+  for _ in 0..interpreted_rounds(400) {
+    if registry.dead().len() == expected {
+      settled = true;
+      break;
+    }
+    tick_liveness(&rig, declined).await;
+    tick_liveness(&rig, late).await;
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+  }
   assert!(
-    settle_within(interpreted_rounds(400), || registry.dead().len()
-      == expected)
-    .await,
+    settled,
     "every scope dies once the probes answer — the scopes the budget turned away \
      ticked again and got probes of their own (dead: {}, expected {expected})",
     registry.dead().len()
@@ -1414,50 +1457,68 @@ async fn drain_events(rig: &Rig) {
 ///
 /// ONCE is the second half. The fact does not become more true each interval,
 /// and a `Rescan` per tick against a wedged filesystem is a re-enumeration storm
-/// the subscriber pays for. The window below spans many intervals, so a per-tick
-/// signal would be counted as such.
+/// the subscriber pays for. Read against many further ticks of the SAME
+/// declined scope, so a per-tick signal would be counted as such.
 ///
 /// Revert witness: drop the loss funnel from the budget arm of
 /// `on_refresh_declined` and no `Rescan` arrives at all until the gate opens;
-/// drop the once-per-episode latch and the count runs with the intervals.
+/// drop the once-per-episode latch and the count runs with the ticks.
 ///
 /// not(miri): the claim needs `MAX_LIVENESS_PROBES` real parked threads, exactly
 /// as its sibling above.
 ///
-/// THE FIRST claim used to wait on the turned-away scope's own next real-clock
-/// interval landing — an eventual `settle_within` whose only trigger was a
-/// wall-clock tick racing sixty-four parked OS threads. On a slow hosted
-/// runner that tick can land outside any window a suite is willing to spend
-/// (three widenings of that window were not enough), so it is driven through
-/// [`tick_liveness`] instead: deterministic and owned by the test, not the
-/// runner's scheduler. Only the DELIVERY of what the tick produces onto the
-/// event channel stays an eventual read (a plain drain here, since the seam's
-/// own reply already barriers the drain against the tick).
+/// Nothing in this cell rides a real-clock interval. The rig's
+/// `root_liveness_interval` is `Duration::ZERO` — `DriverCore::arm_liveness`
+/// disables the periodic tick entirely for a zero interval — and every probe,
+/// staging the budget AND the declined scope's own retries, is driven through
+/// [`tick_liveness`] ([`Command::DebugTickLiveness`]): deterministic and owned
+/// by the test, never the runner's scheduler.
+///
+/// Revert witness (superseding an earlier one): this cell used to stage the
+/// budget by waiting on a wall-clock tick racing sixty-four parked OS threads
+/// (`settle_probes_within` against a real `root_liveness_interval`). Three
+/// widenings of that wait's window were not enough — on a slow or loaded
+/// runner a real tick could decline the sixty-fifth scope during STAGING,
+/// before the gate that holds `hold_refreshes` was even installed, consuming
+/// the FIRST claim's own covering `Rescan` in the baseline drain and leaving
+/// nothing for the forced tick below to observe (the decline is latched once
+/// per episode). Reverting the seam-driven fill and the seam-driven repeat
+/// loop below to a wall-clock wait reproduces both failure modes.
 #[cfg(not(miri))]
 #[tokio::test]
 async fn a_probe_declined_at_the_budget_reports_the_scope_unproven_once() {
   let ticked = MAX_LIVENESS_PROBES + 1;
   let registry = RecordingRegistry::default();
   let roots: Vec<String> = (0..ticked).map(|index| format!("/r{index}")).collect();
-  let rig = ticking_rig_over(Duration::from_millis(20), registry.clone(), &roots);
+  let rig = ticking_rig_over(Duration::ZERO, registry.clone(), &roots);
   let mut scopes = Vec::with_capacity(ticked);
   for root in &roots {
     scopes.push(watch(&rig, root).await);
   }
   // The baseline: every registration window's closing `Rescan` is spent, so what
-  // the window below counts came from the decline and from nothing else.
+  // the window below counts came from the decline and from nothing else. Safe
+  // to drain before any tick runs — the rig's interval is zero, so nothing here
+  // has ticked on its own.
   drain_events(&rig).await;
 
   // Every root vanishes, and every probe from here parks before it can say so.
   let gate = rig.fs.hold_refreshes();
   rig.fs.set_root_liveness(RootLiveness::Missing);
-  assert!(
-    settle_probes_within(&rig, 400, MAX_LIVENESS_PROBES).await,
-    "staging: the budget fills"
-  );
+
+  // Fill the budget deterministically: tick exactly the first
+  // `MAX_LIVENESS_PROBES` scopes through the seam, one dispatch each.
+  // `LivenessProbes::claim` runs synchronously inside every `tick_liveness`
+  // call, so the outstanding count is exactly the budget the instant this loop
+  // returns — no settle, no wall clock, and no race over which scope is left
+  // short a probe: it is always the last one, `scopes[MAX_LIVENESS_PROBES]`,
+  // because every one of the first sixty-four parks on the held gate before
+  // this loop ticks the next.
+  for &scope in &scopes[..MAX_LIVENESS_PROBES] {
+    tick_liveness(&rig, scope).await;
+  }
   assert!(
     probes_hold_at(&rig, MAX_LIVENESS_PROBES).await,
-    "and it holds: one scope is left with no slot at all"
+    "staging: the budget fills"
   );
   assert!(
     registry.dead().is_empty(),
@@ -1468,16 +1529,16 @@ async fn a_probe_declined_at_the_budget_reports_the_scope_unproven_once() {
   // still full — a delta against the stream this cell emptied, not a count of
   // everything the rig ever said.
   //
-  // Which of the sixty-five scopes the budget left short a probe is a race, not
-  // fixed (staged above only as an aggregate count), so the tick is forced on
-  // every one of them: the sixty-four already parked coalesce onto their own
-  // outstanding probe exactly as a real tick would (a no-op here), and the one
-  // left with none actually declines. `tick_liveness` replies only once that
+  // With the budget already exactly full, ticking the one scope left with no
+  // slot deterministically declines it. `tick_liveness` replies only once that
   // decline — and the `Rescan` it mints — has been fully drained by the driver
-  // loop, so the channel already carries it by the time the loop below reads.
-  for &scope in &scopes {
-    tick_liveness(&rig, scope).await;
-  }
+  // loop, so the channel already carries it by the time the read below runs.
+  let declined = scopes[MAX_LIVENESS_PROBES];
+  tick_liveness(&rig, declined).await;
+  assert!(
+    probes_hold_at(&rig, MAX_LIVENESS_PROBES).await,
+    "and it holds: one scope is left with no slot at all"
+  );
   let mut opened = 0usize;
   while let Ok((_, _, change)) = rig.events.try_recv() {
     if change.kind().is_rescan() {
@@ -1494,20 +1555,19 @@ async fn a_probe_declined_at_the_budget_reports_the_scope_unproven_once() {
     "and it is a degradation, not a terminal — nothing died"
   );
 
-  // THEN: nothing more, across many further intervals of the same episode. The
-  // budget is stable (every slot is parked, so no scope can free one and no new
-  // scope can be turned away), so a second cover here could only be the same
-  // fact restated — a re-enumeration storm on top of a wedged filesystem.
-  drain_events(&rig).await;
+  // THEN: nothing more, across many further ticks of the SAME declined scope in
+  // the same episode. The once-per-episode latch (`budget_lossy`) means a
+  // repeated decline of the scope the budget already turned away mints no
+  // second `Rescan` — driven directly, rather than waiting on further
+  // wall-clock intervals to make the same claim.
+  for _ in 0..16 {
+    tick_liveness(&rig, declined).await;
+  }
   let mut repeats = 0usize;
-  for _ in 0..interpreted_rounds(120) {
-    while let Ok((_, _, change)) = rig.events.try_recv() {
-      if change.kind().is_rescan() {
-        repeats += 1;
-      }
+  while let Ok((_, _, change)) = rig.events.try_recv() {
+    if change.kind().is_rescan() {
+      repeats += 1;
     }
-    tokio::task::yield_now().await;
-    tokio::time::sleep(Duration::from_millis(5)).await;
   }
   assert_eq!(
     repeats, 0,
@@ -1518,11 +1578,25 @@ async fn a_probe_declined_at_the_budget_reports_the_scope_unproven_once() {
   // The budget frees: every parked probe answers, the turned-away scope ticks
   // again, and every root's death is finally observed.
   gate.release();
+  // The declined scope has no probe of its own outstanding to answer on
+  // release, and with the tick off (`Duration::ZERO`) it never re-arms itself
+  // — it is re-ticked through the seam until its death is observed. The
+  // sixty-four already-parked scopes need no help: the gate's release is what
+  // lets their own real threads answer, which is a genuine eventual wait (real
+  // OS threads exiting) rather than a wall-clock TICK.
   let expected = ticked;
+  let mut settled = false;
+  for _ in 0..interpreted_rounds(400) {
+    if registry.dead().len() == expected {
+      settled = true;
+      break;
+    }
+    tick_liveness(&rig, declined).await;
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+  }
   assert!(
-    settle_within(interpreted_rounds(400), || registry.dead().len()
-      == expected)
-    .await,
+    settled,
     "every scope dies once the probes answer — the one the budget turned away \
      ticked again and got a probe of its own (dead: {}, expected {expected})",
     registry.dead().len()
@@ -3959,11 +4033,12 @@ mod descending {
 
     /// Shrinks to `/r/keep` and returns the settled verdict.
     ///
-    /// A shrink that dominates a live barrier settles `Degraded` rather than
-    /// `Applied`, and honestly so: the retirement stands its covering `Rescan`
-    /// INSIDE the reconcile's own settle window, and a `Rescan` in the window is
-    /// exactly the loss that verdict reports. The caller is told to re-enumerate,
-    /// which is what a dominated barrier on that ground means for it.
+    /// A shrink that dominates a live barrier settles `Applied`: a domination
+    /// `Rescan` is not a coverage loss of the applied cover — it tells the
+    /// dominated barrier's caller to re-read, it does not say the cover the
+    /// shrink just applied has a hole — so it marks no fence lossy and rewinds
+    /// no settle floor. The dominated CALLER is told, on its own reply and its
+    /// own stream; the shrinking caller is told its cover applied.
     async fn shrink_verdict(rig: &Rig, scope: ScopeId) -> CoverOutcome {
       let ack = send_set_cover(rig, scope, &["/r/keep"]).await;
       resolved(ack).await
@@ -4007,9 +4082,9 @@ mod descending {
 
       assert_eq!(
         shrink_verdict(&rig, scope).await,
-        CoverOutcome::Degraded,
+        CoverOutcome::Applied,
         "the domination's own covering `Rescan` lands inside the reconcile's \
-         settle window, so the verdict reports the loss it is"
+         settle window and is not a loss: the cover the caller asked for applies"
       );
 
       assert!(
@@ -4149,9 +4224,9 @@ mod descending {
 
       assert_eq!(
         shrink_verdict(&rig, scope).await,
-        CoverOutcome::Degraded,
+        CoverOutcome::Applied,
         "the unplaceable drop's own domination stands its covering `Rescan` \
-         inside this reconcile's settle window too, so the verdict reports it"
+         inside this reconcile's settle window too, and is no more a loss there"
       );
 
       assert!(

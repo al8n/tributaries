@@ -5184,6 +5184,76 @@ impl Monitor {
     self.settle_bridges();
   }
 
+  /// Emits the located [`Rescan`](ChangeKind::Rescan) one dominated sync barrier
+  /// is retired with, and reconciles nothing itself — though for the held-subtree
+  /// case below, `book_hold` schedules the pairing's own re-scan by proxy:
+  /// whichever move eventually resolves the hold emits its own `Rescan` and
+  /// re-arms the destination on the pairing's behalf.
+  ///
+  /// A DOMINATION `Rescan` is not a coverage loss: it tells the dominated
+  /// barrier's caller to re-read, it does not say the watched world lost
+  /// coverage. So this seat mints the instruction and stops there.
+  /// [`on_overflow`](Self::on_overflow) — the other way a caller turns a
+  /// [`Scope`] slice into a `Rescan` — additionally RECOVERS the watch set for
+  /// that slice: it re-enumerates in re-arm mode (or re-proves every binding),
+  /// which re-installs every directory the slice no longer holds a watch on.
+  /// That is exactly right for a loss and exactly wrong here: the caller's own
+  /// cover reconcile is what released those watches, and the recovery would
+  /// re-arm the ground the caller had just asked to stop watching.
+  ///
+  /// The instruction carries every delivery property a located `Rescan` minted
+  /// anywhere else carries — the same scope attribution, the same epoch bump
+  /// (so it strictly dominates every change the consumer already holds and
+  /// every later one for the scope), the same dedup, the same
+  /// [`Scope::Subtree`] placement guard against a stale pre-move path (below)
+  /// — EXCEPT the bridge window's loss accounting: this mints through
+  /// `mint_rescan`, not `emit_rescan`, because a domination is not a loss and
+  /// must not supply the window's loss half (see `mint_rescan`'s doc for why).
+  ///
+  /// Reports the [`ChangeId`] it queued, or [`None`] where nothing was queued:
+  /// an identical `Rescan` already stands undelivered for this ground, the
+  /// slice names a scope or watch this Monitor does not cover, or (for
+  /// [`Scope::Subtree`]) the watch sits inside a held move source, in which
+  /// case the pairing that eventually resolves the hold owes the retirement's
+  /// `Rescan` instead. A backend-wide slice ([`Scope::All`]) names no one
+  /// barrier's ground and is never one of these retirements; it queues
+  /// nothing.
+  #[cfg_attr(not(tarpaulin), inline)]
+  pub fn cover_domination(&mut self, scope: Scope) -> Option<ChangeId> {
+    match scope {
+      Scope::All => None,
+      Scope::Root(scope_id) => {
+        let root = *self.roots.get(&scope_id)?;
+        self.mint_rescan(scope_id, self.location_of(root))
+      }
+      Scope::Subtree(sub) => {
+        let watch = sub.watch();
+        // Mirrors `on_overflow`'s `Scope::Subtree` placement guard: a watch
+        // sitting inside a held move source would reconstruct through the
+        // source's stale pre-move parent link, so minting the Rescan here
+        // would land it at ground the subtree has already left. Book the
+        // hold instead of minting — the pairing that eventually resolves it
+        // owes the destination a Rescan and a re-arm — and queue nothing.
+        // Only the placement guard is mirrored, not `on_overflow`'s recovery
+        // half (`dirty_pending_sources_touching`, `mark_enumerate_dirty`, the
+        // re-arm): a domination reconciles nothing directly of its own.
+        //
+        // This guard is currently unreachable from the only in-tree caller:
+        // `covering_rescan` always passes the scope's root watch, never a
+        // held source, so `in_held_subtree` never matches here today. It is
+        // kept for parity with `on_overflow`'s guard against the day a
+        // non-root caller reaches this arm.
+        if let Some(source) = self.in_held_subtree(watch) {
+          self.book_hold(source);
+          return None;
+        }
+        let scope_id = self.scope_of(watch)?;
+        let at = self.location_of(watch).join(sub.descent());
+        self.mint_rescan(scope_id, at)
+      }
+    }
+  }
+
   /// Marks every held move source in `scope` (or all held sources, when `None`) dirtied,
   /// so its pairing reparent re-scans and re-arms the destination. A root/all overflow
   /// re-arms roots and can build temporary destination coverage for an in-flight move;
@@ -6946,12 +7016,48 @@ impl Monitor {
     next
   }
 
-  fn emit_rescan(&mut self, scope: ScopeId, location: Location) {
+  /// Queues one LOSS `Rescan` for `scope` at `location` and reports the
+  /// [`ChangeId`] it minted — [`None`] where an identical still-queued
+  /// instruction already stands for the same ground, whose single generation
+  /// speaks for the whole contiguous run.
+  ///
+  /// This is the bridge window's loss-reporting seat: every caller here is
+  /// telling the scope's bridge accounting that a `Rescan` — a loss — passed,
+  /// so [`bridge_saw_rescan`](Self::bridge_saw_rescan) runs before anything
+  /// else. [`cover_domination`](Self::cover_domination) mints its retirement
+  /// `Rescan` through [`mint_rescan`](Self::mint_rescan) directly, bypassing
+  /// this seat, because a DOMINATION is not a loss and must not supply the
+  /// window's loss half — see `mint_rescan`'s doc for why that is load-bearing
+  /// and not just a naming difference.
+  fn emit_rescan(&mut self, scope: ScopeId, location: Location) -> Option<ChangeId> {
     // The bridge window learns of the loss FIRST, before the coalesce check:
     // a trigger whose `Rescan` folds into a still-queued twin is still a loss
     // in this window (the twin is undelivered, so the window's closing
     // `Rescan` must still postdate it).
     self.bridge_saw_rescan(scope);
+    self.mint_rescan(scope, location)
+  }
+
+  /// Queues one `Rescan` for `scope` at `location` and reports the
+  /// [`ChangeId`] it minted — [`None`] where an identical still-queued
+  /// instruction already stands for the same ground, whose single generation
+  /// speaks for the whole contiguous run. Mints ONLY: the scope clamp, the
+  /// attribution, the epoch bump, the dedup — everything
+  /// [`emit_rescan`](Self::emit_rescan) does except the bridge window's loss
+  /// accounting ([`bridge_saw_rescan`](Self::bridge_saw_rescan)).
+  ///
+  /// That omission is deliberate. The bridge conjunction (`saw_rescan &&
+  /// fresh_rearm`, see [`BridgeFlags`]) fires a CLOSING `Rescan` at the
+  /// window's settle edge ([`settle_bridges`](Self::settle_bridges)) under a
+  /// FRESH [`ChangeId`] — one a domination's own retirement latch does not
+  /// cover. If a domination set `saw_rescan`, that closing `Rescan` would
+  /// walk straight past the latch and route as an ordinary loss, reintroducing
+  /// — one layer up, at the bridge instead of at the routing seat — the exact
+  /// degrade-and-rewind the domination exemption exists to remove.
+  /// [`cover_domination`](Self::cover_domination) is this seat's one caller;
+  /// every other minting site wants the bridge accounting and goes through
+  /// [`emit_rescan`](Self::emit_rescan) instead.
+  fn mint_rescan(&mut self, scope: ScopeId, location: Location) -> Option<ChangeId> {
     // A `Rescan` IS the reconciliation trigger: bump the generation FIRST so the Rescan,
     // and every later change for this scope, strictly dominates what the consumer holds.
     // But the coalesce is decided BEFORE the bump: a trigger whose Rescan would coalesce
@@ -6961,14 +7067,16 @@ impl Monitor {
     // ever carries a generation that no delivered Rescan announced. The decision is a
     // pure read of the event queue, so `emit` re-running it below cannot disagree.
     if self.would_coalesce(scope, &location, &ChangeKind::Rescan) {
-      return;
+      return None;
     }
     self.bump_epoch(scope);
     // A `Rescan` bypasses the filter on its own kind, so it needs no evidence
     // to be admitted.
-    self.emit(scope, location, ChangeKind::Rescan, Evidence::new(), None);
+    self.emit(scope, location, ChangeKind::Rescan, Evidence::new(), None)
   }
 
+  /// Queues one change and reports the [`ChangeId`] it minted, or [`None`]
+  /// where the delivery filter or the dedup took it.
   fn emit(
     &mut self,
     scope: ScopeId,
@@ -6976,7 +7084,7 @@ impl Monitor {
     kind: ChangeKind,
     evidence: Evidence,
     is_dir: Option<bool>,
-  ) {
+  ) -> Option<ChangeId> {
     // The delivery filter: narrow to the kinds the consumer registered for. The backend
     // was subscribed to a coverage superset (see `coverage_mask`), so unrequested kinds
     // are expected here and dropped — EXCEPT `Rescan`, the no-silent-loss escape, which
@@ -6999,14 +7107,15 @@ impl Monitor {
     // turns drop into deliver, and over-delivery is the direction the `Interest`
     // contract already allows.
     if !wanted && !evidence.admits(interest) {
-      return;
+      return None;
     }
     if self.would_coalesce(scope, &location, &kind) {
-      return;
+      return None;
     }
     let id = self.next_change_id();
     let change = Change::new(id, scope, location, kind, self.epoch_of(scope), is_dir);
     self.events.push_back(change);
+    Some(id)
   }
 
   /// Whether a change of `kind` at `location` would coalesce into the most-recent

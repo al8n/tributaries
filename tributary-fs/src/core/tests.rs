@@ -1223,6 +1223,7 @@ fn identity_minting_respects_devices_and_mounts() {
     include: None,
     markers: BTreeMap::new(),
     barrier_epoch: BarrierEpoch::BIRTH,
+    dominating_rescans: BTreeSet::new(),
   };
   let fid = NonZeroU64::new(7);
   assert!(mint(&state, Path::new("/r/a"), fid, None).is_some());
@@ -1267,6 +1268,7 @@ fn blind_mount_table_refuses_event_side_trust() {
     include: None,
     markers: BTreeMap::new(),
     barrier_epoch: BarrierEpoch::BIRTH,
+    dominating_rescans: BTreeSet::new(),
   };
   let fid = NonZeroU64::new(7);
   assert!(
@@ -3033,6 +3035,7 @@ mod lowering {
       include: None,
       markers: BTreeMap::new(),
       barrier_epoch: BarrierEpoch::BIRTH,
+      dominating_rescans: BTreeSet::new(),
     }
   }
 
@@ -9592,15 +9595,37 @@ mod descending {
       );
     }
 
-    /// Funnel 7 and funnel 3 on one `Rescan`: the overlap is real, it names ONE
-    /// ground, and the drain coalesces the two moves rather than retiring the
+    /// The scope's watch standing at `path`, as the core's own map places it.
+    fn watch_at(core: &DriverCore, scope: ScopeId, path: &str) -> WatchId {
+      let state = core.scopes.get(&scope).expect("a live scope");
+      core
+        .watch_scopes
+        .iter()
+        .find(|(watch, owner)| {
+          **owner == scope && core.path_of(state, **watch).as_deref() == Some(Path::new(path))
+        })
+        .map(|(watch, _)| *watch)
+        .expect("a watch stands at this path")
+    }
+
+    /// Funnel 7 and funnel 3 on one LOSS `Rescan`: the overlap is real, it names
+    /// ONE ground, and the drain coalesces the two moves rather than retiring the
     /// same barrier twice. Documented rather than deduped — deleting either
     /// funnel would leave the other's population uncovered.
+    ///
+    /// Driven by an unrepresentable name at `/r/keep`, which escalates a located
+    /// `Rescan` of that directory through the feed funnel — a real loss, so the
+    /// routed `Rescan` degrades the scope's claim and bumps again.
     #[test]
-    fn an_overflow_rescan_bumps_both_funnels_at_one_coalesced_ground() {
+    fn a_loss_rescan_bumps_both_funnels_at_one_coalesced_ground() {
       let (mut core, scope, _root) = shrunk_to_keep();
+      let keep = watch_at(&core, scope, "/r/keep");
       let before = quiesce(&mut core, scope);
-      core.stand_covering_rescan(scope, Path::new("/r/keep/deep"), at(1));
+      core.on_inotify_events(
+        scope,
+        vec![inotify(&[keep], IN_CREATE, 0, Some(&[0xFF, 0xFE]))],
+        at(1),
+      );
       assert_eq!(
         epoch(&core, scope).0,
         before.0 + 2,
@@ -9615,6 +9640,142 @@ mod descending {
         }],
         "and both named the same ground, so the drain sees one move"
       );
+    }
+
+    /// …and a DOMINATION `Rescan` passes the feed funnel ALONE. A domination is
+    /// not a coverage loss of the applied cover — it tells the dominated
+    /// barrier's caller to re-read, it does not say the cover has a hole — so
+    /// there is no claim degrade for funnel 7 to fire on, and the claim the last
+    /// reconcile recorded stands untouched.
+    ///
+    /// The contrast with the cell above is the whole rule: same ground, same
+    /// covering instruction on the stream, one funnel instead of two.
+    #[test]
+    fn a_domination_rescan_passes_the_feed_funnel_alone_and_degrades_no_claim() {
+      let (mut core, scope, _root) = shrunk_to_keep();
+      let before = quiesce(&mut core, scope);
+      core.stand_covering_rescan(scope, Path::new("/r/keep/deep"), at(1));
+      assert_eq!(
+        epoch(&core, scope).0,
+        before.0 + 1,
+        "the feed funnel moved the stamp, and the degrade never ran"
+      );
+      assert_eq!(
+        core.take_barrier_moves(),
+        vec![BarrierMove {
+          scope,
+          location: ground("/r/keep"),
+          rescan_stands: true,
+        }],
+        "the one move names the retired obligation's ground and stands its \
+         `Rescan`"
+      );
+      let effects = drain(&mut core);
+      let changes = emits(&effects);
+      assert!(
+        changes.iter().any(|change| change.kind().is_rescan()),
+        "the dominated caller is still instructed to re-read: {changes:?}"
+      );
+      let state = core.scopes.get(&scope).unwrap();
+      assert_eq!(
+        state.applied_cover,
+        Some(vec![p("/r/keep")]),
+        "and the recorded claim is neither degraded nor folded"
+      );
+      assert_eq!(state.settle_floor, Some(vec![p("/r/keep")]));
+    }
+
+    /// A domination `Rescan` stood INSIDE a reconcile's own settle window leaves
+    /// that window clean: the fence settles `Applied` and the cover the caller
+    /// asked for is the cover that stands.
+    ///
+    /// This is the shape the first Linux CI found: a shrink dominated a live
+    /// barrier, the retirement's `Rescan` landed inside the shrink's own window,
+    /// the verdict came back `Degraded`, the rewind restored the pre-shrink
+    /// claim, and the recovery re-armed exactly the ground the shrink had just
+    /// pruned — the cover a caller asked for undone by the instruction telling
+    /// another caller its barrier had moved.
+    ///
+    /// Revert witness: stand the retirement's `Rescan` through
+    /// [`Planned::Over`] and this fence settles `Degraded` with the claim
+    /// rewound, which is the sibling cell below.
+    ///
+    /// A second, narrower revert witness lives one crate down: `on_set_cover`
+    /// above regrows `/r/drop` (a fresh install — the window's `fresh_rearm`
+    /// half), and `stand_covering_rescan` mints the domination INSIDE that
+    /// same window. If `Monitor::cover_domination` minted through
+    /// `emit_rescan` instead of `mint_rescan` (i.e. still set
+    /// `bridge_saw_rescan`), the bridge conjunction (`saw_rescan &&
+    /// fresh_rearm`) would fire its own closing `Rescan` at the settle edge —
+    /// under a FRESH `ChangeId` the retirement's latch does not cover — and
+    /// this cell would fail exactly as the shape above describes: `Degraded`,
+    /// claim rewound.
+    #[test]
+    fn a_domination_inside_a_reconcile_window_settles_applied_with_the_cover_kept() {
+      let (mut core, scope, _root) = shrunk_to_keep();
+      assert_eq!(
+        core.on_set_cover(scope, &[p("/r/keep"), p("/r/drop")]),
+        CoverReconcile::Reconciling
+      );
+      let fence = core.open_cover_fence(scope);
+
+      // Nothing is drained between here and the cascade: the grow's own arm and
+      // read effects are still queued, and draining them would leave the scope
+      // with re-arm work nothing ever answers. The sibling cells above are where
+      // the instruction itself is read off the stream.
+      core.stand_covering_rescan(scope, Path::new("/r/keep/deep"), at(1));
+      run_cascade(&mut core, &BTreeMap::from([("/r", root_listing())]));
+      core.mark_cut_inflight(scope, 1);
+      core.prove_cut(scope, 1);
+      assert_eq!(
+        core.poll_cover_settlements(DRAINED),
+        vec![(fence, CoverSettle::Applied)],
+        "a domination in the window is not a loss in the window"
+      );
+      let state = core.scopes.get(&scope).unwrap();
+      assert_eq!(
+        state.applied_cover,
+        Some(vec![p("/r/keep"), p("/r/drop")]),
+        "and nothing rewound the claim the reconcile recorded"
+      );
+      assert_eq!(state.settle_floor, Some(vec![p("/r/keep"), p("/r/drop")]));
+    }
+
+    /// …and a REAL loss in the same window still degrades and still rewinds.
+    /// The distinction is the domination's alone: funnel 3's ordinary path — here
+    /// an unrepresentable name escalating a located `Rescan` — marks the fence
+    /// lossy exactly as it always did, and the observation narrows the claim to
+    /// the provable under-claim.
+    #[test]
+    fn a_real_loss_in_the_same_window_still_degrades_and_rewinds() {
+      let (mut core, scope, _root) = shrunk_to_keep();
+      let keep = watch_at(&core, scope, "/r/keep");
+      assert_eq!(
+        core.on_set_cover(scope, &[p("/r/keep"), p("/r/drop")]),
+        CoverReconcile::Reconciling
+      );
+      let fence = core.open_cover_fence(scope);
+
+      core.on_inotify_events(
+        scope,
+        vec![inotify(&[keep], IN_CREATE, 0, Some(&[0xFF, 0xFE]))],
+        at(1),
+      );
+      run_cascade(&mut core, &BTreeMap::from([("/r", root_listing())]));
+      core.mark_cut_inflight(scope, 1);
+      core.prove_cut(scope, 1);
+      assert_eq!(
+        core.poll_cover_settlements(DRAINED),
+        vec![(fence, CoverSettle::Degraded)],
+        "a real loss in the window is reported as one"
+      );
+      let state = core.scopes.get(&scope).unwrap();
+      assert_eq!(
+        state.applied_cover,
+        Some(Vec::<PathBuf>::new()),
+        "and the claim is rewound: nothing below the root is claimed"
+      );
+      assert_eq!(state.settle_floor, Some(Vec::<PathBuf>::new()));
     }
 
     /// Funnel 8, and its independence. The settle observation narrows the
@@ -9666,6 +9827,272 @@ mod descending {
         drain(&mut core).is_empty(),
         "and it queued no `Rescan` of its own: the covering one is owed by \
          whoever retires under this move"
+      );
+    }
+
+    /// A BARE LOSS-MEMORY ENTRY raises nothing at funnel 8 — on a narrowed
+    /// scope exactly as on a never-narrowed one. `route_event` ensures a
+    /// scope's loss-memory entry for every loss `Rescan`, fence or no fence, so
+    /// the settle loop — which walks EVERY `cover_fences` key — reaches an
+    /// entry that holds nothing pending. `split` is 0, `resolving` is empty and
+    /// `spent` is true on the first observation to pass: nothing was
+    /// instructed, nobody's fence closed, and so nobody is owed a covering
+    /// `Rescan`. It is the same rule the stat cover applies sixty lines above.
+    ///
+    /// The narrowed half is the one the over-fire actually reached. It is also
+    /// the one nothing absorbs: a bare entry yields no `(FenceId, CoverSettle)`
+    /// pair, so the driver's per-cookie drain — which sits under
+    /// `parked_cookies.remove(&fence)` — never runs for it, and the move
+    /// survives to a loop-top `drain_barrier_moves` one pass later, when the
+    /// sync that was `Parked` at its own settle is `InPool` and IS retired.
+    ///
+    /// Fails on old (`applied_cover.is_some()` as the funnel's guard): the
+    /// narrowed half reports one whole-scope move and a moved stamp.
+    #[test]
+    fn a_bare_loss_memory_entry_raises_no_funnel_8_move() {
+      // The narrowed half: `applied_cover` is `Some`, and a real loss arrives
+      // with no fence open at all.
+      let (mut core, scope, _root) = shrunk_to_keep();
+      let keep = watch_at(&core, scope, "/r/keep");
+      assert!(
+        core.cover_fences.is_empty(),
+        "staging: no fence is open, so the loss below can only make a bare entry"
+      );
+      core.on_inotify_events(
+        scope,
+        vec![inotify(&[keep], IN_CREATE, 0, Some(&[0xFF, 0xFE]))],
+        at(1),
+      );
+      run_cascade(&mut core, &BTreeMap::new());
+      assert!(
+        core.scopes[&scope].applied_cover.is_some(),
+        "staging: the scope carries a claim, so the old guard would fire"
+      );
+      assert!(
+        core.cover_fences[&scope].pending.is_empty(),
+        "staging: lossy memory and nothing pending — the bare entry"
+      );
+
+      // Everything up to here is staging, the loss's own funnels included; what
+      // follows is the settle observation.
+      let before = quiesce(&mut core, scope);
+      core.mark_cut_inflight(scope, 1);
+      core.prove_cut(scope, 1);
+      assert_eq!(
+        core.poll_cover_settlements(DRAINED),
+        Vec::new(),
+        "the observation resolves no fence"
+      );
+      assert!(
+        core.cover_fences.is_empty(),
+        "but it DID observe the scope and spend the bare entry — without this \
+         the assertions below would pass vacuously"
+      );
+      assert_eq!(
+        epoch(&core, scope).0,
+        before.0,
+        "an observation that instructed nobody moves no stamp"
+      );
+      assert_eq!(
+        core.take_barrier_moves(),
+        Vec::new(),
+        "and retires nothing: a window whose fences are none owes no covering \
+         `Rescan`"
+      );
+
+      // The never-narrowed half: the same shape, with no claim in the way.
+      let (mut core, scope, _root) = with_a_child();
+      let sub = watch_at(&core, scope, "/r/sub");
+      assert!(core.scopes[&scope].applied_cover.is_none());
+      core.on_inotify_events(
+        scope,
+        vec![inotify(&[sub], IN_CREATE, 0, Some(&[0xFF, 0xFE]))],
+        at(1),
+      );
+      run_cascade(&mut core, &BTreeMap::new());
+      assert!(core.cover_fences[&scope].pending.is_empty());
+
+      let before = quiesce(&mut core, scope);
+      core.mark_cut_inflight(scope, 1);
+      core.prove_cut(scope, 1);
+      assert_eq!(core.poll_cover_settlements(DRAINED), Vec::new());
+      assert!(core.cover_fences.is_empty());
+      assert_eq!(epoch(&core, scope).0, before.0);
+      assert_eq!(core.take_barrier_moves(), Vec::new());
+    }
+
+    /// …and a lossy settle that DOES resolve a fence raises the whole-scope
+    /// move on a scope that never narrowed, exactly as on one that did. The
+    /// design attaches no claim condition to funnel 8, and the reason is the
+    /// loss class this seat exists for: a Monitor-minted LOCATED `Rescan` — a
+    /// root invalidation, an arm-failure or stat-deficit re-signal — passes
+    /// neither `feed` nor funnel 7, which is itself gated on
+    /// `applied_cover.is_some()`. On a never-narrowed scope that loss raises no
+    /// funnel of its own, and an obligation whose `cover_dir` the `Rescan` does
+    /// not cover would otherwise settle over a window that lost work.
+    ///
+    /// The loss staged here is the cheapest real one to mint sans-I/O — an
+    /// unrepresentable name escalating through funnel 3 — so funnel 3 does fire
+    /// during staging. That is discarded by `quiesce`: what follows is the
+    /// settle observation alone, and the move it raises is the settle-time
+    /// transition no other funnel reports.
+    ///
+    /// Fails on old (`applied_cover.is_some()` as the funnel's guard): the
+    /// stamp does not move and `take_barrier_moves` is empty.
+    #[test]
+    fn a_lossy_settle_over_a_never_narrowed_scope_raises_the_whole_scope_move() {
+      let (mut core, scope, _root) = with_a_child();
+      let sub = watch_at(&core, scope, "/r/sub");
+      assert!(
+        core.scopes[&scope].applied_cover.is_none(),
+        "staging: the scope never narrowed, so it carries no claim to rewind"
+      );
+      let fence = core.open_cover_fence(scope);
+
+      // A real loss inside the window — funnel 3's ordinary path, an
+      // unrepresentable name escalating a located `Rescan` — so the verdict is
+      // still the `Degraded` one a lossy window always earns.
+      core.on_inotify_events(
+        scope,
+        vec![inotify(&[sub], IN_CREATE, 0, Some(&[0xFF, 0xFE]))],
+        at(1),
+      );
+      run_cascade(&mut core, &BTreeMap::new());
+
+      // Everything up to here is staging, the loss's own funnel included; what
+      // follows is the settle observation.
+      let before = quiesce(&mut core, scope);
+      core.mark_cut_inflight(scope, 1);
+      core.prove_cut(scope, 1);
+      assert_eq!(
+        core.poll_cover_settlements(DRAINED),
+        vec![(fence, CoverSettle::Degraded)],
+        "the fence resolves, and the loss is reported"
+      );
+      assert_eq!(
+        epoch(&core, scope).0,
+        before.0 + 1,
+        "the settle observation moved the stamp exactly once"
+      );
+      assert_eq!(
+        core.take_barrier_moves(),
+        vec![BarrierMove {
+          scope,
+          location: BarrierLocation::Scope,
+          rescan_stands: false,
+        }],
+        "the whole scope, standing no `Rescan` of its own: the covering one is \
+         owed by whoever retires under this move"
+      );
+    }
+
+    /// A DOMINATION reconciles nothing — no re-arm, no re-read. It is
+    /// "re-read, your barrier is dominated", never a claim about the scope's
+    /// coverage, and the recovery an overflow performs would re-arm exactly the
+    /// ground the caller's own shrink had just asked to stop watching.
+    ///
+    /// Revert witness for the flavour itself: stand the retirement's `Rescan`
+    /// through [`Planned::Over`] and `Monitor::on_overflow`'s recovery half
+    /// queues a re-arm read of the slice's anchor — the scope ROOT, since
+    /// `covering_rescan` anchors every located slice there — so this drain
+    /// holds an `Enumerate` as well as the `Rescan`.
+    #[test]
+    fn a_domination_queues_its_rescan_and_no_recovery_work() {
+      let (mut core, scope, _root) = shrunk_to_keep();
+      let _ = quiesce(&mut core, scope);
+      core.stand_covering_rescan(scope, Path::new("/r/keep/deep"), at(1));
+      let effects = drain(&mut core);
+      assert!(
+        emits(&effects)
+          .iter()
+          .any(|change| change.kind().is_rescan()),
+        "the dominated caller is instructed to re-read: {effects:?}"
+      );
+      assert!(
+        !effects
+          .iter()
+          .any(|effect| matches!(effect, Effect::Enumerate { .. } | Effect::AddWatch { .. })),
+        "and the instruction recovers no watch set of its own: {effects:?}"
+      );
+    }
+
+    /// A funnel-8 retirement — a barrier retired under a lossy settle rewind
+    /// — still stands its domination `Rescan` unconditionally
+    /// ([`Planned::Dominated`]'s ruling), and the settle it lands inside
+    /// stays exactly as lossy as the rewind above already made it. The
+    /// retirement's `Rescan` is "re-read, your barrier is dominated", never a
+    /// fresh coverage claim — the window's OWN loss was already signalled by
+    /// the `Degraded` verdict and the rewind, and the exemption removes none
+    /// of it.
+    #[test]
+    fn a_funnel_8_retirement_stands_a_domination_rescan_and_the_lossy_settle_stays_lossy() {
+      let (mut core, scope, _root) = shrunk_to_keep();
+      assert_eq!(
+        core.on_set_cover(scope, &[p("/r/keep"), p("/r/drop")]),
+        CoverReconcile::Reconciling
+      );
+      let fence = core.open_cover_fence(scope);
+      run_cascade(
+        &mut core,
+        &BTreeMap::from([("/r", root_listing_with_unknown())]),
+      );
+      core.mark_cut_inflight(scope, 1);
+      core.prove_cut(scope, 1);
+      assert_eq!(core.poll_cover_settlements(DRAINED), Vec::new());
+      let _ = drain(&mut core);
+      core.on_delivery(scope, Delivery::Accepted, at(1));
+
+      // Everything up to the rewind is staging; what follows is the funnel.
+      let _ = quiesce(&mut core, scope);
+      assert_eq!(
+        core.poll_cover_settlements(DRAINED),
+        vec![(fence, CoverSettle::Degraded)],
+        "the window was lossy: the settle rewinds before any obligation \
+         retires under this move"
+      );
+      let state = core.scopes.get(&scope).unwrap();
+      let rewound_applied = state.applied_cover.clone();
+      let rewound_floor = state.settle_floor.clone();
+      assert_eq!(
+        core.take_barrier_moves(),
+        vec![BarrierMove {
+          scope,
+          location: BarrierLocation::Scope,
+          rescan_stands: false,
+        }],
+      );
+
+      // Simulate the driver retiring a barrier that was live under this
+      // move: it owes its own covering `Rescan`, stood as a DOMINATION.
+      core.stand_covering_rescan(scope, Path::new("/r/keep/deep"), at(2));
+      let effects = drain(&mut core);
+      let changes = emits(&effects);
+      assert!(
+        changes.iter().any(|change| change.kind().is_rescan()),
+        "the retired obligation's caller is still told to re-read: {changes:?}"
+      );
+      let state = core.scopes.get(&scope).unwrap();
+      assert_eq!(
+        state.applied_cover, rewound_applied,
+        "the domination does not re-widen the claim the rewind narrowed"
+      );
+      assert_eq!(
+        state.settle_floor, rewound_floor,
+        "nor does it touch the settle floor the rewind already established"
+      );
+      // The revert witness: `applied_cover`/`settle_floor` are already
+      // `Some(vec![])` after the lossy rewind, and a loss-flavoured `Rescan`
+      // would write the very same values over them, so the two `assert_eq!`s
+      // above cannot tell a domination from a revert to `Over`. This can.
+      // Under `Dominated` the retirement's latch matches and the whole of
+      // `route_event`'s lossy-window branch — which re-creates a lossy
+      // `cover_fences` entry that would poison the scope's next fence — is
+      // skipped, so the map stays empty. Under the reverted `Over` behaviour
+      // that branch runs and the map is non-empty.
+      assert!(
+        core.cover_fences.is_empty(),
+        "a funnel-8 domination creates no cover fence entry; only a loss \
+         route re-creates one"
       );
     }
 
@@ -9850,9 +10277,12 @@ mod descending {
       let (mut core, scope, req, _root) = live_descending();
       let before = quiesce(&mut core, scope);
       core.on_enumerated(req, listed(vec![entry(COOKIE_DIR, FileKind::Dir, 1, 11)]));
-      let cookie_dir_path = format!("/r/{COOKIE_DIR}");
+      // Built by joining rather than spelled as one literal: the core joins with the
+      // PLATFORM separator, so a nested listing key written "/r/<COOKIE_DIR>" matches
+      // nothing on Windows and the child is silently never enumerated.
+      let cookie_dir_path = p("/r").join(COOKIE_DIR);
       let listings = BTreeMap::from([(
-        cookie_dir_path.as_str(),
+        cookie_dir_path.to_str().expect("test paths are UTF-8"),
         vec![entry("sub", FileKind::Dir, 1, 12)],
       )]);
       run_cascade(&mut core, &listings);

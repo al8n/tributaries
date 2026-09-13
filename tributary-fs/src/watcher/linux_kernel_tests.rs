@@ -22,7 +22,9 @@ use std::{
 };
 
 use super::Watcher;
-use crate::{Backend, Event, Interest, SyncRootDenied, WatcherOptions, error::SyncRootError};
+use crate::{
+  Backend, CoverOutcome, Event, Interest, SyncRootDenied, WatcherOptions, error::SyncRootError,
+};
 
 type TokioWatcher = Watcher<agnostic_lite::tokio::TokioRuntime>;
 
@@ -728,9 +730,14 @@ async fn set_cover_keeps_a_covered_directory_s_reserved_sync_directory_armed() {
   // The caller keeps ONE file subscription. Every sibling of that file is
   // strictly outside the cover — the plain directory and the reserved directory
   // alike.
-  w.set_cover(handle, vec![canonical.join("kept.txt")])
-    .await
-    .expect("set_cover shrink");
+  assert_eq!(
+    w.set_cover(handle, vec![canonical.join("kept.txt")])
+      .await
+      .expect("set_cover shrink"),
+    CoverOutcome::Applied,
+    "the shrink's own window is clean: the first sync's retirement stands a \
+     domination `Rescan`, and a domination is not a coverage loss"
+  );
   assert!(
     converge(|| wds_watching(&pruned_object) == 0).await,
     "the plain sibling's watch descriptor is reclaimed — the cut really ran"
@@ -826,9 +833,20 @@ async fn set_cover_dominates_the_owned_marker_standing_in_the_ground_it_takes() 
 
   // The obligation is OWNED and unreaped — nothing has removed its marker — and
   // the cover the caller now asks for names neither it nor the sibling beside it.
-  w.set_cover(handle, vec![canonical.join("b")])
-    .await
-    .expect("set_cover shrink");
+  assert_eq!(
+    w.set_cover(handle, vec![canonical.join("b")])
+      .await
+      .expect("set_cover shrink"),
+    CoverOutcome::Applied,
+    "the domination does not degrade the shrink: its `Rescan` tells the \
+     dominated caller to re-read, it does not say this cover has a hole"
+  );
+  // …and the dominated caller IS told, on its own stream: the covering `Rescan`
+  // the retirement stands names the ground its marker stood in.
+  assert!(
+    wait_for(&mut w, |e| covers(e, &target)).await.is_some(),
+    "a barrier is never retired silently: the covering `Rescan` names its ground"
+  );
   assert!(
     converge(|| wds_watching(&cut_object) == 0).await,
     "the sibling the cover named nothing for loses its watch — the cut really ran"
@@ -911,17 +929,17 @@ async fn a_same_name_substitution_under_a_live_sync_dominates_its_barrier() {
     "staging: the marker is reported, so its ground is armed"
   );
 
-  let all = objects_of(&[
-    canonical.clone(),
-    target.clone(),
-    canonical.join("spare"),
-    canonical.join("aside"),
-  ]);
-
   // The substitution: the judged object moves aside and a prepared directory
   // takes its name, in the window between the write and the observation.
   std::fs::rename(&target, canonical.join("aside")).expect("the judged ground moves aside");
   std::fs::rename(canonical.join("spare"), &target).expect("the replacement takes its name");
+
+  // Sampled AFTER the substitution, which is the only instant every one of these
+  // names resolves: `aside` does not exist until the first rename creates it, and
+  // `spare` stops existing at the second. The three objects are the same three
+  // either way — the root, the carried-away incumbent, and its replacement — and
+  // sampling here names each of them by the path it answers to at teardown.
+  let all = objects_of(&[canonical.clone(), target.clone(), canonical.join("aside")]);
 
   assert!(
     wait_for(&mut w, |e| covers(e, &target)).await.is_some(),
@@ -1061,6 +1079,17 @@ async fn set_cover_dominates_a_live_alias_sync_at_the_landing_it_wrote_in() {
     canonical.join("keep"),
     canonical.join("cut"),
   ]);
+
+  // The cover the caller now asks for names neither the landing nor the sibling
+  // beside it, so it dominates the barrier standing in the landing.
+  assert_eq!(
+    w.set_cover(handle, vec![canonical.join("keep")])
+      .await
+      .expect("set_cover shrink"),
+    CoverOutcome::Applied,
+    "the domination does not degrade the shrink: its `Rescan` tells the \
+     dominated caller to re-read, it does not say this cover has a hole"
+  );
 
   // The covering `Rescan` the retirement stands has to name the LANDING: that is
   // the ground the marker stood in and the only ground a watch of this root is

@@ -1261,17 +1261,29 @@ async fn non_utf8_name_escalates_to_rescan() {
 }
 
 /// A DEGRADED cover window settles behind the same ordering proof a clean one
-/// does — a real round trip through the real reader — and the sync parked on
-/// that window still writes and delivers.
+/// does — a real round trip through the real reader — and the sync admitted
+/// onto that window is dominated by the settle's own `BarrierMove`: the
+/// observation that resolves the grow's fence as lossy retires the sync as an
+/// entry on the very scope it shares with it.
 ///
-/// A degraded verdict is a LIVE verdict: it answers its caller and dispatches
-/// the fence's parked cookie exactly as a clean one does. So it rests on the
-/// same proof, one empty control batch whose reply proves the reader cut its
-/// kernel queue onto the lane before answering. Exempting the window from it —
-/// on the true but incomplete ground that more loss cannot falsify a degraded
-/// verdict — is what let an unread root DEATH slip past the verdict; requiring
-/// the proof without also OFFERING it would park every degraded window forever,
-/// which is what the bounded await below would report.
+/// A degraded verdict is a LIVE verdict: it answers its caller behind the same
+/// proof a clean one does, one empty control batch whose reply proves the
+/// reader cut its kernel queue onto the lane before answering. But live is not
+/// exempt from the move it sampled: the sync learns the domination one of
+/// three ways, all equally the contract's answer. If the write had not yet
+/// claimed when the move retires the obligation, the claim reads the
+/// domination under the ledger lock and the caller is refused `Dominated`. If
+/// the write had already claimed, the marker is withdrawn, its queued emit
+/// purged, and a covering `Rescan` stands at the marker's ground instead — the
+/// caller still holds its cookie, but the cookie's own event never arrives,
+/// only the `Rescan` that supersedes it. And when the marker's own event
+/// reaches the consumer before the settle observation resolves, plain
+/// delivery outran the move and the caller sees its cookie live. Exempting the
+/// window from the round-trip proof entirely — on the true but incomplete
+/// ground that more loss cannot falsify a degraded verdict — is what let an
+/// unread root DEATH slip past the verdict; requiring the proof without also
+/// OFFERING it would park every degraded window forever, which is what the
+/// bounded await below would report.
 ///
 /// The staging is publicly witnessed, not assumed. The grow re-enumerates a
 /// directory holding a non-UTF-8 name, which cannot become a `Segment` and
@@ -1291,6 +1303,12 @@ async fn non_utf8_name_escalates_to_rescan() {
 /// lever this rig has — `SIGSTOP` on the process group — stops both. That leg is
 /// pinned sans-I/O by
 /// `an_unread_root_death_under_a_lossy_fence_is_caught_by_the_cut_it_owes`.
+///
+/// Nor does it pin which of the three answers the sync gets: the race between
+/// the write's claim and the move's retirement, and between the marker's own
+/// event and the settle observation, is real kernel timing, not a knob this
+/// rig turns. The assertion accepts whichever of the three the contract hands
+/// back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_degraded_cover_settles_behind_its_ordering_proof() {
   use std::os::unix::ffi::OsStrExt;
@@ -1343,11 +1361,38 @@ async fn a_degraded_cover_settles_behind_its_ordering_proof() {
     "the escalation inside the window degrades the verdict, which is what makes this round a \
      sample of the degraded path rather than of the clean one"
   );
-  let cookie = cookie.expect("the sync parked on the degraded window still writes its cookie");
-  assert!(
-    wait_for(&mut w, |e| e.path() == cookie).await.is_some(),
-    "the cookie the degraded settle dispatched is reported on the live stream"
-  );
+  // The settle's `BarrierMove` retires the sync admitted onto the same window:
+  // dominated at the claim if the write had not yet landed, superseded by a
+  // covering `Rescan` if it had, or outrun by the marker's own delivery when
+  // that reached the consumer first. All three are the contract's answer.
+  match cookie {
+    Err(denied) => {
+      assert!(
+        matches!(denied.error, SyncRootError::Dominated),
+        "a sync admitted onto the degraded window is refused only as dominated by the settle's \
+         move, got {:?}",
+        denied.error
+      );
+      assert!(
+        wait_for(&mut w, |e| e.is_rescan()
+          && (e.path().starts_with(&root) || root.starts_with(e.path())))
+        .await
+        .is_some(),
+        "the move that dominates the sync stands a covering Rescan naming the root"
+      );
+    }
+    Ok(cookie) => {
+      assert!(
+        wait_for(&mut w, |e| e.path() == cookie
+          || (e.is_rescan()
+            && (e.path().starts_with(&root) || root.starts_with(e.path()))))
+        .await
+        .is_some(),
+        "the sync's cookie is answered by either its own event or the covering Rescan that \
+         supersedes it"
+      );
+    }
+  }
 
   w.unwatch(handle).await.expect("unwatch");
   w.close().await.expect("close");
