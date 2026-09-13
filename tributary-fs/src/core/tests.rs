@@ -3784,6 +3784,8 @@ mod mount_change_cover {
   /// the ones I kept is missing" while saying nothing about the ones it threw away
   /// — and the next authoritative sample covers once, unconditionally.
   #[test]
+  // Sized to the ceiling: minutes under Miri, and nothing Miri checks is at stake in a safe-code loop.
+  #[cfg_attr(miri, ignore)]
   fn honored_boundaries_saturate_into_one_unconditional_cover() {
     let (mut core, scope) = live_core();
     let rows: Vec<crate::os::MountRow> = (0..=MAX_HONORED_BOUNDARIES)

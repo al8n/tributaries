@@ -35,6 +35,8 @@ fn table_under_mnt(rows: usize) -> String {
 /// could not hold — which reads as a pile of departures and covers for every one
 /// of them, on every interval, while claiming authority it does not have.
 #[test]
+// Sized to the ceiling: minutes under Miri, and nothing Miri checks is at stake in a safe-code loop.
+#[cfg_attr(miri, ignore)]
 fn mountinfo_over_the_row_ceiling_overflows() {
   let table = table_under_mnt(MAX_MOUNT_ROWS_UNDER_ROOT + 1);
   assert!(
@@ -46,6 +48,8 @@ fn mountinfo_over_the_row_ceiling_overflows() {
 /// And the ceiling itself is inclusive: a table exactly at it is an ordinary
 /// reading, so the bound never costs a root that merely sits on the line.
 #[test]
+// Sized to the ceiling: minutes under Miri, and nothing Miri checks is at stake in a safe-code loop.
+#[cfg_attr(miri, ignore)]
 fn rows_at_the_ceiling_are_kept() {
   let table = table_under_mnt(MAX_MOUNT_ROWS_UNDER_ROOT);
   let rows = parse_mountinfo(table.as_bytes(), Path::new("/mnt"))
@@ -716,6 +720,8 @@ fn an_unreadable_mountinfo_file_answers_none() {
 /// whole rather than parsed, so the ceiling is exactly the worst case the cost
 /// verdict has to speak for.
 #[test]
+// A timing bound has no meaning under Miri.
+#[cfg_attr(miri, ignore)]
 fn a_full_namespace_stack_is_parsed_in_linear_time() {
   // The parser's own retained-row ceiling, and an octave below it — the largest
   // table it will ever build, and half a step down from it. Miri gets a token
