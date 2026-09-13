@@ -227,6 +227,18 @@ async fn next_event(rig: &Rig) -> (ScopeId, Change) {
   (scope, change)
 }
 
+/// A table row with no identity at all — what every fake reports, and what a host
+/// with no mount ids answers. The driver cells only care WHERE a mount is.
+fn bare_mount(location: &str) -> crate::os::MountRow {
+  crate::os::MountRow {
+    location: PathBuf::from(location),
+    mnt_id: None,
+    parent_id: None,
+    mnt_id_unique: None,
+    dev: None,
+  }
+}
+
 fn loc(parts: &[&str]) -> Location {
   Location::from_segments(parts.iter().map(|p| Segment::new(*p)))
 }
@@ -1777,6 +1789,57 @@ async fn a_probe_declined_at_the_budget_reports_the_scope_unproven_and_renews() 
   );
 }
 
+/// A mount change under a FANOTIFY root reaches the source through the effect
+/// path, on the blocking pool, and its answer decides what the consumer hears
+/// (#74).
+///
+/// The fanotify source's sight is a FID map seeded by a walk that stops at every
+/// mount boundary, so ground a departed mount revealed is ground the map has
+/// never seen. The core therefore raises `Effect::RecoverRoot` rather than
+/// covering directly, and the driver executes it exactly as it executes the
+/// refresh that raised it — end to end, this is the observable that the walk was
+/// requested at all.
+///
+/// The UNREACHABLE answer is the verdict this cell drives, because it is the one
+/// with a terminal the driver can be watched to reach: a source whose map cannot
+/// be rebuilt has no trustworthy sight of the root, so the scope takes the same
+/// death lifecycle a refresh's own liveness gate takes and the registry entry is
+/// reclaimed.
+#[tokio::test(start_paused = true)]
+async fn a_mount_change_under_a_fanotify_root_walks_it_and_an_unreachable_walk_dies() {
+  let registry = RecordingRegistry::default();
+  let rig = rig_with(64, registry.clone());
+  rig.fs.spawn_backend(BackendKind::Fanotify);
+  // The mount is there at the spawn seed AND at the birth refresh, so the birth
+  // refresh installs it as the baseline rather than staging a departure.
+  rig.fs.seed_mounts(vec![bare_mount("/r/vol")]);
+  rig.fs.answer_refresh(vec![bare_mount("/r/vol")], true);
+  let scope = watch(&rig, "/r").await;
+  assert!(
+    rig.fs.recovery_requests().is_empty(),
+    "a table that has not moved asks for no walk"
+  );
+
+  // `umount -l /r/vol`, and the walk that follows cannot reach the root.
+  rig
+    .fs
+    .answer_root_recovery(crate::os::RootRecovery::Unreachable);
+  rig.fs.answer_refresh(Vec::new(), true);
+  rig.fs.send_lossy("/r");
+
+  settle(|| registry.dead() == [scope]).await;
+  assert_eq!(
+    rig.fs.recovery_requests(),
+    [scope],
+    "the departure asked for exactly one whole-root walk"
+  );
+  assert_eq!(
+    registry.dead(),
+    [scope],
+    "a root the walk cannot reach takes the death path"
+  );
+}
+
 /// The refresh samples the root's identity AND its mount frame from ONE object, so
 /// a replaced/re-mounted root can never pair the OLD identity's verdict with a NEW
 /// object's frame (the mixed sample the atomic `statx` restructure closes). The fake
@@ -2174,11 +2237,18 @@ async fn spawn_seals_root_meta_before_the_stream_goes_live() {
 /// for its whole prefix from the first event on — even if the volume vanishes
 /// immediately after (its unmount travels in-band and is applied late, per
 /// the monotone rule); nothing can event before the seed exists.
+///
+/// The live table answers the same row the seed carried, because the mount IS
+/// still there: an authoritative read REPLACES the table
+/// (`install_mount_table`), so a fake whose
+/// birth refresh answered the default empty table would be staging a departure
+/// rather than the pre-existing submount this cell is about.
 #[tokio::test(start_paused = true)]
 async fn spawn_seed_carries_a_preexisting_submount() {
   let fs = FakeFs::new(1);
   fs.put("/r", FileKind::Dir, 1);
-  fs.seed_mounts(vec![PathBuf::from("/r/vol")]);
+  fs.seed_mounts(vec![bare_mount("/r/vol")]);
+  fs.answer_refresh(vec![bare_mount("/r/vol")], true);
   let (cmd_tx, cmd_rx) = async_channel::bounded(16);
   #[cfg(feature = "sync")]
   let (cleanup, cookie_wake) = cookie_ingress();
@@ -3526,6 +3596,7 @@ mod descending {
             name: Segment::new("r"),
             path: Arc::new(PathBuf::from(path)),
             expected: None,
+            frame: crate::os::ScopeFrame::default(),
           }],
         )
         .resolutions
@@ -11573,7 +11644,7 @@ mod descending {
       rig.fs.put("/r/sub", FileKind::Dir, 11);
       let scope = watch(&rig, "/r/sub").await;
       // The widen target's meta resolves with a mount seeded at the old root.
-      rig.fs.seed_mounts(vec![PathBuf::from("/r/sub")]);
+      rig.fs.seed_mounts(vec![bare_mount("/r/sub")]);
 
       assert!(replace(&rig, scope, "/r").await.is_ok());
       settle(|| rig.fs.shutdowns() == 1).await;
@@ -29654,5 +29725,96 @@ mod abnormal_exit {
       settle(|| rig.fs.shutdowns() == 1).await,
       "and it completes once the wedge clears"
     );
+  }
+}
+
+/// The mask-miss leg of [`stat_sample`]: on a kernel whose `statx` answers no
+/// mount id, the sample is taken through an `O_PATH` pin instead, and it must
+/// answer the SAME object and the SAME mount id the single-`statx` leg answers
+/// where the bit exists.
+///
+/// Real syscalls on a real tree, so this runs on the ubuntu runners and in the
+/// container `unit` suite. It drives [`stat_sample_pinned`] DIRECTLY rather than
+/// forcing the process tier: the tier is a process-wide memo and the lib binary
+/// runs its cells in parallel, so a cell that flipped it would decide which leg
+/// every sibling's sample took.
+#[cfg(all(target_os = "linux", not(miri)))]
+mod mount_frame_sampling {
+  use super::*;
+
+  /// A unique real directory for one cell.
+  fn scratch(tag: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let dir = std::env::temp_dir()
+      .canonicalize()
+      .expect("canonicalize temp dir")
+      .join(format!(
+        "tributary-fs-frame-{}-{}-{}",
+        tag,
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed),
+      ));
+    std::fs::create_dir_all(&dir).expect("create scratch dir");
+    dir
+  }
+
+  /// The pinned sample answers a mount id on EVERY supported kernel, for every
+  /// object kind the enumerate can hand it — a directory, a regular file, and a
+  /// symlink, which `O_PATH | O_NOFOLLOW` must open AS the link rather than
+  /// following it, exactly as the `AT_SYMLINK_NOFOLLOW` leg does.
+  ///
+  /// MUTATION WITNESS (the pin follows the link): drop `OFlags::NOFOLLOW` from
+  /// `stat_sample_pinned` and this FAILS at `the pinned sample reaches the same
+  /// object` for the symlink, reporting the target file's kind and inode.
+  /// MUTATION WITNESS (the frame is dropped on the pinned leg): return `None` for
+  /// `frame` there and this FAILS at `every supported kernel answers a mount id
+  /// through fdinfo`.
+  #[test]
+  fn a_pinned_sample_answers_the_same_object_and_a_mount_id() {
+    let dir = scratch("pinned");
+    let file = dir.join("f");
+    std::fs::write(&file, b"x").expect("write the scratch file");
+    let link = dir.join("l");
+    std::os::unix::fs::symlink("f", &link).expect("create the scratch symlink");
+
+    for path in [dir.as_path(), file.as_path(), link.as_path()] {
+      let direct = stat_sample(path).expect("sample the path");
+      let pinned = stat_sample_pinned(path).expect("sample the path through a pin");
+      assert_eq!(
+        (pinned.kind, pinned.dev, pinned.ino),
+        (direct.kind, direct.dev, direct.ino),
+        "the pinned sample reaches the same object as the path sample: {}",
+        path.display()
+      );
+      assert!(
+        pinned.frame.is_some(),
+        "every supported kernel answers a mount id through fdinfo (3.15, below \
+         the 4.11 statx floor), so the pinned leg never degrades to a frameless \
+         sample: {}",
+        path.display()
+      );
+      if direct.frame.is_some() {
+        assert_eq!(
+          pinned.frame,
+          direct.frame,
+          "where this host ALSO has `STATX_MNT_ID`, the two tiers must report one \
+           id — they are one id space: {}",
+          path.display()
+        );
+      }
+    }
+
+    // A path that is not there fails the same way through either leg, so the
+    // enumerate's raced-away `Missing` keeps its meaning on the fdinfo tier.
+    let gone = dir.join("gone");
+    assert_eq!(
+      stat_sample_pinned(&gone).map(|sample| sample.ino),
+      Err(rustix::io::Errno::NOENT),
+      "the pin's own open carries the errno the statx would have, so NOENT is \
+       still a raced-away entry and never a laundered frameless sample"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
   }
 }

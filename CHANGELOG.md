@@ -789,6 +789,23 @@ domination `Rescan` is stood — and nothing else in either crate behaves differ
 
 ### Added
 
+- **`tributary-fs`** — a mount arriving, departing or being replaced **below a
+  watched root** is now covered (#74). No kernel signals such a change on any
+  backend — a lazy `umount -l` just stops the watches under it from meaning
+  anything, and an arriving mount hides ground that was already enumerated — so
+  the periodic mount sample (`WatcherOptions::root_liveness_interval`, now armed
+  by both Linux profiles rather than fanotify alone) compares the table under the
+  root against the last one it read, and answers ANY difference with one
+  whole-root `Rescan`. Deliberately coarse: there is no census of boundaries and
+  no ledger, so the statement is "the tree under this root changed, re-read it"
+  rather than a located one, and the cost is one whole-root re-read per interval
+  in which the table moved. A fanotify root RESEEDS its FID map over the whole
+  root before the `Rescan` is emitted — its sight stops at mount boundaries, so a
+  consumer told to re-read first would see the revealed subtree once and never
+  hear about it again. On a kernel below 6.8 (no never-recycled mount id) a
+  mount-namespace transition anywhere on the host is consumed as a cover, since
+  a recycled id can make a replacement compare equal to continuity.
+
 - **`tributaries`** — a caller-visible **sync barrier** (#23): `Tributaries::sync(sub,
   timeout)` resolves once every change made under the subscription's key BEFORE the
   call is deliverable. It is kernel-mediated, not an owner-side drain: a cookie file
