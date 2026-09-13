@@ -139,6 +139,27 @@ jobs:
         # Cargo.lock is not committed, so this resolves from the manifests
         # alone and the lockfile it writes IS the assertion.
         run: cargo +nightly generate-lockfile -Z direct-minimal-versions
+      - name: Lift the three floors that sit above their major
+        # The manifests advertise plain MAJOR requirements by the owner's choice,
+        # so `-Z direct-minimal-versions` lands each of these below the version
+        # that actually compiles. These are the tested floors, pinned in the
+        # LOCKFILE alone — a consumer still sees `serde = "1"` / `clap = "4"`:
+        #
+        # - serde: `serde_derive` is reached through serde's own `derive` feature,
+        #   so it is TRANSITIVE, is not minimized, and arrives newest; the runtime
+        #   must therefore be its generation (1.0.0 against derive 1.0.229 is
+        #   `cannot find __private229 in _serde`).
+        # - clap: `Option<T>` in `#[command(flatten)]` — what the opt-in debounce
+        #   group rests on — landed in 4.2.0.
+        # - serde_json (dev only): `json!` is usable from a 2018+ edition caller
+        #   from 1.0.25; 1.0.10 still fails to resolve `json_internal!`.
+        #
+        # `--precise` is one version per invocation, hence three.
+        run: |
+          set -eu
+          cargo +nightly update -Z direct-minimal-versions -p serde --precise 1.0.229
+          cargo +nightly update -Z direct-minimal-versions -p clap --precise 4.2.0
+          cargo +nightly update -Z direct-minimal-versions -p serde_json --precise 1.0.25
       - name: Show the floors that were selected
         run: cargo tree --depth 1 --locked
       - name: Build at the floors
@@ -229,10 +250,12 @@ jobs:
           - macos-latest
           - windows-latest
     runs-on: ${{ matrix.os }}
-    # The macOS leg runs the real-FSEvents integration suites (tributary-fs's
-    # `watcher` and tributaries' unprivileged `umbrella`); a wedged kernel stream
-    # must fail the job, not idle out the runner.
-    timeout-minutes: 45
+    # The windows leg runs the whole feature powerset (71 combinations now that
+    # the serde and clap faces are in the mix; ~48 minutes on the hosted runner),
+    # and the macOS leg runs the real-FSEvents integration suites (tributary-fs's
+    # `watcher` and tributaries' unprivileged `umbrella`) in ~36 minutes; a wedged
+    # kernel stream must fail the job, not idle out the runner.
+    timeout-minutes: 90
     steps:
     - uses: actions/checkout@v7
     - name: Cache cargo build and registry
@@ -999,8 +1022,15 @@ jobs:
           # then prove nothing.
           target_dir=$(cargo metadata --no-deps --format-version 1 \
             | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
+          # ONE invocation for the whole workspace, not one per crate. The members
+          # require each other by VERSION as well as by path, so a per-crate
+          # `cargo package` resolves that requirement against crates.io alone and
+          # fails on every pre-publish bump ("failed to select a version for the
+          # requirement tributary-proto = ..."). Packaged together, cargo resolves
+          # each member against the archives it is building beside it. The proof
+          # below is unchanged: it still opens every produced archive.
+          cargo package --workspace --no-verify --allow-dirty
           for crate in tributary-proto tributary-fs tributaries; do
-            cargo package -p "$crate" --no-verify --allow-dirty
             archive=$(ls -1 "$target_dir"/package/"$crate"-*.crate)
             for license in LICENSE-APACHE LICENSE-MIT; do
               if ! tar tzf "$archive" | grep -qE "^$crate-[^/]+/$license\$"; then
