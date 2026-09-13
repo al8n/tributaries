@@ -92,9 +92,10 @@ All notable changes to this workspace are documented here. The format is based o
   and **`clap`** faces on the option households, both off by default and neither
   changing anything when off. `serde` gives every household one document keyed by its
   own field names, defaulted from the type's `Default` (a missing key is that
-  default), with no `deny_unknown_fields` so a document written for a later version
-  still loads; `Duration` knobs are humantime text (`"250ms"`, `"2s"`) and the
-  non-zero capacities refuse a `0`. `clap` gives each household a `clap::Args` group
+  default) and `deny_unknown_fields` on every face, so a typo in a key name is a
+  document error rather than a silently dropped setting; `Duration` knobs are
+  humantime text (`"250ms"`, `"2s"`) and the non-zero capacities refuse a `0`.
+  `clap` gives each household a `clap::Args` group
   whose flagless command line is that same `Default`. Faced: `WatcherOptions` and
   `Backend` (`tributary-fs`), `TributariesOptions`, `DebounceConfig`, `Debounce`,
   `Interest` and `WatchOptions` (`tributaries`), and the core `Interest`
@@ -117,6 +118,31 @@ All notable changes to this workspace are documented here. The format is based o
     every other face of that household, and giving any narrows to those alone. The
     standalone `tributary_proto::Interest` group keeps its own face, where a flagless
     parse is the empty mask.
+  - `RootOptions`'s clap face gains `--interest-none`, conflicting with all six kind
+    flags: it spells the empty interest (coverage `Rescan`s only), the one household
+    value the six together could not reach, and an update carrying it empties the
+    interest the same way.
+  - The shared seat flags (`RootGlobs`, `WatchOptions`, and `tributary-fs`'s
+    `RootOptions` proxy) gain `--prune-none`, conflicting with `--prune`, and
+    `--include-all`, conflicting with `--include`: `--prune` requires a value and
+    `include = None` is spelled only by omission, so neither seat could otherwise be
+    returned to empty/absent on an update, where omission means preserve. The two
+    reset flags spell those states, and an update carrying one resets the seat the
+    same way.
+  - `WatcherOptions`'s clap face gains `--max-map-directories-unbounded`, conflicting
+    with `--max-map-directories`: it spells the uncapped admission map, the one
+    household value that flag could not reach, and an update carrying it clears an
+    existing cap the same way.
+  - `WatcherOptions`'s clap face gains `--exclusions-none`, conflicting with
+    `--exclusions`: `--exclusions` requires an absolute path and omission preserves,
+    so no command line could otherwise return the household to an empty exclusion
+    list on an update; `--exclusions-none` spells that state, and an update carrying
+    it clears the list the same way.
+  - `TributariesOptions`'s clap face gains `--no-debounce`, conflicting with every
+    flattened `DebounceConfig` flag: no argument could otherwise set the debounce
+    policy back to `None` once a household carried one, since the flags only ever
+    edit fields inside an existing policy; `--no-debounce` spells that state, and an
+    update carrying it clears the policy the same way.
   - Every `Duration` key/flag on both faces (`WatcherOptions::latency`,
     `move_window` and `root_liveness_interval`; `DebounceConfig::quiet_window` and
     `max_hold`) reads its text through a bounded visitor that refuses anything past
@@ -405,6 +431,10 @@ domination `Rescan` is stood — and nothing else in either crate behaves differ
   same command emptied it outright. The flagless PARSE still means the empty mask, which
   is what makes this group's flags the whole value they are.
 
+  Each of the six flags now also takes an explicit `=true`/`=false` value, so an
+  UPDATE can write `created = false` too — a plain `SetTrue` switch could previously
+  only ever add a subscription, never remove one.
+
 - **`tributaries`** — a per-root household the fs layer refuses
   (`WatchRootError::InvalidOptions`) reaches a `watch` caller as an explicitly
   classified `FaultKind::Other`, with the typed refusal recoverable through
@@ -467,6 +497,14 @@ domination `Rescan` is stood — and nothing else in either crate behaves differ
   `validate` carries the same bound as the backstop for a list assembled in code, as the
   new `OptionsError::ExclusionTooLong`. Accepted inputs are unchanged up to and
   including both ceilings.
+
+- **`tributary-fs`** — an exclusion must be non-empty and absolute
+  (`Path::is_absolute`) on every face, refused by the new
+  `OptionsError::ExclusionNotAbsolute`, the `serde` visitor and the `clap`
+  `--exclusions` parser: the driver's own exclusion test is a lexically-folded
+  PREFIX test, so an empty (or `.`-shaped) exclusion folds to the empty path,
+  which is a prefix of every directory — one stray value silently suppressed an
+  entire root, with no covering `Rescan`.
 
 - **`tributaries`** — **BREAKING for a custom `Source`**: `Source::arm` and
   `LocalSource::arm` take the per-root `&RootGlobs` as a third argument

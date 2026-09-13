@@ -48,7 +48,7 @@ bring your own `Source` (or `LocalSource`) and construct through
 
 ```toml
 [dependencies]
-tributaries = { version = "0.1", features = ["tokio"] }
+tributaries = { version = "0.2", features = ["tokio"] }
 ```
 
 The minimum supported Rust version (MSRV) is **1.95** (edition 2024).
@@ -110,19 +110,6 @@ let logs = tributaries
 // Re-scope what `project` delivers at any time — no re-watch:
 handle.swap(|_| true);
 
-// A SYNC BARRIER: after this resolves, every change made under `project`
-// BEFORE the call is deliverable — read the stream and you will see it.
-// Kernel-mediated (a cookie file whose own event rides the ordered queue
-// behind those changes), never a hopeful sleep; the cookie is suppressed
-// from the stream. `SyncOutcome` says whether the barrier was met by
-// delivery or by a covering `Rescan` (re-enumerate then).
-let outcome = tributaries
-  .sync(project, std::time::Duration::from_secs(5))
-  .await?;
-if outcome.is_dominated() {
-  // A loss stood a Rescan in for the cookie: re-read rather than replay.
-}
-
 while let Some(event) = tributaries.next().await {
   // `event.subscription()` is `project` or `logs`; a `Rescan` reaches every
   // subscriber of the affected root regardless of filter (coverage loss).
@@ -133,6 +120,48 @@ while let Some(event) = tributaries.next().await {
     event.path().display()
   );
   let _ = (project, logs);
+}
+# Ok(())
+# }
+```
+
+## Sync barrier (experimental)
+
+A sync barrier certifies that every change made under a subscription **before** the
+call is either already deliverable or dominated by a `Rescan`, without a hopeful
+sleep. It rides the **`sync` feature, off by default** — enable it alongside `tokio`
+and `fs` with `features = ["tokio", "sync"]`. A barrier certifies delivery only
+within one coverage epoch; any change to the root's coverage on the barrier's ground
+while it is in flight resolves it as dominated by a rescan.
+
+```rust,no_run
+# #[cfg(all(feature = "tokio", feature = "fs", feature = "sync"))]
+# async fn demo() -> Result<(), Box<dyn std::error::Error>> {
+use std::{ffi::OsString, path::Path, time::Duration};
+
+use tributaries::{TokioTributaries, TributariesOptions, WatchOptions, WatcherOptions};
+
+fn key(path: &str) -> Vec<OsString> {
+  Path::new(path)
+    .components()
+    .map(|c| c.as_os_str().to_os_string())
+    .collect()
+}
+
+let tributaries = TokioTributaries::new(WatcherOptions::new(), TributariesOptions::new())?;
+let project = tributaries
+  .watch(key("/path/to/project"), (), WatchOptions::new())
+  .await?;
+
+// A SYNC BARRIER: after this resolves, every change made under `project`
+// BEFORE the call is deliverable — read the stream and you will see it.
+// Kernel-mediated (a cookie file whose own event rides the ordered queue
+// behind those changes), never a hopeful sleep; the cookie is suppressed
+// from the stream. `SyncOutcome` says whether the barrier was met by
+// delivery or by a covering `Rescan` (re-enumerate then).
+let outcome = tributaries.sync(project, Duration::from_secs(5)).await?;
+if outcome.is_dominated() {
+  // A loss stood a Rescan in for the cookie: re-read rather than replay.
 }
 # Ok(())
 # }

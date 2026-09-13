@@ -2,6 +2,34 @@ use std::num::NonZeroU32;
 
 use super::*;
 
+/// An absolute exclusion path built from a unix-shaped tail (`"repo/target"`),
+/// so ONE literal reads as absolute on every host the `ExclusionNotAbsolute`
+/// rule runs on: unix wants a leading `/`, windows wants a drive-rooted path.
+#[cfg(windows)]
+fn abs_exclusion(tail: &str) -> String {
+  format!("C:\\{}", tail.replace('/', "\\"))
+}
+
+/// See the windows twin above.
+#[cfg(not(windows))]
+fn abs_exclusion(tail: &str) -> String {
+  format!("/{tail}")
+}
+
+/// An absolute exclusion path of EXACTLY `len` bytes — for the length-ceiling
+/// cells, which need a value that is both absolute (the new rule) and an exact
+/// byte count (the old one).
+#[cfg(windows)]
+fn abs_exclusion_of_len(len: usize) -> String {
+  format!("C:\\{}", "x".repeat(len - 3))
+}
+
+/// See the windows twin above.
+#[cfg(not(windows))]
+fn abs_exclusion_of_len(len: usize) -> String {
+  format!("/{}", "x".repeat(len - 1))
+}
+
 #[test]
 fn default_delegates_to_new() {
   assert_eq!(WatcherOptions::default(), WatcherOptions::new());
@@ -230,9 +258,9 @@ fn the_documented_maxima_are_themselves_in_range() {
     .with_root_liveness_interval(WatcherOptions::MAX_ROOT_LIVENESS_INTERVAL)
     .with_cookie_global_cap(WatcherOptions::MAX_COOKIE_GLOBAL_CAP)
     .with_exclusions(vec![
-      PathBuf::from(
-        "/".repeat(WatcherOptions::MAX_EXCLUSION_LEN)
-      );
+      PathBuf::from(abs_exclusion_of_len(
+        WatcherOptions::MAX_EXCLUSION_LEN
+      ));
       WatcherOptions::MAX_EXCLUSIONS
     ])
     .validate()
@@ -242,6 +270,53 @@ fn the_documented_maxima_are_themselves_in_range() {
     .with_root_liveness_interval(Duration::ZERO)
     .validate()
     .expect("the minima are admissible; ZERO still disables the tick");
+}
+
+/// An empty or relative exclusion is a driver-level hazard, not a cosmetic
+/// one: the driver's own exclusion test is a lexically-folded PREFIX test, and
+/// an empty (or `.`-shaped) path folds to the empty path, which is a prefix of
+/// every directory — one stray value silently suppresses the whole root. The
+/// programmatic builders do not check eagerly (they only ever set the field),
+/// so `validate` is the one place that catches it, naming the offending
+/// element's index.
+#[test]
+fn an_empty_or_relative_exclusion_is_refused_by_validate() {
+  assert_eq!(
+    WatcherOptions::new()
+      .with_exclusions(vec![PathBuf::new()])
+      .validate(),
+    Err(OptionsError::ExclusionNotAbsolute { index: 0 })
+  );
+  assert_eq!(
+    WatcherOptions::new()
+      .with_exclusions(vec![PathBuf::from("relative/x")])
+      .validate(),
+    Err(OptionsError::ExclusionNotAbsolute { index: 0 })
+  );
+  assert_eq!(
+    WatcherOptions::new()
+      .with_exclusions(vec![PathBuf::from(".")])
+      .validate(),
+    Err(OptionsError::ExclusionNotAbsolute { index: 0 }),
+    "a `.`-shaped exclusion is exactly the finding's silent-suppression case"
+  );
+  // The index names the OFFENDING element, not the list's length: two good
+  // entries ahead of the bad one still point at index 2.
+  assert_eq!(
+    WatcherOptions::new()
+      .with_exclusions(vec![
+        PathBuf::from(abs_exclusion_of_len(4)),
+        PathBuf::from(abs_exclusion_of_len(5)),
+        PathBuf::from("relative"),
+      ])
+      .validate(),
+    Err(OptionsError::ExclusionNotAbsolute { index: 2 })
+  );
+  // A valid absolute list is unaffected.
+  WatcherOptions::new()
+    .with_exclusions(vec![PathBuf::from(abs_exclusion("repo/target"))])
+    .validate()
+    .expect("an absolute exclusion is admissible");
 }
 
 /// The `serde` face: one object keyed by the field names, every key optional.
@@ -296,7 +371,7 @@ mod serde_face {
       .with_event_capacity(NonZeroUsize::new(4096).unwrap())
       .with_os_batch_capacity(NonZeroUsize::new(8).unwrap())
       .with_os_buffer_bytes(NonZeroU32::new(8 * 1024).unwrap())
-      .with_exclusions(vec![PathBuf::from("/repo/target")])
+      .with_exclusions(vec![PathBuf::from(abs_exclusion("repo/target"))])
       .with_backend(Backend::Fanotify)
       .with_root_liveness_interval(Duration::from_secs(5))
       .with_max_map_directories(Some(250_000));
@@ -304,6 +379,35 @@ mod serde_face {
     assert_eq!(
       serde_json::from_str::<WatcherOptions>(&json).unwrap(),
       options
+    );
+  }
+
+  /// An empty or relative exclusion is refused where the visitor reads it, in
+  /// the same fixed-message mold as the duration-text faces: it never echoes
+  /// the value (there is none worth echoing here, but the rule is the same
+  /// one), and the length bound already ran first.
+  #[test]
+  fn an_empty_or_relative_exclusion_is_refused() {
+    for document in [
+      r#"{"exclusions": [""]}"#,
+      r#"{"exclusions": ["relative/x"]}"#,
+    ] {
+      let err = serde_json::from_str::<WatcherOptions>(document)
+        .expect_err("an empty or relative exclusion is a document error");
+      assert!(
+        err.to_string().contains("absolute"),
+        "the refusal is the fixed absolute-path message: {err}"
+      );
+    }
+
+    // A valid absolute list still parses.
+    let json = format!(r#"{{"exclusions": [{}]}}"#, {
+      serde_json::to_string(&abs_exclusion("repo/target")).unwrap()
+    });
+    let parsed: WatcherOptions = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+      parsed.exclusions_slice(),
+      [PathBuf::from(abs_exclusion("repo/target"))]
     );
   }
 
@@ -316,12 +420,17 @@ mod serde_face {
     assert_eq!(parsed, WatcherOptions::new().with_latency(parsed.latency()));
   }
 
-  /// Forward compatibility: no `deny_unknown_fields`.
+  /// An unknown key is refused rather than silently ignored — a typo in a key
+  /// name must not silently drop the knob it was meant to set.
   #[test]
-  fn an_unknown_key_is_accepted() {
-    let parsed: WatcherOptions =
-      serde_json::from_str(r#"{"latency": "250ms", "some_future_knob": 7}"#).unwrap();
-    assert_eq!(parsed, WatcherOptions::new().with_latency(parsed.latency()));
+  fn an_unknown_key_is_refused() {
+    let err =
+      serde_json::from_str::<WatcherOptions>(r#"{"latency": "250ms", "some_future_knob": 7}"#)
+        .expect_err("an unknown key is refused");
+    assert!(
+      err.to_string().contains("some_future_knob"),
+      "the error names the unknown key: {err}"
+    );
   }
 
   /// Every bounded key is judged WHERE IT IS READ: the bound itself parses, and one
@@ -350,7 +459,7 @@ mod serde_face {
       &'static str,
     );
 
-    let cases: [Case; 7] = [
+    let cases: &[Case] = &[
       (
         "latency",
         r#"{"latency": "60s"}"#,
@@ -402,7 +511,7 @@ mod serde_face {
       ),
     ];
 
-    for (key, at_bound, expected, past_bound, words) in cases {
+    for (key, at_bound, expected, past_bound, words) in cases.iter().copied() {
       let parsed = serde_json::from_str::<WatcherOptions>(at_bound)
         .unwrap_or_else(|err| panic!("{key}: the bound itself is admissible, got {err}"));
       assert_eq!(parsed, expected(WatcherOptions::new()), "{key}");
@@ -463,7 +572,7 @@ mod serde_face {
     let cap = WatcherOptions::MAX_EXCLUSIONS;
     let list = |count: usize| {
       (0..count)
-        .map(|n| format!("\"/x{n}\""))
+        .map(|n| serde_json::to_string(&abs_exclusion(&format!("x{n}"))).unwrap())
         .collect::<Vec<_>>()
         .join(",")
     };
@@ -510,9 +619,11 @@ mod serde_face {
   fn an_over_long_exclusion_is_refused_before_its_path_is_built() {
     let cap = WatcherOptions::MAX_EXCLUSION_LEN;
 
-    let full: WatcherOptions =
-      serde_json::from_str(&format!(r#"{{"exclusions": ["{}"]}}"#, "x".repeat(cap)))
-        .expect("the ceiling itself is honoured");
+    let full: WatcherOptions = serde_json::from_str(&format!(
+      r#"{{"exclusions": [{}]}}"#,
+      serde_json::to_string(&abs_exclusion_of_len(cap)).unwrap()
+    ))
+    .expect("the ceiling itself is honoured");
     assert_eq!(full.exclusions_slice()[0].as_os_str().len(), cap);
     full.validate().expect("and it is an admissible household");
 
@@ -543,7 +654,9 @@ mod serde_face {
   #[test]
   fn an_over_long_ninth_exclusion_is_refused_by_count() {
     let cap = WatcherOptions::MAX_EXCLUSIONS;
-    let mut list = (0..cap).map(|n| format!("\"/x{n}\"")).collect::<Vec<_>>();
+    let mut list = (0..cap)
+      .map(|n| serde_json::to_string(&abs_exclusion(&format!("x{n}"))).unwrap())
+      .collect::<Vec<_>>();
     list.push(format!(
       "\"{}\"",
       "x".repeat(WatcherOptions::MAX_EXCLUSION_LEN * 4)
@@ -735,6 +848,24 @@ mod clap_face {
   use super::*;
   use clap::Parser as _;
 
+  /// Absolute exclusion literals for cells that need a `&'static str`
+  /// (a table of CLI argument slices): a leading slash on unix, a
+  /// drive-rooted path on windows.
+  #[cfg(windows)]
+  const EXCLUSION_REPO_TARGET: &str = r"C:\repo\target";
+  #[cfg(not(windows))]
+  const EXCLUSION_REPO_TARGET: &str = "/repo/target";
+
+  #[cfg(windows)]
+  const EXCLUSION_A: &str = r"C:\a";
+  #[cfg(not(windows))]
+  const EXCLUSION_A: &str = "/a";
+
+  #[cfg(windows)]
+  const EXCLUSION_B: &str = r"C:\b";
+  #[cfg(not(windows))]
+  const EXCLUSION_B: &str = "/b";
+
   #[derive(clap::Parser)]
   struct Cli {
     #[command(flatten)]
@@ -786,7 +917,7 @@ mod clap_face {
       fn(WatcherOptions) -> WatcherOptions,
     );
 
-    let cases: [Case; 9] = [
+    let cases: &[Case] = &[
       (&["--latency", "250ms"], |o| {
         o.with_latency(Duration::from_millis(250))
       }),
@@ -802,8 +933,8 @@ mod clap_face {
       (&["--os-buffer-bytes", "8192"], |o| {
         o.with_os_buffer_bytes(NonZeroU32::new(8192).unwrap())
       }),
-      (&["--exclusions", "/repo/target"], |o| {
-        o.with_exclusions(vec![PathBuf::from("/repo/target")])
+      (&["--exclusions", EXCLUSION_REPO_TARGET], |o| {
+        o.with_exclusions(vec![PathBuf::from(EXCLUSION_REPO_TARGET)])
       }),
       (&["--backend", "fanotify"], |o| {
         o.with_backend(Backend::Fanotify)
@@ -814,10 +945,61 @@ mod clap_face {
       (&["--max-map-directories", "250000"], |o| {
         o.with_max_map_directories(Some(250_000))
       }),
+      (&["--max-map-directories-unbounded"], |o| {
+        o.with_max_map_directories(None)
+      }),
+      (&["--exclusions-none"], |o| o.with_exclusions(Vec::new())),
     ];
-    for (args, expected) in cases {
+    for (args, expected) in cases.iter().copied() {
       assert_eq!(parse(args), expected(WatcherOptions::new()), "{args:?}");
     }
+  }
+
+  /// `--exclusions-none` spells the one household value `--exclusions` cannot
+  /// reach: the empty list.
+  #[test]
+  fn exclusions_none_flag_parses_to_an_empty_list() {
+    assert!(parse(&["--exclusions-none"]).exclusions_slice().is_empty());
+  }
+
+  /// A request for no exclusions and a request for specific ones cannot both
+  /// stand.
+  #[test]
+  fn exclusions_none_conflicts_with_exclusions() {
+    let err = Cli::try_parse_from([
+      "app",
+      "--exclusions",
+      EXCLUSION_REPO_TARGET,
+      "--exclusions-none",
+    ])
+    .err()
+    .expect("the two flags conflict");
+    assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+  }
+
+  /// `--max-map-directories-unbounded` spells the one household value
+  /// `--max-map-directories` cannot reach: the uncapped map.
+  #[test]
+  fn max_map_directories_unbounded_flag_parses_to_none() {
+    assert_eq!(
+      parse(&["--max-map-directories-unbounded"]).max_map_directories(),
+      None
+    );
+  }
+
+  /// A request for no ceiling and a request for a specific one cannot both
+  /// stand.
+  #[test]
+  fn max_map_directories_unbounded_conflicts_with_a_cap() {
+    let err = Cli::try_parse_from([
+      "app",
+      "--max-map-directories",
+      "8",
+      "--max-map-directories-unbounded",
+    ])
+    .err()
+    .expect("the two flags conflict");
+    assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
   }
 
   /// Every bounded flag is judged WHERE THE VALUE IS WRITTEN: the bound itself
@@ -842,7 +1024,7 @@ mod clap_face {
       &'static str,
     );
 
-    let cases: [Case; 7] = [
+    let cases: &[Case] = &[
       (
         &["--latency", "60s"],
         |o| o.with_latency(WatcherOptions::MAX_LATENCY),
@@ -887,7 +1069,7 @@ mod clap_face {
       ),
     ];
 
-    for (at_bound, expected, past_bound, words) in cases {
+    for (at_bound, expected, past_bound, words) in cases.iter().copied() {
       let parsed = parse(at_bound);
       assert_eq!(parsed, expected(WatcherOptions::new()), "{at_bound:?}");
       parsed
@@ -914,9 +1096,27 @@ mod clap_face {
   #[test]
   fn exclusions_repeat() {
     assert_eq!(
-      parse(&["--exclusions", "/a", "--exclusions", "/b"]).exclusions_slice(),
-      [PathBuf::from("/a"), PathBuf::from("/b")]
+      parse(&["--exclusions", EXCLUSION_A, "--exclusions", EXCLUSION_B]).exclusions_slice(),
+      [PathBuf::from(EXCLUSION_A), PathBuf::from(EXCLUSION_B)]
     );
+  }
+
+  /// An empty or relative value is refused as the flag's value parser reads
+  /// it, before a `PathBuf` reaches the household — the same rule `validate`
+  /// and the serde visitor ask.
+  #[test]
+  fn an_empty_or_relative_exclusion_value_is_refused() {
+    for value in ["", "relative/x"] {
+      let err = Cli::try_parse_from(["app", "--exclusions", value])
+        .err()
+        .expect("an empty or relative exclusion is refused by the parse");
+      assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+      assert!(
+        err.render().to_string().contains("absolute"),
+        "the refusal is the fixed absolute-path message: {}",
+        err.render()
+      );
+    }
   }
 
   /// And the ceiling, at the same flag: the occurrence past
@@ -934,7 +1134,7 @@ mod clap_face {
     let cap = WatcherOptions::MAX_EXCLUSIONS;
     let flags = |count: usize| {
       (0..count)
-        .flat_map(|n| ["--exclusions".to_owned(), format!("/x{n}")])
+        .flat_map(|n| ["--exclusions".to_owned(), abs_exclusion(&format!("x{n}"))])
         .collect::<Vec<_>>()
     };
 
@@ -984,7 +1184,7 @@ mod clap_face {
   fn an_over_long_exclusion_value_is_refused() {
     let cap = WatcherOptions::MAX_EXCLUSION_LEN;
 
-    let full = Cli::parse_from(["app", "--exclusions", &"x".repeat(cap)]).options;
+    let full = Cli::parse_from(["app", "--exclusions", &abs_exclusion_of_len(cap)]).options;
     assert_eq!(
       full.exclusions_slice()[0].as_os_str().len(),
       cap,
@@ -1024,7 +1224,7 @@ mod clap_face {
   /// everything.
   #[test]
   fn a_full_seat_of_in_range_exclusions_parses() {
-    let value = "x".repeat(WatcherOptions::MAX_EXCLUSION_LEN);
+    let value = abs_exclusion_of_len(WatcherOptions::MAX_EXCLUSION_LEN);
     let mut args = vec!["app".to_owned()];
     for _ in 0..WatcherOptions::MAX_EXCLUSIONS {
       args.push("--exclusions".to_owned());
@@ -1162,7 +1362,7 @@ mod clap_face {
       .with_move_window(Duration::from_millis(750))
       .with_root_liveness_interval(Duration::from_secs(90))
       .with_max_map_directories(Some(250_000))
-      .with_exclusions(std::vec![PathBuf::from("/repo/target")]);
+      .with_exclusions(std::vec![PathBuf::from(EXCLUSION_REPO_TARGET)]);
 
     let mut options = configured.clone();
     options
@@ -1184,17 +1384,58 @@ mod clap_face {
     // The repeatable seat REPLACES the list it updates, and only when it is named.
     let mut options = configured.clone();
     options
-      .update_from_arg_matches(&matches(&["--exclusions", "/a", "--exclusions", "/b"]))
+      .update_from_arg_matches(&matches(&[
+        "--exclusions",
+        EXCLUSION_A,
+        "--exclusions",
+        EXCLUSION_B,
+      ]))
       .expect("the update applies");
     assert_eq!(
       options.exclusions_slice(),
-      [PathBuf::from("/a"), PathBuf::from("/b")],
+      [PathBuf::from(EXCLUSION_A), PathBuf::from(EXCLUSION_B)],
       "a named list is the whole list — there is no spelling for appending one path"
     );
     assert_eq!(
       options.backend(),
       Backend::Inotify,
       "and it carries nothing else with it"
+    );
+
+    // `--max-map-directories-unbounded` clears an existing cap, and nothing
+    // else with it.
+    let mut options = configured.clone();
+    options
+      .update_from_arg_matches(&matches(&["--max-map-directories-unbounded"]))
+      .expect("the update applies");
+    assert_eq!(
+      options,
+      configured.clone().with_max_map_directories(None),
+      "the unbounded flag clears the existing cap and carries nothing else with it"
+    );
+
+    // `--exclusions-none` clears a persisted exclusion list, and nothing else
+    // with it.
+    let mut options = configured.clone();
+    options
+      .update_from_arg_matches(&matches(&["--exclusions-none"]))
+      .expect("the update applies");
+    assert_eq!(
+      options,
+      configured.clone().with_exclusions(Vec::new()),
+      "the reset flag clears the existing list and carries nothing else with it"
+    );
+
+    // An update naming neither `--exclusions` nor `--exclusions-none` preserves
+    // the persisted list exactly as it stood.
+    let mut options = configured.clone();
+    options
+      .update_from_arg_matches(&matches(&["--backend", "fanotify"]))
+      .expect("the update applies");
+    assert_eq!(
+      options.exclusions_slice(),
+      configured.exclusions_slice(),
+      "the exclusion list is untouched by an unrelated update"
     );
   }
 }
@@ -1563,12 +1804,16 @@ mod root_options {
       assert_eq!(empty.include(), Some(&[][..]));
     }
 
-    /// Forward compatibility: no `deny_unknown_fields`.
+    /// An unknown key is refused rather than silently ignored — a typo in a key
+    /// name must not silently drop the seat it was meant to set.
     #[test]
-    fn an_unknown_key_is_accepted() {
-      let parsed: RootOptions =
-        serde_json::from_str(r#"{"prune": [], "some_future_seat": 7}"#).unwrap();
-      assert_eq!(parsed, RootOptions::new());
+    fn an_unknown_key_is_refused() {
+      let err = serde_json::from_str::<RootOptions>(r#"{"prune": [], "some_future_seat": 7}"#)
+        .expect_err("an unknown key is refused");
+      assert!(
+        err.to_string().contains("some_future_seat"),
+        "the error names the unknown key: {err}"
+      );
     }
 
     /// An invalid pattern is refused by the DOCUMENT, not carried as a seat that
@@ -1698,6 +1943,76 @@ mod root_options {
         OptionalCli::parse_from(["app"]).options.is_none(),
         "and nothing spelled is still no household"
       );
+    }
+
+    /// `--prune-none` resets the prune seat to empty — the one household
+    /// value `--prune` alone cannot reach on an update.
+    #[test]
+    fn prune_none_flag_parses_to_the_empty_seat() {
+      assert!(parse(&["--prune-none"]).prune().is_empty());
+    }
+
+    /// `--prune-none` conflicts with `--prune`: pruning nothing and pruning
+    /// something cannot both stand.
+    #[test]
+    fn prune_none_conflicts_with_prune() {
+      let err = Cli::try_parse_from(["app", "--prune-none", "--prune", "**/x"]).unwrap_err();
+      assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    /// An update carrying `--prune-none` resets a persisted prune seat, and
+    /// one without it leaves that seat untouched.
+    #[test]
+    fn an_update_with_prune_none_clears_a_persisted_prune() {
+      let matches = |rest: &[&str]| {
+        <RootOptions as clap::Args>::augment_args_for_update(clap::Command::new("app"))
+          .get_matches_from(std::iter::once("app").chain(rest.iter().copied()))
+      };
+
+      let mut cleared = RootOptions::new().with_prune([glob("**/node_modules")]);
+      clap::FromArgMatches::update_from_arg_matches(&mut cleared, &matches(&["--prune-none"]))
+        .expect("the update applies");
+      assert!(cleared.prune().is_empty());
+
+      let mut kept = RootOptions::new().with_prune([glob("**/node_modules")]);
+      clap::FromArgMatches::update_from_arg_matches(&mut kept, &matches(&["--include", "*.mp4"]))
+        .expect("the update applies");
+      assert_eq!(patterns(kept.prune()), ["**/node_modules"]);
+    }
+
+    /// `--include-all` resets the include seat to absent — the one household
+    /// value `--include` alone cannot reach on an update.
+    #[test]
+    fn include_all_flag_parses_to_the_absent_seat() {
+      assert_eq!(parse(&["--include-all"]).include(), None);
+    }
+
+    /// `--include-all` conflicts with `--include`: delivering every file and
+    /// narrowing delivery cannot both stand.
+    #[test]
+    fn include_all_conflicts_with_include() {
+      let err = Cli::try_parse_from(["app", "--include-all", "--include", "*.mp4"]).unwrap_err();
+      assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    /// An update carrying `--include-all` resets a persisted include seat, and
+    /// one without it leaves that seat untouched.
+    #[test]
+    fn an_update_with_include_all_clears_a_persisted_include() {
+      let matches = |rest: &[&str]| {
+        <RootOptions as clap::Args>::augment_args_for_update(clap::Command::new("app"))
+          .get_matches_from(std::iter::once("app").chain(rest.iter().copied()))
+      };
+
+      let mut cleared = RootOptions::new().with_include([glob("*.mp4")]);
+      clap::FromArgMatches::update_from_arg_matches(&mut cleared, &matches(&["--include-all"]))
+        .expect("the update applies");
+      assert_eq!(cleared.include(), None);
+
+      let mut kept = RootOptions::new().with_include([glob("*.mp4")]);
+      clap::FromArgMatches::update_from_arg_matches(&mut kept, &matches(&["--prune", "**/.git"]))
+        .expect("the update applies");
+      assert_eq!(kept.include().map(patterns), Some(std::vec!["*.mp4"]));
     }
 
     /// A FLAGLESS command line is the default household — the same value
@@ -1965,6 +2280,74 @@ mod root_options {
       assert_eq!(
         update(empty, &["--moved"]).interest(),
         Interest::new().with_moved()
+      );
+    }
+
+    /// `--interest-none` is the empty interest's spelling on this face: the one
+    /// household value the six kind flags together cannot reach.
+    #[test]
+    fn interest_none_flag_parses_to_the_empty_interest() {
+      assert_eq!(parse(&["--interest-none"]).interest(), Interest::new());
+    }
+
+    /// `--interest-none` conflicts with every kind flag: a request for no event
+    /// kind and a request for a specific one cannot both stand.
+    #[test]
+    fn interest_none_conflicts_with_a_kind_flag() {
+      let err = Cli::try_parse_from(["app", "--interest-none", "--created"]).unwrap_err();
+      assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    /// A flagless parse still means every kind — adding `--interest-none` does
+    /// not change what "no flag at all" spells.
+    #[test]
+    fn the_flagless_parse_still_yields_the_default_interest() {
+      assert_eq!(parse(&[]).interest(), RootOptions::DEFAULT_INTEREST);
+    }
+
+    /// The empty interest round-trips through the inverse: an already-built
+    /// household holding it is spelled with `interest_none` set, not silently
+    /// widened to every kind, and converting that spelling back recovers it
+    /// exactly.
+    #[test]
+    fn the_empty_interest_round_trips_through_the_inverse() {
+      let args = RootInterestArgs::from(Interest::new());
+      assert!(
+        args.interest_none,
+        "the empty interest spells --interest-none"
+      );
+      assert!(
+        !(args.created || args.removed || args.modified || args.moved || args.attrib || args.ondir),
+        "no kind flag rides along with --interest-none"
+      );
+      assert_eq!(Interest::from(args), Interest::new());
+    }
+
+    /// An update carrying `--interest-none` empties a previously narrowed
+    /// interest, and one without it leaves that interest untouched.
+    #[test]
+    fn an_update_with_interest_none_empties_a_narrowed_interest() {
+      let update = |mut options: RootOptions, args: &[&str]| {
+        let matches = <Cli as clap::CommandFactory>::command_for_update()
+          .try_get_matches_from(std::iter::once("app").chain(args.iter().copied()))
+          .expect("the command line parses");
+        clap::FromArgMatches::update_from_arg_matches(&mut options, &matches)
+          .expect("the update applies");
+        options
+      };
+
+      let narrow = RootOptions::new().with_interest(Interest::new().with_created());
+
+      // WITH --interest-none: the narrowed interest is emptied.
+      assert_eq!(
+        update(narrow.clone(), &["--interest-none"]).interest(),
+        Interest::new()
+      );
+
+      // WITHOUT it: an unrelated update leaves the narrowed interest untouched.
+      assert_eq!(
+        update(narrow, &["--prune", "**/node_modules"]).interest(),
+        Interest::new().with_created()
       );
     }
   }
