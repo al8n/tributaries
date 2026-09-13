@@ -627,7 +627,11 @@ where
 }
 
 /// The clap face of the same bound: judged on the `&str` clap already holds,
-/// before `humantime::parse_duration` is asked to read any of it.
+/// before `humantime::parse_duration` is asked to read any of it. The bound
+/// covers only what this crate owns — humantime's copy of the unknown unit
+/// and the parse itself; clap's own `ValueValidation` diagnostic still
+/// renders the offending value verbatim, and that echo, over argv clap
+/// already holds, is out of reach of this bound.
 ///
 /// # Errors
 ///

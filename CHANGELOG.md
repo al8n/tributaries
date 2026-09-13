@@ -345,7 +345,10 @@ All notable changes to this workspace are documented here. The format is based o
   A build without it compiles no cookie ledger, no admission door and no retirement path,
   and takes neither `rand_chacha` nor `getrandom`. Every other surface is unchanged in both
   states, `WatcherOptions::cookie_global_cap` included: it stays on both configuration faces
-  whatever the gate, and is simply inert without `sync`.
+  whatever the gate, and is simply inert without `sync`. The reserved cookie namespace stays
+  reserved with the feature off: a marker another watcher writes on the same tree is still
+  suppressed from every consumer stream and exempt from `prune`, because the namespace
+  belongs to the barrier of ANY watcher, not to this build's.
 
 #### `sync` feature (experimental, off by default)
 

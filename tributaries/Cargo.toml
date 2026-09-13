@@ -30,12 +30,15 @@ smol = ["agnostic-lite/smol", "tributary-fs?/smol"]
 # weak `?` dependency: nothing to forward when `fs` is off, and a custom `Source`
 # consumer still gets the barrier vocabulary).
 #
-# EXPERIMENTAL and off by default. With it off no barrier is ever admitted, so nothing
-# else in the crate behaves differently. Its two dependencies are the one mechanism that
-# makes a cookie name unguessable: `rand_chacha` is the per-driver nonce stream and
-# `getrandom` the single OS seed that starts it. `getrandom` is declared only in the
-# non-wasm target table, so on `wasm32-unknown-unknown` this enables `rand_chacha` alone
-# and the driver holds no generator — the answer that target has always given.
+# EXPERIMENTAL and off by default. With it off no barrier is ever admitted, so nothing else
+# in the crate behaves differently. The reserved cookie namespace stays reserved with the
+# feature off: a marker written by another watcher on the same tree is still suppressed from
+# every consumer stream and exempt from the prune seats, because the namespace belongs to
+# the barrier of ANY watcher, not to this build's. Its two dependencies are the one
+# mechanism that makes a cookie name unguessable: `rand_chacha` is the per-driver nonce
+# stream and `getrandom` the single OS seed that starts it. `getrandom` is declared only
+# in the non-wasm target table, so on `wasm32-unknown-unknown` this enables `rand_chacha`
+# alone and the driver holds no generator — the answer that target has always given.
 sync = ["dep:rand_chacha", "dep:getrandom", "tributary-fs?/sync"]
 # Optional `serde` face on the option households (`TributariesOptions`,
 # `DebounceConfig`, `Debounce`, `Interest`, `WatchOptions`), forwarded to the
@@ -44,6 +47,7 @@ sync = ["dep:rand_chacha", "dep:getrandom", "tributary-fs?/sync"]
 # `Duration` knobs read and write as humantime text ("50ms", "2s").
 serde = [
   "dep:serde",
+  "dep:humantime",
   "dep:humantime-serde",
   "tributary-proto/serde",
   "tributary-fs?/serde",

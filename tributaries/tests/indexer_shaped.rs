@@ -25,8 +25,10 @@
   any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 
+#[cfg(feature = "sync")]
+use std::collections::HashMap;
 use std::{
-  collections::{HashMap, HashSet, VecDeque},
+  collections::{HashSet, VecDeque},
   future::Future,
   num::NonZeroUsize,
   path::{Path, PathBuf},
@@ -37,6 +39,7 @@ use std::{
 };
 
 use agnostic_lite::{RuntimeLite, tokio::TokioRuntime};
+#[cfg(feature = "sync")]
 use futures_util::FutureExt;
 use tempfile::TempDir;
 use tributaries::{
@@ -107,10 +110,12 @@ struct IndexerSource<R: RuntimeLite> {
   /// microseconds wide inside the lower crate's write and cannot be entered from a test, so the
   /// perturbation is applied where the owner sees it: the marker is created and observed where it
   /// truly is, and only the report is stale.
+  #[cfg(feature = "sync")]
   stale_landing: Option<(String, String)>,
   /// The TRUE landing each perturbed report stands for, so the reap still addresses the marker
   /// that exists — the real binding's report and its cleanup key are one and the same stale
   /// spelling, and this keeps that true here.
+  #[cfg(feature = "sync")]
   reported_landings: HashMap<Vec<Comp>, Vec<Comp>>,
 }
 
@@ -172,18 +177,22 @@ impl<R: RuntimeLite> IndexerSource<R> {
       pending_set: HashSet::new(),
       #[cfg(feature = "sync")]
       pending_syncs: HashMap::new(),
+      #[cfg(feature = "sync")]
       stale_landing: None,
+      #[cfg(feature = "sync")]
       reported_landings: HashMap::new(),
     }
   }
 
   /// Reports every later landing with the `Seg(true_seg)` component rewritten to
   /// `Seg(reported_seg)` — see [`stale_landing`](Self::stale_landing).
+  #[cfg(feature = "sync")]
   fn report_landings_under(&mut self, true_seg: &str, reported_seg: &str) {
     self.stale_landing = Some((true_seg.to_string(), reported_seg.to_string()));
   }
 
   /// The key a completed write REPORTS for `landed`, and the record that maps it back.
+  #[cfg(feature = "sync")]
   fn report_landing(&mut self, landed: Vec<Comp>) -> Vec<Comp> {
     let Some((truth, reported)) = self.stale_landing.clone() else {
       return landed;
@@ -1427,6 +1436,7 @@ async fn a_marker_identity_changes_with_the_token_nonce() {
 /// cell resolves the same way over a weaker identity. That property is (j.1)'s alone, and the
 /// exactness of the word behind it is the minting crate's own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "sync")]
 async fn sync_barrier_resolves_over_the_custom_binding() {
   let Rig {
     _dir,
@@ -1517,6 +1527,7 @@ async fn sync_barrier_resolves_over_the_custom_binding() {
 /// marker can no longer meet a barrier at all — the first round the registration's own debt does
 /// not dominate fails on its deadline.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "sync")]
 async fn sync_barrier_resolves_when_the_reported_landing_is_stale() {
   let Rig {
     _dir,

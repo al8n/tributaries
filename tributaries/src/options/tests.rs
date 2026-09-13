@@ -1215,8 +1215,13 @@ mod clap_face {
   }
 
   /// A duration flag's TEXT is bounded before `humantime` ever parses it — the
-  /// flag's own `ValueValidation`, naming the bound and the length, never the
-  /// text.
+  /// flag's own `ValueValidation`, naming the bound and the length. The bound
+  /// protects what this crate owns: humantime's copy of the unknown unit and
+  /// the parse it would otherwise run on an unbounded string. Clap's own
+  /// diagnostic still renders the offending value verbatim in its
+  /// `invalid value '...' for '--quiet-window'` preamble — that echo is
+  /// clap's, over argv it already holds, and this bound cannot and does not
+  /// reach it.
   ///
   /// Revert witness: drop `parse_bounded_duration` back to
   /// `humantime::parse_duration` and an over-long value is copied whole into
@@ -1233,10 +1238,6 @@ mod clap_face {
     assert!(
       rendered.contains("64-byte bound") && rendered.contains("65 bytes"),
       "the refusal names the bound and the length: {rendered}"
-    );
-    assert!(
-      !rendered.contains(&text),
-      "and never the text itself: {rendered}"
     );
   }
 
