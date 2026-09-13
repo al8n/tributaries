@@ -1078,9 +1078,14 @@ impl RearmKickoff {
   }
 }
 
-/// What feeding one [`OsRecord`] to [`Monitor::on_os_record`] did to the watch
-/// tree's SHAPE — the geometry a consumer that keeps its own per-scope bookkeeping
-/// keyed by path must follow.
+/// What feeding one [`OsRecord`] to [`Monitor::on_os_record`] RELOCATED — the
+/// geometry a consumer that keeps its own per-scope bookkeeping keyed by path
+/// must follow.
+///
+/// Two facts, told apart because their consumers differ: a directory rename
+/// moves the PATH a consumer's records are keyed by, and only some of those
+/// renames also carry a watched subtree whose anchor the consumer must re-key.
+/// A kernel-recursive profile reports the first and never the second.
 ///
 /// A consumer learns this from the call that performed it rather than by
 /// re-deciding it from the same inputs. That is the whole point of the type: a
@@ -1099,13 +1104,36 @@ impl RearmKickoff {
 /// (see [`RearmKickoff`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordOutcome {
-  /// The record moved no watched subtree between parents. Every record kind
-  /// reports this except the one below — including a `MovedTo` that paired past
-  /// its window, one whose source held no watched subtree, one with no cookie,
-  /// and one whose reparent was *attempted and rejected* (a cyclic destination,
-  /// or an endpoint the attempt's own teardown removed). A consumer re-anchors
-  /// exactly when the Monitor reparented, and never when it did not.
+  /// The record relocated nothing a path-keyed consumer has to follow. Every
+  /// record kind reports this except the two below — including a `MovedTo` that
+  /// paired past its window, one with no cookie, one whose object is a PROVEN
+  /// non-directory, one that names no slot below its watch, and one whose source
+  /// anchor died mid-window and so has no source path left to name. A consumer
+  /// re-anchors exactly when the Monitor reparented, and never when it did not.
   Nothing,
+  /// A paired, in-window [`RecordKind::MovedTo`] whose object is not a proven
+  /// non-directory and whose source is still anchored — a DIRECTORY RENAME the
+  /// tree carried no watched subtree across.
+  ///
+  /// Reported on every profile, including the kernel-recursive ones: their one
+  /// native stream covers the destination the moment the rename lands, so they
+  /// hold no subtree to re-key and would otherwise report a relocation of ground
+  /// as nothing at all. A descending profile reports it too wherever the source
+  /// was not a live child watch — an unarmed directory, or one whose O(1)
+  /// carry-over was rejected — since the object moved either way.
+  ///
+  /// It says only where the renamed object WAS. A consumer whose own bookkeeping
+  /// is keyed by path moves that key; it must NOT re-anchor a watch, which is
+  /// what [`Reparented`](Self::Reparented) alone reports.
+  ///
+  /// The destination is the record's own watch and target, so a consumer pairs
+  /// this `from` with the landing it already holds and one coordinate is
+  /// reconstructed once rather than twice.
+  Renamed {
+    /// The renamed object's scope-relative location immediately before the
+    /// rename, reconstructed from the live tree at report time.
+    from: Location,
+  },
   /// A paired, in-window [`RecordKind::MovedTo`] over a held watched directory
   /// whose O(1) reparent SUCCEEDED, reporting the source slot as it stood
   /// immediately BEFORE that reparent.
@@ -1134,12 +1162,27 @@ impl RecordOutcome {
     matches!(self, Self::Nothing)
   }
 
-  /// The pre-reparent source slot, or `None` for [`Nothing`](Self::Nothing).
+  /// The pre-reparent source slot, or `None` for every outcome that carried no
+  /// watched subtree between parents.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn reparented(&self) -> Option<(WatchId, &Location)> {
     match self {
-      Self::Nothing => None,
+      Self::Nothing | Self::Renamed { .. } => None,
       Self::Reparented { from_parent, from } => Some((*from_parent, from)),
+    }
+  }
+
+  /// Where the renamed object WAS, for either kind of paired directory rename —
+  /// the coordinate a consumer keyed by path has to move.
+  ///
+  /// One question, one answer, for the two outcomes that both describe a
+  /// relocation: a reparent is a pairing too, so a profile that pairs AND
+  /// re-keys is described here once rather than twice.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn paired_from(&self) -> Option<&Location> {
+    match self {
+      Self::Nothing => None,
+      Self::Renamed { from } | Self::Reparented { from, .. } => Some(from),
     }
   }
 }
@@ -3207,15 +3250,16 @@ impl Monitor {
     signaled
   }
 
-  /// Ingests one normalized event, reporting what it did to the watch tree's
-  /// shape.
+  /// Ingests one normalized event, reporting what it RELOCATED.
   ///
   /// The [`RecordOutcome`] exists so a consumer holding its own path-keyed
-  /// bookkeeping never has to re-derive the Monitor's reparenting decision from
-  /// the same record: it is told, by the call that made the decision. Everything
-  /// but a successful held-directory reparent reports
-  /// [`RecordOutcome::Nothing`]; ignoring the value is a supported way to drive
-  /// the loop.
+  /// bookkeeping never has to re-derive the Monitor's decision from the same
+  /// record: it is told, by the call that made the decision. A paired directory
+  /// rename reports [`RecordOutcome::Renamed`], and one that also carried a
+  /// watched subtree between parents reports the stronger
+  /// [`RecordOutcome::Reparented`] instead — one relocation, reported once.
+  /// Everything else reports [`RecordOutcome::Nothing`]; ignoring the value is a
+  /// supported way to drive the loop.
   ///
   /// The return value is a semver-relevant addition to this method — the crates
   /// in this workspace ship together and none is published, so it lands as an
@@ -5769,6 +5813,27 @@ impl Monitor {
     self.settle_bridges();
   }
 
+  /// The live source location of the half parked under `(scope, cookie)` — `None`
+  /// where nothing is parked there, or where the half's anchor has died.
+  ///
+  /// It serves the caller [`consume_pending_move`](Self::consume_pending_move)
+  /// serves, and answers the other half of that caller's question. A fence that
+  /// replaces a rename's destination before it reaches this Monitor still has to
+  /// say WHERE the object came from: every located judgement such a caller makes
+  /// of a live obligation is by PATH, and the source's ground is the one the
+  /// rename just moved. It is asked BEFORE the consumption and at the same seat,
+  /// because the consumption empties the store this reads.
+  ///
+  /// The coordinate is the one this Monitor reports a paired rename's source
+  /// through ([`RecordOutcome::paired_from`]), reconstructed by the same rule, so
+  /// a caller reading it here and a caller reading it off a record's outcome name
+  /// one location — and a half whose source anchor a narrow subtree drop has torn
+  /// down reconstructs nothing here exactly as it reports nothing there.
+  #[cfg_attr(not(tarpaulin), inline)]
+  pub fn pending_move_from(&self, scope: ScopeId, cookie: MoveCookie) -> Option<Location> {
+    self.live_pending_from(self.pending_moves.get(&(scope, cookie))?)
+  }
+
   /// Dequeues the next [`Action`] for the driver to execute, if any.
   ///
   /// A queued [`Action::Watch`] whose [`ArmAttempt`] its handle no longer names
@@ -6088,6 +6153,24 @@ impl Monitor {
         // single-definition precondition so the value that steers the re-anchor and
         // the value this record reports are one evaluation, not two agreeing ones.
         let reparenting = self.reparenting_source(&pending, rec.name(), now);
+        // EVERY SUCCESSFULLY PAIRED DIRECTORY RENAME RELOCATES THE GROUND a
+        // consumer's own path-keyed bookkeeping stands on, whether or not the
+        // tree carried a watched subtree with it: a kernel-recursive stream
+        // covers the destination the moment the rename lands, so it holds
+        // nothing to re-key and would otherwise report the relocation as
+        // nothing at all. Built from the pairing's single source capture, so
+        // this report and the `Moved` it accompanies name one coordinate.
+        //
+        // Judged a DIRECTORY unless the pair proved otherwise — the reading
+        // every fence of this crate takes of an omitted class, and the profiles
+        // that most need the report are the ones whose records often prove
+        // nothing. And only where the destination NAMES a slot below its watch:
+        // a nameless one reconstructs to the watch's own path, which is the
+        // destination's parent rather than the object that moved.
+        let renamed = (class != Some(false) && rec.depth() > 0)
+          .then(|| resolved_from.clone())
+          .flatten()
+          .map(|from| RecordOutcome::Renamed { from });
         match (rec.name(), pending.held) {
           // Held directory: attempt the O(1) reparent and emit the pairing only once
           // it succeeds — a `Moved` must never precede a rejected/aborted reparent.
@@ -6117,6 +6200,12 @@ impl Monitor {
               // re-anchor above ran on — captured before the re-key, so it names
               // where the subtree was (the key a consumer's own bookkeeping still
               // holds), not where it now is.
+              //
+              // The stronger of the two reports, and the only one: a pairing that
+              // also re-keyed describes ONE relocation, so it is reported once.
+              // The `None` here is not a lost rename either — both captures rest
+              // on the same source-liveness guard, so a slot this cannot name is
+              // one the rename report cannot name either.
               outcome = match reparenting {
                 Some((from_parent, from)) => RecordOutcome::Reparented { from_parent, from },
                 None => RecordOutcome::Nothing,
@@ -6184,10 +6273,14 @@ impl Monitor {
               if self.is_watched(rec.watch()) {
                 self.emit_pair(scope, to.clone(), &pending, class, paired);
                 // The arm's own capture again — the reparent failing changes where the
-                // pair relocates halves FROM not at all. The `outcome` stays `Nothing`:
-                // the tree did not carry the subtree, so a consumer must NOT re-anchor
-                // as if it had. That sliver is why the record reports what it did
-                // rather than exposing what it decided.
+                // pair relocates halves FROM not at all. The outcome is the RENAME and
+                // never a reparent: the tree did not carry the subtree, so a consumer
+                // must NOT re-anchor as if it had. That sliver is why the record
+                // reports what it did rather than exposing what it decided. The
+                // ground still moved, though — the object is at the destination and
+                // the write that holds a descriptor on it lands there — so the
+                // relocation is reported like any other pairing's.
+                outcome = renamed.unwrap_or(RecordOutcome::Nothing);
                 if let Some((_, from)) = reparenting.as_ref() {
                   self.reanchor_pending_sources(scope, from, &to);
                 }
@@ -6225,7 +6318,11 @@ impl Monitor {
                 // The destination parent died with the held subtree (it sat inside it),
                 // so the precomputed `to` reconstructed through the detached source and
                 // is a STALE pre-move path. Escalate at the scope root — the one
-                // location still known live — never at a path we no longer cover. The
+                // location still known live — never at a path we no longer cover. No
+                // rename is reported for the same reason no pair is emitted: the
+                // destination this record names is not where the object is, and a
+                // relocation onto it would move a consumer's ground to a path the
+                // tree has already left. The root escalation covers all of it. The
                 // root Rescan is a scope-wide transition like a whole-scope loss:
                 // every parked half (either store) resolves AFTER it and must cover,
                 // or its stale facts would land post-rescan uninstructed.
@@ -6243,8 +6340,12 @@ impl Monitor {
             }
           }
           // Non-directory (or unwatched) source: emit the pairing and reconcile the slot.
+          // An UNWATCHED directory relocates its ground exactly as a held one does —
+          // an arm the kernel refused, or one that never landed — so the pairing's
+          // rename report is owed here too, with no subtree for a consumer to re-key.
           (Some(name), None) => {
             self.emit_pair(scope, to.clone(), &pending, class, paired);
+            outcome = renamed.unwrap_or(RecordOutcome::Nothing);
             if let Some(from) = resolved_from.as_ref() {
               self.reanchor_pending_sources(scope, from, &to);
             }
@@ -6270,6 +6371,14 @@ impl Monitor {
               self.drop_subtree(src, DeficitDischarge::CoveringRescan);
             }
             self.emit_pair(scope, to.clone(), &pending, class, paired);
+            // The KERNEL-RECURSIVE arm: a record anchored at the root and carrying a
+            // whole root-relative location names no direct child slot, so every
+            // pairing of those profiles resolves here — with no held source, since
+            // they keep no per-directory child watches to hold. It is where their
+            // rename report is produced. A NAMELESS destination lands here too and
+            // reports nothing: it addresses no slot below its watch, which is the
+            // rename capture's own guard.
+            outcome = renamed.unwrap_or(RecordOutcome::Nothing);
             if let Some(from) = resolved_from.as_ref() {
               self.reanchor_pending_sources(scope, from, &to);
             }

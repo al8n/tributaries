@@ -48,9 +48,10 @@ use tributary_proto::{
 
 use crate::{
   core::{
-    BarrierEpoch, BarrierLocation, BarrierMove, CoverNoop, CoverReconcile, CoverSettle,
-    DeclineReason, Delivery, DriverCore, Effect, ExpectedObject, FenceId, MountRefresh, ProbeId,
-    ProbeOutcome, RawDirEntry, RawEnumerate, RootLiveness, SettlePass, WidenCommit, WidenTaint,
+    BarrierEpoch, BarrierEvent, BarrierLocation, BarrierMove, CoverNoop, CoverReconcile,
+    CoverSettle, DeclineReason, Delivery, DriverCore, Effect, ExpectedObject, FenceId,
+    MountRefresh, ProbeId, ProbeOutcome, RawDirEntry, RawEnumerate, RootLiveness, SettlePass,
+    WidenCommit, WidenTaint,
   },
   error::WatchRootError,
   os::{
@@ -4358,8 +4359,14 @@ impl ClaimPrecedence {
 struct DominatedBarrier {
   /// The rendered marker leaf whose queued emit the purge takes.
   name: Arc<str>,
-  /// Where this barrier's marker lands — the ground its covering `Rescan` owes.
-  cover_dir: PathBuf,
+  /// The directory the covering `Rescan` this retirement owes has to cover:
+  /// where the record says the barrier stands.
+  ///
+  /// A retirement driven by a paired directory RENAME reads none of it. The
+  /// ground the rename moved is no longer a path anything stands on, so that
+  /// retirement's instruction is aimed at the destination's parent, which the
+  /// queue entry carries and the record cannot.
+  ground: PathBuf,
 }
 
 /// Why [`CookieGuard::claim`] refused a handover — the two facts a caller learns
@@ -5146,7 +5153,7 @@ impl<F: FsOps> CookieRegistry<F> {
         ob.dominated = true;
         dominated.push(DominatedBarrier {
           name: Arc::clone(&ob.name),
-          cover_dir: ob.cover_dir.clone(),
+          ground: ob.cover_dir.clone(),
         });
         if let Some(decided) =
           Self::removal_decision_locked(&mut inner, &RemovalRequest::Targeted(id))
@@ -6317,6 +6324,12 @@ where
       // cover. So a shrink that landed while this sync was parked would
       // otherwise dispatch a marker into ground holding no watch, and the
       // caller's barrier could only time out over a write that reported success.
+      //
+      // The ground is the ADMISSION'S. A rename that carried this obligation's
+      // subtree away while it was parked moved no record: a parked barrier is
+      // answered by its own belt at dispatch, and the write's landing verdict
+      // refuses a spelling whose landing has moved (`DirReplaced`, retryable)
+      // rather than following a path the caller never named.
       //
       // Nothing physical exists for a parked record, so there is no marker to
       // withdraw and no emit to purge — only the covering `Rescan` the terminal
@@ -11951,7 +11964,7 @@ pub(crate) async fn run<R, F>(
   // request it answers. Monotone for the driver's life: a token is never reused,
   // so a stale completion can only ever fail to match.
   let mut cut_token_seq: u64 = 0;
-  let mut pending_control: PendingControl = BTreeMap::new();
+  let mut pending_control = PendingControl::default();
   let mut control_inflight: ControlInflight = BTreeMap::new();
   // The ROOT-LIVENESS PROBES outstanding, generation-tagged per scope. A probe
   // runs on a thread of its own rather than on the blocking pool — see the
@@ -12660,6 +12673,8 @@ pub(crate) async fn run<R, F>(
                   &registry,
                   &cookies,
                   &mut probes,
+                  &mut pending_control,
+                  &mut control_inflight,
                   scope,
                   spawned,
                   replace.reservation.path(),
@@ -13018,6 +13033,8 @@ pub(crate) async fn run<R, F>(
               &registry,
               &cookies,
               &mut probes,
+              &mut pending_control,
+              &mut control_inflight,
               scope,
               spawned,
               replace.reservation.path(),
@@ -13349,6 +13366,17 @@ pub(crate) async fn run<R, F>(
           if holds_mark {
             control_inflight.remove(&scope);
           }
+          // A scope latched by a control-queue fold is released by the END of
+          // the batch that was in flight when the fold ran, and by nothing else:
+          // that batch is what the ceiling was crossed behind, and until it
+          // finishes every arm the standing overflow re-derives would cross the
+          // ceiling again. The re-derivation is owed at the release — the fold
+          // dropped the attempts, so the overflow that stood the covering
+          // `Rescan` needs a second pass to put the coverage back, and this is
+          // the first instant its queue can drain. A scope reaching a FATAL
+          // terminal below owes none: its fences fold, and nothing is left to
+          // re-arm.
+          let re_derive = holds_mark && pending_control.release_overflow(scope);
           match end {
             ControlBatchEnd::Unwound => {
               // The batch stopped somewhere inside itself, so its native
@@ -13370,7 +13398,7 @@ pub(crate) async fn run<R, F>(
               // and what its callers are still owed — is exactly what is unknown,
               // and no generation comparison bounds that: whatever it half-wrote,
               // it wrote through a port, and a swap since then retracts none of it.
-              pending_control.remove(&scope);
+              pending_control.drop_scope(scope);
               core.on_source_fatal(scope, now());
             }
             ControlBatchEnd::Unanswered if !generation_retired(&lanes, scope, generation) => {
@@ -13381,7 +13409,7 @@ pub(crate) async fn run<R, F>(
               // proven, and whatever parks on one would wait forever. So the
               // terminal is the same one an unwind takes, reached for a different
               // reason: it is what resolves everything the scope is owed.
-              pending_control.remove(&scope);
+              pending_control.drop_scope(scope);
               core.on_source_fatal(scope, now());
             }
             ControlBatchEnd::Unanswered => {
@@ -13399,6 +13427,9 @@ pub(crate) async fn run<R, F>(
               // mark it may have owned is released above with no proof attached and
               // the live lane's fences still wait on a round trip of their own.
               if holds_mark {
+                if re_derive {
+                  core.on_root_overflow(scope, now());
+                }
                 kick_control_queue::<R, F>(
                   &ops,
                   &op_tx,
@@ -13435,6 +13466,9 @@ pub(crate) async fn run<R, F>(
                   // them ever has a request out for a scope at a time, so the
                   // other's `prove` is inert.
                   core.prove_adoption_cut(scope, generation, token);
+                }
+                if re_derive {
+                  core.on_root_overflow(scope, now());
                 }
                 kick_control_queue::<R, F>(
                   &ops,
@@ -16478,6 +16512,8 @@ fn commit_replace<F>(
   registry: &impl ScopeRegistry,
   cookies: &CookieRegistry<F>,
   probes: &mut LivenessProbes,
+  pending_control: &mut PendingControl,
+  control_inflight: &mut ControlInflight,
   scope: ScopeId,
   spawned: EscrowedSpawn<F::Handle>,
   reserved: &Path,
@@ -16591,6 +16627,18 @@ where
   // one claims the fresh tag: the replacement is probed immediately, however long
   // the old root takes to answer.
   probes.retire_generation(scope);
+  // Retire the scope's CONTROL-PLANE state with the transport it was derived
+  // for, at the same instant and for the same reason: its overflow latch, its
+  // queued batches and its in-flight mark all belong to the generation this swap
+  // ends, and every attempt they carried is resolved by the domination the commit
+  // below feeds. Ahead of that commit, so no effect of the NEW world is derived
+  // against the old one's latch — a replacement whose re-arm work the old latch
+  // discards is reported live and stays unarmed, with the only release in the
+  // hands of a batch the replacement exists to escape. The mark goes with them,
+  // which is also what makes a late completion of the retired generation inert:
+  // it names a mark nothing holds, so it releases nothing and kicks nothing.
+  pending_control.retire_generation(scope);
+  control_inflight.remove(&scope);
   // The rebind supersedes every arm the retired transport still owes, and hands
   // back the attempt the replay must name — so a straggler from the dead world
   // answers an attempt the core no longer holds and is discarded, rather than
@@ -16728,17 +16776,26 @@ where
   }
 }
 
+/// One queued control batch: the lane generation it was emitted under, its ops,
+/// and the ordering-proof request it carries (`None` for an ordinary arm or
+/// disarm batch, which owes no proof).
+type ControlBatch = (u64, Vec<ControlRequest>, Option<u64>);
+
 /// One scope's queued control batches: the lane generation each was emitted
 /// under, its ops, and the ordering-proof request it carries (`None` for an
 /// ordinary arm or disarm batch, which owes no proof).
 ///
 /// The deque carries ONE invariant, which both enqueue paths
 /// ([`queue_control_batch`] and [`queue_cut_proof`]) restore before they return:
-/// no two ADJACENT ordinary entries share a generation. Proofs are themselves
-/// coalesced to at most one per scope, so that caps the queue at one ordinary
-/// entry per generation it carries plus that single proof — and only a transport
-/// swap mints a generation, so no volume of directory churn can add an entry at
-/// all.
+/// no two ADJACENT ordinary entries share a generation UNLESS the earlier one is
+/// FULL — at [`MAX_QUEUED_CONTROL_REQUESTS`], which is also the largest batch
+/// that may be submitted at once ([`push_coalesced`]). Proofs are themselves
+/// coalesced to at most one per scope, so that caps the queue at
+/// `ceil(the generation's queued requests / the ceiling) + 1` ordinary entries
+/// per generation it carries plus that single proof — and only a transport swap
+/// mints a generation, so no volume of directory churn can add an entry at all:
+/// churn fills the trailing entry, and only a cohort bigger than the ceiling
+/// spills into another, exactly as many as it has ceilings.
 ///
 /// The cap is what keeps a barrier reachable. Enqueue rate is set by that churn;
 /// drain rate is one batch per scope at a time, each paying for the reader's
@@ -16753,48 +16810,195 @@ where
 /// obsolete proof, which carries no requests and is owed to nobody (see
 /// [`queue_cut_proof`]); dropping an ordinary entry would strand every
 /// registration waiting on an arm it carried, because even a refused arm returns
-/// the outcome its Monitor node is parked on. So what is capped is the NUMBER of
-/// queued batches, not the work inside them: a coalesced batch's own request
-/// vector still grows under sustained churn, unchanged from dispatching every
-/// batch straight to the blocking pool, where the same payloads accumulated in
-/// the pool's own queue instead.
+/// the outcome its Monitor node is parked on. So this cap is on the NUMBER of
+/// queued batches; the work INSIDE each one is capped at
+/// [`MAX_QUEUED_CONTROL_REQUESTS`] by the same merge that maintains the
+/// adjacency ([`push_coalesced`]), and what sustained churn grows is the TOTAL
+/// the scope holds across them.
 ///
-/// That remaining growth is a KNOWN, DELIBERATE exception to the retention rule
-/// the rest of this driver now follows ([`MAX_TEARDOWN_BACKLOG`],
-/// [`MAX_PARKED_SETTLEMENTS`], [`MAX_ENUMERATE_ENTRIES`]): every one of those
-/// bounds is enforced by REFUSING an admission, and there is nothing here to
-/// refuse. These requests are not caller requests at all — they are the Monitor's
-/// own derived coverage work, each one OWED to a node parked on its outcome, so
-/// the only ways to bound them are to shed the exact history or to stop producing
-/// it, and both were rejected on their costs rather than overlooked:
+/// The REQUESTS inside those batches are bounded in their own right, by
+/// [`MAX_QUEUED_CONTROL_REQUESTS`] per scope, and that bound is enforced by
+/// FOLDING rather than by refusing: these are not caller requests at all — they
+/// are the Monitor's own derived coverage work, each one owed to a node parked on
+/// its outcome — so there is nothing here to refuse. A push that would cross the
+/// ceiling instead drops the scope's queued attempts and takes the ROOT-OVERFLOW
+/// path, which is this crate's existing answer to "more reconcile work than the
+/// scope can account for": funnel 6's bump, the trust loss, and the full re-arm
+/// under a covering `Rescan`. Nothing is shed silently — what the queue held is
+/// re-derived from current truth, and the consumer is told to re-enumerate.
 ///
-/// - **Shed to a scope-wide loss.** Discarding the queue and letting the
-///   overflow cut re-derive coverage from a cold read would bound it, and the
-///   covering `Rescan` would keep the CONSUMER whole. But a discarded
-///   `RemoveWatch` leaves a kernel watch on an object the Monitor no longer
-///   models, and a discarded `AddWatch` leaves a directory unarmed until some
-///   later read happens to re-visit it — trading bounded memory for stranded
-///   kernel coverage, which is silent loss of exactly the kind this crate refuses
-///   to trade for anything.
-/// - **Backpressure the producer.** Refusing to drain a scope's source lane while
-///   its backlog is over a cap would bound it through the transport, whose own
-///   overflow already lowers to a covering `Rescan`. But the lanes are merged into
-///   one `SelectAll`, so declining to poll is watcher-wide: one wedged scope would
-///   stop DELIVERY for every healthy one, converting bounded memory growth into an
-///   unbounded, watcher-wide delivery stall. That is a worse availability posture
-///   than the growth it fixes.
+/// The two alternatives are rejected on their costs. Shedding the queue WITHOUT
+/// the overflow would leave a kernel watch on an object the Monitor no longer
+/// models and a directory unarmed until some later read happened to re-visit it —
+/// silent loss of exactly the kind this crate refuses to trade for anything.
+/// Backpressuring the producer — declining to drain a scope's source lane over a
+/// cap — is watcher-wide, because the lanes are merged into one `SelectAll`: one
+/// wedged scope would stop DELIVERY for every healthy one, converting bounded
+/// memory growth into an unbounded, watcher-wide delivery stall.
 ///
-/// What does bound it, and why the growth is survivable rather than merely
-/// admitted: the queue is per-scope and dies whole with its scope; the payload is
-/// arms and disarms for directories, so it is bounded at any instant by the
-/// scope's live directory count plus the churn a stalled control batch spans, not
-/// by the watcher's lifetime; and the cap above guarantees an ordering proof is
-/// always reached after at most one finite batch, so a barrier's latency is a
-/// function of that payload rather than unbounded in the number of batches. A
-/// real fix belongs with the core: an explicit rebuild mode that INVALIDATES the
-/// queued attempts and re-derives coverage from current truth, which is a change
-/// to the recovery algebra, not to this queue.
-type PendingControl = BTreeMap<ScopeId, VecDeque<(u64, Vec<ControlRequest>, Option<u64>)>>;
+/// The fold LATCHES the scope, and that is what makes it terminate. The overflow
+/// re-arms the scope from a cold read, which derives a fresh set of arms — into
+/// this same queue, behind the same batch that has not completed, across the same
+/// ceiling. A latched scope therefore queues no further arms or disarms at all;
+/// the latch is released by the END of the batch that was in flight when it was
+/// set, and that release raises one more root overflow, which is what re-derives
+/// the dropped attempts' coverage against a queue that can now drain. A scope
+/// whose batch never completes is never released, which is the honest answer: its
+/// control plane is wedged, the consumer holds the covering `Rescan` the fold
+/// stood, and the memory is held at the ceiling.
+///
+/// Which is exactly why the fold is taken ONLY over a batch in flight
+/// ([`queue_control_batch`]). The release has one producer — that batch's end —
+/// so a latch set with nothing running would never be lifted, and the ceiling
+/// bounds nothing there anyway: with no batch holding the queue the work is
+/// submitted rather than held.
+#[derive(Default)]
+struct PendingControl {
+  /// Each scope's queued batches, in emission order.
+  queues: BTreeMap<ScopeId, VecDeque<ControlBatch>>,
+  /// The scopes whose queued attempts were folded into the root-overflow path
+  /// and which therefore queue no derived control work until the batch that was
+  /// in flight at the fold reaches an end.
+  overflowed: BTreeSet<ScopeId>,
+}
+
+impl PendingControl {
+  /// `scope`'s queue, created empty if it has none.
+  fn queue(&mut self, scope: ScopeId) -> &mut VecDeque<ControlBatch> {
+    self.queues.entry(scope).or_default()
+  }
+
+  /// The arms and disarms `scope` currently holds un-submitted — the gauge
+  /// [`MAX_QUEUED_CONTROL_REQUESTS`] is read against. O(batches), which the
+  /// adjacency invariant already caps at one per generation plus one proof.
+  fn queued_requests(&self, scope: ScopeId) -> usize {
+    self.queues.get(&scope).map_or(0, |queue| {
+      queue.iter().map(|(_, requests, _)| requests.len()).sum()
+    })
+  }
+
+  /// Whether `scope` is latched: its attempts are folded into a standing root
+  /// overflow, and the work it derives until the release belongs to that
+  /// overflow's own re-arm rather than to this queue.
+  fn is_latched(&self, scope: ScopeId) -> bool {
+    self.overflowed.contains(&scope)
+  }
+
+  /// Drops `scope`'s queued attempts and latches it.
+  ///
+  /// The queued ORDERING PROOF goes with them, and is owed to nobody: only a
+  /// SUBMITTED batch owes a `ControlBatchDone`, and the overflow this fold takes
+  /// acquires coverage work, whose epoch move retires whatever latch the proof
+  /// was to close (see [`queue_cut_proof`]).
+  fn fold_overflow(&mut self, scope: ScopeId) {
+    self.queues.remove(&scope);
+    self.overflowed.insert(scope);
+  }
+
+  /// Clears `scope`'s latch, reporting whether one stood — the caller owes the
+  /// re-derivation exactly when it did.
+  fn release_overflow(&mut self, scope: ScopeId) -> bool {
+    self.overflowed.remove(&scope)
+  }
+
+  /// Reclaims every per-scope structure for a scope that is gone or fatal.
+  ///
+  /// One site for both, because scope ids are never reused and nothing would
+  /// ever remove state re-inserted for one: a latch left behind would be a
+  /// per-dead-scope residue of exactly the kind the no-residual invariant
+  /// forbids.
+  fn drop_scope(&mut self, scope: ScopeId) {
+    self.queues.remove(&scope);
+    self.overflowed.remove(&scope);
+  }
+
+  /// Retires everything `scope` holds for the transport generation a root
+  /// replacement is swapping away from, so the new one starts UNLATCHED with an
+  /// EMPTY queue.
+  ///
+  /// The latch, the queued batches and the in-flight mark belong to the
+  /// generation they were derived under, and the swap ends it. Carrying a latch
+  /// across would silence the replacement for good: its re-arm work is discarded
+  /// at [`queue_control_batch`]'s first line, and the only release is the OLD
+  /// generation's completion — which a replacement of a wedged root exists to
+  /// escape. Carrying the queue across would submit that generation's arms into a
+  /// world they were never derived for, where the source's own front-check
+  /// refuses them.
+  ///
+  /// Nothing here is owed to anyone. Everything the old world still owed is
+  /// resolved by domination at the same commit, so its queued attempts — like an
+  /// unwound batch's — have no registration left waiting on them.
+  fn retire_generation(&mut self, scope: ScopeId) {
+    self.drop_scope(scope);
+  }
+}
+
+/// The most arms and disarms one SCOPE may hold queued and un-submitted BEHIND A
+/// BATCH IN FLIGHT — and the size of the largest batch that may be SUBMITTED at
+/// once.
+///
+/// [`PendingControl`] caps the number of queued BATCHES; this caps the work
+/// inside them. The accumulation half is read only where the work would actually
+/// WAIT — a scope with no batch holding its queue submits what it derives on the
+/// next line, so the same test there would measure one cohort's size rather than
+/// any accumulation ([`queue_control_batch`]).
+///
+/// The submission half holds everywhere and unconditionally. A batch leaves this
+/// driver whole: the source translates it into `ops` and publication vectors of
+/// the batch's own size, and the reader works through that one message before it
+/// returns to event reads. So a cohort larger than this — one enumeration of a
+/// large enough tree is one — is SPLIT into pieces of this size and submitted in
+/// order, one in flight at a time ([`push_coalesced`]), which is what makes the
+/// constant bound crate-owned transient memory and the reader's turn rather than
+/// only the queue's depth.
+///
+/// With a scope's current batch stalled inside an arm syscall,
+/// alternating reply-less cover updates each derive another set of arm/disarm
+/// requests, every one of them merged into the same trailing batch — and since
+/// that batch never completes, the vector grows until the process is out of
+/// memory, over a source tree that can be perfectly finite (cover alternation
+/// mints fresh attempts for the same directories).
+///
+/// Per SCOPE rather than globally, for the reason [`MAX_PARKED_SETTLEMENTS`] is:
+/// one wedged root must not deny the control plane to every healthy one.
+///
+/// Sized well above the largest legitimate cohort. What a scope legitimately
+/// derives while one batch is in flight is at most one arm per directory it
+/// brings into coverage plus one disarm per directory it drops, and every one of
+/// those is derived from a directory read that COMPLETED on the same blocking
+/// pool the stalled batch is holding. So a quarter of a million un-submitted
+/// attempts is not a large tree — it is a control plane wedged relative to
+/// enumeration, which is the state this bound exists for.
+///
+/// Deliberately NOT derived from `max_map_directories`: that cap is threaded only
+/// into the fanotify and USN journal spawns, so the descending profile whose
+/// control queue this is ignores it entirely; it is optional, so "uncapped" is
+/// expressible and would leave this ceiling undefined exactly where it is needed;
+/// and its default is a million, which bounds nothing worth bounding here. The
+/// point, as [`MAX_PARKED_SETTLEMENTS`] says of its own number, is to turn
+/// unbounded into constant, not to make the constant tight.
+const MAX_QUEUED_CONTROL_REQUESTS: usize = 262_144;
+
+#[cfg(test)]
+thread_local! {
+  /// Test seam: the request bound [`queue_control_batch`] reads, so a cell can
+  /// prove the fold and its latch without minting
+  /// [`MAX_QUEUED_CONTROL_REQUESTS`] real requests. `queue_control_batch` is a
+  /// plain synchronous function, so a cell calling it directly runs it on the
+  /// very thread that set this.
+  static CONTROL_REQUEST_CAP: std::cell::Cell<usize> =
+    const { std::cell::Cell::new(MAX_QUEUED_CONTROL_REQUESTS) };
+}
+
+#[cfg(test)]
+fn control_request_cap() -> usize {
+  CONTROL_REQUEST_CAP.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+const fn control_request_cap() -> usize {
+  MAX_QUEUED_CONTROL_REQUESTS
+}
 
 /// Each scope with a control batch dispatched and not yet completed, mapped to
 /// the transport GENERATION that batch was emitted for — the wait
@@ -16834,6 +17038,25 @@ fn generation_retired(lanes: &BTreeMap<ScopeId, u64>, scope: ScopeId, generation
   lanes.get(&scope).copied().unwrap_or(u64::MAX) != generation
 }
 
+/// Whether a batch of `scope` HOLDS ITS QUEUE: a mark exists and names the
+/// scope's CURRENT transport, so work enqueued now waits rather than going out.
+///
+/// The ONE definition, read by both seats that turn on it —
+/// [`kick_control_queue`], which withholds the submission, and
+/// [`queue_control_batch`], which latches the scope only over a batch whose END
+/// can release the latch again. A mark of a RETIRED generation holds nothing
+/// back: the swap released the queue, and the kick that follows every enqueue
+/// submits its front over that mark and claims it under the live generation.
+fn control_batch_holds_queue(
+  control_inflight: &ControlInflight,
+  lanes: &BTreeMap<ScopeId, u64>,
+  scope: ScopeId,
+) -> bool {
+  control_inflight
+    .get(&scope)
+    .is_some_and(|running| !generation_retired(lanes, scope, *running))
+}
+
 /// Appends `entry` to `queue`, MERGING it into the tail instead when both are
 /// ordinary batches of one generation — the single rule that maintains
 /// [`PendingControl`]'s adjacency invariant, shared by both enqueue paths.
@@ -16855,19 +17078,61 @@ fn generation_retired(lanes: &BTreeMap<ScopeId, u64>, scope: ScopeId, generation
 /// A proof neither absorbs a merge nor rides into one. An EMPTY batch IS the pure
 /// ordering proof: giving it requests, or moving its requests elsewhere, changes
 /// what the reader is being asked to prove.
-fn push_coalesced(
-  queue: &mut VecDeque<(u64, Vec<ControlRequest>, Option<u64>)>,
-  entry: (u64, Vec<ControlRequest>, Option<u64>),
-) {
-  let (generation, requests, cut_token) = entry;
+///
+/// # No entry passes the ceiling, so no SUBMITTED batch does either
+///
+/// [`kick_control_queue`] pops one entry and hands it to the pool whole, and the
+/// source then translates it into `ops` and publication vectors of that entry's
+/// size and gives the reader one message it works through before it returns to
+/// event reads. So an entry larger than [`MAX_QUEUED_CONTROL_REQUESTS`] bounds
+/// neither this crate's transient memory nor the reader's turn, however the work
+/// got there — and one legal cohort on an idle scope is enough to build one.
+///
+/// The merge is therefore also the SPLIT: the trailing entry is filled to the
+/// ceiling and whatever is left spills into fresh ceiling-sized entries behind
+/// it. One rule, so both enqueue paths get it, and a separate splitting pass
+/// could not have worked anyway — chunks pushed one after another would merge
+/// straight back into the single oversized entry this rule exists to prevent.
+///
+/// Emission order is untouched by the spill for the reason it is untouched by the
+/// merge: filling the tail places the entry's ops exactly where a trailing entry
+/// would have run them, and the spill keeps the remainder behind what it filled.
+/// The batch COUNT stays bounded too — a generation's entries are
+/// `ceil(its queued requests / ceiling) + 1`, and the queued requests are what
+/// the ceiling already bounds behind a batch in flight, so churn still cannot add
+/// an entry. Only a cohort bigger than the ceiling can, and it adds exactly as
+/// many as it has ceilings, which the kick then drains in order.
+///
+/// A cut token rides the LAST piece of a split rather than the first, so the
+/// reader is asked to prove the cut over everything the entry carried. Today no
+/// split can carry one — the only minted token belongs to an EMPTY proof batch,
+/// which neither merges nor splits — and the queued proof behind a cohort's
+/// chunks is reached only after every one of them, which is the same ordering.
+fn push_coalesced(queue: &mut VecDeque<ControlBatch>, entry: ControlBatch) {
+  let (generation, mut requests, cut_token) = entry;
+  // A cohort is split into pieces of the ceiling, so a zero cap (reachable only
+  // through the test seam) would split forever; one request per piece is the
+  // smallest honest chunk.
+  let ceiling = control_request_cap().max(1);
+  let mut merged = false;
   if cut_token.is_none()
     && let Some((queued_generation, queued, None)) = queue.back_mut()
     && *queued_generation == generation
+    && queued.len() < ceiling
   {
-    queued.extend(requests);
-    return;
+    let room = ceiling - queued.len();
+    let fits = room.min(requests.len());
+    queued.extend(requests.drain(..fits));
+    merged = true;
   }
-  queue.push_back((generation, requests, cut_token));
+  while requests.len() > ceiling {
+    let spilled = requests.split_off(ceiling);
+    queue.push_back((generation, requests, None));
+    requests = spilled;
+  }
+  if !merged || !requests.is_empty() {
+    queue.push_back((generation, requests, cut_token));
+  }
 }
 
 /// Queues `scope`'s ordering-proof request, COALESCING it with any proof
@@ -16917,7 +17182,7 @@ fn push_coalesced(
 /// same-generation neighbours, it never moves a live request forward past one
 /// that must precede it.
 fn queue_cut_proof(pending_control: &mut PendingControl, scope: ScopeId, lane: u64, token: u64) {
-  let queue = pending_control.entry(scope).or_default();
+  let queue = pending_control.queue(scope);
   queue.retain(|(_, _, carried)| carried.is_none());
   let mut compacted = VecDeque::with_capacity(queue.len());
   for entry in queue.drain(..) {
@@ -16938,16 +17203,58 @@ fn queue_cut_proof(pending_control: &mut PendingControl, scope: ScopeId, lane: u
 /// Merging at the tail is what makes the queue's depth independent of how hard the
 /// tree is churned; [`push_coalesced`] carries the rule and the reasoning that
 /// keeps the merge order-preserving and generation-safe.
+///
+/// Reports whether THIS push folded the scope into the root-overflow path, which
+/// is the caller's cue to take it: the queued attempts of a scope whose derived
+/// work crosses [`MAX_QUEUED_CONTROL_REQUESTS`] BEHIND A BATCH IN FLIGHT are
+/// dropped and the scope is latched, and what re-derives its coverage is the
+/// overflow's own re-arm under a covering `Rescan`. A scope already latched
+/// queues nothing and folds nothing — the overflow standing over it owns the
+/// work — so the fold is raised once per wedge rather than once per batch.
+///
+/// # The fold needs a batch whose END can release the latch
+///
+/// A latch is released by the end of the batch that was in flight when it was
+/// set, and by nothing else. Installing one with NO batch in flight would
+/// therefore latch a scope forever: every batch the standing overflow re-derives
+/// is discarded, no submitted batch exists to complete, coverage stays
+/// incomplete, and the scope's fences never settle.
+///
+/// It is also the wrong question to ask there. The ceiling bounds the work a
+/// scope holds UN-SUBMITTED, and nothing is waiting when no batch holds the
+/// queue: this function's caller kicks the queue immediately afterwards, which
+/// pops the front and hands it to the pool. What the test would measure in that
+/// state is the size of ONE cohort — a property of the tree, not of a wedge — so
+/// an oversized cohort on an idle scope is queued like any other.
+///
+/// It is not SUBMITTED like any other. The enqueue splits it into ceiling-sized
+/// pieces ([`push_coalesced`]), which the kick and the completions then submit in
+/// order with one in flight at a time, so the batch that reaches the source — and
+/// the `ops` and publication vectors it becomes, and the reader's turn it takes —
+/// is bounded by the ceiling even where the cohort is not. What the scope holds
+/// un-submitted is still what the ceiling is read against: a push arriving while
+/// a batch holds the queue and finding more than a ceiling of chunks still
+/// waiting folds exactly as any other accumulation does.
+#[must_use = "a fold owes its scope the root-overflow path"]
 fn queue_control_batch(
   pending_control: &mut PendingControl,
+  control_inflight: &ControlInflight,
+  lanes: &BTreeMap<ScopeId, u64>,
   scope: ScopeId,
   generation: u64,
   requests: Vec<ControlRequest>,
-) {
-  push_coalesced(
-    pending_control.entry(scope).or_default(),
-    (generation, requests, None),
-  );
+) -> bool {
+  if pending_control.is_latched(scope) {
+    return false;
+  }
+  if control_batch_holds_queue(control_inflight, lanes, scope)
+    && pending_control.queued_requests(scope) + requests.len() > control_request_cap()
+  {
+    pending_control.fold_overflow(scope);
+    return true;
+  }
+  push_coalesced(pending_control.queue(scope), (generation, requests, None));
+  false
 }
 
 /// Dispatches ONE control batch: hands it to the executor on the blocking pool,
@@ -17042,23 +17349,27 @@ fn kick_control_queue<R, F>(
   R: RuntimeLite,
   F: FsOps,
 {
-  if control_inflight
-    .get(&scope)
-    .is_some_and(|running| !generation_retired(lanes, scope, *running))
-  {
+  if control_batch_holds_queue(control_inflight, lanes, scope) {
     // A batch of the live transport is running; its ControlBatchDone releases
     // the next.
     return;
   }
   let Some((generation, requests, cut_token)) = pending_control
+    .queues
     .get_mut(&scope)
     .and_then(VecDeque::pop_front)
   else {
     // Nothing queued (idle scope, or its queue was just torn down).
     return;
   };
-  if pending_control.get(&scope).is_some_and(VecDeque::is_empty) {
-    pending_control.remove(&scope);
+  // The QUEUE alone: a latch outlives the emptying, because what releases it is
+  // the end of the batch in flight rather than the exhaustion of its successors.
+  if pending_control
+    .queues
+    .get(&scope)
+    .is_some_and(VecDeque::is_empty)
+  {
+    pending_control.queues.remove(&scope);
   }
   control_inflight.insert(scope, generation);
   submit_control_batch::<R, F>(ops, op_tx, scope, generation, requests, cut_token);
@@ -17082,14 +17393,14 @@ fn kick_control_queue<R, F>(
 /// `purge_marker_emits` / `stand_covering_rescan` — which mutate the queue in
 /// place — is what puts the covering `Rescan` where the marker was.
 ///
-/// What each move RETIRES is the ledger's business
-/// ([`CookieRegistry::invalidate_barriers`]); the two halves meet here because
-/// only here are both in hand at once — the ledger knows which barriers stood on
-/// the ground that moved, and the core owns the queue their certificates are
-/// sitting in.
+/// What each entry RETIRES is the ledger's business
+/// ([`CookieRegistry::invalidate_barriers`], which both a move and a rename
+/// spend); the two halves meet here because only here are both in hand at once —
+/// the ledger knows which barriers stood on the ground that moved, and the core
+/// owns the queue their certificates are sitting in.
 ///
-/// The covering `Rescan` is stood at `cover_dir.join(<marker leaf>)` and not at
-/// `cover_dir` itself, because
+/// The covering `Rescan` is stood at `<ground>.join(<marker leaf>)` and not at
+/// the ground itself, because
 /// [`covering_rescan`](DriverCore::stand_covering_rescan) covers the PARENT of
 /// what it is given: handing it the ground directly would name the ground's
 /// parent, which for a cover directly under the root degenerates to a
@@ -17138,16 +17449,46 @@ fn drain_barrier_moves<R, F>(
   for scope in core.take_ended_scopes() {
     cookies.publish_retiring(scope);
   }
-  for BarrierMove {
-    scope,
-    location,
-    rescan_stands,
-  } in core.take_barrier_moves()
-  {
-    for barrier in cookies.invalidate_barriers::<R>(op_tx, scope, &location) {
-      core.purge_marker_emits(scope, &barrier.name);
-      if !rescan_stands {
-        core.stand_covering_rescan(scope, &barrier.cover_dir.join(barrier.name.as_ref()), now());
+  for event in core.take_barrier_events() {
+    // IN ORDER, which is the order the funnels raised them in: a retirement is
+    // idempotent and no entry rewrites what another is judged against, so what
+    // each spends is exactly what it would have spent alone.
+    match event {
+      BarrierEvent::Renamed { scope, from, to } => {
+        // A DIRECTORY RENAME DOMINATES EVERY BARRIER UNDER ITS SOURCE. Every
+        // located judgement of a barrier is by PATH, and the rename moved the
+        // ground each of these obligations stands on, so each is retired here
+        // rather than followed — which is what closes the class on every route
+        // at once, the ledger no longer having to be kept current about where a
+        // barrier stands.
+        //
+        // Each retirement's covering `Rescan` is stood at the DESTINATION'S
+        // PARENT (`stand_covering_rescan` covers the parent of what it is
+        // given): that is the ground the retired caller's marker now stands in,
+        // where the ordinary retirement aims its instruction at the obligation's
+        // own recorded ground, which after a rename names a path nothing stands
+        // on.
+        //
+        // A rename with no barrier under it reports no row, so it stands no
+        // instruction and passes no funnel — the rename stays the deliberate
+        // non-bump §2.1 makes it wherever nothing stood on what it moved.
+        let location = BarrierLocation::Path(Arc::new(from));
+        for barrier in cookies.invalidate_barriers::<R>(op_tx, scope, &location) {
+          core.purge_marker_emits(scope, &barrier.name);
+          core.stand_covering_rescan(scope, &to, now());
+        }
+      }
+      BarrierEvent::Move(BarrierMove {
+        scope,
+        location,
+        rescan_stands,
+      }) => {
+        for barrier in cookies.invalidate_barriers::<R>(op_tx, scope, &location) {
+          core.purge_marker_emits(scope, &barrier.name);
+          if !rescan_stands {
+            core.stand_covering_rescan(scope, &barrier.ground.join(barrier.name.as_ref()), now());
+          }
+        }
       }
     }
   }
@@ -17285,7 +17626,7 @@ fn execute_effects<R, F>(
         // that dispatch skip the scope, so after a drain that tore a scope down
         // NO per-scope control state remains for it — within the tearing drain,
         // not only across later ones.
-        pending_control.remove(&scope);
+        pending_control.drop_scope(scope);
         control_inflight.remove(&scope);
         // The liveness probe's TAG is retired with the scope, and deliberately
         // not its seat: a probe inside a wedged `stat` is still a live thread,
@@ -17613,7 +17954,25 @@ fn execute_effects<R, F>(
     // rather than appending unconditionally, so churn arriving faster than
     // batches complete cannot push the ordering proof behind an unbounded run of
     // them — see [`queue_control_batch`].
-    queue_control_batch(pending_control, scope, generation, requests);
+    // The enqueue also BOUNDS the work the queue holds behind a batch in flight
+    // — see [`MAX_QUEUED_CONTROL_REQUESTS`]. A push that would cross the ceiling
+    // there drops the scope's queued attempts and takes the root-overflow path
+    // here, which is the crate's existing answer to more reconcile work than the
+    // scope can account for: the bump, the trust loss and the full re-arm under
+    // one covering `Rescan`, with the barrier in flight dominated by it. The
+    // in-flight mark and the lane are what the enqueue reads that question from,
+    // and the kick below is why it is the right question: with nothing holding
+    // the queue, this cohort goes out rather than waiting.
+    if queue_control_batch(
+      pending_control,
+      control_inflight,
+      lanes,
+      scope,
+      generation,
+      requests,
+    ) {
+      core.on_root_overflow(scope, now());
+    }
     kick_control_queue::<R, F>(ops, op_tx, pending_control, control_inflight, lanes, scope);
   }
 }

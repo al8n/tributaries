@@ -19116,11 +19116,22 @@ fn record_outcome_is_nothing_past_the_pairing_window() {
   m.assert_invariants();
 }
 
-/// A paired, in-window rename of a NON-directory emits a `Moved` and reparents
-/// nothing. The delivered change and the reported outcome are different questions,
-/// and only the second one answers "did a watched subtree change parents".
+/// A paired, in-window rename of a PROVEN non-directory relocates no ground and
+/// reports nothing, while the same pairing with the class OMITTED is judged a
+/// directory and reports its relocation.
+///
+/// The delivered change and the reported outcome stay different questions: both
+/// pairings deliver their `Moved`, and neither reparents anything.
+///
+/// Reading an omitted class as a directory is the reading every fence of this
+/// crate takes of it, and it is load-bearing here: the profiles whose ground the
+/// rename report exists for are the ones whose records most often prove nothing.
+///
+/// Revert witness: judge the class by `== Some(true)` and the second half of this
+/// cell reports nothing, leaving those profiles' obligations recorded at a path
+/// the object has left.
 #[test]
-fn record_outcome_is_nothing_for_an_unheld_file_source() {
+fn record_outcome_reports_a_rename_unless_the_class_refutes_it() {
   let mut m = per_dir();
   let root = live_root(&mut m, scope(1));
   let _ = drain_actions(&mut m);
@@ -19129,31 +19140,73 @@ fn record_outcome_is_nothing_for_an_unheld_file_source() {
   m.on_os_record(
     OsRecord::new(root, RecordKind::MovedFrom)
       .with_name(seg("old"))
-      .with_cookie(cookie(7)),
+      .with_cookie(cookie(7))
+      .with_is_dir(false),
     at(10),
   );
-  let outcome = m.on_os_record(
+  let proven = m.on_os_record(
     OsRecord::new(root, RecordKind::MovedTo)
       .with_name(seg("new"))
-      .with_cookie(cookie(7)),
+      .with_cookie(cookie(7))
+      .with_is_dir(false),
     at(11),
   );
 
-  assert_eq!(outcome, RecordOutcome::Nothing);
-  assert!(outcome.is_nothing() && outcome.reparented().is_none());
+  assert_eq!(proven, RecordOutcome::Nothing);
+  assert!(proven.is_nothing() && proven.reparented().is_none() && proven.paired_from().is_none());
   let events = drain_events(&mut m);
   assert!(
     events.iter().any(|e| e.kind().is_moved()),
     "the rename is still delivered"
   );
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_name(seg("unproven"))
+      .with_cookie(cookie(8)),
+    at(12),
+  );
+  let unproven = m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_name(seg("landed"))
+      .with_cookie(cookie(8)),
+    at(13),
+  );
+
+  assert_eq!(
+    unproven,
+    RecordOutcome::Renamed {
+      from: loc(&["unproven"]),
+    },
+    "a class neither half proved is not a proof of a file"
+  );
+  assert!(
+    unproven.reparented().is_none(),
+    "and nothing was carried between parents"
+  );
+  assert_eq!(unproven.paired_from(), Some(&loc(&["unproven"])));
+  let events = drain_events(&mut m);
+  assert!(
+    events.iter().any(|e| e.kind().is_moved()),
+    "which changes the delivery not at all"
+  );
   m.assert_invariants();
 }
 
 /// A directory whose watch was REFUSED holds no subtree to carry: the pair still
-/// delivers a `Moved` and arms fresh coverage at the destination, but the Monitor
-/// reparented nothing and says so.
+/// delivers a `Moved` and arms fresh coverage at the destination, the Monitor
+/// reparented nothing and says so — and the object still RELOCATED, so the
+/// rename is reported all the same.
+///
+/// The two facts are told apart here on one record: a consumer must not re-anchor
+/// a watch that never existed, and must still move the ground its own bookkeeping
+/// stands on.
+///
+/// Revert witness: report the relocation only where a subtree was re-keyed and an
+/// unarmed directory's rename goes unreported on the profile that keeps child
+/// watches at all.
 #[test]
-fn record_outcome_is_nothing_for_an_unarmed_directory_source() {
+fn record_outcome_renames_an_unarmed_directory_source() {
   let mut m = per_dir();
   let root = live_root(&mut m, scope(1));
   let _ = drain_actions(&mut m);
@@ -19186,12 +19239,68 @@ fn record_outcome_is_nothing_for_an_unarmed_directory_source() {
     at(11),
   );
 
-  assert_eq!(outcome, RecordOutcome::Nothing);
+  assert_eq!(
+    outcome,
+    RecordOutcome::Renamed { from: loc(&["d"]) },
+    "the relocation is reported"
+  );
+  assert!(
+    outcome.reparented().is_none(),
+    "and no watch travelled with it"
+  );
   assert!(
     drain_actions(&mut m)
       .iter()
       .any(|a| a.as_watch().map(|w| w.target()) == Some(&WatchTarget::child(root, seg("e")))),
     "the destination is armed fresh, not carried"
+  );
+  m.assert_invariants();
+}
+
+/// THE KERNEL-RECURSIVE ARM: one native stream covers the whole root, so the
+/// Monitor keeps no child watches, holds no subtree at a pairing and re-keys
+/// nothing — while the renamed directory's ground moved exactly as it does on a
+/// descending profile. The pairing is what reports it.
+///
+/// fanotify, FSEvents, RDCW and USN all resolve their renames through this one
+/// arm: their records anchor at the root and carry the whole root-relative
+/// location, which names no direct child slot.
+///
+/// Revert witness: report a relocation only from a re-keyed subtree and every one
+/// of those profiles reports nothing at all, leaving a consumer's ground recorded
+/// where the directory WAS while the located instructions it is judged against
+/// name where the directory now is.
+#[test]
+fn record_outcome_reports_a_kernel_recursive_directory_rename() {
+  let mut m = kernel_recursive();
+  let root = live_root(&mut m, scope(1));
+  let _ = drain_events(&mut m);
+
+  m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedFrom)
+      .with_target(loc(&["a", "deep"]))
+      .with_cookie(cookie(3))
+      .with_is_dir(true),
+    at(10),
+  );
+  let outcome = m.on_os_record(
+    OsRecord::new(root, RecordKind::MovedTo)
+      .with_target(loc(&["b", "moved"]))
+      .with_cookie(cookie(3))
+      .with_is_dir(true),
+    at(11),
+  );
+
+  assert_eq!(
+    outcome,
+    RecordOutcome::Renamed {
+      from: loc(&["a", "deep"]),
+    },
+    "the pairing names where the directory was"
+  );
+  assert!(
+    outcome.reparented().is_none(),
+    "a kernel-recursive scope keeps no child watch to re-key"
   );
   m.assert_invariants();
 }
@@ -19366,9 +19475,13 @@ fn record_outcome_is_nothing_when_a_cyclic_reparent_is_rejected() {
 /// dropping the stale object at the destination (the source's own parent) takes the
 /// held source with it. A consumer that re-anchored on the precondition alone would
 /// move its bookkeeping to a destination the Monitor covers with a FRESH watch. The
-/// outcome is `Nothing`, so it does not.
+/// outcome reports no reparent, so it does not.
+///
+/// It does report the RENAME: the pair was emitted, the object is at the
+/// destination, and a write holding a descriptor on it lands there — so the ground
+/// moved even though no watch did.
 #[test]
-fn record_outcome_is_nothing_when_the_reparent_aborts_on_a_dead_endpoint() {
+fn an_aborted_reparent_on_a_dead_endpoint_reports_a_rename_and_no_re_anchor() {
   let mut m = per_dir();
   let root = live_root(&mut m, scope(1));
   let _ = drain_actions(&mut m);
@@ -19393,7 +19506,17 @@ fn record_outcome_is_nothing_when_the_reparent_aborts_on_a_dead_endpoint() {
     at(11),
   );
 
-  assert_eq!(outcome, RecordOutcome::Nothing);
+  assert_eq!(
+    outcome,
+    RecordOutcome::Renamed {
+      from: loc(&["a", "d"]),
+    },
+    "the object relocated, and the report names where it was"
+  );
+  assert!(
+    outcome.reparented().is_none(),
+    "while nothing was carried between parents"
+  );
   assert!(!m.is_watched(w_a), "the replaced ancestor is dropped");
   assert!(!m.is_watched(w_d), "and the held source went with it");
   assert!(

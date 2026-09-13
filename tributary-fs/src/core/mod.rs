@@ -403,12 +403,47 @@ impl BarrierLocation {
   }
 }
 
-/// One coverage transition a funnel raised while barriers may be live.
+/// One entry of the barrier queue: a coverage transition a funnel raised, or a
+/// paired DIRECTORY RENAME, which dominates every barrier under its source.
+///
+/// The two ride ONE queue because they are drained in order at one seam, ahead
+/// of every effect. A rename is not a [`Move`](Self::Move) because it carries
+/// what no move carries: the DESTINATION, which is where the markers of the
+/// obligations it retires now stand and therefore where their covering
+/// instruction has to be aimed — a retirement's ordinary `Rescan` stands at the
+/// obligation's own recorded ground, which after a rename names a path nothing
+/// stands on.
 ///
 /// Recorded in the core (sans-I/O) and drained by the driver with
-/// [`take_barrier_moves`](DriverCore::take_barrier_moves) BEFORE it executes the
-/// effect queue — not as an [`Effect`], because an effect cannot purge an emit
-/// that precedes it in the same queue.
+/// [`take_barrier_events`](DriverCore::take_barrier_events) BEFORE it executes
+/// the effect queue — not as an [`Effect`], because an effect cannot purge an
+/// emit that precedes it in the same queue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BarrierEvent {
+  /// A coverage transition; which barriers it retires is the ledger's business.
+  Move(BarrierMove),
+  /// A DIRECTORY RENAME the Monitor paired inside the scope: every in-pool,
+  /// owned and removing obligation standing under `from` is retired
+  /// `Dominated` at the drain, and each retirement's domination `Rescan` stands
+  /// at the DESTINATION'S PARENT — the ground its marker now stands in.
+  ///
+  /// Whether a barrier stood under `from` at all is the LEDGER's answer, which
+  /// is why this carries the coordinates rather than a verdict: a rename with no
+  /// barrier under it retires nothing, stands nothing and advances nothing, so
+  /// the rename stays the deliberate non-bump §2.1 makes it.
+  Renamed {
+    /// The scope whose subtree moved.
+    scope: ScopeId,
+    /// Where the subtree WAS, absolute: the source slot the Monitor
+    /// reconstructed from its live tree at the pairing, joined onto the scope
+    /// ROOT — the one anchor no reparent inside the tree can move.
+    from: PathBuf,
+    /// Where it now is, absolute.
+    to: PathBuf,
+  },
+}
+
+/// One coverage transition a funnel raised while barriers may be live.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BarrierMove {
   /// The scope whose coverage moved.
@@ -2098,8 +2133,11 @@ pub(crate) struct DriverCore {
   /// that no external input will bring it back for. Read and cleared by
   /// [`take_cover_flush_due`](Self::take_cover_flush_due).
   cover_flush_due: bool,
-  /// The coverage transitions the barrier funnels have raised since the driver
-  /// last drained them ([`take_barrier_moves`](Self::take_barrier_moves)).
+  /// The coverage transitions the barrier funnels have raised, and the paired
+  /// directory renames the scopes have learned, since the driver last drained
+  /// them ([`take_barrier_events`](Self::take_barrier_events)) — in ONE queue,
+  /// because one seam spends both: the retirement each drives has to purge the
+  /// retired obligation's already-queued marker emit.
   ///
   /// NOT an [`Effect`], and that placement is the whole of the drain-order fix:
   /// [`drain_monitor`](Self::drain_monitor) routes every change before it
@@ -2108,9 +2146,14 @@ pub(crate) struct DriverCore {
   /// could never purge it; a queue the driver drains BEFORE it executes the
   /// effects can.
   ///
-  /// Bounded by [`MAX_BARRIER_MOVES_PER_SCOPE`] per scope, and moves naming the
-  /// same `(scope, location)` between two drains coalesce rather than stack.
-  barrier_moves: VecDeque<BarrierMove>,
+  /// The MOVES are bounded by [`MAX_BARRIER_MOVES_PER_SCOPE`] per scope, and
+  /// moves naming the same `(scope, location)` between two drains coalesce
+  /// rather than stack. A RENAME is never folded and never coalesced away: at
+  /// most one is recorded per record the Monitor pairs a directory rename for,
+  /// so a scope's renames between two drains are bounded by one batch's records
+  /// — the transport's own budget — and dropping one would leave the barriers
+  /// its subtree carried away standing on a path nothing stands on.
+  barrier_moves: VecDeque<BarrierEvent>,
   /// Every scope this core has ENDED since the driver last drained them
   /// ([`take_ended_scopes`](Self::take_ended_scopes)).
   ///
@@ -2397,7 +2440,20 @@ impl DriverCore {
     watch: WatchId,
     descent: Option<&Location>,
   ) -> Option<PathBuf> {
-    let mut path = self.path_of(state, watch)?;
+    Self::anchored_at(&self.monitor, state, watch, descent)
+  }
+
+  /// [`anchored_path`](Self::anchored_path) for a caller holding the Monitor
+  /// rather than the core — the funnel's route, which resolves a paired
+  /// rename's two ends from inside the hand-off that reported it. One
+  /// resolution, asked from both seats.
+  fn anchored_at(
+    monitor: &Monitor,
+    state: &ScopeState,
+    watch: WatchId,
+    descent: Option<&Location>,
+  ) -> Option<PathBuf> {
+    let mut path = watch_path(monitor, state, watch)?;
     for segment in descent.into_iter().flat_map(Location::segments) {
       path.push(segment.as_str());
     }
@@ -2880,20 +2936,34 @@ impl DriverCore {
     self.scopes.get(&scope).map(|state| state.barrier_epoch)
   }
 
-  /// Drains the coverage transitions the funnels have raised since the last
-  /// drain.
+  /// Drains the coverage transitions the funnels have raised, and the paired
+  /// directory renames the scope learned, since the last drain — IN ORDER.
   ///
   /// The driver calls this after every core input and BEFORE it executes the
   /// effect queue: the retirement a move drives has to purge the retired
   /// obligation's already-queued marker emit, and an effect drained in queue
   /// order can only ever arrive behind one.
-  pub(crate) fn take_barrier_moves(&mut self) -> Vec<BarrierMove> {
+  pub(crate) fn take_barrier_events(&mut self) -> Vec<BarrierEvent> {
     self.barrier_moves.drain(..).collect()
+  }
+
+  /// The coverage transitions alone, for the cells that read the funnels through
+  /// their moves rather than through the renames a scope records beside them.
+  #[cfg(test)]
+  pub(crate) fn take_barrier_moves(&mut self) -> Vec<BarrierMove> {
+    self
+      .barrier_moves
+      .drain(..)
+      .filter_map(|event| match event {
+        BarrierEvent::Move(moved) => Some(moved),
+        BarrierEvent::Renamed { .. } => None,
+      })
+      .collect()
   }
 
   /// Drains the scopes this core has ended since the last drain.
   ///
-  /// Taken by the same drain as [`take_barrier_moves`](Self::take_barrier_moves),
+  /// Taken by the same drain as [`take_barrier_events`](Self::take_barrier_events),
   /// which the driver runs at every loop top and before every effect: the
   /// retirement of each scope named here is published in the same synchronous
   /// pass as the input that ended it, before the teardown effect takes the
@@ -2985,9 +3055,15 @@ impl DriverCore {
   ///   nobody a covering `Rescan`.
   ///
   /// Everything else outside this list is a site that never reaches a funnel at
-  /// all — data events, a reparent within the scope, a widen commit, a no-op
-  /// cover re-issue, a scope teardown, a scope birth — and each carries a
-  /// negative cell of its own too.
+  /// all — data events, a directory rename within the scope, a widen commit, a
+  /// no-op cover re-issue, a scope teardown, a scope birth — and each carries a
+  /// negative cell of its own too. Such a rename records a
+  /// [`BarrierEvent::Renamed`] instead
+  /// ([`barrier_renamed`](Self::barrier_renamed)): the destination's coverage is
+  /// unchanged, so the rename passes no funnel of its own — but the ground every
+  /// barrier under its source stands on has moved, and the drain retires them
+  /// under the domination `Rescan` it stands at the destination's parent. A
+  /// rename with no barrier under it retires nothing and stays the non-bump.
   ///
   /// Two foldings keep the queue bounded without ever forgetting a transition:
   ///
@@ -3000,7 +3076,7 @@ impl DriverCore {
   ///   into one. Folding UP is the honest degrade: the whole-scope move retires a
   ///   superset of what the folded ones would have.
   fn barrier_moved(
-    moves: &mut VecDeque<BarrierMove>,
+    moves: &mut VecDeque<BarrierEvent>,
     state: &mut ScopeState,
     scope: ScopeId,
     location: BarrierLocation,
@@ -3011,8 +3087,15 @@ impl DriverCore {
       Self::fold_barrier_moves(moves, scope, rescan_stands);
       return;
     }
+    // The merge reaches the whole queue: no entry rewrites the ground another is
+    // judged against, so a move applied out of order intersects exactly what it
+    // would have intersected in order. A rename entry beside them retires on its
+    // own ground and is idempotent with every move that overlaps it.
     let mut located = 0usize;
-    for queued in moves.iter_mut() {
+    for event in moves.iter_mut() {
+      let BarrierEvent::Move(queued) = event else {
+        continue;
+      };
       if queued.scope != scope {
         continue;
       }
@@ -3035,27 +3118,81 @@ impl DriverCore {
       Self::fold_barrier_moves(moves, scope, false);
       return;
     }
-    moves.push_back(BarrierMove {
+    moves.push_back(BarrierEvent::Move(BarrierMove {
       scope,
       location,
       rescan_stands,
-    });
+    }));
+  }
+
+  /// A DIRECTORY RENAME DOMINATES EVERY BARRIER UNDER ITS SOURCE: records the
+  /// paired rename inside `scope` so the drain retires every obligation
+  /// standing under `from` and stands each retirement's domination `Rescan` at
+  /// the destination's parent.
+  ///
+  /// Every located judgement of a barrier is by PATH, and a rename changes paths
+  /// on four different routes — the Monitor's re-key, the pairing on a profile
+  /// that keeps no child watches, the reserved cookie directory moved as a
+  /// subtree of its own, and the prune fence's widened destination. One rule
+  /// answers all of them: the ground a barrier stands on has moved, so the
+  /// barrier is retired and re-read rather than followed.
+  ///
+  /// The rename advances no epoch here. A rename with no barrier under it
+  /// retires nothing and stands nothing, which keeps it the deliberate non-bump
+  /// §2.1 makes it; a rename WITH one passes the funnel through the domination
+  /// `Rescan` the drain stands for each retirement.
+  ///
+  /// An endpoint the Monitor can no longer place records a whole-scope move
+  /// instead — an unnamed source cannot select the obligations the rename moved,
+  /// and an unnamed destination cannot aim their instruction. That is the
+  /// fail-WIDE direction [`barrier_ground`](Self::barrier_ground) takes for the
+  /// same question, and the whole-scope move claims nothing: every obligation it
+  /// retires stands its own covering `Rescan` at its own recorded ground.
+  fn barrier_renamed(
+    moves: &mut VecDeque<BarrierEvent>,
+    monitor: &Monitor,
+    state: &mut ScopeState,
+    scope: ScopeId,
+    from: &Location,
+    to: Option<(WatchId, Option<Location>)>,
+  ) {
+    // The SOURCE is joined onto the scope root rather than onto the slot's own
+    // parent: `from` is the location the Monitor reconstructed from its live
+    // tree at the pairing, already carrying that parent's own descent, and the
+    // root is the one anchor no reparent inside the tree can move.
+    let from = Self::anchored_at(monitor, state, state.watch, Some(from));
+    let to =
+      to.and_then(|(watch, target)| Self::anchored_at(monitor, state, watch, target.as_ref()));
+    match (from, to) {
+      (Some(from), Some(to)) => moves.push_back(BarrierEvent::Renamed { scope, from, to }),
+      _ => Self::barrier_moved(moves, state, scope, BarrierLocation::Scope, false),
+    }
   }
 
   /// Replaces every queued move of `scope` with the one whole-scope move that
   /// subsumes them, keeping the AND of what they and the incoming move stood.
-  fn fold_barrier_moves(moves: &mut VecDeque<BarrierMove>, scope: ScopeId, rescan_stands: bool) {
+  ///
+  /// The scope's queued RENAMES survive the fold, in place. A whole-scope move
+  /// retires a superset of every located move it absorbs, but it stands no
+  /// instruction at any destination — and a rename's whole business is to aim
+  /// one at the ground the markers it carried away now stand in, which the
+  /// obligation's own recorded ground no longer names.
+  fn fold_barrier_moves(moves: &mut VecDeque<BarrierEvent>, scope: ScopeId, rescan_stands: bool) {
+    let folded = |event: &BarrierEvent| match event {
+      BarrierEvent::Move(queued) => queued.scope == scope,
+      BarrierEvent::Renamed { .. } => false,
+    };
     let stands = rescan_stands
       && moves
         .iter()
-        .filter(|queued| queued.scope == scope)
-        .all(|queued| queued.rescan_stands);
-    moves.retain(|queued| queued.scope != scope);
-    moves.push_back(BarrierMove {
+        .filter(|event| folded(event))
+        .all(|event| matches!(event, BarrierEvent::Move(queued) if queued.rescan_stands));
+    moves.retain(|event| !folded(event));
+    moves.push_back(BarrierEvent::Move(BarrierMove {
       scope,
       location: BarrierLocation::Scope,
       rescan_stands: stands,
-    });
+    }));
   }
 
   /// The ground one [`Planned::Over`] or [`Planned::Dominated`] names, as the
@@ -4222,7 +4359,7 @@ impl DriverCore {
     // call and before the batch can settle. A resolution whose batch is already
     // gone (a loss flush, a teardown) drops its records and its deferrals together.
     let mut deferred = Vec::new();
-    let resolved = self.fence_resolved(&state, scope, resolved, &mut deferred);
+    let resolved = self.fence_resolved(&mut state, scope, resolved, &mut deferred);
     let mut fed = false;
     if let Some(batch) = state.park.active.as_mut() {
       batch.deferred_consumptions.append(&mut deferred);
@@ -5807,6 +5944,16 @@ impl DriverCore {
     if !fence && !at_classify {
       return;
     }
+    // The paired SOURCES this batch carries, taken before the walk for the same
+    // reason the consumptions are collected beside it: the walk holds
+    // `batch.items` mutably and empties each item's planned inputs as it judges
+    // them. Empty on the discipline that feeds as it classifies, where the half
+    // is already parked in the Monitor by the time its destination is judged.
+    let paired = if at_classify {
+      Vec::new()
+    } else {
+      self.batch_paired_sources(state, batch)
+    };
     // The consumptions this pass cannot take itself, collected beside the batch
     // rather than into it: the walk below holds `batch.items` mutably. They are
     // appended to the batch at the end of the pass, still ahead of every feed a
@@ -5824,7 +5971,7 @@ impl DriverCore {
       };
       for planned in planned {
         let planned = if fence {
-          match self.fenced(state, exclusions, scope, &planned, &mut deferred) {
+          match self.fenced(state, exclusions, scope, &planned, &paired, &mut deferred) {
             Fenced::Stands => planned,
             Fenced::Dropped => continue,
             // The widened signal takes the dropped one's PLACE, so everything
@@ -5890,7 +6037,8 @@ impl DriverCore {
         // `Rescan` naming exactly the subtree the caller pruned — an instruction
         // to enumerate ground whose every later change stays silent.
         if let Some(repair) = revealed
-          && let Some(repair) = self.fenced_repair(state, exclusions, scope, repair, &mut deferred)
+          && let Some(repair) =
+            self.fenced_repair(state, exclusions, scope, repair, &paired, &mut deferred)
         {
           Self::accept(
             &mut self.monitor,
@@ -5909,7 +6057,7 @@ impl DriverCore {
       let trailing = core::mem::take(&mut batch.trailing)
         .into_iter()
         .filter_map(|planned| {
-          match self.fenced(state, exclusions, scope, &planned, &mut deferred) {
+          match self.fenced(state, exclusions, scope, &planned, &paired, &mut deferred) {
             Fenced::Stands => Some(planned),
             Fenced::Dropped => None,
             Fenced::Widened(widened) => Some(widened),
@@ -5956,7 +6104,7 @@ impl DriverCore {
   /// no reparent can change how a later one resolves.
   fn fence_resolved(
     &mut self,
-    state: &ScopeState,
+    state: &mut ScopeState,
     scope: ScopeId,
     mut resolved: Resolved,
     deferred: &mut Vec<MoveCookie>,
@@ -5969,7 +6117,10 @@ impl DriverCore {
     let before = resolved.planned.len();
     let mut kept = Vec::with_capacity(before);
     for planned in core::mem::take(&mut resolved.planned) {
-      let planned = match self.fenced(state, exclusions, scope, &planned, deferred) {
+      // The probe-parked profile grants its rename sources their pairing cookies
+      // at SETTLEMENT, on evidence this pass does not hold, so no pairing of this
+      // batch is established here and the fence has no source to place.
+      let planned = match self.fenced(state, exclusions, scope, &planned, &[], deferred) {
         Fenced::Stands => planned,
         Fenced::Dropped => continue,
         Fenced::Widened(widened) => widened,
@@ -5989,7 +6140,8 @@ impl DriverCore {
       // its record's verdict and names ground that verdict never judged, so it
       // is the one input that could carry a `Rescan` into a pruned subtree.
       kept.extend(
-        revealed.and_then(|repair| self.fenced_repair(state, exclusions, scope, repair, deferred)),
+        revealed
+          .and_then(|repair| self.fenced_repair(state, exclusions, scope, repair, &[], deferred)),
       );
     }
     resolved.planned = kept;
@@ -6019,7 +6171,7 @@ impl DriverCore {
   /// at all.
   fn accept(
     monitor: &mut Monitor,
-    moves: &mut VecDeque<BarrierMove>,
+    moves: &mut VecDeque<BarrierEvent>,
     state: &mut ScopeState,
     scope: ScopeId,
     kept: &mut Vec<Planned>,
@@ -6086,16 +6238,22 @@ impl DriverCore {
   /// owed at all does not exist until the feed has happened. So the record's own
   /// half is captured here, and joined with the Monitor's report afterwards.
   ///
-  /// Gated on the KIND alone. Only a `MovedTo` can report a reparent, and gating any
-  /// tighter — on a directory flag the destination half is free to omit — would let
-  /// a real reparent go unrepaired because its record under-described itself.
+  /// Gated on the KIND alone. Only a `MovedTo` can report a relocation, and gating
+  /// any tighter — on a directory flag the destination half is free to omit — would
+  /// let a real one go unrepaired because its record under-described itself.
   fn landing(planned: &Planned) -> Option<(WatchId, Option<Location>)> {
     match planned {
-      Planned::Rec(rec) if matches!(rec.kind(), RecordKind::MovedTo) => {
-        Some((rec.watch(), rec.target().cloned()))
-      }
+      Planned::Rec(rec) => Self::landing_of(rec),
       _ => None,
     }
+  }
+
+  /// [`landing`](Self::landing) for a caller holding the record itself — the
+  /// funnel's route, which takes it out of the record it is about to feed so the
+  /// rename's destination can be named on the far side of the hand-off. One
+  /// rule, asked from both seats.
+  fn landing_of(rec: &OsRecord) -> Option<(WatchId, Option<Location>)> {
+    matches!(rec.kind(), RecordKind::MovedTo).then(|| (rec.watch(), rec.target().cloned()))
   }
 
   /// Whether this scope owes a DESTINATION COVER on every directory rename it
@@ -6160,13 +6318,14 @@ impl DriverCore {
   /// other located over-signal.
   fn fenced_repair(
     &mut self,
-    state: &ScopeState,
+    state: &mut ScopeState,
     exclusions: bool,
     scope: ScopeId,
     repair: Planned,
+    paired: &[(MoveCookie, PathBuf)],
     deferred: &mut Vec<MoveCookie>,
   ) -> Option<Planned> {
-    match self.fenced(state, exclusions, scope, &repair, deferred) {
+    match self.fenced(state, exclusions, scope, &repair, paired, deferred) {
       Fenced::Stands => Some(repair),
       Fenced::Dropped => None,
       Fenced::Widened(widened) => Some(widened),
@@ -6271,9 +6430,10 @@ impl DriverCore {
   /// performance are two implementations of one rule, and two implementations skew:
   /// the Monitor pairs only inside the window, only over a held subtree, and only
   /// when the O(1) reparent it then attempts actually succeeds. Every case that
-  /// fails one of those tests reports [`RecordOutcome::Nothing`] and is answered
-  /// here by repairing nothing — which is correct by construction, because a
-  /// subtree nothing relocated has crossed no exclusion boundary.
+  /// fails one of those tests reports something OTHER than
+  /// [`RecordOutcome::Reparented`] and is answered here by repairing nothing —
+  /// which is correct by construction, because watches that did not travel hold
+  /// no membership that could have crossed an exclusion boundary with them.
   ///
   /// # Composing the source
   ///
@@ -6328,6 +6488,86 @@ impl DriverCore {
     })
   }
 
+  /// The paired SOURCE of every rename this batch carries a cookie for, by
+  /// cookie, resolved absolutely.
+  ///
+  /// It exists for the ONE seat that has to name a rename's source after taking
+  /// its destination away: the prune fence's widening arm replaces a `MovedTo`
+  /// whose destination the seat covers, so that record never reaches the Monitor,
+  /// no pairing is resolved there, and the ground the pairing dominates has to be
+  /// named from what the batch itself holds.
+  ///
+  /// The lowerings that mint a cookie mint it for a pair the backend reported as
+  /// ONE rename and emit both halves into the batch, so a cookie found here is a
+  /// pairing the events proved rather than one this core predicted. A destination
+  /// whose cookie names no half of this batch is answered by the fence's
+  /// fail-wide, not by a guess.
+  ///
+  /// Taken only where the fence classifies a whole batch ahead of feeding it. The
+  /// descending discipline parks the source in the Monitor before it judges the
+  /// destination, so its source is read there
+  /// ([`Monitor::pending_move_from`]) and this pass would allocate for nothing.
+  fn batch_paired_sources(
+    &self,
+    state: &ScopeState,
+    batch: &PendingBatch,
+  ) -> Vec<(MoveCookie, PathBuf)> {
+    let mut sources = Vec::new();
+    let planned = batch
+      .items
+      .iter()
+      .flat_map(|item| item.planned.iter())
+      .chain(batch.trailing.iter());
+    for planned in planned {
+      let Planned::Rec(rec) = planned else {
+        continue;
+      };
+      if !matches!(rec.kind(), RecordKind::MovedFrom) {
+        continue;
+      }
+      if let Some(cookie) = rec.cookie()
+        && let Some(path) = self.anchored_path(state, rec.watch(), rec.target())
+      {
+        sources.push((cookie, path));
+      }
+    }
+    sources
+  }
+
+  /// Where the half paired with `cookie` came from, absolutely — the ground the
+  /// rename dominates, asked of whichever seat holds it on this scope's feeding
+  /// discipline.
+  ///
+  /// A profile that FEEDS AS IT CLASSIFIES ([`feeds_at_classify`]) has already
+  /// fed — and parked — the source by the time its destination is judged, so the
+  /// Monitor's own store is the seat, and the coordinate it answers with is the
+  /// one a paired record's outcome reports through
+  /// ([`Monitor::pending_move_from`]). A profile that classifies a whole batch
+  /// ahead of feeding it has parked nothing yet, and its pair is in the batch
+  /// ([`batch_paired_sources`](Self::batch_paired_sources)).
+  ///
+  /// `None` where the source cannot be placed at all — a half whose anchor has
+  /// died, or a cookie no half of this batch carries. The fence answers that by
+  /// failing wide.
+  fn paired_source(
+    &self,
+    state: &ScopeState,
+    scope: ScopeId,
+    cookie: MoveCookie,
+    paired: &[(MoveCookie, PathBuf)],
+  ) -> Option<PathBuf> {
+    if feeds_at_classify(state.profile) {
+      let from = self.monitor.pending_move_from(scope, cookie)?;
+      // Joined onto the scope ROOT, the one anchor no reparent inside the tree
+      // can move, exactly as the funnel's own rename joins it.
+      return Self::anchored_at(&self.monitor, state, state.watch, Some(&from));
+    }
+    paired
+      .iter()
+      .find(|(queued, _)| *queued == cookie)
+      .map(|(_, path)| path.clone())
+  }
+
   /// What the fence makes of one planned Monitor input — excluded, pruned, or
   /// neither ([`is_fenced`](Self::is_fenced)).
   ///
@@ -6378,6 +6618,18 @@ impl DriverCore {
   ///   and it dominates any barrier still waiting under the moved subtree, which
   ///   a bare drop left waiting for its deadline.
   ///
+  ///   That domination is the RENAME'S OWN MOVE, recorded here and AHEAD of the
+  ///   widened cover. The destination this arm replaces never reaches the
+  ///   Monitor, so no pairing is resolved there and the funnel that records a
+  ///   rename off a record's own outcome is never asked; the obligations of the
+  ///   scope stay recorded at the path their ground has already left, and the
+  ///   widened cover intersects none of them. The move is LOCATED at the rename's
+  ///   source and claims the widened cover as its standing `Rescan` — a cover at
+  ///   the destination's nearest unpruned ancestor is a prefix of the ground the
+  ///   markers moved into, and no `Rescan` this seat stands may name pruned
+  ///   ground. A source that cannot be placed
+  ///   ([`paired_source`](Self::paired_source)) fails WIDE.
+  ///
   ///   The half the Monitor parked for that rename is CONSUMED
   ///   ([`Monitor::consume_pending_move`]). The destination this arm replaces
   ///   never reaches the Monitor, so nothing is left to pair with — and an
@@ -6390,10 +6642,11 @@ impl DriverCore {
   ///   records are fed.
   fn fenced(
     &mut self,
-    state: &ScopeState,
+    state: &mut ScopeState,
     exclusions: bool,
     scope: ScopeId,
     planned: &Planned,
+    paired: &[(MoveCookie, PathBuf)],
     deferred: &mut Vec<MoveCookie>,
   ) -> Fenced {
     match planned {
@@ -6451,6 +6704,47 @@ impl DriverCore {
           // scope's move settle, and with it every cover fence and every new sync,
           // for the whole window.
           if let Some(cookie) = rec.cookie() {
+            // THE PAIRING'S OWN DOMINATION, AHEAD OF THE WIDENED COVER. This
+            // destination never reaches the Monitor, so no pairing is resolved
+            // there and the funnel that records a rename off a record's own
+            // outcome is never asked. The obligations of the scope would go on
+            // being judged at the path their ground has already left, and the
+            // widened cover — which names the destination's nearest unpruned
+            // ancestor — intersects none of them.
+            //
+            // The source is placed from whichever seat holds it on this
+            // discipline ([`paired_source`](Self::paired_source)).
+            let from = self.paired_source(state, scope, cookie, paired);
+            let scope_wide = matches!(
+              &widened,
+              Planned::Over(target)
+                if matches!(
+                  Self::barrier_ground(&self.monitor, state, target),
+                  BarrierLocation::Scope
+                )
+            );
+            // THE RENAME'S OWN MOVE, AHEAD OF THE WIDENED COVER — and a LOCATED
+            // move rather than this seat's destination, because no `Rescan` may
+            // name pruned ground and the destination's parent may lie inside it.
+            // The widened cover standing at the destination's nearest unpruned
+            // ancestor is a prefix of the ground the retired markers moved into,
+            // so it IS their covering instruction and the move claims it.
+            let located = from.map(|from| BarrierLocation::at(state, Arc::new(from)));
+            match located {
+              Some(location) => {
+                Self::barrier_moved(&mut self.barrier_moves, state, scope, location, true);
+              }
+              // A source nobody can place cannot select the obligations the
+              // rename moved, so the whole scope is retired — claiming the
+              // widened cover only where that cover is itself scope-wide.
+              None => Self::barrier_moved(
+                &mut self.barrier_moves,
+                state,
+                scope,
+                BarrierLocation::Scope,
+                scope_wide,
+              ),
+            }
             if feeds_at_classify(state.profile) {
               self.monitor.consume_pending_move(scope, cookie);
             } else {
@@ -6550,7 +6844,7 @@ impl DriverCore {
 
   fn settle_if_ready(
     monitor: &mut Monitor,
-    moves: &mut VecDeque<BarrierMove>,
+    moves: &mut VecDeque<BarrierEvent>,
     state: &mut ScopeState,
     scope: ScopeId,
     batch: PendingBatch,
@@ -6586,7 +6880,7 @@ impl DriverCore {
   /// so a call that misses its half owes nothing and takes nothing.
   fn settle(
     monitor: &mut Monitor,
-    moves: &mut VecDeque<BarrierMove>,
+    moves: &mut VecDeque<BarrierEvent>,
     state: &mut ScopeState,
     scope: ScopeId,
     mut batch: PendingBatch,
@@ -6678,15 +6972,15 @@ impl DriverCore {
     batch.trailing.extend(covers);
   }
 
-  /// Hands one planned input to the Monitor and reports what it did to the watch
-  /// tree's SHAPE.
+  /// Hands one planned input to the Monitor and reports what it RELOCATED.
   ///
-  /// The [`RecordOutcome`] is the Monitor's own account of the reparent it just
-  /// performed — never a prediction re-derived from the same record by a second
-  /// implementation of the same rule. That is what the geometry pass decides on
-  /// ([`reparent_geometry`](Self::reparent_geometry)).
+  /// The [`RecordOutcome`] is the Monitor's own account of the rename it just
+  /// resolved — never a prediction re-derived from the same record by a second
+  /// implementation of the same rule. The re-key half of it is what the geometry
+  /// pass decides on ([`reparent_geometry`](Self::reparent_geometry)); the
+  /// domination below reads the whole of it.
   ///
-  /// An overflow instruction moves no subtree, so it reports nothing.
+  /// An overflow instruction relocates nothing, so it reports nothing.
   ///
   /// It is also the BARRIER FUNNEL every located `Rescan` this core mints passes
   /// through — the twenty-odd [`Planned::Over`] construction sites and the one
@@ -6697,14 +6991,38 @@ impl DriverCore {
   /// (see [`Planned::Dominated`]).
   fn feed(
     monitor: &mut Monitor,
-    moves: &mut VecDeque<BarrierMove>,
+    moves: &mut VecDeque<BarrierEvent>,
     state: &mut ScopeState,
     scope: ScopeId,
     planned: Planned,
     now: Instant,
   ) -> RecordOutcome {
     match planned {
-      Planned::Rec(rec) => monitor.on_os_record(rec, now),
+      Planned::Rec(rec) => {
+        // The destination slot the domination would be aimed at, taken while
+        // the record is still in hand: the feed consumes it, and the report that
+        // says whether anything relocated at all does not exist until the feed
+        // has happened.
+        let landing = Self::landing_of(&rec);
+        let outcome = monitor.on_os_record(rec, now);
+        // EVERY PAIRED DIRECTORY RENAME DOMINATES THE BARRIERS UNDER ITS
+        // SOURCE. This is the one seat the Monitor's own report of a relocation
+        // is produced at, and it is reached by every profile and every
+        // configuration — the geometry pass beside it is gated on the fence, and
+        // a scope with neither exclusions nor prune patterns renames just the
+        // same.
+        //
+        // Read through the report that answers for BOTH shapes of relocation, so
+        // one line covers the profiles that keep per-directory child watches and
+        // the ones that keep none. A kernel-recursive stream covers the
+        // destination the moment the rename lands and so re-keys nothing — but
+        // its located moves still name the POST-rename path, and a ground
+        // recorded at the pre-rename one intersects none of them.
+        if let Some(from) = outcome.paired_from() {
+          Self::barrier_renamed(moves, monitor, state, scope, from, landing);
+        }
+        outcome
+      }
       Planned::Over(target) => {
         // The ground is read BEFORE the overflow reshapes the watch tree the
         // anchor is placed against. The `Rescan` the Monitor stands IS the
