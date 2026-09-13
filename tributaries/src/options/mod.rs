@@ -81,7 +81,9 @@ pub enum OptionsError {
     RootGlobs::MAX_SEAT_PATTERNS
   )]
   TooManyPrunePatterns {
-    /// How many patterns the seat carried.
+    /// How many patterns the seat carried — which a programmatic setter bounds
+    /// at [`RootGlobs::MAX_SEAT_PATTERNS`] + 1, so it is the length
+    /// held rather than the length of whatever iterator was handed in.
     supplied: usize,
   },
   /// The per-root [`include`](RootGlobs::include) seat carries more patterns than
@@ -91,7 +93,9 @@ pub enum OptionsError {
     RootGlobs::MAX_SEAT_PATTERNS
   )]
   TooManyIncludePatterns {
-    /// How many patterns the seat carried.
+    /// How many patterns the seat carried — which a programmatic setter bounds
+    /// at [`RootGlobs::MAX_SEAT_PATTERNS`] + 1, so it is the length
+    /// held rather than the length of whatever iterator was handed in.
     supplied: usize,
   },
 }
@@ -188,6 +192,36 @@ const fn check_seats(prune: usize, include: Option<usize>) -> Result<(), Options
     return Err(OptionsError::TooManyIncludePatterns { supplied: include });
   }
   Ok(())
+}
+
+/// Collects ONE glob seat from a caller's iterator, taking at most
+/// [`RootGlobs::MAX_SEAT_PATTERNS`] + 1 items — the door every programmatic
+/// setter of both households goes through.
+///
+/// The setters are infallible, and that is a statement about their SIGNATURE, not
+/// a licence to do unbounded work on the way to one: `impl IntoIterator` is a
+/// caller's own iterator, which need not terminate, and a plain `collect` grows
+/// the crate-owned `Vec` for as long as it yields — so the ceiling the type
+/// documents is reached by nothing, `check_seats` is never asked, and the process
+/// dies holding a seat nobody ever validated.
+///
+/// Taking ONE item past the ceiling is what keeps the refusal exact rather than
+/// merely bounded: a seat that fills the ceiling is legal and survives intact,
+/// and the extra item is the over-cap witness [`check_seats`] refuses on — the
+/// same verdict, in the same place, a finite over-cap list has always got. What a
+/// non-terminating iterator loses is only the true count in the refusal's
+/// `supplied`, which is a number nobody could have read without doing the
+/// unbounded work.
+///
+/// The shape is [`Globs::new`](tributary_proto::Globs::new)'s, deliberately: that
+/// constructor is the floor beneath every seat, and a household bounded by a
+/// different rule than the matcher below it would be a second opinion about one
+/// number.
+fn collect_seat(patterns: impl IntoIterator<Item = Glob>) -> Vec<Glob> {
+  patterns
+    .into_iter()
+    .take(RootGlobs::MAX_SEAT_PATTERNS + 1)
+    .collect()
 }
 
 /// Reads ONE glob seat, refusing the element past
@@ -1344,9 +1378,12 @@ impl Default for TributariesOptions {
 /// [`validate`](Self::validate) checks, the `serde` face refuses mid-document, the
 /// `clap` face refuses at the occurrence past it — before a pattern of the seat is
 /// compiled at all — and [`Tributaries::watch`](crate::Tributaries::watch) refuses
-/// on before anything is planned. Beneath all of them the matcher's own
-/// constructor carries the same bound, so words this household never saw are
-/// bounded too.
+/// on before anything is planned. The programmatic setters keep the same list
+/// bounded AT COLLECTION: they retain one pattern past the ceiling and no more,
+/// whatever the iterator handed to them goes on to yield, so `validate` is always
+/// reachable and always sees the over-cap witness. Beneath all of them the
+/// matcher's own constructor carries the same bound, so words this household never
+/// saw are bounded too.
 ///
 /// # Configuration faces
 ///
@@ -1523,17 +1560,25 @@ impl RootGlobs {
   }
 
   /// Returns these words with the pruned subtrees set.
+  ///
+  /// Retains at most [`MAX_SEAT_PATTERNS`](Self::MAX_SEAT_PATTERNS) + 1 patterns,
+  /// whatever the iterator goes on to yield; a seat that reaches that length is
+  /// refused by [`validate`](Self::validate).
   #[inline]
   #[must_use]
   pub fn with_prune(mut self, prune: impl IntoIterator<Item = Glob>) -> Self {
-    self.prune = prune.into_iter().collect();
+    self.prune = collect_seat(prune);
     self
   }
 
   /// Sets the pruned subtrees.
+  ///
+  /// Retains at most [`MAX_SEAT_PATTERNS`](Self::MAX_SEAT_PATTERNS) + 1 patterns,
+  /// whatever the iterator goes on to yield; a seat that reaches that length is
+  /// refused by [`validate`](Self::validate).
   #[inline]
   pub fn set_prune(&mut self, prune: impl IntoIterator<Item = Glob>) -> &mut Self {
-    self.prune = prune.into_iter().collect();
+    self.prune = collect_seat(prune);
     self
   }
 
@@ -1546,17 +1591,25 @@ impl RootGlobs {
   }
 
   /// Returns these words with delivery narrowed to the given file patterns.
+  ///
+  /// Retains at most [`MAX_SEAT_PATTERNS`](Self::MAX_SEAT_PATTERNS) + 1 patterns,
+  /// whatever the iterator goes on to yield; a seat that reaches that length is
+  /// refused by [`validate`](Self::validate).
   #[inline]
   #[must_use]
   pub fn with_include(mut self, include: impl IntoIterator<Item = Glob>) -> Self {
-    self.include = Some(include.into_iter().collect());
+    self.include = Some(collect_seat(include));
     self
   }
 
   /// Sets the file patterns delivery is narrowed to.
+  ///
+  /// Retains at most [`MAX_SEAT_PATTERNS`](Self::MAX_SEAT_PATTERNS) + 1 patterns,
+  /// whatever the iterator goes on to yield; a seat that reaches that length is
+  /// refused by [`validate`](Self::validate).
   #[inline]
   pub fn set_include(&mut self, include: impl IntoIterator<Item = Glob>) -> &mut Self {
-    self.include = Some(include.into_iter().collect());
+    self.include = Some(collect_seat(include));
     self
   }
 
@@ -1625,8 +1678,11 @@ impl RootGlobs {
 /// [`validate`](Self::validate) for a household built by hand, a mid-document
 /// refusal for a loaded one, and [`watch`](crate::Tributaries::watch) itself, which
 /// runs the same check before it submits anything
-/// ([`WatchError::InvalidOptions`](crate::WatchError::InvalidOptions)). A seat past
-/// the ceiling therefore never reaches a [`Source`](crate::Source).
+/// ([`WatchError::InvalidOptions`](crate::WatchError::InvalidOptions)). The
+/// programmatic setters keep the list bounded AT COLLECTION — one pattern past the
+/// ceiling and no more, whatever the iterator goes on to yield — so the hand-built
+/// household's `validate` is always reachable. A seat past the ceiling therefore
+/// never reaches a [`Source`](crate::Source).
 ///
 /// # Cloning shares the [`Filter`] slot
 ///
@@ -1951,17 +2007,25 @@ impl<C> WatchOptions<C> {
   }
 
   /// Returns these options with the pruned subtrees set.
+  ///
+  /// Retains at most [`MAX_SEAT_PATTERNS`](Self::MAX_SEAT_PATTERNS) + 1 patterns,
+  /// whatever the iterator goes on to yield; a seat that reaches that length is
+  /// refused by [`validate`](Self::validate).
   #[inline]
   #[must_use]
   pub fn with_prune(mut self, prune: impl IntoIterator<Item = Glob>) -> Self {
-    self.prune = prune.into_iter().collect();
+    self.prune = collect_seat(prune);
     self
   }
 
   /// Sets the pruned subtrees.
+  ///
+  /// Retains at most [`MAX_SEAT_PATTERNS`](Self::MAX_SEAT_PATTERNS) + 1 patterns,
+  /// whatever the iterator goes on to yield; a seat that reaches that length is
+  /// refused by [`validate`](Self::validate).
   #[inline]
   pub fn set_prune(&mut self, prune: impl IntoIterator<Item = Glob>) -> &mut Self {
-    self.prune = prune.into_iter().collect();
+    self.prune = collect_seat(prune);
     self
   }
 
@@ -1977,17 +2041,25 @@ impl<C> WatchOptions<C> {
   }
 
   /// Returns these options with delivery narrowed to the given file patterns.
+  ///
+  /// Retains at most [`MAX_SEAT_PATTERNS`](Self::MAX_SEAT_PATTERNS) + 1 patterns,
+  /// whatever the iterator goes on to yield; a seat that reaches that length is
+  /// refused by [`validate`](Self::validate).
   #[inline]
   #[must_use]
   pub fn with_include(mut self, include: impl IntoIterator<Item = Glob>) -> Self {
-    self.include = Some(include.into_iter().collect());
+    self.include = Some(collect_seat(include));
     self
   }
 
   /// Sets the file patterns delivery is narrowed to.
+  ///
+  /// Retains at most [`MAX_SEAT_PATTERNS`](Self::MAX_SEAT_PATTERNS) + 1 patterns,
+  /// whatever the iterator goes on to yield; a seat that reaches that length is
+  /// refused by [`validate`](Self::validate).
   #[inline]
   pub fn set_include(&mut self, include: impl IntoIterator<Item = Glob>) -> &mut Self {
-    self.include = Some(include.into_iter().collect());
+    self.include = Some(collect_seat(include));
     self
   }
 

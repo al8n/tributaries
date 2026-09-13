@@ -103,7 +103,9 @@ pub enum OptionsError {
     RootOptions::MAX_SEAT_PATTERNS
   )]
   TooManyPrunePatterns {
-    /// How many patterns the seat carried.
+    /// How many patterns the seat carried — which a programmatic setter bounds
+    /// at [`RootOptions::MAX_SEAT_PATTERNS`] + 1, so it is the length
+    /// held rather than the length of whatever iterator was handed in.
     supplied: usize,
   },
   /// The per-root [`include`](RootOptions::include) seat carries more patterns
@@ -113,7 +115,9 @@ pub enum OptionsError {
     RootOptions::MAX_SEAT_PATTERNS
   )]
   TooManyIncludePatterns {
-    /// How many patterns the seat carried.
+    /// How many patterns the seat carried — which a programmatic setter bounds
+    /// at [`RootOptions::MAX_SEAT_PATTERNS`] + 1, so it is the length
+    /// held rather than the length of whatever iterator was handed in.
     supplied: usize,
   },
 }
@@ -776,12 +780,13 @@ impl WatcherOptions {
   pub const DEFAULT_BACKEND: Backend = Backend::Auto;
 
   /// The default periodic root-liveness interval (30 s) — the detection-latency
-  /// bound for a signal-silent unmount. A `FAN_MARK_FILESYSTEM`-watched
-  /// superblock unmounted out from under the watch emits NO kernel signal (the
-  /// L4.1 finding), so a periodic root re-stat is its only unmount detection;
-  /// every other backend (inotify's `IN_UNMOUNT`/`IN_IGNORED`, FSEvents'
-  /// `RootChanged`, and both Windows backends' own fatal-source-error report on
-  /// a lost root or volume) signals root death in-band and ignores this knob.
+  /// bound for a root death no in-band signal reports in time. A
+  /// `FAN_MARK_FILESYSTEM`-watched superblock unmounted out from under the watch
+  /// emits NO kernel signal (the L4.1 finding), and an inotify root's
+  /// `IN_DELETE_SELF` is queued only once the last reference to it drops, so a
+  /// periodic root re-stat is what bounds both. FSEvents' `RootChanged` and both
+  /// Windows backends' own fatal-source-error report on a lost root or volume
+  /// arrive regardless of anything this crate holds, so those ignore this knob.
   /// See [`root_liveness_interval`](Self::root_liveness_interval).
   pub const DEFAULT_ROOT_LIVENESS_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -789,8 +794,9 @@ impl WatcherOptions {
   ///
   /// The interval is armed as a deadline (`now + interval`) whose arithmetic
   /// SATURATES, so an enormous one does not crash — it silently arms a deadline
-  /// that never fires, disabling fanotify's only unmount detector while looking
-  /// configured. [`Duration::ZERO`](Duration::ZERO) is how a caller says
+  /// that never fires, disabling the Linux profiles' out-of-band root-death
+  /// detector while looking configured. [`Duration::ZERO`](Duration::ZERO) is
+  /// how a caller says
   /// "disabled"; anything past a day is the accidental spelling of it, and gets
   /// a typed refusal instead. One day is also the ceiling
   /// [`effective_move_window`](Self::effective_move_window) stands on: deadline
@@ -1128,27 +1134,34 @@ impl WatcherOptions {
   }
 
   /// The periodic root-liveness interval — the detection-latency bound for a
-  /// signal-silent root unmount.
+  /// root death the backend's own signal does not report in time.
   ///
-  /// A fanotify (`FAN_MARK_FILESYSTEM`) root unmounted out from under the watch
-  /// delivers no kernel signal (the mark holds the superblock alive and the fd
-  /// goes quiet — the L4.1 finding), so the driver re-stats such a root on this
-  /// cadence and lowers its death (a terminal
-  /// [`Rescan`](crate::EventKind::Rescan) and registry reclamation) when the
-  /// path no longer names the watched object. This is the WORST-CASE latency:
-  /// an unmount is also caught immediately by any loss signal (which already
-  /// re-reads the mount table), so the tick only bounds the quiet case.
+  /// The driver re-stats such a root on this cadence and lowers its death (a
+  /// terminal [`Rescan`](crate::EventKind::Rescan) and registry reclamation)
+  /// when the path no longer names the watched object. This is the WORST-CASE
+  /// latency: a death is also caught immediately by any loss signal (which
+  /// already re-reads the mount table), so the tick only bounds the quiet case.
   ///
-  /// Only signal-silent-on-unmount backends consult it — fanotify. inotify
-  /// (`IN_UNMOUNT`/`IN_IGNORED`), FSEvents (`RootChanged`), and both Windows
-  /// backends (a fatal source error the moment the root or its volume is gone)
-  /// surface root death in-band and never arm this tick, so the knob is inert
-  /// for them.
+  /// Both Linux backends consult it, for two different reasons:
   ///
-  /// [`Duration::ZERO`] DISABLES the tick: a quiet unmount is then observed only
-  /// at the next loss-triggered refresh (or never, if none occurs) — the
-  /// pre-L4.2 behavior, quiet-but-alive with the root observably gone on
-  /// re-access.
+  /// - **fanotify** (`FAN_MARK_FILESYSTEM`) unmounted out from under the watch
+  ///   delivers no kernel signal at all — the mark holds the superblock alive
+  ///   and the fd goes quiet (the L4.1 finding).
+  /// - **inotify**'s `IN_DELETE_SELF` for a removed root is queued only once the
+  ///   last reference to it drops, and this crate itself holds references: a
+  ///   [`sync`](crate::Watcher::sync_root)'s admission pins the objects it
+  ///   ordered against for as long as the write that owns them takes, which on a
+  ///   stalled filesystem has no bound. The tick is the observation that does not
+  ///   wait on them.
+  ///
+  /// FSEvents (`RootChanged`) and both Windows backends (a fatal source error the
+  /// moment the root or its volume is gone) report root death through their own
+  /// streams, with nothing this crate holds able to postpone it, so they never
+  /// arm the tick and the knob is inert for them.
+  ///
+  /// [`Duration::ZERO`] DISABLES the tick: such a death is then observed only at
+  /// the next loss-triggered refresh (or never, if none occurs) — the pre-L4.2
+  /// behavior, quiet-but-alive with the root observably gone on re-access.
   #[inline]
   pub const fn root_liveness_interval(&self) -> Duration {
     self.root_liveness_interval
@@ -1323,8 +1336,12 @@ impl Default for WatcherOptions {
 /// [`watch_with`](crate::Watcher::watch_with) refuses on before any coverage
 /// exists. The `serde` face refuses an over-full seat mid-document and the `clap`
 /// face at the occurrence past the ceiling, so on neither of them does a list past
-/// it ever compile; and beneath every one of those the matcher's own constructor
-/// carries the same bound, so a seat this household never saw is bounded too.
+/// it ever compile; the programmatic setters keep the same list bounded AT
+/// COLLECTION — they retain one pattern past the ceiling and no more, whatever the
+/// iterator handed to them goes on to yield, so `validate` is always reachable and
+/// always sees the over-cap witness; and beneath every one of those the matcher's
+/// own constructor carries the same bound, so a seat this household never saw is
+/// bounded too.
 ///
 /// With the `serde` feature the household is one object keyed by the field
 /// names, every key optional and defaulted from [`new`](Self::new); the two glob
@@ -1528,6 +1545,36 @@ struct RootOptionsArgs {
   /// Raw strings for `prune`'s reason, and bounded the same way.
   #[arg(long, num_args = 0..=1)]
   include: Option<Vec<String>>,
+}
+
+/// Collects ONE glob seat from a caller's iterator, taking at most
+/// [`RootOptions::MAX_SEAT_PATTERNS`] + 1 items — the door every programmatic
+/// setter of this household goes through.
+///
+/// The setters are infallible, and that is a statement about their SIGNATURE, not
+/// a licence to do unbounded work on the way to one: `impl IntoIterator` is a
+/// caller's own iterator, which need not terminate, and a plain `collect` grows
+/// the crate-owned `Vec` for as long as it yields — so the ceiling this type
+/// documents is reached by nothing, [`validate`](RootOptions::validate) is never
+/// asked, and the process dies holding a seat nobody ever validated.
+///
+/// Taking ONE item past the ceiling is what keeps the refusal exact rather than
+/// merely bounded: a seat that fills the ceiling is legal and survives intact,
+/// and the extra item is the over-cap witness `validate` refuses on — the same
+/// verdict, in the same place, a finite over-cap list has always got. What a
+/// non-terminating iterator loses is only the true count in the refusal's
+/// `supplied`, which is a number nobody could have read without doing the
+/// unbounded work.
+///
+/// The shape is [`Globs::new`](tributary_proto::Globs::new)'s, deliberately: that
+/// constructor is the floor beneath every seat, and a household bounded by a
+/// different rule than the matcher below it would be a second opinion about one
+/// number.
+fn collect_seat(patterns: impl IntoIterator<Item = Glob>) -> Vec<Glob> {
+  patterns
+    .into_iter()
+    .take(RootOptions::MAX_SEAT_PATTERNS + 1)
+    .collect()
 }
 
 /// Compiles ONE glob seat off the command line, refusing a list longer than
@@ -1841,17 +1888,25 @@ impl RootOptions {
   }
 
   /// Returns these options with the pruned subtrees set.
+  ///
+  /// Retains at most [`MAX_SEAT_PATTERNS`](Self::MAX_SEAT_PATTERNS) + 1 patterns,
+  /// whatever the iterator goes on to yield; a seat that reaches that length is
+  /// refused by [`validate`](Self::validate).
   #[inline]
   #[must_use]
   pub fn with_prune(mut self, prune: impl IntoIterator<Item = Glob>) -> Self {
-    self.prune = prune.into_iter().collect();
+    self.prune = collect_seat(prune);
     self
   }
 
   /// Sets the pruned subtrees.
+  ///
+  /// Retains at most [`MAX_SEAT_PATTERNS`](Self::MAX_SEAT_PATTERNS) + 1 patterns,
+  /// whatever the iterator goes on to yield; a seat that reaches that length is
+  /// refused by [`validate`](Self::validate).
   #[inline]
   pub fn set_prune(&mut self, prune: impl IntoIterator<Item = Glob>) -> &mut Self {
-    self.prune = prune.into_iter().collect();
+    self.prune = collect_seat(prune);
     self
   }
 
@@ -1866,17 +1921,25 @@ impl RootOptions {
   }
 
   /// Returns these options with delivery narrowed to the given file patterns.
+  ///
+  /// Retains at most [`MAX_SEAT_PATTERNS`](Self::MAX_SEAT_PATTERNS) + 1 patterns,
+  /// whatever the iterator goes on to yield; a seat that reaches that length is
+  /// refused by [`validate`](Self::validate).
   #[inline]
   #[must_use]
   pub fn with_include(mut self, include: impl IntoIterator<Item = Glob>) -> Self {
-    self.include = Some(include.into_iter().collect());
+    self.include = Some(collect_seat(include));
     self
   }
 
   /// Sets the file patterns delivery is narrowed to.
+  ///
+  /// Retains at most [`MAX_SEAT_PATTERNS`](Self::MAX_SEAT_PATTERNS) + 1 patterns,
+  /// whatever the iterator goes on to yield; a seat that reaches that length is
+  /// refused by [`validate`](Self::validate).
   #[inline]
   pub fn set_include(&mut self, include: impl IntoIterator<Item = Glob>) -> &mut Self {
-    self.include = Some(include.into_iter().collect());
+    self.include = Some(collect_seat(include));
     self
   }
 

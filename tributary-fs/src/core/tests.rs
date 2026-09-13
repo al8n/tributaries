@@ -2,9 +2,9 @@ use super::*;
 use std::time::Duration;
 
 const WINDOW: Duration = Duration::from_millis(100);
-/// The root-liveness tick interval the shared harness cores run with. Only a
-/// fanotify scope arms it, and the FSEvents/inotify suites never drive time
-/// this far, so it is inert everywhere except the fanotify liveness-tick suite.
+/// The root-liveness tick interval the shared harness cores run with. Only the
+/// two Linux profiles arm it, and no suite but the liveness-tick one drives
+/// time this far, so it is inert everywhere else.
 const LIVENESS: Duration = Duration::from_secs(30);
 
 /// The scope's delivery lane, for cells whose transport never swaps.
@@ -9328,8 +9328,10 @@ mod kernel_recursive_fanotify {
   }
 
   /// A live inotify (descending) scope, spawned and root-armed, with its birth
-  /// refresh fed — the comparison peer for the liveness-tick gate. inotify's
-  /// unmount is signalled in-band (`IN_UNMOUNT`), so it must NOT arm the tick.
+  /// refresh fed. It arms the tick as a fanotify scope does: inotify's unmount
+  /// is signalled in-band (`IN_UNMOUNT`), but its in-tree `IN_DELETE_SELF` is
+  /// queued only once the last reference to the removed root drops, and this
+  /// driver's own sync pins are such references.
   fn live_inotify() -> (DriverCore, ScopeId) {
     let mut core = DriverCore::new(WINDOW, LIVENESS);
     let scope = core
@@ -9372,51 +9374,62 @@ mod kernel_recursive_fanotify {
     (core, scope)
   }
 
-  /// The composition's one timer: a fanotify scope arms a periodic root-liveness
-  /// deadline (its birth refresh at `at(0)` seeds it at `+LIVENESS`), and the
-  /// tick coming due fires a `RefreshMounts` — the ONLY way a signal-silent
-  /// unmount is ever observed. An inotify scope, whose unmount is in-band, arms
-  /// no such deadline and fires no tick.
+  /// The composition's one timer, and BOTH Linux profiles owe it.
+  ///
+  /// A fanotify scope arms it because a signal-silent unmount is observable no
+  /// other way. An inotify scope arms it because its root-death notice is not
+  /// independent of this process: `IN_DELETE_SELF` is queued only when the last
+  /// reference to the removed root drops, and a sync's admission pins are held
+  /// for as long as the write owning them takes. Both therefore seed the
+  /// deadline at their birth refresh (`at(0)` → `+LIVENESS`) and both fire a
+  /// `RefreshMounts` when it comes due.
+  ///
+  /// FSEvents does not, and that is unchanged: its stream reports the root's
+  /// death itself, with nothing of ours able to postpone it.
   #[test]
-  fn liveness_tick_refreshes_a_fanotify_root_but_not_an_inotify_one() {
-    let (mut core, _scope) = live_fanotify();
-    assert_eq!(
-      core.poll_timeout(),
-      Some(at(30_000)),
-      "a fanotify scope arms the liveness deadline one interval past its birth refresh"
-    );
-    // Before the deadline: no tick.
-    core.on_timeout(at(29_999));
-    assert_eq!(
-      refresh_requests(&drain(&mut core)),
-      0,
-      "the tick does not fire early"
-    );
-    // At the deadline: exactly one refresh, and the deadline re-arms.
-    core.on_timeout(at(30_000));
-    assert_eq!(
-      refresh_requests(&drain(&mut core)),
-      1,
-      "the due tick fires the root-liveness refresh"
-    );
-    assert_eq!(
-      core.poll_timeout(),
-      Some(at(60_000)),
-      "the tick re-arms one interval out"
-    );
+  fn liveness_tick_refreshes_both_linux_profiles_but_not_fsevents() {
+    for (profile, mut core) in [
+      ("fanotify", live_fanotify().0),
+      ("inotify", live_inotify().0),
+    ] {
+      assert_eq!(
+        core.poll_timeout(),
+        Some(at(30_000)),
+        "{profile} arms the liveness deadline one interval past its birth refresh"
+      );
+      // Before the deadline: no tick.
+      core.on_timeout(at(29_999));
+      assert_eq!(
+        refresh_requests(&drain(&mut core)),
+        0,
+        "{profile}'s tick does not fire early"
+      );
+      // At the deadline: exactly one refresh, and the deadline re-arms.
+      core.on_timeout(at(30_000));
+      assert_eq!(
+        refresh_requests(&drain(&mut core)),
+        1,
+        "{profile}'s due tick fires the root-liveness refresh"
+      );
+      assert_eq!(
+        core.poll_timeout(),
+        Some(at(60_000)),
+        "{profile}'s tick re-arms one interval out"
+      );
+    }
 
-    // inotify: no liveness deadline, so no tick ever fires.
-    let (mut core, _scope) = live_inotify();
+    // FSEvents: no liveness deadline, so no tick ever fires.
+    let (mut core, _scope) = super::live_core();
     assert_eq!(
       core.poll_timeout(),
       None,
-      "an inotify scope arms no liveness deadline (its unmount is in-band)"
+      "an FSEvents scope arms no liveness deadline (its stream reports the death)"
     );
     core.on_timeout(at(1_000_000));
     assert_eq!(
       refresh_requests(&drain(&mut core)),
       0,
-      "an inotify scope never fires a liveness tick"
+      "an FSEvents scope never fires a liveness tick"
     );
   }
 
@@ -9459,6 +9472,61 @@ mod kernel_recursive_fanotify {
         .iter()
         .any(|e| matches!(e, Effect::TeardownStream { scope: s } if *s == scope)),
       "the dead root's stream tears down: {effects:?}"
+    );
+  }
+
+  /// The same payoff for the DESCENDING profile, where the death the tick beats
+  /// is not a silent unmount but a deferred notice.
+  ///
+  /// An inotify root removed while any descriptor on it is still open — a sync's
+  /// admission pins, held for the whole of a write that may be stalled in a
+  /// syscall — has no `IN_DELETE_SELF` to lower yet: Linux queues that only once
+  /// the last reference drops. Nothing else in the scope is going to say so, so
+  /// a tick-driven refresh reading the root `Missing` must run the whole death
+  /// funnel a self-event would: terminal Removed + Rescan, and the stream torn
+  /// down so the obligations hanging off the scope are reaped. Nothing on that
+  /// funnel is fanotify's — this drives it with the descending profile to keep
+  /// it that way.
+  #[test]
+  fn liveness_tick_finding_an_inotify_root_gone_dies_end_to_end() {
+    let (mut core, scope) = live_inotify();
+    // The tick comes due and fires the refresh — no loss, no birth, just time.
+    core.on_timeout(at(30_000));
+    let effects = drain(&mut core);
+    assert_eq!(
+      refresh_requests(&effects),
+      1,
+      "the inotify tick armed the refresh: {effects:?}"
+    );
+    // The refresh executor comes back with the root GONE, while the kernel's own
+    // `IN_DELETE_SELF` is still owed to whatever holds the last reference.
+    core.on_mounts_refreshed(
+      scope,
+      MountRefresh {
+        mounts: Vec::new(),
+        authoritative: true,
+        root: RootLiveness::Missing,
+        root_mnt_id: None,
+      },
+      at(30_001),
+    );
+    let effects = drain(&mut core);
+    let emitted = emits(&effects);
+    assert_eq!(emitted.len(), 2, "{effects:?}");
+    assert!(emitted[0].kind().is_removed(), "a gone root is a Removed");
+    assert!(
+      emitted[1].kind().is_rescan(),
+      "the tick-detected death is never silent"
+    );
+    assert!(
+      effects
+        .iter()
+        .any(|e| matches!(e, Effect::TeardownStream { scope: s } if *s == scope)),
+      "the dead root's stream tears down: {effects:?}"
+    );
+    assert!(
+      !core.scopes.contains_key(&scope),
+      "and the scope is retired, so nothing keeps reporting it live: {effects:?}"
     );
   }
 
@@ -13630,8 +13698,16 @@ mod exclusions {
 
   /// A core enforcing `paths`, exactly as the driver builds one from the
   /// watcher's options.
+  ///
+  /// The root-liveness cadence is DISABLED here (`Duration::ZERO`, which the
+  /// options layer offers for exactly this). Every cell in this suite reasons
+  /// about the pairing deadline and about what the exclusion fence does or does
+  /// not arm, and a descending scope carries the liveness cadence as well — a
+  /// second deadline `poll_timeout` would report, saying nothing about either
+  /// subject and hiding the one being asserted.
   fn excluding(paths: &[&str]) -> DriverCore {
-    DriverCore::new(WINDOW, LIVENESS).with_exclusions(paths.iter().map(PathBuf::from).collect())
+    DriverCore::new(WINDOW, Duration::ZERO)
+      .with_exclusions(paths.iter().map(PathBuf::from).collect())
   }
 
   fn entry(name: &str, kind: FileKind) -> RawDirEntry {
