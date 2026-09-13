@@ -104,15 +104,52 @@ mod serde_face {
   }
 
   /// A misspelled or future kind name is refused rather than silently ignored — a
-  /// typo must not parse as the EMPTY mask for the kind it meant to admit.
+  /// typo must not parse as the EMPTY mask for the kind it meant to admit. The key
+  /// is short enough to stay inside the bounded identifier visitor's own ceiling
+  /// (the longest legal field name, `modified` at 8 bytes), so this is the JUNK
+  /// KEY INSIDE THE BOUND cell: the vocabulary answers, naming it.
   #[test]
   fn an_unknown_key_is_refused() {
-    let err = serde_json::from_str::<Interest>(r#"{"created": true, "some_future_kind": true}"#)
+    let err = serde_json::from_str::<Interest>(r#"{"created": true, "future": true}"#)
       .expect_err("an unknown key is refused");
     assert!(
-      err.to_string().contains("some_future_kind"),
+      err.to_string().contains("future"),
       "the error names the unknown key: {err}"
     );
+  }
+
+  /// The struct-key twin of the umbrella's own bounded delivery-kind tag: a
+  /// rejected key past the bounded identifier visitor's ceiling costs a FIXED
+  /// message and never an allocation proportional to its own size.
+  #[test]
+  fn an_over_long_unknown_key_is_refused_without_echoing_it() {
+    let key: String = core::iter::repeat_n('z', 1024 * 1024).collect();
+    let document = format!(r#"{{"{key}": true}}"#);
+    let refusal = serde_json::from_str::<Interest>(&document)
+      .expect_err("a key past the longest field name is refused")
+      .to_string();
+
+    assert!(
+      refusal.contains("8-byte bound"),
+      "the refusal names the bound: {refusal}"
+    );
+    assert!(
+      refusal.contains(&key.len().to_string()),
+      "and the length it measured: {refusal}"
+    );
+    assert!(
+      !refusal.contains(&"z".repeat(9)),
+      "and none of the key itself: {refusal}"
+    );
+  }
+
+  /// A repeated key is refused rather than silently taking the last (or first)
+  /// value — the same `duplicate_field` verdict the derive would give.
+  #[test]
+  fn a_duplicate_key_is_refused() {
+    let err = serde_json::from_str::<Interest>(r#"{"created": true, "created": false}"#)
+      .expect_err("a duplicate key is refused");
+    assert!(err.to_string().contains("duplicate field"), "{err}");
   }
 
   #[test]

@@ -481,24 +481,92 @@ mod serde_face {
   }
 
   /// An unknown key is refused on every household — a typo in a key name must not
-  /// silently drop the knob it was meant to set.
+  /// silently drop the knob it was meant to set. The key is short enough to stay
+  /// inside every household's own bounded identifier visitor ceiling (the
+  /// smallest is `RootGlobs`', 7 bytes for `include`), so this is the JUNK KEY
+  /// INSIDE THE BOUND cell: the vocabulary answers, naming it.
   #[test]
   fn an_unknown_key_is_refused() {
-    let err = serde_json::from_str::<DebounceConfig>(r#"{"some_future_knob": 7}"#)
+    let err = serde_json::from_str::<DebounceConfig>(r#"{"future": 7}"#)
       .expect_err("an unknown key is refused");
-    assert!(err.to_string().contains("some_future_knob"), "{err}");
+    assert!(err.to_string().contains("future"), "{err}");
 
-    let err = serde_json::from_str::<TributariesOptions>(r#"{"some_future_knob": 7}"#)
+    let err = serde_json::from_str::<TributariesOptions>(r#"{"future": 7}"#)
       .expect_err("an unknown key is refused");
-    assert!(err.to_string().contains("some_future_knob"), "{err}");
+    assert!(err.to_string().contains("future"), "{err}");
 
-    let err = serde_json::from_str::<WatchOptions<OsString>>(r#"{"some_future_knob": 7}"#)
+    let err = serde_json::from_str::<WatchOptions<OsString>>(r#"{"future": 7}"#)
       .expect_err("an unknown key is refused");
-    assert!(err.to_string().contains("some_future_knob"), "{err}");
+    assert!(err.to_string().contains("future"), "{err}");
 
-    let err = serde_json::from_str::<RootGlobs>(r#"{"prune": [], "some_future_seat": 7}"#)
+    let err = serde_json::from_str::<RootGlobs>(r#"{"prune": [], "future": 7}"#)
       .expect_err("an unknown key is refused");
-    assert!(err.to_string().contains("some_future_seat"), "{err}");
+    assert!(err.to_string().contains("future"), "{err}");
+  }
+
+  /// The struct-key sibling of the duration-text and debounce-tag bounds: a
+  /// rejected key past each household's own bounded identifier visitor ceiling
+  /// costs a FIXED message and never an allocation proportional to its own size.
+  #[test]
+  fn an_over_long_unknown_key_is_refused_without_echoing_it() {
+    let key: String = core::iter::repeat_n('z', 1024 * 1024).collect();
+    let echo_guard = "z".repeat(9);
+
+    let document = format!(r#"{{"{key}": 7}}"#);
+
+    let refusal = serde_json::from_str::<DebounceConfig>(&document)
+      .expect_err("a key past the longest field name is refused")
+      .to_string();
+    assert!(refusal.contains("12-byte bound"), "{refusal}");
+    assert!(refusal.contains(&key.len().to_string()), "{refusal}");
+    assert!(!refusal.contains(&echo_guard), "{refusal}");
+
+    let refusal = serde_json::from_str::<TributariesOptions>(&document)
+      .expect_err("a key past the longest field name is refused")
+      .to_string();
+    assert!(refusal.contains("16-byte bound"), "{refusal}");
+    assert!(refusal.contains(&key.len().to_string()), "{refusal}");
+    assert!(!refusal.contains(&echo_guard), "{refusal}");
+
+    let refusal = serde_json::from_str::<WatchOptions<OsString>>(&document)
+      .expect_err("a key past the longest field name is refused")
+      .to_string();
+    assert!(refusal.contains("8-byte bound"), "{refusal}");
+    assert!(refusal.contains(&key.len().to_string()), "{refusal}");
+    assert!(!refusal.contains(&echo_guard), "{refusal}");
+
+    let document = format!(r#"{{"prune": [], "{key}": 7}}"#);
+    let refusal = serde_json::from_str::<RootGlobs>(&document)
+      .expect_err("a key past the longest field name is refused")
+      .to_string();
+    assert!(refusal.contains("7-byte bound"), "{refusal}");
+    assert!(refusal.contains(&key.len().to_string()), "{refusal}");
+    assert!(!refusal.contains(&echo_guard), "{refusal}");
+  }
+
+  /// A repeated key is refused on every household rather than silently taking
+  /// the last (or first) value — the same `duplicate_field` verdict the derive
+  /// would give.
+  #[test]
+  fn a_duplicate_key_is_refused() {
+    let err = serde_json::from_str::<DebounceConfig>(r#"{"max_hold": "1s", "max_hold": "2s"}"#)
+      .expect_err("a duplicate key is refused");
+    assert!(err.to_string().contains("duplicate field"), "{err}");
+
+    let err =
+      serde_json::from_str::<TributariesOptions>(r#"{"event_capacity": 1, "event_capacity": 2}"#)
+        .expect_err("a duplicate key is refused");
+    assert!(err.to_string().contains("duplicate field"), "{err}");
+
+    let err = serde_json::from_str::<WatchOptions<OsString>>(
+      r#"{"debounce": "off", "debounce": "inherit"}"#,
+    )
+    .expect_err("a duplicate key is refused");
+    assert!(err.to_string().contains("duplicate field"), "{err}");
+
+    let err = serde_json::from_str::<RootGlobs>(r#"{"prune": [], "prune": []}"#)
+      .expect_err("a duplicate key is refused");
+    assert!(err.to_string().contains("duplicate field"), "{err}");
   }
 
   /// The capacities are non-zero TYPES, so a zero is refused by the format.

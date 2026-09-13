@@ -22,6 +22,15 @@ mod tests;
 const EXCLUSION_NOT_ABSOLUTE_MESSAGE: &str =
   "an exclusion directory must be a non-empty absolute path";
 
+/// The FIXED message the `clap` face refuses a non-UTF-8 exclusion with — never
+/// the bytes themselves, in the same mold as [`EXCLUSION_NOT_ABSOLUTE_MESSAGE`].
+///
+/// The `serde` face needs no twin of this constant: its visitor reads through
+/// `deserialize_str`, so it is handed a `&str` — valid UTF-8 by construction —
+/// and can never receive anything this check would refuse.
+#[cfg(feature = "clap")]
+const EXCLUSION_NOT_UTF8_MESSAGE: &str = "an exclusion directory must be valid UTF-8";
+
 /// Why a [`WatcherOptions`] value cannot be honored.
 ///
 /// Every knob is a bounded quantity: an out-of-range value reaches unchecked
@@ -50,6 +59,17 @@ pub enum OptionsError {
   ExclusionTooLong {
     /// How many bytes the offending path carried.
     supplied: usize,
+  },
+  /// One exclusion path is not valid UTF-8.
+  ///
+  /// The `serde` face can only ever hold UTF-8 (its visitor reads through
+  /// `deserialize_str`), so a household built through the programmatic or
+  /// `clap` face must be held to the same domain — otherwise a value those
+  /// faces accepted could never be persisted and read back through the third.
+  #[error("exclusion at index {index} is not valid UTF-8")]
+  ExclusionNotUtf8 {
+    /// The index of the offending exclusion within the list.
+    index: usize,
   },
   /// One exclusion path is empty or not absolute
   /// ([`Path::is_absolute`](std::path::Path::is_absolute)).
@@ -161,6 +181,12 @@ impl OptionsError {
   #[inline]
   pub const fn is_exclusion_too_long(&self) -> bool {
     matches!(self, Self::ExclusionTooLong { .. })
+  }
+
+  /// Whether this is [`ExclusionNotUtf8`](Self::ExclusionNotUtf8).
+  #[inline]
+  pub const fn is_exclusion_not_utf8(&self) -> bool {
+    matches!(self, Self::ExclusionNotUtf8 { .. })
   }
 
   /// Whether this is [`ExclusionNotAbsolute`](Self::ExclusionNotAbsolute).
@@ -294,7 +320,9 @@ const fn check_cookie_global_cap(cap: NonZeroUsize) -> Result<NonZeroUsize, Opti
 /// it, so a document names only what it overrides, and an unknown key is rejected
 /// (a typo in a key name must not silently drop the knob it was meant to set).
 /// Durations are humantime text (`"10ms"`, `"2s"`), the capacities plain integers
-/// (a `0` is refused — they are non-zero types), the exclusions plain paths,
+/// (a `0` is refused — they are non-zero types), the exclusions plain paths (each
+/// non-empty, absolute and UTF-8 — the same domain on every face, since this one
+/// must be able to represent whatever the programmatic and `clap` faces accept),
 /// `cookie_global_cap` a non-zero integer whose omitted default is the host
 /// platform's, and `max_map_directories` either an integer cap or `null` for
 /// uncapped.
@@ -391,47 +419,34 @@ const fn check_cookie_global_cap(cap: NonZeroUsize) -> Result<NonZeroUsize, Opti
 /// cap; naming neither it nor `--max-map-directories` leaves the existing one
 /// exactly as it stood.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct WatcherOptions {
-  // The bounded durations keep humantime's SERIALIZER and take a deserializer
-  // that reads the same text and then asks the shared range rule — `with` would
-  // replace both halves, and the text form is not what is changing here.
+  // The bounded durations keep humantime's SERIALIZER; the matching bounded
+  // deserializer is now read by hand in this type's `Deserialize` impl below
+  // (see [`WatcherOptions::deserialize`]'s `LatencyValue` and its siblings),
+  // through the same bounded-identifier visitor pattern the household's own
+  // keys use, rather than through a derive-attribute `deserialize_with`.
   #[cfg_attr(
     feature = "serde",
-    serde(
-      serialize_with = "humantime_serde::serialize",
-      deserialize_with = "de_latency"
-    )
+    serde(serialize_with = "humantime_serde::serialize")
   )]
   latency: Duration,
   #[cfg_attr(
     feature = "serde",
-    serde(
-      serialize_with = "humantime_serde::serialize",
-      deserialize_with = "de_move_window"
-    )
+    serde(serialize_with = "humantime_serde::serialize")
   )]
   move_window: Duration,
-  #[cfg_attr(feature = "serde", serde(deserialize_with = "de_event_capacity"))]
   event_capacity: NonZeroUsize,
-  #[cfg_attr(feature = "serde", serde(deserialize_with = "de_os_batch_capacity"))]
   os_batch_capacity: NonZeroUsize,
-  #[cfg_attr(feature = "serde", serde(deserialize_with = "de_os_buffer_bytes"))]
   os_buffer_bytes: NonZeroU32,
-  #[cfg_attr(feature = "serde", serde(deserialize_with = "deserialize_exclusions"))]
   exclusions: Vec<PathBuf>,
   backend: Backend,
   #[cfg_attr(
     feature = "serde",
-    serde(
-      serialize_with = "humantime_serde::serialize",
-      deserialize_with = "de_root_liveness_interval"
-    )
+    serde(serialize_with = "humantime_serde::serialize")
   )]
   root_liveness_interval: Duration,
   max_map_directories: Option<usize>,
-  #[cfg_attr(feature = "serde", serde(deserialize_with = "de_cookie_global_cap"))]
   cookie_global_cap: NonZeroUsize,
 }
 
@@ -590,9 +605,12 @@ where
 /// the flag's own [`ValueValidation`](clap::error::ErrorKind::ValueValidation),
 /// naming the value the caller must shorten.
 ///
-/// It measures the `OsString` rather than a `String` because a path need not be
-/// UTF-8 on either platform, and requiring it here would refuse perfectly ordinary
-/// directories the rest of this crate handles.
+/// It starts from the `OsString` rather than a `String` so the length ceiling
+/// binds on the bytes clap handed over before anything is validated as UTF-8 or
+/// built into a `PathBuf`. The value must still resolve to UTF-8 — the `serde`
+/// face can hold nothing else ([`OptionsError::ExclusionNotUtf8`]'s doc gives
+/// the reason) — so a non-UTF-8 argument is refused here, with a fixed message,
+/// rather than accepted on this face alone.
 #[cfg(feature = "clap")]
 fn bounded_exclusion() -> impl clap::builder::TypedValueParser<Value = PathBuf> {
   use clap::builder::TypedValueParser as _;
@@ -604,6 +622,9 @@ fn bounded_exclusion() -> impl clap::builder::TypedValueParser<Value = PathBuf> 
         value.len(),
         WatcherOptions::MAX_EXCLUSION_LEN
       ));
+    }
+    if value.to_str().is_none() {
+      return Err(EXCLUSION_NOT_UTF8_MESSAGE.to_string());
     }
     let path = PathBuf::from(value);
     if !path.is_absolute() {
@@ -854,6 +875,361 @@ fn parse_cookie_global_cap(
   text: &str,
 ) -> Result<NonZeroUsize, Box<dyn core::error::Error + Send + Sync>> {
   Ok(check_cookie_global_cap(text.parse()?)?)
+}
+
+/// The `serde` face's `Deserialize` half, kept by hand rather than derived: a
+/// document's KEY is read through a bounded identifier visitor, measured
+/// against the longest legal field name before it is matched against this
+/// household's own fields or echoed into an `unknown_field` refusal.
+///
+/// The identifier visitor `derive(Deserialize)` would otherwise generate hands
+/// the WHOLE rejected key to that refusal's formatter, so an untrusted key of
+/// unbounded length cost an allocation proportional to its own size before the
+/// vocabulary it was about to fail was ever consulted. So the ceiling is judged
+/// first, on the bytes the format is already holding: a key past it is refused
+/// with a FIXED message naming the bound and the length, never the key itself;
+/// a key within it is matched, or refused by `unknown_field` exactly as the
+/// derive would. Every VALUE keeps the exact per-field rule the derive's own
+/// `deserialize_with` named (each wrapped in a private newtype below, since a
+/// map's value has no attribute of its own to carry a function name), every
+/// key is optional and defaulted from [`WatcherOptions::new`], and a repeated
+/// key is refused with `duplicate_field`.
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for WatcherOptions {
+  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+  where
+    D: serde::Deserializer<'de>,
+  {
+    const FIELDS: &[&str] = &[
+      "latency",
+      "move_window",
+      "event_capacity",
+      "os_batch_capacity",
+      "os_buffer_bytes",
+      "exclusions",
+      "backend",
+      "root_liveness_interval",
+      "max_map_directories",
+      "cookie_global_cap",
+    ];
+
+    const MAX_FIELD_LEN: usize = {
+      let mut longest = 0;
+      let mut index = 0;
+      while index < FIELDS.len() {
+        if FIELDS[index].len() > longest {
+          longest = FIELDS[index].len();
+        }
+        index += 1;
+      }
+      longest
+    };
+
+    enum Field {
+      Latency,
+      MoveWindow,
+      EventCapacity,
+      OsBatchCapacity,
+      OsBufferBytes,
+      Exclusions,
+      Backend,
+      RootLivenessInterval,
+      MaxMapDirectories,
+      CookieGlobalCap,
+    }
+
+    impl<'de> serde::Deserialize<'de> for Field {
+      fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+      where
+        D: serde::Deserializer<'de>,
+      {
+        struct FieldVisitor;
+
+        impl serde::de::Visitor<'_> for FieldVisitor {
+          type Value = Field;
+
+          fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            write!(f, "a field name of at most {MAX_FIELD_LEN} bytes")
+          }
+
+          /// The one door, and the one every other text arm reaches:
+          /// `visit_borrowed_str` and `visit_string` are serde's own forwards
+          /// to it, so a key the format borrows out of its input is measured
+          /// without being copied at all, and one the format already owns is
+          /// measured before this face does anything with it.
+          fn visit_str<E>(self, name: &str) -> Result<Self::Value, E>
+          where
+            E: serde::de::Error,
+          {
+            if name.len() > MAX_FIELD_LEN {
+              // The length, never the value: an over-long key is exactly the
+              // input whose echo is the hazard.
+              return Err(E::custom(format_args!(
+                "field name longer than the {MAX_FIELD_LEN}-byte bound ({} bytes)",
+                name.len()
+              )));
+            }
+            match name {
+              "latency" => Ok(Field::Latency),
+              "move_window" => Ok(Field::MoveWindow),
+              "event_capacity" => Ok(Field::EventCapacity),
+              "os_batch_capacity" => Ok(Field::OsBatchCapacity),
+              "os_buffer_bytes" => Ok(Field::OsBufferBytes),
+              "exclusions" => Ok(Field::Exclusions),
+              "backend" => Ok(Field::Backend),
+              "root_liveness_interval" => Ok(Field::RootLivenessInterval),
+              "max_map_directories" => Ok(Field::MaxMapDirectories),
+              "cookie_global_cap" => Ok(Field::CookieGlobalCap),
+              _ => Err(E::unknown_field(name, FIELDS)),
+            }
+          }
+
+          /// The bytes-identifier door a format reads when its key comes as
+          /// raw bytes rather than `str` — bounded and echoed the same way
+          /// [`visit_str`](Self::visit_str) is.
+          fn visit_bytes<E>(self, name: &[u8]) -> Result<Self::Value, E>
+          where
+            E: serde::de::Error,
+          {
+            if name.len() > MAX_FIELD_LEN {
+              return Err(E::custom(format_args!(
+                "field name longer than the {MAX_FIELD_LEN}-byte bound ({} bytes)",
+                name.len()
+              )));
+            }
+            match name {
+              b"latency" => Ok(Field::Latency),
+              b"move_window" => Ok(Field::MoveWindow),
+              b"event_capacity" => Ok(Field::EventCapacity),
+              b"os_batch_capacity" => Ok(Field::OsBatchCapacity),
+              b"os_buffer_bytes" => Ok(Field::OsBufferBytes),
+              b"exclusions" => Ok(Field::Exclusions),
+              b"backend" => Ok(Field::Backend),
+              b"root_liveness_interval" => Ok(Field::RootLivenessInterval),
+              b"max_map_directories" => Ok(Field::MaxMapDirectories),
+              b"cookie_global_cap" => Ok(Field::CookieGlobalCap),
+              _ => Err(E::unknown_field(&String::from_utf8_lossy(name), FIELDS)),
+            }
+          }
+
+          /// The identifier door a NON-self-describing format answers with —
+          /// the field's declaration-order INDEX.
+          fn visit_u64<E>(self, index: u64) -> Result<Self::Value, E>
+          where
+            E: serde::de::Error,
+          {
+            match index {
+              0 => Ok(Field::Latency),
+              1 => Ok(Field::MoveWindow),
+              2 => Ok(Field::EventCapacity),
+              3 => Ok(Field::OsBatchCapacity),
+              4 => Ok(Field::OsBufferBytes),
+              5 => Ok(Field::Exclusions),
+              6 => Ok(Field::Backend),
+              7 => Ok(Field::RootLivenessInterval),
+              8 => Ok(Field::MaxMapDirectories),
+              9 => Ok(Field::CookieGlobalCap),
+              _ => Err(E::invalid_value(
+                serde::de::Unexpected::Unsigned(index),
+                &"a field index within WatcherOptions",
+              )),
+            }
+          }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+      }
+    }
+
+    struct LatencyValue(Duration);
+    impl<'de> serde::Deserialize<'de> for LatencyValue {
+      fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+      where
+        D: serde::Deserializer<'de>,
+      {
+        de_latency(deserializer).map(LatencyValue)
+      }
+    }
+
+    struct MoveWindowValue(Duration);
+    impl<'de> serde::Deserialize<'de> for MoveWindowValue {
+      fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+      where
+        D: serde::Deserializer<'de>,
+      {
+        de_move_window(deserializer).map(MoveWindowValue)
+      }
+    }
+
+    struct EventCapacityValue(NonZeroUsize);
+    impl<'de> serde::Deserialize<'de> for EventCapacityValue {
+      fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+      where
+        D: serde::Deserializer<'de>,
+      {
+        de_event_capacity(deserializer).map(EventCapacityValue)
+      }
+    }
+
+    struct OsBatchCapacityValue(NonZeroUsize);
+    impl<'de> serde::Deserialize<'de> for OsBatchCapacityValue {
+      fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+      where
+        D: serde::Deserializer<'de>,
+      {
+        de_os_batch_capacity(deserializer).map(OsBatchCapacityValue)
+      }
+    }
+
+    struct OsBufferBytesValue(NonZeroU32);
+    impl<'de> serde::Deserialize<'de> for OsBufferBytesValue {
+      fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+      where
+        D: serde::Deserializer<'de>,
+      {
+        de_os_buffer_bytes(deserializer).map(OsBufferBytesValue)
+      }
+    }
+
+    struct ExclusionsValue(Vec<PathBuf>);
+    impl<'de> serde::Deserialize<'de> for ExclusionsValue {
+      fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+      where
+        D: serde::Deserializer<'de>,
+      {
+        deserialize_exclusions(deserializer).map(ExclusionsValue)
+      }
+    }
+
+    struct RootLivenessIntervalValue(Duration);
+    impl<'de> serde::Deserialize<'de> for RootLivenessIntervalValue {
+      fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+      where
+        D: serde::Deserializer<'de>,
+      {
+        de_root_liveness_interval(deserializer).map(RootLivenessIntervalValue)
+      }
+    }
+
+    struct CookieGlobalCapValue(NonZeroUsize);
+    impl<'de> serde::Deserialize<'de> for CookieGlobalCapValue {
+      fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+      where
+        D: serde::Deserializer<'de>,
+      {
+        de_cookie_global_cap(deserializer).map(CookieGlobalCapValue)
+      }
+    }
+
+    struct Visitor;
+
+    impl<'de> serde::de::Visitor<'de> for Visitor {
+      type Value = WatcherOptions;
+
+      fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("struct WatcherOptions")
+      }
+
+      fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+      where
+        A: serde::de::MapAccess<'de>,
+      {
+        use serde::de::Error as _;
+
+        let mut latency = None;
+        let mut move_window = None;
+        let mut event_capacity = None;
+        let mut os_batch_capacity = None;
+        let mut os_buffer_bytes = None;
+        let mut exclusions = None;
+        let mut backend = None;
+        let mut root_liveness_interval = None;
+        let mut max_map_directories = None;
+        let mut cookie_global_cap = None;
+
+        while let Some(key) = map.next_key::<Field>()? {
+          match key {
+            Field::Latency => {
+              if latency.is_some() {
+                return Err(A::Error::duplicate_field("latency"));
+              }
+              latency = Some(map.next_value::<LatencyValue>()?.0);
+            }
+            Field::MoveWindow => {
+              if move_window.is_some() {
+                return Err(A::Error::duplicate_field("move_window"));
+              }
+              move_window = Some(map.next_value::<MoveWindowValue>()?.0);
+            }
+            Field::EventCapacity => {
+              if event_capacity.is_some() {
+                return Err(A::Error::duplicate_field("event_capacity"));
+              }
+              event_capacity = Some(map.next_value::<EventCapacityValue>()?.0);
+            }
+            Field::OsBatchCapacity => {
+              if os_batch_capacity.is_some() {
+                return Err(A::Error::duplicate_field("os_batch_capacity"));
+              }
+              os_batch_capacity = Some(map.next_value::<OsBatchCapacityValue>()?.0);
+            }
+            Field::OsBufferBytes => {
+              if os_buffer_bytes.is_some() {
+                return Err(A::Error::duplicate_field("os_buffer_bytes"));
+              }
+              os_buffer_bytes = Some(map.next_value::<OsBufferBytesValue>()?.0);
+            }
+            Field::Exclusions => {
+              if exclusions.is_some() {
+                return Err(A::Error::duplicate_field("exclusions"));
+              }
+              exclusions = Some(map.next_value::<ExclusionsValue>()?.0);
+            }
+            Field::Backend => {
+              if backend.is_some() {
+                return Err(A::Error::duplicate_field("backend"));
+              }
+              backend = Some(map.next_value()?);
+            }
+            Field::RootLivenessInterval => {
+              if root_liveness_interval.is_some() {
+                return Err(A::Error::duplicate_field("root_liveness_interval"));
+              }
+              root_liveness_interval = Some(map.next_value::<RootLivenessIntervalValue>()?.0);
+            }
+            Field::MaxMapDirectories => {
+              if max_map_directories.is_some() {
+                return Err(A::Error::duplicate_field("max_map_directories"));
+              }
+              max_map_directories = Some(map.next_value()?);
+            }
+            Field::CookieGlobalCap => {
+              if cookie_global_cap.is_some() {
+                return Err(A::Error::duplicate_field("cookie_global_cap"));
+              }
+              cookie_global_cap = Some(map.next_value::<CookieGlobalCapValue>()?.0);
+            }
+          }
+        }
+
+        let default = WatcherOptions::default();
+        Ok(WatcherOptions {
+          latency: latency.unwrap_or(default.latency),
+          move_window: move_window.unwrap_or(default.move_window),
+          event_capacity: event_capacity.unwrap_or(default.event_capacity),
+          os_batch_capacity: os_batch_capacity.unwrap_or(default.os_batch_capacity),
+          os_buffer_bytes: os_buffer_bytes.unwrap_or(default.os_buffer_bytes),
+          exclusions: exclusions.unwrap_or(default.exclusions),
+          backend: backend.unwrap_or(default.backend),
+          root_liveness_interval: root_liveness_interval.unwrap_or(default.root_liveness_interval),
+          max_map_directories: max_map_directories.unwrap_or(default.max_map_directories),
+          cookie_global_cap: cookie_global_cap.unwrap_or(default.cookie_global_cap),
+        })
+      }
+    }
+
+    deserializer.deserialize_struct("WatcherOptions", FIELDS, Visitor)
+  }
 }
 
 #[cfg(feature = "clap")]
@@ -1361,6 +1737,13 @@ impl WatcherOptions {
     if let Some(index) = self
       .exclusions
       .iter()
+      .position(|exclusion| exclusion.to_str().is_none())
+    {
+      return Err(OptionsError::ExclusionNotUtf8 { index });
+    }
+    if let Some(index) = self
+      .exclusions
+      .iter()
       .position(|exclusion| !exclusion.is_absolute())
     {
       return Err(OptionsError::ExclusionNotAbsolute { index });
@@ -1583,10 +1966,13 @@ impl WatcherOptions {
 
   /// Returns these options with the exclusion directories set.
   ///
-  /// Not checked here: an empty or relative element is refused only when
-  /// [`validate`](Self::validate) runs (every [`Watcher`](crate::Watcher)
+  /// Not checked here: an empty, relative or non-UTF-8 element is refused only
+  /// when [`validate`](Self::validate) runs (every [`Watcher`](crate::Watcher)
   /// constructor calls it before spawning anything), as
-  /// [`OptionsError::ExclusionNotAbsolute`].
+  /// [`OptionsError::ExclusionNotAbsolute`] or
+  /// [`OptionsError::ExclusionNotUtf8`]. The domain is the same on every
+  /// face — non-empty, absolute, UTF-8 — so the `serde` face can always
+  /// represent whatever this one accepts.
   #[inline]
   #[must_use]
   pub fn with_exclusions(mut self, exclusions: Vec<PathBuf>) -> Self {
@@ -1596,10 +1982,13 @@ impl WatcherOptions {
 
   /// Sets the exclusion directories.
   ///
-  /// Not checked here: an empty or relative element is refused only when
-  /// [`validate`](Self::validate) runs (every [`Watcher`](crate::Watcher)
+  /// Not checked here: an empty, relative or non-UTF-8 element is refused only
+  /// when [`validate`](Self::validate) runs (every [`Watcher`](crate::Watcher)
   /// constructor calls it before spawning anything), as
-  /// [`OptionsError::ExclusionNotAbsolute`].
+  /// [`OptionsError::ExclusionNotAbsolute`] or
+  /// [`OptionsError::ExclusionNotUtf8`]. The domain is the same on every
+  /// face — non-empty, absolute, UTF-8 — so the `serde` face can always
+  /// represent whatever this one accepts.
   #[inline]
   pub fn set_exclusions(&mut self, exclusions: Vec<PathBuf>) -> &mut Self {
     self.exclusions = exclusions;
@@ -1945,16 +2334,10 @@ impl Default for WatcherOptions {
 /// the prune seat exactly as it stood, and likewise for `--include` /
 /// `--include-all`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct RootOptions {
   interest: Interest,
-  #[cfg_attr(feature = "serde", serde(deserialize_with = "deserialize_seat"))]
   prune: Vec<Glob>,
-  #[cfg_attr(
-    feature = "serde",
-    serde(deserialize_with = "deserialize_optional_seat")
-  )]
   include: Option<Vec<Glob>>,
 }
 
@@ -2065,6 +2448,206 @@ where
   }
 
   deserializer.deserialize_option(Engaged)
+}
+
+/// The `serde` face's `Deserialize` half, kept by hand rather than derived: a
+/// document's KEY is read through a bounded identifier visitor, measured
+/// against the longest legal field name before it is matched against this
+/// household's own fields or echoed into an `unknown_field` refusal.
+///
+/// The identifier visitor `derive(Deserialize)` would otherwise generate hands
+/// the WHOLE rejected key to that refusal's formatter, so an untrusted key of
+/// unbounded length cost an allocation proportional to its own size before the
+/// vocabulary it was about to fail was ever consulted. So the ceiling is judged
+/// first, on the bytes the format is already holding: a key past it is refused
+/// with a FIXED message naming the bound and the length, never the key itself;
+/// a key within it is matched, or refused by `unknown_field` exactly as the
+/// derive would. Each glob seat keeps the exact per-field rule the derive's own
+/// `deserialize_with` named (wrapped in a private newtype below, since a map's
+/// value has no attribute of its own to carry a function name), every key is
+/// optional and defaulted from [`RootOptions::new`], and a repeated key is
+/// refused with `duplicate_field`.
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for RootOptions {
+  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+  where
+    D: serde::Deserializer<'de>,
+  {
+    const FIELDS: &[&str] = &["interest", "prune", "include"];
+
+    const MAX_FIELD_LEN: usize = {
+      let mut longest = 0;
+      let mut index = 0;
+      while index < FIELDS.len() {
+        if FIELDS[index].len() > longest {
+          longest = FIELDS[index].len();
+        }
+        index += 1;
+      }
+      longest
+    };
+
+    enum Field {
+      Interest,
+      Prune,
+      Include,
+    }
+
+    impl<'de> serde::Deserialize<'de> for Field {
+      fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+      where
+        D: serde::Deserializer<'de>,
+      {
+        struct FieldVisitor;
+
+        impl serde::de::Visitor<'_> for FieldVisitor {
+          type Value = Field;
+
+          fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            write!(f, "a field name of at most {MAX_FIELD_LEN} bytes")
+          }
+
+          /// The one door, and the one every other text arm reaches:
+          /// `visit_borrowed_str` and `visit_string` are serde's own forwards
+          /// to it, so a key the format borrows out of its input is measured
+          /// without being copied at all, and one the format already owns is
+          /// measured before this face does anything with it.
+          fn visit_str<E>(self, name: &str) -> Result<Self::Value, E>
+          where
+            E: serde::de::Error,
+          {
+            if name.len() > MAX_FIELD_LEN {
+              // The length, never the value: an over-long key is exactly the
+              // input whose echo is the hazard.
+              return Err(E::custom(format_args!(
+                "field name longer than the {MAX_FIELD_LEN}-byte bound ({} bytes)",
+                name.len()
+              )));
+            }
+            match name {
+              "interest" => Ok(Field::Interest),
+              "prune" => Ok(Field::Prune),
+              "include" => Ok(Field::Include),
+              _ => Err(E::unknown_field(name, FIELDS)),
+            }
+          }
+
+          /// The bytes-identifier door a format reads when its key comes as
+          /// raw bytes rather than `str` — bounded and echoed the same way
+          /// [`visit_str`](Self::visit_str) is.
+          fn visit_bytes<E>(self, name: &[u8]) -> Result<Self::Value, E>
+          where
+            E: serde::de::Error,
+          {
+            if name.len() > MAX_FIELD_LEN {
+              return Err(E::custom(format_args!(
+                "field name longer than the {MAX_FIELD_LEN}-byte bound ({} bytes)",
+                name.len()
+              )));
+            }
+            match name {
+              b"interest" => Ok(Field::Interest),
+              b"prune" => Ok(Field::Prune),
+              b"include" => Ok(Field::Include),
+              _ => Err(E::unknown_field(&String::from_utf8_lossy(name), FIELDS)),
+            }
+          }
+
+          /// The identifier door a NON-self-describing format answers with —
+          /// the field's declaration-order INDEX.
+          fn visit_u64<E>(self, index: u64) -> Result<Self::Value, E>
+          where
+            E: serde::de::Error,
+          {
+            match index {
+              0 => Ok(Field::Interest),
+              1 => Ok(Field::Prune),
+              2 => Ok(Field::Include),
+              _ => Err(E::invalid_value(
+                serde::de::Unexpected::Unsigned(index),
+                &"a field index within RootOptions",
+              )),
+            }
+          }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+      }
+    }
+
+    struct PruneValue(Vec<Glob>);
+    impl<'de> serde::Deserialize<'de> for PruneValue {
+      fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+      where
+        D: serde::Deserializer<'de>,
+      {
+        deserialize_seat(deserializer).map(PruneValue)
+      }
+    }
+
+    struct IncludeValue(Option<Vec<Glob>>);
+    impl<'de> serde::Deserialize<'de> for IncludeValue {
+      fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+      where
+        D: serde::Deserializer<'de>,
+      {
+        deserialize_optional_seat(deserializer).map(IncludeValue)
+      }
+    }
+
+    struct Visitor;
+
+    impl<'de> serde::de::Visitor<'de> for Visitor {
+      type Value = RootOptions;
+
+      fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("struct RootOptions")
+      }
+
+      fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+      where
+        A: serde::de::MapAccess<'de>,
+      {
+        use serde::de::Error as _;
+
+        let mut interest = None;
+        let mut prune = None;
+        let mut include = None;
+
+        while let Some(key) = map.next_key::<Field>()? {
+          match key {
+            Field::Interest => {
+              if interest.is_some() {
+                return Err(A::Error::duplicate_field("interest"));
+              }
+              interest = Some(map.next_value()?);
+            }
+            Field::Prune => {
+              if prune.is_some() {
+                return Err(A::Error::duplicate_field("prune"));
+              }
+              prune = Some(map.next_value::<PruneValue>()?.0);
+            }
+            Field::Include => {
+              if include.is_some() {
+                return Err(A::Error::duplicate_field("include"));
+              }
+              include = Some(map.next_value::<IncludeValue>()?.0);
+            }
+          }
+        }
+
+        let default = RootOptions::default();
+        Ok(RootOptions {
+          interest: interest.unwrap_or(default.interest),
+          prune: prune.unwrap_or(default.prune),
+          include: include.unwrap_or(default.include),
+        })
+      }
+    }
+
+    deserializer.deserialize_struct("RootOptions", FIELDS, Visitor)
+  }
 }
 
 /// The `clap` face of [`RootOptions`], and the one place the two households differ.

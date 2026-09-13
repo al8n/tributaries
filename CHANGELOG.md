@@ -149,6 +149,12 @@ All notable changes to this workspace are documented here. The format is based o
     a small byte ceiling with a fixed message naming the bound and the length,
     never the text, before `humantime` ever parses it — so a rejected value costs
     nothing proportional to its own size.
+  - Every household's serde `Deserialize` is now hand-written rather than derived,
+    so a document's own field KEY is read through the same kind of bounded
+    identifier visitor: refused with a fixed message naming the bound and the
+    length past the longest legal field name, and never echoed into the
+    `unknown_field` refusal a longer key would otherwise cost an allocation
+    proportional to its own size to produce.
 
 - **`tributaries`** — the two glob seats reach the umbrella, so a subscription carries
   them and every source is armed with them.
@@ -498,13 +504,17 @@ domination `Rescan` is stood — and nothing else in either crate behaves differ
   new `OptionsError::ExclusionTooLong`. Accepted inputs are unchanged up to and
   including both ceilings.
 
-- **`tributary-fs`** — an exclusion must be non-empty and absolute
-  (`Path::is_absolute`) on every face, refused by the new
-  `OptionsError::ExclusionNotAbsolute`, the `serde` visitor and the `clap`
-  `--exclusions` parser: the driver's own exclusion test is a lexically-folded
-  PREFIX test, so an empty (or `.`-shaped) exclusion folds to the empty path,
-  which is a prefix of every directory — one stray value silently suppressed an
-  entire root, with no covering `Rescan`.
+- **`tributary-fs`** — an exclusion must be non-empty, absolute
+  (`Path::is_absolute`) and UTF-8 on every face, refused by the new
+  `OptionsError::ExclusionNotAbsolute` / `OptionsError::ExclusionNotUtf8`, the
+  `serde` visitor and the `clap` `--exclusions` parser: the driver's own
+  exclusion test is a lexically-folded PREFIX test, so an empty (or
+  `.`-shaped) exclusion folds to the empty path, which is a prefix of every
+  directory — one stray value silently suppressed an entire root, with no
+  covering `Rescan`. A non-UTF-8 exclusion is refused the same way: the
+  `serde` face can only ever hold UTF-8 (`deserialize_str`), so a value the
+  programmatic and `clap` faces alone accepted could never be persisted and
+  read back through it.
 
 - **`tributaries`** — **BREAKING for a custom `Source`**: `Source::arm` and
   `LocalSource::arm` take the per-root `&RootGlobs` as a third argument
