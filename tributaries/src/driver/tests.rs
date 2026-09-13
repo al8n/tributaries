@@ -18994,17 +18994,27 @@ async fn a_pre_install_domination_resolves_the_caller_dominated() {
 /// the dedicated sync mailbox, the run loop's own dispatch of it, and the reply channel — is
 /// pinned too, end to end.
 ///
-/// FAIL-ON-REVERT: same as the lib cell above — answer `FakeSource::begin_sync`'s
-/// `dominate_syncs` arm `Err(SyncError::Busy)` instead of `Ok(Begun::Dominated)`, and the
-/// outcome assertion fails, this time proven through the real mailbox and run loop rather than a
-/// directly-driven `on_sync`.
+/// The source is [`SyncSource`], whose `next` PARKS: a public-entry cell needs the owner's run
+/// loop alive to carry the watch grant, the sync mailbox and the reply back, and a source whose
+/// `next` answers `None` tears the owner down before the first `watch` is ever granted.
+///
+/// FAIL-ON-REVERT: same as the lib cell above — answer `SyncSource::begin_sync`'s `dominate`
+/// arm `Err(SyncError::Busy)` instead of `Ok(Begun::Dominated)`, and the outcome assertion
+/// fails, this time proven through the real mailbox and run loop rather than a directly-driven
+/// `on_sync`.
 #[tokio::test]
 async fn a_forced_domination_resolves_through_the_public_sync_entry_point() {
   use crate::source::SyncOutcome;
 
-  let mut source = FakeSource::new();
-  source.supports_sync = true;
-  source.dominate_syncs = true;
+  // `observe` cleared: a dominated barrier has no marker to report, so nothing may be queued
+  // for the funnel to resolve it by DELIVERY — the domination is the only arm that can answer.
+  let source = SyncSource {
+    next_handle: 0,
+    live: HashMap::new(),
+    pending: VecDeque::new(),
+    observe: false,
+    dominate: true,
+  };
   let w: super::Tributaries<OsString, (), TokioRuntime, u32> =
     super::Tributaries::with_source(source, TributariesOptions::new())
       .expect("the default capacities are in range");
@@ -19275,11 +19285,21 @@ async fn a_ready_write_still_wins_the_tie_and_is_not_token_cancelled() {
 /// barrier `Delivered`. With `observe` cleared the cookie is never reported, so the barrier can only
 /// resolve via the caller's `R::timeout`. `next` parks when its queue is empty, keeping the run loop
 /// alive to answer `close`/further requests.
+///
+/// A parking `next` is what makes this the source for every cell driven through the PUBLIC
+/// entry points: [`FakeSource`]'s `next` answers `None` at once, which is the source-drained
+/// signal — the owner tears down before a `watch` can be granted, and the caller is answered
+/// `Closed`.
 struct SyncSource {
   next_handle: u32,
   live: HashMap<u32, Vec<OsString>>,
   pending: VecDeque<SourceEvent<OsString, u32>>,
   observe: bool,
+  /// When set, every `begin_sync` answers [`Begun::Dominated`](crate::source::Begun::Dominated)
+  /// without rendering a cookie key: a coverage transition on the barrier's ground retired it
+  /// before the marker was installed. OFF for every other cell, which keeps exercising the
+  /// installed arm.
+  dominate: bool,
 }
 
 impl Source<OsString> for SyncSource {
@@ -19317,6 +19337,11 @@ impl Source<OsString> for SyncSource {
     dir_key: &[OsString],
     token: SyncToken,
   ) -> Result<crate::source::Begun<OsString>, crate::error::SyncError> {
+    // Answered BEFORE any key is rendered: this fake writes no marker for it, which is what
+    // makes the arm a PRE-install retirement rather than a completed write the owner discards.
+    if self.dominate {
+      return Ok(crate::source::Begun::Dominated);
+    }
     let mut cookie_key = dir_key.to_vec();
     cookie_key.push(OsString::from(format!("cookie-{}", token.seq())));
     if self.observe {
@@ -19360,6 +19385,7 @@ async fn a_sync_admitted_through_the_dedicated_mailbox_still_resolves() {
     live: HashMap::new(),
     pending: VecDeque::new(),
     observe: true,
+    dominate: false,
   };
   let w: super::Tributaries<OsString, (), TokioRuntime, u32> =
     super::Tributaries::with_source(source, TributariesOptions::new())
@@ -19390,6 +19416,7 @@ async fn a_sync_times_out_when_never_observed() {
     live: HashMap::new(),
     pending: VecDeque::new(),
     observe: false,
+    dominate: false,
   };
   let w: super::Tributaries<OsString, (), TokioRuntime, u32> =
     super::Tributaries::with_source(source, TributariesOptions::new())
@@ -19463,6 +19490,7 @@ async fn a_command_flood_does_not_starve_the_sync_mailbox() {
     live: HashMap::new(),
     pending: VecDeque::new(),
     observe: true,
+    dominate: false,
   };
   let w: super::Tributaries<OsString, (), TokioRuntime, u32> = super::Tributaries::with_source(
     source,

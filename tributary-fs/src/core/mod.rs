@@ -86,9 +86,9 @@ use std::{
 };
 
 use tributary_proto::{
-  ArmAttempt, Capabilities, Change, ChangeKind, DirEntry, EnumerateResult, Evidence, FileKind,
-  Identity, Instant, IoClass, Location, Monitor, MoveCookie, OsRecord, RecordKind, ReqId, Scope,
-  ScopeId, Segment, StatEntry, StatResult, SubtreeScope, WatchError, WatchId,
+  ArmAttempt, Capabilities, Change, ChangeId, ChangeKind, DirEntry, EnumerateResult, Evidence,
+  FileKind, Identity, Instant, IoClass, Location, Monitor, MoveCookie, OsRecord, RecordKind, ReqId,
+  Scope, ScopeId, Segment, StatEntry, StatResult, SubtreeScope, WatchError, WatchId,
   glob::Globs,
   monitor::{CoverageWorkEpoch, RecordOutcome},
 };
@@ -1309,6 +1309,55 @@ enum Planned {
   Rec(OsRecord),
   /// Feed an overflow for a scope slice.
   Over(Scope),
+  /// Stand the located `Rescan` a DOMINATED sync barrier is retired with — the
+  /// same instruction [`Over`](Self::Over) produces, minted as a DOMINATION and
+  /// not as a loss.
+  ///
+  /// The distinction exists because the two say different things about the
+  /// scope's COVERAGE. An overflow says the watched world may have moved
+  /// unobserved: the cover fence's window is lossy, the scope's optimistic
+  /// coverage claim may span a hole and is degraded to the empty cover with the
+  /// settle floor folded down beside it, and the Monitor recovers the watch set
+  /// for the slice. A domination says only that one barrier's caller must
+  /// re-read: the retirement's `Rescan` is "re-read, your barrier is
+  /// dominated", never a claim about the scope's coverage — so unlike an
+  /// overflow it must NOT mark the fence lossy and must NOT rewind the settle
+  /// floor. Marking that fence lossy made a shrink DEGRADE and rewind its own
+  /// claim, and the recovery re-armed the very ground the shrink had just
+  /// pruned — the cover a caller asked for undone by the instruction telling
+  /// another caller its barrier had moved.
+  ///
+  /// This holds UNCONDITIONALLY, on every funnel that retires this way
+  /// (`rescan_stands: false`) — including the two that are themselves
+  /// loss-originated: funnel 5a's refresh-world-stale path and funnel 8's
+  /// lossy settle rewind. A retirement stood there is still only "re-read",
+  /// never "nothing about the window was in doubt" — the window's own loss IS
+  /// in doubt, and it is signalled by that path's own machinery, not by this
+  /// `Rescan`: 5a's loss surfaces at the refresh's later verdict, 8's at the
+  /// settle it already made lossy before this retirement ever ran. Exempting
+  /// the retirement's own instruction from a SECOND, redundant lossy mark
+  /// removes nothing either of them established.
+  ///
+  /// Only the RETIREMENT's own `Rescan` is stood this way
+  /// ([`stand_covering_rescan`](DriverCore::stand_covering_rescan), the funnels
+  /// that stand none of their own). Every other funnel stands its `Rescan`
+  /// through [`Over`](Self::Over) and stays lossy — those ARE losses.
+  Dominated(Scope),
+}
+
+impl Planned {
+  /// Re-flavours a planned covering `Rescan` as a DOMINATION rather than a loss
+  /// ([`Dominated`](Self::Dominated)).
+  ///
+  /// [`covering_rescan`](DriverCore::covering_rescan) — the one producer a
+  /// retirement stands its instruction through — plans nothing but an
+  /// [`Over`](Self::Over), so there is no other flavour to carry here.
+  fn into_domination(self) -> Self {
+    match self {
+      Self::Over(target) => Self::Dominated(target),
+      other => other,
+    }
+  }
 }
 
 /// One raw event's compilation: its planned inputs, possibly gated on a probe.
@@ -1609,6 +1658,38 @@ struct ScopeState {
   /// [`broadening_delta`] and settle clean over a hole; under-claiming only
   /// costs redundant re-reads.
   settle_floor: Option<Vec<PathBuf>>,
+  /// The [`ChangeId`]s of the DOMINATION `Rescan`s this scope's barrier
+  /// retirements stood ([`Planned::Dominated`]) and the routing seat has not
+  /// reached yet — each read once by [`route_event`](DriverCore::route_event)
+  /// to exempt exactly that change from the lossy-window handling (the fence
+  /// mark, the coverage degrade and the settle-floor fold) and removed as it is
+  /// read.
+  ///
+  /// Keyed on the change's own id rather than on a "a domination is in flight"
+  /// flag, because ids are unique and never reused: an entry no routing pass
+  /// ever matches is inert, and every `Rescan` the scope produces for any other
+  /// reason is a loss the seat handles as one.
+  ///
+  /// A SET and not one slot, so the exemption does not depend on WHEN the
+  /// instruction is routed. [`stand_covering_rescan`](DriverCore::stand_covering_rescan)
+  /// drains the Monitor on its way out, so today each retirement's `Rescan` is
+  /// routed before the next retirement of the same drain stands one — but a
+  /// drain stands one retirement per obligation the move retired, and a
+  /// whole-scope move retires every obligation of the scope. One slot is
+  /// correct only for as long as that immediate drain holds: the moment two of
+  /// them are in flight at once, it keeps the last and lets every earlier
+  /// domination route as the loss it is not, marking the fence lossy and
+  /// re-arming the very settle rewind that stood the retirement. Bounded by the
+  /// obligations a scope can hold: an entry is removed by the routing pass of
+  /// the change it names, and every route consumes it — including
+  /// [`route_event`](DriverCore::route_event)'s never-live return, which would
+  /// otherwise skip the read and strand the entry.
+  ///
+  /// A mint that COALESCED into an identical still-queued instruction reports
+  /// [`None`] and adds nothing — that queued change is the earlier mint's and
+  /// already carries the earlier mint's entry, so it keeps the flavour the
+  /// earlier mint gave it instead of having it taken away.
+  dominating_rescans: BTreeSet<ChangeId>,
   /// A same-transport widen's WITNESSED WINDOW (INV-ROOT), open from the
   /// reservation of the widened root's watch id to the commit gate. The
   /// reserved watch is pre-armed on the LIVE lane under a Monitor-unknown id,
@@ -2306,6 +2387,7 @@ impl DriverCore {
         liveness_deadline: None,
         applied_cover: None,
         settle_floor: None,
+        dominating_rescans: BTreeSet::new(),
         pending_widen: None,
         prune,
         include,
@@ -2686,14 +2768,24 @@ impl DriverCore {
   /// FUNNELS rather than their callers: a caller list is exactly the enumeration
   /// discipline that the pairwise-check rounds kept defeating.
   ///
-  /// The funnels are unconditional but for ONE deliberate non-bump, stated at the
-  /// arm funnel itself: the arming of this process's reserved cookie directory
-  /// (the exact leaf [`reserved_cookie_dir`](DriverCore::reserved_cookie_dir)
-  /// holds) is the barrier's own ground coming into coverage, created by the write
-  /// itself, so it records no move. Everything else outside this list is a site
-  /// that never reaches a funnel at all — data events, a reparent within the
-  /// scope, a widen commit, a no-op cover re-issue, a scope teardown, a scope
-  /// birth — and each carries a negative cell of its own.
+  /// The funnels are unconditional but for the deliberate non-bumps listed at the
+  /// funnels themselves, each with a negative cell of its own:
+  ///
+  /// - the arm funnel — the arming of this process's reserved cookie directory
+  ///   (the exact leaf [`reserved_cookie_dir`](DriverCore::reserved_cookie_dir)
+  ///   holds) is the barrier's own ground coming into coverage, created by the
+  ///   write itself, so it records no move;
+  /// - the cover degrade — a scope that never narrowed has no recorded claim, so
+  ///   there is no wholesale change of what "covered" means for that funnel to
+  ///   report;
+  /// - the settle observation — an observation that resolves no fence (a bare
+  ///   loss-memory entry) instructed nobody and closed nobody's fence, so it owes
+  ///   nobody a covering `Rescan`.
+  ///
+  /// Everything else outside this list is a site that never reaches a funnel at
+  /// all — data events, a reparent within the scope, a widen commit, a no-op
+  /// cover re-issue, a scope teardown, a scope birth — and each carries a
+  /// negative cell of its own too.
   ///
   /// Two foldings keep the queue bounded without ever forgetting a transition:
   ///
@@ -2764,9 +2856,9 @@ impl DriverCore {
     });
   }
 
-  /// The ground one [`Planned::Over`] names, as the funnel records it: the whole
-  /// scope for a root (or backend-wide) overflow, the located directory for a
-  /// subtree one.
+  /// The ground one [`Planned::Over`] or [`Planned::Dominated`] names, as the
+  /// funnel records it: the whole scope for a root (or backend-wide) slice, the
+  /// located directory for a subtree one.
   ///
   /// An anchor the Monitor can no longer place answers the whole scope. That is
   /// the fail-WIDE direction every barrier question takes: retiring more
@@ -3427,6 +3519,13 @@ impl DriverCore {
         self.cover_fences.remove(&scope);
         if let Some(state) = self.scopes.get_mut(&scope) {
           if lossy {
+            // The rewind below is unconditional while the funnel that
+            // follows is conditional on `!resolving.is_empty()`; the pairing
+            // is safe because a bare loss-memory entry (no fence resolving)
+            // was created by `route_event`'s lossy branch, which writes
+            // `applied_cover` and `settle_floor` to the same value in one
+            // step — so this rewind is a no-op for it. Only a resolving
+            // fence can have moved the two apart.
             state.applied_cover = state.settle_floor.clone();
             // BARRIER FUNNEL: the settle observation narrows the scope's claim
             // to the provable under-claim, so an obligation admitted under the
@@ -3435,13 +3534,48 @@ impl DriverCore {
             // passes after whatever set it, and the `Rescan` that made the
             // window lossy need not cover this obligation's ground — so this
             // funnel always owes its own covering `Rescan`.
-            Self::barrier_moved(
-              &mut self.barrier_moves,
-              state,
-              scope,
-              BarrierLocation::Scope,
-              false,
-            );
+            //
+            // NO claim condition gates it, and none may be added. The
+            // Monitor-minted LOCATED losses that pass neither `feed` nor
+            // funnel 7 — a root invalidation, an arm-failure or stat-deficit
+            // re-signal ([`route_event`](Self::route_event)'s own list),
+            // since funnel 7 is itself gated on `applied_cover.is_some()` —
+            // are the losses for which this funnel is the ONLY one that
+            // fires. Every other loss reaching this seat has already bumped
+            // through its own funnel, so this funnel doubling up on it is
+            // harmless (`fold_barrier_moves`' rule).
+            //
+            // What it does NOT fire for is an observation that resolves no
+            // fence. The loop walks every `cover_fences` key, and a BARE
+            // LOSS-MEMORY ENTRY is one of them: `route_event` creates it
+            // (`entry(scope).or_default().mark_lossy()`) for a `Rescan` that
+            // arrives with no fence open at all. Such an entry has nothing
+            // pending, so `split` is 0, `resolving` is empty and `spent` is
+            // true on the first observation to pass — a window in which
+            // nothing was instructed and nobody's fence closed. It is the same
+            // shape the stat cover refuses above: an observation that resolves
+            // no fence instructs nobody and so owes nobody a cover.
+            //
+            // That over-fire was not idempotently inert. A whole-scope move
+            // raised for a bare entry cannot be consumed where a resolved
+            // fence's move is: the per-cookie drain in
+            // `resolve_cover_settlements` sits under
+            // `parked_cookies.remove(&fence)`, and a bare entry yields no
+            // `(FenceId, CoverSettle)` pair at all, so its move survives to a
+            // loop-top `drain_barrier_moves` one pass later. By then the sync
+            // that was `Parked` at its own settle — and so could not be
+            // retired by it — has dispatched and is `InPool`, and
+            // `invalidate_barriers` DOES retire it: a caller handed a covering
+            // `Rescan` nothing owes it, on a scope that has since healed.
+            if !resolving.is_empty() {
+              Self::barrier_moved(
+                &mut self.barrier_moves,
+                state,
+                scope,
+                BarrierLocation::Scope,
+                false,
+              );
+            }
           } else {
             state.settle_floor = state.applied_cover.clone();
           }
@@ -5891,6 +6025,11 @@ impl DriverCore {
         })
       }
       Planned::Over(_) => Fenced::Stands,
+      // A retirement's own instruction never reaches this seat: it is stood
+      // straight at the funnel ([`stand_covering_rescan`](Self::stand_covering_rescan))
+      // rather than compiled from a raw event, and the barrier it retires was
+      // refused at birth had its ground lain under a prune seat or an exclusion.
+      Planned::Dominated(_) => Fenced::Stands,
     }
   }
 
@@ -6070,8 +6209,12 @@ impl DriverCore {
   /// An overflow instruction moves no subtree, so it reports nothing.
   ///
   /// It is also the BARRIER FUNNEL every located `Rescan` this core mints passes
-  /// through — the twenty-odd [`Planned::Over`] construction sites all drain
-  /// here — so the bump for one is raised here and at none of them.
+  /// through — the twenty-odd [`Planned::Over`] construction sites and the one
+  /// [`Planned::Dominated`] site all drain here — so the bump for one is raised
+  /// here and at none of them. The two arms raise the SAME bump over the same
+  /// ground; what separates them is what the Monitor is then asked to do with
+  /// the slice, and what the routing seat makes of the `Rescan` that comes back
+  /// (see [`Planned::Dominated`]).
   fn feed(
     monitor: &mut Monitor,
     moves: &mut VecDeque<BarrierMove>,
@@ -6090,6 +6233,24 @@ impl DriverCore {
         let ground = Self::barrier_ground(monitor, state, &target);
         Self::barrier_moved(moves, state, scope, ground, true);
         monitor.on_overflow(target, now);
+        RecordOutcome::Nothing
+      }
+      Planned::Dominated(target) => {
+        // The same funnel bump the overflow arm raises, for the same reason and
+        // with the same claim: the located `Rescan` this stands IS the covering
+        // instruction every obligation it retires is owed. The ground is read
+        // first here too, so the two arms record one ground the same way.
+        let ground = Self::barrier_ground(monitor, state, &target);
+        Self::barrier_moved(moves, state, scope, ground, true);
+        // Latched so the routing seat can tell this instruction from a loss —
+        // see [`ScopeState::dominating_rescans`] and [`Planned::Dominated`].
+        // ADDED to the standing latches, never made the only one: one drain
+        // stands a retirement per obligation the move retired. A mint that
+        // coalesced reports nothing and takes nothing away — the instruction it
+        // folded into is an earlier mint's, already latched by that mint.
+        if let Some(stood) = monitor.cover_domination(target) {
+          state.dominating_rescans.insert(stood);
+        }
         RecordOutcome::Nothing
       }
     }
@@ -6383,10 +6544,18 @@ impl DriverCore {
   /// It goes through [`covering_rescan`](Self::covering_rescan) and
   /// [`feed`](Self::feed) rather than reaching for the Monitor directly, so the
   /// instruction carries everything a `Rescan` this core mints carries — the same
-  /// clamp to the scope, the same attribution, the loss-memory mark and the
-  /// coverage degrade its routing performs. `covering_rescan` covers the PARENT
+  /// clamp to the scope, the same attribution, the same epoch bump and the same
+  /// ordering ahead of every later delta. `covering_rescan` covers the PARENT
   /// of what it is given, which subsumes `at` itself. Its own funnel bump is
   /// idempotent: it names ground already dominated, and it stands a `Rescan`.
+  ///
+  /// It is stood as a DOMINATION ([`Planned::Dominated`]) and not as a loss: a
+  /// domination `Rescan` is not a coverage loss of the applied cover — it tells
+  /// the dominated barrier's caller to re-read, it does not say the new cover has
+  /// a hole — so it must NOT mark the scope's cover fence lossy and must NOT
+  /// rewind the settle floor, and the Monitor recovers no watch set for it. The
+  /// funnels that stand their OWN `Rescan` (3 through 7) go through the ordinary
+  /// loss path, which stays lossy: those are losses.
   ///
   /// The drain that follows is what puts the instruction into the effect queue
   /// ahead of the flush the driver is about to run — the whole point of standing
@@ -6395,7 +6564,7 @@ impl DriverCore {
     let Some(mut state) = self.scopes.remove(&scope) else {
       return;
     };
-    let planned = Self::covering_rescan(&state, scope, core::iter::once(at));
+    let planned = Self::covering_rescan(&state, scope, core::iter::once(at)).into_domination();
     Self::feed(
       &mut self.monitor,
       &mut self.barrier_moves,
@@ -6918,6 +7087,17 @@ impl DriverCore {
     // at spawn but is not publicly live until its root arm succeeds, so a failed
     // root arm (whose `Err` the deferred grant already delivered) is fenced here.
     if !state.publicly_live {
+      // The domination latch is consumed HERE too, and not only at the seat
+      // below. It is minted per retirement standing and read once by the
+      // routing of the change it names; a return that skips that read would
+      // strand the entry for the life of the scope, and since the set holds one
+      // entry per retirement rather than one slot, a never-public scope would
+      // accrue them without bound. Unreachable today — an obligation exists
+      // only for an admitted sync, which requires a publicly live scope — which
+      // is exactly why the bound is made structural rather than argued.
+      if change.kind().is_rescan() {
+        state.dominating_rescans.remove(&change.id());
+      }
       return;
     }
     // THE LOSSY WINDOW: a public scope `Rescan` signals the scope may have lost
@@ -6956,7 +7136,18 @@ impl DriverCore {
     // caller self-heals by re-issuing). Both routes below deliver the `Rescan`
     // (emitted, or parked as the lag's dominating change), so a marked window is
     // never a signal the consumer didn't also get.
-    if change.kind().is_rescan() {
+    //
+    // A DOMINATION `Rescan` is the ONE exemption, and it is exempt from all of
+    // it: the retirement's own instruction tells a dominated barrier's caller to
+    // re-read, it does not say the applied cover has a hole. Treating it as a
+    // loss made a shrink that dominated a live barrier degrade its own verdict
+    // and rewind the claim it had just applied. It is recognized by the id the
+    // funnel latched ([`ScopeState::dominating_rescans`]) — by ITS OWN id, one
+    // entry per retirement standing, so a drain that retires several
+    // obligations exempts every instruction it stood rather than only the last
+    // — so every other `Rescan`, including the ones funnels 3 through 7 stand
+    // for real losses, reaches the handling below unchanged.
+    if change.kind().is_rescan() && !state.dominating_rescans.remove(&change.id()) {
       self.cover_fences.entry(scope).or_default().mark_lossy();
       if state.applied_cover.is_some() {
         state.applied_cover = Some(Vec::new());

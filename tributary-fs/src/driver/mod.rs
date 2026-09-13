@@ -13152,9 +13152,12 @@ pub(crate) async fn run<R, F>(
           //
           // A retirement reached this way stands its covering `Rescan` INSIDE
           // this reconcile's own settle window — before the fence below has
-          // resolved — so a shrink that dominates a live barrier settles
-          // [`CoverOutcome::Degraded`], never `Applied`: the domination's
-          // `Rescan` is exactly the loss that verdict reports.
+          // resolved — and that does NOT degrade the shrink. A domination
+          // `Rescan` is not a coverage loss of the applied cover: it tells the
+          // dominated barrier's caller to re-read, it does not say the cover
+          // this call just applied has a hole. So a shrink that dominates a
+          // live barrier settles [`CoverOutcome::Applied`] on an otherwise
+          // clean window, and the narrowing it asked for stands.
           match core.on_set_cover(scope, &retained) {
             CoverReconcile::Reconciling => {
               if let Some(reply) = reply {

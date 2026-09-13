@@ -88,6 +88,11 @@ All notable changes to this workspace are documented here. The format is based o
   exactly as before. `DirEntry::is_dir()` is the object's class; `descends()` is
   the coverage question.
 
+- **`tributary-proto`** — `Monitor::cover_domination()`: mints the located
+  `Rescan` a DOMINATED sync barrier is retired with, and reconciles nothing —
+  the seat a coverage transition's retirement stands its instruction through,
+  as distinct from an overflow, which additionally recovers the watch set.
+
 - **`tributaries`**, **`tributary-fs`**, **`tributary-proto`** — optional **`serde`**
   and **`clap`** faces on the option households, both off by default and neither
   changing anything when off. `serde` gives every household one document keyed by its
@@ -589,9 +594,10 @@ All notable changes to this workspace are documented here. The format is based o
   rather than only those on the pruned ground — a dropped watch is reported after the
   node carrying its path is gone, so the transition cannot be placed — which costs an
   extra `Dominated`, never a wider instruction: each dominated caller's covering `Rescan`
-  is minted from its own obligation's ground. A shrink that dominates a barrier also
-  settles `CoverOutcome::Degraded` where it used to settle `Applied`, the retirement's
-  `Rescan` standing inside the reconcile's own settle window.
+  is minted from its own obligation's ground. A shrink that dominates a barrier still
+  settles `CoverOutcome::Applied`: the domination is not a coverage loss of the cover
+  that shrink applied, so its retirement's `Rescan` standing inside the reconcile's own
+  settle window does not degrade that window or rewind its claim.
 
 - **`tributaries`** — **BREAKING for a custom `Source`**: `Source::begin_sync` and
   `LocalSource::begin_sync` return `Result<Begun<C>, SyncError>` instead of
