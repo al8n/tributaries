@@ -804,7 +804,13 @@ domination `Rescan` is stood — and nothing else in either crate behaves differ
   consumer told to re-read first would see the revealed subtree once and never
   hear about it again. On a kernel below 6.8 (no never-recycled mount id) a
   mount-namespace transition anywhere on the host is consumed as a cover, since
-  a recycled id can make a replacement compare equal to continuity.
+  a recycled id can make a replacement compare equal to continuity. That rule is
+  per ROW: a sample speaks for itself only when EVERY row carries the id, so one
+  row whose read was refused still consults the transition count. The baseline
+  itself is seeded at every world start from that world's own barrier table
+  (spawn, replace, widen), which is read before the tree is walked — so a mount
+  that departs between the barrier and the first sample is covered rather than
+  absorbed into it.
 
 - **`tributaries`** — a caller-visible **sync barrier** (#23): `Tributaries::sync(sub,
   timeout)` resolves once every change made under the subscription's key BEFORE the

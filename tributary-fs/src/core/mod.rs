@@ -114,14 +114,28 @@
 //! The fingerprint is the sorted multiset of
 //! [`MountRow`](crate::os::MountRow)s — `(location, dev, mnt_id, parent_id,
 //! mnt_id_unique)` — and the cover fires when the rows differ, when the root's own
-//! incarnation moved (the frame-adoption legs above), or, on a kernel whose rows
-//! carry no never-recycled id, when the mount-namespace transition count moved
-//! since the last sample. That last clause is the conservative one: a legacy mount
-//! id is allocated lowest-free, so a departure and an arrival at one location
+//! incarnation moved (the frame-adoption legs above), or, for a sample in which
+//! ANY row lacks the never-recycled id, when the mount-namespace transition count
+//! moved since the last sample. That last clause is the conservative one: a legacy
+//! mount id is allocated lowest-free, so a departure and an arrival at one location
 //! inside a single interval can leave two samples comparing EQUAL, and a
 //! transition the host counted is the only fact left that can contradict them. It
-//! over-fires on unrelated namespace churn, and that is the accepted price of
-//! never being silent.
+//! is asked of EVERY row rather than of the sample as a whole, because the id is a
+//! per-row fact: a row whose own read failed is as blind to a recycled id as a
+//! kernel that has no such id at all, and a neighbour that answered vouches for
+//! nothing about it. It over-fires on unrelated namespace churn, and that is the
+//! accepted price of never being silent.
+//!
+//! The baseline the first sample compares against is seeded where the WORLD starts
+//! — a spawn, a replace, a widen — from the table that world's own barrier read.
+//! Every backend reads that table BEFORE it walks the tree for coverage, and the
+//! order is what makes the seed sound: a mount the barrier listed and the first
+//! sample cannot find departed in between, so either the walk reached the ground it
+//! left behind (it went first) or the sample is missing its row (it went after).
+//! Without the seed the first sample would install that post-departure table as the
+//! truth and the window would be invisible for the life of the world. A barrier
+//! whose table could not be read seeds an empty one and pays one cover on the first
+//! sample — bounded, once, and in the covering direction.
 //!
 //! What a cover IS depends only on how the profile SEES the tree.
 //! [`cover_whole_root`](DriverCore::cover_whole_root) is `on_overflow(Scope::Root)`
@@ -4344,7 +4358,10 @@ impl DriverCore {
         state.root_incarnation = None;
         retire_root_recovery(state);
         state.identity = Some(meta.identity);
-        install_mount_table(state, meta.mounts.into_iter().map(|row| row.location));
+        install_mount_table(state, meta.mounts.iter().map(|row| row.location.clone()));
+        // The baseline this world's mount-change cover compares against, taken
+        // from the barrier that started it (#74).
+        seed_table_fingerprint(state, meta.mounts);
         // A brand-new world: nothing learned about the previous one survives, and
         // nothing else may empty this set (see [`ScopeState::learned_mounts`]).
         state.learned_mounts.clear();
@@ -4783,7 +4800,13 @@ impl DriverCore {
     state.root_incarnation = None;
     retire_root_recovery(state);
     state.identity = Some(meta.identity);
-    install_mount_table(state, meta.mounts.into_iter().map(|row| row.location));
+    install_mount_table(state, meta.mounts.iter().map(|row| row.location.clone()));
+    // The replacement root's own mount-change baseline, taken from the barrier
+    // that resolved it (#74). The commit's covering `Rescan` speaks for the tree
+    // as the barrier read it; a mount that left between that read and the first
+    // refresh is a window neither statement reaches, and this is what turns it
+    // into a difference.
+    seed_table_fingerprint(state, meta.mounts);
     // A brand-new world: nothing learned about the previous one survives, and
     // nothing else may empty this set (see [`ScopeState::learned_mounts`]).
     state.learned_mounts.clear();
@@ -5251,19 +5274,19 @@ impl DriverCore {
     retire_root_recovery(state);
     state.identity = Some(meta.identity);
     install_mount_table(state, meta.mounts.iter().map(|row| row.location.clone()));
-    // The ONE world entry that seeds its own mount-change baseline (#74) instead
-    // of leaving the first authoritative refresh to install one.
+    // The widened world's mount-change baseline (#74), and the entry whose stake
+    // in the shared seed is sharpest.
     //
-    // A registration and a replace both hand the consumer a covering statement
+    // A registration and a replace each hand the consumer a covering statement
     // for the whole new root — the crawl's closing `Rescan`, the commit's
-    // epoch-bumped one — so nothing is owed for the window between the barrier's
-    // table read and the first refresh, and the refresh may simply install. A
-    // widen deliberately splices WITHOUT domination: it mints no covering
-    // `Rescan` at all, and the ADDED ground is read by the chain arm's cold
-    // enumerate, which declines beneath every mount it finds. So a mount that is
-    // listed by this barrier and gone by the first refresh leaves ground that was
-    // declined by the crawl and never re-read by anything — invisible forever, if
-    // that first refresh were the baseline rather than the first comparison.
+    // epoch-bumped one — so a mount that left inside their barrier window costs
+    // ground they were going to have re-read anyway. A widen deliberately splices
+    // WITHOUT domination: it mints no covering `Rescan` at all, and the ADDED
+    // ground is read by the chain arm's cold enumerate, which declines beneath
+    // every mount it finds. So a mount that is listed by this barrier and gone by
+    // the first refresh leaves ground that was declined by the crawl and never
+    // re-read by anything — invisible forever, if that first refresh were the
+    // baseline rather than the first comparison.
     //
     // The two readings are comparable by construction: the seed reader enriches
     // its rows with the same per-row unique ids the refresh sampler reads, for
@@ -5271,9 +5294,7 @@ impl DriverCore {
     // degrades where the refresh's does not costs one whole-root cover on this
     // scope's first refresh — bounded, once per widen, and in the covering
     // direction.
-    let mut seeded = meta.mounts;
-    seeded.sort_unstable();
-    state.table_fingerprint = Some(seeded);
+    seed_table_fingerprint(state, meta.mounts);
     // A brand-new world: nothing learned about the previous one survives, and
     // nothing else may empty this set (see [`ScopeState::learned_mounts`]).
     state.learned_mounts.clear();
@@ -5772,18 +5793,30 @@ impl DriverCore {
 
       // Whether this sample's rows can speak for themselves about a REPLACEMENT.
       // A row's `mnt_id_unique` is never recycled, so two samples that differ by
-      // a same-location replacement differ in the rows; a sample carrying none
-      // (a kernel below 6.8, a table with no rows at all, or per-row reads that
-      // all failed) has only the LEGACY id, which the kernel hands to the next
-      // mount as soon as the old one frees it — so a departure and an arrival
-      // inside one interval can compare EQUAL.
+      // a same-location replacement differ in the rows; a row carrying none (a
+      // kernel below 6.8, or a per-row read that failed) has only the LEGACY id,
+      // which the kernel hands to the next mount as soon as the old one frees it
+      // — so a departure and an arrival at THAT row's location inside one
+      // interval can compare EQUAL.
+      //
+      // EVERY row, and not merely one of them. The id is a per-row fact read by
+      // a per-row `statx`, so a neighbour that answered vouches for nothing
+      // about a row whose own read was refused (traversal denied, the mount
+      // point momentarily unreachable). Asking `any` would let one `Some`
+      // anywhere in the table retire the namespace fallback for the WHOLE
+      // sample, and the row that could not be read is then free to be replaced
+      // in place, unnoticed, for as long as its read keeps failing.
+      //
+      // An EMPTY table is vacuously self-identifying: it holds no row that could
+      // be replaced in place, and a mount arriving under the root is a row
+      // difference rather than a recycled id.
       //
       // Read off the sample rather than off the per-process tier memo on
       // purpose: the memo answers what the KERNEL can do, and the question here
       // is what THIS reading actually carries. A reading whose per-row reads
       // failed is exactly as blind to a recycled id as a 6.7 kernel is, and it
       // is the reading that gets compared.
-      let per_row_unique = rows.iter().any(|row| row.mnt_id_unique.is_some());
+      let per_row_unique = rows.iter().all(|row| row.mnt_id_unique.is_some());
 
       // The conservative leg, and the only one that can over-fire: a namespace
       // transition is SOMETHING mounting or unmounting anywhere on the host, not
@@ -5800,10 +5833,14 @@ impl DriverCore {
         state.namespace_transitions_seen = refresh.namespace_transitions;
       }
 
-      // A held fingerprint is what makes a comparison possible at all. Its
-      // absence is the FIRST authoritative sample of this world — registration's
-      // crawl (or the swap's own `Rescan`) already covered the tree, so this one
-      // installs and says nothing.
+      // A held fingerprint is what makes a comparison possible at all, and every
+      // world start leaves one — the spawn barrier's own table, the replace's,
+      // the widen's ([`seed_table_fingerprint`]). So the FIRST authoritative
+      // sample of a world compares too, which is the whole point of seeding it: a
+      // mount the barrier listed and this sample cannot find departed while the
+      // world's coverage walk was running, and installing that post-departure
+      // table as the truth would bury the window for good. `None` survives only
+      // where no world has started yet, and there is nothing to compare against.
       if let Some(held) = state.table_fingerprint.as_ref()
         && (*held != rows || (!per_row_unique && namespace_moved))
       {
@@ -9239,13 +9276,42 @@ fn install_mount_table(state: &mut ScopeState, rows: impl IntoIterator<Item = Pa
   state.mount_table.extend(rows);
 }
 
+/// Seeds a STARTING world's mount-change baseline (#74) from the table that
+/// world's own barrier read — the counterpart to [`retire_root_recovery`], which
+/// clears the ending world's, and the single write path all three world entries
+/// take.
+///
+/// The order the seed rests on is a property of every backend's barrier: the
+/// table is read BEFORE the tree is walked for coverage (the fanotify spawn reads
+/// `mounts_under` before it seeds the FID map; the inotify meta resolves before
+/// the core drives the crawl). So a mount this table lists and the first
+/// authoritative sample cannot find departed in between, and the walk either
+/// reached the ground it left or it did not — one case the walk covered, the
+/// other a missing row. Leaving that first sample to INSTALL instead would absorb
+/// the departure and leave the revealed ground unread for the life of the world.
+///
+/// Sorted here because the comparison is over a sorted multiset: mountinfo's row
+/// order is the kernel's own list order, which a mount created ELSEWHERE on the
+/// host can permute with nothing under this root having moved.
+///
+/// Best-effort in exactly one direction. A barrier whose table could not be read
+/// hands over an empty one, so the first sample compares a real table against
+/// nothing and covers once — bounded, once per world, and covering.
+fn seed_table_fingerprint(state: &mut ScopeState, mut rows: Vec<crate::os::MountRow>) {
+  rows.sort_unstable();
+  state.table_fingerprint = Some(rows);
+}
+
 /// Retires everything the coarse mount-change cover (#74) holds about the world
 /// that just ended — at a spawn, and at both world swaps.
 ///
 /// The fingerprint goes first: it describes the table under a DIFFERENT root, so
 /// comparing the new world's first sample against it would read the swap itself
 /// as a mount change and cover a tree the swap's own `Rescan` already covered.
-/// `None` makes that first sample an install, exactly as it is at birth.
+/// What this clears is the ENDING world's baseline and nothing more — the new
+/// one's is seeded at the same site from its own barrier's table
+/// ([`seed_table_fingerprint`]), so the swap is never a gap in which the first
+/// sample has nothing to compare against.
 ///
 /// The epoch BUMPS rather than resets, and that is what makes an in-flight reseed
 /// safe to abandon: its reply carries the old stamp, so it is dropped instead of

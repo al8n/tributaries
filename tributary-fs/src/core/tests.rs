@@ -3544,6 +3544,132 @@ mod mount_change_cover {
     one_root_cover(&drain(&mut core));
   }
 
+  /// A live scope whose spawn barrier listed `mounts` under the root and whose
+  /// birth refresh has NOT run yet: the next `on_mounts_refreshed` is this
+  /// world's first authoritative sample, and it compares against that barrier's
+  /// own table rather than installing itself as the truth.
+  fn spawned_holding(mounts: Vec<crate::os::MountRow>) -> (DriverCore, ScopeId) {
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
+    let scope = core
+      .on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::FsEvents)
+      .expect("a fresh scope registers");
+    let _ = drain(&mut core);
+    core.on_stream_spawned(
+      scope,
+      Ok(RootMeta {
+        root: PathBuf::from("/r"),
+        root_dev: 1,
+        root_mnt_id: None,
+        mounts,
+        identity: crate::os::RootIdentity::new(1, 1),
+        ancestors: Vec::new(),
+        backend: BackendKind::FsEvents,
+      }),
+    );
+    let _ = drain(&mut core);
+    (core, scope)
+  }
+
+  /// The window a birth refresh cannot answer on its own. The barrier reads the
+  /// table BEFORE the world walks the tree for coverage, so a mount that departs
+  /// in between leaves ground the walk stopped short of and nothing re-reads —
+  /// and a first sample that merely INSTALLED the post-departure table would bury
+  /// it for the life of the scope. Seeded from the barrier, the departure is
+  /// exactly what it is: a difference, and one cover.
+  #[test]
+  fn a_mount_departing_before_the_birth_refresh_covers_the_root() {
+    let (mut core, scope) = spawned_holding(vec![row("/r/vol", 40, 7)]);
+    core.on_mounts_refreshed(scope, framed_refresh(Vec::new(), true, None), at(1));
+    one_root_cover(&drain(&mut core));
+  }
+
+  /// The replacement world has the same window and takes the same seed: its
+  /// commit's covering `Rescan` speaks for the tree its barrier read, and the
+  /// mount that left after that read is not in it.
+  #[test]
+  fn a_mount_departing_before_the_replaces_first_refresh_covers_the_root() {
+    let (mut core, scope) = live_core();
+    core.on_root_replaced(
+      scope,
+      RootMeta {
+        root: PathBuf::from("/r"),
+        root_dev: 1,
+        root_mnt_id: None,
+        mounts: vec![row("/r/vol", 40, 7)],
+        identity: crate::os::RootIdentity::new(1, 1),
+        ancestors: Vec::new(),
+        backend: BackendKind::FsEvents,
+      },
+      at(1),
+    );
+    let _ = drain(&mut core);
+    core.on_mounts_refreshed(scope, framed_refresh(Vec::new(), true, None), at(2));
+    one_root_cover(&drain(&mut core));
+  }
+
+  /// And the seed costs nothing when nothing moved: a first sample that confirms
+  /// the barrier's table is not a change, so a scope born on a host with mounts
+  /// under its root pays no cover for having them.
+  #[test]
+  fn a_first_sample_equal_to_the_spawn_table_costs_nothing() {
+    let (mut core, scope) = spawned_holding(vec![row("/r/vol", 40, 7)]);
+    core.on_mounts_refreshed(
+      scope,
+      framed_refresh(vec![row("/r/vol", 40, 7)], true, None),
+      at(1),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).is_empty(),
+      "a baseline the first sample confirms is not a difference: {effects:?}"
+    );
+  }
+
+  /// The never-recycled id is a per-ROW fact, read by a per-row `statx` that can
+  /// be refused on one row and answered on the next. A row that answered vouches
+  /// for nothing about a row that did not, so a sample is self-identifying only
+  /// when EVERY row carries the id — otherwise the namespace transition count is
+  /// still the only evidence that can contradict two equal readings.
+  #[test]
+  fn a_namespace_transition_covers_when_any_row_lacks_a_unique_id() {
+    let (mut core, scope) = live_core();
+    let table = || {
+      vec![
+        row_unique("/r/a", 40, 36, Some(900), 7),
+        row_unique("/r/b", 41, 36, None, 7),
+      ]
+    };
+    core.on_mounts_refreshed(scope, sampled_refresh(table(), true, Some(11)), at(1));
+    let _ = drain(&mut core);
+
+    // `/r/b` could be replaced in place with the id the kernel just freed and
+    // these rows would read identically. The transition says something moved.
+    core.on_mounts_refreshed(scope, sampled_refresh(table(), true, Some(12)), at(2));
+    one_root_cover(&drain(&mut core));
+  }
+
+  /// Its dual, and the bound on the cost: when every row DOES carry the id the
+  /// rows are the whole evidence, and a namespace that moved elsewhere on the
+  /// host costs this scope nothing.
+  #[test]
+  fn a_namespace_transition_costs_nothing_when_every_row_carries_a_unique_id() {
+    let (mut core, scope) = live_core();
+    let table = || {
+      vec![
+        row_unique("/r/a", 40, 36, Some(900), 7),
+        row_unique("/r/b", 41, 36, Some(901), 7),
+      ]
+    };
+    core.on_mounts_refreshed(scope, sampled_refresh(table(), true, Some(11)), at(1));
+    let _ = drain(&mut core);
+    core.on_mounts_refreshed(scope, sampled_refresh(table(), true, Some(12)), at(2));
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).is_empty(),
+      "rows that can all speak for themselves consult nothing else: {effects:?}"
+    );
+  }
+
   /// A mount REPLACED at one location is the hard case, and on 6.8+ the rows
   /// carry the answer themselves. Location, device, legacy id and parent are all
   /// unchanged — the kernel handed the newcomer the id the old mount freed — and
@@ -3654,29 +3780,35 @@ mod mount_change_cover {
     );
   }
 
-  /// The FIRST authoritative sample of a world installs the fingerprint and says
-  /// nothing. Registration's own crawl has just covered the tree, so there is no
-  /// difference to speak of and nothing to cover — a scope that announced a
-  /// `Rescan` for the table it was born holding would cover every root twice.
+  /// A world born BLIND to the table still holds a baseline, because the seed is
+  /// the spawn barrier's own read and a birth refresh that could not read the
+  /// table retires nothing. So the first AUTHORITATIVE sample of such a scope is a
+  /// comparison like every other one.
   #[test]
-  fn the_first_authoritative_sample_only_installs() {
+  fn a_born_blind_scope_still_compares_against_its_barrier_table() {
     // Born blind: the birth refresh could not read the table, so the sample below
-    // is this scope's FIRST — and it carries rows the seed never had.
+    // is this scope's first authoritative one — and it carries a row the barrier
+    // never listed.
     let (mut core, scope) = live_core_blind_mounts();
     core.on_mounts_refreshed(
       scope,
       framed_refresh(vec![row("/r/vol", 40, 7)], true, None),
       at(1),
     );
+    one_root_cover(&drain(&mut core));
+
+    // And the sample that covered also INSTALLED: read back unchanged, it is no
+    // difference at all.
+    core.on_mounts_refreshed(
+      scope,
+      framed_refresh(vec![row("/r/vol", 40, 7)], true, None),
+      at(2),
+    );
     let effects = drain(&mut core);
     assert!(
       emits(&effects).is_empty(),
-      "the first sample has nothing to compare against: {effects:?}"
+      "the covering sample became the baseline: {effects:?}"
     );
-
-    // And it INSTALLED: the very next differing sample covers.
-    core.on_mounts_refreshed(scope, framed_refresh(Vec::new(), true, None), at(2));
-    one_root_cover(&drain(&mut core));
   }
 
   /// A BLIND refresh — the table could not be read at all — installs nothing and
