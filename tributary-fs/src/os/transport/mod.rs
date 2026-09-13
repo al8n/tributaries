@@ -340,6 +340,16 @@ pub(crate) enum SourceMessage<E> {
   /// The driver reacts to the death itself (root invalidation); the carried
   /// class is diagnostic surface for a future health-reporting channel.
   Fatal(#[allow(dead_code)] SourceError),
+  /// Mount boundaries one of this source's WALKS stopped at (#74), never empty.
+  ///
+  /// Not a loss and not a delivery: it says where the source's sight ends right
+  /// now, so the next authoritative mount sample can ask whether those mounts are
+  /// still in the table. One that is gone was hiding ground no walk read and no
+  /// sample ever listed — the one shape a row-to-row diff cannot see — and the
+  /// core answers it with the ordinary whole-root cover. It rides this queue
+  /// rather than a side channel because it is a statement about the same tree the
+  /// events describe, and the queue is that tree's one ordered lane.
+  Honored(Vec<std::path::PathBuf>),
 }
 
 /// The driver's receiving end of a source's messages.

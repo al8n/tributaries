@@ -16720,6 +16720,11 @@ fn apply_source_message(
       core.on_root_overflow(scope, now());
     }
     SourceMessage::Fatal(_) => core.on_source_fatal(scope, now()),
+    // Where one of this source's walks stopped (#74). It carries no coverage
+    // consequence of its own — nothing is delivered, nothing is lost — so it
+    // needs neither barrier nor drain; the core simply remembers the locations
+    // until its next authoritative mount sample can check them.
+    SourceMessage::Honored(paths) => core.on_boundaries_honored(scope, paths),
   }
 }
 

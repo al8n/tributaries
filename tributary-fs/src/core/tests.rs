@@ -3670,6 +3670,136 @@ mod mount_change_cover {
     );
   }
 
+  /// The shape no row diff can see, and the whole reason a walk reports where it
+  /// stopped. A mount arrives over ground the world's coverage walk was about to
+  /// read, the walk honors it (so nothing beneath it is mapped, armed or
+  /// enumerated), and it departs before any sample lists it. NEITHER table ever
+  /// held a row for it, so the rows compare equal — and the ground it hid is read
+  /// by nothing, forever. The boundary the walk reported is the only evidence
+  /// left, and a sample that cannot find it is proof it was never there.
+  #[test]
+  fn a_honored_boundary_gone_by_the_next_sample_covers_the_root() {
+    let (mut core, scope) = live_core();
+    core.on_boundaries_honored(scope, vec![PathBuf::from("/r/vol")]);
+    assert!(
+      emits(&drain(&mut core)).is_empty(),
+      "a report is not itself a cover — it is a question for the next sample"
+    );
+    core.on_mounts_refreshed(scope, framed_refresh(Vec::new(), true, None), at(1));
+    one_root_cover(&drain(&mut core));
+  }
+
+  /// Its bound, and why this costs nothing on an ordinary host: a boundary the
+  /// sample still finds in the table is answered by the table. It enters the
+  /// fingerprint like any other row, so no further memory is needed — and its
+  /// eventual departure is an ordinary difference, covered by the row diff alone.
+  #[test]
+  fn a_honored_boundary_still_mounted_costs_nothing_and_its_later_departure_covers() {
+    let (mut core, scope) = live_core();
+    // The mount is in the baseline, so the rows below never change and anything
+    // that fires is the boundary report and nothing else.
+    core.on_mounts_refreshed(
+      scope,
+      framed_refresh(vec![row("/r/vol", 40, 7)], true, None),
+      at(1),
+    );
+    let _ = drain(&mut core);
+
+    core.on_boundaries_honored(scope, vec![PathBuf::from("/r/vol")]);
+    core.on_mounts_refreshed(
+      scope,
+      framed_refresh(vec![row("/r/vol", 40, 7)], true, None),
+      at(2),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).is_empty(),
+      "the table carries the mount the walk stopped at, so nothing is owed: {effects:?}"
+    );
+
+    // Consumed by that sample: the row is the memory now, and the ordinary diff
+    // covers the departure.
+    core.on_mounts_refreshed(scope, framed_refresh(Vec::new(), true, None), at(3));
+    one_root_cover(&drain(&mut core));
+  }
+
+  /// Only an AUTHORITATIVE sample may answer a boundary. Absence from a table
+  /// that could not be read is not evidence of anything, so a blind refresh leaves
+  /// the set standing for the next real one rather than consuming it.
+  #[test]
+  fn a_blind_sample_keeps_the_honored_boundaries_for_an_authoritative_one() {
+    let (mut core, scope) = live_core();
+    core.on_boundaries_honored(scope, vec![PathBuf::from("/r/vol")]);
+    core.on_mounts_refreshed(scope, framed_refresh(Vec::new(), false, None), at(1));
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).is_empty(),
+      "an unreadable table judges nothing: {effects:?}"
+    );
+    core.on_mounts_refreshed(scope, framed_refresh(Vec::new(), true, None), at(2));
+    one_root_cover(&drain(&mut core));
+  }
+
+  /// A world swap forgets them, because the new world re-walks its whole tree and
+  /// every boundary it stops at is reported again by that walk. Keeping the old
+  /// world's locations would have the replacement's first sample cover a tree the
+  /// swap's own `Rescan` already covered.
+  #[test]
+  fn a_world_swap_forgets_honored_boundaries() {
+    let (mut core, scope) = live_core();
+    core.on_boundaries_honored(scope, vec![PathBuf::from("/r/vol")]);
+    core.on_root_replaced(
+      scope,
+      RootMeta {
+        root: PathBuf::from("/r"),
+        root_dev: 1,
+        root_mnt_id: None,
+        mounts: Vec::new(),
+        identity: crate::os::RootIdentity::new(1, 1),
+        ancestors: Vec::new(),
+        backend: BackendKind::FsEvents,
+      },
+      at(1),
+    );
+    let _ = drain(&mut core);
+    core.on_mounts_refreshed(scope, framed_refresh(Vec::new(), true, None), at(2));
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).is_empty(),
+      "the swap's own cover already spoke for the whole new root: {effects:?}"
+    );
+  }
+
+  /// The memory is BOUNDED, and it fails closed. Past the ceiling the set is
+  /// dropped whole rather than truncated — a truncated set would answer "none of
+  /// the ones I kept is missing" while saying nothing about the ones it threw away
+  /// — and the next authoritative sample covers once, unconditionally.
+  #[test]
+  fn honored_boundaries_saturate_into_one_unconditional_cover() {
+    let (mut core, scope) = live_core();
+    let rows: Vec<crate::os::MountRow> = (0..=MAX_HONORED_BOUNDARIES)
+      .map(|i| bare(format!("/r/vol{i}")))
+      .collect();
+    // Installed as the baseline first, so the rows never change again: every
+    // reported location IS in the table, and an intact set would find them all
+    // and cover nothing.
+    core.on_mounts_refreshed(scope, framed_refresh(rows.clone(), true, None), at(1));
+    let _ = drain(&mut core);
+
+    let flood: Vec<PathBuf> = rows.iter().map(|row| row.location.clone()).collect();
+    core.on_boundaries_honored(scope, flood);
+    core.on_mounts_refreshed(scope, framed_refresh(rows.clone(), true, None), at(2));
+    one_root_cover(&drain(&mut core));
+
+    // And the saturation is spent by that cover, not sticky.
+    core.on_mounts_refreshed(scope, framed_refresh(rows, true, None), at(3));
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).is_empty(),
+      "one unconditional cover, not one per interval forever: {effects:?}"
+    );
+  }
+
   /// A mount REPLACED at one location is the hard case, and on 6.8+ the rows
   /// carry the answer themselves. Location, device, legacy id and parent are all
   /// unchanged — the kernel handed the newcomer the id the old mount freed — and
@@ -4662,6 +4792,153 @@ mod descending {
       core.resignal_coverage_deficits(scope),
       "the refused slot is the accepted terminal: a standing deficit, \
        re-signalled ahead of every sync cookie"
+    );
+  }
+
+  /// The same refusal when the MOUNT ids proved it. Everything the consumer sees
+  /// is identical — the same located `Rescan`, the same standing deficit — and the
+  /// one thing that differs is invisible to it: the arm stopped at a mount, which
+  /// is a boundary this profile honored, so the next authoritative sample asks
+  /// whether that mount is still in the table. It is not, so the whole root is
+  /// covered and the crawl that follows heals the deficit (#74).
+  #[test]
+  fn a_foreign_arm_on_the_descending_profile_stands_its_rescan_and_is_an_honored_boundary() {
+    let (mut core, scope, req, root_watch) = live_descending_mnt(42);
+    core.on_enumerated(req, listed(Vec::new()));
+    let _ = drain(&mut core);
+
+    core.on_inotify_events(
+      scope,
+      vec![inotify(
+        &[root_watch],
+        IN_CREATE | IN_ISDIR,
+        0,
+        Some(b"subvol"),
+      )],
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let watch = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch { watch, path, .. } if path.as_path() == Path::new("/r/subvol") => {
+          Some(*watch)
+        }
+        _ => None,
+      })
+      .expect("a created directory is armed with no enumerate in between");
+    core.on_watch_installed(
+      watch,
+      core.arm_attempt(watch),
+      crate::os::linux::WatchOutcome::Foreign,
+    );
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects)
+        .iter()
+        .any(|c| c.kind().is_rescan() && c.location() == &loc(&["subvol"])),
+      "the refusal still stands its located Rescan, exactly as `Gone` does: {effects:?}"
+    );
+
+    // The mount the arm stopped at is gone by the next sample, and no table ever
+    // held a row for it — so the rows say nothing and the boundary says
+    // everything.
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(2));
+    let effects = drain(&mut core);
+    let covers: Vec<_> = emits(&effects)
+      .into_iter()
+      .filter(|c| c.kind().is_rescan() && c.location() == &loc(&[]))
+      .collect();
+    assert_eq!(
+      covers.len(),
+      1,
+      "the honored boundary the table cannot find costs one whole-root cover: {effects:?}"
+    );
+  }
+
+  /// And a refusal the DEVICE alone decided reports nothing. A btrfs subvolume
+  /// carries its own device and has no mountinfo row anywhere, so a sample would
+  /// look for a row that never existed and cover the whole root to say so — every
+  /// interval, for the life of the scope. The refusal stands; the report does not.
+  #[test]
+  fn a_device_only_arm_refusal_reports_no_boundary() {
+    let (mut core, scope, req, root_watch) = live_descending_mnt(42);
+    core.on_enumerated(req, listed(Vec::new()));
+    let _ = drain(&mut core);
+
+    core.on_inotify_events(
+      scope,
+      vec![inotify(
+        &[root_watch],
+        IN_CREATE | IN_ISDIR,
+        0,
+        Some(b"subvol"),
+      )],
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let watch = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch { watch, path, .. } if path.as_path() == Path::new("/r/subvol") => {
+          Some(*watch)
+        }
+        _ => None,
+      })
+      .expect("a created directory is armed with no enumerate in between");
+    core.on_watch_installed(
+      watch,
+      core.arm_attempt(watch),
+      crate::os::linux::WatchOutcome::Failed(WatchError::Gone),
+    );
+    let _ = drain(&mut core);
+
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(2));
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).is_empty(),
+      "a device-only refusal names nothing the mount table will ever carry: {effects:?}"
+    );
+  }
+
+  /// The seat the descending crawl actually honors boundaries at. A listing marks
+  /// a boundary entry and neither arms nor descends it, so no arm refusal ever
+  /// speaks for it — and a mount that was there when the listing ran and gone by
+  /// the next sample would otherwise leave that ground marked non-descendable with
+  /// nothing to re-read it. The MOUNT leg reports; the DEVICE leg does not.
+  #[test]
+  fn a_listing_reports_the_mounts_it_stopped_at_and_not_the_devices() {
+    let (mut core, scope, req, _root_watch) = live_descending_mnt(42);
+    core.on_enumerated(
+      req,
+      listed(vec![
+        entry_on_mount("vol", FileKind::Dir, 1, 10, 77),
+        entry("subvol", FileKind::Dir, 2, 11),
+      ]),
+    );
+    let _ = drain(&mut core);
+
+    // Both were declined as boundaries; only the one a mount id proved is a
+    // question for the table, and the table has no row for it.
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(1));
+    let effects = drain(&mut core);
+    let covers: Vec<_> = emits(&effects)
+      .into_iter()
+      .filter(|c| c.kind().is_rescan() && c.location() == &loc(&[]))
+      .collect();
+    assert_eq!(
+      covers.len(),
+      1,
+      "the mount the crawl stopped at is gone and unsampled: {effects:?}"
+    );
+
+    // The subvolume is not reported at all, so the next sample covers nothing —
+    // otherwise a root holding one would cover once per interval forever.
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(2));
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).is_empty(),
+      "a device-only boundary is never a report: {effects:?}"
     );
   }
 

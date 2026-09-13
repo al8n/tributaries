@@ -1,7 +1,8 @@
 use std::{cell::Cell, io, path::Path};
 
 use super::{
-  BufferContext, ReseedOutcome, SeedOutcome, process_decoded, reseed_map, seed_moved_in_subtree,
+  BufferContext, ReseedOutcome, SeedOutcome, SeedWalk, process_decoded, reseed_map,
+  seed_moved_in_subtree,
 };
 use crate::os::{
   BackendStatsShared, SourceMessage,
@@ -111,6 +112,8 @@ enum Sent {
   Batch(usize),
   Overflow,
   Fatal,
+  /// The mount boundaries a walk this call ran stopped at (#74), in report order.
+  Honored(Vec<std::path::PathBuf>),
 }
 
 /// Runs `process_decoded` over `decoded` against `map`, capturing what it forwards
@@ -136,16 +139,25 @@ fn run_process(
     || {
       reseeds.set(reseeds.get() + 1);
       match &reseed {
-        Some(entries) => Ok(entries.clone()),
+        Some(entries) => Ok(SeedWalk {
+          entries: entries.clone(),
+          honored: Vec::new(),
+        }),
         None => Err(io::Error::other("reseed walk fails")),
       }
     },
-    |_, _, _| Ok(Vec::new()),
+    |_, _, _| {
+      Ok(SeedWalk {
+        entries: Vec::new(),
+        honored: Vec::new(),
+      })
+    },
     |msg| {
       sent.borrow_mut().push(match msg {
         SourceMessage::Batch(payload) => Sent::Batch(payload.events.len()),
         SourceMessage::Overflow(_) => Sent::Overflow,
         SourceMessage::Fatal(_) => Sent::Fatal,
+        SourceMessage::Honored(paths) => Sent::Honored(paths),
       });
       true
     },
@@ -174,7 +186,12 @@ fn run_process_with_exclusions(
       fence: excluding(exclusions),
     },
     || Ok(one_entry_walk()),
-    |_, _, _| Ok(Vec::new()),
+    |_, _, _| {
+      Ok(SeedWalk {
+        entries: Vec::new(),
+        honored: Vec::new(),
+      })
+    },
     |msg| {
       if let SourceMessage::Batch(payload) = msg {
         for ev in payload.events {
@@ -218,14 +235,20 @@ fn run_process_with_subtree(
     || {
       reseeds.set(reseeds.get() + 1);
       match &reseed {
-        Some(entries) => Ok(entries.clone()),
+        Some(entries) => Ok(SeedWalk {
+          entries: entries.clone(),
+          honored: Vec::new(),
+        }),
         None => Err(io::Error::other("reseed walk fails")),
       }
     },
     |_, _, _| {
       walks.set(walks.get() + 1);
       match &subtree {
-        Some(entries) => Ok(entries.clone()),
+        Some(entries) => Ok(SeedWalk {
+          entries: entries.clone(),
+          honored: Vec::new(),
+        }),
         None => Err(io::Error::from(io::ErrorKind::NotFound)),
       }
     },
@@ -234,6 +257,7 @@ fn run_process_with_subtree(
         SourceMessage::Batch(payload) => Sent::Batch(payload.events.len()),
         SourceMessage::Overflow(_) => Sent::Overflow,
         SourceMessage::Fatal(_) => Sent::Fatal,
+        SourceMessage::Honored(paths) => Sent::Honored(paths),
       });
       true
     },
@@ -259,8 +283,20 @@ fn move_in_under_sub() -> RawFanotifyEvent {
   }
 }
 
-fn one_entry_walk() -> Vec<SeedEntry> {
-  vec![SeedEntry::root(fid(1), Path::new("/root"))]
+fn one_entry_walk() -> SeedWalk {
+  SeedWalk {
+    entries: vec![SeedEntry::root(fid(1), Path::new("/root"))],
+    honored: Vec::new(),
+  }
+}
+
+/// The same walk, stopped at one mount boundary — the shape a root with a
+/// submount under it produces, and the one the core is owed a report for.
+fn walk_honoring(boundary: &str) -> SeedWalk {
+  SeedWalk {
+    honored: vec![std::path::PathBuf::from(boundary)],
+    ..one_entry_walk()
+  }
 }
 
 /// A seeded map with `/root` and its child `/root/sub` (fid 2), the parent a
@@ -280,8 +316,36 @@ fn seeded_with_sub() -> FidMap {
 fn first_walk_success_reseeds() {
   let mut map = FidMap::new();
   let outcome = reseed_map(&mut map, || Ok(one_entry_walk()));
-  assert_eq!(outcome, ReseedOutcome::Reseeded);
+  assert_eq!(
+    outcome,
+    ReseedOutcome::Reseeded {
+      honored: Vec::new()
+    }
+  );
   assert_eq!(map.dir_count(), 1, "the map was rebuilt from the walk");
+}
+
+/// A walk that stopped at a mount boundary carries WHERE out with it (#74): the
+/// rebuilt map is the answer to "can the source see", and the honored locations
+/// are the answer to "where does its sight end" — the caller reports them in band
+/// so the next authoritative mount sample can ask whether those mounts are still
+/// there.
+#[test]
+fn a_reseed_carries_the_boundaries_its_walk_honored() {
+  let mut map = FidMap::new();
+  let outcome = reseed_map(&mut map, || Ok(walk_honoring("/root/vol")));
+  assert_eq!(
+    outcome,
+    ReseedOutcome::Reseeded {
+      honored: vec![std::path::PathBuf::from("/root/vol")]
+    },
+    "the boundary the walk stopped at rides the outcome, not just the map"
+  );
+  assert_eq!(
+    map.dir_count(),
+    1,
+    "and the map is rebuilt as it always was"
+  );
 }
 
 /// A transient failure is absorbed by the single immediate retry: fail once,
@@ -299,7 +363,12 @@ fn retry_absorbs_a_transient_failure() {
       Ok(one_entry_walk())
     }
   });
-  assert_eq!(outcome, ReseedOutcome::Reseeded);
+  assert_eq!(
+    outcome,
+    ReseedOutcome::Reseeded {
+      honored: Vec::new()
+    }
+  );
   assert_eq!(calls.get(), 2, "the retry ran exactly once");
   assert_eq!(map.dir_count(), 1);
 }
@@ -314,7 +383,7 @@ fn double_failure_is_blind() {
   let calls = Cell::new(0u32);
   let outcome = reseed_map(&mut map, || {
     calls.set(calls.get() + 1);
-    Err::<Vec<SeedEntry>, io::Error>(io::Error::other("still failing"))
+    Err::<SeedWalk, io::Error>(io::Error::other("still failing"))
   });
   assert_eq!(outcome, ReseedOutcome::Blind);
   assert_eq!(
@@ -1041,7 +1110,12 @@ fn dfid_name_dot_root_delete_reaches_root_death_at_the_reader() {
       fence: unfenced(),
     },
     || Ok(one_entry_walk()),
-    |_, _, _| Ok(Vec::new()),
+    |_, _, _| {
+      Ok(SeedWalk {
+        entries: Vec::new(),
+        honored: Vec::new(),
+      })
+    },
     |msg| {
       if let SourceMessage::Batch(payload) = msg {
         for ev in payload.events {
@@ -1125,6 +1199,7 @@ mod exclusion_fence {
           SourceMessage::Batch(payload) => Sent::Batch(payload.events.len()),
           SourceMessage::Overflow(_) => Sent::Overflow,
           SourceMessage::Fatal(_) => Sent::Fatal,
+          SourceMessage::Honored(paths) => Sent::Honored(paths),
         });
         if let SourceMessage::Batch(payload) = msg {
           for ev in payload.events {

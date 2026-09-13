@@ -1165,6 +1165,19 @@ pub(crate) enum WatchOutcome {
   // `Failed`, not the plan sketch's `Err`: a variant named `Err` reads as
   // the `Result` constructor at every match site.
   Failed(tributary_proto::WatchError),
+  /// The arm was refused because the landing object provably sits on ANOTHER
+  /// MOUNT — both mount ids were read and they differ.
+  ///
+  /// A refusal exactly like [`Failed(Gone)`](WatchOutcome::Failed) as far as the
+  /// consumer is concerned: the core maps it to the same `Err`, so the same
+  /// located `Rescan` stands and the same slot deficit is booked. It is a distinct
+  /// variant because it carries one extra fact the refusal itself cannot — this
+  /// scope stopped at a MOUNT, and a mount has a row in the table — which the
+  /// mount-change cover consumes as a boundary honored by this profile's walk
+  /// (#74). A refusal the DEVICE alone decided stays `Failed(Gone)`: a differing
+  /// device need not be a mount, and a location no table will ever carry would
+  /// cover the whole root once per liveness interval for the life of the scope.
+  Foreign,
 }
 
 // The descending core (and the container smoke suites) reach the inotify arm

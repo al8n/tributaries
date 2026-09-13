@@ -137,6 +137,23 @@
 //! whose table could not be read seeds an empty one and pays one cover on the first
 //! sample — bounded, once, and in the covering direction.
 //!
+//! The rows still cannot see one shape, and it is the one a WALK can. A mount
+//! that arrives after a walk read its table, is honored by that walk (so the
+//! ground beneath it is never mapped, armed or enumerated) and departs before the
+//! next sample was in NEITHER table: the two compare equal while the ground it hid
+//! was read by nothing. So every walk reports where it stopped — the fanotify seed
+//! and reseed and moved-in subtree walks in band on the source's own queue, the
+//! descending crawl at its listing, the descending arm at a refusal the mount ids
+//! proved — and the next authoritative sample consumes the set: a boundary the
+//! table still carries enters the fingerprint and needs no further memory, while
+//! one the table cannot find is a mount no sample ever held, and costs the same
+//! whole-root cover. Only a PROVEN mount is reported (two mount ids read, and
+//! differing): a differing device alone need not be a mount at all — a btrfs
+//! subvolume has its own and no table row anywhere — and a location no table will
+//! ever carry would cover the root once per interval for the life of the scope.
+//! The set is bounded ([`MAX_HONORED_BOUNDARIES`]); past it the scope simply
+//! covers once, unconditionally, at the next sample.
+//!
 //! What a cover IS depends only on how the profile SEES the tree.
 //! [`cover_whole_root`](DriverCore::cover_whole_root) is `on_overflow(Scope::Root)`
 //! on every profile but one — the Monitor re-enumerates and re-arms, the consumer
@@ -1743,6 +1760,18 @@ struct ProbeCtx {
 /// lagged consumer is polled at this bounded interval instead.
 const DELIVERY_RETRY: Duration = Duration::from_millis(25);
 
+/// How many mount boundaries one scope may remember between two authoritative
+/// mount samples (#74) before the set is dropped and the next sample covers
+/// unconditionally.
+///
+/// The same order as the ceiling on retained mount rows under a root, and for the
+/// same reason: a root with more boundaries than this is one whose table is
+/// already beyond what a per-interval comparison can usefully speak about, so the
+/// honest degrade is one whole-root cover rather than an unbounded set. The set is
+/// consumed by every authoritative sample, so this bounds a single interval's
+/// reports and not the life of the scope.
+const MAX_HONORED_BOUNDARIES: usize = 16_384;
+
 /// The consumer-lag state of one scope. Events are only ever dropped while a
 /// dominating `Rescan` is parked and undelivered, so the consumer's
 /// post-`Rescan` re-enumeration provably covers them.
@@ -1938,11 +1967,39 @@ struct ScopeState {
   /// the kernel's list order, which a mount elsewhere can permute without
   /// anything under this root having changed.
   ///
-  /// `None` until the first authoritative sample of this world, which therefore
-  /// only INSTALLS: registration's own crawl already covered the tree, so the
-  /// birth refresh has nothing to cover. A world swap resets it to `None` for the
-  /// same reason.
+  /// Seeded at every world start from that world's own barrier table
+  /// ([`seed_table_fingerprint`]), so the first authoritative sample COMPARES.
+  /// `None` only before a world has started at all.
   table_fingerprint: Option<Vec<crate::os::MountRow>>,
+  /// Mount boundaries a coverage walk of this world stopped at and no
+  /// authoritative sample has judged yet (#74) — deduplicated, and CONSUMED by
+  /// the next authoritative sample.
+  ///
+  /// The row diff sees a mount that was in one sample and not the next. It cannot
+  /// see a mount that no sample ever held: one that arrived after a walk's own
+  /// table read, was honored by that walk (so the ground beneath it was never
+  /// covered), and departed before the next sample. Nothing in either table ever
+  /// named it, so the two compare equal and the revealed ground is read by
+  /// nothing. A walk that reports where it stopped closes exactly that shape: a
+  /// boundary still mounted at the next sample is in that sample's rows, and from
+  /// then on its departure is an ordinary difference; a boundary the sample cannot
+  /// find is one nothing ever sampled, and it costs one whole-root cover.
+  ///
+  /// Only PROVEN mount boundaries enter — a differing mount id, never a differing
+  /// device alone. A device-only boundary need not be a mount (a btrfs subvolume
+  /// has its own device and no mountinfo row), and a location no table will ever
+  /// carry would cover the whole root once per liveness interval forever.
+  ///
+  /// Cleared by a world swap: the new world re-walks everything, so the old
+  /// world's boundaries describe a tree this scope no longer watches.
+  honored_boundaries: BTreeSet<PathBuf>,
+  /// The honored set overflowed [`MAX_HONORED_BOUNDARIES`] and was DROPPED, so
+  /// the next authoritative sample covers unconditionally (#74).
+  ///
+  /// Bounded memory, fail-closed: a root with more boundaries than the set can
+  /// hold is a root whose table the sample cannot vouch for either, and one cover
+  /// is the honest answer to "I can no longer tell you which of these is gone".
+  honored_saturated: bool,
   /// The mount-namespace transition count the last authoritative sample carried
   /// ([`MountRefresh::namespace_transitions`]), or `None` where the host answers
   /// none.
@@ -2892,6 +2949,8 @@ impl DriverCore {
         learned_mounts: Vec::new(),
         mounts_authoritative: false,
         table_fingerprint: None,
+        honored_boundaries: BTreeSet::new(),
+        honored_saturated: false,
         namespace_transitions_seen: None,
         recovery_epoch: 0,
         recovery_in_flight: false,
@@ -4506,7 +4565,27 @@ impl DriverCore {
       WatchOutcome::Installed(_) => Ok(tributary_proto::WatchAck::Installed),
       WatchOutcome::Aliased(_) => Ok(tributary_proto::WatchAck::Aliased),
       WatchOutcome::Failed(err) => Err(err),
+      // The consumer contract is UNCHANGED by the extra variant: a landing across
+      // the scope's mount is refused exactly as `Gone` is, so the Monitor stands
+      // the same located `Rescan` and books the same slot deficit.
+      WatchOutcome::Foreign => Err(WatchError::Gone),
     };
+    // What the variant adds is one fact the refusal cannot carry (#74): this arm
+    // stopped at a MOUNT, so the location is a boundary this profile's walk
+    // honored, and the next authoritative sample can ask whether the mount is
+    // still in the table. Read BEFORE the result is fed, because the `Err` below
+    // drops the node this path is derived from.
+    if matches!(outcome, WatchOutcome::Foreign) {
+      let placed = self.watch_scopes.get(&watch).copied().and_then(|scope| {
+        let state = self.scopes.get(&scope)?;
+        Some((scope, watch_path(&self.monitor, state, watch)?))
+      });
+      if let Some((scope, path)) = placed
+        && let Some(state) = self.scopes.get_mut(&scope)
+      {
+        record_honored_boundary(state, path);
+      }
+    }
     // A descending scope's ROOT arm succeeding is the moment its coverage — and
     // its caller's handle (the deferred grant commits on this same result) —
     // become real: public delivery begins here, exactly like the KR spawn does
@@ -4586,6 +4665,12 @@ impl DriverCore {
     let Some((scope, dir)) = self.enum_reqs.remove(&req) else {
       return;
     };
+    // Where this listing stopped at a MOUNT (#74), collected as the entries are
+    // classified and recorded after the borrow ends. The descending crawl is this
+    // profile's coverage walk, and this is the seat where it honors a boundary:
+    // a boundary entry is delivered as the directory it is and then neither armed
+    // nor descended, so no arm refusal ever speaks for it.
+    let mut honored = Vec::new();
     let res = match raw {
       RawEnumerate::Failed(class) => EnumerateResult::Failed(class),
       RawEnumerate::Listed { entries, complete } => {
@@ -4620,6 +4705,15 @@ impl DriverCore {
           let mut dir_entry = DirEntry::new(Segment::new(name), entry.kind);
           if entry.kind.is_dir() && crosses_mount_boundary(state, &entry) {
             dir_entry = dir_entry.with_boundary();
+            // Reported only where the MOUNT ids prove it (#74). The boundary
+            // above is the disjunction — a differing device OR a differing mount
+            // — and the device leg alone stops at things that are not mounts at
+            // all: a btrfs subvolume carries its own device and has no mountinfo
+            // row, so a sample would look for its row forever and cover the whole
+            // root every interval to say so.
+            if crosses_scope_mount(state, &entry) {
+              honored.push(path);
+            }
           }
           if let Some(node) = node {
             dir_entry = dir_entry.with_node(node);
@@ -4633,6 +4727,13 @@ impl DriverCore {
         }
       }
     };
+    if !honored.is_empty()
+      && let Some(state) = self.scopes.get_mut(&scope)
+    {
+      for boundary in honored {
+        record_honored_boundary(state, boundary);
+      }
+    }
     self.monitor.on_enumerate(req, res);
     self.drain_monitor();
   }
@@ -5809,7 +5910,10 @@ impl DriverCore {
       //
       // An EMPTY table is vacuously self-identifying: it holds no row that could
       // be replaced in place, and a mount arriving under the root is a row
-      // difference rather than a recycled id.
+      // difference rather than a recycled id. What an empty table can still hide
+      // — a mount that arrived and departed between two samples, over ground a
+      // walk had already declined to descend — is not a row question at all, and
+      // is answered below by the boundaries those walks reported.
       //
       // Read off the sample rather than off the per-process tier memo on
       // purpose: the memo answers what the KERNEL can do, and the question here
@@ -5844,6 +5948,32 @@ impl DriverCore {
       if let Some(held) = state.table_fingerprint.as_ref()
         && (*held != rows || (!per_row_unique && namespace_moved))
       {
+        fire = true;
+      }
+
+      // The boundaries this world's walks stopped at, CONSUMED here (#74). A row
+      // diff can only see a mount that ONE of two samples held; a mount that
+      // arrived after a walk's own table read and departed before this sample was
+      // in neither, so the two compare equal while the ground it hid was walked by
+      // nothing. The walk that stopped at it said where, and this is where that is
+      // put to the table: a location with no row is a mount no sample ever held.
+      //
+      // Taken rather than kept, because this sample answers every one of them. A
+      // boundary still mounted is in `rows` from here on, so its later departure
+      // is an ordinary difference and needs no separate memory; a boundary that is
+      // gone is covered once, now. Only an AUTHORITATIVE sample may answer:
+      // absence from a table that could not be read is not evidence of anything,
+      // which is why the take lives in this branch and a blind refresh leaves the
+      // set standing for the next real one.
+      let honored = std::mem::take(&mut state.honored_boundaries);
+      if std::mem::replace(&mut state.honored_saturated, false) {
+        fire = true;
+      }
+      if honored.iter().any(|boundary| {
+        rows
+          .binary_search_by(|row| row.location.as_path().cmp(boundary.as_path()))
+          .is_err()
+      }) {
         fire = true;
       }
 
@@ -6051,6 +6181,29 @@ impl DriverCore {
       .is_some_and(|state| std::mem::take(&mut state.recovery_dirty))
     {
       self.cover_whole_root(scope, now);
+    }
+  }
+
+  /// Feeds the mount boundaries one of `scope`'s coverage walks stopped at (#74)
+  /// — the spawn seed, a post-loss reseed, a requested whole-root reseed, a
+  /// moved-in subtree walk.
+  ///
+  /// Nothing is covered here and nothing is delivered. A boundary is a question
+  /// for the next AUTHORITATIVE mount sample: the mount is either still in the
+  /// table, in which case it enters the fingerprint and its eventual departure is
+  /// an ordinary difference, or it is not, in which case no sample ever held it
+  /// and the ground it was hiding was read by nothing — one whole-root cover.
+  ///
+  /// A report from a stream being torn down can land in the set of the world that
+  /// replaced it. The cost is bounded and in the covering direction: at worst the
+  /// new world's first sample cannot find a location the OLD world stopped at and
+  /// covers a tree the swap's own `Rescan` already covered.
+  pub(crate) fn on_boundaries_honored(&mut self, scope: ScopeId, paths: Vec<PathBuf>) {
+    let Some(state) = self.scopes.get_mut(&scope) else {
+      return;
+    };
+    for path in paths {
+      record_honored_boundary(state, path);
     }
   }
 
@@ -9087,11 +9240,44 @@ fn mint(
 /// thus only ever the honest pre-5.8 degrade, not a silently disabled fence.
 fn crosses_mount_boundary(state: &ScopeState, entry: &RawDirEntry) -> bool {
   let device_boundary = matches!(state.root_dev, Some(root_dev) if entry.dev != root_dev);
-  let mount_boundary = matches!(
+  crosses_scope_mount(state, entry) || device_boundary
+}
+
+/// The MOUNT half of [`crosses_mount_boundary`] on its own: both ids were read
+/// and they differ, so this entry provably sits on another mount.
+///
+/// Split out because two different questions are asked of the same fence. Whether
+/// to DESCEND is the disjunction — a differing device is a boundary too, and
+/// erring toward "boundary" only declines ground. Whether to REPORT the boundary
+/// to the mount-change cover (#74) is this half alone: a report is a claim that
+/// the table will carry a row for this location, and only a mount has one. A
+/// device that differs without a mount id to match it is a subvolume, an unknown,
+/// or a kernel that answers no ids — and on that last one no row carries a unique
+/// id either, so the namespace-transition clause is live and covers it instead.
+fn crosses_scope_mount(state: &ScopeState, entry: &RawDirEntry) -> bool {
+  matches!(
     (state.root_mnt_id, entry.mnt_id),
     (Some(root_mnt), Some(entry_mnt)) if root_mnt != entry_mnt
-  );
-  device_boundary || mount_boundary
+  )
+}
+
+/// Records ONE mount boundary a coverage walk of `state`'s world honored (#74) —
+/// deduplicated by the set, and bounded by [`MAX_HONORED_BOUNDARIES`].
+///
+/// Past the ceiling the whole set is DROPPED and the scope is marked saturated,
+/// which the next authoritative sample reads as an unconditional cover. Dropping
+/// rather than refusing further inserts is what keeps the degrade honest: a
+/// truncated set would answer "none of the boundaries I kept is missing" while
+/// saying nothing about the ones it discarded.
+fn record_honored_boundary(state: &mut ScopeState, path: PathBuf) {
+  if state.honored_saturated {
+    return;
+  }
+  state.honored_boundaries.insert(path);
+  if state.honored_boundaries.len() > MAX_HONORED_BOUNDARIES {
+    state.honored_boundaries = BTreeSet::new();
+    state.honored_saturated = true;
+  }
 }
 
 /// Whether `path` lies STRICTLY OUTSIDE `retained` — neither a descendant of a retained
@@ -9313,12 +9499,19 @@ fn seed_table_fingerprint(state: &mut ScopeState, mut rows: Vec<crate::os::Mount
 /// ([`seed_table_fingerprint`]), so the swap is never a gap in which the first
 /// sample has nothing to compare against.
 ///
+/// The honored boundaries go with it, and for the same reason: the new world
+/// re-walks its whole tree, so every boundary it stops at is reported again by
+/// that walk, and a location recorded under the old root is a claim about a tree
+/// this scope no longer watches.
+///
 /// The epoch BUMPS rather than resets, and that is what makes an in-flight reseed
 /// safe to abandon: its reply carries the old stamp, so it is dropped instead of
 /// covering the new world off a walk of the old one. Nothing is cancelled — the
 /// walk finishes on the blocking pool and its answer is discarded.
 fn retire_root_recovery(state: &mut ScopeState) {
   state.table_fingerprint = None;
+  state.honored_boundaries.clear();
+  state.honored_saturated = false;
   state.namespace_transitions_seen = None;
   state.recovery_epoch = state.recovery_epoch.wrapping_add(1);
   state.recovery_in_flight = false;

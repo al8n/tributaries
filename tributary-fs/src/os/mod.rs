@@ -1137,6 +1137,23 @@ impl ScopeFrame {
     );
     device_boundary || mount_boundary
   }
+
+  /// The MOUNT half of [`crossed_by`](Self::crossed_by) on its own: both ids were
+  /// read and they differ, so the landing provably sits on another mount.
+  ///
+  /// What REFUSES an arm is the disjunction above — erring toward "boundary" only
+  /// ever declines ground. What may be REPORTED to the mount-change cover (#74) is
+  /// only this half, because a report is a claim that the mount table carries a row
+  /// for that location, and a differing device with no mount id to match it need
+  /// not be a mount at all: a btrfs subvolume has its own device and no row
+  /// anywhere, so reporting one would cover the whole root every interval forever.
+  #[cfg(any(all(target_os = "linux", not(miri)), all(test, feature = "tokio")))]
+  pub(crate) fn mount_crossed_by(self, mnt_id: Option<u64>) -> bool {
+    matches!(
+      (self.root_mnt_id, mnt_id),
+      (Some(root_mnt), Some(landed)) if landed != root_mnt
+    )
+  }
 }
 
 /// What a source's spawn learned about its root — finalized strictly BEFORE

@@ -58,6 +58,8 @@ fn recv_until(
       }
       Ok(SourceMessage::Overflow(_ack)) => overflow = true,
       Ok(SourceMessage::Fatal(err)) => panic!("stream died: {err}"),
+      // A mac source runs no walk that honors a mount boundary (#74).
+      Ok(SourceMessage::Honored(_)) => {}
       Err(async_channel::TryRecvError::Empty) => thread::sleep(Duration::from_millis(10)),
       Err(async_channel::TryRecvError::Closed) => break,
     }
@@ -670,6 +672,8 @@ fn over_budget_batches_signal_one_inband_overflow() {
       Ok(SourceMessage::Overflow(ack)) => break ack,
       Ok(SourceMessage::Batch(_)) => {}
       Ok(SourceMessage::Fatal(err)) => panic!("stream died: {err}"),
+      // A mac source runs no walk that honors a mount boundary (#74).
+      Ok(SourceMessage::Honored(_)) => {}
       Err(_) => {
         assert!(
           Instant::now() < end,
@@ -702,6 +706,7 @@ fn over_budget_batches_signal_one_inband_overflow() {
         last_was_overflow = true;
       }
       SourceMessage::Fatal(err) => panic!("stream died: {err}"),
+      SourceMessage::Honored(_) => {}
     }
   }
 
@@ -719,6 +724,8 @@ fn over_budget_batches_signal_one_inband_overflow() {
       Ok(SourceMessage::Overflow(_)) => break,
       Ok(SourceMessage::Batch(_)) => {}
       Ok(SourceMessage::Fatal(err)) => panic!("stream died: {err}"),
+      // A mac source runs no walk that honors a mount boundary (#74).
+      Ok(SourceMessage::Honored(_)) => {}
       Err(_) => {
         assert!(
           Instant::now() < end,

@@ -1238,11 +1238,15 @@ impl FakeFs {
     // refused here — the fake models "nothing there", and nothing there is not a
     // boundary. Cells that want the absent case refused use `watch_failures`.
     let landing = self.state.nodes.lock().unwrap().get(path).copied();
-    if frame.crossed_by(
-      landing.map(|node| node.dev),
-      landing.and_then(|node| node.mnt_id),
-    ) {
-      return WatchOutcome::Failed(tributary_proto::WatchError::Gone);
+    let landed_mnt_id = landing.and_then(|node| node.mnt_id);
+    if frame.crossed_by(landing.map(|node| node.dev), landed_mnt_id) {
+      // The real reader's own split, modelled: a refusal the MOUNT ids proved is
+      // reported as a boundary this profile honored, a device-only one is not.
+      return if frame.mount_crossed_by(landed_mnt_id) {
+        WatchOutcome::Foreign
+      } else {
+        WatchOutcome::Failed(tributary_proto::WatchError::Gone)
+      };
     }
     // The arm installs (or aliases) a kernel watch: record it live, so a reorder
     // that installs it AFTER its disarm already ran shows as a residual entry.

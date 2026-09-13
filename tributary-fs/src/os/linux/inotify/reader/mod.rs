@@ -1117,9 +1117,18 @@ fn arm(instance: &mut Instance, request: AnchorRequest) -> ArmReply {
   // which is the exact state this check exists to prevent.
   match crosses_scope_frame(&anchor, landed.as_ref(), request.frame) {
     FrameCheck::Inside => {}
-    FrameCheck::Crossed => {
+    FrameCheck::Crossed { mount } => {
+      // Both legs refuse; only the mount leg REPORTS. The refusal the consumer
+      // sees is identical either way (the core maps `Foreign` to the same `Err`),
+      // and what the extra variant buys is the one fact the cover needs: this arm
+      // stopped at a mount, so the next authoritative sample can ask whether that
+      // mount is still there (#74).
       return ArmReply {
-        outcome: WatchOutcome::Failed(WatchError::Gone),
+        outcome: if mount {
+          WatchOutcome::Foreign
+        } else {
+          WatchOutcome::Failed(WatchError::Gone)
+        },
         anchor: None,
       };
     }
@@ -1286,8 +1295,11 @@ enum FrameCheck {
   /// The landing object is on the scope's own frame. The arm may install.
   Inside,
   /// The landing object is across the frame — a foreign device, or a differing
-  /// mount id. The arm is refused as `Gone`.
-  Crossed,
+  /// mount id. The arm is refused as `Gone` either way; `mount` says which leg
+  /// decided, because a refusal the MOUNT ids proved is also a boundary this
+  /// profile's walk honored and the mount-change cover is owed it (#74), while a
+  /// device-only one names nothing the mount table will ever carry.
+  Crossed { mount: bool },
   /// A read the verdict DEPENDS ON failed, so there is no verdict. The arm is
   /// refused as `Io`.
   Unreadable,
@@ -1378,7 +1390,9 @@ fn frame_check(
     },
   };
   if frame.crossed_by(Some(landed.st_dev), mnt_id) {
-    FrameCheck::Crossed
+    FrameCheck::Crossed {
+      mount: frame.mount_crossed_by(mnt_id),
+    }
   } else {
     FrameCheck::Inside
   }

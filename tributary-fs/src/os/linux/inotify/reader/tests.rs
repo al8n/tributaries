@@ -2726,8 +2726,9 @@ mod arm_frame_fence {
     );
     assert_eq!(
       frame_check(Some(&landed(9)), FRAMED, || Ok(None)),
-      FrameCheck::Crossed,
-      "and the belt still fences a foreign device with no mount id in sight"
+      FrameCheck::Crossed { mount: false },
+      "and the belt still fences a foreign device with no mount id in sight — \
+       a refusal no mount id proved, so it names no boundary to report"
     );
   }
 
@@ -2758,7 +2759,7 @@ mod arm_frame_fence {
     );
     assert_eq!(
       frame_check(Some(&landed(9)), frameless, || Ok(None)),
-      FrameCheck::Crossed,
+      FrameCheck::Crossed { mount: false },
       "the device belt is the whole fence there, and it still fences"
     );
     assert_eq!(
@@ -2780,8 +2781,9 @@ mod arm_frame_fence {
     );
     assert_eq!(
       frame_check(Some(&landed(1)), FRAMED, || Ok(Some(77))),
-      FrameCheck::Crossed,
-      "same device, DIFFERENT mount: the bind the device belt cannot see"
+      FrameCheck::Crossed { mount: true },
+      "same device, DIFFERENT mount: the bind the device belt cannot see, and \
+       the one refusal that PROVES a mount and so reports the boundary"
     );
   }
 }

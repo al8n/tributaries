@@ -810,7 +810,10 @@ domination `Rescan` is stood — and nothing else in either crate behaves differ
   itself is seeded at every world start from that world's own barrier table
   (spawn, replace, widen), which is read before the tree is walked — so a mount
   that departs between the barrier and the first sample is covered rather than
-  absorbed into it.
+  absorbed into it. And every coverage walk now REPORTS the mount boundaries it
+  honored, so a mount that arrives over ground a walk was about to read and departs
+  before any sample lists it — invisible to a row-to-row diff, since no table ever
+  held it — is covered by the next sample instead of leaving that ground unread.
 
 - **`tributaries`** — a caller-visible **sync barrier** (#23): `Tributaries::sync(sub,
   timeout)` resolves once every change made under the subscription's key BEFORE the
