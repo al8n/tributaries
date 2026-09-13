@@ -118,7 +118,7 @@ async fn watch(rig: &Rig, root: &str) -> ScopeId {
     .commands
     .send(Command::Watch {
       root: PathBuf::from(root),
-      interest: tributary_proto::Interest::all(),
+      options: crate::options::RootOptions::new(),
       reply,
     })
     .await
@@ -533,7 +533,7 @@ async fn watch_of_a_missing_root_fails_typed() {
     .commands
     .send(Command::Watch {
       root: PathBuf::from("/absent"),
-      interest: tributary_proto::Interest::all(),
+      options: crate::options::RootOptions::new(),
       reply,
     })
     .await
@@ -643,7 +643,7 @@ async fn orphaned_watch_reply_tears_the_stream_down() {
     .commands
     .send(Command::Watch {
       root: PathBuf::from("/r"),
-      interest: tributary_proto::Interest::all(),
+      options: crate::options::RootOptions::new(),
       reply,
     })
     .await
@@ -715,7 +715,7 @@ async fn uncommitted_watch_grant_unwinds_the_stream() {
     .commands
     .send(Command::Watch {
       root: PathBuf::from("/r"),
-      interest: tributary_proto::Interest::all(),
+      options: crate::options::RootOptions::new(),
       reply,
     })
     .await
@@ -917,7 +917,7 @@ async fn death_between_grant_send_and_poll_leaves_a_consistent_registry() {
     .commands
     .send(Command::Watch {
       root: PathBuf::from("/r"),
-      interest: tributary_proto::Interest::all(),
+      options: crate::options::RootOptions::new(),
       reply,
     })
     .await
@@ -1261,7 +1261,7 @@ async fn close_waits_for_an_in_flight_spawn_and_tears_it_down() {
     .commands
     .send(Command::Watch {
       root: PathBuf::from("/r"),
-      interest: tributary_proto::Interest::all(),
+      options: crate::options::RootOptions::new(),
       reply,
     })
     .await
@@ -1306,7 +1306,7 @@ async fn close_settles_an_in_flight_spawn_failure() {
     .commands
     .send(Command::Watch {
       root: PathBuf::from("/r"),
-      interest: tributary_proto::Interest::all(),
+      options: crate::options::RootOptions::new(),
       reply,
     })
     .await
@@ -1351,7 +1351,7 @@ async fn close_grace_bounds_a_wedged_spawn_and_drop_reclaims_it() {
     .commands
     .send(Command::Watch {
       root: PathBuf::from("/r"),
-      interest: tributary_proto::Interest::all(),
+      options: crate::options::RootOptions::new(),
       reply,
     })
     .await
@@ -1414,7 +1414,7 @@ async fn close_counts_a_post_live_wedged_spawn_as_non_quiescent() {
     .commands
     .send(Command::Watch {
       root: PathBuf::from("/r"),
-      interest: tributary_proto::Interest::all(),
+      options: crate::options::RootOptions::new(),
       reply,
     })
     .await
@@ -1594,7 +1594,7 @@ mod teardown_reaper {
       .commands
       .send(Command::Watch {
         root: PathBuf::from("/r"),
-        interest: tributary_proto::Interest::all(),
+        options: crate::options::RootOptions::new(),
         reply,
       })
       .await;
@@ -2723,7 +2723,7 @@ mod descending {
       .commands
       .send(Command::Watch {
         root: PathBuf::from("/r"),
-        interest: tributary_proto::Interest::all(),
+        options: crate::options::RootOptions::new(),
         reply,
       })
       .await
@@ -2783,7 +2783,7 @@ mod descending {
       .commands
       .send(Command::Watch {
         root: PathBuf::from("/r"),
-        interest: tributary_proto::Interest::all(),
+        options: crate::options::RootOptions::new(),
         reply,
       })
       .await
@@ -18853,7 +18853,7 @@ mod retention {
       .commands
       .send(Command::Watch {
         root: PathBuf::from(root),
-        interest: tributary_proto::Interest::all(),
+        options: crate::options::RootOptions::new(),
         reply,
       })
       .await
@@ -18986,7 +18986,7 @@ mod retention {
       .commands
       .send(Command::Watch {
         root: PathBuf::from(root),
-        interest: tributary_proto::Interest::all(),
+        options: crate::options::RootOptions::new(),
         reply,
       })
       .await
@@ -19676,7 +19676,7 @@ mod retention {
       .commands
       .send(Command::Watch {
         root: PathBuf::from("/alt0"),
-        interest: tributary_proto::Interest::all(),
+        options: crate::options::RootOptions::new(),
         reply,
       })
       .await
@@ -19716,7 +19716,7 @@ mod retention {
       .commands
       .send(Command::Watch {
         root: PathBuf::from("/r"),
-        interest: tributary_proto::Interest::all(),
+        options: crate::options::RootOptions::new(),
         reply,
       })
       .await
@@ -20036,7 +20036,7 @@ mod abnormal_exit {
       .commands
       .send(Command::Watch {
         root: PathBuf::from("/r"),
-        interest: tributary_proto::Interest::all(),
+        options: crate::options::RootOptions::new(),
         reply,
       })
       .await
@@ -20259,7 +20259,7 @@ mod abnormal_exit {
       .commands
       .send(Command::Watch {
         root: PathBuf::from("/r"),
-        interest: tributary_proto::Interest::all(),
+        options: crate::options::RootOptions::new(),
         reply,
       })
       .await
@@ -20477,7 +20477,7 @@ mod abnormal_exit {
       .commands
       .send(Command::Watch {
         root: PathBuf::from("/r"),
-        interest: tributary_proto::Interest::all(),
+        options: crate::options::RootOptions::new(),
         reply,
       })
       .await

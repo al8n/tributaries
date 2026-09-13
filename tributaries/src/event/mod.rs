@@ -176,6 +176,10 @@ pub struct Event<C, V> {
   /// owning subscription (a pure-test fixture, or a delivery whose subscription raced
   /// retirement).
   value: Option<V>,
+  /// The affected object's class where the source proved it, `None` where nothing did
+  /// (exposed by [`is_dir`](Self::is_dir)). A synthesized event carries `None`: it
+  /// describes no single underlying object.
+  is_dir: Option<bool>,
 }
 
 impl<C, V> Event<C, V> {
@@ -200,6 +204,7 @@ impl<C, V> Event<C, V> {
       location,
       change_id: None,
       value: None,
+      is_dir: None,
     }
   }
 
@@ -218,6 +223,7 @@ impl<C, V> Event<C, V> {
       location: Location::new(),
       change_id: None,
       value: None,
+      is_dir: None,
     }
   }
 
@@ -242,6 +248,7 @@ impl<C, V> Event<C, V> {
       location: event.location().clone(),
       change_id: event.change_id(),
       value: None,
+      is_dir: event.is_dir(),
     }
   }
 
@@ -278,6 +285,9 @@ impl<C, V> Event<C, V> {
       location: event.move_from_location().cloned().unwrap_or_default(),
       change_id: None,
       value: None,
+      // A rename's two endpoints name ONE object, so its class describes the
+      // departure as truthfully as the arrival.
+      is_dir: event.is_dir(),
     }
   }
 
@@ -300,6 +310,7 @@ impl<C, V> Event<C, V> {
       location: event.location().clone(),
       change_id: None,
       value: None,
+      is_dir: event.is_dir(),
     }
   }
 
@@ -331,6 +342,9 @@ impl<C, V> Event<C, V> {
       location: Location::new(),
       change_id: event.change_id(),
       value: None,
+      // The clamp re-keys onto the SUBSCRIPTION's own key, so the class the source
+      // proved about the rescanned coordinate says nothing about this one.
+      is_dir: None,
     }
   }
 
@@ -460,6 +474,24 @@ impl<C, V> Event<C, V> {
   #[inline]
   pub const fn change_id(&self) -> Option<ChangeId> {
     self.change_id
+  }
+
+  /// The affected object's CLASS where the source proved it — `Some(true)` for a
+  /// directory, `Some(false)` for a non-directory — and `None` where nothing did.
+  ///
+  /// `None` is the honest third answer rather than a defaulted `false`: no stat is
+  /// performed to fill it in, so a source reporting a bare path (and a removal, whose
+  /// object is already gone) leaves the class unknown. A synthesized delivery — a widen
+  /// [`Rescan`](EventKind::Rescan), a clamped recovery projection, a coalesced-churn
+  /// [`Modified`](EventKind::Modified) — describes no single underlying object and
+  /// reports `None`; a move's two projections DO carry it, both endpoints being the one
+  /// object.
+  ///
+  /// A consumer filtering on this must treat `None` as unknown, exactly as the
+  /// [`include`](crate::RootGlobs::include) seat does when it admits an unproven class.
+  #[inline]
+  pub const fn is_dir(&self) -> Option<bool> {
+    self.is_dir
   }
 
   /// The caller value attributed to this delivery (design §3): the value of the

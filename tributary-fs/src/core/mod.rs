@@ -83,13 +83,21 @@ use std::{
 
 use tributary_proto::{
   ArmAttempt, Capabilities, Change, ChangeKind, DirEntry, EnumerateResult, Evidence, FileKind,
-  Identity, Instant, Interest, IoClass, Location, Monitor, MoveCookie, OsRecord, RecordKind, ReqId,
-  Scope, ScopeId, Segment, StatEntry, StatResult, SubtreeScope, WatchError, WatchId,
+  Identity, Instant, IoClass, Location, Monitor, MoveCookie, OsRecord, RecordKind, ReqId, Scope,
+  ScopeId, Segment, StatEntry, StatResult, SubtreeScope, WatchError, WatchId,
+  glob::Globs,
   monitor::{CoverageWorkEpoch, RecordOutcome},
 };
 
+// Named only by the test-only interest shorthand below (and, through
+// `use super::*`, by the cells themselves); the production entry takes a whole
+// `RootOptions`.
+#[cfg(test)]
+use tributary_proto::Interest;
+
 use crate::{
   error::WatchRootError,
+  options::RootOptions,
   os::{
     BackendKind, BatchPayload, FsEventFlags, RawOsEvent, RootIdentity, RootMeta, SourceError,
     SourceEvent,
@@ -1457,6 +1465,29 @@ struct ScopeState {
   /// identity sample (which cannot distinguish a live watch from an IGNORED
   /// one over a same-identity rebind).
   pending_widen: Option<PendingWiden>,
+  /// The root's PRUNED subtrees, compiled once when the root is registered.
+  ///
+  /// The per-root, glob-shaped half of the common-layer fence: a directory whose
+  /// root-relative path — or that of any ancestor below the root — matches is
+  /// never staged by a listing, never armed, never descended, and nothing at or
+  /// under it is delivered. Empty is the common case and short-circuits every
+  /// test.
+  ///
+  /// Unlike the watcher-wide [`exclusions`](DriverCore::exclusions) it NEVER
+  /// stands down for a backend that enforces exclusions itself: no OS API takes
+  /// a glob, so a backend cannot have decided this question at admission (see
+  /// [`fence_exclusions`](DriverCore::fence_exclusions)).
+  prune: Globs,
+  /// The root's INCLUDE seat: `None` — the default — delivers every file, and
+  /// `Some` narrows delivery to files whose last location segment matches.
+  ///
+  /// Purely a DELIVERY gate, applied in [`route_event`](DriverCore::route_event):
+  /// it changes no coverage, arms nothing differently and consumes no lag
+  /// accounting, so widening it later needs no re-arm. Directories, `Rescan`s and
+  /// changes whose object class no source proved always pass — the seat fails
+  /// OPEN, because a folder the consumer never hears about is a hole in its view
+  /// while an extra event is one it can drop.
+  include: Option<Globs>,
 }
 
 /// What one record owes the exclusion geometry, decided from the Monitor's own
@@ -1754,6 +1785,72 @@ impl DriverCore {
     crate::driver::excluded(&self.exclusions, path)
   }
 
+  /// The SHALLOWEST pruned ancestor of `path` (or `path` itself), or `None` when
+  /// nothing on the way down is pruned.
+  ///
+  /// "Pruned" for a path is: some prefix of its root-relative segments, of length
+  /// **at least one**, matches the scope's [`prune`](ScopeState::prune) set. The
+  /// length floor is what makes the ROOT unprunable — its root-relative path is
+  /// empty, so it has no prefix to match with, and a seat can never silence the
+  /// very root it was configured on.
+  ///
+  /// An ancestor walk from the shallowest segment down, bounded by the path's own
+  /// depth and cached nowhere: a scope's coverage moves under it (a rename
+  /// re-parents a whole subtree in O(1)), so a memo keyed on a path would be a
+  /// second description of a tree the Monitor already owns — the mirror
+  /// [`path_of`](Self::path_of) exists to have deleted.
+  ///
+  /// FAILS OPEN — answers `None` — for a scope with no prune seat, a path outside
+  /// the scope root, a root that is not known yet, and a segment that is not
+  /// UTF-8 (a glob is text; an unrepresentable name is not something a pattern can
+  /// have meant). The direction is the fence's own: not suppressing costs a
+  /// delivery the caller did not want, suppressing on an unresolved path costs one
+  /// it may have needed.
+  fn prune_root(state: &ScopeState, path: &Path) -> Option<PathBuf> {
+    if state.prune.is_empty() {
+      return None;
+    }
+    let root = state.root.as_deref()?;
+    let relative = path.strip_prefix(root).ok()?;
+    let mut walked = String::new();
+    let mut fence = root.clone();
+    for segment in relative.iter() {
+      let segment = segment.to_str()?;
+      if !walked.is_empty() {
+        walked.push('/');
+      }
+      walked.push_str(segment);
+      fence.push(segment);
+      if state.prune.is_match(&walked) {
+        return Some(fence);
+      }
+    }
+    None
+  }
+
+  /// The nearest FENCED ancestor of `path` — the ONE containment predicate both
+  /// halves of the common-layer fence are asked through.
+  ///
+  /// Two seats, one question: the watcher-wide exclusion covering `path` (an
+  /// absolute-path subtree test), or the scope's shallowest pruned ancestor of it
+  /// (a root-relative glob test, [`prune_root`](Self::prune_root)). A path is
+  /// fenced iff this answers `Some`, and what it answers is the fence's own root
+  /// — the directory the suppression begins at.
+  ///
+  /// `exclusions` is whether the EXCLUSION half is live for this scope: it stands
+  /// down where the backend decides exclusions at admission
+  /// ([`backend_enforces_exclusions`]). The PRUNE half never stands down — no OS
+  /// API takes a glob, so no backend can have decided that question already.
+  fn fence_root(&self, state: &ScopeState, exclusions: bool, path: &Path) -> Option<PathBuf> {
+    if exclusions
+      && !self.exclusions.is_empty()
+      && let Some(exclusion) = crate::driver::cookie_dir_excluded(&self.exclusions, path)
+    {
+      return Some(exclusion.to_path_buf());
+    }
+    Self::prune_root(state, path)
+  }
+
   /// Where one watch of `state`'s scope IS: the scope root's canonical path
   /// joined with the Monitor's own placement of that watch in its node tree.
   ///
@@ -1890,12 +1987,36 @@ impl DriverCore {
   /// `expect`ed because the Monitor's guard exists for out-of-tree drivers, and
   /// an assertion in this crate's only caller would answer their mistake with a
   /// panic instead of the refusal. Nothing is registered on the error path.
+  ///
+  /// Test entry: the production path always carries a whole
+  /// [`RootOptions`] (it rides the watcher's `Command::Watch`), so this
+  /// interest-only shorthand exists for the cells that are about anything else.
+  #[cfg(test)]
   pub(crate) fn on_watch(
     &mut self,
     root: PathBuf,
     interest: Interest,
     profile: BackendKind,
   ) -> Result<ScopeId, WatchRootError> {
+    self.on_watch_with(root, &RootOptions::new().with_interest(interest), profile)
+  }
+
+  /// [`on_watch`](Self::on_watch) taking the whole per-root household: the
+  /// interest AND the two glob seats, compiled once here and stored on the
+  /// scope ([`prune`](ScopeState::prune), [`include`](ScopeState::include)).
+  ///
+  /// # Errors
+  ///
+  /// [`WatchRootError::ScopeInUse`] when the Monitor already holds a root for
+  /// the minted scope — see [`on_watch`](Self::on_watch).
+  pub(crate) fn on_watch_with(
+    &mut self,
+    root: PathBuf,
+    options: &RootOptions,
+    profile: BackendKind,
+  ) -> Result<ScopeId, WatchRootError> {
+    let interest = options.interest();
+    let (prune, include) = options.compile();
     self.scope_seq += 1;
     let scope = ScopeId::new(NonZeroU64::new(self.scope_seq).expect("sequence starts at one"));
     let Some(watch) = self
@@ -1928,6 +2049,8 @@ impl DriverCore {
         applied_cover: None,
         settle_floor: None,
         pending_widen: None,
+        prune,
+        include,
       },
     );
     self.watch_scopes.insert(watch, scope);
@@ -3127,7 +3250,7 @@ impl DriverCore {
             continue;
           };
           let path = dir.join(name);
-          if self.excluded(&path) {
+          if self.excluded(&path) || Self::prune_root(state, &path).is_some() {
             continue;
           }
           let node = mint(state, &path, NonZeroU64::new(entry.ino), Some(entry.dev));
@@ -3214,6 +3337,7 @@ impl DriverCore {
     };
     let scope = ctx.scope;
     let resolved = Self::resolve(&mut state, ctx.purpose, outcome);
+    let resolved = self.fence_resolved(&state, resolved);
     let mut fed = false;
     if let Some(batch) = state.park.active.as_mut() {
       if let Some((fid, partner)) = resolved.evidences {
@@ -3645,6 +3769,7 @@ impl DriverCore {
         Location::new(),
         change.kind().clone(),
         change.epoch(),
+        change.is_dir(),
       );
     }
 
@@ -4359,9 +4484,13 @@ impl DriverCore {
       "INV-FEED: feed-at-classify => awaiting == 0 — a probe-parked batch's items \
        are placeholders and must not reach the Monitor before their probes answer"
     );
-    // The fence itself stands down where the backend decides exclusions at
-    // admission, and where the caller configured none.
-    let fence = !self.exclusions.is_empty() && !backend_enforces_exclusions(state.profile);
+    // The EXCLUSION half stands down where the backend decides exclusions at
+    // admission, and where the caller configured none. The PRUNE half never
+    // stands down for a backend — no OS API takes a glob, so no backend can have
+    // decided that question already — only for a root that configured no
+    // patterns.
+    let exclusions = !self.exclusions.is_empty() && !backend_enforces_exclusions(state.profile);
+    let fence = exclusions || !state.prune.is_empty();
     // The geometry half additionally stands down for a kernel-recursive profile
     // (see [`reparent_geometry`](Self::reparent_geometry)); the fence itself does
     // not.
@@ -4380,7 +4509,7 @@ impl DriverCore {
         Vec::with_capacity(planned.len())
       };
       for planned in planned {
-        if fence && self.fenced(state, &planned) {
+        if fence && self.fenced(state, exclusions, &planned) {
           continue;
         }
         // Only a KEPT record carries geometry: a rename half the fence just
@@ -4402,7 +4531,7 @@ impl DriverCore {
         // this order, on both disciplines.
         if let Some((watch, target)) = landing
           && let Geometry::Repair(repair) =
-            self.reparent_geometry(state, scope, watch, target.as_ref(), &outcome)
+            self.reparent_geometry(state, exclusions, scope, watch, target.as_ref(), &outcome)
         {
           Self::accept(&mut self.monitor, state, &mut kept, repair, now);
         }
@@ -4412,8 +4541,51 @@ impl DriverCore {
     if fence {
       batch
         .trailing
-        .retain(|planned| !self.fenced(state, planned));
+        .retain(|planned| !self.fenced(state, exclusions, planned));
     }
+  }
+
+  /// Re-runs the live fence over one probe's resolution — the second, and last,
+  /// place a planned input can be born.
+  ///
+  /// [`fence_exclusions`](Self::fence_exclusions) judges a batch as it is
+  /// compiled, and an item still AWAITING a probe is a placeholder there: its
+  /// planned inputs do not exist yet, and
+  /// [`on_probe_result`](Self::on_probe_result) installs them wholesale
+  /// afterwards. Without this pass those inputs would reach the Monitor unjudged.
+  ///
+  /// It costs nothing for the exclusion half, which stands down on the ONE
+  /// profile that parks for probes (FSEvents enforces its own exclusions), and it
+  /// exists for the prune half, which stands down for no backend at all.
+  ///
+  /// A record the fence takes contributes NOTHING further: its cookie candidacy
+  /// goes with it, so a vanished half inside pruned ground can neither be granted
+  /// a pairing cookie nor provoke the ambiguity cover that grant would otherwise
+  /// stand — which is what keeps a `Rescan` from naming a path the caller pruned.
+  /// Its EVIDENCE for someone else's grant survives: a pair straddling the fence
+  /// is a real crossing, and the half that lies inside the reported tree is owed
+  /// its report.
+  ///
+  /// Classifying a whole batch ahead of feeding it leaks on a profile whose
+  /// records are addressed through per-directory anchors (a reparent mid-read
+  /// moves the ground under the records behind it), which is exactly why
+  /// [`feeds_at_classify`] is true for the descending profile. This pass is safe
+  /// for the same reason it is needed: only FSEvents parks, and every FSEvents
+  /// record is anchored at the ROOT watch with a whole root-relative location, so
+  /// no reparent can change how a later one resolves.
+  fn fence_resolved(&self, state: &ScopeState, mut resolved: Resolved) -> Resolved {
+    let exclusions = !self.exclusions.is_empty() && !backend_enforces_exclusions(state.profile);
+    if !exclusions && state.prune.is_empty() {
+      return resolved;
+    }
+    let before = resolved.planned.len();
+    resolved
+      .planned
+      .retain(|planned| !self.fenced(state, exclusions, planned));
+    if before > 0 && resolved.planned.is_empty() {
+      resolved.candidate = None;
+    }
+    resolved
   }
 
   /// Takes one record the fence kept: handed to the Monitor AT ONCE under a
@@ -4448,25 +4620,49 @@ impl DriverCore {
     Self::feed(monitor, planned, now)
   }
 
-  /// Whether an exclusion lies AT OR UNDER `path` — the fence's own containment
-  /// predicate run the other way round, with `path` as the exclusion set and each
-  /// exclusion as the candidate.
+  /// Whether the fence's MEMBERSHIP over the subtree rooted at `path` depends on
+  /// where that subtree sits — the mirror of [`fence_root`](Self::fence_root),
+  /// asked the other way round.
   ///
-  /// [`excluded`](Self::excluded) answers "is this path inside an exclusion", which
-  /// is what suppression needs. Re-parenting needs the mirror question — "does this
-  /// subtree CONTAIN an exclusion" — because that is what decides whether rewriting
-  /// the subtree's path changes which of its descendants are reported.
+  /// [`fence_root`](Self::fence_root) answers "is this path inside a fence", which
+  /// is what suppression needs. Re-parenting needs "does this subtree CONTAIN
+  /// fenced ground", because that is what decides whether rewriting the subtree's
+  /// path changes which of its descendants are reported.
   ///
-  /// Deliberately expressed through [`crate::driver::excluded`] rather than a fresh
-  /// prefix walk: that is the ONE matching rule the cold fence, the live fence, the
-  /// sync-cookie birth refusal and the fanotify backend all share, and a second rule
-  /// here could drift out of step with it and re-open the hole from the other side.
-  fn exclusion_under(&self, path: &Path) -> bool {
-    let containing = [path.to_path_buf()];
-    self
-      .exclusions
-      .iter()
-      .any(|exclusion| crate::driver::excluded(&containing, exclusion))
+  /// The two seats answer it differently, and the difference is forced by what a
+  /// pattern IS:
+  ///
+  /// - **exclusions** are literal paths, so the question is decidable exactly:
+  ///   does some exclusion lie at or under `path`? Deliberately expressed through
+  ///   [`crate::driver::excluded`] rather than a fresh prefix walk — that is the
+  ///   ONE matching rule the cold fence, the live fence, the sync-cookie birth
+  ///   refusal and the fanotify backend all share, and a second rule here could
+  ///   drift out of step with it and re-open the hole from the other side.
+  /// - **prune** is a glob over root-relative paths, whose language cannot be
+  ///   enumerated: whether some unseen descendant's verdict flips when the subtree
+  ///   is relocated is not a question the matcher can be asked. So a scope with any
+  ///   prune pattern answers `true` — CONSERVATIVE in the direction the exclusion
+  ///   half already is, and for the same reason: with no answer available, the safe
+  ///   direction is the one that costs a re-enumeration, not the one that costs
+  ///   coverage.
+  ///
+  /// The cost of that conservatism is bounded and paid only where the Monitor
+  /// actually re-parented a watched subtree
+  /// ([`reparent_geometry`](Self::reparent_geometry) consults this only after a
+  /// [`RecordOutcome::Reparented`]): one located `Rescan` and one re-arm read of
+  /// the destination per directory rename inside a pruned root.
+  fn fence_under(&self, state: &ScopeState, exclusions: bool, path: &Path) -> bool {
+    if exclusions {
+      let containing = [path.to_path_buf()];
+      if self
+        .exclusions
+        .iter()
+        .any(|exclusion| crate::driver::excluded(&containing, exclusion))
+      {
+        return true;
+      }
+    }
+    !state.prune.is_empty()
   }
 
   /// The destination slot a rename's repair would be lowered against, taken from a
@@ -4600,6 +4796,7 @@ impl DriverCore {
   fn reparent_geometry(
     &self,
     state: &ScopeState,
+    exclusions: bool,
     scope: ScopeId,
     watch: WatchId,
     target: Option<&Location>,
@@ -4615,7 +4812,8 @@ impl DriverCore {
     // for a moved node whose ancestry no longer reaches the root: with
     // no path to compare, the safe direction is the one that costs a
     // re-enumeration, not the one that costs coverage.
-    let changed = |end: Option<&Path>| end.is_none_or(|path| self.exclusion_under(path));
+    let changed =
+      |end: Option<&Path>| end.is_none_or(|path| self.fence_under(state, exclusions, path));
     if !changed(from.as_deref()) && !changed(to.as_deref()) {
       return Geometry::Nothing;
     }
@@ -4628,21 +4826,23 @@ impl DriverCore {
     })
   }
 
-  /// Whether one planned Monitor input addresses only excluded ground.
-  fn fenced(&self, state: &ScopeState, planned: &Planned) -> bool {
+  /// Whether one planned Monitor input addresses only fenced ground — excluded,
+  /// pruned, or both ([`fence_root`](Self::fence_root)).
+  fn fenced(&self, state: &ScopeState, exclusions: bool, planned: &Planned) -> bool {
+    let inside = |path: &Path| self.fence_root(state, exclusions, path).is_some();
     match planned {
       Planned::Rec(rec) => {
         !rec.kind().is_self_event()
           && self
             .anchored_path(state, rec.watch(), rec.target())
-            .is_some_and(|path| self.excluded(&path))
+            .is_some_and(|path| inside(&path))
       }
       Planned::Over(Scope::Subtree(sub)) => {
         let scope_wide = sub.watch() == state.watch && sub.descent().is_empty();
         !scope_wide
           && self
             .anchored_path(state, sub.watch(), Some(sub.descent()))
-            .is_some_and(|path| self.excluded(&path))
+            .is_some_and(|path| inside(&path))
       }
       Planned::Over(_) => false,
     }
@@ -5064,6 +5264,7 @@ impl DriverCore {
       location,
       ChangeKind::Rescan,
       newer.epoch(),
+      newer.is_dir(),
     )
   }
 
@@ -5342,6 +5543,44 @@ impl DriverCore {
     }
   }
 
+  /// Whether `state`'s [`include`](ScopeState::include) seat admits `change`.
+  ///
+  /// Five admitting clauses, and every one of them widens rather than narrows:
+  ///
+  /// - **(a)** a [`Rescan`](ChangeKind::Rescan). It is the no-silent-loss escape
+  ///   and names a subtree to re-read rather than an object, so no file pattern
+  ///   can speak for it;
+  /// - **(b)** an unengaged seat (`None`) — the default, which delivers
+  ///   everything and is byte-for-byte the pre-seat path;
+  /// - **(c)** an object that is not a PROVEN non-directory
+  ///   ([`Change::is_dir`] `!= Some(false)`). Directories always pass, so a moved
+  ///   or removed folder is never silent, and an unproven class fails OPEN — a
+  ///   backend that reported no class has not reported a file;
+  /// - **(d)** a last location segment that matches;
+  /// - **(e)** a [`Moved`](ChangeKind::Moved) whose SOURCE's last segment
+  ///   matches. A media file renamed to a non-media name is still reported, so
+  ///   the consumer can drop what it was holding rather than keep a name that no
+  ///   longer exists.
+  ///
+  /// [`Interest::ondir`](tributary_proto::Interest::ondir) keeps governing directory changes
+  /// exactly as it did: this seat only ever admits ON TOP of it, never instead of
+  /// it.
+  fn admits(state: &ScopeState, change: &Change) -> bool {
+    let Some(include) = state.include.as_ref() else {
+      return true;
+    };
+    if change.kind().is_rescan() || change.is_dir() != Some(false) {
+      return true;
+    }
+    let matches = |location: &Location| {
+      location
+        .segments()
+        .last()
+        .is_some_and(|segment| include.is_match(segment.as_str()))
+    };
+    matches(change.location()) || change.kind().moved_from().is_some_and(matches)
+  }
+
   fn route_event(&mut self, change: Change) {
     let scope = change.scope();
     let Some(state) = self.scopes.get_mut(&scope) else {
@@ -5413,6 +5652,16 @@ impl DriverCore {
         state.applied_cover = Some(Vec::new());
         state.settle_floor = Some(Vec::new());
       }
+    }
+    // THE INCLUDE SEAT: the root's file-delivery narrowing, applied here and
+    // nowhere else. A change it does not admit is dropped SILENTLY — no effect,
+    // no lag accounting, no coverage consequence — because the seat is a
+    // statement about what the consumer wants to hear, not about what the core
+    // knows. It sits behind the lossy-window handling above deliberately: a
+    // `Rescan` is admitted by rule (a) anyway, and the cover bookkeeping it
+    // drives is coverage state the seat has no business touching.
+    if !Self::admits(state, &change) {
+      return;
     }
     match &mut state.lag {
       LagState::Normal => {

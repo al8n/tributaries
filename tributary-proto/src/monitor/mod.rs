@@ -4014,6 +4014,7 @@ impl Monitor {
               location,
               ChangeKind::Created,
               Evidence::of(RecordKind::Created),
+              Some(entry.is_dir()),
             );
           }
           // A cold enumerate is discovery, not a replace, so an already-watched slot
@@ -6092,7 +6093,13 @@ impl Monitor {
           // Delivery honors `ondir`; the slot reconciliation below is coverage and
           // runs regardless.
           if self.ondir_allows(scope, class) {
-            self.emit(scope, to.clone(), ChangeKind::Created, rec.evidence());
+            self.emit(
+              scope,
+              to.clone(),
+              ChangeKind::Created,
+              rec.evidence(),
+              class,
+            );
           }
           if let Some(name) = rec.name() {
             if carried {
@@ -6139,7 +6146,7 @@ impl Monitor {
       }
       None => {
         if self.ondir_allows(scope, rec.is_dir()) {
-          self.emit(scope, to, ChangeKind::Created, rec.evidence());
+          self.emit(scope, to, ChangeKind::Created, rec.evidence(), rec.is_dir());
         }
         if let Some(name) = rec.name() {
           let _ = self.reconcile_slot(
@@ -6237,11 +6244,11 @@ impl Monitor {
       return;
     }
     if let Some(from) = self.live_pending_from(pending) {
-      self.emit(scope, to, ChangeKind::Moved(from), evidence);
+      self.emit(scope, to, ChangeKind::Moved(from), evidence, class);
     } else {
       // A rename whose source anchor died reports as a `Created`; the pair's own
       // evidence rides along so a `moved`-only subscription still learns of it.
-      self.emit(scope, to, ChangeKind::Created, evidence);
+      self.emit(scope, to, ChangeKind::Created, evidence, class);
     }
   }
 
@@ -6450,7 +6457,7 @@ impl Monitor {
     // subscriber who asked about renames — and would otherwise receive neither
     // half of one, nor a `Rescan` — is admitted on the fact that actually
     // happened.
-    self.emit(scope, from, ChangeKind::Removed, evidence);
+    self.emit(scope, from, ChangeKind::Removed, evidence, is_dir);
   }
 
   /// The single point of truth for "the watch at `(parent, name)` matches the
@@ -6792,7 +6799,13 @@ impl Monitor {
     if self.is_root_watch(rec.watch()) {
       if self.ondir_allows(scope, Some(true)) {
         let location = self.location_of(rec.watch());
-        self.emit(scope, location, ChangeKind::Removed, rec.evidence());
+        self.emit(
+          scope,
+          location,
+          ChangeKind::Removed,
+          rec.evidence(),
+          rec.is_dir(),
+        );
       }
       self.emit_rescan(scope, Location::new());
       self.invalidate_root(scope, rec.watch());
@@ -6879,7 +6892,7 @@ impl Monitor {
 
   fn emit_child(&mut self, scope: ScopeId, rec: &OsRecord, kind: ChangeKind) {
     let location = self.record_location(rec);
-    self.emit(scope, location, kind, rec.evidence());
+    self.emit(scope, location, kind, rec.evidence(), rec.is_dir());
   }
 
   /// The scope's current reconciliation generation ([`Epoch::START`] if never bumped).
@@ -6922,10 +6935,17 @@ impl Monitor {
     self.bump_epoch(scope);
     // A `Rescan` bypasses the filter on its own kind, so it needs no evidence
     // to be admitted.
-    self.emit(scope, location, ChangeKind::Rescan, Evidence::new());
+    self.emit(scope, location, ChangeKind::Rescan, Evidence::new(), None);
   }
 
-  fn emit(&mut self, scope: ScopeId, location: Location, kind: ChangeKind, evidence: Evidence) {
+  fn emit(
+    &mut self,
+    scope: ScopeId,
+    location: Location,
+    kind: ChangeKind,
+    evidence: Evidence,
+    is_dir: Option<bool>,
+  ) {
     // The delivery filter: narrow to the kinds the consumer registered for. The backend
     // was subscribed to a coverage superset (see `coverage_mask`), so unrequested kinds
     // are expected here and dropped — EXCEPT `Rescan`, the no-silent-loss escape, which
@@ -6954,7 +6974,7 @@ impl Monitor {
       return;
     }
     let id = self.next_change_id();
-    let change = Change::new(id, scope, location, kind, self.epoch_of(scope));
+    let change = Change::new(id, scope, location, kind, self.epoch_of(scope), is_dir);
     self.events.push_back(change);
   }
 

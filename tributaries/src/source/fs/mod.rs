@@ -17,9 +17,9 @@ use std::{
 use agnostic_lite::RuntimeLite;
 use tributary_fs::{
   CloseError as FsCloseError, CoverOutcome, Event as FsEvent, EventKind as FsEventKind,
-  ReplaceRootError, RequestOutcome, RootHandle, SkipReason, SourceError, SyncRootDenied,
-  SyncRootError, SyncTicket, UnwatchError as FsUnwatchError, WatchRootError, Watcher,
-  WatcherOptions,
+  ReplaceRootError, RequestOutcome, RootHandle, RootOptions, SkipReason, SourceError,
+  SyncRootDenied, SyncRootError, SyncTicket, UnwatchError as FsUnwatchError, WatchRootError,
+  Watcher, WatcherOptions,
 };
 use tributary_proto::Interest;
 
@@ -27,6 +27,7 @@ use super::{Armed, Source, SourceEvent, SyncToken};
 use crate::{
   error::{BuildError, FaultKind, SourceCloseError, SourceFault, SyncError, WatchError},
   event::{EventKind, path_components},
+  options::RootGlobs,
 };
 
 #[cfg(test)]
@@ -252,7 +253,11 @@ impl<R> Source<OsString> for FsSource<R> {
     Ok(path_components(&canonical))
   }
 
-  async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, RootHandle>, WatchError> {
+  async fn arm(
+    &mut self,
+    key: &[OsString],
+    globs: &RootGlobs,
+  ) -> Result<Armed<OsString, RootHandle>, WatchError> {
     // (0) MAINTENANCE: drop every in-flight release the watcher has SINCE applied, and its dead-mark.
     // Once the watcher's registry has forgotten a root, it can never NAME it as a conflict again, and
     // `root_path` now answers the same `None` the mirror did — so pruning here keeps both the in-flight
@@ -325,6 +330,15 @@ impl<R> Source<OsString> for FsSource<R> {
     // watch never narrows what it collects, so a covered subscription can ask for any kind and the root
     // already carries it (interest becomes a pure fan-out gate at the umbrella).
     //
+    // The two GLOB seats are the exception, and deliberately so: they are not a delivery
+    // gate the umbrella could apply above the seam but the words this root is armed with,
+    // so they ride the fs household straight down to `watch_with`. `prune` subtracts
+    // coverage — the fs watcher never enumerates, arms or descends a matching subtree —
+    // and `include` narrows which files that coverage delivers. Both are matched relative
+    // to THIS root, which is the coordinate `arm_path` names, so the words the umbrella
+    // handed down need no re-basing here. Absent seats (the default household) leave the
+    // watch byte-for-byte the `watch(path, Interest::all())` it always was.
+    //
     // The correctness guarantee — a conforming source never SURFACES an `Overlaps` for a root whose
     // release was requested, QUEUED or IN-FLIGHT (disarm contract clause 2) — is upheld here by
     // construction: the WATCHER itself names the conflicting `existing` root (it rejects by
@@ -344,6 +358,20 @@ impl<R> Source<OsString> for FsSource<R> {
     // bug), never a lingering released root — surfaces the overlap IMMEDIATELY: there is no index-0
     // fallback, so we never unwatch an unrelated pending root to mask a real conflict.
     let arm_path = key_to_path(key);
+    // Built once and cloned per retry: a conflict retry re-arms the SAME root with the
+    // same words, so re-deriving them each iteration could only introduce a drift.
+    let root_options = {
+      let options = RootOptions::new()
+        .with_interest(Interest::all())
+        .with_prune(globs.prune().iter().cloned());
+      match globs.include() {
+        // `Some` and `None` are different seats, not a present-vs-empty list: an empty
+        // `Some` admits no file at all, so it must reach the watcher as the engaged seat
+        // it is rather than collapse into the absent one.
+        Some(include) => options.with_include(include.iter().cloned()),
+        None => options,
+      }
+    };
     // Progress tripwire (debug-only): the exact-match retry can run at most one more iteration than the
     // queued-plus-in-flight release count was deep, since that total strictly shrinks each retry and a
     // non-matching rejection exits immediately.
@@ -361,7 +389,11 @@ impl<R> Source<OsString> for FsSource<R> {
            in-flight release sets must strictly shrink each retry (structural progress bound)"
         );
       }
-      match self.watcher.watch(arm_path.clone(), Interest::all()).await {
+      match self
+        .watcher
+        .watch_with(arm_path.clone(), root_options.clone())
+        .await
+      {
         Ok(handle) => break handle,
         Err(WatchRootError::Overlaps { path, existing }) => {
           // Resolve ONLY a conflict the watcher NAMES against a release we requested — QUEUED (not yet
@@ -869,6 +901,12 @@ impl SourceEvent<OsString, RootHandle> {
       event.epoch(),
       Some(event.change_id()),
     );
+    // The class the fs layer PROVED, carried across as the same three-valued fact — an
+    // unproven class stays unproven, never a stated `false` (see `with_is_dir`).
+    let source_event = match event.is_dir() {
+      Some(is_dir) => source_event.with_is_dir(is_dir),
+      None => source_event,
+    };
     match move_from_location {
       Some(location) => source_event.with_move_from_location(location),
       None => source_event,

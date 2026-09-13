@@ -21,8 +21,13 @@ serde = ["dep:serde"]
 # Optional `clap` face on the same vocabulary — `Interest` becomes a
 # `clap::Args` group. clap itself is std-only, so the face implies `std`.
 clap = ["dep:clap", "std"]
+# The `glob` vocabulary (`Glob`, `Globs`): validated root-relative patterns and
+# the compiled sets the watcher's per-root seats match with. `globset` needs
+# `std`, so the face implies it.
+glob = ["dep:globset", "std"]
 
 [dependencies]
+globset = { version = "0.4", optional = true }
 clap = { version = "4", optional = true, default-features = false, features = [
   "std",
   "derive",

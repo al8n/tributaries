@@ -22,7 +22,7 @@ use crate::{
   event::{Event, EventKind},
   filter::Filter,
   interest::Interest,
-  options::{Debounce, DebounceConfig, TributariesOptions, WatchOptions},
+  options::{Debounce, DebounceConfig, RootGlobs, TributariesOptions, WatchOptions},
   source::{Armed, Source, SourceEvent, SyncToken},
   subscription::Subscription,
   subsume::Subsumer,
@@ -748,7 +748,11 @@ impl Source<OsString> for FakeSource {
     }
   }
 
-  async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+  async fn arm(
+    &mut self,
+    key: &[OsString],
+    _globs: &RootGlobs,
+  ) -> Result<Armed<OsString, u32>, WatchError> {
     let path: PathBuf = key.iter().collect();
     self.calls.push(Call::Arm(path.clone()));
     self.note(SourceCall::Arm(path.clone()));
@@ -3946,7 +3950,8 @@ async fn a_signal_that_closes_after_the_probe_ends_the_attempt_before_the_source
   let retry_until = tokio::time::Instant::now().into_std() + super::RESTORE_RETRY_BUDGET;
   let step = tokio::time::timeout(
     Duration::from_secs(30),
-    h.owner.rearm_disarmed_root(&key("/a/b"), retry_until),
+    h.owner
+      .rearm_disarmed_root(&key("/a/b"), &RootGlobs::new(), retry_until),
   )
   .await
   .expect(
@@ -5850,9 +5855,13 @@ async fn watch_admission_backpressures_when_the_mailbox_is_full() {
       self.inner.canonicalize_key(key)
     }
 
-    async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+    async fn arm(
+      &mut self,
+      key: &[OsString],
+      globs: &RootGlobs,
+    ) -> Result<Armed<OsString, u32>, WatchError> {
       let _ = self.gate.recv().await;
-      self.inner.arm(key).await
+      self.inner.arm(key, globs).await
     }
 
     fn disarm(&mut self, handle: u32) {
@@ -5927,8 +5936,12 @@ async fn parts_future_drives_the_watcher_when_caller_spawned() {
     fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
       self.0.canonicalize_key(key)
     }
-    async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
-      self.0.arm(key).await
+    async fn arm(
+      &mut self,
+      key: &[OsString],
+      globs: &RootGlobs,
+    ) -> Result<Armed<OsString, u32>, WatchError> {
+      self.0.arm(key, globs).await
     }
     fn disarm(&mut self, handle: u32) {
       self.0.disarm(handle);
@@ -6013,13 +6026,17 @@ async fn dropping_the_parts_future_mid_arm_drops_the_source_for_reclamation() {
     fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
       self.inner.canonicalize_key(key)
     }
-    async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+    async fn arm(
+      &mut self,
+      key: &[OsString],
+      globs: &RootGlobs,
+    ) -> Result<Armed<OsString, u32>, WatchError> {
       if let Some(entered) = self.arm_entered.take() {
         let _ = entered.send(());
       }
       // Park forever: the cancellation arrives as this future being dropped.
       let _ = self.gate.recv().await;
-      self.inner.arm(key).await
+      self.inner.arm(key, globs).await
     }
     fn disarm(&mut self, handle: u32) {
       self.inner.disarm(handle);
@@ -6104,8 +6121,12 @@ async fn dropping_the_parts_future_mid_grow_drops_the_source_for_reclamation() {
     fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
       self.inner.canonicalize_key(key)
     }
-    async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
-      self.inner.arm(key).await
+    async fn arm(
+      &mut self,
+      key: &[OsString],
+      globs: &RootGlobs,
+    ) -> Result<Armed<OsString, u32>, WatchError> {
+      self.inner.arm(key, globs).await
     }
     fn disarm(&mut self, handle: u32) {
       self.inner.disarm(handle);
@@ -6222,7 +6243,11 @@ async fn parts_local_drives_a_thread_local_source_end_to_end() {
       Ok(key.to_vec())
     }
 
-    async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+    async fn arm(
+      &mut self,
+      key: &[OsString],
+      _globs: &RootGlobs,
+    ) -> Result<Armed<OsString, u32>, WatchError> {
       let handle = self.next_handle.get() + 1;
       self.next_handle.set(handle);
       self.live.borrow_mut().insert(handle, key.to_vec());
@@ -8102,7 +8127,11 @@ async fn source_next_cancellation_is_lossless_only_when_cancel_safe() {
     fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
       Ok(key.to_vec())
     }
-    async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+    async fn arm(
+      &mut self,
+      key: &[OsString],
+      _globs: &RootGlobs,
+    ) -> Result<Armed<OsString, u32>, WatchError> {
       Ok(Armed::new(1, key.to_vec()))
     }
     fn disarm(&mut self, _handle: u32) {}
@@ -8127,7 +8156,11 @@ async fn source_next_cancellation_is_lossless_only_when_cancel_safe() {
     fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
       Ok(key.to_vec())
     }
-    async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+    async fn arm(
+      &mut self,
+      key: &[OsString],
+      _globs: &RootGlobs,
+    ) -> Result<Armed<OsString, u32>, WatchError> {
       Ok(Armed::new(1, key.to_vec()))
     }
     fn disarm(&mut self, _handle: u32) {}
@@ -8724,7 +8757,11 @@ impl Source<OsString> for DrainableSource {
     Ok(key.to_vec())
   }
 
-  async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+  async fn arm(
+    &mut self,
+    key: &[OsString],
+    _globs: &RootGlobs,
+  ) -> Result<Armed<OsString, u32>, WatchError> {
     self.next_handle += 1;
     let handle = self.next_handle;
     self.live.insert(handle, key.to_vec());
@@ -12510,6 +12547,7 @@ async fn a_quarantine_armed_mid_widen_refuses_the_wider_arm_and_the_restore_puts
       Interest::all(),
       &mut gate,
       Debounce::Inherit,
+      &RootGlobs::new(),
     )
     .await;
 
@@ -12682,6 +12720,7 @@ async fn a_quarantine_armed_mid_reconcile_refuses_a_covered_newcomers_grow() {
       Interest::all(),
       &mut gate,
       Debounce::Inherit,
+      &RootGlobs::new(),
     )
     .await;
 
@@ -13921,7 +13960,7 @@ async fn the_tails_bounded_wait_reports_a_join_close_that_unwinds_in_its_own_dro
 /// could not return at all and the hand-poll below would report `Pending` rather than a verdict —
 /// an out-of-order check cannot merely add a call here.
 ///
-/// FAIL-ON-REVERT: answer the closed signal with `self.source.arm(key).await` again and the single
+/// FAIL-ON-REVERT: answer the closed signal with `self.source.arm(key, globs).await` again and the single
 /// poll parks on the wedge, with the `Arm` that must not have been issued on the ledger.
 #[tokio::test]
 async fn a_disjoint_watch_whose_signal_closes_mid_arm_is_terminal_and_arms_nothing() {
@@ -14611,6 +14650,7 @@ impl Source<HostileComponent> for HostileKeySource {
   async fn arm(
     &mut self,
     key: &[HostileComponent],
+    _globs: &RootGlobs,
   ) -> Result<Armed<HostileComponent, u32>, WatchError> {
     self.note(HostileCall::Arm(HostileComponent::names(key)));
     if self.wedged.iter().any(|wedge| wedge.as_slice() == key) {
@@ -16245,6 +16285,11 @@ async fn the_deferral_is_engaged_on_the_terminal_path_alone() {
 /// Queues one public `Watch` on the command mailbox exactly as [`Tributaries::watch`] does, with
 /// its reply slot already abandoned — the caller in this shape only asks whether the send was
 /// ADMITTED. Returns the mailbox's own verdict.
+///
+/// The refused `Command` rides back inside the `Err`, which is what makes that variant large —
+/// deliberately: a rejected send hands the whole command back so nothing it owns is dropped by
+/// the channel, and boxing it here would only move the same bytes to test-only heap.
+#[allow(clippy::result_large_err)]
 fn queue_public_watch(
   commands: &async_channel::Sender<super::Command<OsString, ()>>,
 ) -> Result<(), async_channel::TrySendError<super::Command<OsString, ()>>> {
@@ -16553,7 +16598,11 @@ async fn release_marks_handle_logically_dead_immediately_even_with_transport_pen
       Ok(key.to_vec())
     }
 
-    async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+    async fn arm(
+      &mut self,
+      key: &[OsString],
+      _globs: &RootGlobs,
+    ) -> Result<Armed<OsString, u32>, WatchError> {
       // Apply every deferred transport teardown FIRST (mirroring `FsSource::arm`).
       while let Some(released) = self.pending.pop_front() {
         self.transport_live.remove(&released);
@@ -16712,7 +16761,11 @@ async fn unclaimed_orphans_parked_rescan_is_suppressed_by_state_in_the_run_loop(
       Ok(key.to_vec())
     }
 
-    async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+    async fn arm(
+      &mut self,
+      key: &[OsString],
+      _globs: &RootGlobs,
+    ) -> Result<Armed<OsString, u32>, WatchError> {
       self.next_handle += 1;
       let handle = self.next_handle;
       self.live.insert(handle, key.to_vec());
@@ -17224,7 +17277,11 @@ impl Source<OsString> for TriggeredSource {
     Ok(key.to_vec())
   }
 
-  async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+  async fn arm(
+    &mut self,
+    key: &[OsString],
+    _globs: &RootGlobs,
+  ) -> Result<Armed<OsString, u32>, WatchError> {
     self.next_handle += 1;
     let handle = self.next_handle;
     self.live.insert(handle, key.to_vec());
@@ -18688,7 +18745,11 @@ impl Source<OsString> for SyncSource {
     Ok(key.to_vec())
   }
 
-  async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+  async fn arm(
+    &mut self,
+    key: &[OsString],
+    _globs: &RootGlobs,
+  ) -> Result<Armed<OsString, u32>, WatchError> {
     self.next_handle += 1;
     let handle = self.next_handle;
     self.live.insert(handle, key.to_vec());
@@ -18923,7 +18984,11 @@ impl Source<OsString> for HeldBeginSyncSource {
     Ok(key.to_vec())
   }
 
-  async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+  async fn arm(
+    &mut self,
+    key: &[OsString],
+    _globs: &RootGlobs,
+  ) -> Result<Armed<OsString, u32>, WatchError> {
     self.next_handle += 1;
     let handle = self.next_handle;
     self.live.insert(handle, key.to_vec());
@@ -19097,7 +19162,11 @@ impl Source<OsString> for HeldReplaceSource {
     Ok(key.to_vec())
   }
 
-  async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+  async fn arm(
+    &mut self,
+    key: &[OsString],
+    _globs: &RootGlobs,
+  ) -> Result<Armed<OsString, u32>, WatchError> {
     self.next_handle += 1;
     let handle = self.next_handle;
     self.live.insert(handle, key.to_vec());
@@ -20962,7 +21031,11 @@ mod reserved_namespace {
       Ok(key.to_vec())
     }
 
-    async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+    async fn arm(
+      &mut self,
+      key: &[OsString],
+      _globs: &RootGlobs,
+    ) -> Result<Armed<OsString, u32>, WatchError> {
       self.next_handle += 1;
       let handle = self.next_handle;
       self.live.insert(handle, key.to_vec());
@@ -21144,7 +21217,11 @@ mod reserved_namespace {
       Ok(key.to_vec())
     }
 
-    async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+    async fn arm(
+      &mut self,
+      key: &[OsString],
+      _globs: &RootGlobs,
+    ) -> Result<Armed<OsString, u32>, WatchError> {
       self.next_handle += 1;
       let handle = self.next_handle;
       self.live.insert(handle, key.to_vec());
@@ -21216,7 +21293,7 @@ mod ownership {
   /// and every source resource still live.
   ///
   /// FAIL-ON-REVERT: drop the close arm from `Owner::arm`'s `select_biased!` (back
-  /// to `self.source.arm(key).await?`) and `close()` never resolves — the timeout
+  /// to `self.source.arm(key, globs).await?`) and `close()` never resolves — the timeout
   /// below fires, which is exactly the reproduction #49 filed.
   #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
   async fn a_permanently_pending_arm_cannot_wedge_close() {
@@ -21232,7 +21309,11 @@ mod ownership {
         self.inner.canonicalize_key(key)
       }
 
-      async fn arm(&mut self, _key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+      async fn arm(
+        &mut self,
+        _key: &[OsString],
+        _globs: &RootGlobs,
+      ) -> Result<Armed<OsString, u32>, WatchError> {
         self
           .entered
           .store(true, core::sync::atomic::Ordering::SeqCst);
@@ -21961,8 +22042,12 @@ mod ownership {
         self.inner.canonicalize_key(key)
       }
 
-      async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
-        self.inner.arm(key).await
+      async fn arm(
+        &mut self,
+        key: &[OsString],
+        globs: &RootGlobs,
+      ) -> Result<Armed<OsString, u32>, WatchError> {
+        self.inner.arm(key, globs).await
       }
 
       fn disarm(&mut self, handle: u32) {

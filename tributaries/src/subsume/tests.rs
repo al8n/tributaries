@@ -8,7 +8,7 @@ use std::{
 use proptest::prelude::*;
 
 use super::{Subscription, Subsumer, UnwatchOutcome, WatchOutcome};
-use crate::interest::Interest;
+use crate::{interest::Interest, options::RootGlobs};
 
 /// The subsumer under test: fs key component `OsString`, no per-watch value, `u32`
 /// handles (the trivial stand-in for the real `tributary-fs` handle).
@@ -53,7 +53,8 @@ fn watch(s: &mut S, handles: &mut Handles, path: &str, interest: Interest) -> (u
     WatchOutcome::Covered { fs_root, sub, .. } => (*fs_root, *sub),
     WatchOutcome::Widen { sub, .. } | WatchOutcome::Disjoint { sub, .. } => (handles.mint(), *sub),
   };
-  s.commit_watch(&outcome, fs_root, &k).release();
+  s.commit_watch(&outcome, fs_root, &k, &RootGlobs::new())
+    .release();
   (fs_root, sub)
 }
 
@@ -104,7 +105,8 @@ fn descendant_is_covered() {
     }
     other => panic!("expected Covered by /a, got {other:?}"),
   };
-  s.commit_watch(&outcome, ra, &key("/a/b")).release();
+  s.commit_watch(&outcome, ra, &key("/a/b"), &RootGlobs::new())
+    .release();
 
   assert_eq!(root_keys(&s), BTreeSet::from([key("/a")]));
   assert_eq!(s.subscribers(ra), vec![sa, sb]);
@@ -139,7 +141,8 @@ fn ancestor_widens_and_repoints() {
     other => panic!("expected Widen, got {other:?}"),
   };
   let wide = h.mint();
-  s.commit_watch(&outcome, wide, &key("/a")).release();
+  s.commit_watch(&outcome, wide, &key("/a"), &RootGlobs::new())
+    .release();
 
   assert_ne!(wide, narrow);
   assert_eq!(root_keys(&s), BTreeSet::from([key("/a")]));
@@ -268,7 +271,8 @@ fn stale_broad_root_does_not_over_report_is_watched() {
     other => panic!("expected Widen, got {other:?}"),
   };
   let wide = h.mint();
-  s.commit_watch(&outcome, wide, &key("/a")).release();
+  s.commit_watch(&outcome, wide, &key("/a"), &RootGlobs::new())
+    .release();
   // Unwatch the widening /a watch: the root /a lives on for /a/b, now broader than it — exactly the
   // over-broad case shrink-in-place reclaims (the set-cover design). The departing key /a equals the root key
   // and no survivor is at /a, so the drop reports a shrink to the /a/b survivor cover.
@@ -314,7 +318,8 @@ fn stale_broad_root_does_not_over_report_is_watched() {
     matches!(re, WatchOutcome::Covered { .. }),
     "re-installing /a/c is Covered under the still-armed broad root — no re-arm",
   );
-  s.commit_watch(&re, wide, &key("/a/c")).release();
+  s.commit_watch(&re, wide, &key("/a/c"), &RootGlobs::new())
+    .release();
   assert!(
     view.is_watched(&key("/a/c")),
     "after re-install /a/c is watched again (self-healing, no silent loss)"
@@ -375,7 +380,8 @@ fn over_broad_drop_reports_survivor_antichain() {
     other => panic!("expected Widen, got {other:?}"),
   };
   let wide = h.mint();
-  s.commit_watch(&outcome, wide, &key("/a")).release();
+  s.commit_watch(&outcome, wide, &key("/a"), &RootGlobs::new())
+    .release();
 
   // Unwatch the widening /a: departing key /a == root key /a and no survivor is at /a, so the root is
   // over-broad and shrinks to the {/a/b, /a/c} survivor cover.
@@ -436,7 +442,8 @@ fn over_broad_antichain_collapses_nested_survivors() {
     other => panic!("expected Widen, got {other:?}"),
   };
   let wide = h.mint();
-  s.commit_watch(&outcome, wide, &key("/a")).release();
+  s.commit_watch(&outcome, wide, &key("/a"), &RootGlobs::new())
+    .release();
 
   match s.test_plan_unwatch(s_a) {
     Some(UnwatchOutcome::Dropped {
@@ -472,7 +479,8 @@ fn narrowed_cover_non_root_unwatch_reprunes() {
     other => panic!("expected Widen, got {other:?}"),
   };
   let wide = h.mint();
-  s.commit_watch(&outcome, wide, &key("/a")).release();
+  s.commit_watch(&outcome, wide, &key("/a"), &RootGlobs::new())
+    .release();
   s.test_plan_unwatch(s_a).expect("unwatch the widening /a");
   // Record the source's narrowed coverage exactly as the driver would (narrow-on-prune-issue).
   s.set_retained_cover(wide, Some(vec![key("/a/b"), key("/a/c")]))
@@ -516,7 +524,8 @@ fn equal_survivor_antichain_reports_no_reprune() {
     other => panic!("expected Widen, got {other:?}"),
   };
   let wide = h.mint();
-  s.commit_watch(&outcome, wide, &key("/a")).release();
+  s.commit_watch(&outcome, wide, &key("/a"), &RootGlobs::new())
+    .release();
   s.test_plan_unwatch(s_a).expect("unwatch the widening /a");
   // The narrowed cover the driver would record: the minimal antichain {/a/b, /a/c}.
   s.set_retained_cover(wide, Some(vec![key("/a/b"), key("/a/c")]))
@@ -552,7 +561,8 @@ fn retained_cover_for_tracks_current_membership() {
     other => panic!("expected Widen, got {other:?}"),
   };
   let wide = h.mint();
-  s.commit_watch(&outcome, wide, &key("/a")).release();
+  s.commit_watch(&outcome, wide, &key("/a"), &RootGlobs::new())
+    .release();
 
   // The /a subscriber still pins the wide root at its own key → not over-broad → None.
   assert_eq!(
@@ -592,7 +602,8 @@ fn retained_cover_for_collapses_nested_survivors() {
     other => panic!("expected Widen, got {other:?}"),
   };
   let wide = h.mint();
-  s.commit_watch(&outcome, wide, &key("/a")).release();
+  s.commit_watch(&outcome, wide, &key("/a"), &RootGlobs::new())
+    .release();
   s.test_plan_unwatch(s_a).expect("unwatch the widening /a");
 
   assert_eq!(
@@ -618,7 +629,8 @@ fn retained_cover_for_includes_a_newly_covered_subscriber() {
     other => panic!("expected Widen, got {other:?}"),
   };
   let wide = h.mint();
-  s.commit_watch(&outcome, wide, &key("/a")).release();
+  s.commit_watch(&outcome, wide, &key("/a"), &RootGlobs::new())
+    .release();
   s.test_plan_unwatch(s_a).expect("unwatch the widening /a");
   assert_eq!(
     s.test_retained_cover_for(wide, None),
@@ -655,7 +667,8 @@ fn retained_cover_for_joins_the_explicit_newcomer_before_commit() {
     other => panic!("expected Widen, got {other:?}"),
   };
   let wide = h.mint();
-  s.commit_watch(&outcome, wide, &key("/a")).release();
+  s.commit_watch(&outcome, wide, &key("/a"), &RootGlobs::new())
+    .release();
   s.test_plan_unwatch(s_a).expect("unwatch the widening /a");
 
   // An uncommitted newcomer under a pruned region joins the cover explicitly.
@@ -970,7 +983,8 @@ fn cohort_retirement_clones_values_linearly() {
       }
     };
     let _ = i;
-    s.commit_watch(&outcome, fs_root, &k).release();
+    s.commit_watch(&outcome, fs_root, &k, &RootGlobs::new())
+      .release();
   }
 
   // Count ONLY the retirement's clones.
@@ -1019,7 +1033,8 @@ fn cohort_construction_clones_values_linearly() {
       WatchOutcome::Covered { fs_root, .. } => *fs_root,
       WatchOutcome::Widen { .. } | WatchOutcome::Disjoint { .. } => 1,
     };
-    s.commit_watch(&outcome, fs_root, &k).release();
+    s.commit_watch(&outcome, fs_root, &k, &RootGlobs::new())
+      .release();
   }
 
   let spent = clones.load(Ordering::Relaxed);
@@ -1058,7 +1073,8 @@ fn per_event_attribution_does_not_scan_the_cohort() {
         WatchOutcome::Covered { fs_root, sub, .. } => (*fs_root, *sub),
         WatchOutcome::Widen { sub, .. } | WatchOutcome::Disjoint { sub, .. } => (1, *sub),
       };
-      s.commit_watch(&outcome, fs_root, &k).release();
+      s.commit_watch(&outcome, fs_root, &k, &RootGlobs::new())
+        .release();
       subs.push(sub);
     }
     COHORT_VISITS.with(|visits| visits.set(0));

@@ -17,14 +17,17 @@ pub use error::{
   BuildError, CloseError, ReplaceRootError, SyncRootError, UnwatchError, WatchRootError,
 };
 pub use event::{Event, EventKind, MovedEvent};
-pub use options::{OptionsError, WatcherOptions};
+pub use options::{OptionsError, RootOptions, WatcherOptions};
 pub use os::{Backend, BackendKind, BackendStats, ProbeStage, SourceError};
 pub use watcher::{
   CoverOutcome, RequestOutcome, RootHandle, SkipReason, SyncAdmission, SyncRootDenied, SyncTicket,
   Watcher,
 };
 
-pub use tributary_proto::{ChangeId, Epoch, Interest, Location, ScopeId, Segment};
+pub use tributary_proto::{
+  ChangeId, Epoch, Interest, Location, ScopeId, Segment,
+  glob::{Glob, GlobError, Globs},
+};
 
 // Test-only surface for the real-kernel integration suites: forcing an
 // inotify instance rebuild deterministically requires lowering the reader's

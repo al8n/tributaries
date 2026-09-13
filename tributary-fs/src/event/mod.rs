@@ -23,6 +23,7 @@ pub struct Event {
   kind: EventKind,
   epoch: Epoch,
   id: ChangeId,
+  is_dir: Option<bool>,
 }
 
 impl Event {
@@ -49,6 +50,7 @@ impl Event {
       kind,
       epoch: change.epoch(),
       id: change.id(),
+      is_dir: change.is_dir(),
     }
   }
 
@@ -145,6 +147,22 @@ impl Event {
   #[inline]
   pub const fn change_id(&self) -> ChangeId {
     self.id
+  }
+
+  /// The affected object's CLASS, where the backend proved it: `Some(true)` for
+  /// a directory, `Some(false)` for a non-directory, and `None` where nothing
+  /// proved either.
+  ///
+  /// `None` is the honest third answer, not a defaulted `false`: no stat is
+  /// performed to fill it in, so a backend that reports a bare path (and a
+  /// removal, whose object is already gone) leaves the class unknown. A
+  /// consumer that filters on this must treat `None` as unknown rather than as
+  /// "not a directory" — the same rule
+  /// [`RootOptions::include`](crate::RootOptions::include) itself follows when
+  /// it admits an unproven class.
+  #[inline]
+  pub const fn is_dir(&self) -> Option<bool> {
+    self.is_dir
   }
 
   /// Whether this is a [`Rescan`](EventKind::Rescan).

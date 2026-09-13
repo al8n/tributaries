@@ -15,7 +15,7 @@ use crate::{
   driver::Tributaries,
   error::WatchError,
   event::{Event, EventKind},
-  options::{TributariesOptions, WatchOptions},
+  options::{RootGlobs, TributariesOptions, WatchOptions},
   source::{Armed, Source, SourceEvent},
   subscription::Subscription,
 };
@@ -61,7 +61,11 @@ impl Source<OsString> for StreamSource {
     Ok(k.to_vec())
   }
 
-  async fn arm(&mut self, key: &[OsString]) -> Result<Armed<OsString, u32>, WatchError> {
+  async fn arm(
+    &mut self,
+    key: &[OsString],
+    _globs: &RootGlobs,
+  ) -> Result<Armed<OsString, u32>, WatchError> {
     self.next_handle += 1;
     let handle = self.next_handle;
     self.live.insert(handle, key.to_vec());

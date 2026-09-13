@@ -55,7 +55,7 @@ use crate::{
   event::Event,
   filter::{Filter, FilterInput},
   interest::Interest,
-  options::{Debounce, DebounceConfig, TributariesOptions, WatchOptions},
+  options::{Debounce, DebounceConfig, RootGlobs, TributariesOptions, WatchOptions},
   route::{ReservedEndpoints, RoutableEvent},
   source::{Armed, LocalSource, Source, SourceEvent, SyncOutcome, SyncToken},
   subscription::Subscription,
@@ -3804,7 +3804,7 @@ where
     value: &V,
     options: WatchOptions<C>,
   ) -> Result<Subscription, ReconcileStop> {
-    let (interest, filter, debounce) = options.into_parts();
+    let (interest, filter, debounce, globs) = options.into_parts();
     // SOURCE-PLANE ACQUISITION GATE, ahead of every other gate here because it is the widest of
     // them: this owner is quarantined ([`SourceDisposals::forgotten`]), so it will never issue
     // another [`Source::disarm`], [`Source::set_cover`], [`Source::end_sync`] or
@@ -3933,6 +3933,7 @@ where
         interest,
         &mut uninstalled,
         debounce,
+        &globs,
       )
       .await;
     // The canonicalized key is a SECOND caller-owned `Vec<C>` — the source built it out of the
@@ -3963,6 +3964,7 @@ where
   /// `filter` is the caller's admission gate in a slot the CALLER's frame owns, for the same
   /// reason: every committing arm `take`s it out to install, and every other exit leaves it there,
   /// so an uninstalled gate is never destroyed by this body. See the note at the call.
+  #[allow(clippy::too_many_arguments)]
   async fn reconcile_canonical_watch(
     &mut self,
     key: &[C],
@@ -3970,6 +3972,7 @@ where
     interest: Interest,
     filter: &mut Option<Filter<C>>,
     debounce: Debounce,
+    globs: &RootGlobs,
   ) -> Result<Subscription, ReconcileStop> {
     // Plan the watch, **re-planning past any dead covering root** so no subscription ever binds a
     // source-forgotten handle (the structural close of the dead-root-coverage class).
@@ -4103,7 +4106,7 @@ where
         } else {
           None
         };
-        let salvage = self.subsumer.commit_watch(&outcome, fs_root, key);
+        let salvage = self.subsumer.commit_watch(&outcome, fs_root, key, globs);
         self.retire_salvage(salvage);
         let salvage = self.filters.install(sub, Self::take_gate(filter));
         self.retire_salvage(salvage);
@@ -4116,7 +4119,7 @@ where
       }
       WatchOutcome::Disjoint { sub, .. } => {
         let sub = *sub;
-        let armed = match self.arm(key).await {
+        let armed = match self.arm(key, globs).await {
           Ok(armed) => armed,
           Err(stop) => {
             let salvage = self.subsumer.abort_watch(&outcome);
@@ -4138,7 +4141,7 @@ where
         // reverse index and `commit_watch`'s `by_handle` insert cannot clobber a live root's entry.
         // A contract-violating source is caught by the arm choke point's handle tripwire, whose
         // live-index half fires on ANY still-live alias before this commit is ever reached.
-        let salvage = self.subsumer.commit_watch(&outcome, handle, &fs_key);
+        let salvage = self.subsumer.commit_watch(&outcome, handle, &fs_key, globs);
         self.retire_salvage(salvage);
         let salvage = self.filters.install(sub, Self::take_gate(filter));
         self.retire_salvage(salvage);
@@ -4242,7 +4245,25 @@ where
           let fs_key = armed.canonical_key().to_vec();
           if self.subsumer.fs_path_preserves_plan(&fs_key, unwatch) {
             let gate = Self::take_gate(filter);
-            self.commit_widen(&outcome, handle, &fs_key, sub, gate, debounce, &repointed);
+            // The retarget PRESERVED the handle, so the root keeps the words it was
+            // armed with — a source that widens in place re-keys its watch, it does not
+            // re-configure it. Record what the source actually holds rather than the
+            // newcomer's seats, which this path never asked it to adopt.
+            let armed_globs = self
+              .subsumer
+              .root_globs(handle)
+              .cloned()
+              .unwrap_or_default();
+            self.commit_widen(
+              &outcome,
+              handle,
+              &fs_key,
+              sub,
+              gate,
+              debounce,
+              &repointed,
+              &armed_globs,
+            );
             return Ok(sub);
           }
           // A canonicalization race: the retarget committed a key that does
@@ -4315,7 +4336,7 @@ where
         for &old in unwatch {
           self.source.disarm(old);
         }
-        let armed = match self.arm(key).await {
+        let armed = match self.arm(key, globs).await {
           Ok(armed) => armed,
           // The wider arm lost the close race, so this caller's [`CloseReply`] is CONSUMED and in
           // hand — which is a TERMINAL state of the restore rather than a posture to run it under,
@@ -4384,7 +4405,9 @@ where
         // by the arm choke point's handle tripwire — its live-index half covers exactly these
         // still-recorded roots — before this commit is ever reached.
         let gate = Self::take_gate(filter);
-        self.commit_widen(&outcome, handle, &fs_key, sub, gate, debounce, &repointed);
+        self.commit_widen(
+          &outcome, handle, &fs_key, sub, gate, debounce, &repointed, globs,
+        );
         Ok(sub)
       }
     }
@@ -4522,8 +4545,9 @@ where
     filter: Filter<C>,
     debounce: Debounce,
     repointed: &[Subscription],
+    globs: &RootGlobs,
   ) {
-    let salvage = self.subsumer.commit_watch(outcome, handle, fs_key);
+    let salvage = self.subsumer.commit_watch(outcome, handle, fs_key, globs);
     self.retire_salvage(salvage);
     let salvage = self.filters.install(sub, filter);
     self.retire_salvage(salvage);
@@ -4847,7 +4871,11 @@ where
   /// it would retire healthy roots over a condition that says nothing about them — the defect the
   /// release-and-rearm restore exists to prevent. What bounds that excursion is the population
   /// argument on [`forgotten`](SourceDisposals::forgotten), not this gate.
-  async fn arm(&mut self, key: &[C]) -> Result<(S::Handle, Vec<C>), ReconcileStop> {
+  async fn arm(
+    &mut self,
+    key: &[C],
+    globs: &RootGlobs,
+  ) -> Result<(S::Handle, Vec<C>), ReconcileStop> {
     // THE ACQUISITION FENCE. Ahead of the close race deliberately: a refusal issues no `Source`
     // call, so there is nothing for a close to preempt and no reply to consume — the run loop's own
     // biased `select` still has the queued close waiting for it, exactly as it does behind the
@@ -4863,7 +4891,7 @@ where
       // Held in a slot the race only BORROWS, for the reason `retire_raced_source_future` gives:
       // the `select` destroys what it owns ahead of the winning handler, and destroying a source
       // future runs caller code.
-      let mut raced = core::pin::pin!(Some(source.arm(key)));
+      let mut raced = core::pin::pin!(Some(source.arm(key, globs)));
       // The winner leaves the race as OWNED data — the raw arm result, adopted BELOW rather than in
       // the arm — so the seam entry and the adoption both find `self` fully released. That is also
       // what lets the slot outlive the `select`: neither of them could take `&mut self` while a
@@ -5347,7 +5375,16 @@ where
       else {
         continue;
       };
-      match self.rearm_disarmed_root(&root_key, retry_until).await {
+      // THIS root's own words, not the reconcile's: the widen that released it carries
+      // the NEWCOMER's glob seats, and restoring a survivor under those would re-scope
+      // coverage its subscribers never asked to change — silently, since a restore owes
+      // them a `Rescan` about the gap, not about a narrower watch. Cloned so the
+      // subsumer borrow ends before the re-arm takes `&mut self`.
+      let globs = self.subsumer.root_globs(old).cloned().unwrap_or_default();
+      match self
+        .rearm_disarmed_root(&root_key, &globs, retry_until)
+        .await
+      {
         RearmStep::Armed(new_handle, fs_key) if fs_key == root_key => {
           // The re-arm returns a GENERATION-UNIQUE handle by contract (see `Source::Handle`), so it
           // aliases neither `old` nor any not-yet-restored sibling still recorded here — a fresh
@@ -5540,10 +5577,11 @@ where
   async fn rearm_disarmed_root(
     &mut self,
     root_key: &[C],
+    globs: &RootGlobs,
     retry_until: Instant,
   ) -> RearmStep<C, S::Handle> {
     loop {
-      match self.rearm_racing_close(root_key).await {
+      match self.rearm_racing_close(root_key, globs).await {
         // Armed, at its own key or a divergent one — which of the two it is stays the caller's to
         // decide, exactly as it was.
         RearmAttempt::Armed(handle, fs_key) => return RearmStep::Armed(handle, fs_key),
@@ -5624,7 +5662,11 @@ where
   /// the arm future's own, so it conditions nothing further — so [`parts`](Tributaries::parts)'
   /// promise still proves out (`assert_generic_owner_send`) and
   /// [`parts_local`](Tributaries::parts_local) still withholds it.
-  async fn rearm_racing_close(&mut self, key: &[C]) -> RearmAttempt<C, S::Handle> {
+  async fn rearm_racing_close(
+    &mut self,
+    key: &[C],
+    globs: &RootGlobs,
+  ) -> RearmAttempt<C, S::Handle> {
     let raced_out = {
       // Split-borrow so the two arms stay disjoint, exactly as `arm` and `replace_racing_close` do:
       // the close arm reads `&self.closes` while the arm reborrows `&mut self.source`. Both futures
@@ -5636,7 +5678,7 @@ where
       // Held in a slot the race only BORROWS, for the reason `retire_raced_source_future` gives:
       // the `select` destroys what it owns ahead of the winning handler, and destroying a source
       // future runs caller code.
-      let mut raced = core::pin::pin!(Some(source.arm(key)));
+      let mut raced = core::pin::pin!(Some(source.arm(key, globs)));
       let raced_out = {
         let arm = raced
           .as_mut()
@@ -7714,7 +7756,7 @@ where
         let mut salvage = Salvage::new();
         salvage.keep_key(key);
         salvage.keep_value(value);
-        let (_, filter, _) = options.into_parts();
+        let (_, filter, _, _) = options.into_parts();
         salvage.keep_filter(filter);
         self.retire_salvage(salvage);
       }
@@ -8249,6 +8291,7 @@ fn assert_rc_local_source_constructs<R: RuntimeLite>() {
     fn arm(
       &mut self,
       key: &[OsString],
+      _globs: &RootGlobs,
     ) -> impl Future<Output = Result<Armed<OsString, u32>, WatchError>> {
       let state = Rc::clone(&self.state);
       let canonical = key.to_vec();

@@ -26,7 +26,7 @@ pub use error::{
 pub use event::{Event, EventKind};
 pub use filter::{Filter, FilterInput};
 pub use interest::Interest;
-pub use options::{Debounce, DebounceConfig, TributariesOptions, WatchOptions};
+pub use options::{Debounce, DebounceConfig, RootGlobs, TributariesOptions, WatchOptions};
 pub use source::{Armed, LocalSource, Source, SourceEvent, SyncOutcome, SyncToken};
 pub use subscription::{InstanceId, Subscription};
 pub use view::{Snapshot, WatchView};
@@ -54,10 +54,14 @@ pub use driver::SmolTributaries;
 #[cfg_attr(docsrs, doc(cfg(feature = "fs")))]
 pub use tributary_fs::{RootHandle, WatcherOptions};
 
-/// The identity/coordinate primitives — change id, epoch, location — are owned by
+/// The identity/coordinate primitives — change id, epoch, location — and the glob
+/// vocabulary the per-root seats ([`RootGlobs`]) are spelled in are owned by
 /// `tributary-proto` and re-exported from there directly (`tributary-fs` merely
 /// re-exports them itself). The per-watch [`Interest`] is **not** among them: the
 /// umbrella owns its own source-neutral mask (aligned to [`EventKind`]), and the
 /// proto/fs `Interest` stays a purely fs-internal arm mask for consumers driving a raw
 /// fs watcher.
-pub use tributary_proto::{ChangeId, Epoch, Location, Segment};
+pub use tributary_proto::{
+  ChangeId, Epoch, Location, Segment,
+  glob::{Glob, GlobError, Globs},
+};

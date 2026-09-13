@@ -46,6 +46,7 @@ use crate::{
   event::Event,
   filter::Filter,
   interest::Interest,
+  options::RootGlobs,
   subscription::{InstanceId, Subscription},
   view::WatchView,
 };
@@ -276,6 +277,11 @@ pub(crate) type Shared<C, V, H> = Arc<ArcSwap<Published<C, V, H>>>;
 /// [`root_subs`](Subsumer::root_subs) map instead, where an append is `O(1)` and the published
 /// snapshot receives this lean record; nothing on the read plane ever needed the list.
 ///
+/// It carries the [`globs`](Self::globs) the root was ARMED with, because they are a
+/// property of the armed watch rather than of any one subscription: a restore re-arms a
+/// disarmed root by its key, and re-arming it under different words would silently
+/// re-scope coverage the subscribers under it never asked to change.
+///
 /// It carries **no** caller value and **no** interest either. Attribution
 /// ([`covering`](crate::WatchView::covering)) reads the owning value from the live-subscription
 /// [`covers`](Published::covers) plane, not from the armed root — an armed root can outlive the
@@ -293,6 +299,12 @@ pub(crate) struct RootRecord<C, H> {
   pub(crate) key: Vec<C>,
   /// The armed root handle.
   pub(crate) handle: H,
+  /// The per-root glob words this root was ARMED with — the [`RootGlobs`] the
+  /// subscription whose reconcile created it carried. Kept so a re-arm of this same root
+  /// (the widen restore's [`rearm_disarmed_root`](crate::Source::arm)) asks the source
+  /// for the coverage it already had, rather than for whatever the reconcile that
+  /// happens to be running wants.
+  pub(crate) globs: RootGlobs,
   /// The source's ACTUAL coverage for this root (set-cover): `None` = **full** coverage (a
   /// fresh/widened root never narrowed, or one grown back to its own key — the cancel-equivalent),
   /// `Some(cover)` = narrowed to the prefix-free antichain `cover`. Kept EXACT — it names the source's
@@ -947,9 +959,10 @@ where
   /// simply `fs_root_key`.
   ///
   /// For [`WatchOutcome::Covered`] no arm happened (the covering root was armed — and
-  /// its key validated — when first created), so `fs_root_key` is ignored and the
-  /// newcomer's own key is used unchanged. Each committed mutation republishes the
-  /// watch-set (design §5).
+  /// its key validated — when first created), so `fs_root_key` and `globs` are both
+  /// ignored and the newcomer's own key is used unchanged — which is also why a covered
+  /// newcomer's glob seats never re-scope the root already serving it. Each committed
+  /// mutation republishes the watch-set (design §5).
   ///
   /// Returns the caller-owned state the commit displaced — above all the publication its republish
   /// swapped out, which is the last owner of every node this commit unlinked (see [`Salvage`]).
@@ -958,6 +971,7 @@ where
     outcome: &WatchOutcome<H>,
     fs_root: H,
     fs_root_key: &[C],
+    globs: &RootGlobs,
   ) -> Salvage<C, V, H> {
     let mut salvage = Salvage::new();
     match outcome {
@@ -1006,6 +1020,7 @@ where
         let record = RootRecord {
           key: root_key.clone(),
           handle: fs_root,
+          globs: globs.clone(),
           // A freshly-armed root covers its whole key (`Interest::all`) — full coverage, never
           // narrowed (a set-cover prune).
           retained_cover: None,
@@ -1056,6 +1071,7 @@ where
         let record = RootRecord {
           key: root_key.clone(),
           handle: fs_root,
+          globs: globs.clone(),
           // The wider root is freshly armed `Interest::all` over its whole key — full coverage,
           // never narrowed (any pending set_cover for the released subsumed handles is moot);
           // set-cover .
@@ -1471,6 +1487,17 @@ where
     let record = self.index.get(key)?;
     let cohort = self.root_subs.get(&fs_root).map_or(&[][..], Vec::as_slice);
     Some((record.key.as_slice(), cohort))
+  }
+
+  /// The per-root glob words the live root `fs_root` was ARMED with — [`None`] for a
+  /// handle naming no live root.
+  ///
+  /// The widen restore reads it to re-arm a disarmed root under its OWN words: the
+  /// reconcile that released it carries the *newcomer's* seats, and arming a survivor
+  /// with those would re-scope coverage its subscribers never asked to change.
+  pub(crate) fn root_globs(&self, fs_root: H) -> Option<&RootGlobs> {
+    let key = self.by_handle.get(&fs_root)?;
+    Some(&self.index.get(key)?.globs)
   }
 
   /// The routing cohort of the live root `fs_root` — empty for a handle naming no live root.

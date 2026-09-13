@@ -105,11 +105,15 @@ pub struct Change {
   location: Location,
   kind: ChangeKind,
   epoch: Epoch,
+  is_dir: Option<bool>,
 }
 
 impl Change {
   /// Builds a change. The core mints [`id`](Self::id), tags [`scope`](Self::scope) from
   /// the originating watch, and stamps the scope's current [`epoch`](Self::epoch).
+  ///
+  /// `is_dir` is the object's class where the source PROVED it, and [`None`] where
+  /// nothing did — see [`is_dir`](Self::is_dir).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new(
     id: ChangeId,
@@ -117,6 +121,7 @@ impl Change {
     location: Location,
     kind: ChangeKind,
     epoch: Epoch,
+    is_dir: Option<bool>,
   ) -> Self {
     Self {
       id,
@@ -124,6 +129,7 @@ impl Change {
       location,
       kind,
       epoch,
+      is_dir,
     }
   }
 
@@ -159,6 +165,23 @@ impl Change {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn kind(&self) -> &ChangeKind {
     &self.kind
+  }
+
+  /// The object's class at this change's location: `Some(true)` for a directory,
+  /// `Some(false)` for a non-directory, [`None`] where nothing proved it.
+  ///
+  /// This is the SAME three-valued fact the OS records already carry, threaded
+  /// through unchanged — not a stat the core performs. A backend that reports a
+  /// class reports it (inotify's `IN_ISDIR`, FSEvents' item flags, a listing
+  /// entry's own kind); one that does not leaves [`None`], and so does every
+  /// [`Rescan`](ChangeKind::Rescan), which is a coverage instruction rather than
+  /// a statement about one object.
+  ///
+  /// A consumer filtering on it must therefore treat [`None`] as UNKNOWN and fail
+  /// OPEN — an unproven class is not a proven non-directory.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_dir(&self) -> Option<bool> {
+    self.is_dir
   }
 }
 
