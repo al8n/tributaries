@@ -1416,7 +1416,11 @@ impl SourceHandle {
 }
 
 /// The clonable port one whole-root FID-map reseed is requested through (#74).
-#[derive(Clone)]
+///
+/// `Debug` because [`ScopePort`](crate::os::ScopePort) derives it and carries this
+/// variant: a port with no `Debug` form makes the whole seam underivable on Linux
+/// while every other host still compiles.
+#[derive(Debug, Clone)]
 pub(crate) struct RecoveryPort {
   control: mpsc::Sender<Control>,
   wake: Arc<WakeState>,

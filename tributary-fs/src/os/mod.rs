@@ -1119,10 +1119,13 @@ impl ScopeFrame {
   /// the two seams disagree about what they are fencing.
   ///
   /// Every unknown leg PASSES (see the type doc).
-  // Consumed by the inotify arm's own fence, which is Linux-only, and by the fake
-  // executor that models it. Every other build carries the frame without ever
-  // being able to ask it anything.
-  #[cfg_attr(not(any(all(target_os = "linux", not(miri)), test)), allow(dead_code))]
+  // Compiled for exactly its two readers and for no other shape: the inotify arm's
+  // own fence (Linux, non-miri) and the fake executor that models it, which lives
+  // behind `all(test, feature = "tokio")`. A build outside that union carries the
+  // frame without ever being able to ask it anything, so the method would be dead
+  // there — and dead is what `-D warnings` refuses and what an `allow` would only
+  // hide. The union is the gate; widening either reader widens this.
+  #[cfg(any(all(target_os = "linux", not(miri)), all(test, feature = "tokio")))]
   pub(crate) fn crossed_by(self, dev: Option<u64>, mnt_id: Option<u64>) -> bool {
     let device_boundary = matches!(
       (self.root_dev, dev),

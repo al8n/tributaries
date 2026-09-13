@@ -406,7 +406,7 @@ pub(crate) enum Effect {
     expected: Option<ExpectedObject>,
     /// The scope's descent frame at the moment the arm was issued. The executor
     /// stats the object it opened and REFUSES the arm when the landing sits
-    /// across this frame ([`ScopeFrame::crossed_by`]) — the prevention half of
+    /// across this frame (`ScopeFrame::crossed_by`) — the prevention half of
     /// the mount-boundary design, and the only one that runs on an arm the
     /// enumerate fence never saw.
     ///

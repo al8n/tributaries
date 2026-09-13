@@ -7527,7 +7527,7 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
   /// Reached only under a descending profile. `expected` is the object the arm
   /// must confirm the open lands on (the enumerate→arm rename guard); `frame` is
   /// the scope's descent frame, and an arm whose landing sits ACROSS it is
-  /// refused before anything installs ([`ScopeFrame::crossed_by`]).
+  /// refused before anything installs (`ScopeFrame::crossed_by`).
   ///
   /// The two guards are independent and both are needed. `expected` asks "is
   /// this the object the enumerate saw" and is `None` for the arms that never
