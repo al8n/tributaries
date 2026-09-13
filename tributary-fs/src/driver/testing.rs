@@ -1964,6 +1964,7 @@ impl FsOps for FakeFs {
       // `on_mounts_refreshed` directly.
       root_incarnation: None,
       namespace_transitions: None,
+      overflowed: false,
     }
   }
 

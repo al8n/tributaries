@@ -706,6 +706,7 @@ fn classify_walk_skip(err: Errno) -> WalkSkip {
 /// a differing device is not necessarily a mount (a btrfs subvolume has its own
 /// and no mountinfo row), and a location no table will ever carry would cover the
 /// whole root on every interval for the life of the scope.
+#[derive(Debug)]
 pub(crate) struct SeedWalk {
   /// One entry per directory the walk mapped, each linked to its parent.
   pub(crate) entries: Vec<SeedEntry>,

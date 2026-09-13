@@ -27668,6 +27668,10 @@ mod control_batch_publication_order {
       name: Segment::new("churn"),
       path: Arc::new(path.to_path_buf()),
       expected: None,
+      // The scope's descent frame rides every arm. This cell answers its own
+      // requests and never puts one to the fence, so an empty frame — both legs
+      // unknown, which refuses nothing — is the honest value.
+      frame: crate::os::ScopeFrame::default(),
     }
   }
 

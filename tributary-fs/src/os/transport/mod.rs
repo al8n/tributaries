@@ -349,6 +349,15 @@ pub(crate) enum SourceMessage<E> {
   /// core answers it with the ordinary whole-root cover. It rides this queue
   /// rather than a side channel because it is a statement about the same tree the
   /// events describe, and the queue is that tree's one ordered lane.
+  ///
+  /// Compiled for exactly the shapes that can CONSTRUCT one: the fanotify source
+  /// and reader, which are the only walks this crate runs. Every other host
+  /// reaches its tree through a kernel-recursive mark or a per-directory re-arm
+  /// and honors no boundary anywhere, so carrying the variant there would carry a
+  /// message nothing can send — which `-D warnings` refuses, and which an `allow`
+  /// would only hide. Each arm that handles it outside a Linux-only file carries
+  /// the same gate.
+  #[cfg(all(target_os = "linux", not(miri)))]
   Honored(Vec<std::path::PathBuf>),
 }
 

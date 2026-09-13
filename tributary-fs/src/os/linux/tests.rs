@@ -3,13 +3,84 @@ use std::path::Path;
 use tributary_proto::WatchId;
 
 use super::{
-  attribute_events, excluded, fs_type_is_local, fs_type_is_remote,
+  MAX_MOUNT_ROWS_UNDER_ROOT, MAX_MOUNTINFO_LINE, attribute_events, excluded, fs_type_is_local,
+  fs_type_is_remote,
   inotify::{
     decode::{IN_CREATE, IN_IGNORED, IN_ISDIR, IN_Q_OVERFLOW, InotifyMask, RawInotifyEvent},
     table::WdTable,
   },
   locality_refusal, mounts_from_file, parse_mountinfo,
 };
+
+/// [`parse_mountinfo`] for a fixture that is inside every ceiling — which every
+/// fixture below is, except the ones whose whole subject is the ceiling.
+fn parsed(content: &[u8], root: &Path) -> Vec<crate::os::MountRow> {
+  parse_mountinfo(content, root).expect("the fixture is inside every parser ceiling")
+}
+
+/// A mountinfo table of `rows` mounts, every one strictly under `/mnt`.
+fn table_under_mnt(rows: usize) -> String {
+  let mut table = String::new();
+  for i in 0..rows {
+    let id = 100 + i;
+    table.push_str(&format!(
+      "{id} 25 0:{id} / /mnt/v{i} rw,relatime shared:1 - tmpfs tmpfs rw\n"
+    ));
+  }
+  table
+}
+
+/// The row ceiling is counted on RETAINED rows, and one past it refuses the whole
+/// reading. Truncating instead would hand the core a table missing the rows it
+/// could not hold — which reads as a pile of departures and covers for every one
+/// of them, on every interval, while claiming authority it does not have.
+#[test]
+fn mountinfo_over_the_row_ceiling_overflows() {
+  let table = table_under_mnt(MAX_MOUNT_ROWS_UNDER_ROOT + 1);
+  assert!(
+    parse_mountinfo(table.as_bytes(), Path::new("/mnt")).is_none(),
+    "one row past the ceiling is an overflow, not a truncation"
+  );
+}
+
+/// And the ceiling itself is inclusive: a table exactly at it is an ordinary
+/// reading, so the bound never costs a root that merely sits on the line.
+#[test]
+fn rows_at_the_ceiling_are_kept() {
+  let table = table_under_mnt(MAX_MOUNT_ROWS_UNDER_ROOT);
+  let rows = parse_mountinfo(table.as_bytes(), Path::new("/mnt"))
+    .expect("a table exactly at the ceiling still reads");
+  assert_eq!(
+    rows.len(),
+    MAX_MOUNT_ROWS_UNDER_ROOT,
+    "every row up to the ceiling is retained"
+  );
+}
+
+/// The LINE ceiling bounds the allocation rather than the name: the reader takes
+/// at most a bounded number of bytes per line, so a line that never ends cannot
+/// grow the buffer to the size of the source before anything notices.
+#[test]
+fn a_mountinfo_line_over_the_ceiling_overflows() {
+  let long = "x".repeat(MAX_MOUNTINFO_LINE + 1);
+  let table = format!("36 25 0:32 / /mnt/{long} rw,relatime shared:1 - tmpfs tmpfs rw\n");
+  assert!(
+    parse_mountinfo(table.as_bytes(), Path::new("/mnt")).is_none(),
+    "a line past the ceiling is an overflow"
+  );
+
+  // A long line UNDER the ceiling is an ordinary row: the bound is on how much
+  // this parser will hold, not on how a host may name its mount points.
+  let ordinary = "x".repeat(1024);
+  let table = format!("36 25 0:32 / /mnt/{ordinary} rw,relatime shared:1 - tmpfs tmpfs rw\n");
+  assert_eq!(
+    parse_mountinfo(table.as_bytes(), Path::new("/mnt"))
+      .expect("a long-but-bounded line reads")
+      .len(),
+    1,
+    "a name well inside the ceiling is parsed like any other"
+  );
+}
 
 fn watch(n: u64) -> WatchId {
   WatchId::new(core::num::NonZeroU64::new(n).unwrap())
@@ -132,7 +203,7 @@ fn mountinfo_extracts_mounts_strictly_under_root() {
 malformed line
 40 25 0:36 /
 ";
-  let mounts = parse_mountinfo(content.as_bytes(), Path::new("/mnt/a"));
+  let mounts = parsed(content.as_bytes(), Path::new("/mnt/a"));
   assert_eq!(
     mounts,
     vec![row("/mnt/a/inner", 37, 36, 0, 33)],
@@ -166,7 +237,7 @@ fn mountinfo_carries_the_identity_of_every_row() {
 41 36 259:3 / /mnt/nvme rw,relatime shared:9 - ext4 /dev/nvme0n1p3 rw
 42 36 0:57 /sub /mnt/bind rw,relatime shared:7 - btrfs /dev/sda1 rw
 ";
-  let mounts = parse_mountinfo(content.as_bytes(), Path::new("/mnt"));
+  let mounts = parsed(content.as_bytes(), Path::new("/mnt"));
   assert_eq!(
     mounts,
     vec![
@@ -215,7 +286,7 @@ fn mountinfo_returns_every_row_at_one_location() {
 40 36 0:44 / /mnt/stack rw,relatime shared:5 - tmpfs lower rw
 44 40 0:48 / /mnt/stack rw,relatime shared:6 - tmpfs upper rw
 ";
-  let mounts = parse_mountinfo(stack.as_bytes(), Path::new("/mnt"));
+  let mounts = parsed(stack.as_bytes(), Path::new("/mnt"));
   assert_eq!(
     mounts,
     vec![
@@ -241,7 +312,7 @@ fn mountinfo_returns_every_row_at_one_location() {
 43 1 0:47 / /root/other rw,relatime shared:8 - tmpfs elsewhere rw
 ";
   assert_eq!(
-    parse_mountinfo(unrelated.as_bytes(), Path::new("/root")),
+    parsed(unrelated.as_bytes(), Path::new("/root")),
     vec![
       row("/root/x/y", 40, 1, 0, 44),
       row("/root/x", 41, 1, 0, 45),
@@ -281,14 +352,14 @@ fn a_stacked_mounts_departure_is_a_transition_between_two_reads() {
 36 25 0:32 / /mnt rw,relatime shared:1 - tmpfs tmpfs rw
 55 36 0:44 / /mnt/vol rw,relatime shared:3 - tmpfs hidden rw
 ";
-  let before = parse_mountinfo(stacked.as_bytes(), Path::new("/mnt"));
+  let before = parsed(stacked.as_bytes(), Path::new("/mnt"));
 
   // `umount -l /mnt/vol` detaches the moved mount; the mount it hid is revealed.
   let unstacked = "\
 36 25 0:32 / /mnt rw,relatime shared:1 - tmpfs tmpfs rw
 55 36 0:44 / /mnt/vol rw,relatime shared:3 - tmpfs hidden rw
 ";
-  let after = parse_mountinfo(unstacked.as_bytes(), Path::new("/mnt"));
+  let after = parsed(unstacked.as_bytes(), Path::new("/mnt"));
 
   // Asserted FIRST: it is what the defect costs, so it is what a parse that
   // collapses the location has to trip on.
@@ -332,7 +403,7 @@ fn mountinfo_returns_both_rows_of_a_torn_read_with_a_duplicate_id() {
 44 36 0:48 / /mnt/after rw,relatime shared:5 - tmpfs twice rw
 ";
   assert_eq!(
-    parse_mountinfo(torn.as_bytes(), Path::new("/mnt")),
+    parsed(torn.as_bytes(), Path::new("/mnt")),
     vec![
       row("/mnt/before", 44, 36, 0, 48),
       row("/mnt/after", 44, 36, 0, 48),
@@ -360,7 +431,7 @@ zz 25 0:32 / /mnt/bad-id rw,relatime shared:1 - tmpfs tmpfs rw
 38 25 0:x / /mnt/bad-minor rw,relatime shared:3 - tmpfs tmpfs rw
 39 -1 0:37 / /mnt/bad-parent rw,relatime shared:4 - tmpfs tmpfs rw
 ";
-  let mounts = parse_mountinfo(content.as_bytes(), Path::new("/mnt"));
+  let mounts = parsed(content.as_bytes(), Path::new("/mnt"));
   assert_eq!(
     mounts,
     vec![
@@ -400,7 +471,7 @@ zz 25 0:32 / /mnt/bad-id rw,relatime shared:1 - tmpfs tmpfs rw
 #[test]
 fn mountinfo_unescapes_octal_fields() {
   let content = "36 25 0:32 / /mnt/with\\040space rw shared:1 - tmpfs tmpfs rw\n";
-  let mounts = parse_mountinfo(content.as_bytes(), Path::new("/mnt"));
+  let mounts = parsed(content.as_bytes(), Path::new("/mnt"));
   assert_eq!(mounts, vec![row("/mnt/with space", 36, 25, 0, 32)]);
 }
 
@@ -446,7 +517,7 @@ fn mountinfo_keeps_the_raw_whitespace_bytes_of_a_mount_point() {
 37 25 0:33 / /mnt/with\\040space rw,relatime shared:2 - tmpfs tmpfs rw
 38  25 0:34 / /mnt/doubled rw,relatime shared:3 - tmpfs tmpfs rw
 ";
-  let mounts = parse_mountinfo(content.as_bytes(), Path::new("/mnt"));
+  let mounts = parsed(content.as_bytes(), Path::new("/mnt"));
   assert_eq!(
     mounts,
     vec![
@@ -508,7 +579,7 @@ fn mountinfo_parses_a_non_utf8_mount_point_and_keeps_the_rows_around_it() {
      would refuse"
   );
 
-  let mounts = parse_mountinfo(&content, Path::new("/mnt"));
+  let mounts = parsed(&content, Path::new("/mnt"));
   assert_eq!(
     mounts,
     vec![
@@ -638,15 +709,25 @@ fn an_unreadable_mountinfo_file_answers_none() {
 /// shared by the whole shard — and the RATIO is skipped there, because at sixteen
 /// rows the fixed costs are the measurement. What is asserted unconditionally at
 /// both sizes is that every member came back.
+///
+/// The big size is the RETAINED-ROW CEILING itself
+/// ([`MAX_MOUNT_ROWS_UNDER_ROOT`]), because that is now the largest table this
+/// parser will ever build: a root with more rows than that under it is refused
+/// whole rather than parsed, so the ceiling is exactly the worst case the cost
+/// verdict has to speak for.
 #[test]
 fn a_full_namespace_stack_is_parsed_in_linear_time() {
-  // The kernel's own default `fs.mount-max`, and an octave below it. Miri gets a
-  // token stack: the interpreted cost of the real one would fall on the shard
-  // that shares a single 32-bit address space.
+  // The parser's own retained-row ceiling, and an octave below it — the largest
+  // table it will ever build, and half a step down from it. Miri gets a token
+  // stack: the interpreted cost of the real one would fall on the shard that
+  // shares a single 32-bit address space.
   let (small, big): (u64, u64) = if cfg!(miri) {
     (4, 16)
   } else {
-    (12_500, 100_000)
+    (
+      (MAX_MOUNT_ROWS_UNDER_ROOT / 8) as u64,
+      MAX_MOUNT_ROWS_UNDER_ROOT as u64,
+    )
   };
 
   // One mount point's whole stack as mountinfo spells it, plus the elapsed of the
@@ -664,7 +745,7 @@ fn a_full_namespace_stack_is_parsed_in_linear_time() {
       ));
     }
     let started = std::time::Instant::now();
-    let mounts = parse_mountinfo(table.as_bytes(), Path::new("/mnt"));
+    let mounts = parsed(table.as_bytes(), Path::new("/mnt"));
     (started.elapsed(), mounts)
   }
 
@@ -692,7 +773,7 @@ fn a_full_namespace_stack_is_parsed_in_linear_time() {
   assert_eq!(
     big_mounts,
     whole_stack(2_200_000, big),
-    "and that holds at the namespace's own limit, however deep the stack is"
+    "and that holds at the ceiling itself, however deep the stack is"
   );
 
   // 8x the input. Linear grows about 8x with it; quadratic grows about 64x. The
@@ -752,6 +833,7 @@ fn a_mount_sample_the_namespace_moved_under_is_not_a_table() {
           dev: Some(root),
         }]
       }),
+      overflowed: false,
       root,
       stable,
       namespace: None,
@@ -1103,7 +1185,7 @@ fn a_quiet_namespace_holds_its_transition_count_still() {
 #[test]
 fn mountinfo_unescape_survives_an_out_of_range_octal_triple() {
   let content = b"36 25 0:32 / /mnt/hi\\777there rw shared:1 - tmpfs tmpfs rw\n";
-  let mounts = parse_mountinfo(content, Path::new("/mnt"));
+  let mounts = parsed(content, Path::new("/mnt"));
   assert_eq!(
     mounts,
     vec![row("/mnt/hi\\777there", 36, 25, 0, 32)],

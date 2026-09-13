@@ -104,6 +104,7 @@ fn alive_refresh(mounts: Vec<PathBuf>, authoritative: bool) -> MountRefresh {
     root_mnt_id: None,
     root_incarnation: None,
     namespace_transitions: None,
+    overflowed: false,
   }
 }
 
@@ -719,6 +720,7 @@ fn refresh_finding_root_gone_is_delete_self() {
       root_mnt_id: None,
       root_incarnation: None,
       namespace_transitions: None,
+      overflowed: false,
     },
     at(5),
   );
@@ -754,6 +756,7 @@ fn refresh_finding_root_replaced_is_move_self() {
         root_mnt_id: None,
         root_incarnation: None,
         namespace_transitions: None,
+        overflowed: false,
       },
       at(5),
     );
@@ -794,6 +797,7 @@ fn refresh_finding_root_alive_only_updates_trust() {
       root_mnt_id: None,
       root_incarnation: None,
       namespace_transitions: None,
+      overflowed: false,
     },
     at(5),
   );
@@ -1461,6 +1465,8 @@ fn identity_minting_respects_devices_and_mounts() {
     learned_mounts: Vec::new(),
     mounts_authoritative: true,
     table_fingerprint: None,
+    honored_boundaries: BTreeSet::new(),
+    honored_saturated: false,
     namespace_transitions_seen: None,
     recovery_epoch: 0,
     recovery_in_flight: false,
@@ -1516,6 +1522,8 @@ fn blind_mount_table_refuses_event_side_trust() {
     learned_mounts: Vec::new(),
     mounts_authoritative: false,
     table_fingerprint: None,
+    honored_boundaries: BTreeSet::new(),
+    honored_saturated: false,
     namespace_transitions_seen: None,
     recovery_epoch: 0,
     recovery_in_flight: false,
@@ -3428,6 +3436,7 @@ mod mount_change_cover {
       root_mnt_id,
       root_incarnation: None,
       namespace_transitions: None,
+      overflowed: false,
     }
   }
 
@@ -3800,6 +3809,49 @@ mod mount_change_cover {
     );
   }
 
+  /// A reading the parser refused past a ceiling is not a table at all, and the
+  /// two refusals are deliberately different. A table that could not be READ is a
+  /// transient nothing the next tick retries — it installs nothing, trusts nothing
+  /// and says nothing. One that could not be JUDGED is a root this design can no
+  /// longer speak about, so it says so: one whole-root cover per such refresh,
+  /// bounded by the liveness interval, instead of an unguarded root or an
+  /// allocation with no ceiling above it.
+  #[test]
+  fn an_overflowed_sample_covers_the_root_and_trusts_no_table() {
+    let (mut core, scope) = live_core();
+    let overflowed = || MountRefresh {
+      overflowed: true,
+      ..framed_refresh(Vec::new(), false, None)
+    };
+    core.on_mounts_refreshed(scope, overflowed(), at(1));
+    one_root_cover(&drain(&mut core));
+    assert!(
+      !core
+        .scopes
+        .get(&scope)
+        .expect("the scope is live")
+        .mounts_authoritative,
+      "a table this parser refused grants no device trust"
+    );
+
+    // Once per overflowed refresh — loud, and bounded by the cadence.
+    core.on_mounts_refreshed(scope, overflowed(), at(2));
+    one_root_cover(&drain(&mut core));
+
+    // The honored boundaries are answered by that cover rather than asked again:
+    // a cover of the whole root is every answer they were owed.
+    core.on_boundaries_honored(scope, vec![PathBuf::from("/r/vol")]);
+    core.on_mounts_refreshed(scope, overflowed(), at(3));
+    one_root_cover(&drain(&mut core));
+    core.on_mounts_refreshed(scope, framed_refresh(Vec::new(), true, None), at(4));
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).is_empty(),
+      "and the overflow installed nothing, so the next good sample is a \
+       comparison against the baseline that still stands: {effects:?}"
+    );
+  }
+
   /// A mount REPLACED at one location is the hard case, and on 6.8+ the rows
   /// carry the answer themselves. Location, device, legacy id and parent are all
   /// unchanged — the kernel handed the newcomer the id the old mount freed — and
@@ -4102,6 +4154,8 @@ mod lowering {
       learned_mounts: Vec::new(),
       mounts_authoritative: true,
       table_fingerprint: None,
+      honored_boundaries: BTreeSet::new(),
+      honored_saturated: false,
       namespace_transitions_seen: None,
       recovery_epoch: 0,
       recovery_in_flight: false,
@@ -5698,6 +5752,7 @@ mod descending {
         root_mnt_id: Some(77),
         root_incarnation: None,
         namespace_transitions: None,
+        overflowed: false,
       },
       at(1),
     );
@@ -5778,6 +5833,7 @@ mod descending {
         root_mnt_id: None,
         root_incarnation: None,
         namespace_transitions: None,
+        overflowed: false,
       },
       at(1),
     );
@@ -5862,6 +5918,7 @@ mod descending {
         root_mnt_id: Some(77),
         root_incarnation: None,
         namespace_transitions: None,
+        overflowed: false,
       },
       at(1),
     );
@@ -5920,6 +5977,7 @@ mod descending {
         root_mnt_id: Some(77),
         root_incarnation: None,
         namespace_transitions: None,
+        overflowed: false,
       },
       at(1),
     );
@@ -5963,6 +6021,7 @@ mod descending {
         root_mnt_id: Some(77),
         root_incarnation: None,
         namespace_transitions: None,
+        overflowed: false,
       },
       at(1),
     );
@@ -6026,6 +6085,7 @@ mod descending {
         root_mnt_id: Some(77),
         root_incarnation: None,
         namespace_transitions: None,
+        overflowed: false,
       },
       at(1),
     );
@@ -10933,6 +10993,7 @@ mod descending {
           root_mnt_id: None,
           root_incarnation: None,
           namespace_transitions: None,
+          overflowed: false,
         },
         at(1),
       );
@@ -10963,6 +11024,7 @@ mod descending {
           root_mnt_id: Some(6),
           root_incarnation: None,
           namespace_transitions: None,
+          overflowed: false,
         },
         at(1),
       );
@@ -13105,6 +13167,7 @@ mod kernel_recursive_fanotify {
         root_mnt_id: None,
         root_incarnation: None,
         namespace_transitions: None,
+        overflowed: false,
       },
       at(30_001),
     );
@@ -13158,6 +13221,7 @@ mod kernel_recursive_fanotify {
         root_mnt_id: None,
         root_incarnation: None,
         namespace_transitions: None,
+        overflowed: false,
       },
       at(30_001),
     );
@@ -13424,6 +13488,7 @@ mod kernel_recursive_fanotify {
         root_mnt_id: None,
         root_incarnation: None,
         namespace_transitions: None,
+        overflowed: false,
       },
       at(60_001),
     );
@@ -13478,6 +13543,7 @@ mod kernel_recursive_fanotify {
         root_mnt_id: None,
         root_incarnation: None,
         namespace_transitions: None,
+        overflowed: false,
       },
       at(31_000),
     );
@@ -13523,6 +13589,7 @@ mod kernel_recursive_fanotify {
         root_mnt_id: None,
         root_incarnation: None,
         namespace_transitions: None,
+        overflowed: false,
       },
       at(31_000),
     );
@@ -13764,6 +13831,7 @@ mod kernel_recursive_fanotify {
         root_mnt_id: Some(77),
         root_incarnation: None,
         namespace_transitions: None,
+        overflowed: false,
       },
       at(1),
     );
@@ -15930,6 +15998,7 @@ mod root_replaced {
         root_mnt_id: None,
         root_incarnation: None,
         namespace_transitions: None,
+        overflowed: false,
       },
       at(2),
     );
@@ -17283,6 +17352,7 @@ mod root_widened {
         root_mnt_id: None,
         root_incarnation: None,
         namespace_transitions: None,
+        overflowed: false,
       },
       at(3),
     );

@@ -10671,6 +10671,7 @@ impl FsOps for RealFs {
       root_mnt_id,
       root_incarnation,
       namespace_transitions: reading.namespace,
+      overflowed: reading.overflowed,
     }
   }
 
@@ -13477,8 +13478,18 @@ pub(crate) async fn run<R, F>(
                   core.on_unwatch(scope);
                 }
               }
+              // A root landing across the scope's own mount is refused to the
+              // caller exactly as `Gone` is; the boundary it also records is the
+              // core's business, not this grant's.
               WatchOutcome::Failed(err) => {
                 let _ = pending.reply.send(Err(arm_grant_error(err, pending.requested, root)));
+              }
+              WatchOutcome::Foreign => {
+                let _ = pending.reply.send(Err(arm_grant_error(
+                  WatchError::Gone,
+                  pending.requested,
+                  root,
+                )));
               }
             }
           }
@@ -16724,6 +16735,7 @@ fn apply_source_message(
     // consequence of its own — nothing is delivered, nothing is lost — so it
     // needs neither barrier nor drain; the core simply remembers the locations
     // until its next authoritative mount sample can check them.
+    #[cfg(all(target_os = "linux", not(miri)))]
     SourceMessage::Honored(paths) => core.on_boundaries_honored(scope, paths),
   }
 }

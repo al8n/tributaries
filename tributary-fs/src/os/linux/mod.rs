@@ -465,6 +465,85 @@ const fn makedev(major: u64, minor: u64) -> u64 {
     | (minor & 0x0000_00ff)
 }
 
+/// The longest single mountinfo line this parser will hold in memory.
+///
+/// A kernel-rendered line is a handful of small integers plus two octal-escaped
+/// pathnames, so 64 KiB is far above anything `/proc` produces — which is the
+/// point: the ceiling exists to bound the ALLOCATION, not to judge the table. It
+/// is enforced by reading at most that many bytes per line rather than by
+/// measuring one already read, because a `read_until` that appends to a buffer
+/// until a delimiter arrives is exactly the unbounded growth being closed.
+#[cfg(any(unix, test))]
+const MAX_MOUNTINFO_LINE: usize = 64 * 1024;
+
+/// The most rows strictly under one root this parser will retain.
+///
+/// Counted on the RETAINED rows, not on the file: a namespace with a hundred
+/// thousand mounts elsewhere costs one reused line buffer, because a row outside
+/// the root is parsed and dropped without ever being kept. What this fences is a
+/// root that genuinely has more boundaries under it than a per-interval row
+/// comparison can usefully speak about — and there the honest answer is to refuse
+/// the sample and cover, never to keep allocating.
+#[cfg(any(unix, test))]
+const MAX_MOUNT_ROWS_UNDER_ROOT: usize = 16_384;
+
+/// What one mountinfo reading produced.
+#[cfg(any(unix, test))]
+pub(crate) enum MountReadout {
+  /// The rows strictly under the root, inside every ceiling.
+  Rows(Vec<crate::os::MountRow>),
+  /// A line or the retained row count went past its ceiling. The reading is
+  /// refused WHOLE — a truncated table would read as a pile of departures and
+  /// cover for every one of them — and the caller degrades to non-authoritative.
+  Overflowed,
+  /// The bytes could not be read at all.
+  Unreadable,
+}
+
+/// [`parse_mountinfo`] over any `BufRead`, which is what makes the ceilings real:
+/// the source is consumed one bounded line at a time and only the rows strictly
+/// under `root` are ever retained, so neither the namespace's size nor a single
+/// pathological line decides this parser's footprint.
+#[cfg(any(unix, test))]
+fn stream_mountinfo<R: std::io::BufRead>(mut reader: R, root: &Path) -> MountReadout {
+  // One reused buffer for the whole file: the per-line ceiling is what bounds it,
+  // and reusing it keeps a large table at one allocation rather than one per row.
+  let mut line = Vec::new();
+  let mut rows: Vec<crate::os::MountRow> = Vec::new();
+  loop {
+    line.clear();
+    // Bounded BEFORE the bytes are appended. `read_until` on its own grows the
+    // buffer until it finds the delimiter, so a line with no newline in it would
+    // allocate the rest of the source — the exact shape the ceiling is for. The
+    // limit is two over the ceiling so a line of exactly `MAX_MOUNTINFO_LINE`
+    // bytes plus its newline still fits and is NOT read as an overflow.
+    let read = match std::io::BufRead::read_until(
+      &mut std::io::Read::take(&mut reader, (MAX_MOUNTINFO_LINE + 2) as u64),
+      b'\n',
+      &mut line,
+    ) {
+      Ok(read) => read,
+      Err(_) => return MountReadout::Unreadable,
+    };
+    if read == 0 {
+      return MountReadout::Rows(rows);
+    }
+    if line.last() == Some(&b'\n') {
+      line.pop();
+    }
+    if line.len() > MAX_MOUNTINFO_LINE {
+      return MountReadout::Overflowed;
+    }
+    let Some(row) = parse_mountinfo_row(&line, root) else {
+      continue;
+    };
+    if rows.len() >= MAX_MOUNT_ROWS_UNDER_ROOT {
+      return MountReadout::Overflowed;
+    }
+    rows.push(row);
+  }
+}
+
 /// Parses `/proc/self/mountinfo` content into EVERY mount row strictly under
 /// `root`, in FILE order (PURE — the reader lives in the cfg'd `mounts_under`).
 ///
@@ -537,74 +616,71 @@ const fn makedev(major: u64, minor: u64) -> u64 {
 /// runs at all. A single unrelated mount point anywhere in the namespace left
 /// every watched root's revealed subtree dark indefinitely, however ordinary the
 /// watched root's own names were.
+/// The BYTE-SLICE entry over the same core: one in-memory table, parsed under the
+/// same ceilings, so a fixture drives exactly what `/proc` does. `None` is an
+/// overflow — a slice cannot fail to be read.
 #[cfg(any(unix, test))]
-pub(crate) fn parse_mountinfo(content: &[u8], root: &Path) -> Vec<crate::os::MountRow> {
-  let mut rows: Vec<crate::os::MountRow> = Vec::new();
-  // Split on the RAW newline: mountinfo octal-escapes `\n` inside its path
-  // fields (`\012`), so no line boundary can fall inside a mount point.
-  for line in content.split(|byte| *byte == b'\n') {
-    // Fields 1..=5 never carry an unescaped SPACE (mountinfo octal-escapes the
-    // one delimiter byte it uses, along with tab, newline and backslash), so
-    // positional splitting reaches all four of the fields read here. Every other
-    // whitespace byte is ordinary path data — see [`mountinfo_fields`].
-    let mut fields = mountinfo_fields(line);
-    let Some(id_field) = fields.next() else {
-      continue;
-    };
-    let Some(parent_field) = fields.next() else {
-      continue;
-    };
-    let Some(dev_field) = fields.next() else {
-      continue;
-    };
-    // Field 4 is the mounted subtree's own root inside its filesystem, which is
-    // not one of the facts a row records.
-    if fields.next().is_none() {
-      continue;
-    }
-    let Some(field) = fields.next() else {
-      continue;
-    };
-    let mnt_id = parse_mountinfo_u64(id_field);
-    let parent_id = parse_mountinfo_u64(parent_field);
-    let dev = dev_field
-      .iter()
-      .position(|byte| *byte == b':')
-      .and_then(|at| {
-        Some(makedev(
-          parse_mountinfo_u64(&dev_field[..at])?,
-          parse_mountinfo_u64(&dev_field[at + 1..])?,
-        ))
-      });
-    let bytes = unescape_mountinfo(field);
-    // A mount point is raw path bytes — only unix carries non-UTF-8 verbatim.
-    // The non-unix arm serves solely the cross-platform parser tests (the `test`
-    // half of the gate), whose fixtures are UTF-8, so the lossy decode matches.
-    #[cfg(unix)]
-    let path = {
-      use std::os::unix::ffi::OsStrExt;
-      PathBuf::from(std::ffi::OsStr::from_bytes(&bytes))
-    };
-    #[cfg(not(unix))]
-    let path = PathBuf::from(String::from_utf8_lossy(&bytes).into_owned());
-    // STRICTLY under the root. `Path::starts_with` compares COMPONENTS, so
-    // `/rooted` is not under `/root`, and the root's own row is excluded because
-    // a mount AT the root is not a boundary inside it.
-    if !path.starts_with(root) || path.as_path() == root {
-      continue;
-    }
-    rows.push(crate::os::MountRow {
-      location: path,
-      mnt_id,
-      parent_id,
-      // Not a mountinfo field: the parse is PURE, and the unique id is a syscall
-      // per row. It is filled in by [`mount_sample`], inside the same
-      // namespace-stable bracket that certifies the table this line came from.
-      mnt_id_unique: None,
-      dev,
-    });
+pub(crate) fn parse_mountinfo(content: &[u8], root: &Path) -> Option<Vec<crate::os::MountRow>> {
+  match stream_mountinfo(content, root) {
+    MountReadout::Rows(rows) => Some(rows),
+    MountReadout::Overflowed | MountReadout::Unreadable => None,
   }
-  rows
+}
+
+/// One mountinfo LINE as a row strictly under `root`, or `None` for a line that
+/// is malformed, empty, or names a location that is not under the root.
+#[cfg(any(unix, test))]
+fn parse_mountinfo_row(line: &[u8], root: &Path) -> Option<crate::os::MountRow> {
+  // Fields 1..=5 never carry an unescaped SPACE (mountinfo octal-escapes the
+  // one delimiter byte it uses, along with tab, newline and backslash), so
+  // positional splitting reaches all four of the fields read here. Every other
+  // whitespace byte is ordinary path data — see [`mountinfo_fields`].
+  let mut fields = mountinfo_fields(line);
+  let id_field = fields.next()?;
+  let parent_field = fields.next()?;
+  let dev_field = fields.next()?;
+  // Field 4 is the mounted subtree's own root inside its filesystem, which is
+  // not one of the facts a row records — read past it.
+  fields.next()?;
+  let field = fields.next()?;
+  let mnt_id = parse_mountinfo_u64(id_field);
+  let parent_id = parse_mountinfo_u64(parent_field);
+  let dev = dev_field
+    .iter()
+    .position(|byte| *byte == b':')
+    .and_then(|at| {
+      Some(makedev(
+        parse_mountinfo_u64(&dev_field[..at])?,
+        parse_mountinfo_u64(&dev_field[at + 1..])?,
+      ))
+    });
+  let bytes = unescape_mountinfo(field);
+  // A mount point is raw path bytes — only unix carries non-UTF-8 verbatim.
+  // The non-unix arm serves solely the cross-platform parser tests (the `test`
+  // half of the gate), whose fixtures are UTF-8, so the lossy decode matches.
+  #[cfg(unix)]
+  let path = {
+    use std::os::unix::ffi::OsStrExt;
+    PathBuf::from(std::ffi::OsStr::from_bytes(&bytes))
+  };
+  #[cfg(not(unix))]
+  let path = PathBuf::from(String::from_utf8_lossy(&bytes).into_owned());
+  // STRICTLY under the root. `Path::starts_with` compares COMPONENTS, so
+  // `/rooted` is not under `/root`, and the root's own row is excluded because
+  // a mount AT the root is not a boundary inside it.
+  if !path.starts_with(root) || path.as_path() == root {
+    return None;
+  }
+  Some(crate::os::MountRow {
+    location: path,
+    mnt_id,
+    parent_id,
+    // Not a mountinfo field: the parse is PURE, and the unique id is a syscall
+    // per row. It is filled in by [`mount_sample`], inside the same
+    // namespace-stable bracket that certifies the table this line came from.
+    mnt_id_unique: None,
+    dev,
+  })
 }
 
 /// The mount rows strictly under `root`, read from `/proc/self/mountinfo`.
@@ -658,8 +734,15 @@ pub(crate) fn mounts_under(root: &Path) -> Option<Vec<crate::os::MountRow>> {
 /// file a cell writes.
 #[cfg(any(all(target_os = "linux", not(miri)), test))]
 pub(crate) fn mounts_from_file(path: &Path, root: &Path) -> Option<Vec<crate::os::MountRow>> {
-  let content = std::fs::read(path).ok()?;
-  Some(parse_mountinfo(&content, root))
+  let file = std::fs::File::open(path).ok()?;
+  match stream_mountinfo(std::io::BufReader::new(file), root) {
+    MountReadout::Rows(rows) => Some(rows),
+    // A seed is trust-REDUCING only, so an overflow here answers exactly what an
+    // unreadable table answers: no seed. The refresh that follows reads the same
+    // oversized table, overflows in its turn, and covers — which is where the
+    // degrade is supposed to be loud.
+    MountReadout::Overflowed | MountReadout::Unreadable => None,
+  }
 }
 
 /// How many times [`mount_sample`] re-takes the pair before conceding that it
@@ -682,8 +765,13 @@ const MAX_MOUNT_SAMPLE_ATTEMPTS: usize = 3;
 /// the root, and whether the mount namespace provably held still across BOTH.
 #[cfg(any(all(target_os = "linux", not(miri)), test))]
 struct MountSample<S> {
-  /// The rows strictly under the root, or `None` for a read that failed.
+  /// The rows strictly under the root, or `None` for a read that failed or one
+  /// refused past a ceiling.
   rows: Option<Vec<crate::os::MountRow>>,
+  /// The reading went past a parser ceiling, so the table could not be judged at
+  /// all — as distinct from a table that could not be READ. Both withhold
+  /// authority; only this one covers.
+  overflowed: bool,
   /// Whatever the caller sampled about the root itself, taken INSIDE the window
   /// `stable` speaks for.
   root: S,
@@ -828,6 +916,9 @@ fn coherent_mount_sample<S>(
   }
   crate::os::MountReading {
     rows: if sample.stable { sample.rows } else { None },
+    // An overflow travels whatever the window did: it says the table is past what
+    // this parser will hold, which no amount of namespace stability changes.
+    overflowed: sample.overflowed,
     root: sample.root,
     // The LAST attempt's generation travels whether or not that attempt was
     // stable: the count only ever moves forward, so a caller comparing it against
@@ -895,27 +986,33 @@ pub(crate) fn mount_sample<S>(
     let Ok(file) = std::fs::File::open("/proc/self/mountinfo") else {
       return MountSample {
         rows: None,
+        overflowed: false,
         root: sample_root(),
         namespace: namespace.observe(),
         stable: true,
       };
     };
-    let content = {
-      use std::io::Read as _;
-      let mut buffer = Vec::new();
-      (&file).read_to_end(&mut buffer).ok().map(|_| buffer)
+    // STREAMED under the ceilings rather than slurped: a `read_to_end` here grew
+    // one `Vec` per due scope holding the WHOLE namespace's representation, so a
+    // bind-mount storm multiplied the table into process memory across every
+    // concurrent liveness probe. Rows outside the root are parsed and dropped, so
+    // what is retained is this root's own boundaries and nothing else.
+    let readout = stream_mountinfo(std::io::BufReader::new(&file), root);
+    let overflowed = matches!(readout, MountReadout::Overflowed);
+    let rows = match readout {
+      MountReadout::Rows(mut rows) => {
+        enrich_unique_ids(&mut rows);
+        Some(rows)
+      }
+      MountReadout::Overflowed | MountReadout::Unreadable => None,
     };
-    let rows = content.map(|content| {
-      let mut rows = parse_mountinfo(&content, root);
-      enrich_unique_ids(&mut rows);
-      rows
-    });
     // INSIDE the window: the stability check below speaks for everything between
     // the open above and this call's return.
     let sampled = sample_root();
     let observed = namespace.observe();
     MountSample {
       rows,
+      overflowed,
       root: sampled,
       namespace: observed,
       stable: namespace_unchanged(&file),

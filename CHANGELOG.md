@@ -814,6 +814,11 @@ domination `Rescan` is stood — and nothing else in either crate behaves differ
   honored, so a mount that arrives over ground a walk was about to read and departs
   before any sample lists it — invisible to a row-to-row diff, since no table ever
   held it — is covered by the next sample instead of leaving that ground unread.
+  Finally, `/proc/self/mountinfo` is now STREAMED under explicit line and row
+  ceilings and only the rows strictly under the root are retained, so a namespace
+  with a huge mount table no longer allocates its whole representation once per due
+  scope; a reading past either ceiling is refused whole and answered with one
+  whole-root `Rescan`, never truncated and never trusted.
 
 - **`tributaries`** — a caller-visible **sync barrier** (#23): `Tributaries::sync(sub,
   timeout)` resolves once every change made under the subscription's key BEFORE the

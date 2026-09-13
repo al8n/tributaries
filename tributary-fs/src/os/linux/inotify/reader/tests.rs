@@ -76,23 +76,11 @@ mod barrier {
       sent.borrow_mut().push(match msg {
         SourceMessage::Batch(payload) => Sent::Batch(payload.events.len()),
         SourceMessage::Overflow(_) => Sent::Overflow,
-        // inotify DESCENDS: the core's own enumerate fence is where its
-        // boundaries are observed, so its reader walks nothing and declines
-        // nothing. Seam 2 is the kernel-recursive profile's answer only.
-        SourceMessage::Boundaries(declined, _) => {
-          unreachable!("an inotify reader walks no tree: {declined:?}")
-        }
-        // And it keeps no admission map: a departed mount below the root is
-        // covered by a `Rescan` whose re-arm crawl re-enumerates the revealed
-        // ground and arms it, so there is no round trip for this reader to
-        // answer.
-        SourceMessage::Admitted(report) => {
-          unreachable!("an inotify reader admits no reseed: {report:?}")
-        }
-        // Nor a whole-root recovery: that message reseeds an ADMISSION MAP, and
-        // this reader keeps none.
-        SourceMessage::RootRecovered(recovery, _) => {
-          unreachable!("an inotify reader recovers no map: {recovery:?}")
+        // inotify DESCENDS, and it runs no walk of its own: its boundaries are
+        // observed by the core's enumerate fence, so this reader never honors
+        // one and never reports one.
+        SourceMessage::Honored(boundaries) => {
+          unreachable!("an inotify reader walks no tree: {boundaries:?}")
         }
         SourceMessage::Fatal(_) => unreachable!("no fatal on this path"),
       });
@@ -122,23 +110,11 @@ mod barrier {
       sent.borrow_mut().push(match msg {
         SourceMessage::Batch(payload) => Sent::Batch(payload.events.len()),
         SourceMessage::Overflow(_) => Sent::Overflow,
-        // inotify DESCENDS: the core's own enumerate fence is where its
-        // boundaries are observed, so its reader walks nothing and declines
-        // nothing. Seam 2 is the kernel-recursive profile's answer only.
-        SourceMessage::Boundaries(declined, _) => {
-          unreachable!("an inotify reader walks no tree: {declined:?}")
-        }
-        // And it keeps no admission map: a departed mount below the root is
-        // covered by a `Rescan` whose re-arm crawl re-enumerates the revealed
-        // ground and arms it, so there is no round trip for this reader to
-        // answer.
-        SourceMessage::Admitted(report) => {
-          unreachable!("an inotify reader admits no reseed: {report:?}")
-        }
-        // Nor a whole-root recovery: that message reseeds an ADMISSION MAP, and
-        // this reader keeps none.
-        SourceMessage::RootRecovered(recovery, _) => {
-          unreachable!("an inotify reader recovers no map: {recovery:?}")
+        // inotify DESCENDS, and it runs no walk of its own: its boundaries are
+        // observed by the core's enumerate fence, so this reader never honors
+        // one and never reports one.
+        SourceMessage::Honored(boundaries) => {
+          unreachable!("an inotify reader walks no tree: {boundaries:?}")
         }
         SourceMessage::Fatal(_) => unreachable!("no fatal on this path"),
       });
@@ -1093,23 +1069,11 @@ mod rebuild {
       sent.push(match msg {
         SourceMessage::Batch(payload) => Sent::Batch(payload.events.len()),
         SourceMessage::Overflow(_) => Sent::Overflow,
-        // inotify DESCENDS: the core's own enumerate fence is where its
-        // boundaries are observed, so its reader walks nothing and declines
-        // nothing. Seam 2 is the kernel-recursive profile's answer only.
-        SourceMessage::Boundaries(declined, _) => {
-          unreachable!("an inotify reader walks no tree: {declined:?}")
-        }
-        // And it keeps no admission map: a departed mount below the root is
-        // covered by a `Rescan` whose re-arm crawl re-enumerates the revealed
-        // ground and arms it, so there is no round trip for this reader to
-        // answer.
-        SourceMessage::Admitted(report) => {
-          unreachable!("an inotify reader admits no reseed: {report:?}")
-        }
-        // Nor a whole-root recovery: that message reseeds an ADMISSION MAP, and
-        // this reader keeps none.
-        SourceMessage::RootRecovered(recovery, _) => {
-          unreachable!("an inotify reader recovers no map: {recovery:?}")
+        // inotify DESCENDS, and it runs no walk of its own: its boundaries are
+        // observed by the core's enumerate fence, so this reader never honors
+        // one and never reports one.
+        SourceMessage::Honored(boundaries) => {
+          unreachable!("an inotify reader walks no tree: {boundaries:?}")
         }
         SourceMessage::Fatal(_) => unreachable!("no fatal on this path"),
       });
@@ -1581,22 +1545,11 @@ mod queue_cut {
       sent.push(match msg {
         SourceMessage::Batch(payload) => Sent::Batch(payload.events.len()),
         SourceMessage::Overflow(_) => Sent::Overflow,
-        // inotify DESCENDS: its boundaries are observed by the core's enumerate
-        // fence, so its reader walks nothing and declines nothing.
-        SourceMessage::Boundaries(declined, _) => {
-          unreachable!("an inotify reader walks no tree: {declined:?}")
-        }
-        // And it keeps no admission map: a departed mount below the root is
-        // covered by a `Rescan` whose re-arm crawl re-enumerates the revealed
-        // ground and arms it, so there is no round trip for this reader to
-        // answer.
-        SourceMessage::Admitted(report) => {
-          unreachable!("an inotify reader admits no reseed: {report:?}")
-        }
-        // Nor a whole-root recovery: that message reseeds an ADMISSION MAP, and
-        // this reader keeps none.
-        SourceMessage::RootRecovered(recovery, _) => {
-          unreachable!("an inotify reader recovers no map: {recovery:?}")
+        // inotify DESCENDS, and it runs no walk of its own: its boundaries are
+        // observed by the core's enumerate fence, so this reader never honors
+        // one and never reports one.
+        SourceMessage::Honored(boundaries) => {
+          unreachable!("an inotify reader walks no tree: {boundaries:?}")
         }
         SourceMessage::Fatal(err) => panic!("no fatal on this path: {err:?}"),
       });
@@ -2377,22 +2330,11 @@ mod queue_cut {
               .collect(),
           ),
           SourceMessage::Overflow(_) => Forwarded::Overflow,
-          // inotify DESCENDS: its boundaries are observed by the core's
-          // enumerate fence, so its reader walks nothing and declines nothing.
-          SourceMessage::Boundaries(declined, _) => {
-            unreachable!("an inotify reader walks no tree: {declined:?}")
-          }
-          // And it keeps no admission map: a departed mount below the root is
-          // covered by a `Rescan` whose re-arm crawl re-enumerates the revealed
-          // ground and arms it, so there is no round trip for this reader to
-          // answer.
-          SourceMessage::Admitted(report) => {
-            unreachable!("an inotify reader admits no reseed: {report:?}")
-          }
-          // Nor a whole-root recovery: that message reseeds an ADMISSION MAP,
-          // and this reader keeps none.
-          SourceMessage::RootRecovered(recovery, _) => {
-            unreachable!("an inotify reader recovers no map: {recovery:?}")
+          // inotify DESCENDS, and it runs no walk of its own: its boundaries are
+          // observed by the core's enumerate fence, so this reader never honors
+          // one and never reports one.
+          SourceMessage::Honored(boundaries) => {
+            unreachable!("an inotify reader walks no tree: {boundaries:?}")
           }
           SourceMessage::Fatal(err) => panic!("no fatal on this path: {err:?}"),
         });

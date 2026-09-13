@@ -595,7 +595,7 @@ fn lossy_buffer_forwards_only_the_overflow_after_reseeding() {
     events: vec![modify_under(fid(2), b"f")],
     lossy: true,
   };
-  let (sent, alive, reseeds) = run_process(&mut map, decoded, Some(one_entry_walk()));
+  let (sent, alive, reseeds) = run_process(&mut map, decoded, Some(one_entry_walk().entries));
   assert!(alive, "a reseeded loss keeps the stream live");
   assert_eq!(reseeds, 1, "the loss reseeded the map before signaling");
   assert_eq!(
@@ -630,7 +630,7 @@ fn merged_multi_structural_event_takes_the_barrier_and_reseeds() {
     events: vec![modify_under(fid(2), b"before"), merged],
     lossy: false,
   };
-  let (sent, alive, reseeds) = run_process(&mut map, decoded, Some(one_entry_walk()));
+  let (sent, alive, reseeds) = run_process(&mut map, decoded, Some(one_entry_walk().entries));
   assert!(
     alive,
     "the ambiguous merge reseeds and keeps the stream live"
@@ -679,7 +679,7 @@ fn merged_rename_delete_takes_the_barrier_and_reseeds() {
     events: vec![modify_under(fid(2), b"before"), merged],
     lossy: false,
   };
-  let (sent, alive, reseeds) = run_process(&mut map, decoded, Some(one_entry_walk()));
+  let (sent, alive, reseeds) = run_process(&mut map, decoded, Some(one_entry_walk().entries));
   assert!(
     alive,
     "the ambiguous rename+delete reseeds and keeps the stream live"
@@ -731,7 +731,7 @@ fn merged_rename_self_hidden_in_root_target_takes_the_barrier_and_reseeds() {
     events: vec![modify_under(fid(2), b"before"), merged],
     lossy: false,
   };
-  let (sent, alive, reseeds) = run_process(&mut map, decoded, Some(one_entry_walk()));
+  let (sent, alive, reseeds) = run_process(&mut map, decoded, Some(one_entry_walk().entries));
   assert!(
     alive,
     "the ambiguous merge reseeds and keeps the stream live"
@@ -771,7 +771,7 @@ fn lossy_dir_delete_reseed_prunes_the_stale_subtree() {
     events: Vec::new(),
     lossy: true,
   };
-  let (sent, alive, reseeds) = run_process(&mut map, decoded, Some(one_entry_walk()));
+  let (sent, alive, reseeds) = run_process(&mut map, decoded, Some(one_entry_walk().entries));
   assert!(alive, "a reseeded loss keeps the stream live");
   assert_eq!(reseeds, 1, "the loss reseeded the map");
   assert_eq!(
@@ -797,7 +797,7 @@ fn clean_buffer_forwards_the_batch_and_never_reseeds() {
     events: vec![modify_under(fid(2), b"f"), modify_under(fid(1), b"g")],
     lossy: false,
   };
-  let (sent, alive, reseeds) = run_process(&mut map, decoded, Some(one_entry_walk()));
+  let (sent, alive, reseeds) = run_process(&mut map, decoded, Some(one_entry_walk().entries));
   assert!(alive);
   assert_eq!(reseeds, 0, "a clean buffer never triggers a reseed");
   assert_eq!(
@@ -829,7 +829,7 @@ fn classified_lossy_event_takes_the_barrier_and_reseeds() {
     events: vec![modify_under(fid(2), b"f"), dir_create_no_target],
     lossy: false,
   };
-  let (sent, alive, reseeds) = run_process(&mut map, decoded, Some(one_entry_walk()));
+  let (sent, alive, reseeds) = run_process(&mut map, decoded, Some(one_entry_walk().entries));
   assert!(alive, "a reseeded classified loss keeps the stream live");
   assert_eq!(
     reseeds, 1,
@@ -855,7 +855,7 @@ fn foreign_event_is_dropped_from_a_clean_batch() {
     ],
     lossy: false,
   };
-  let (sent, alive, reseeds) = run_process(&mut map, decoded, Some(one_entry_walk()));
+  let (sent, alive, reseeds) = run_process(&mut map, decoded, Some(one_entry_walk().entries));
   assert!(alive);
   assert_eq!(reseeds, 0, "a dropped foreign event is not a loss");
   assert_eq!(
@@ -1028,7 +1028,7 @@ fn a_move_in_walk_that_cannot_find_its_subtree_is_loss_not_death() {
     lossy: false,
   };
   let (sent, alive, reseeds, walks) =
-    run_process_with_subtree(&mut map, decoded, Some(one_entry_walk()), None);
+    run_process_with_subtree(&mut map, decoded, Some(one_entry_walk().entries), None);
 
   assert!(
     alive,
@@ -1188,18 +1188,21 @@ mod exclusion_fence {
       || Ok(one_entry_walk()),
       |_, subtree_fid, _| {
         walks.set(walks.get() + 1);
-        Ok(vec![SeedEntry::child(
-          fid(6),
-          subtree_fid.clone(),
-          std::ffi::OsString::from("deep"),
-        )])
+        Ok(SeedWalk {
+          entries: vec![SeedEntry::child(
+            fid(6),
+            subtree_fid.clone(),
+            std::ffi::OsString::from("deep"),
+          )],
+          honored: Vec::new(),
+        })
       },
       |msg| {
         sent.borrow_mut().push(match &msg {
           SourceMessage::Batch(payload) => Sent::Batch(payload.events.len()),
           SourceMessage::Overflow(_) => Sent::Overflow,
           SourceMessage::Fatal(_) => Sent::Fatal,
-          SourceMessage::Honored(paths) => Sent::Honored(paths),
+          SourceMessage::Honored(paths) => Sent::Honored(paths.clone()),
         });
         if let SourceMessage::Batch(payload) = msg {
           for ev in payload.events {

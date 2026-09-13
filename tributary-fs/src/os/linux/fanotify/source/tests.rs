@@ -766,9 +766,9 @@ fn subtree_walk_on_missing_path_is_incomplete_not_empty() {
       );
     }
     Err(WalkError::RootGone(_)) => unreachable!("subtree_walk never reports RootGone"),
-    Ok(entries) => panic!(
+    Ok(walked) => panic!(
       "a missing moved-in subtree path must be Incomplete, not an empty walk (got {} entries)",
-      entries.len()
+      walked.entries.len()
     ),
   }
 }

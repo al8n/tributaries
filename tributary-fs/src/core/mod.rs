@@ -154,6 +154,17 @@
 //! The set is bounded ([`MAX_HONORED_BOUNDARIES`]); past it the scope simply
 //! covers once, unconditionally, at the next sample.
 //!
+//! One reading answers neither question: the table the parser refused. The rows
+//! are read STREAMING under a per-line ceiling and a ceiling on the rows retained
+//! strictly under the root ([`MAX_MOUNT_ROWS_UNDER_ROOT`] in the Linux sampler),
+//! so a namespace of any size costs one reused line buffer and this root's own
+//! boundaries. A reading past either ceiling is refused WHOLE — truncating it
+//! would present the rows it could not hold as departures — and the core treats
+//! it as a table it cannot judge: nothing installs, device trust closes, the
+//! honored set is discharged, and the whole root is covered once. One cover per
+//! liveness interval while the condition lasts, which is a loud bounded degrade
+//! rather than an unguarded root.
+//!
 //! What a cover IS depends only on how the profile SEES the tree.
 //! [`cover_whole_root`](DriverCore::cover_whole_root) is `on_overflow(Scope::Root)`
 //! on every profile but one — the Monitor re-enumerates and re-arms, the consumer
@@ -329,6 +340,18 @@ pub(crate) struct MountRefresh {
   /// their own (an empty table, or a per-row `statx` that failed). Kept as its
   /// own field rather than derived, so the rule reads what it means.
   pub(crate) namespace_transitions: Option<u64>,
+  /// The sampler refused this reading because the table went past a parser
+  /// ceiling — a single line, or the number of rows retained strictly under the
+  /// root (#74).
+  ///
+  /// Distinct from [`authoritative`](Self::authoritative) being false, which says
+  /// the table could not be READ. This says it could not be JUDGED: what the
+  /// parser holds is bounded on purpose, so a table beyond the bound is refused
+  /// whole rather than truncated into a pile of apparent departures. The core
+  /// installs nothing, trusts nothing, and covers the whole root once per such
+  /// refresh — a loud, bounded degrade instead of an unguarded root or an
+  /// allocation with no ceiling.
+  pub(crate) overflowed: bool,
 }
 
 /// Why one mount refresh is being armed.
@@ -5883,7 +5906,21 @@ impl DriverCore {
     // about one transition.
     let mut fire = frame_changed;
 
-    if refresh.authoritative {
+    // A reading past a parser ceiling (#74) is not a table at all, so nothing it
+    // carries may install and nothing it omits may be read as a departure. It
+    // takes the blind branch's `mounts_authoritative = false` below AND covers,
+    // which is the difference between the two refusals: a table that could not be
+    // READ is a transient nothing the next tick retries, while one that could not
+    // be JUDGED is a root this design can no longer speak about — and the honest
+    // answer there is to say so, once per refresh, out loud. The honored
+    // boundaries go with it: this cover answers every question they asked.
+    if refresh.overflowed {
+      state.honored_boundaries.clear();
+      state.honored_saturated = false;
+      fire = true;
+    }
+
+    if refresh.authoritative && !refresh.overflowed {
       // The FINGERPRINT, taken before the table half is installed off the same
       // rows. Sorted, because mountinfo's row order is the kernel's own list
       // order: a mount created ELSEWHERE on the host can permute it with nothing
@@ -6198,6 +6235,12 @@ impl DriverCore {
   /// replaced it. The cost is bounded and in the covering direction: at worst the
   /// new world's first sample cannot find a location the OLD world stopped at and
   /// covers a tree the swap's own `Rescan` already covered.
+  ///
+  /// Compiled for the shapes that can reach it: the driver's source pump on the
+  /// one profile whose walks report ([`SourceMessage::Honored`]), and the suites.
+  /// The RECORDING seats the other profiles use are the listing and the arm, and
+  /// both call [`record_honored_boundary`] directly.
+  #[cfg(any(all(target_os = "linux", not(miri)), test))]
   pub(crate) fn on_boundaries_honored(&mut self, scope: ScopeId, paths: Vec<PathBuf>) {
     let Some(state) = self.scopes.get_mut(&scope) else {
       return;

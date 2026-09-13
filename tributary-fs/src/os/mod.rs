@@ -114,6 +114,11 @@ pub(crate) struct MountReading<S> {
   /// The rows strictly under the root, or `None` for a read that failed (or a
   /// window that never held still).
   pub(crate) rows: Option<Vec<MountRow>>,
+  /// The reading went past a parser ceiling — a line or the retained row count —
+  /// so it was refused whole rather than truncated. Distinct from a read that
+  /// FAILED: both withhold authority, and only this one says the table is beyond
+  /// what a comparison can speak about, which the core answers with one cover.
+  pub(crate) overflowed: bool,
   /// Whatever the caller sampled about the root itself, taken INSIDE the window.
   pub(crate) root: S,
   /// The mount-namespace generation observed inside the window, or `None` where
@@ -151,6 +156,9 @@ pub(crate) fn mount_sample<S>(
 ) -> MountReading<S> {
   MountReading {
     rows: mounts_under(root),
+    // No streaming parser and no ceiling to trip: these hosts answer a whole
+    // table in one call, so a reading either exists or it does not.
+    overflowed: false,
     root: sample_root(),
     namespace: None,
     stable: true,
