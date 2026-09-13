@@ -450,7 +450,7 @@ pub(crate) type BackendStatsHandle = std::sync::Arc<BackendStatsShared>;
 /// $ app --backend usn-journal
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
 #[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 #[non_exhaustive]
@@ -532,6 +532,92 @@ impl Backend {
 impl core::fmt::Display for Backend {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     f.write_str(self.as_str())
+  }
+}
+
+/// The legal spellings of a [`Backend`] tag, in variant-declaration order —
+/// the same lowercase (kebab-case for `usn-journal`) words [`Backend::as_str`]
+/// returns.
+#[cfg(feature = "serde")]
+const BACKEND_NAMES: [&str; 5] = ["auto", "inotify", "fanotify", "rdcw", "usn-journal"];
+
+/// The longest name in [`BACKEND_NAMES`], in bytes — the ceiling a tag is
+/// measured against before anything is done with it. Derived from the
+/// vocabulary itself, so a renamed or added backend moves it rather than
+/// leaving a stale literal behind.
+#[cfg(feature = "serde")]
+const MAX_BACKEND_NAME_LEN: usize = {
+  let mut longest = 0;
+  let mut index = 0;
+  while index < BACKEND_NAMES.len() {
+    if BACKEND_NAMES[index].len() > longest {
+      longest = BACKEND_NAMES[index].len();
+    }
+    index += 1;
+  }
+  longest
+};
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for Backend {
+  /// A single tag, read through a BOUNDED borrowed-string visitor — the same
+  /// mold this crate's own exclusion-path face uses.
+  ///
+  /// Asking the format for an owned `String` first hands an untrusted document
+  /// one allocation per tag before the five-word vocabulary it is about to fail
+  /// is ever consulted, and formatting an unknown tag into `unknown_variant`
+  /// then hands it a second allocation of the same size, live at the same
+  /// instant. So the ceiling is judged first, on the bytes the format is
+  /// already holding, and a tag past it is refused with a FIXED message naming
+  /// the bound and the length — never the value. What reaches
+  /// `unknown_variant` is by construction at most [`MAX_BACKEND_NAME_LEN`]
+  /// bytes, so the echo it formats is bounded too.
+  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+  where
+    D: serde::Deserializer<'de>,
+  {
+    struct BackendName;
+
+    impl serde::de::Visitor<'_> for BackendName {
+      type Value = Backend;
+
+      fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "a backend name of at most {MAX_BACKEND_NAME_LEN} bytes")
+      }
+
+      /// The one door, and the one every other arm reaches: `visit_borrowed_str`
+      /// and `visit_string` are serde's own forwards to it, so text the format
+      /// borrows out of its input is measured without being copied at all, and
+      /// text the format already owns is measured before this face does
+      /// anything with it.
+      fn visit_str<E>(self, name: &str) -> Result<Self::Value, E>
+      where
+        E: serde::de::Error,
+      {
+        if name.len() > MAX_BACKEND_NAME_LEN {
+          // The length, never the value: an over-long tag is exactly the input
+          // whose echo is the hazard.
+          return Err(E::custom(format_args!(
+            "a backend name is at most {MAX_BACKEND_NAME_LEN} bytes, and this one is {}",
+            name.len()
+          )));
+        }
+        match name {
+          "auto" => Ok(Backend::Auto),
+          "inotify" => Ok(Backend::Inotify),
+          "fanotify" => Ok(Backend::Fanotify),
+          "rdcw" => Ok(Backend::Rdcw),
+          "usn-journal" => Ok(Backend::UsnJournal),
+          other => Err(E::unknown_variant(other, &BACKEND_NAMES)),
+        }
+      }
+    }
+
+    // `deserialize_str` rather than `deserialize_string`: this door needs to
+    // READ the tag, not to own it, and the hint is what lets a format borrow
+    // straight out of its input instead of allocating a copy it would only be
+    // measured against.
+    deserializer.deserialize_str(BackendName)
   }
 }
 
@@ -1218,5 +1304,88 @@ mod tests {
     assert!(Backend::UsnJournal.is_usn_journal());
     assert!(!Backend::Auto.is_rdcw());
     assert!(!Backend::Rdcw.is_usn_journal());
+  }
+
+  /// [`Backend`]'s hand-written bounded-visitor [`Deserialize`](serde::Deserialize).
+  #[cfg(feature = "serde")]
+  mod serde_face {
+    use super::Backend;
+
+    #[test]
+    fn every_variant_round_trips() {
+      for backend in [
+        Backend::Auto,
+        Backend::Inotify,
+        Backend::Fanotify,
+        Backend::Rdcw,
+        Backend::UsnJournal,
+      ] {
+        let json = serde_json::to_string(&backend).unwrap();
+        assert_eq!(json, format!(r#""{}""#, backend.as_str()));
+        assert_eq!(serde_json::from_str::<Backend>(&json).unwrap(), backend);
+      }
+    }
+
+    /// A tag longer than the longest valid name is refused ON ITS LENGTH, and
+    /// the refusal says nothing about the value.
+    #[test]
+    fn an_over_long_backend_name_is_refused_without_echoing_it() {
+      const FILLER: char = 'z';
+
+      let tag: String = core::iter::repeat_n(FILLER, 1024 * 1024).collect();
+      let document = format!(r#""{tag}""#);
+      let refusal = serde_json::from_str::<Backend>(&document)
+        .expect_err("a tag past the vocabulary's longest name is refused")
+        .to_string();
+
+      assert!(
+        refusal.contains("at most 11 bytes"),
+        "the refusal names the bound: {refusal}"
+      );
+      assert!(
+        refusal.contains(&tag.len().to_string()),
+        "and the length it measured: {refusal}"
+      );
+      assert!(
+        !refusal.contains(&FILLER.to_string().repeat(9)),
+        "and none of the value itself: {refusal}"
+      );
+    }
+
+    /// A junk tag inside the bound reaches the vocabulary and is refused as
+    /// `unknown_variant`, with the (short, bounded) tag echoed.
+    #[test]
+    fn a_junk_backend_name_inside_the_bound_is_an_unknown_variant() {
+      let refusal = serde_json::from_str::<Backend>(r#""notabackend""#)
+        .expect_err("not one of the five spellings")
+        .to_string();
+      assert!(
+        refusal.contains("unknown variant") && refusal.contains("notabackend"),
+        "the vocabulary answers an in-bound tag: {refusal}"
+      );
+    }
+  }
+
+  /// The `clap` face ([`clap::ValueEnum`]) is untouched by the bounded-visitor
+  /// `Deserialize` rewrite above — it still parses every spelling
+  /// [`Backend::as_str`] returns.
+  #[cfg(feature = "clap")]
+  mod clap_face {
+    use clap::ValueEnum as _;
+
+    use super::Backend;
+
+    #[test]
+    fn every_variant_parses_from_its_own_tag() {
+      for backend in [
+        Backend::Auto,
+        Backend::Inotify,
+        Backend::Fanotify,
+        Backend::Rdcw,
+        Backend::UsnJournal,
+      ] {
+        assert_eq!(Backend::from_str(backend.as_str(), false).unwrap(), backend);
+      }
+    }
   }
 }

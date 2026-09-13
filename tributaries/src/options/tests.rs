@@ -638,6 +638,51 @@ mod serde_face {
     assert_eq!(parsed, Debounce::Custom(DebounceConfig::new()));
   }
 
+  /// A variant tag longer than the longest valid name is refused ON ITS
+  /// LENGTH, and the refusal says nothing about the value.
+  ///
+  /// This vocabulary is three words of at most seven bytes. A megabyte-long
+  /// tag is not a near miss to be reported helpfully — it is an untrusted
+  /// document asking this face to copy it and then to format it into an
+  /// error, twice its size live at the same instant. The bound is judged
+  /// first, and the message it produces is fixed.
+  #[test]
+  fn an_over_long_debounce_posture_name_is_refused_without_echoing_it() {
+    const FILLER: char = 'z';
+
+    let tag: String = core::iter::repeat_n(FILLER, 1024 * 1024).collect();
+    let document = format!(r#""{tag}""#);
+    let refusal = serde_json::from_str::<Debounce>(&document)
+      .expect_err("a tag past the vocabulary's longest name is refused")
+      .to_string();
+
+    assert!(
+      refusal.contains("at most 7 bytes"),
+      "the refusal names the bound: {refusal}"
+    );
+    assert!(
+      refusal.contains(&tag.len().to_string()),
+      "and the length it measured: {refusal}"
+    );
+    assert!(
+      !refusal.contains(&FILLER.to_string().repeat(9)),
+      "and none of the value itself: {refusal}"
+    );
+  }
+
+  /// A junk tag inside the bound reaches the vocabulary and is refused as
+  /// `unknown_variant`, with the (short, bounded) tag echoed.
+  #[test]
+  fn a_junk_debounce_posture_name_inside_the_bound_is_an_unknown_variant() {
+    let refusal = serde_json::from_str::<Debounce>(r#""custo""#)
+      .expect_err("not one of the three spellings")
+      .to_string();
+    assert!(
+      refusal.contains("unknown variant") && refusal.contains("custo"),
+      "the vocabulary answers an in-bound tag: {refusal}"
+    );
+  }
+
   /// The watcher-global debounce is an opt-in `Option`: absent and `null` are off, an
   /// object turns the coalescer on.
   #[test]

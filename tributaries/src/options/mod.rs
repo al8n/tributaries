@@ -824,7 +824,7 @@ impl Default for DebounceConfig {
 /// [`DebounceConfig`]'s own flags and hands the result to
 /// [`WatchOptions::with_debounce`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 #[non_exhaustive]
 pub enum Debounce {
@@ -866,6 +866,152 @@ impl Debounce {
       Self::Custom(config) => Some(config),
       _ => None,
     }
+  }
+}
+
+/// The legal spellings of a [`Debounce`] variant tag, in declaration order —
+/// the externally-tagged name each variant carries, [`Custom`](Debounce::Custom)
+/// included (its tag names the variant, never the [`DebounceConfig`] payload).
+#[cfg(feature = "serde")]
+const DEBOUNCE_NAMES: [&str; 3] = ["inherit", "off", "custom"];
+
+/// The longest name in [`DEBOUNCE_NAMES`], in bytes — the ceiling a tag is
+/// measured against before anything is done with it. Derived from the
+/// vocabulary itself, so a renamed or added posture moves it rather than
+/// leaving a stale literal behind.
+#[cfg(feature = "serde")]
+const MAX_DEBOUNCE_NAME_LEN: usize = {
+  let mut longest = 0;
+  let mut index = 0;
+  while index < DEBOUNCE_NAMES.len() {
+    if DEBOUNCE_NAMES[index].len() > longest {
+      longest = DEBOUNCE_NAMES[index].len();
+    }
+    index += 1;
+  }
+  longest
+};
+
+/// Which [`Debounce`] variant one tag names — the seed's answer, so the enum
+/// visitor below does nothing but read the tag and then ask for the payload
+/// (or not) the named variant carries.
+#[cfg(feature = "serde")]
+enum DebounceVariant {
+  Inherit,
+  Off,
+  Custom,
+}
+
+/// One variant tag, read as BORROWED text and measured before it is copied,
+/// compared or echoed — the same mold [`Interest`] and
+/// [`Glob`](tributary_proto::glob::Glob) use for their own bounded tags,
+/// applied here through `deserialize_identifier`: [`Debounce`] is externally
+/// tagged WITH a data-carrying variant, so the tag is the enum's variant
+/// identifier rather than the whole value a `deserialize_str` door would read.
+///
+/// Asking the format for an owned `String` first hands an untrusted document
+/// one allocation per tag before the three-word vocabulary it is about to fail
+/// is ever consulted, and formatting an unknown tag into `unknown_variant` then
+/// hands it a second allocation of the same size, live at the same instant. So
+/// the ceiling is judged first, on the bytes the format is already holding, and
+/// a tag past it is refused with a FIXED message naming the bound and the
+/// length — never the value. What reaches `unknown_variant` is by construction
+/// at most [`MAX_DEBOUNCE_NAME_LEN`] bytes, so the echo it formats is bounded
+/// too.
+#[cfg(feature = "serde")]
+struct DebounceTag;
+
+#[cfg(feature = "serde")]
+impl<'de> serde::de::DeserializeSeed<'de> for DebounceTag {
+  type Value = DebounceVariant;
+
+  fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+  where
+    D: serde::Deserializer<'de>,
+  {
+    deserializer.deserialize_identifier(self)
+  }
+}
+
+#[cfg(feature = "serde")]
+impl serde::de::Visitor<'_> for DebounceTag {
+  type Value = DebounceVariant;
+
+  fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    write!(
+      f,
+      "a debounce posture name of at most {MAX_DEBOUNCE_NAME_LEN} bytes"
+    )
+  }
+
+  /// The one door, and the one every other arm reaches: `visit_borrowed_str`
+  /// and `visit_string` are serde's own forwards to it, so text the format
+  /// borrows out of its input is measured without being copied at all, and
+  /// text the format already owns is measured before this face does anything
+  /// with it.
+  fn visit_str<E>(self, name: &str) -> Result<Self::Value, E>
+  where
+    E: serde::de::Error,
+  {
+    if name.len() > MAX_DEBOUNCE_NAME_LEN {
+      // The length, never the value: an over-long tag is exactly the input
+      // whose echo is the hazard.
+      return Err(E::custom(format_args!(
+        "a debounce posture name is at most {MAX_DEBOUNCE_NAME_LEN} bytes, and this one is {}",
+        name.len()
+      )));
+    }
+    match name {
+      "inherit" => Ok(DebounceVariant::Inherit),
+      "off" => Ok(DebounceVariant::Off),
+      "custom" => Ok(DebounceVariant::Custom),
+      other => Err(E::unknown_variant(other, &DEBOUNCE_NAMES)),
+    }
+  }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for Debounce {
+  /// One externally-tagged posture: `"inherit"` and `"off"` carry nothing,
+  /// `{"custom": ...}` carries a whole [`DebounceConfig`] — the exact shape
+  /// serde's own derive would produce, kept by hand so the TAG is read through
+  /// the bounded [`DebounceTag`] visitor rather than an owned, unbounded
+  /// `String` serde's derive would build to match it against the vocabulary.
+  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+  where
+    D: serde::Deserializer<'de>,
+  {
+    struct DebounceVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for DebounceVisitor {
+      type Value = Debounce;
+
+      fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("a debounce posture (\"inherit\", \"off\", or a custom policy)")
+      }
+
+      fn visit_enum<A>(self, data: A) -> Result<Self::Value, A::Error>
+      where
+        A: serde::de::EnumAccess<'de>,
+      {
+        use serde::de::VariantAccess as _;
+
+        let (variant, access) = data.variant_seed(DebounceTag)?;
+        match variant {
+          DebounceVariant::Inherit => {
+            access.unit_variant()?;
+            Ok(Debounce::Inherit)
+          }
+          DebounceVariant::Off => {
+            access.unit_variant()?;
+            Ok(Debounce::Off)
+          }
+          DebounceVariant::Custom => Ok(Debounce::Custom(access.newtype_variant()?)),
+        }
+      }
+    }
+
+    deserializer.deserialize_enum("Debounce", &DEBOUNCE_NAMES, DebounceVisitor)
   }
 }
 
