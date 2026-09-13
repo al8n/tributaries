@@ -5,11 +5,11 @@
 use std::{
   collections::{BTreeMap, BTreeSet},
   num::NonZeroU64,
-  path::PathBuf,
+  path::{Path, PathBuf},
   vec::Vec,
 };
 
-use tributary_proto::{Evidence, OsRecord, RecordKind, Scope};
+use tributary_proto::{Evidence, Location, OsRecord, RecordKind, Scope};
 
 use super::super::{
   DriverCore, Effect, Item, ItemPlan, Lowered, PendingBatch, Planned, ProbePurpose, ScopeId,
@@ -28,6 +28,11 @@ impl DriverCore {
   /// rename half on the blocking pool, accepted by design: an event-side
   /// pre-pair must trust device facts it cannot observe, which is exactly how
   /// a fabricated cross-device move happens.
+  ///
+  /// What a half CAN be spared is a probe whose every verdict the common-layer
+  /// fence would discard: ground the per-root seat closes is asked about before
+  /// the probe is minted ([`under_closed_ground`](Self::under_closed_ground)),
+  /// not after it answers.
   pub(in crate::core) fn compile_fsevents(
     &mut self,
     state: &mut ScopeState,
@@ -179,6 +184,37 @@ impl DriverCore {
     let removed = flags.item_removed();
 
     if flags.item_renamed() {
+      // ASK THE FENCE FIRST. A rename word whose ground the seat closes, and
+      // whose class the word itself proves not to be a directory, has no
+      // verdict left for a probe to establish: every `Planned` the resolution
+      // could yield is one the common-layer fence drops. The probe would be
+      // pure waste, and while it is awaited the batch is parked and every later
+      // batch of the root queues behind it — so the record is dropped here,
+      // where the post-probe fence would have dropped it.
+      //
+      // The seat is read class-independently ([`DriverCore::is_pruned`] with
+      // `directory` false): it speaks for the ANCESTORS alone and never for the
+      // last component, so a path whose own name matches a word keeps its probe
+      // — its class is exactly what the probe is for, and a directory renamed
+      // into the seat owes the widened-cover repair the post-probe arm
+      // performs. That is also why the class must be PROVEN here: an unproven
+      // class is read as a directory, because the profiles that report the
+      // fewest classes are exactly the ones that move whole subtrees silently.
+      //
+      // The drop strands no pairing, and needs no consumption to say so. A half
+      // is parked only for a rename's SOURCE, and this profile grants a
+      // vanished source its cookie solely on the probe evidence of exactly one
+      // same-batch PRESENT partner — evidence a record dropped before its probe
+      // never publishes. So a rename INTO closed ground leaves its unpruned
+      // source uncookied and the Monitor resolves it as an immediate removal,
+      // and a rename OUT of closed ground leaves nothing parked for its
+      // unpruned destination to wait on, which arrives as an appearance. Both
+      // surviving halves resolve at once rather than after the pairing window.
+      if dir_hint(flags) == Some(false)
+        && Self::under_closed_ground(state, target.as_ref(), &ev.path)
+      {
+        return ItemPlan::Immediate(Vec::new());
+      }
       let probe = self.mint_probe(
         scope,
         ProbePurpose::Rename {
@@ -222,6 +258,14 @@ impl DriverCore {
         ItemPlan::Immediate(vec![Planned::Rec(rec)])
       }
       _ => {
+        // The same pre-probe fence, and here it needs no class proof: this
+        // purpose's outcomes are built from an existence verdict and the word's
+        // own content and metadata bits, so none of them can be the rename
+        // destination the fence widens instead of dropping. Every verdict under
+        // closed ground is a drop for any class, and nothing pairs.
+        if Self::under_closed_ground(state, target.as_ref(), &ev.path) {
+          return ItemPlan::Immediate(Vec::new());
+        }
         let probe = self.mint_probe(
           scope,
           ProbePurpose::Ambiguous {
@@ -237,6 +281,35 @@ impl DriverCore {
         }
       }
     }
+  }
+
+  /// Whether `path` lies UNDER ground the per-root seat closes — asked ahead of
+  /// the probe that would otherwise ground it.
+  ///
+  /// Two questions, in the order the common-layer fence asks them and through
+  /// the fence's own predicates, so the two seats cannot drift apart:
+  ///
+  /// - the marker exemption. A location whose last segment is an ACTIVE marker
+  ///   leaf of this scope stands whatever the seat says: its event is what a
+  ///   barrier waits on, and a seat that suppressed it would leave the caller
+  ///   waiting on an event that can no longer exist.
+  /// - the seat itself, read CLASS-INDEPENDENTLY. `directory` is the caller's
+  ///   PROOF that the last segment is a directory, never its suspicion, and
+  ///   nothing is proven before the probe — so the walk is asked about the
+  ///   ancestors alone. That is the same reading the fence applies to a
+  ///   vanished half's record, and it implies the reading it applies to a
+  ///   present one, whose walk asks a superset of these prefixes under the same
+  ///   exemption window. Nothing is dropped here that the fence would keep.
+  ///
+  /// The EXCLUSION half of the fence is absent on purpose: this profile hands
+  /// its exclusions to the OS, which drops those events before the process sees
+  /// them, so the common layer stands that half down and a test here would be
+  /// suppression the fence itself does not perform.
+  ///
+  /// Costs nothing on a root that configured no seat: the walk returns at once
+  /// on an empty pattern set, as the marker question does on an empty map.
+  fn under_closed_ground(state: &ScopeState, target: Option<&Location>, path: &Path) -> bool {
+    !Self::names_active_marker(state, target) && Self::is_pruned(state, false, path)
   }
 
   /// Plans a mount-table update plus the located rescan the volume change

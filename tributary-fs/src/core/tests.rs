@@ -20754,6 +20754,359 @@ mod prune {
        {events:?}"
     );
   }
+
+  /// The pre-probe seat, in its plainest shape: a rename word whose ground the
+  /// seat closes and whose class the word itself proves not to be a directory
+  /// has no verdict left for a probe to establish, so none is minted and the
+  /// batch is never parked. That is the whole content of the fix — an awaited
+  /// `lstat` over ground the fence discards parks the batch, and every later
+  /// batch of the root queues behind it.
+  ///
+  /// Non-vacuity: the same word on unpruned ground still probes.
+  ///
+  /// Revert witness: mint the probe unconditionally and the pruned word
+  /// dispatches one too.
+  #[test]
+  fn a_proven_file_rename_under_pruned_ground_mints_no_probe() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
+    let scope = live_fsevents(&mut core, &pruning(&["**/cache"]));
+
+    core.on_batch_events(
+      scope,
+      vec![ev(
+        "/r/cache/one.txt",
+        flags(&[FsEventFlags::ITEM_RENAMED, FsEventFlags::ITEM_IS_FILE]),
+        10,
+        42,
+      )],
+      at(1),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      probes(&effects).is_empty(),
+      "the seat answers before the probe is minted: {effects:?}"
+    );
+    assert!(
+      emits(&effects).is_empty(),
+      "and nothing emerges from the ground the caller closed: {effects:?}"
+    );
+
+    core.on_batch_events(
+      scope,
+      vec![ev(
+        "/r/keep/one.txt",
+        flags(&[FsEventFlags::ITEM_RENAMED, FsEventFlags::ITEM_IS_FILE]),
+        11,
+        43,
+      )],
+      at(2),
+    );
+    let effects = drain(&mut core);
+    assert_eq!(
+      probes(&effects).len(),
+      1,
+      "an unpruned rename half is still probe-grounded: {effects:?}"
+    );
+  }
+
+  /// The seat is read CLASS-INDEPENDENTLY here: it speaks for the ancestors
+  /// alone and never for the last component, because nothing has proven that
+  /// component a directory yet — which is exactly what the probe is for. So a
+  /// path whose OWN name matches a word keeps its probe, while one under a
+  /// matching ANCESTOR does not.
+  ///
+  /// Revert witness: read the seat with `directory` true and `/r/a/cache` loses
+  /// its probe, taking the widened-cover repair a directory renamed into the
+  /// seat owes with it.
+  #[test]
+  fn a_rename_naming_the_pruned_directory_itself_keeps_its_probe() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
+    let scope = live_fsevents(&mut core, &pruning(&["**/cache"]));
+
+    core.on_batch_events(
+      scope,
+      vec![
+        // The LEAF matches the word — unproven class, so the seat may not speak
+        // for it.
+        ev(
+          "/r/a/cache",
+          flags(&[FsEventFlags::ITEM_RENAMED, FsEventFlags::ITEM_IS_FILE]),
+          10,
+          44,
+        ),
+        // An ANCESTOR matches: the seat speaks for every class below it.
+        ev(
+          "/r/cache/deep.txt",
+          flags(&[FsEventFlags::ITEM_RENAMED, FsEventFlags::ITEM_IS_FILE]),
+          11,
+          45,
+        ),
+      ],
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let minted = probes(&effects);
+    assert_eq!(
+      minted
+        .iter()
+        .map(|(_, path)| path.clone())
+        .collect::<Vec<_>>(),
+      vec![PathBuf::from("/r/a/cache")],
+      "the leaf keeps its probe and the descendant of a pruned prefix does not: \
+       {effects:?}"
+    );
+  }
+
+  /// The class condition, from the other side. An UNPROVEN class is read as a
+  /// directory — the profiles that report the fewest classes are the ones that
+  /// move whole subtrees silently — so such a word keeps its probe, and a
+  /// directory that turns out to have been renamed into closed ground still
+  /// buys the widened cover the post-probe arm stands at its nearest unpruned
+  /// ancestor.
+  ///
+  /// Revert witness: drop the class condition from the pre-probe seat and the
+  /// cover disappears with the probe.
+  #[test]
+  fn an_unproven_class_under_pruned_ground_keeps_its_probe_and_its_cover() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
+    let scope = live_fsevents(&mut core, &pruning(&["a/cache"]));
+
+    core.on_batch_events(
+      scope,
+      vec![ev(
+        "/r/a/cache/incoming",
+        flags(&[FsEventFlags::ITEM_RENAMED]),
+        10,
+        46,
+      )],
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let minted = probes(&effects);
+    assert_eq!(
+      minted.len(),
+      1,
+      "a word that proves no class is grounded by its probe: {effects:?}"
+    );
+
+    core.on_probe_result(
+      minted[0].0,
+      ProbeOutcome::Present {
+        kind: FileKind::Dir,
+        file_id: NonZeroU64::new(46),
+        dev: 1,
+      },
+      at(2),
+    );
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+    assert!(
+      changes
+        .iter()
+        .any(|change| change.kind().is_rescan() && change.location() == &loc(&["a"])),
+      "the destination the seat covers is replaced by a cover at its nearest \
+       unpruned ancestor: {changes:?}"
+    );
+  }
+
+  /// A rename OUT of closed ground. Only the unpruned half probes, and its
+  /// destination is delivered AT ONCE as an appearance — the pruned side was
+  /// never reported, so there is nothing for it to be paired with and nothing
+  /// to wait for. A half is parked only for a rename's SOURCE, and a source
+  /// dropped before its probe publishes no evidence, so no cookie it could have
+  /// stranded is ever minted.
+  ///
+  /// Revert witness: mint the probe unconditionally and a second `lstat` is
+  /// dispatched for ground whose every verdict the fence discards.
+  #[test]
+  fn a_rename_out_of_pruned_ground_reports_its_destination_at_once() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
+    let scope = live_fsevents(&mut core, &pruning(&["**/cache"]));
+
+    core.on_batch_events(
+      scope,
+      vec![
+        ev(
+          "/r/cache/one.txt",
+          flags(&[FsEventFlags::ITEM_RENAMED, FsEventFlags::ITEM_IS_FILE]),
+          10,
+          47,
+        ),
+        ev(
+          "/r/keep/one.txt",
+          flags(&[FsEventFlags::ITEM_RENAMED, FsEventFlags::ITEM_IS_FILE]),
+          11,
+          47,
+        ),
+      ],
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let minted = probes(&effects);
+    assert_eq!(
+      minted
+        .iter()
+        .map(|(_, path)| path.clone())
+        .collect::<Vec<_>>(),
+      vec![PathBuf::from("/r/keep/one.txt")],
+      "only the half the caller still hears about is grounded: {effects:?}"
+    );
+
+    core.on_probe_result(
+      minted[0].0,
+      ProbeOutcome::Present {
+        kind: FileKind::File,
+        file_id: NonZeroU64::new(47),
+        dev: 1,
+      },
+      at(2),
+    );
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+    assert_eq!(
+      changes.len(),
+      1,
+      "one delivery, in the same resolution: {effects:?}"
+    );
+    assert!(
+      changes[0].kind().is_created() && changes[0].location() == &loc(&["keep", "one.txt"]),
+      "the surviving destination arrives as an appearance rather than waiting \
+       out the pairing window: {changes:?}"
+    );
+  }
+
+  /// A rename INTO closed ground, the same rule from the other end. The pruned
+  /// destination mints no probe, so it publishes no evidence, so the vanished
+  /// source is granted no cookie and the Monitor resolves it as an immediate
+  /// removal.
+  ///
+  /// Revert witness: mint the destination's probe unconditionally, resolve it
+  /// `Present`, and the source is granted its cookie and parks — the fence then
+  /// drops the proven-file destination without consuming anything, and this
+  /// removal does not arrive until the move window elapses.
+  #[test]
+  fn a_rename_into_pruned_ground_reports_its_source_at_once() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
+    let scope = live_fsevents(&mut core, &pruning(&["**/cache"]));
+
+    core.on_batch_events(
+      scope,
+      vec![
+        ev(
+          "/r/keep/two.txt",
+          flags(&[FsEventFlags::ITEM_RENAMED, FsEventFlags::ITEM_IS_FILE]),
+          10,
+          48,
+        ),
+        ev(
+          "/r/cache/two.txt",
+          flags(&[FsEventFlags::ITEM_RENAMED, FsEventFlags::ITEM_IS_FILE]),
+          11,
+          48,
+        ),
+      ],
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let minted = probes(&effects);
+    assert_eq!(
+      minted
+        .iter()
+        .map(|(_, path)| path.clone())
+        .collect::<Vec<_>>(),
+      vec![PathBuf::from("/r/keep/two.txt")],
+      "only the unpruned source is grounded: {effects:?}"
+    );
+
+    core.on_probe_result(minted[0].0, ProbeOutcome::Missing, at(2));
+    let effects = drain(&mut core);
+    let changes = emits(&effects);
+    assert_eq!(
+      changes.len(),
+      1,
+      "one delivery, in the same resolution: {effects:?}"
+    );
+    assert!(
+      changes[0].kind().is_removed() && changes[0].location() == &loc(&["keep", "two.txt"]),
+      "the source the caller still hears about departs at once rather than \
+       waiting out the pairing window: {changes:?}"
+    );
+  }
+
+  /// The other awaited probe on this lowering takes the same seat, and needs no
+  /// class proof to: an ambiguous word's outcomes are built from an existence
+  /// verdict and the word's own content and metadata bits, so none of them can
+  /// be the rename destination the fence widens instead of dropping.
+  ///
+  /// Revert witness: mint the ambiguous probe unconditionally and the pruned
+  /// word dispatches one too.
+  #[test]
+  fn an_ambiguous_word_under_pruned_ground_mints_no_probe() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
+    let scope = live_fsevents(&mut core, &pruning(&["**/cache"]));
+
+    core.on_batch_events(
+      scope,
+      vec![
+        ev(
+          "/r/cache/three.txt",
+          flags(&[FsEventFlags::ITEM_CREATED, FsEventFlags::ITEM_REMOVED]),
+          10,
+          49,
+        ),
+        ev(
+          "/r/keep/three.txt",
+          flags(&[FsEventFlags::ITEM_CREATED, FsEventFlags::ITEM_REMOVED]),
+          11,
+          50,
+        ),
+      ],
+      at(1),
+    );
+    let effects = drain(&mut core);
+    assert_eq!(
+      probes(&effects)
+        .iter()
+        .map(|(_, path)| path.clone())
+        .collect::<Vec<_>>(),
+      vec![PathBuf::from("/r/keep/three.txt")],
+      "the closed ground's word is dropped where the fence would have dropped \
+       it, and the open ground's is still grounded: {effects:?}"
+    );
+  }
+
+  /// The seat this pre-probe fence does NOT carry. This profile hands its
+  /// exclusions to the OS, which drops those events before the process sees
+  /// them, so the common layer stands that half down — and a test here would be
+  /// suppression the fence itself does not perform, on records that are minted
+  /// after compile and so could only be suppressed in part.
+  ///
+  /// Revert witness: ask the exclusion half at the pre-probe seat and this
+  /// probe disappears.
+  #[test]
+  fn an_excluded_rename_still_probes_because_the_os_holds_that_seat() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir())
+      .with_exclusions(vec![PathBuf::from("/r/ex")]);
+    let scope = live_fsevents(&mut core, &RootOptions::new());
+
+    core.on_batch_events(
+      scope,
+      vec![ev(
+        "/r/ex/one.txt",
+        flags(&[FsEventFlags::ITEM_RENAMED, FsEventFlags::ITEM_IS_FILE]),
+        10,
+        51,
+      )],
+      at(1),
+    );
+    let effects = drain(&mut core);
+    assert_eq!(
+      probes(&effects).len(),
+      1,
+      "the exclusion is the OS's seat on this profile, not the compile's: \
+       {effects:?}"
+    );
+  }
 }
 
 mod include {
