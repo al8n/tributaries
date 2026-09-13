@@ -96,7 +96,7 @@ tributary-proto = { version = "0.2", path = "../tributary-proto", features = [
 # call. Absent it a driver holds no generator and refuses every barrier outright, rather
 # than running on a name something else can compute.
 [target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
-getrandom = { version = "0.3", optional = true }
+getrandom = { version = "0.4", optional = true }
 
 [dev-dependencies]
 # Mirror a real consumer's manifest: the indexer-shaped integration suite
