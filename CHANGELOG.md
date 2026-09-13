@@ -418,7 +418,8 @@ All notable changes to this workspace are documented here. The format is based o
 
 - **`tributaries`** — the fs binding no longer renders a cookie name from `SyncToken`; it
   places the leaf `tributary_fs::Watcher` minted and correlates the barrier on that. A
-  custom `Source` is unaffected in signature, and `Source::begin_sync`'s contract now
+  custom `Source` is unaffected in signature by this change — see the `begin_sync` entry
+  below for the return type it IS breaking — and `Source::begin_sync`'s contract now
   states both ways to discharge the unpredictability obligation: render the token's
   `nonce` into the marker's identity, or take an identity a lower layer mints
   unpredictably itself. A binding built directly on `tributary_fs::Watcher` must take the
@@ -555,8 +556,16 @@ All notable changes to this workspace are documented here. The format is based o
   beneath the marker's ground, a `set_cover` shrunk over it, a root replaced, a trust or
   overflow verdict on the whole scope: each is a coverage transition, each stands a
   located `Rescan`, and a barrier whose ground one of them touches is retired by it
-  rather than certified past it. A barrier is never retired silently — the covering
-  `Rescan` is on the stream before the caller is answered.
+  rather than certified past it. EXCEPT: arming the barrier's own reserved cookie
+  directory is not a transition — it is the write's own ground coming into coverage,
+  created by the write itself — so the first sync of a directory does not dominate
+  its own marker.
+
+  A barrier is never retired silently — the covering
+  `Rescan` is stood, queued ahead of every later delta on that ground, before the caller
+  is answered; it reaches the stream at the next flush, not necessarily before the
+  answer does, so a caller that re-reads at once may still race ahead of it and converges
+  on it once it arrives.
 
   The caller learns it one of two ways, both at once rather than at its deadline: before
   the marker is installed, `Watcher::sync_root` answers `SyncRootError::Dominated` and
@@ -628,9 +637,9 @@ All notable changes to this workspace are documented here. The format is based o
   landing is itself a watch-lifecycle transition and retires the barriers standing on
   it. On a kernel-recursive backend (FSEvents, fanotify) there are no per-directory
   watches to transition, so the certificate rests where it always did — on the
-  descriptors the watcher pins for the sync target and the reserved cookie directory for
-  the sync's duration. The assumption below is the same one this entry always stated; it
-  does not widen.
+  descriptors the watcher pins for the sync target and the reserved cookie directory
+  until the marker is created. The assumption below is the same one this entry always
+  stated; it does not widen.
 
   Identity, mount frame and landing are re-verified at the write on every backend, a
   minted reserved directory is proved to hold only its marker, every cleanup terminal is
@@ -642,9 +651,10 @@ All notable changes to this workspace are documented here. The format is based o
   holds no descriptor on the objects it was admitted against — the door samples them and
   releases — so what it carries into the write is a REMEMBERED tuple, and a replacement
   reusing the admitted inode inside that parked window is no longer refused
-  `SyncRootError::DirReplaced`. Where such a reuse is a watch-lifecycle event the epoch
-  retires the barrier instead; where it is not, it is the same-uid residual this entry
-  already names.
+  `SyncRootError::DirReplaced`. A `Parked` obligation is exempt from move-retirement, and
+  its dispatch re-judges only the applied cover — never the epoch — so an inode reuse
+  inside that parked window on a descending backend is caught by neither the released
+  pins nor the epoch: it is the same-uid residual this entry already names, full stop.
 
   What remains outside the contract is therefore a process running with the watcher's
   OWN uid acting BEHIND coverage that never transitions: renaming, hard-linking or

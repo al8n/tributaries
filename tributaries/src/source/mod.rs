@@ -1318,8 +1318,9 @@ pub enum Begun<C> {
   /// the owner resolves the barrier by.
   Installed(Vec<C>),
   /// A coverage transition on the barrier's ground retired it before it was
-  /// installed, and the covering `Rescan` it stood is already on the caller's
-  /// stream.
+  /// installed. The covering `Rescan` it stood is queued ahead of every later
+  /// delta on that ground, and reaches the caller's stream at the owner's next
+  /// flush — not necessarily before this reply does.
   ///
   /// The owner resolves the caller at once with
   /// [`SyncOutcome::Dominated`] — which is exactly that variant's public
@@ -1348,6 +1349,21 @@ impl<C> Begun<C> {
   /// before it was installed.
   #[inline]
   pub fn installed(&self) -> Option<&[C]> {
+    match self {
+      Self::Installed(key) => Some(key),
+      Self::Dominated => None,
+    }
+  }
+
+  /// The marker's OWNED canonical key, or `None` when the barrier was dominated
+  /// before it was installed.
+  ///
+  /// The shape an EXTERNAL owner needs when its own admission path consumes the
+  /// key by value: [`installed`](Self::installed)'s borrow cannot be turned into
+  /// one without a clone, and a `Source` implementation outside this crate has
+  /// no other way to take it.
+  #[inline]
+  pub fn into_installed(self) -> Option<Vec<C>> {
     match self {
       Self::Installed(key) => Some(key),
       Self::Dominated => None,

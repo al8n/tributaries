@@ -416,8 +416,13 @@ fn a_programmatic_seat_is_bounded_at_collection() {
 mod serde_face {
   use core::{num::NonZeroUsize, time::Duration};
 
+  use serde::de::{DeserializeSeed as _, value::U64Deserializer};
+
   use super::{
-    super::{Debounce, DebounceConfig, RootGlobs, TributariesOptions, WatchOptions},
+    super::{
+      DEBOUNCE_NAMES, Debounce, DebounceConfig, DebounceTag, DebounceVariant, RootGlobs,
+      TributariesOptions, WatchOptions,
+    },
     glob, texts,
   };
   use crate::{
@@ -636,6 +641,79 @@ mod serde_face {
     }
     let parsed: Debounce = serde_json::from_str(r#"{"custom": {}}"#).unwrap();
     assert_eq!(parsed, Debounce::Custom(DebounceConfig::new()));
+  }
+
+  /// The externally-tagged MAP form a unit variant takes — `derive(Deserialize)`
+  /// accepted `{"inherit": null}` and `{"off": null}`, and the bounded hand
+  /// impl must accept exactly the same shape (`{"custom": {}}` is pinned
+  /// above, the map form its own payload variant already takes).
+  #[test]
+  fn every_unit_posture_round_trips_through_the_map_form() {
+    for (tag, posture) in [("inherit", Debounce::Inherit), ("off", Debounce::Off)] {
+      let document = format!(r#"{{"{tag}": null}}"#);
+      assert_eq!(
+        serde_json::from_str::<Debounce>(&document).unwrap(),
+        posture,
+        "the map form of a unit variant round-trips: {document}"
+      );
+    }
+  }
+
+  /// The same bound as [`an_over_long_debounce_posture_name_is_refused_without_echoing_it`],
+  /// over the bytes-identifier door — the one a binary format's map-key
+  /// reaches, which `serde_json` never drives.
+  #[test]
+  fn an_over_long_debounce_posture_name_is_refused_without_echoing_it_as_bytes() {
+    use serde::de::Visitor as _;
+
+    const FILLER: u8 = b'z';
+
+    let tag: std::vec::Vec<u8> = core::iter::repeat_n(FILLER, 1024 * 1024).collect();
+    let refusal = DebounceTag
+      .visit_bytes::<serde_json::Error>(&tag)
+      .expect_err("a tag past the vocabulary's longest name is refused")
+      .to_string();
+
+    assert!(
+      refusal.contains("at most 7 bytes"),
+      "the refusal names the bound: {refusal}"
+    );
+    assert!(
+      refusal.contains(&tag.len().to_string()),
+      "and the length it measured: {refusal}"
+    );
+    assert!(
+      !refusal.contains(&(FILLER as char).to_string().repeat(9)),
+      "and none of the value itself: {refusal}"
+    );
+  }
+
+  /// A non-self-describing format's identifier door answers with the
+  /// variant's declaration-order INDEX rather than a name — the shape
+  /// `Debounce`'s own derived `Serialize` still writes for such a format.
+  /// `U64Deserializer` drives `deserialize_identifier` exactly the way such a
+  /// format would: index `0` is the first variant, and an out-of-range index
+  /// is refused with a fixed message.
+  #[test]
+  fn index_zero_resolves_to_the_first_variant_through_a_non_self_describing_identifier() {
+    let seed_result = DebounceTag.deserialize(U64Deserializer::<serde_json::Error>::new(0));
+    assert!(
+      matches!(seed_result, Ok(DebounceVariant::Inherit)),
+      "index 0 is the first variant, Debounce::Inherit"
+    );
+  }
+
+  #[test]
+  fn an_out_of_range_debounce_index_is_refused() {
+    let out_of_range = DEBOUNCE_NAMES.len() as u64;
+    let refusal = DebounceTag.deserialize(U64Deserializer::<serde_json::Error>::new(out_of_range));
+    let refusal = refusal
+      .expect_err("an index at or past the vocabulary's length names no variant")
+      .to_string();
+    assert!(
+      refusal.contains(&format!("at most {}", DEBOUNCE_NAMES.len() - 1)),
+      "the refusal names the fixed bound: {refusal}"
+    );
   }
 
   /// A variant tag longer than the longest valid name is refused ON ITS

@@ -1893,25 +1893,33 @@ impl<R> Watcher<R> {
   /// are still checked, and are still only ever grounds to REFUSE: no directory is
   /// entered because its bits look right.
   ///
-  /// # The judged objects are held for the sync's duration
+  /// # The judged objects, by profile
   ///
   /// An identity is a `(dev, ino)` pair, and an inode number is a slot the
   /// filesystem reclaims. A peer that removes one of the judged directories,
   /// churns allocations until a replacement of its own receives that number, and
   /// moves the replacement onto the name satisfies every field of the comparison
   /// above — so the comparison alone would certify an ordering for a directory the
-  /// cut never covered. This call therefore does not merely READ those objects; on
-  /// the platforms that can hold one it opens a descriptor onto the watched root,
-  /// onto `dir`, and onto the reserved directory where one already stands, and
-  /// holds them. A held inode is not reclaimable, so an equality at write time is
-  /// an object identity rather than a coincidence of numbering.
+  /// cut never covered. A held descriptor closes that: a held inode is not
+  /// reclaimable, so an equality at write time is an object identity rather than
+  /// a coincidence of numbering. The two profiles do not hold the same objects
+  /// for the same span, though, and neither holds the watched root: `root`'s
+  /// identity is read and released inside this same call, on every profile.
   ///
-  /// They are held for the SYNC'S DURATION and no longer: the descriptors travel
-  /// with the admission and are dropped when it writes, refuses, or retires. One
-  /// visible consequence is worth stating — a judged directory deleted while the
-  /// sync is in flight stays allocated until the sync settles, so the kernel's own
-  /// deletion notice for it is deferred to that moment rather than arriving at the
-  /// unlink. The window is bounded by the same caps that bound parked syncs.
+  /// On a DESCENDING backend `dir` and the reserved directory are SAMPLED and
+  /// released at the door too — every descriptor this call opens on them is
+  /// closed before the write is dispatched, so what the write carries forward is
+  /// a REMEMBERED `(dev, ino)` tuple, not a hold, and the coverage epoch (above)
+  /// is the belt that closes the reuse an unheld number would otherwise let
+  /// through, for everything the epoch's funnels reach.
+  ///
+  /// On a KERNEL-RECURSIVE backend (FSEvents, fanotify) `dir` and the reserved
+  /// directory ARE held, and held UNTIL THE MARKER IS CREATED: the write takes
+  /// the descriptors by value and no path past the create reads them, so they
+  /// drop there, not at settle. One visible consequence is worth stating for
+  /// that profile — a judged directory deleted before the marker is created
+  /// stays allocated until then, so the kernel's own deletion notice for it is
+  /// deferred to that moment rather than arriving at the unlink.
   ///
   /// # The leaf is minted, never chosen
   ///
@@ -1948,8 +1956,16 @@ impl<R> Watcher<R> {
   /// replaced, a trust or overflow verdict on the whole scope: each is a coverage
   /// transition, each stands a located [`Rescan`](crate::EventKind::Rescan), and a
   /// barrier whose ground one of them touches is retired by it rather than
-  /// certified past it. A barrier is never retired silently — the covering
-  /// `Rescan` is on the stream before the terminal is answered.
+  /// certified past it. EXCEPT: arming the barrier's own reserved cookie
+  /// directory is not a transition — it is the write's own ground coming into
+  /// coverage, created by the write itself — so the first sync of a directory
+  /// does not dominate its own marker.
+  ///
+  /// A barrier is never retired silently — the covering
+  /// `Rescan` is stood, queued ahead of every later delta on that ground, before
+  /// the terminal is answered; it reaches the stream at the owner's next flush,
+  /// not necessarily before the terminal does, so a caller that re-reads at once
+  /// may still race ahead of it and converge on it once it arrives.
   ///
   /// Reaching THIS call, that is [`Dominated`](SyncRootError::Dominated): the
   /// obligation was retired before its reply was sent. A transition that lands
@@ -2089,8 +2105,8 @@ impl<R> Watcher<R> {
   /// retires the barriers standing on it. On a kernel-recursive backend (FSEvents,
   /// fanotify) there are no per-directory watches to transition, so the certificate
   /// rests where it always did — on the descriptors this call pins for `dir` and
-  /// the reserved cookie directory for the sync's duration. The assumption below is
-  /// the same one this note always stated; it does not widen.
+  /// the reserved cookie directory until the marker is created. The assumption
+  /// below is the same one this note always stated; it does not widen.
   ///
   /// Identity, mount frame and landing are re-verified at the write on every
   /// backend, a minted reserved directory is proved to hold only its marker, every
@@ -2103,9 +2119,11 @@ impl<R> Watcher<R> {
   /// descriptor on the objects it was admitted against — the door samples them and
   /// releases — so what it carries into the write is a REMEMBERED tuple, and a
   /// replacement reusing the admitted inode inside that parked window is no longer
-  /// refused [`DirReplaced`](SyncRootError::DirReplaced). Where such a reuse is a
-  /// watch-lifecycle event the epoch retires the barrier instead; where it is not,
-  /// it is the same-uid residual this note already names.
+  /// refused [`DirReplaced`](SyncRootError::DirReplaced). A `Parked` obligation is
+  /// exempt from move-retirement, and its dispatch re-judges only the applied
+  /// cover — never the epoch — so an inode reuse inside that parked window on a
+  /// descending backend is caught by neither the released pins nor the epoch: it
+  /// is the same-uid residual this note already names, full stop.
   ///
   /// What remains outside the contract is therefore a process running with the
   /// watcher's OWN uid acting BEHIND coverage that never transitions: renaming,

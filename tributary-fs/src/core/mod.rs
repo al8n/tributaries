@@ -2686,6 +2686,15 @@ impl DriverCore {
   /// FUNNELS rather than their callers: a caller list is exactly the enumeration
   /// discipline that the pairwise-check rounds kept defeating.
   ///
+  /// The funnels are unconditional but for ONE deliberate non-bump, stated at the
+  /// arm funnel itself: the arming of this process's reserved cookie directory
+  /// (the exact leaf [`reserved_cookie_dir`](DriverCore::reserved_cookie_dir)
+  /// holds) is the barrier's own ground coming into coverage, created by the write
+  /// itself, so it records no move. Everything else outside this list is a site
+  /// that never reaches a funnel at all — data events, a reparent within the
+  /// scope, a widen commit, a no-op cover re-issue, a scope teardown, a scope
+  /// birth — and each carries a negative cell of its own.
+  ///
   /// Two foldings keep the queue bounded without ever forgetting a transition:
   ///
   /// - a move naming ground a queued move of the same scope already names folds
@@ -4543,6 +4552,28 @@ impl DriverCore {
     state.liveness_deadline =
       (Self::liveness_ticked(state.profile) && !interval.is_zero() && state.root.is_some())
         .then(|| now + interval);
+  }
+
+  /// Test-only: forces `scope`'s liveness deadline to be immediately due —
+  /// [`Instant::ORIGIN`], which every later `now` has already reached — so the
+  /// next [`on_timeout`](Self::on_timeout) fires its tick regardless of the
+  /// configured interval or how much wall-clock time has actually elapsed.
+  ///
+  /// Unconditional: it bypasses the `liveness_ticked` / non-zero-interval /
+  /// live-root gating [`arm_liveness`] applies, the same way a caller-forced
+  /// deadline should — a scope with no root yet simply finds `arm_refresh` a
+  /// no-op on the next timeout, exactly as an organically-armed deadline
+  /// would. The seam this backs
+  /// ([`DebugTickLiveness`](crate::driver::Command::DebugTickLiveness)) exists
+  /// so a suite can drive one scope's periodic re-stat deterministically
+  /// instead of waiting on a real interval to elapse against dozens of parked
+  /// OS threads — see its doc for why that wait is the wrong shape on a slow
+  /// runner.
+  #[cfg(all(test, feature = "tokio", not(miri)))]
+  pub(crate) fn force_liveness_due(&mut self, scope: ScopeId) {
+    if let Some(state) = self.scopes.get_mut(&scope) {
+      state.liveness_deadline = Some(Instant::ORIGIN);
+    }
   }
 
   /// Feeds one mount-table refresh result: updates device trust AND checks the
@@ -6536,7 +6567,45 @@ impl DriverCore {
             // them passes through, so the bump is raised HERE and at none of them.
             // It stands no `Rescan` of its own (an arm emits none), so a
             // retirement under it owes the covering one itself.
-            if let Some(state) = self.scopes.get_mut(&scope) {
+            //
+            // ONE arm is a deliberate NON-bump: the arming of THIS PROCESS's
+            // RESERVED COOKIE DIRECTORY
+            // ([`reserved_cookie_dir`](Self::reserved_cookie_dir) — the exact leaf
+            // the core holds). The first sync of a directory MINTS that directory
+            // and the cascade arms it: it is the barrier's own ground coming into
+            // coverage, created by the write itself, and it can only ever hold
+            // markers. A foreign directory standing at that name is the EEXIST
+            // arm's business — identity against the admission's reading, the
+            // sole-entry proof, the exact-leaf exemption — never the epoch's.
+            // Without this exemption every barrier dominates ITSELF on its first
+            // sync: the arm lands AT the reserved directory, which intersects the
+            // obligation's `cover_dir` (its parent, `starts_with` in either
+            // direction), so the retirement refuses the claim or purges the emit
+            // of the very write that created the ground.
+            //
+            // The name is matched for EQUALITY against the one leaf this process
+            // reserves, never against the classifier's whole name space — the
+            // rule `on_set_cover`'s shrink exemption already states, and for the
+            // same reason: the space is predictable and unowned, so exempting it
+            // would let any peer fill covered ground with reserved-SHAPED
+            // siblings whose arms move no stamp. Keep every other arm a bump.
+            //
+            // This predicate is NAME-ONLY — unlike `on_set_cover`'s twin it does
+            // not also require the parent to be inside the retained cover — and
+            // that widening is safe only because of a fact this crate does not
+            // itself enforce: the CONSUMER classifier (`is_reserved`, two-level
+            // ground — parent-is-a-cookie-dir-name OR leaf-is-one) suppresses a
+            // foreign directory at this name and everything directly inside it
+            // from every stream regardless, so no un-bumped arm here can bring
+            // unreported old contents into observable coverage. Everything
+            // deeper than depth one is NOT suppressed and still arms under its
+            // OWN name, which passes this funnel normally and bumps. A future
+            // narrowing of that suppression to one level, or a widening of it to
+            // the whole subtree, would silently open this exemption into a real
+            // hole — the two are one invariant split across two crates.
+
+            let reserved_cookie_dir = self.reserved_cookie_dir.as_deref() == Some(name.as_str());
+            if !reserved_cookie_dir && let Some(state) = self.scopes.get_mut(&scope) {
               let ground = BarrierLocation::at(state, Arc::clone(&path));
               Self::barrier_moved(&mut self.barrier_moves, state, scope, ground, false);
             }
