@@ -5007,7 +5007,9 @@ fn random_op_storm_holds_invariants_and_terminates() {
           }
           m.on_os_record(rec, now);
         }
-        3 => m.on_overflow(scopes[(rng() as usize) % scopes.len()].clone(), now),
+        3 => {
+          m.on_overflow(scopes[(rng() as usize) % scopes.len()].clone(), now);
+        }
         4 => m.handle_timeout(at(step + 1 + rng() % 400)),
         5 => {
           // The barrier's dispatch-time deficit re-signal, interleaved with
@@ -5383,9 +5385,15 @@ fn root_overflow_during_hold_rearms_the_paired_source() {
   );
 }
 
-/// A subtree overflow targeting a held move source is fenced like a record: it does not
-/// Rescan at the stale pre-move path, but dirties the hold so the pairing reparent
-/// re-scans the real destination.
+/// A subtree overflow targeting a held move source has its LOCATED mint fenced
+/// like a record: nothing lands at the stale pre-move path, and the hold is
+/// dirtied so the pairing reparent re-scans the real destination.
+///
+/// The instruction is not fenced with it. It stands at once at the scope's ROOT,
+/// whose location is stable across the move, and the seat reports that it stands
+/// — so a caller retiring an obligation over this ground is answered with a
+/// covering `Rescan` already queued, ahead of anything a later record of the same
+/// batch can put on the stream.
 #[test]
 fn subtree_overflow_on_a_held_source_is_fenced() {
   let mut m = per_dir();
@@ -5417,11 +5425,25 @@ fn subtree_overflow_on_a_held_source_is_fenced() {
   );
   let _ = drain_events(&mut m);
 
-  // A subtree overflow on the held source: fenced — no stale-path Rescan.
-  m.on_overflow(Scope::subtree_of(w_d), at(11));
+  // A subtree overflow on the held source: the located mint is fenced, and the
+  // instruction stands at the root instead.
   assert!(
-    drain_events(&mut m).is_empty(),
-    "a subtree overflow on a held source emits no stale-path Rescan"
+    m.on_overflow(Scope::subtree_of(w_d), at(11)),
+    "the held arm stands its instruction at once, and reports that it stands"
+  );
+  let fenced = drain_events(&mut m);
+  let rescans: std::vec::Vec<&Location> = fenced
+    .iter()
+    .filter(|e| e.kind().is_rescan())
+    .map(|e| e.location())
+    .collect();
+  assert!(
+    !rescans.is_empty(),
+    "the held arm really did queue an instruction: {fenced:?}"
+  );
+  assert!(
+    rescans.iter().all(|at| **at == Location::new()),
+    "at the root, and nowhere near the stale pre-move path: {fenced:?}"
   );
 
   // Pairing d → e: the dirtied hold re-scans the destination.
@@ -5436,6 +5458,34 @@ fn subtree_overflow_on_a_held_source_is_fenced() {
     drain_events(&mut m).iter().any(|e| e.kind().is_rescan()),
     "the dirtied hold re-scans on pairing"
   );
+}
+
+/// A DOMINATION whose slice lies inside a held move source is not fenced the same
+/// way: a retirement's instruction is never deferred, so the seat answers at the
+/// scope's ROOT — which no hold can defer and no stale pre-move link
+/// reconstructs — instead of leaving the dominated caller uninstructed until the
+/// move resolves.
+#[test]
+fn cover_domination_on_a_held_source_answers_at_the_scope_root() {
+  let mut m = per_dir();
+  let root = live_root_idle(&mut m, scope(1));
+  let held = held_move_source(&mut m, root, "d");
+
+  let stood = m
+    .cover_domination(Scope::subtree_of(held))
+    .expect("the retirement's instruction is never deferred");
+  let events = drain_events(&mut m);
+  let instruction = events
+    .iter()
+    .find(|e| e.id() == stood)
+    .expect("the minted instruction is on the stream");
+  assert!(instruction.kind().is_rescan());
+  assert_eq!(
+    instruction.location(),
+    &Location::new(),
+    "answered at the root, not at ground the subtree has already left"
+  );
+  m.assert_invariants();
 }
 
 // ── The lowered path's second clause: knowingly stale at the stamp ──
@@ -8107,9 +8157,12 @@ fn located_subtree_overflow_rearms_from_watch_when_descending() {
   let mut m = per_dir();
   let root = live_root_idle(&mut m, scope(1));
 
-  m.on_overflow(
-    SubtreeScope::new(root).with_descent(loc(&["deep"])).into(),
-    at(5),
+  assert!(
+    m.on_overflow(
+      SubtreeScope::new(root).with_descent(loc(&["deep"])).into(),
+      at(5),
+    ),
+    "an unfenced slice stands its covering `Rescan` here and now"
   );
   let events = drain_events(&mut m);
   assert_eq!(events.len(), 1);
@@ -8130,9 +8183,12 @@ fn located_overflow_on_unknown_watch_is_dropped() {
   let _root = live_root(&mut m, scope(1));
   let _ = drain_events(&mut m);
 
-  m.on_overflow(
-    Scope::subtree_of(WatchId::new(NonZeroU64::new(999).unwrap())),
-    at(5),
+  assert!(
+    !m.on_overflow(
+      Scope::subtree_of(WatchId::new(NonZeroU64::new(999).unwrap())),
+      at(5),
+    ),
+    "ground this Monitor does not cover stands nothing, and reports so"
   );
   assert!(drain_events(&mut m).is_empty());
 }

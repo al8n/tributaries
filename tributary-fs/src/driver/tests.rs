@@ -4964,6 +4964,17 @@ mod descending {
     /// ordering guarantee is untouched by this: it is a barrier over the scope's
     /// coverage, never a claim about the consumer's read position.
     ///
+    /// WHICH of the two answers the cookie gets is the scheduler's business, and
+    /// the cell takes either. A channel this full is also a lag entry, and lag
+    /// entry raises the whole-scope move with `rescan_stands`: the retirement
+    /// withdraws an in-pool marker and answers `Dominated` before the write can
+    /// claim, while a write that claims first answers `Ok` and the covering
+    /// `Rescan` resolves the barrier post-install. Both are the contract's, so a
+    /// cell that demands the cookie would be pinning a race, not a rule, and the
+    /// slow leg (a sanitizer) decides it the other way. Nothing this cell states
+    /// about the stat-loss degrade depends on which lands: the `Degraded` verdict,
+    /// the unread channel, and the parked cover's re-offer are asserted either way.
+    ///
     /// Mutation that kills it: gate the resolution on the delivery — hold the
     /// tranche until an offer is accepted (a delivery watermark, a lane-state
     /// inference, a queue probe). Nothing here ever accepts one, so the reply and
@@ -5006,12 +5017,15 @@ mod descending {
         CoverOutcome::Degraded,
         "an unanswered kind over a slot the root covers with nothing is a loss"
       );
-      let path = tokio::time::timeout(interpreted_secs(10), on_cookie)
+      let landed = tokio::time::timeout(interpreted_secs(10), on_cookie)
         .await
         .expect("and neither does the sync fenced on the same tranche")
-        .expect("the driver answers the parked reply")
-        .expect("the write lands");
-      assert_eq!(path, PathBuf::from("/r/.tributaries-sync-9-9-9"));
+        .expect("the driver answers the parked reply");
+      match landed {
+        Ok(path) => assert_eq!(path, PathBuf::from("/r/.tributaries-sync-9-9-9")),
+        Err(crate::error::SyncRootError::Dominated) => {}
+        Err(other) => panic!("unexpected sync error: {other:?}"),
+      }
       assert_eq!(
         rig.events.len(),
         1,
@@ -14575,6 +14589,16 @@ mod sync_cookie {
     name: &str,
     ticket: u64,
   ) -> CookieGuard {
+    // THE SCOPE GOES LIVE FIRST, exactly as the driver's commit does. A write is
+    // only ever dispatched for a scope that is already live — the production
+    // dispatch is gated on `root_of`, whose sole writer is `scope_live` — and
+    // `scope_live` is what mints the scope's cookie floor AND its retirement
+    // interlock. Admitting straight into `dispatch_guard` would dispatch for a
+    // scope the registry never saw, which is a state no driver can reach.
+    reg.scope_live(
+      scope,
+      LiveRoot::new(PathBuf::from("/r"), RootIdentity::new(1, 0)),
+    );
     let fence = core.open_cover_fence(scope);
     let id = reg.admit_parked(
       scope,
@@ -14863,12 +14887,12 @@ mod sync_cookie {
         ".tributaries-sync-parked-replaced",
       );
 
-      revoke_uncovered_parked_cookies(
+      revoke_or_rebind_parked_cookies(
         &mut core,
         &mut parked,
         &reg,
         scope,
-        std::path::Path::new("/other"),
+        &crate::driver::LiveRoot::new(PathBuf::from("/other"), crate::os::RootIdentity::new(1, 1)),
       );
 
       assert!(
@@ -15583,6 +15607,65 @@ mod sync_cookie {
       "the late write reaped the file it created"
     );
     assert!(rig.fs.files_under("/r").is_empty());
+  }
+
+  // A TERMINAL TRANSITION PUBLISHES ITS INTERLOCK AT ITS LINEARIZATION POINT —
+  // and only for the scope whose transition it is. The accepted `Unwatch` arm
+  // raises the retirement before it unregisters the root, which is what closes
+  // the interval between the scope's end and the teardown effect that takes its
+  // delivery lane away. A NEIGHBOUR's barrier is not in that interval: its scope
+  // is untouched, its lane stands, and its in-pool write must still be
+  // certified.
+  //
+  // STAGED the same way as the teardown boundary above: the hold freezes the
+  // loop inside the torn scope's `detach_scope`, and the kept scope's write is
+  // released from the pool while it is frozen there.
+  #[cfg(not(miri))]
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn an_unwatch_retires_only_the_scope_it_ends() {
+    let rig = rig_with_capacity(64);
+    rig.fs.put("/s", FileKind::Dir, 2);
+    let kept = watch(&rig, "/r").await;
+    let torn = watch(&rig, "/s").await;
+
+    let hold = rig.fs.hold_cookie_writes();
+    let on_reply = sync_root_pending(&rig, kept, "/r", ".tributaries-sync-17-1-1").await;
+    assert!(
+      settle(|| rig.fs.cookie_dispatches() == 1).await,
+      "staging: the kept scope's write is in the pool"
+    );
+
+    let detach = rig.fs.hold_detaches();
+    let (reply, on_unwatch) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Unwatch {
+        scope: torn,
+        reply: Some(reply),
+      })
+      .await
+      .unwrap();
+    assert!(
+      settle(|| detach.captured() >= 1).await,
+      "staging: the loop is frozen inside the torn scope's teardown"
+    );
+
+    hold.release();
+    let landing = on_reply
+      .await
+      .expect("the write replies")
+      .expect("a live scope's barrier is certified across a neighbour's teardown");
+    assert_eq!(landing, PathBuf::from("/r/.tributaries-sync-17-1-1"));
+
+    detach.release();
+    assert!(
+      on_unwatch.await.unwrap().is_torn(),
+      "and the neighbour's teardown completes"
+    );
+    assert!(
+      rig.fs.cookie_removes().is_empty(),
+      "the certified cookie stands until its caller asks for it"
+    );
   }
 
   // A FILE subscription is validly covered (it commits under an armed
@@ -16550,6 +16633,215 @@ mod sync_cookie {
     );
 
     refreshes.release();
+  }
+
+  /// A REFUSED delivery retires an in-pool barrier of a KERNEL-RECURSIVE scope.
+  ///
+  /// The consumer's channel is full, so the scope enters the lag: everything it
+  /// has queued is dropped, and everything it produces until the lag exits is
+  /// dropped too, under the one dominating `Rescan` the entry parks. A barrier
+  /// dispatched before that window certifies an ordering across it. The funnel
+  /// beside the lag entry is what makes the in-pool write answer the domination
+  /// instead of claiming after that `Rescan` and handing its caller a
+  /// certificate whose marker is then dropped while lagged.
+  ///
+  /// Kernel-recursive on purpose: the routed cover degrade fires only where a
+  /// scope recorded a claim, which this profile never does, and the lag entry
+  /// arms no child watch and drops none — so no other funnel can stand in.
+  ///
+  /// The release is gated on nothing having LEFT the channel: the cell reads no
+  /// event until the write has answered, so the lag's own instruction is still
+  /// parked and undelivered when the claim is made. That is the seam the
+  /// guarantee is stated at, taken at its strongest — the `Rescan` must not
+  /// leave the queue before the barriers its funnel retires are flagged, and
+  /// here it has not left at all. The one `Command` round trip is what makes the
+  /// refusal ORDERED rather than likely: a command is answered at the select, so
+  /// the `execute_effects` pass that queued both emits has drained to empty
+  /// before the reply, and its own per-poll `drain_barrier_moves` has published
+  /// the domination.
+  ///
+  /// Revert witness: drop the `barrier_moved` call from `on_delivery`'s
+  /// `(Refused, Normal)` arm and the released write claims, the reply carries
+  /// `Ok(path)`, and the marker stays on disk behind a `Rescan` the caller
+  /// cannot correlate.
+  #[cfg(not(miri))]
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_refused_delivery_dominates_an_in_pool_barrier() {
+    let rig = rig_with_capacity(1);
+    let scope = watch(&rig, "/r").await;
+
+    // The barrier's write parks in the pool: the obligation is `InPool`, the
+    // phase a move retires rather than a dispatch re-judges.
+    let gate = rig.fs.hold_cookie_writes();
+    let on_reply = sync_root_pending(&rig, scope, "/r", ".tributaries-sync-1-9-30").await;
+    assert!(
+      settle(|| rig.fs.cookie_dispatches() == 1).await,
+      "staging: the write is PARKED in the pool before the channel fills"
+    );
+
+    // ONE batch, so both emits are queued in one pass: the first fills the
+    // capacity-one channel and the second is refused, because nothing here ever
+    // reads and the slot cannot free.
+    rig.fs.send_batch(
+      "/r",
+      vec![ev("/r/a", created(), 1, 10), ev("/r/b", created(), 2, 11)],
+    );
+    assert!(
+      settle(|| rig.events.is_full()).await,
+      "staging: the first change fills the consumer's channel"
+    );
+    assert_eq!(
+      cookie_count(&rig).await,
+      1,
+      "staging: the barrier is still the driver's, and the round trip puts the \
+       refusal — and the drain that publishes its move — behind us"
+    );
+
+    gate.release();
+    let answer = tokio::time::timeout(interpreted_secs(10), on_reply)
+      .await
+      .expect("the sync resolves in bounded time")
+      .expect("the driver replies");
+    assert!(
+      matches!(answer, Err(crate::error::SyncRootError::Dominated)),
+      "the window the lag drops retires the barrier it spans: {answer:?}"
+    );
+    assert!(
+      settle(|| rig.fs.files_under("/r").is_empty()).await,
+      "the refused claim reaped the file the write had created"
+    );
+
+    // And the instruction the retirement rested on is really there, once the
+    // consumer drains the change that was holding the lag open.
+    assert!(
+      awaits_rescan_on(&rig, scope).await,
+      "the lag's dominating `Rescan` reaches the consumer once the lag exits"
+    );
+  }
+
+  /// A never-narrowed DESCENDING rig whose consumer channel the caller can fill,
+  /// over a childless `/r` so that no child watch is ever armed or dropped: with
+  /// no cover claim to degrade either, the lag entry is the only funnel a refused
+  /// delivery can pass on this profile.
+  #[cfg(not(miri))]
+  fn descending_rig_capacity(event_capacity: usize) -> Rig {
+    let fs = FakeFs::new(1);
+    fs.put("/r", FileKind::Dir, 1);
+    fs.spawn_backend(BackendKind::Inotify);
+    let (cmd_tx, cmd_rx) = async_channel::bounded(16);
+    let (cleanup, cookie_wake) = cookie_ingress();
+    let (ev_tx, ev_rx) = async_channel::bounded(event_capacity);
+    tokio::spawn(run::<TokioRuntime, FakeFs>(
+      DriverConfig {
+        profile: BackendKind::Inotify,
+        ..config()
+      },
+      fs.clone(),
+      cmd_rx,
+      cookie_wake,
+      ev_tx,
+      NullRegistry,
+    ));
+    Rig {
+      fs,
+      commands: cmd_tx,
+      cleanup,
+      events: ev_rx,
+    }
+  }
+
+  /// One depth-one `IN_CREATE` on the anchor that carries it.
+  #[cfg(not(miri))]
+  fn create_on(anchor: tributary_proto::WatchId, name: &[u8]) -> crate::os::linux::RawLinuxEvent {
+    const IN_CREATE: u32 = 0x0000_0100;
+    crate::os::linux::RawLinuxEvent::Inotify {
+      anchors: vec![anchor],
+      event: crate::os::linux::RawInotifyEvent {
+        wd: 1,
+        mask: crate::os::linux::inotify::decode::InotifyMask(IN_CREATE),
+        cookie: 0,
+        name: Some(name.to_vec()),
+      },
+    }
+  }
+
+  /// The same funnel on a NEVER-NARROWED descending scope: funnel 7 has no claim
+  /// to degrade here either, and the childless root leaves funnels 1 and 2
+  /// nothing to arm or drop — so a refused delivery reaches only the lag entry on
+  /// this side of the backend split too.
+  ///
+  /// Revert witness: as above.
+  #[cfg(not(miri))]
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_refused_delivery_dominates_an_in_pool_barrier_on_a_descending_scope() {
+    let rig = descending_rig_capacity(1);
+    let scope = watch(&rig, "/r").await;
+    assert!(
+      settle(|| !rig.fs.enumerates().is_empty()).await,
+      "staging: the descending root arms and cold-enumerates"
+    );
+    let root_watch = rig
+      .fs
+      .enumerates()
+      .first()
+      .map(|(watch, _)| *watch)
+      .expect("the root enumerated");
+    // Whatever the registration window announced is taken first, so the channel
+    // is empty and the only `Rescan` left to arrive is the lag entry's own.
+    while matches!(
+      tokio::time::timeout(Duration::from_millis(200), rig.events.recv()).await,
+      Ok(Ok(_))
+    ) {}
+
+    let gate = rig.fs.hold_cookie_writes();
+    let on_reply = sync_root_pending(&rig, scope, "/r", ".tributaries-sync-1-9-31").await;
+    assert!(
+      settle(|| rig.fs.cookie_dispatches() == 1).await,
+      "staging: the write is PARKED in the pool before the channel fills"
+    );
+
+    rig.fs.put("/r/a.txt", FileKind::File, 20);
+    rig.fs.put("/r/b.txt", FileKind::File, 21);
+    rig.fs.send_inotify_batch(
+      "/r",
+      vec![
+        create_on(root_watch, b"a.txt"),
+        create_on(root_watch, b"b.txt"),
+      ],
+    );
+    assert!(
+      settle(|| rig.events.is_full()).await,
+      "staging: the first change fills the consumer's channel"
+    );
+    assert_eq!(
+      cookie_count(&rig).await,
+      1,
+      "staging: the barrier is still the driver's, and the round trip puts the \
+       refusal — and the drain that publishes its move — behind us"
+    );
+
+    gate.release();
+    let answer = tokio::time::timeout(interpreted_secs(10), on_reply)
+      .await
+      .expect("the sync resolves in bounded time")
+      .expect("the driver replies");
+    assert!(
+      matches!(answer, Err(crate::error::SyncRootError::Dominated)),
+      "the window the lag drops retires the barrier it spans: {answer:?}"
+    );
+    settle_cookie_count(&rig, 0).await;
+    assert_eq!(
+      cookie_count(&rig).await,
+      0,
+      "the refused claim withdrew the marker the write had created"
+    );
+
+    // And the instruction the retirement rested on is really there, once the
+    // consumer drains the change that was holding the lag open.
+    assert!(
+      awaits_rescan_on(&rig, scope).await,
+      "the lag's dominating `Rescan` reaches the consumer once the lag exits"
+    );
   }
 
   /// The first refresh of a root this scope REPLACED or WIDENED into.
@@ -25575,6 +25867,309 @@ mod sync_cookie {
           "a cookie directory owned by somebody else is refused, not adopted"
         );
       }
+    }
+
+    /// One sync PARKED on a fresh cover fence, staged from a REAL admission of
+    /// `spelled` under `root`: the obligation keeps the landing a resolver read
+    /// through the staged link, and the routing entry keeps the spelling the
+    /// write is addressed by — the two coordinates a revocation could be judged
+    /// on. `landing` is what the staging means the door to read, asserted here so
+    /// every cell below states the divergence it relies on.
+    fn park_admitted(
+      reg: &mut CookieRegistry<FakeFs>,
+      core: &mut DriverCore,
+      scope: ScopeId,
+      root: &Path,
+      spelled: &Path,
+      landing: &Path,
+      name: &str,
+    ) -> (
+      BTreeMap<FenceId, ParkedCookie>,
+      CookieId,
+      futures_channel::oneshot::Receiver<Result<PathBuf, crate::error::SyncRootError>>,
+    ) {
+      let admitted_dirs = admitted(root, spelled);
+      assert_eq!(
+        admitted_dirs.target_landing(),
+        Some(landing),
+        "staging: the door reads the landing the link resolves to, not the spelling"
+      );
+      let fence = core.open_cover_fence(scope);
+      let id = reg.admit_parked(
+        scope,
+        spelled.to_path_buf(),
+        Some(landing),
+        Arc::from(name),
+        ticket().seq(),
+        fence,
+      );
+      let (reply, on_reply) = futures_channel::oneshot::channel();
+      let mut parked: BTreeMap<FenceId, ParkedCookie> = BTreeMap::new();
+      parked.insert(
+        fence,
+        ParkedCookie {
+          dir: spelled.to_path_buf(),
+          admitted: Box::new(admitted_dirs),
+          reply,
+        },
+      );
+      (parked, id, on_reply)
+    }
+
+    /// A PARKED BARRIER LEAVES A REPLACEMENT'S NEW ROOT BY ITS LANDING.
+    ///
+    /// Every other coverage judgement of a barrier — the retirement's intersect,
+    /// the dispatch's re-judge, the write's own containment test — is taken on
+    /// the landing the door recorded, and the revocation a replacement commit
+    /// runs takes it on that same coordinate. With an intermediate symlink the
+    /// caller's spelling and that landing fall on opposite sides of the new root,
+    /// and each direction is a broken promise:
+    ///
+    /// - a spelling INSIDE the new root whose landing lies outside answers
+    ///   `Dominated` at the commit. Judged on the spelling it is kept parked, the
+    ///   dispatch re-judges only the cover, and the write then canonicalizes to
+    ///   the landing and fails its containment test — the caller reads
+    ///   `SyncRootError::Write` where the replacement owed it the instruction to
+    ///   re-read.
+    /// - a spelling OUTSIDE the new root whose landing stays covered is kept.
+    ///   Judged on the spelling it is dominated although the new root still
+    ///   covers the ground its marker lands in.
+    ///
+    /// A RETAINED barrier is then carried the rest of the way: the second row runs
+    /// it through the production write under the root the commit installed, which
+    /// is where "stays parked" has to end. The commit rebinds its admission's root
+    /// to the new one, so the write's root belt compares the object the commit
+    /// recorded against the object the write descends from and the marker lands.
+    /// There is no driver loop here to settle the fence, so the cell stands in for
+    /// the dispatch and executes the write itself.
+    ///
+    /// Real symlinks and a real admission, because the divergence has to be a
+    /// landing a resolver READ: the fake tree's rig admits with no landing at all,
+    /// so both coordinates are one value there and no fake staging can tell them
+    /// apart — and its write reads no admission at all, so only the real one can
+    /// reach the root belt.
+    ///
+    /// Revert witness: judge `ParkedCookie`'s `dir` and the first row keeps the
+    /// barrier parked while the second revokes it. Drop the rebinding and the
+    /// second row's write refuses with "the watched root was not this scope's
+    /// object when the sync was admitted", before any marker exists.
+    #[tokio::test]
+    async fn a_replacement_judges_a_parked_barrier_at_its_landing() {
+      let scope = ScopeId::new(NonZeroU64::new(1).unwrap());
+
+      // THE SPELLING INSIDE THE NEW ROOT, THE LANDING OUTSIDE IT.
+      {
+        let root = scratch("parked-landing-outside");
+        std::fs::create_dir_all(root.join("other").join("deep"))
+          .expect("the ground the marker lands in");
+        std::fs::create_dir_all(root.join("sub")).expect("the replacement's new root");
+        std::os::unix::fs::symlink(root.join("other"), root.join("sub").join("link"))
+          .expect("the link the caller spells through");
+        let spelled = root.join("sub").join("link").join("deep");
+
+        let mut reg = registry(FakeFs::new(1));
+        let mut core = fence_source();
+        let (mut parked, id, on_reply) = park_admitted(
+          &mut reg,
+          &mut core,
+          scope,
+          &root,
+          &spelled,
+          &root.join("other").join("deep"),
+          ".tributaries-sync-parked-landing-outside",
+        );
+
+        revoke_or_rebind_parked_cookies(
+          &mut core,
+          &mut parked,
+          &reg,
+          scope,
+          &crate::driver::LiveRoot::for_tests(&root.join("sub")),
+        );
+
+        assert!(
+          matches!(
+            on_reply.await.expect("the revocation answers the caller"),
+            Err(crate::error::SyncRootError::Dominated)
+          ),
+          "a landing the new root no longer covers is a dominated barrier, not a \
+           write left to fail"
+        );
+        assert!(
+          parked.is_empty(),
+          "and its routing entry is consumed with it"
+        );
+        assert!(
+          !lock_ledger(&reg.ledger).obligations.contains_key(&id),
+          "the obligation is retired pre-physically: no write was ever dispatched"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+      }
+
+      // THE INVERSE ALIAS: the spelling outside the new root, the landing inside.
+      {
+        let root = scratch("parked-landing-inside");
+        std::fs::create_dir_all(root.join("sub").join("deep"))
+          .expect("the ground the marker lands in");
+        std::fs::create_dir_all(root.join("other")).expect("the ground the spelling reads from");
+        std::os::unix::fs::symlink(root.join("sub"), root.join("other").join("link"))
+          .expect("the link the caller spells through");
+        let spelled = root.join("other").join("link").join("deep");
+
+        let mut reg = registry(FakeFs::new(1));
+        let mut core = fence_source();
+        let (mut parked, id, mut on_reply) = park_admitted(
+          &mut reg,
+          &mut core,
+          scope,
+          &root,
+          &spelled,
+          &root.join("sub").join("deep"),
+          ".tributaries-sync-parked-landing-inside",
+        );
+
+        let live = crate::driver::LiveRoot::for_tests(&root.join("sub"));
+        revoke_or_rebind_parked_cookies(&mut core, &mut parked, &reg, scope, &live);
+
+        assert!(
+          matches!(on_reply.try_recv(), Ok(None)),
+          "a barrier whose landing the new root still covers is answered by its own \
+           dispatch, not dominated here"
+        );
+        assert_eq!(parked.len(), 1, "and its routing entry stands with it");
+        assert!(
+          lock_ledger(&reg.ledger).obligations.contains_key(&id),
+          "the obligation is still parked, waiting on its fence"
+        );
+
+        let ParkedCookie {
+          dir,
+          admitted: admission,
+          ..
+        } = parked
+          .into_values()
+          .next()
+          .expect("the retained routing entry");
+        let written = RealFs::new()
+          .write_cookie(
+            &live,
+            &dir,
+            *admission,
+            ".tributaries-sync-parked-landing-inside",
+            &tributary_proto::glob::Globs::default(),
+            &[],
+          )
+          .expect("the retained barrier writes under the root the commit installed");
+        let landed = written.path().to_path_buf();
+        let on_disk = landed.is_file();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(
+          landed.starts_with(root.join("sub").join("deep")),
+          "the marker stands in the ground the door judged: {landed:?}"
+        );
+        assert_eq!(
+          landed.file_name().and_then(std::ffi::OsStr::to_str),
+          Some(".tributaries-sync-parked-landing-inside"),
+          "and it is reported back under the name the sync was admitted with"
+        );
+        assert!(on_disk, "and the marker the caller is handed exists");
+      }
+    }
+
+    /// A WIDEN KEEPS A PARKED BARRIER, AND THE BARRIER STILL WRITES.
+    ///
+    /// The revoking half of the commit's step must uncover nothing: a widen's new
+    /// root is a strict ancestor of the old one ([`widen_predicate`]) and the
+    /// admission proved the landing inside the old root, so the widened root
+    /// covers that landing whatever link the caller spelled it through.
+    ///
+    /// Keeping it parked is only half a promise. The write proves the root it
+    /// descends from against the identity its own door read, and a widen makes
+    /// that a DIFFERENT object by construction — so without the rebinding the
+    /// retained barrier fails its write as `SyncRootError::Write` while the widen,
+    /// a deliberate non-bump, stands no covering `Rescan` for it: the caller can
+    /// only time out. Coverage only grew, so this barrier must PROCEED, and the
+    /// cell carries it through the production write to say so. There is no driver
+    /// loop here to settle the fence, so the cell stands in for the dispatch.
+    ///
+    /// Revert witness: drop the rebinding and the write below refuses with "the
+    /// watched root was not this scope's object when the sync was admitted",
+    /// before any marker exists.
+    #[test]
+    fn a_widen_keeps_a_parked_barrier_whose_landing_the_link_moved() {
+      let scope = ScopeId::new(NonZeroU64::new(1).unwrap());
+      let widened = scratch("parked-landing-widened");
+      let old_root = widened.join("sub");
+      std::fs::create_dir_all(old_root.join("other").join("deep"))
+        .expect("the ground the marker lands in");
+      std::os::unix::fs::symlink(old_root.join("other"), old_root.join("link"))
+        .expect("the link the caller spells through");
+      let spelled = old_root.join("link").join("deep");
+      assert!(
+        widen_predicate(&old_root, &widened),
+        "staging: the new root is a strict widen of the one the sync was admitted under"
+      );
+
+      let mut reg = registry(FakeFs::new(1));
+      let mut core = fence_source();
+      let (mut parked, id, mut on_reply) = park_admitted(
+        &mut reg,
+        &mut core,
+        scope,
+        &old_root,
+        &spelled,
+        &old_root.join("other").join("deep"),
+        ".tributaries-sync-parked-landing-widened",
+      );
+
+      let live = crate::driver::LiveRoot::for_tests(&widened);
+      revoke_or_rebind_parked_cookies(&mut core, &mut parked, &reg, scope, &live);
+
+      assert!(
+        matches!(on_reply.try_recv(), Ok(None)),
+        "a widen uncovers nothing, so it revokes nothing"
+      );
+      assert_eq!(parked.len(), 1, "and every routing entry stands");
+      assert!(
+        lock_ledger(&reg.ledger).obligations.contains_key(&id),
+        "the obligation is still parked, waiting on its fence"
+      );
+
+      let ParkedCookie {
+        dir,
+        admitted: admission,
+        ..
+      } = parked
+        .into_values()
+        .next()
+        .expect("the retained routing entry");
+      let written = RealFs::new()
+        .write_cookie(
+          &live,
+          &dir,
+          *admission,
+          ".tributaries-sync-parked-landing-widened",
+          &tributary_proto::glob::Globs::default(),
+          &[],
+        )
+        .expect("a widen lets the barrier it retained proceed");
+      let landed = written.path().to_path_buf();
+      let on_disk = landed.is_file();
+      let _ = std::fs::remove_dir_all(&widened);
+
+      assert!(
+        landed.starts_with(old_root.join("other").join("deep")),
+        "the marker stands in the ground the door judged, now inside the widened \
+         root: {landed:?}"
+      );
+      assert_eq!(
+        landed.file_name().and_then(std::ffi::OsStr::to_str),
+        Some(".tributaries-sync-parked-landing-widened"),
+        "and it is reported back under the name the sync was admitted with"
+      );
+      assert!(on_disk, "and the marker the caller is handed exists");
     }
   }
 

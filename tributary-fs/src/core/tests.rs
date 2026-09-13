@@ -1,5 +1,5 @@
 use super::*;
-use std::time::Duration;
+use std::{sync::Mutex, time::Duration};
 
 const WINDOW: Duration = Duration::from_millis(100);
 /// The root-liveness tick interval the shared harness cores run with. Only the
@@ -840,6 +840,210 @@ fn unwatch_tears_down_and_silences_the_scope() {
   );
 }
 
+// A TERMINAL TRANSITION PUBLISHES ITS INTERLOCK AT ITS LINEARIZATION POINT. The
+// scope ends at the one site that QUEUES its teardown, not when the driver later
+// polls that effect, so the core reports it there — beside the barrier moves, and
+// taken by the same drain, which runs at every loop top and before every effect.
+// A write released between the end and the effect would otherwise read
+// `retiring = false` and answer `Ok` for a marker the teardown then reaps.
+//
+// MUST FAIL where the core reports nothing: the drain has no ended scope to
+// publish, and the retirement waits for the effect.
+#[test]
+fn an_ended_scope_is_reported_where_its_teardown_is_queued() {
+  let (mut core, scope) = live_core();
+  assert!(
+    core.take_ended_scopes().is_empty(),
+    "a live scope has ended nothing"
+  );
+
+  core.on_unwatch(scope);
+  assert_eq!(
+    core.take_ended_scopes(),
+    vec![scope],
+    "the unwatch ends the scope in the same step that queues its teardown"
+  );
+  assert!(
+    core.take_ended_scopes().is_empty(),
+    "and the drain takes it exactly once"
+  );
+  assert!(
+    drain(&mut core)
+      .iter()
+      .any(|e| matches!(e, Effect::TeardownStream { scope: s } if *s == scope)),
+    "the teardown itself is still only queued"
+  );
+
+  core.on_unwatch(scope);
+  assert!(
+    core.take_ended_scopes().is_empty(),
+    "a scope removed by its own end cannot end a second time"
+  );
+}
+
+// The same report for a scope an EVENT ends: a source fatal reaches the one
+// teardown queue site through the Monitor, so the drain publishes its retirement
+// in the same synchronous pass as the record that killed the root.
+#[test]
+fn a_root_death_by_event_reports_its_ended_scope() {
+  let (mut core, scope) = live_core();
+  core.on_source_fatal(scope, at(1));
+  assert_eq!(
+    core.take_ended_scopes(),
+    vec![scope],
+    "the death ends the scope where it queues the teardown"
+  );
+  assert!(
+    drain(&mut core)
+      .iter()
+      .any(|e| matches!(e, Effect::TeardownStream { scope: s } if *s == scope)),
+  );
+}
+
+// THE RETIREMENT IS PART OF THE TRANSITION. The drain that publishes a scope's
+// retirement runs microseconds after the input that ended it, on the same driver
+// thread — but a write claims on ANOTHER OS thread, and no yield separates the
+// two. So the flag the driver mints when the scope goes live is bound in here,
+// and the core stores `true` into it on the very statement that removes the
+// scope: before its fences resolve, before it is reported ended, before its
+// teardown is queued. An atomic store is not I/O.
+//
+// Both ways a scope ends, because they are one site: the unwatch route and the
+// event route funnel through the same removal.
+//
+// MUST FAIL where the flag moves only in the drain: the store has not happened
+// when the scope is removed, so every read below is `false` and the window a
+// writer claims in is still open.
+#[test]
+fn the_core_raises_a_bound_scope_flag_at_the_removal_that_ends_it() {
+  for by_event in [false, true] {
+    let (mut core, scope) = live_core();
+    let flag = Arc::new(AtomicBool::new(false));
+    core.bind_retiring(scope, Arc::clone(&flag));
+    assert!(
+      !flag.load(Ordering::SeqCst),
+      "a live scope's interlock reads live"
+    );
+
+    if by_event {
+      core.on_source_fatal(scope, at(1));
+    } else {
+      core.on_unwatch(scope);
+    }
+    assert!(
+      flag.load(Ordering::SeqCst),
+      "the removal that ends the scope raised it, with no drain and no effect run yet"
+    );
+
+    assert_eq!(
+      core.take_ended_scopes(),
+      vec![scope],
+      "and the report the drain reads is still owed — the store preceded it"
+    );
+    assert!(
+      drain(&mut core)
+        .iter()
+        .any(|e| matches!(e, Effect::TeardownStream { scope: s } if *s == scope)),
+      "as is the teardown"
+    );
+  }
+}
+
+// A19.1: the cell above proves the flag reads `true` and the scope is gone
+// once `on_unwatch` returns — which the store landing right after EITHER
+// removal would also satisfy. This one pins the ORDER directly, through the
+// test-only seam at the removal site: the hook fires exactly once, between
+// the store and the removals, so it must see the flag already `true` while
+// BOTH the scope state and the root-watch mapping are still present.
+//
+// MUST FAIL where the store reads the flag off the already-removed state (the
+// prior shape): the hook would observe the scope, or its mapping, already
+// gone.
+#[test]
+fn the_core_stores_the_retirement_flag_before_it_removes_the_scope() {
+  let (mut core, scope) = live_core();
+  let flag = Arc::new(AtomicBool::new(false));
+  core.bind_retiring(scope, Arc::clone(&flag));
+
+  let observed: Arc<Mutex<Vec<(bool, bool, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+  let recorded = Arc::clone(&observed);
+  let hook_flag = Arc::clone(&flag);
+  core.removal_hook = Some(RemovalHook(Box::new(
+    move |hooked_scope, scope_present, watch_mapping_present| {
+      assert_eq!(
+        hooked_scope, scope,
+        "the hook fires for the scope being ended"
+      );
+      recorded.lock().unwrap().push((
+        hook_flag.load(Ordering::SeqCst),
+        scope_present,
+        watch_mapping_present,
+      ));
+    },
+  )));
+
+  core.on_unwatch(scope);
+
+  let calls = observed.lock().unwrap().clone();
+  assert_eq!(calls.len(), 1, "the hook fires exactly once per scope end");
+  let (flag_was_true, scope_was_present, watch_mapping_was_present) = calls[0];
+  assert!(
+    flag_was_true,
+    "the store landed before the hook, not after it"
+  );
+  assert!(
+    scope_was_present,
+    "the scope state was still in `scopes` at the instant the flag went up"
+  );
+  assert!(
+    watch_mapping_was_present,
+    "the root-watch mapping was still in `watch_scopes` at the instant the flag went up"
+  );
+}
+
+// A scope that never went live bound no flag — it has no dispatchable write to
+// revoke — and ending it is still one clean transition.
+#[test]
+fn an_unbound_scope_ends_without_an_interlock() {
+  let (mut core, scope) = live_core();
+  core.on_unwatch(scope);
+  assert_eq!(core.take_ended_scopes(), vec![scope]);
+}
+
+// An ended scope comes FIRST: the core reports one for as long as either its
+// report or its teardown is outstanding, which is the whole of the interval in
+// which the driver must not service another input. `ended_scopes` alone is not
+// that interval — the drain inside the settlement resolution can take the list
+// in the very pass that ended the scope, leaving the teardown queued and the
+// gate blind.
+//
+// MUST FAIL where the predicate reads only the list: the middle assertion sees
+// `false` with the teardown still queued, which is exactly the state a ready
+// replacement completion is consumed in.
+#[test]
+fn an_ended_scope_stands_until_its_teardown_runs() {
+  let (mut core, scope) = live_core();
+  assert!(!core.has_ended_scopes(), "a live scope has ended nothing");
+
+  core.on_source_fatal(scope, at(1));
+  assert!(core.has_ended_scopes(), "the death arms it");
+  assert_eq!(core.take_ended_scopes(), vec![scope]);
+  assert!(
+    core.has_ended_scopes(),
+    "and it stands on the queued teardown alone, after the report is taken"
+  );
+
+  assert!(
+    drain(&mut core)
+      .iter()
+      .any(|e| matches!(e, Effect::TeardownStream { scope: s } if *s == scope)),
+  );
+  assert!(
+    !core.has_ended_scopes(),
+    "the teardown left the queue, so the gate disarms — it cannot spin"
+  );
+}
+
 #[test]
 fn consumer_lag_parks_one_dominating_rescan() {
   let (mut core, scope) = live_core();
@@ -1198,6 +1402,7 @@ fn delivered_epochs_are_always_announced_by_a_delivered_rescan() {
 fn identity_minting_respects_devices_and_mounts() {
   let state = ScopeState {
     watch: WatchId::new(NonZeroU64::new(1).unwrap()),
+    retiring: None,
     root_attempt: None,
     profile: BackendKind::FsEvents,
     requested: PathBuf::from("/r"),
@@ -1244,6 +1449,7 @@ fn identity_minting_respects_devices_and_mounts() {
 fn blind_mount_table_refuses_event_side_trust() {
   let state = ScopeState {
     watch: WatchId::new(NonZeroU64::new(1).unwrap()),
+    retiring: None,
     root_attempt: None,
     profile: BackendKind::FsEvents,
     requested: PathBuf::from("/r"),
@@ -3012,6 +3218,7 @@ mod lowering {
   fn state_with_root(root: &str) -> ScopeState {
     ScopeState {
       watch: WatchId::new(NonZeroU64::new(99).unwrap()),
+      retiring: None,
       root_attempt: None,
       profile: BackendKind::FsEvents,
       requested: PathBuf::from(root),
@@ -9218,7 +9425,7 @@ mod descending {
   }
 
   mod barrier {
-    //! The barrier epoch and the nine funnels that move it, the deliberate
+    //! The barrier epoch and the ten funnels that move it, the deliberate
     //! non-bumps, and the drain-order substitution a retirement is built on.
     //!
     //! Every cell here is sans-I/O and reads the stamp through
@@ -9257,7 +9464,7 @@ mod descending {
       (core, scope, root)
     }
 
-    // ---- the nine funnels --------------------------------------------------
+    // ---- the ten funnels ---------------------------------------------------
 
     /// Funnel 1. Every route into the watch map — a crawl, a cascade, a cold
     /// enumeration, a `set_cover` grow, the slot reconcile's move-in arm — lands
@@ -9347,6 +9554,105 @@ mod descending {
         }],
         "at the ground the `Rescan` names, and the `Rescan` IS the covering \
          instruction a retirement would otherwise owe"
+      );
+    }
+
+    /// Drives A15.1's sequence in ONE `BatchPayload` and reports what it
+    /// emitted: `MovedFrom` detaches and holds `/r/sub`; a non-UTF-8 child
+    /// record on the retained watch escalates to a located `Rescan` INSIDE the
+    /// held subtree, which the Monitor stands at the scope's ROOT — the located
+    /// path is the stale pre-move one, the root's is stable across the move —
+    /// and, when `pair`, the matching `MovedTo` closes the move in the same
+    /// batch.
+    ///
+    /// Nothing yields between the three. One call is one batch, whose items are
+    /// fed to the Monitor in order, and the barrier drain runs only once the
+    /// whole call has returned — so an instruction left to that drain lands
+    /// behind whatever a later item of the same batch already queued.
+    ///
+    /// Returns the core, its scope and the batch's effects, every effect polled.
+    ///
+    /// Revert witness: fence the held arm's mint again and it stands nothing at
+    /// this item, the funnel records that the move owes its own covering
+    /// `Rescan`, and the only instruction is the one the drain appends after the
+    /// batch — behind the `Moved` both cells below read.
+    fn a_held_source_overflow_in_one_batch(pair: bool) -> (DriverCore, ScopeId, Vec<Effect>) {
+      let (mut core, scope, root) = with_a_child();
+      let sub = watch_at(&core, scope, "/r/sub");
+      let _ = core.take_barrier_moves();
+
+      let mut events = vec![
+        inotify(&[root], IN_MOVED_FROM | IN_ISDIR, 7, Some(b"sub")),
+        inotify(&[sub], IN_CREATE, 0, Some(&[0xFF, 0xFE])),
+      ];
+      if pair {
+        events.push(inotify(&[root], IN_MOVED_TO | IN_ISDIR, 7, Some(b"dest")));
+      }
+      core.on_inotify_events(scope, events, at(1));
+      let fed = drain(&mut core);
+
+      let moves = core.take_barrier_moves();
+      let owed = moves
+        .iter()
+        .find(|queued| queued.scope == scope && queued.location == ground("/r/sub"))
+        .expect("the overflow's own coverage transition");
+      assert!(
+        owed.rescan_stands,
+        "the funnel records the instruction the Monitor stood at that item, so \
+         the retirement stands none of its own: {moves:?}"
+      );
+      (core, scope, fed)
+    }
+
+    /// A15.1, the same-batch pairing: the covering `Rescan` is on the stream
+    /// before the `Moved` delta the pairing queues.
+    ///
+    /// The barrier this retires is answered `Dominated`, and the public promise
+    /// is a covering `Rescan` queued ahead of every later delta. An instruction
+    /// deferred to the drain is queued after the whole batch, so a pairing in
+    /// that same batch puts its delta on the stream first and the consumer sees
+    /// the move before it is told to re-read.
+    #[test]
+    fn a_held_source_overflow_precedes_a_same_batch_pairing() {
+      let (_core, _scope, fed) = a_held_source_overflow_in_one_batch(true);
+      let changes = emits(&fed);
+      let instruction = changes
+        .iter()
+        .position(|change| change.kind().is_rescan() && change.location() == &loc(&[]))
+        .expect("the held arm stood its covering `Rescan` at the scope's root");
+      let delta = changes
+        .iter()
+        .position(|change| change.kind().is_moved())
+        .expect("non-vacuity: the pairing really did queue its `Moved` delta");
+      assert!(
+        instruction < delta,
+        "and the instruction precedes it: {changes:?}"
+      );
+    }
+
+    /// …and the expiry variant, where the batch carries no `MovedTo`: the same
+    /// instruction is already standing when the window resolves the stranded
+    /// half, which is the longer of the two waits the deferral imposed — a day
+    /// at the option's bound.
+    #[test]
+    fn a_held_source_overflow_precedes_the_move_window_s_expiry() {
+      let (mut core, _scope, fed) = a_held_source_overflow_in_one_batch(false);
+      let changes = emits(&fed);
+      assert!(
+        changes
+          .iter()
+          .any(|change| change.kind().is_rescan() && change.location() == &loc(&[])),
+        "the held arm stood its covering `Rescan` at the scope's root: {changes:?}"
+      );
+      core.on_timeout(at(1) + WINDOW);
+      let expired = drain(&mut core);
+      assert!(
+        emits(&expired)
+          .iter()
+          .any(|change| change.kind().is_removed()),
+        "non-vacuity: the window's expiry really did resolve the stranded half, \
+         and it follows the instruction: {:?}",
+        emits(&expired)
       );
     }
 
@@ -10488,6 +10794,106 @@ mod descending {
         }],
         "the fold widens the location to the whole scope, so it must not also \
          claim a scope-wide `Rescan` that nothing actually stood"
+      );
+    }
+
+    /// Funnel 10. A delivery the consumer REFUSED enters the lag, where every
+    /// change of this scope but the parked instruction is dropped — a window the
+    /// scope cannot account for, the same shape `on_root_overflow` has, reached
+    /// from a delivery rather than from the transport.
+    ///
+    /// It is NOT subsumed by funnels 1 and 2: entering the lag arms no watch and
+    /// drops none. Nor by funnel 7, which is gated on a recorded cover claim that
+    /// a kernel-recursive scope permanently lacks. Without this funnel such a
+    /// scope's in-pool write claims AFTER the covering `Rescan` is parked, and
+    /// its marker is then dropped while lagged.
+    ///
+    /// Revert witness: drop the `barrier_moved` call from the `(Refused,
+    /// Normal)` arm and the stamp stands still and the drain is empty.
+    #[test]
+    fn a_refused_delivery_bumps_a_kernel_recursive_scope() {
+      let (mut core, scope) = live_core();
+      assert!(
+        core.scopes[&scope].applied_cover.is_none(),
+        "staging: never narrowed, so funnel 7 cannot stand in for this one"
+      );
+      core.on_batch_events(
+        scope,
+        vec![
+          ev("/r/a", flags(&[FsEventFlags::ITEM_CREATED]), 1, 10),
+          ev("/r/b", flags(&[FsEventFlags::ITEM_CREATED]), 2, 11),
+        ],
+        at(1),
+      );
+      let offered = core.poll_effect();
+      assert!(
+        matches!(offered, Some(Effect::Emit { .. })),
+        "staging: the scope has queued deliveries and one is in flight: {offered:?}"
+      );
+
+      let before = quiesce(&mut core, scope);
+      core.on_delivery(scope, Delivery::Refused, at(2));
+      assert_eq!(
+        epoch(&core, scope).0,
+        before.0 + 1,
+        "the window the lag drops moved the stamp exactly once"
+      );
+      assert_eq!(
+        core.take_barrier_moves(),
+        vec![BarrierMove {
+          scope,
+          location: BarrierLocation::Scope,
+          rescan_stands: true,
+        }],
+        "under the dominating `Rescan` the lag entry parks for it"
+      );
+    }
+
+    /// The same funnel on a never-narrowed DESCENDING scope, where funnel 7 has
+    /// no claim to degrade either and the childless root leaves funnels 1 and 2
+    /// nothing to arm or drop — so the lag entry is the only funnel a refused
+    /// delivery passes on this side of the backend split too.
+    ///
+    /// Revert witness: as above.
+    #[test]
+    fn a_refused_delivery_bumps_a_never_narrowed_descending_scope() {
+      let (mut core, scope, req, root) = live_descending();
+      core.on_enumerated(req, listed(Vec::new()));
+      run_cascade(&mut core, &BTreeMap::new());
+      let _ = drain(&mut core);
+      assert!(
+        core.scopes[&scope].applied_cover.is_none(),
+        "staging: never narrowed, so funnel 7 cannot stand in for this one"
+      );
+      core.on_inotify_events(
+        scope,
+        vec![
+          inotify(&[root], IN_CREATE, 0, Some(b"a.txt")),
+          inotify(&[root], IN_CREATE, 0, Some(b"b.txt")),
+        ],
+        at(1),
+      );
+      let offered = core.poll_effect();
+      assert!(
+        matches!(offered, Some(Effect::Emit { .. })),
+        "staging: the scope has queued deliveries and one is in flight: {offered:?}"
+      );
+
+      let before = quiesce(&mut core, scope);
+      core.on_delivery(scope, Delivery::Refused, at(2));
+      assert_eq!(
+        epoch(&core, scope).0,
+        before.0 + 1,
+        "the window the lag drops moved the stamp exactly once"
+      );
+      assert_eq!(
+        core.take_barrier_moves(),
+        vec![BarrierMove {
+          scope,
+          location: BarrierLocation::Scope,
+          rescan_stands: true,
+        }],
+        "under the dominating `Rescan` the lag entry parks for it"
       );
     }
 

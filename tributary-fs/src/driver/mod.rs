@@ -4433,6 +4433,12 @@ struct CookieRegistry<F: FsOps> {
   /// are unlinked, so a write that lands afterwards reaps itself instead of
   /// surviving. The entry is dropped with the
   /// scope (the write holds its own clone), so this never accrues dead scopes.
+  ///
+  /// MINTED when the scope goes live ([`scope_live`](Self::scope_live)), never
+  /// lazily at dispatch, and cloned from there into the core's scope state: the
+  /// core stores `true` into it at the instant it removes the scope, which is
+  /// what makes the interlock part of the transition instead of a publication a
+  /// later drain makes on a thread the claiming writer does not run on.
   retiring: HashMap<ScopeId, Arc<AtomicBool>>,
   /// Each live scope's LIVE ROOT: the canonical path its cookies may never be
   /// written above (see [`cookie_dir`]) together with the IDENTITY of the object
@@ -4484,12 +4490,23 @@ impl<F: FsOps> CookieRegistry<F> {
   /// ([`advance_generation_locked`](Self::advance_generation_locked), taken
   /// under the ledger lock), so it is atomic with a concurrent claim and lands
   /// at the swap's linearization point rather than in this post-commit call.
-  fn scope_live(&mut self, scope: ScopeId, root: LiveRoot) {
+  ///
+  /// MINTS the scope's retirement flag and hands a clone back, for the core to
+  /// hold on its scope state: the core stores `true` into it at the instant it
+  /// removes the scope, so the interlock moves with the transition rather than
+  /// waiting for a drain that runs after it. Minted here rather than at dispatch
+  /// because a write can only ever be dispatched for a scope that is already
+  /// live (the dispatch is gated on [`root_of`](Self::root_of), which this call
+  /// is the sole writer of). Never OVERWRITTEN: a write already in the pool
+  /// holds a clone of the scope's flag, and a commit that re-records the root
+  /// under a surviving scope must not orphan it from the store to come.
+  fn scope_live(&mut self, scope: ScopeId, root: LiveRoot) -> Arc<AtomicBool> {
     self.roots.insert(scope, root);
     self
       .generations
       .entry(scope)
       .or_insert_with(|| Arc::new(AtomicU64::new(0)));
+    Arc::clone(self.retiring.entry(scope).or_default())
   }
 
   /// Bumps `scope`'s root generation under the LEDGER LOCK — the same lock
@@ -4618,10 +4635,21 @@ impl<F: FsOps> CookieRegistry<F> {
   /// the machine rather than a lookaside protocol.
   ///
   /// `Some(guard)` transitions the record `InPool` and hands the write its
-  /// ownership handle, minting the scope's retirement flag on demand. The flags
+  /// ownership handle, taking the scope's EXISTING retirement flag. The flags
   /// are taken here, at dispatch, so they cover the whole in-flight window:
   /// everything that retires the cookie between here and the write's landing is
   /// visible to the write itself.
+  ///
+  /// The flag is never created here. A live scope always has one — it is minted
+  /// when the scope goes live ([`scope_live`](Self::scope_live)), and a dispatch
+  /// is gated on [`root_of`](Self::root_of), which that same call is the sole
+  /// writer of, so no scope can dispatch before it went live. An ABSENT entry
+  /// therefore means one thing only: the scope's retirement was already
+  /// published, which TAKES the entry
+  /// ([`publish_retiring`](Self::publish_retiring)). The honest flag for that
+  /// scope is a RAISED one — minting a fresh false flag would hand a write
+  /// dispatched after the scope ended a live-reading interlock, and it would
+  /// then claim and answer `Ok` for a marker no stream can report.
   ///
   /// `epoch` is the scope's [`BarrierEpoch`] read at this instant — the stamp the
   /// record keeps ([`Obligation::barrier_epoch`]). It rides the same transition
@@ -4640,7 +4668,10 @@ impl<F: FsOps> CookieRegistry<F> {
         .or_insert_with(|| Arc::new(AtomicU64::new(0))),
     );
     let dispatched_generation = generation.load(Ordering::SeqCst);
-    let retiring = Arc::clone(self.retiring.entry(scope).or_default());
+    let retiring = self
+      .retiring
+      .get(&scope)
+      .map_or_else(|| Arc::new(AtomicBool::new(true)), Arc::clone);
     {
       let mut inner = lock_ledger(&self.ledger);
       let ob = inner.obligations.get_mut(&id)?;
@@ -5221,7 +5252,19 @@ impl<F: FsOps> CookieRegistry<F> {
   /// answers `Retired` and self-reaps, which is the truth about a stream that is
   /// ending.
   ///
-  /// Idempotent: the entry is taken on the first call, and the reaping sweep
+  /// Raised where the scope ENDS, not where its teardown effect runs: the
+  /// accepted `Unwatch` arm publishes before it unregisters the root, and a
+  /// scope ended by an event is published by the barrier drain in the same
+  /// synchronous pass as the input that ended it.
+  ///
+  /// The store the CORE makes at its own removal site is ahead of every one of
+  /// those: it is part of the transition, on the same statement that ends the
+  /// scope, so it is the only publication a writer racing on another OS thread
+  /// cannot slip past. What this call still owes is the map entry — taking it is
+  /// what stops a later dispatch from cloning a flag for a scope that has ended.
+  ///
+  /// Idempotent: the entry is taken on the first call — a second publication
+  /// neither panics nor re-inserts — and the reaping sweep
   /// ([`retire_scope`](Self::retire_scope)) opens with it so a caller that has no
   /// interval to close still publishes before it sweeps.
   fn publish_retiring(&mut self, scope: ScopeId) {
@@ -5284,6 +5327,10 @@ impl<F: FsOps> CookieRegistry<F> {
   /// streams are being dismantled (or during the close drain) finds its claim
   /// refused and reaps itself (inside its own tracked job) rather than landing a
   /// cookie owned but unswept, or replying `Ok` for a marker whose lane is gone.
+  ///
+  /// Raised at the close command's own arm, which is where the close linearizes
+  /// and where every one of the driver's scopes ends; the call ahead of the
+  /// stream sweep stays as the idempotent backstop.
   fn begin_shutdown(&self) {
     self.shutdown.store(true, Ordering::SeqCst);
   }
@@ -6768,12 +6815,46 @@ fn self_reap<F: FsOps>(
   }
 }
 
-/// Revokes every barrier still PARKED for `scope` whose directory the just-
-/// committed replacement root no longer covers. A replace overwrites the root
-/// under a surviving scope; a parked write whose directory now sits outside that
-/// coverage would place a cookie the current stream could never observe, so its
-/// obligation is retired `NeverCreated` (no write was dispatched, so nothing
-/// physical was ever created) rather than left to strand.
+/// Carries every barrier still PARKED for `scope` across the root the commit has
+/// just installed: one whose LANDING the new root no longer covers is REVOKED,
+/// and one it still covers has its admission's root REBOUND to the new root's
+/// identity.
+///
+/// The two halves are one step because the second is defined as the complement of
+/// the first: what is retained is what the revocation predicate did not take. A
+/// commit that ran one without the other would either strand a barrier or rebind
+/// one it had already answered.
+///
+/// A replace overwrites the root under a surviving scope; a parked write whose
+/// landing now sits outside that coverage would place a cookie the current stream
+/// could never observe, so its obligation is retired `NeverCreated` (no write was
+/// dispatched, so nothing physical was ever created) rather than left to strand.
+///
+/// A RETAINED barrier is rebound because the write proves the root it descends
+/// from against the identity its own door read, and the commit has just made that
+/// a different object — across a widen necessarily so, the new root being a strict
+/// ancestor of the old. Unrebound it would neither write nor be dominated, and a
+/// widen stands no covering `Rescan` for it: coverage only GREW, so a parked sync
+/// whose landing stays covered must proceed ([`AdmittedDirs::rebind_root`], which
+/// states what the rebinding leaves standing). The identity bound here is the one
+/// `new_root` carries, which is the same value the scope's [`LiveRoot`] is
+/// recorded under in the commit's very next step — so the reading the write
+/// compares and the reading it compares against can only ever be one pair.
+///
+/// The landing the door RECORDED ([`Obligation::cover_dir`]), never the caller's
+/// spelling — the coordinate every other coverage judgement of a barrier is taken
+/// on: the retirement's intersect, the dispatch's re-judge, and the write's own
+/// containment test, which asks the canonicalized directory. With an intermediate
+/// symlink the two differ, and each direction is a broken promise: a spelling
+/// inside the new root whose landing lies outside is kept parked here and later
+/// fails its write as `SyncRootError::Write` instead of answering `Dominated`,
+/// and the inverse alias spuriously dominates a barrier whose landing stays
+/// covered. The arms that read no landing at all hold the spelling in that same
+/// field (the admission's `landing.map_or(dir, ..)`), so both operands are one
+/// value there and this judgement is the judgement they always took.
+///
+/// [`ParkedCookie`]'s `dir` stays what the WRITE is addressed by — the spelling is
+/// what the write resolves — so only the verdict moves here.
 ///
 /// Its caller is answered `Dominated`, not `Retired`. Every caller of this
 /// revocation is a COMMIT on a live scope — a replacement whose new root no
@@ -6789,20 +6870,39 @@ fn self_reap<F: FsOps>(
 /// the pool — is revoked instead by the generation the same commit bumped,
 /// checked when it claims, and answers the same word for the same reason
 /// ([`CookieGuard::precedence`]).
-fn revoke_uncovered_parked_cookies<F: FsOps>(
+fn revoke_or_rebind_parked_cookies<F: FsOps>(
   core: &mut DriverCore,
   parked_cookies: &mut BTreeMap<FenceId, ParkedCookie>,
   cookies: &CookieRegistry<F>,
   scope: ScopeId,
-  new_root: &Path,
+  new_root: &LiveRoot,
 ) {
   retire_parked_cookies(
     core,
     parked_cookies,
     cookies,
     ParkedTerminal::Dominated,
-    &|ob, parked| ob.scope == scope && !cookie_dir_within_root(new_root, &parked.dir),
+    &|ob, _| ob.scope == scope && !cookie_dir_within_root(new_root.path(), &ob.cover_dir),
   );
+  // What survives that walk is the retained set, and the LEDGER is what says
+  // which routing entries belong to it — `parked_cookies` is keyed by fence
+  // across every scope and carries no scope of its own. So the fences are read
+  // from the scope's still-`Parked` obligations, exactly as the revocation reads
+  // them, and the rebinding follows once the lock is released: nothing here
+  // touches the ledger, and nothing here may hold it.
+  let retained: Vec<FenceId> = lock_ledger(&cookies.ledger)
+    .obligations
+    .values()
+    .filter_map(|ob| match ob.phase {
+      Phase::Parked { fence } => (ob.scope == scope).then_some(fence),
+      Phase::InPool | Phase::Owned | Phase::Removing { .. } | Phase::RemoveFailed { .. } => None,
+    })
+    .collect();
+  for fence in retained {
+    if let Some(parked) = parked_cookies.get_mut(&fence) {
+      parked.admitted.rebind_root(new_root.identity());
+    }
+  }
 }
 
 /// Drops CANCELLED awaited-unwatch waiters (the caller dropped its future, so
@@ -8372,6 +8472,23 @@ impl AdmittedDir {
     }
   }
 
+  /// Replaces the remembered reading with `identity` — the watched ROOT's
+  /// rebinding, and nothing else's ([`AdmittedDirs::rebind_root`]).
+  ///
+  /// A field update, because the root is the one reading no profile holds:
+  /// [`watched_root_identity`] opens, reads and releases inside its own call, so
+  /// `released` is the only field [`identity`](Self::identity) can answer from
+  /// and writing it is the whole of the rebinding. A pin held here would be read
+  /// live instead and would silently ignore this reading, which is what the
+  /// assertion states.
+  fn rebind(&mut self, identity: RootIdentity) {
+    debug_assert!(
+      self.pin.is_none(),
+      "the admission holds no descriptor for the watched root"
+    );
+    self.released = Some(identity);
+  }
+
   /// Where the door found this object, as the descriptor answered it at the cut.
   fn landing(&self) -> Option<&Path> {
     self.landing.as_deref()
@@ -8424,6 +8541,12 @@ impl AdmittedDir {
   /// statement about the lowering rather than about the host — a reading that
   /// holds nothing is simply already in the state the release produces.
   fn release_pin(&mut self) {}
+
+  /// Replaces the identity the door read — the one field there is to replace
+  /// ([`AdmittedDirs::rebind_root`]).
+  fn rebind(&mut self, identity: RootIdentity) {
+    self.identity = Some(identity);
+  }
 
   /// No landing, because there is no held descriptor to have read one off — the
   /// same silence these arms keep about the write's own read-backs.
@@ -9022,6 +9145,32 @@ impl AdmittedDirs {
   /// The watched root, as the door held it.
   pub(crate) fn root(&self) -> Option<RootIdentity> {
     self.root.identity()
+  }
+
+  /// Rebinds the watched root to `identity` — the object the commit that just
+  /// installed a new live root recorded for it.
+  ///
+  /// A parked barrier the commit's revocation RETAINED still carries the root
+  /// reading its own door took, and the write compares that reading against the
+  /// root it descends from (see the belt in [`FsOps::write_cookie`]'s real
+  /// lowering). Across a widen the two are different objects by construction —
+  /// the new root is a strict ancestor of the old — so a retained barrier would
+  /// neither write nor be dominated, while a widen is a deliberate non-bump that
+  /// stands no covering `Rescan` for it. Coverage only GREW, so a parked sync
+  /// whose landing stays covered must PROCEED; this is what lets it.
+  ///
+  /// What the rebinding leaves the retained barrier is exactly what a sync
+  /// admitted after the commit would hold: the new root's identity as the commit
+  /// read it. Every other belt stands unmoved — the target's identity and its
+  /// landing, the reserved directory's reading, the mount frame the write takes
+  /// on the descriptors of its own walk — so a target replaced or moved under the
+  /// new root is still refused.
+  ///
+  /// The root's FRAME is deliberately not touched: it is the reference the
+  /// admission's own ground verdict was taken against and nothing reads it after
+  /// that verdict, and re-reading it would resolve a mount on the owner loop.
+  pub(crate) fn rebind_root(&mut self, identity: RootIdentity) {
+    self.root.rebind(identity);
   }
 
   /// The directory the sync was admitted for.
@@ -11859,7 +12008,7 @@ pub(crate) async fn run<R, F>(
   let (unwind_tx, unwind_rx) = async_channel::unbounded::<ScopeId>();
 
   let close_reply = loop {
-    drain_barrier_moves::<R, F>(&mut core, &cookies, &op_tx, &now);
+    drain_barrier_moves::<R, F>(&mut core, &mut cookies, &op_tx, &now);
     execute_effects::<R, F>(
       &mut core,
       &ops,
@@ -11915,7 +12064,7 @@ pub(crate) async fn run<R, F>(
       // so this second flush carries only post-commit (new-world) effects —
       // the G3-1 pre/post ordering is untouched. Conditional: one extra
       // flush per RESOLVED widen, never a steady-state cost.
-      drain_barrier_moves::<R, F>(&mut core, &cookies, &op_tx, &now);
+      drain_barrier_moves::<R, F>(&mut core, &mut cookies, &op_tx, &now);
       execute_effects::<R, F>(
         &mut core,
         &ops,
@@ -12368,6 +12517,24 @@ pub(crate) async fn run<R, F>(
     // end of delivery, not a driver parked while its caller waits on what it was
     // promised.
     //
+    // AN ENDED SCOPE COMES FIRST, whatever else is ready. A due fence's
+    // settlement can consume a fatal and remove the core scope with its teardown
+    // and its `ended_scopes` entry still queued, and a plain `Dead` settlement
+    // stands no cover, so nothing above re-tops for it. With a replacement
+    // completion ready on `op_rx` the gate below is satisfied, the biased select
+    // takes that completion, and the commit installs a successor for a scope the
+    // core no longer holds — which the old death's teardown then dismantles: a
+    // successful replacement followed by silent loss.
+    //
+    // So the re-top is UNCONDITIONAL here, not gated on readiness the way the
+    // gate below is. It cannot spin: the loop top drains the ended scopes and
+    // executes their teardowns, ends are finite per input, and only a fresh
+    // input can arm it again — so every other ready arm waits at most one
+    // further pass, which is the same bound the gate below carries.
+    if core.has_ended_scopes() {
+      continue;
+    }
+
     // The gate sits last, after both source-drain phases, so it defers nothing
     // either of them was waiting for, and it is consulted strictly after the drain
     // and the resolve it protects, so barrier honesty is untouched either way.
@@ -12501,14 +12668,21 @@ pub(crate) async fn run<R, F>(
                 );
                 if let Ok(backend) = &outcome {
                   scope_backends.insert(scope, *backend);
+                  let live = LiveRoot::new(widened, widened_identity);
                   // Any barrier still parked under coverage the new root has
                   // moved out from under is revoked BEFORE the commit records the
-                  // new root; the generation that revokes writes already in the
-                  // pool under the old root was bumped inside `commit_replace`, at
-                  // the lane swap. This only RE-records the cookie floor for the
-                  // widened root.
-                  revoke_uncovered_parked_cookies(&mut core, &mut parked_cookies, &cookies, scope, &widened);
-                  cookies.scope_live(scope, LiveRoot::new(widened, widened_identity));
+                  // new root, and every barrier the new root still covers has its
+                  // admission rebound to that root in the same step; the
+                  // generation that revokes writes already in the pool under the
+                  // old root was bumped inside `commit_replace`, at the lane swap.
+                  // This only RE-records the cookie floor for the widened root.
+                  revoke_or_rebind_parked_cookies(&mut core, &mut parked_cookies, &cookies, scope, &live);
+                  // The retirement interlock travels with the floor: the same
+                  // flag the scope has carried since it went live is re-bound to
+                  // the core, which stores `true` into it at the instant it
+                  // removes the scope.
+                  let retiring = cookies.scope_live(scope, live);
+                  core.bind_retiring(scope, retiring);
                 }
                 // The reservation releases HERE — commit or failure alike —
                 // after the registry overwrite (commit) has already made the
@@ -12649,8 +12823,15 @@ pub(crate) async fn run<R, F>(
                 registry.scope_live(scope, &canonical_root, identity, &ancestors, backend, stats);
                 scope_backends.insert(scope, backend);
                 // The cookie floor travels with the stream: a sync for this
-                // scope may write inside this root, never above it.
-                cookies.scope_live(scope, LiveRoot::new(canonical_root.clone(), identity));
+                // scope may write inside this root, never above it. The scope's
+                // retirement interlock is minted with the floor and bound into
+                // the core, which stores `true` into it at the instant it
+                // removes the scope — so a writer released between that removal
+                // and the drain that publishes the retirement reads the flag
+                // already raised instead of a live world.
+                let retiring =
+                  cookies.scope_live(scope, LiveRoot::new(canonical_root.clone(), identity));
+                core.bind_retiring(scope, retiring);
                 match backend {
                   // Descending: the stream is live but covers NOTHING until
                   // the root's kernel watch arms; the grant defers to the
@@ -12846,13 +13027,17 @@ pub(crate) async fn run<R, F>(
           };
           if let Ok(backend) = &outcome {
             scope_backends.insert(scope, *backend);
+            let live = LiveRoot::new(widened, widened_identity);
             // The cookie floor follows the committed root (see the kernel-
             // recursive commit above); the generation that revokes in-flight
             // writes under the old root was already bumped inside `commit_replace`
             // at the lane swap. Parked barriers the new root no longer covers are
-            // revoked first.
-            revoke_uncovered_parked_cookies(&mut core, &mut parked_cookies, &cookies, scope, &widened);
-            cookies.scope_live(scope, LiveRoot::new(widened, widened_identity));
+            // revoked first, and the ones it covers are rebound to it.
+            revoke_or_rebind_parked_cookies(&mut core, &mut parked_cookies, &cookies, scope, &live);
+            // The retirement interlock travels with the floor (see the
+            // kernel-recursive commit above).
+            let retiring = cookies.scope_live(scope, live);
+            core.bind_retiring(scope, retiring);
           }
           drop(replace.reservation);
           let _ = replace.reply.send(outcome.map(|_| ()));
@@ -13462,6 +13647,16 @@ pub(crate) async fn run<R, F>(
                 admitted_verdict(&unproven_scopes, scope, UnwatchAck::Torn),
               ));
             }
+            // A TERMINAL TRANSITION PUBLISHES ITS INTERLOCK AT ITS
+            // LINEARIZATION POINT. This arm IS the scope's end: `on_unwatch`
+            // below unregisters the root and merely QUEUES the teardown, whose
+            // own publication is one loop top and one effect flush away. A write
+            // released in between reads `retiring = false` and an unchanged
+            // generation, claims, and answers `Ok` for a marker the teardown
+            // then reaps — a successful barrier nothing can satisfy. Raised
+            // here it answers `Retired` and self-reaps. Only the ACCEPTED arm
+            // publishes: a backlogged, parked or unknown unwatch ends no scope.
+            cookies.publish_retiring(scope);
             core.on_unwatch(scope);
           } else if pending_spawns.contains(&scope)
             || pending_teardowns.contains_key(&scope)
@@ -13777,7 +13972,14 @@ pub(crate) async fn run<R, F>(
             }
           }
         }
-        Ok(Command::Close { reply }) => break Some(reply),
+        Ok(Command::Close { reply }) => {
+          // The close's own linearization point: every scope ends here, so the
+          // shutdown flag goes up in this arm rather than further down the
+          // orderly shutdown. The tail's call stays as the idempotent backstop
+          // ahead of the stream sweep.
+          cookies.begin_shutdown();
+          break Some(reply);
+        }
         #[cfg(all(test, feature = "tokio"))]
         Ok(Command::DebugLaneCount { reply }) => {
           let _ = reply.send(lanes.len());
@@ -13839,7 +14041,7 @@ pub(crate) async fn run<R, F>(
           // in it — replying only once the dispatch (or the decline and its
           // covering `Rescan`) has actually run, so the caller never races
           // the effect this tick produced.
-          drain_barrier_moves::<R, F>(&mut core, &cookies, &op_tx, &now);
+          drain_barrier_moves::<R, F>(&mut core, &mut cookies, &op_tx, &now);
           execute_effects::<R, F>(
             &mut core,
             &ops,
@@ -13873,8 +14075,12 @@ pub(crate) async fn run<R, F>(
           core.force_liveness_due(scope);
           let _ = reply.send(());
         }
-        // The watcher facade dropped: same orderly teardown, nobody to tell.
-        Err(_) => break None,
+        // The watcher facade dropped: same orderly teardown, nobody to tell —
+        // and the same terminal transition, so the same publication.
+        Err(_) => {
+          cookies.begin_shutdown();
+          break None;
+        }
       },
       // The cookie-cleanup wake, ranked below `commands` so it can never starve a
       // Close, and above the source stream. It cannot drop a request whatever the
@@ -13918,6 +14124,9 @@ pub(crate) async fn run<R, F>(
   // publish, claim, and reply `Ok` for a marker whose lane is already gone. Raised
   // here it answers `Retired` and self-reaps, and the sweep of what the registry
   // owns still runs below, after the streams are quiesced.
+  //
+  // The idempotent backstop: the exit arms above already published at the close's
+  // own linearization point, and this covers any future exit that does not.
   cookies.begin_shutdown();
   while let Some((scope, stream)) = streams.take_live() {
     registry.scope_dead(scope);
@@ -14173,7 +14382,7 @@ pub(crate) async fn run<R, F>(
   // unwedges with more time, so a longer window would only delay the honest
   // signal.
   let _ = R::timeout(grace, drain).await;
-  drain_barrier_moves::<R, F>(&mut core, &cookies, &op_tx, &now);
+  drain_barrier_moves::<R, F>(&mut core, &mut cookies, &op_tx, &now);
   execute_effects::<R, F>(
     &mut core,
     &ops,
@@ -16141,14 +16350,22 @@ where
     };
     let resolution = match outcome {
       Ok(WidenOutcome::Committed) => {
+        let live = LiveRoot::new(widened, widened_identity);
         // The cookie floor follows the committed root. The widen uncovers
-        // nothing (old ⊂ new), so the parked-barrier revoke is a provable
-        // no-op — kept for uniformity with the stream-replace commits.
+        // nothing (old ⊂ new), so the REVOKING half is a provable no-op —
+        // kept for uniformity with the stream-replace commits — and the
+        // REBINDING half is the whole of what this call does here: every
+        // parked barrier is retained, and each one's admission still names the
+        // narrower root it was read under.
         // Deliberately absent: the generation bump and the lane swap — the
         // stream did not retire, and an in-flight cookie write under the
-        // old root must still claim on it.
-        revoke_uncovered_parked_cookies(core, parked_cookies, cookies, scope, &widened);
-        cookies.scope_live(scope, LiveRoot::new(widened, widened_identity));
+        // old root must still claim on it. Such a write keeps the narrower
+        // floor it was dispatched with, which the widened root contains.
+        revoke_or_rebind_parked_cookies(core, parked_cookies, cookies, scope, &live);
+        // The retirement interlock travels with the floor: the scope survives a
+        // widen, so this re-binds the flag it has carried since it went live.
+        let retiring = cookies.scope_live(scope, live);
+        core.bind_retiring(scope, retiring);
         Ok(())
       }
       Ok(WidenOutcome::FallBack(taint)) => {
@@ -16239,6 +16456,11 @@ where
 /// [`on_root_replaced`](DriverCore::on_root_replaced) cut; a descending
 /// commit then replays the pre-armed root outcome (`replay`) so the rebound
 /// root's re-arm-flavored rebuild starts on the new transport.
+///
+/// The first gate is LIVE CORE STATE: a scope the core has already ended cannot
+/// take a successor, whatever the driver's own liveness maps still say, so the
+/// candidate is retired through the refused path and the caller answers
+/// `Retired`.
 #[allow(clippy::too_many_arguments)]
 fn commit_replace<F>(
   core: &mut DriverCore,
@@ -16266,6 +16488,25 @@ where
   F: FsOps,
 {
   use crate::error::ReplaceRootError;
+
+  // A REPLACEMENT NEEDS A LIVE SCOPE, and the core is the authority on that: a
+  // due fence's settlement can consume a fatal and remove the scope with its
+  // teardown still queued, and the driver's own liveness maps — `handles` above
+  // all — still read live until that teardown runs. Installing a successor for a
+  // scope the core no longer holds reports success and then has the old death's
+  // teardown dismantle the successor: silent loss behind an `Ok`.
+  //
+  // Read HERE, before anything is installed — before the old handle is retired,
+  // before the generation bump and before any port work — so an absent core
+  // leaves the world bit-identical: the candidate is retired through the refused
+  // path, exactly as a final-root conflict is, and the caller is answered
+  // `Retired`, which is what a root that died while its replacement was starting
+  // has always meant. The same read serves the descending replay below: nothing
+  // between here and there touches the core.
+  let Some(watch) = core.root_watch(scope) else {
+    retire_refused::<F>(op_tx, reaper, pending_teardowns, scope, spawned);
+    return Err(ReplaceRootError::Retired);
+  };
 
   // The single-writer final check: the spawn re-canonicalized, so the
   // FINAL root's disjointness (exempting this scope AND the command's own
@@ -16342,7 +16583,6 @@ where
     backend,
     stats,
   );
-  let watch = core.root_watch(scope);
   // Retire the scope's liveness-probe tag with the root it named. A probe still
   // inside the retiring root's `stat` keeps its budget slot — the thread is
   // alive — but its answer is now about a world this scope has left, so it will
@@ -16358,7 +16598,7 @@ where
   let rebound = core.on_root_replaced(scope, meta, now());
   // Descending: replay the pre-armed root outcome the commit adopted; the
   // rebound root is a pending re-arm, and this is the arm it awaits.
-  if let (Some(outcome), Some(watch), Some(attempt)) = (replay, watch, rebound) {
+  if let (Some(outcome), Some(attempt)) = (replay, rebound) {
     core.on_watch_installed(watch, attempt, outcome);
   }
   Ok(backend)
@@ -16824,9 +17064,14 @@ fn kick_control_queue<R, F>(
   submit_control_batch::<R, F>(ops, op_tx, scope, generation, requests, cut_token);
 }
 
-/// Drains the coverage transitions the core's barrier funnels raised, at the one
-/// seam that can act on them: after the core input that raised them, and BEFORE
-/// the effect queue is executed.
+/// Drains the coverage transitions the core's barrier funnels raised — and the
+/// scopes the core ENDED — at the one seam that can act on them: after the core
+/// input that raised them, and BEFORE the effect queue is executed.
+///
+/// The ended scopes come first, and they are the same seam's other half: a
+/// terminal transition publishes its interlock at its linearization point, and a
+/// scope ended by an input ends at the core's teardown queue site rather than
+/// when that teardown is later polled.
 ///
 /// The ordering is the whole reason they are not an [`Effect`]. The core routes
 /// every change before it processes any action, so a sync marker's `Emit` is
@@ -16876,13 +17121,23 @@ fn kick_control_queue<R, F>(
 /// on — so there is no surviving consumer left to be owed one.
 fn drain_barrier_moves<R, F>(
   core: &mut DriverCore,
-  cookies: &CookieRegistry<F>,
+  cookies: &mut CookieRegistry<F>,
   op_tx: &async_channel::Sender<OpResult<F::Handle>>,
   now: &impl Fn() -> Instant,
 ) where
   R: RuntimeLite,
   F: FsOps,
 {
+  // A terminal transition publishes its interlock at its linearization point.
+  // The core reports every scope it ended at the one site that queues the
+  // teardown, and this drain runs at every loop top and before every effect —
+  // so the retirement goes up in the same synchronous pass as the input that
+  // ended the scope, before any effect and before the next flush. Without it a
+  // write released between the end and the teardown's poll would read
+  // `retiring = false` and answer `Ok` for a marker the teardown then reaps.
+  for scope in core.take_ended_scopes() {
+    cookies.publish_retiring(scope);
+  }
   for BarrierMove {
     scope,
     location,
@@ -17005,6 +17260,11 @@ fn execute_effects<R, F>(
         // be refused for a lane that no longer exists: a successful barrier
         // nothing can satisfy. With the flag up first the write answers `Retired`
         // and reaps its own file.
+        //
+        // The idempotent backstop: the scope's end already published — in the
+        // accepted `Unwatch` arm, or through the barrier drain for a scope an
+        // event ended — and this covers any future producer of this effect that
+        // does not.
         cookies.publish_retiring(scope);
         scope_backends.remove(&scope);
         // The delivery lane (the transport generation) is reclaimed with the
