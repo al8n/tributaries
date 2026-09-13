@@ -10473,6 +10473,121 @@ mod descending {
       );
     }
 
+    /// A DIRECTORY RENAME DOMINATES THE BARRIER UNDER IT, and its instruction
+    /// stands at the DESTINATION'S PARENT — the ground the marker now stands in.
+    ///
+    /// A reparent is a deliberate non-bump: the watches travel and the
+    /// destination's coverage is unchanged. But every located judgement of a
+    /// barrier is by path, so the obligation goes on naming `/r/x/a` while its
+    /// marker rides the moved descriptor into `/r/y/b`, and every later move
+    /// under the destination intersects nothing the ledger records. The write's
+    /// own identity and frame belts all pass — the object is the one the
+    /// admission judged, it merely lives somewhere else now — so the consumer
+    /// could match the marker and read a certificate over a window whose ground
+    /// moved.
+    ///
+    /// Retiring it is the whole answer, and the destination is what aims the
+    /// instruction: a `Rescan` at the obligation's own recorded ground would name
+    /// a path nothing stands on.
+    ///
+    /// Revert witness: drop the rename arm from `drain_barrier_moves` and the
+    /// marker reaches the stream with no `Rescan` in front of it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rename_of_a_barriers_ground_stands_its_rescan_at_the_destination() {
+      let leaf = ".tributaries-sync-renamed-ground";
+      let fs = FakeFs::new(1);
+      fs.put("/r", FileKind::Dir, 1);
+      fs.put("/r/x", FileKind::Dir, 11);
+      fs.put("/r/x/a", FileKind::Dir, 12);
+      fs.put("/r/y", FileKind::Dir, 13);
+      let rig = inotify_rig_fs(fs);
+      let scope = watch(&rig, "/r").await;
+      settle(|| arms_at(&rig, "/r/x/a") > 0).await;
+      settle(|| arms_at(&rig, "/r/y") > 0).await;
+
+      let path = sync_ok(&rig, scope, "/r/x/a", leaf).await;
+      let reserved = path
+        .parent()
+        .expect("a marker stands inside the reserved directory")
+        .to_path_buf();
+      settle(|| arms_at(&rig, &reserved.to_string_lossy()) > 0).await;
+      let floor = drain_to_quiet(&rig, Epoch::START).await;
+
+      // ONE batch: the marker's own create, and the rename that carries its
+      // whole ground to another parent behind it.
+      let reserved_watch = watch_at(&rig, &reserved.to_string_lossy());
+      let x_watch = watch_at(&rig, "/r/x");
+      let y_watch = watch_at(&rig, "/r/y");
+      rig.fs.put("/r/y/b", FileKind::Dir, 12);
+      rig.fs.send_inotify_batch(
+        "/r",
+        vec![
+          RawLinuxEvent::Inotify {
+            anchors: vec![reserved_watch],
+            event: RawInotifyEvent {
+              wd: 1,
+              mask: InotifyMask(IN_CREATE),
+              cookie: 0,
+              name: Some(leaf.as_bytes().to_vec()),
+            },
+          },
+          RawLinuxEvent::Inotify {
+            anchors: vec![x_watch],
+            event: RawInotifyEvent {
+              wd: 2,
+              mask: InotifyMask(IN_MOVED_FROM | IN_ISDIR),
+              cookie: 77,
+              name: Some(b"a".to_vec()),
+            },
+          },
+          RawLinuxEvent::Inotify {
+            anchors: vec![y_watch],
+            event: RawInotifyEvent {
+              wd: 3,
+              mask: InotifyMask(IN_MOVED_TO | IN_ISDIR),
+              cookie: 77,
+              name: Some(b"b".to_vec()),
+            },
+          },
+        ],
+      );
+
+      let mut at_destination = false;
+      let mut saw_marker = false;
+      let _ = settle(|| {
+        while let Ok((_, _, change)) = rig.events.try_recv() {
+          if change.kind().is_rescan()
+            && change.epoch() > floor
+            && change
+              .location()
+              .segments()
+              .first()
+              .is_some_and(|segment| segment.as_str() == "y")
+          {
+            at_destination = true;
+          } else if change
+            .location()
+            .segments()
+            .last()
+            .is_some_and(|segment| segment.as_str() == leaf)
+          {
+            saw_marker = true;
+          }
+        }
+        at_destination
+      })
+      .await;
+      assert!(
+        !saw_marker,
+        "the dominated barrier's queued marker emit was purged, not delivered"
+      );
+      assert!(
+        at_destination,
+        "and its covering `Rescan` stands where the marker now is, under the \
+         destination's parent"
+      );
+    }
+
     /// Retirement is LOCATION-SCOPED: a transition on ground that does not
     /// intersect the barrier's retires nothing.
     ///
@@ -12184,6 +12299,300 @@ mod descending {
       );
     }
 
+    /// A SCOPE'S QUEUED CONTROL WORK IS BOUNDED, and crossing the bound folds
+    /// into the root-overflow path exactly ONCE per wedge.
+    ///
+    /// The queue caps the number of BATCHES, and a reply-less cover alternation
+    /// behind a batch stalled inside an arm syscall never adds one: every set of
+    /// derived arms and disarms shares the stalled batch's generation and merges
+    /// into it, so what grows is the request vector inside a single entry. Over a
+    /// finite tree, and with the current batch never completing, that is
+    /// unbounded memory.
+    ///
+    /// Both halves of the rule are here. The fold drops the scope's queued
+    /// attempts and hands its coverage to the root-overflow path — the bump, the
+    /// trust loss and the full re-arm under one covering `Rescan`. The LATCH is
+    /// what makes that terminate: the overflow's own re-arm derives another set
+    /// of arms into the same queue behind the same stalled batch, and without the
+    /// latch it would cross the ceiling again, fold again, and re-arm again with
+    /// no external input at all. The release is owed the re-derivation, because
+    /// the fold dropped the attempts the coverage was carried by.
+    ///
+    /// Driven against the enqueue directly, under the request seam, because that
+    /// is the only way to STATE the ceiling rather than allocate a quarter
+    /// million requests to reach it.
+    ///
+    /// Revert witness: drop the ceiling test and the first assertion below reads
+    /// a queue that simply kept growing; drop the latch and the push after the
+    /// fold folds a second time.
+    #[test]
+    fn a_saturated_control_queue_folds_once_into_the_root_overflow_path() {
+      let scope = ScopeId::new(NonZeroU64::new(1).unwrap());
+      let watch = WatchId::new(NonZeroU64::new(1).unwrap());
+      let disarms = |count: usize| -> Vec<crate::driver::ControlRequest> {
+        (0..count)
+          .map(|_| crate::driver::ControlRequest::Disarm { watch })
+          .collect()
+      };
+      crate::driver::CONTROL_REQUEST_CAP.with(|cap| cap.set(4));
+      let mut pending = crate::driver::PendingControl::default();
+      // The stalled batch itself: a mark of the scope's CURRENT lane, which is
+      // what makes the queue behind it a wait rather than a hand-off.
+      let lanes = BTreeMap::from([(scope, 0u64)]);
+      let inflight = BTreeMap::from([(scope, 0u64)]);
+
+      // One stalled batch's worth of churn: same generation, so every push
+      // merges into the one trailing entry rather than adding another.
+      assert!(!crate::driver::queue_control_batch(
+        &mut pending,
+        &inflight,
+        &lanes,
+        scope,
+        0,
+        disarms(3)
+      ));
+      assert!(!crate::driver::queue_control_batch(
+        &mut pending,
+        &inflight,
+        &lanes,
+        scope,
+        0,
+        disarms(1)
+      ));
+      assert_eq!(
+        pending.queued_requests(scope),
+        4,
+        "staging: the churn merged into one batch, exactly at the ceiling"
+      );
+
+      assert!(
+        crate::driver::queue_control_batch(&mut pending, &inflight, &lanes, scope, 0, disarms(1)),
+        "the push that would cross the ceiling takes the root-overflow path"
+      );
+      assert_eq!(
+        pending.queued_requests(scope),
+        0,
+        "dropping the attempts it held, which the overflow's re-arm re-derives"
+      );
+      assert!(pending.is_latched(scope), "and latching the scope");
+
+      assert!(
+        !crate::driver::queue_control_batch(&mut pending, &inflight, &lanes, scope, 0, disarms(9)),
+        "the re-arm the overflow derives folds nothing: the overflow standing \
+         over the scope already owns that work"
+      );
+      assert_eq!(
+        pending.queued_requests(scope),
+        0,
+        "and queues nothing behind the batch that is still stalled"
+      );
+
+      assert!(
+        pending.release_overflow(scope),
+        "the end of the batch in flight at the fold releases the latch, and \
+         owes the re-derivation"
+      );
+      assert!(!pending.release_overflow(scope), "exactly once");
+      assert!(!crate::driver::queue_control_batch(
+        &mut pending,
+        &inflight,
+        &lanes,
+        scope,
+        0,
+        disarms(2)
+      ));
+      assert_eq!(
+        pending.queued_requests(scope),
+        2,
+        "and the released scope queues its coverage work against a queue that \
+         can now drain"
+      );
+    }
+
+    /// THE LATCH EXISTS ONLY WHILE A BATCH IS IN FLIGHT. A cohort that crosses
+    /// the ceiling with nothing holding the scope's queue is SUBMITTED, never
+    /// folded.
+    ///
+    /// The latch has exactly one production release — the end of the batch that
+    /// was in flight when it was set — so installing one with no batch running
+    /// would silence the scope for good: the standing overflow's re-derived
+    /// batches are all discarded by the latch, no submitted batch exists to
+    /// complete, coverage stays incomplete and no fence of the scope ever
+    /// settles. One enumeration of more directories than the ceiling on an
+    /// otherwise idle scope is enough to reach it.
+    ///
+    /// It is also the wrong question there. The ceiling bounds what a scope holds
+    /// UN-SUBMITTED, and with no batch holding the queue the enqueue's own caller
+    /// kicks it on the next line and the work goes out — so the test would be
+    /// measuring one cohort's size, which is a property of the tree rather than
+    /// of a wedge.
+    ///
+    /// A mark of a RETIRED generation is not in flight either: the swap already
+    /// released the queue, so the same kick submits over it.
+    ///
+    /// Revert witness: fold without consulting the in-flight mark and the first
+    /// half below latches a scope whose latch nothing can ever lift.
+    #[test]
+    fn an_oversized_cohort_on_an_idle_scope_is_submitted_rather_than_latched() {
+      let scope = ScopeId::new(NonZeroU64::new(1).unwrap());
+      let watch = WatchId::new(NonZeroU64::new(1).unwrap());
+      let disarms = |count: usize| -> Vec<crate::driver::ControlRequest> {
+        (0..count)
+          .map(|_| crate::driver::ControlRequest::Disarm { watch })
+          .collect()
+      };
+      crate::driver::CONTROL_REQUEST_CAP.with(|cap| cap.set(4));
+      let lanes = BTreeMap::from([(scope, 7u64)]);
+
+      // IDLE: no mark at all. The first batch alone exceeds the cap.
+      let mut pending = crate::driver::PendingControl::default();
+      let idle = BTreeMap::new();
+      assert!(
+        !crate::driver::queue_control_batch(&mut pending, &idle, &lanes, scope, 7, disarms(9)),
+        "an idle scope's oversized cohort folds nothing"
+      );
+      assert!(
+        !pending.is_latched(scope),
+        "and latches nothing, because nothing could ever release it"
+      );
+      assert_eq!(
+        pending.queued_requests(scope),
+        9,
+        "the cohort is queued for the kick that follows to submit"
+      );
+
+      // A mark of a transport the scope has SWAPPED AWAY FROM holds nothing back.
+      let mut pending = crate::driver::PendingControl::default();
+      let retired = BTreeMap::from([(scope, 6u64)]);
+      assert!(
+        !crate::driver::queue_control_batch(&mut pending, &retired, &lanes, scope, 7, disarms(9)),
+        "a retired generation's mark is not a batch this queue waits on"
+      );
+      assert!(!pending.is_latched(scope));
+      assert_eq!(pending.queued_requests(scope), 9);
+
+      // And the wedge itself still folds: same cohort, same ceiling, a mark of
+      // the scope's CURRENT lane.
+      let mut pending = crate::driver::PendingControl::default();
+      let running = BTreeMap::from([(scope, 7u64)]);
+      assert!(
+        crate::driver::queue_control_batch(&mut pending, &running, &lanes, scope, 7, disarms(9)),
+        "work accumulating behind a live batch still takes the root-overflow path"
+      );
+      assert!(pending.is_latched(scope));
+      assert!(
+        pending.release_overflow(scope),
+        "and that batch's own end is what releases it"
+      );
+    }
+
+    /// NO SUBMITTED COHORT EXCEEDS THE CEILING EITHER. A cohort larger than it
+    /// is SPLIT into ceiling-sized batches, in order.
+    ///
+    /// The ceiling bounds the work a scope holds un-submitted, and an idle scope
+    /// holds nothing — so an oversized first cohort was submitted whole. But a
+    /// batch leaves this driver whole too: the source translates it into `ops`
+    /// and publication vectors of the batch's own size and hands the reader one
+    /// message it works through before returning to event reads. One legal
+    /// enumeration of a large enough tree therefore bought neither bounded
+    /// crate-owned memory nor a bounded reader turn, and the profile whose queue
+    /// this is is not bounded by `max_map_directories` either.
+    ///
+    /// The split is the MERGE, generalised — the trailing entry is filled to the
+    /// ceiling and the remainder spills behind it — because chunks pushed one
+    /// after another through a separate pass would merge straight back into the
+    /// single oversized entry the split exists to prevent. Every entry is then a
+    /// batch the kick may submit whole, so bounding the entries IS bounding the
+    /// submissions, and emission order is untouched: the pieces sit in the queue
+    /// in exactly the order their requests were derived.
+    ///
+    /// Revert witness: push without the ceiling and the cohort below is one entry
+    /// of twelve — the whole of it handed to one reader in one message.
+    #[test]
+    fn an_oversized_cohort_is_queued_as_ceiling_sized_batches_in_order() {
+      let scope = ScopeId::new(NonZeroU64::new(1).unwrap());
+      // Distinguishable requests, so ORDER is stated and not merely size.
+      let disarms = |from: u64, count: u64| -> Vec<crate::driver::ControlRequest> {
+        (from..from + count)
+          .map(|id| crate::driver::ControlRequest::Disarm {
+            watch: WatchId::new(NonZeroU64::new(id).unwrap()),
+          })
+          .collect()
+      };
+      let carried = |queue: &std::collections::VecDeque<crate::driver::ControlBatch>| -> Vec<u64> {
+        queue
+          .iter()
+          .flat_map(|(_, requests, _)| requests.iter())
+          .map(|request| match request {
+            crate::driver::ControlRequest::Disarm { watch } => watch.get().get(),
+            crate::driver::ControlRequest::Arm { .. } => unreachable!("this cell queues disarms"),
+          })
+          .collect()
+      };
+      crate::driver::CONTROL_REQUEST_CAP.with(|cap| cap.set(4));
+      let lanes = BTreeMap::from([(scope, 7u64)]);
+      let idle = BTreeMap::new();
+      let mut pending = crate::driver::PendingControl::default();
+
+      // THE IDLE COHORT: three ceilings in one drain, on a scope holding nothing.
+      assert!(
+        !crate::driver::queue_control_batch(&mut pending, &idle, &lanes, scope, 7, disarms(1, 12)),
+        "an idle scope's oversized cohort folds nothing"
+      );
+      let queue = pending
+        .queues
+        .get(&scope)
+        .expect("the cohort is queued for the kick to submit");
+      assert_eq!(
+        queue
+          .iter()
+          .map(|(_, requests, _)| requests.len())
+          .collect::<Vec<_>>(),
+        vec![4, 4, 4],
+        "three ceiling-sized batches, none of which the kick can submit past the \
+         ceiling"
+      );
+      assert_eq!(
+        carried(queue),
+        (1..=12).collect::<Vec<u64>>(),
+        "and the pieces carry the cohort's own order, so the batch submitted \
+         first runs the requests derived first"
+      );
+      assert_eq!(
+        pending.queued_requests(scope),
+        12,
+        "the gauge the ceiling is read against counts the chunks like any other \
+         queued work"
+      );
+
+      // A LATER DRAIN fills the trailing piece before it spills, so churn adds
+      // no entry until it has a whole ceiling to add.
+      crate::driver::CONTROL_REQUEST_CAP.with(|cap| cap.set(8));
+      let mut pending = crate::driver::PendingControl::default();
+      assert!(
+        !crate::driver::queue_control_batch(&mut pending, &idle, &lanes, scope, 7, disarms(1, 6)),
+        "staging: one part-filled batch"
+      );
+      assert!(
+        !crate::driver::queue_control_batch(&mut pending, &idle, &lanes, scope, 7, disarms(7, 5)),
+        "staging: a second drain of the same generation"
+      );
+      let queue = pending.queues.get(&scope).expect("both drains queued");
+      assert_eq!(
+        queue
+          .iter()
+          .map(|(_, requests, _)| requests.len())
+          .collect::<Vec<_>>(),
+        vec![8, 3],
+        "the merge fills to the ceiling and the remainder spills behind it"
+      );
+      assert_eq!(
+        carried(queue),
+        (1..=11).collect::<Vec<u64>>(),
+        "with emission order untouched across the fill and the spill"
+      );
+    }
+
     /// R5 regression — the per-scope CONTROL QUEUE must not leak state for a
     /// scope torn down in the SAME effect drain that also carried a control op
     /// for it. The finding: an `AddWatch`/`RemoveWatch` collected for a scope
@@ -12353,7 +12762,7 @@ mod descending {
         )>,
       > = BTreeMap::new();
       let mut deferred_grants: BTreeMap<ScopeId, DeferredGrant> = BTreeMap::new();
-      let mut pending_control: crate::driver::PendingControl = BTreeMap::new();
+      let mut pending_control = crate::driver::PendingControl::default();
       let mut control_inflight: crate::driver::ControlInflight = BTreeMap::new();
       let mut probes = crate::driver::LivenessProbes::default();
       let registry = NullRegistry;
@@ -12384,11 +12793,13 @@ mod descending {
       );
 
       assert!(
-        !control_inflight.contains_key(&dead) && !pending_control.contains_key(&dead),
+        !control_inflight.contains_key(&dead)
+          && !pending_control.queues.contains_key(&dead)
+          && !pending_control.is_latched(dead),
         "a scope torn down in the drain leaves NO control-queue state; \
          in-flight: {:?}, queued: {:?}",
         control_inflight,
-        pending_control.keys().collect::<Vec<_>>()
+        pending_control.queues.keys().collect::<Vec<_>>()
       );
       assert_eq!(
         control_inflight.get(&live).copied(),
@@ -16859,6 +17270,7 @@ mod sync_cookie {
   #[cfg(not(miri))]
   mod first_new_world_refresh {
     use super::*;
+    use crate::os::linux::{RawInotifyEvent, RawLinuxEvent, inotify::decode::InotifyMask};
 
     /// The staging the four cells share: the OLD root's probe is parked inside
     /// the refresh, and a sync write is parked in the pool. The commit that
@@ -16910,6 +17322,106 @@ mod sync_cookie {
         registry,
         &["/r".to_owned(), "/r/sub".to_owned()],
       )
+    }
+
+    /// A REPLACEMENT STARTS ITS CONTROL PLANE UNLATCHED, however the old world
+    /// wedged.
+    ///
+    /// The overflow latch, the queued batches and the in-flight mark belong to
+    /// the transport generation they were derived under. Keyed by scope alone
+    /// they survived the swap, and the replacement's whole re-arm was then
+    /// discarded at the enqueue's first line — with the only release in the hands
+    /// of the OLD generation's completion, which is exactly what replacing a
+    /// wedged root exists to escape. The replacement was reported live and stayed
+    /// unarmed, its cover and sync fences unable to settle.
+    ///
+    /// The staging is the wedge itself. `/old`'s one child arms into a batch that
+    /// never returns, so that batch holds the scope's queue for good; the create
+    /// injected behind it derives coverage work that crosses the ceiling and folds
+    /// into the root overflow, installing the latch over a batch whose end will
+    /// never come. The overflow's own cold re-read of `/old` is what says the fold
+    /// really fired.
+    ///
+    /// The request seam is thread-local and this runtime is single-threaded, so
+    /// the driver task reads the ceiling this cell sets.
+    ///
+    /// Revert witness: leave the control-plane state behind at the swap and
+    /// `/new/fresh` is never armed — the replacement's own ground, discarded by
+    /// its predecessor's latch.
+    #[tokio::test]
+    async fn a_replaced_root_starts_its_control_plane_unlatched() {
+      const IN_CREATE: u32 = 0x0000_0100;
+      const IN_ISDIR: u32 = 0x4000_0000;
+      // Every derived request crosses the ceiling, so the first push behind the
+      // wedged batch folds — without minting a quarter million of them.
+      crate::driver::CONTROL_REQUEST_CAP.with(|cap| cap.set(0));
+      let registry = RecordingRegistry::default();
+      let rig = replace_rig(registry);
+      rig.fs.put("/old/wedged", FileKind::Dir, 10);
+      rig.fs.put("/new/fresh", FileKind::Dir, 11);
+
+      // The old world's one arm never returns, so the batch holding its queue
+      // never completes and nothing can ever release what is latched behind it.
+      let wedged = rig.fs.hold_arm_exec_at("/old/wedged");
+      let scope = watch(&rig, "/old").await;
+      assert!(
+        settle(|| wedged.captured() >= 1).await,
+        "staging: the old world's control batch is parked inside an arm"
+      );
+      let root_watch = rig
+        .fs
+        .enumerates()
+        .first()
+        .map(|(watch, _)| *watch)
+        .expect("staging: the root read its own cold listing");
+
+      // Coverage work derived BEHIND that batch: it crosses the ceiling, so it
+      // folds into the root overflow and latches the scope.
+      rig.fs.put("/old/late", FileKind::Dir, 12);
+      rig.fs.send_inotify_batch(
+        "/old",
+        vec![RawLinuxEvent::Inotify {
+          anchors: vec![root_watch],
+          event: RawInotifyEvent {
+            wd: 1,
+            mask: InotifyMask(IN_CREATE | IN_ISDIR),
+            cookie: 0,
+            name: Some(b"late".to_vec()),
+          },
+        }],
+      );
+      assert!(
+        settle(|| {
+          rig
+            .fs
+            .enumerates()
+            .iter()
+            .filter(|(_, path)| path == std::path::Path::new("/old"))
+            .count()
+            >= 2
+        })
+        .await,
+        "staging: the fold took the root-overflow path, which re-reads the root \
+         cold — so the scope is LATCHED"
+      );
+
+      replace_root(&rig, scope, "/new")
+        .await
+        .expect("the replacement commits");
+
+      assert!(
+        settle(|| {
+          rig
+            .fs
+            .arms()
+            .iter()
+            .any(|(_, path)| path == std::path::Path::new("/new/fresh"))
+        })
+        .await,
+        "the replacement's own coverage work is queued and submitted: its \
+         predecessor's latch died with the generation it belonged to"
+      );
+      wedged.release();
     }
 
     /// The stream replace, alive: the replacement's first refresh is applied at

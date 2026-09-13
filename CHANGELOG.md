@@ -564,7 +564,9 @@ All notable changes to this workspace are documented here. The format is based o
   rather than certified past it. EXCEPT: arming the barrier's own reserved cookie
   directory is not a transition — it is the write's own ground coming into coverage,
   created by the write itself — so the first sync of a directory does not dominate
-  its own marker.
+  its own marker. A directory rename inside the root is a transition on every backend:
+  every barrier standing under the source is retired, with its covering `Rescan` stood
+  at the destination's parent, where its marker now stands.
 
   A barrier is never retired silently — the covering
   `Rescan` is stood, queued ahead of every later delta on that ground, before the caller

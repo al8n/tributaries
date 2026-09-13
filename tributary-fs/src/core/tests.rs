@@ -10939,6 +10939,62 @@ mod descending {
       assert!(core.take_barrier_moves().is_empty());
     }
 
+    /// A REPARENT DOMINATES EVERY BARRIER UNDER ITS SOURCE — and a rename with
+    /// no barrier under it advances nothing.
+    ///
+    /// Every located judgement of a barrier is by PATH, so a re-key leaves the
+    /// ground recorded on each obligation naming where the subtree WAS: a move
+    /// raised behind it names the subtree's new home and intersects none of
+    /// them, so a write paused under the renamed directory could create its
+    /// marker through the moved descriptor and certify delivery over a window in
+    /// which its own ground had moved.
+    ///
+    /// The rename is recorded with BOTH coordinates instead: the source selects
+    /// the obligations the drain retires, and the destination aims the
+    /// domination `Rescan` each retirement is owed, at the ground its marker now
+    /// stands in. Whether any stood there at all is the LEDGER's answer, so this
+    /// scope — which holds no obligation — passes no funnel, emits nothing and
+    /// leaves the stamp where it was.
+    ///
+    /// Revert witness: drop the `barrier_renamed` call from `feed` and the queue
+    /// is empty, with every obligation under `/r/sub` left judged at a path
+    /// nothing stands on.
+    #[test]
+    fn a_reparent_dominates_the_barriers_under_its_source() {
+      let (mut core, scope, root) = with_a_child();
+      let before = quiesce(&mut core, scope);
+      core.on_inotify_events(
+        scope,
+        vec![
+          inotify(&[root], IN_MOVED_FROM | IN_ISDIR, 7, Some(b"sub")),
+          inotify(&[root], IN_MOVED_TO | IN_ISDIR, 7, Some(b"moved")),
+        ],
+        at(1),
+      );
+      let effects = drain(&mut core);
+      assert!(
+        !emits(&effects)
+          .iter()
+          .any(|change| change.kind().is_rescan()),
+        "with no barrier under it the rename stands no instruction of its own"
+      );
+      assert_eq!(
+        epoch(&core, scope).0,
+        before.0,
+        "and passes no funnel: nothing advances"
+      );
+      assert_eq!(
+        core.take_barrier_events(),
+        vec![BarrierEvent::Renamed {
+          scope,
+          from: PathBuf::from("/r/sub"),
+          to: PathBuf::from("/r/moved"),
+        }],
+        "but the queue names both ends absolutely, which is what lets the drain \
+         retire the barriers a move alone would have spared"
+      );
+    }
+
     /// A reply-less re-issue of a settled cover prunes nothing and grows
     /// nothing, so it reaches no action and no funnel. The umbrella re-issues
     /// covers periodically; a bump here would dominate every barrier in flight
@@ -20437,6 +20493,240 @@ mod prune {
       }),
       "and the consumed source half's own departure is reported in the same \
        drain, at `open`: {changes:?}"
+    );
+  }
+  /// EVERY PAIRED DIRECTORY RENAME DOMINATES THE BARRIERS UNDER ITS SOURCE, and
+  /// a kernel-recursive profile's is recorded ahead of the very move its prune
+  /// seat raises behind it.
+  ///
+  /// These profiles keep no per-directory child watches, so the Monitor holds no
+  /// subtree at the pairing and re-keys nothing. The destination cover beside
+  /// them is a located `Rescan` at `/r/b`, and which barriers a coverage
+  /// transition retires is decided by PATH: an obligation still recorded under
+  /// `/r/a` intersects nothing that instruction names, so a write paused under
+  /// the renamed directory could create its marker through the moved descriptor
+  /// and certify delivery over a window in which its own ground had moved.
+  ///
+  /// One rule closes it on every profile: the rename names the source it moved,
+  /// and the destination it now stands at.
+  ///
+  /// Revert witness: read the funnel through the re-key alone and the queue
+  /// carries the destination move with nothing in front of it.
+  #[test]
+  fn a_kernel_recursive_rename_dominates_the_ground_under_its_source() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
+    let scope = live_fanotify(&mut core, &pruning(&["a/cache"]));
+    let _ = core.take_barrier_events();
+
+    core.on_batch(
+      scope,
+      BatchPayload::detached(vec![SourceEvent::Linux(RawLinuxEvent::Fanotify(
+        crate::os::linux::fanotify::AdmittedEvent {
+          mask: crate::os::linux::fanotify::fid::FanMask::new(
+            crate::os::linux::fanotify::fid::FAN_RENAME
+              | crate::os::linux::fanotify::fid::FAN_ONDIR,
+          ),
+          path: None,
+          rename: Some(crate::os::linux::fanotify::AdmittedRename {
+            old_path: PathBuf::from("/r/a"),
+            new_path: PathBuf::from("/r/b"),
+          }),
+        },
+      ))]),
+      at(1),
+    );
+    let _ = drain(&mut core);
+
+    assert_eq!(
+      core.take_barrier_events(),
+      vec![
+        BarrierEvent::Renamed {
+          scope,
+          from: PathBuf::from("/r/a"),
+          to: PathBuf::from("/r/b"),
+        },
+        BarrierEvent::Move(BarrierMove {
+          scope,
+          location: BarrierLocation::Path(Arc::new(PathBuf::from("/r/b"))),
+          rescan_stands: true,
+        }),
+      ],
+      "the pairing names both ends absolutely, ahead of the destination cover \
+       the prune seat stands behind it"
+    );
+  }
+
+  /// MOVING THE RESERVED COOKIE DIRECTORY NEEDS NO CASE OF ITS OWN.
+  ///
+  /// A marker's real parent is the sync's own directory joined with the leaf
+  /// this process reserves, so a rename whose SOURCE is that reserved directory
+  /// is a coverage transition for exactly the barriers inside it — and for no
+  /// other, since the sync's own directory did not move. The rename is recorded
+  /// at its source like any other, and the ground it names intersects the
+  /// obligation's own, because intersection is tested in BOTH directions: a
+  /// prefix rewrite is directional, a retirement is not.
+  ///
+  /// Revert witness: record the rename at its destination instead and the
+  /// location intersects nothing the ledger holds.
+  #[test]
+  fn a_rename_of_the_reserved_cookie_directory_names_the_ground_it_moved() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
+    let scope = live_fanotify(&mut core, &pruning(&[]));
+    let _ = core.take_barrier_events();
+    let reserved = PathBuf::from("/r/sync").join(COOKIE_DIR);
+
+    core.on_batch(
+      scope,
+      BatchPayload::detached(vec![SourceEvent::Linux(RawLinuxEvent::Fanotify(
+        crate::os::linux::fanotify::AdmittedEvent {
+          mask: crate::os::linux::fanotify::fid::FanMask::new(
+            crate::os::linux::fanotify::fid::FAN_RENAME
+              | crate::os::linux::fanotify::fid::FAN_ONDIR,
+          ),
+          path: None,
+          rename: Some(crate::os::linux::fanotify::AdmittedRename {
+            old_path: reserved.clone(),
+            new_path: PathBuf::from("/r/b/cookies"),
+          }),
+        },
+      ))]),
+      at(1),
+    );
+    let _ = drain(&mut core);
+
+    assert_eq!(
+      core.take_barrier_events(),
+      vec![BarrierEvent::Renamed {
+        scope,
+        from: reserved.clone(),
+        to: PathBuf::from("/r/b/cookies"),
+      }],
+      "the reserved directory is named as the ground that moved"
+    );
+    assert!(
+      BarrierLocation::Path(Arc::new(reserved)).intersects(&PathBuf::from("/r/sync")),
+      "and it intersects the sync's own directory, which is what retires the \
+       barrier whose reserved directory this was"
+    );
+  }
+
+  /// THE WIDENED COVER IS THE PAIRING'S OWN STANDING `Rescan`.
+  ///
+  /// The destination this arm replaces never reaches the Monitor, so no pairing
+  /// is resolved there and the funnel that records a rename off a record's own
+  /// outcome is never asked. Which barriers a coverage transition retires is
+  /// decided by PATH, so every obligation of the scope goes on being judged at
+  /// the path its ground has already left — and the widened cover, standing at
+  /// the destination's nearest unpruned ancestor, intersects none of them. A
+  /// write paused under the renamed directory could then create its marker
+  /// through the moved descriptor and certify delivery over a window in which its
+  /// own ground had moved, with no covering `Rescan` ahead of the certificate.
+  ///
+  /// So the seat records the rename's own move, LOCATED at the source and
+  /// CLAIMING the widened cover: no `Rescan` this seat stands may name pruned
+  /// ground, and the cover above the pruned subtree is a prefix of the ground the
+  /// retired markers moved into.
+  ///
+  /// Kernel-recursive, which is where it bites hardest: these profiles keep no
+  /// per-directory child watches, so no child-watch drop stands behind the rename
+  /// to retire anything the cover missed.
+  ///
+  /// Revert witness: leave this seat to the funnel's own report and the queue
+  /// carries the widened move with nothing in front of it.
+  #[test]
+  fn a_rename_into_pruned_ground_dominates_its_source_ahead_of_the_widened_cover() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
+    let scope = live_fanotify(&mut core, &pruning(&["a/blocked"]));
+    let _ = core.take_barrier_events();
+
+    core.on_batch(
+      scope,
+      BatchPayload::detached(vec![SourceEvent::Linux(RawLinuxEvent::Fanotify(
+        crate::os::linux::fanotify::AdmittedEvent {
+          mask: crate::os::linux::fanotify::fid::FanMask::new(
+            crate::os::linux::fanotify::fid::FAN_RENAME
+              | crate::os::linux::fanotify::fid::FAN_ONDIR,
+          ),
+          path: None,
+          rename: Some(crate::os::linux::fanotify::AdmittedRename {
+            old_path: PathBuf::from("/r/open"),
+            new_path: PathBuf::from("/r/a/blocked/deep"),
+          }),
+        },
+      ))]),
+      at(1),
+    );
+    let _ = drain(&mut core);
+
+    let events = core.take_barrier_events();
+    assert_eq!(
+      events.first(),
+      Some(&BarrierEvent::Move(BarrierMove {
+        scope,
+        location: BarrierLocation::Path(Arc::new(PathBuf::from("/r/open"))),
+        rescan_stands: true,
+      })),
+      "the batch's own paired source names the ground the rename moved, ahead \
+       of everything the fence stands behind it: {events:?}"
+    );
+    assert!(
+      matches!(
+        events.get(1),
+        Some(BarrierEvent::Move(moved))
+          if moved.scope == scope
+            && moved.location == BarrierLocation::Path(Arc::new(PathBuf::from("/r/a")))
+      ),
+      "and the widened cover follows, at the nearest unpruned parent — the \
+       instruction the rename's own move claims: {events:?}"
+    );
+    assert_eq!(events.len(), 2, "and nothing else: {events:?}");
+  }
+
+  /// The descending variant. It reaches the same seat by the other route: the
+  /// source half is already PARKED in the Monitor when the destination is
+  /// judged, because this is the one profile that feeds as it classifies, so the
+  /// move's ground is the Monitor's own reconstruction of the parked half.
+  ///
+  /// Its widened cover is the SCOPE cover here — a leaf pruned by its own name
+  /// has no unpruned parent to climb to below the root — and the rename's located
+  /// move FOLDS into it, claim and all: a whole-scope move retires a superset of
+  /// what it absorbs, and the root `Rescan` behind it covers every ground either
+  /// of them named.
+  ///
+  /// Revert witness: the same one. Leave this seat to the funnel's own report and
+  /// the fold is all the queue carries, with nothing having named the ground the
+  /// subtree left.
+  #[test]
+  fn a_descending_rename_into_pruned_ground_dominates_from_the_parked_half() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
+    let (scope, req, root) = live_descending(&mut core, &pruning(&["blocked"]));
+    core.on_enumerated(req, listed(vec![entry("open", FileKind::Dir)]));
+    let effects = drain(&mut core);
+    let (_, open_req) = arm(&mut core, &effects, "/r/open");
+    core.on_enumerated(open_req, listed(Vec::new()));
+    let _ = drain(&mut core);
+    let _ = core.take_barrier_events();
+
+    core.on_inotify_events(
+      scope,
+      vec![
+        inotify(root, IN_MOVED_FROM | IN_ISDIR, 9, Some("open")),
+        inotify(root, IN_MOVED_TO | IN_ISDIR, 9, Some("blocked")),
+      ],
+      at(1),
+    );
+    let _ = drain(&mut core);
+
+    let events = core.take_barrier_events();
+    assert_eq!(
+      events,
+      vec![BarrierEvent::Move(BarrierMove {
+        scope,
+        location: BarrierLocation::Scope,
+        rescan_stands: true,
+      })],
+      "the scope-wide cover subsumes the rename's own move and carries its \
+       claim: {events:?}"
     );
   }
 }
