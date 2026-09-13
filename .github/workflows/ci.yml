@@ -265,7 +265,13 @@ jobs:
     - name: Install cargo-hack
       run: cargo install cargo-hack
     - name: Run build
-      run: cargo hack build --feature-powerset --exclude-no-default-features
+      # The powerset runs at depth 2 by the owner's ruling: every feature
+      # alone and every pair (143 combinations became a few dozen once the
+      # `sync` feature doubled the set). The four pinned gate-state checks
+      # below (`Check both states of the sync gate, outside the powerset`)
+      # and the `--each-feature` clippy job keep the single-feature states
+      # pinned; triples and above are not exercised by CI.
+      run: cargo hack build --feature-powerset --exclude-no-default-features --depth 2
 
   test:
     name: test
@@ -301,15 +307,16 @@ jobs:
     - name: Install cargo-hack
       run: cargo install cargo-hack
     - name: Free the hosted runner's disk for the feature powerset
-      # Only ubuntu-latest needs this: the powerset below accumulates 143
-      # combinations' worth of debug test artifacts in one target directory
-      # and exceeds the hosted runner's ~14 GB disk around combination 100 of
-      # 143 — at which point the runner's own worker crashes with "No space
-      # left on device" and the step just stops, with no Rust-side error line
-      # to point at. macOS and Windows runners carry far more disk and never
-      # hit this. Clearing toolsets this job never touches (dotnet, Android,
-      # GHC, CodeQL) and any cached Docker images buys back enough room to
-      # finish.
+      # Only ubuntu-latest needs this. The full feature powerset, uncapped,
+      # used to accumulate 143 combinations' worth of debug test artifacts in
+      # one target directory and exceed the hosted runner's ~14 GB disk around
+      # combination 100 of 143 — the runner's own worker would crash with "No
+      # space left on device" and the step would just stop, with no Rust-side
+      # error line to point at. The run now stops at depth 2, well short of
+      # that, but this step stays and the freed room is kept as margin. macOS
+      # and Windows runners carry far more disk and never hit this. Clearing
+      # toolsets this job never touches (dotnet, Android, GHC, CodeQL) and any
+      # cached Docker images buys back enough room to finish.
       if: runner.os == 'Linux'
       run: |
         df -h /
@@ -325,11 +332,17 @@ jobs:
       # powerset that only needs each combination to build and run once, so
       # both are off here to keep the artifacts from filling right back up
       # the disk the step above just cleared.
+      # The powerset runs at depth 2 by the owner's ruling: every feature
+      # alone and every pair (143 combinations became a few dozen once the
+      # `sync` feature doubled the set). The four pinned gate-state checks
+      # below (`Check both states of the sync gate, outside the powerset`)
+      # and the `--each-feature` clippy job keep the single-feature states
+      # pinned; triples and above are not exercised by CI.
       env:
         CARGO_INCREMENTAL: "0"
         CARGO_PROFILE_DEV_DEBUG: "0"
         CARGO_PROFILE_TEST_DEBUG: "0"
-      run: cargo hack test --feature-powerset --exclude-no-default-features --exclude-features _integration
+      run: cargo hack test --feature-powerset --exclude-no-default-features --exclude-features _integration --depth 2
     - name: Check featureless tributaries
       # The blanket --exclude-no-default-features above never builds the FEATURELESS
       # umbrella (the generic core: no fs, no runtime); pin it explicitly here.
