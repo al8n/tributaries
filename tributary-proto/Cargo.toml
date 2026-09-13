@@ -23,11 +23,14 @@ serde = ["dep:serde"]
 clap = ["dep:clap", "std"]
 # The `glob` vocabulary (`Glob`, `Globs`): validated root-relative patterns and
 # the compiled sets the watcher's per-root seats match with. `globset` needs
-# `std`, so the face implies it.
-glob = ["dep:globset", "std"]
+# `std`, so the face implies it. `unicode-normalization` folds both a pattern and
+# a candidate path to NFC, so a name spelled composed matches one the filesystem
+# spells decomposed.
+glob = ["dep:globset", "dep:unicode-normalization", "std"]
 
 [dependencies]
 globset = { version = "0.4", optional = true }
+unicode-normalization = { version = "0.1", optional = true }
 clap = { version = "4", optional = true, default-features = false, features = [
   "std",
   "derive",

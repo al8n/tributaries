@@ -19,6 +19,8 @@
 
 use core::error::Error;
 
+use crate::options::{OptionsError, RootGlobs};
+
 #[cfg(all(test, not(feature = "fs")))]
 mod tests;
 
@@ -198,6 +200,14 @@ impl core::fmt::Display for FaultKind {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum BuildError {
+  /// A capacity in the umbrella's own household lies outside its documented range.
+  /// The whole range-checking vocabulary lives with the options
+  /// ([`TributariesOptions::validate`](crate::TributariesOptions::validate)), so the
+  /// verdict a configuration layer computes where the setting is read and the one
+  /// construction computes are the same value — and it is reached before a single
+  /// channel is allocated.
+  #[error(transparent)]
+  InvalidOptions(#[from] OptionsError),
   /// The source could not be built; the classified fault carries the source's concrete
   /// error.
   #[error("the source could not be built")]
@@ -205,17 +215,25 @@ pub enum BuildError {
 }
 
 impl BuildError {
+  /// Whether this is [`InvalidOptions`](Self::InvalidOptions).
+  #[inline]
+  pub const fn is_invalid_options(&self) -> bool {
+    matches!(self, Self::InvalidOptions(_))
+  }
+
   /// Whether this is [`Source`](Self::Source).
   #[inline]
   pub const fn is_source(&self) -> bool {
     matches!(self, Self::Source(_))
   }
 
-  /// The classified fault this error carries.
+  /// The classified fault this error carries, when the failure was the SOURCE's —
+  /// [`None`] for a refused configuration, which no source ever saw.
   #[inline]
   pub const fn fault(&self) -> Option<&SourceFault> {
     match self {
       Self::Source(fault) => Some(fault),
+      Self::InvalidOptions(_) => None,
     }
   }
 
@@ -228,6 +246,47 @@ impl BuildError {
   pub fn as_fs(&self) -> Option<&tributary_fs::BuildError> {
     self.fault()?.downcast_ref()
   }
+}
+
+/// Which way a watch's per-root glob words failed to fit the root that would serve it —
+/// the `reason` on [`WatchError::RootWordsConflict`].
+///
+/// The two seats are not the same shape, and that is what makes two reasons necessary.
+/// [`include`](crate::WatchOptions::include) matches an object's NAME, so it means the
+/// same thing wherever it is armed. [`prune`](crate::WatchOptions::prune) matches the
+/// root-relative DIRECTORY path, so its meaning is fixed by the root it is anchored to:
+/// the identical pattern text under a different root names different ground.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
+#[non_exhaustive]
+pub enum WordsConflict {
+  /// The words themselves differ from the root's — different patterns, or the same
+  /// patterns in a different order (equality is [`RootGlobs`]'s own [`PartialEq`]:
+  /// the same patterns, as written, in the same order). Unengaged words
+  /// ([`RootGlobs::new`]) are just another value here: they differ from engaged ones
+  /// exactly as two engaged sets do.
+  #[error("the watch's per-root words differ from those of the root whose coverage it would share")]
+  Differ,
+  /// The words are EQUAL, but serving this watch would anchor them to a different root
+  /// than the one they were written for, and at least one side carries a
+  /// [`prune`](crate::WatchOptions::prune) seat — whose patterns are root-relative, so
+  /// re-anchoring them silently re-aims them at other ground.
+  ///
+  /// Two shapes reach this. A watch DEEPER than the root already covering it would ride
+  /// words written for the shallower root, so a `prune` of `sub` — meaning the covering
+  /// root's `sub` — is not the `sub` this watch meant. A WIDEN always moves the anchor
+  /// the other way: the subsumed roots' words are re-based onto the wider key, so a
+  /// `prune` that named one subsumed root's own subdirectory can come to name that
+  /// entire root, silencing a live subscription that is still published.
+  ///
+  /// Watch at the root's own key, or with both `prune` seats empty — an
+  /// [`include`](crate::WatchOptions::include)-only household matches names, which no
+  /// anchor can change — or narrow this subscription alone with the per-subscription
+  /// [`Filter`](crate::Filter).
+  #[error(
+    "the watch's per-root words are equal but would be anchored to a different root, and a \
+     prune seat is root-relative"
+  )]
+  Anchored,
 }
 
 /// Why a subscription could not be established.
@@ -308,6 +367,44 @@ pub enum WatchError {
      retry the watch"
   )]
   CoverageIncomplete,
+  /// This watch's per-root glob words cannot be served by the root whose coverage it
+  /// would share, so it was refused rather than silently served under words that mean
+  /// something else there.
+  ///
+  /// The two glob seats ([`prune`](crate::WatchOptions::prune) /
+  /// [`include`](crate::WatchOptions::include)) are per-ROOT, and roots are SHARED: a watch
+  /// already covered by a live root arms nothing and rides that root's words, and a wider
+  /// watch that subsumes live roots re-points their subscribers onto its own. Either way one
+  /// set of words has to stand for subscriptions that asked for two, and no merge of them is
+  /// honest — a union of `prune` seats subtracts coverage a subscriber never agreed to lose,
+  /// an intersection re-enters a subtree another asked to stay out of. So the newcomer is
+  /// refused instead.
+  ///
+  /// [`reason`](Self::RootWordsConflict::reason) says which of the two ways the words
+  /// failed to fit — the TEXT differs, or the text is equal but the ANCHOR would move.
+  /// See [`WordsConflict`].
+  ///
+  /// Refused by the planner, **before anything is armed, disarmed or re-pointed**: no
+  /// coverage moves, no root is torn down, and nobody is owed a
+  /// [`Rescan`](crate::EventKind::Rescan). Retrying the same words changes nothing while that
+  /// root lives; watch at the root's own key with words EQUAL to the `armed` ones this
+  /// carries, or narrow this subscription alone with the per-subscription
+  /// [`Filter`](crate::Filter), which gates delivery only, is never shared, and moves with no
+  /// anchor.
+  #[error("{reason} (the root is {root_depth} key component(s) deep)")]
+  RootWordsConflict {
+    /// How deep the conflicting root's own key is, in key components — which names WHICH root
+    /// it is, relative to the watch: at or below the watch's own key depth it is the root
+    /// COVERING the watch, and beyond it, one of the roots the watch would have subsumed.
+    root_depth: usize,
+    /// The words that root is ARMED with — the ones a watch sharing its coverage must carry.
+    armed: RootGlobs,
+    /// The words this watch asked for.
+    requested: RootGlobs,
+    /// Which way the words failed to fit: the text differs, or the text is equal but the
+    /// root the words are ANCHORED to would not be the one they were written for.
+    reason: WordsConflict,
+  },
   /// This watch asked for a [`Filter`](crate::Filter) of its own, and the watcher's filter
   /// plane is **retired**: it will never enter a caller predicate again, so the subscription
   /// could only be created unfiltered.
@@ -348,6 +445,22 @@ pub enum WatchError {
   /// would run. A caller that needs another subscription builds a new watcher.
   #[error("the watcher's source plane is retired; no new watch can be established on it")]
   SourceRetired,
+  /// The [`WatchOptions`](crate::WatchOptions) themselves cannot be honored: one of
+  /// the two per-root glob seats carries more patterns than
+  /// [`WatchOptions::MAX_SEAT_PATTERNS`](crate::WatchOptions::MAX_SEAT_PATTERNS).
+  ///
+  /// The seats are the words the root is ARMED with, which makes them the one part
+  /// of a watch request handed straight down to a [`Source`](crate::Source) and then
+  /// asked per event. A caller writes their length, so refusing it at the door is
+  /// what keeps a source from being handed a set it would have to walk pattern by
+  /// pattern on every candidate.
+  ///
+  /// Refused by [`watch`](crate::Tributaries::watch) itself, before the request is
+  /// even submitted to the owner: nothing is canonicalized, classified, armed or
+  /// re-pointed, and the source is never called. Not retryable as written — the
+  /// remedy is a broader pattern rather than a longer list.
+  #[error("the watch options cannot be honored")]
+  InvalidOptions(#[source] OptionsError),
 }
 
 impl WatchError {
@@ -413,6 +526,13 @@ impl WatchError {
     matches!(self, Self::CoverageIncomplete)
   }
 
+  /// Whether this is [`RootWordsConflict`](Self::RootWordsConflict) — the pre-mutation refusal
+  /// of a watch whose per-root words differ from those of the root it would share.
+  #[inline]
+  pub const fn is_root_words_conflict(&self) -> bool {
+    matches!(self, Self::RootWordsConflict { .. })
+  }
+
   /// Whether this is [`FilterRetired`](Self::FilterRetired) — the watcher will never enter a
   /// caller predicate again, so a watch asking for one is refused rather than silently
   /// created unfiltered.
@@ -428,6 +548,33 @@ impl WatchError {
     matches!(self, Self::SourceRetired)
   }
 
+  /// Whether this is [`InvalidOptions`](Self::InvalidOptions) — the watch's own
+  /// options were refused at the door, so nothing was planned and the source was
+  /// never called.
+  #[inline]
+  pub const fn is_invalid_options(&self) -> bool {
+    matches!(self, Self::InvalidOptions(_))
+  }
+
+  /// The refused options verdict this error carries, for
+  /// [`InvalidOptions`](Self::InvalidOptions).
+  #[inline]
+  pub const fn options(&self) -> Option<&OptionsError> {
+    match self {
+      Self::InvalidOptions(err) => Some(err),
+      Self::Canonicalize { .. }
+      | Self::Source(_)
+      | Self::DeadOnArrival
+      | Self::CanonicalRace
+      | Self::RescanBacklog
+      | Self::Closed
+      | Self::CoverageIncomplete
+      | Self::RootWordsConflict { .. }
+      | Self::FilterRetired
+      | Self::SourceRetired => None,
+    }
+  }
+
   /// The classified fault this error carries, for the two fault-carrying variants
   /// ([`Canonicalize`](Self::Canonicalize) and [`Source`](Self::Source)).
   #[inline]
@@ -439,8 +586,10 @@ impl WatchError {
       | Self::RescanBacklog
       | Self::Closed
       | Self::CoverageIncomplete
+      | Self::RootWordsConflict { .. }
       | Self::FilterRetired
-      | Self::SourceRetired => None,
+      | Self::SourceRetired
+      | Self::InvalidOptions(_) => None,
     }
   }
 

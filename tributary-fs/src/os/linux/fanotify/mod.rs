@@ -47,6 +47,8 @@ use std::{
   path::{Path, PathBuf},
 };
 
+use tributary_proto::glob::Globs;
+
 pub(crate) use fid::{FanMask, RawFanotifyEvent};
 use fid::{Fid, RenameInfo};
 use map::FidMap;
@@ -182,7 +184,7 @@ pub(crate) enum Admission {
   /// re-parent / move-out `forget` / move-in `learn`). `seed` is the moved
   /// directory's FID when the reader must walk its descendants in before forwarding —
   /// it arrived from OUTSIDE the root, or it was re-parented across a change in
-  /// exclusion geometry ([`exclusion_geometry_changed`]) that makes the map's picture
+  /// exclusion geometry ([`fence_geometry_changed`]) that makes the map's picture
   /// of the subtree disagree with the fence's. `None` for a geometry-preserving
   /// in-root re-parent, a move-out, or a file/boundary rename. REQUIRES both halves (+
   /// `target_fid` when `ONDIR`, else → [`Lossy`](Self::Lossy)).
@@ -259,6 +261,72 @@ pub(crate) enum Admission {
   Lossy,
 }
 
+/// The reported tree's boundary for one root, stated as ONE predicate: the
+/// caller's exclusion directories AND the root's own compiled `prune` seat.
+///
+/// The two seats answer the same question in different vocabularies — an
+/// exclusion is an absolute subtree, a prune pattern a root-relative directory
+/// glob — and this backend needs one answer, because it enforces them in the same
+/// places for the same reason. A `FAN_MARK_FILESYSTEM` mark covers a whole
+/// superblock, so the ONLY way to keep a subtree from costing this source
+/// anything is to keep it out of the admission map: not seeded, not descended,
+/// not learned. Both seats therefore ride every walk decision and every
+/// admission decision, and neither may reach a mutation site the other does not.
+///
+/// It re-derives no matching rule of its own. The exclusion half is
+/// [`crate::driver::excluded`] and the prune half is
+/// [`crate::driver::pruned`] — the same two predicates the core's own fence and
+/// the sync-cookie birth refusal consult — so "a directory this walk declines",
+/// "a path this admission drops" and "a path the core refuses to cover" stay one
+/// set by construction.
+///
+/// The unengaged fence — no exclusions and no prune words, the overwhelmingly
+/// common case — has no opinion at all, and the callers short-circuit on it so
+/// the action is bit-for-bit what it was before either seat existed.
+#[derive(Clone, Copy)]
+pub(crate) struct Fence<'a> {
+  /// The canonical watched root every prune pattern is relative to. The map
+  /// resolves absolute paths, so the fence needs the root to re-derive the
+  /// root-relative form the seat is written in.
+  root: &'a Path,
+  /// The caller's exclusion directories, matched as absolute subtree prefixes.
+  exclusions: &'a [PathBuf],
+  /// The root's compiled prune seat, matched on root-relative DIRECTORY prefixes.
+  prune: &'a Globs,
+}
+
+impl<'a> Fence<'a> {
+  /// The fence for a root watched with `exclusions` and `prune` (both empty =
+  /// unfenced).
+  pub(crate) const fn new(root: &'a Path, exclusions: &'a [PathBuf], prune: &'a Globs) -> Self {
+    Self {
+      root,
+      exclusions,
+      prune,
+    }
+  }
+
+  /// Whether the fence speaks for nothing — neither seat engaged.
+  fn unengaged(&self) -> bool {
+    self.exclusions.is_empty() && self.prune.is_empty()
+  }
+
+  /// Whether `path` lies OUTSIDE the reported tree — at or under an exclusion, or
+  /// under (or at, for a directory) a pruned name.
+  ///
+  /// `directory` is the PRUNE half's own question and the exclusion half ignores
+  /// it: an exclusion is a literal subtree, so it covers a file inside it exactly
+  /// as it covers the directory holding it, while prune speaks for directories
+  /// only — a plain file whose own name matches a pattern stays reported, and only
+  /// an already-pruned directory above it takes it out. Every caller passes the
+  /// class the event proved (`FAN_ONDIR`) or the class the site guarantees (a walk
+  /// child and a mapped object are directories by construction).
+  pub(crate) fn fences(&self, directory: bool, path: &Path) -> bool {
+    crate::driver::excluded(self.exclusions, path)
+      || crate::driver::pruned(self.root, self.prune, directory, path)
+  }
+}
+
 /// Classifies one decoded event into its [`Admission`] action against the per-root
 /// map: resolves the ADDRESSING object's FID to a path through the batch
 /// [`MemoBatch`], and applies the action's map self-maintenance inline (learn on a
@@ -324,12 +392,12 @@ pub(crate) fn classify(
   map: &mut FidMap,
   event: &RawFanotifyEvent,
   memo: &mut MemoBatch,
-  exclusions: &[PathBuf],
+  fence: Fence<'_>,
 ) -> Admission {
-  // THE EXCLUSION fence, ahead of every mutation site in this function. Read-only
+  // THE fence, ahead of every mutation site in this function. Read-only
   // (`resolve_path`, never `admit`), so the decision is made against the map state the
   // shapes will act on and nothing is mutated to reach it.
-  if let Some(fenced) = fence(map, event, exclusions) {
+  if let Some(fenced) = fence_verdict(map, event, fence) {
     return fenced;
   }
 
@@ -369,7 +437,7 @@ pub(crate) fn classify(
   }
 
   if let Some(rename) = &event.rename {
-    return classify_rename(map, event, rename, memo, exclusions);
+    return classify_rename(map, event, rename, memo, fence);
   }
 
   // A named event addresses a CHILD under its parent directory (`dir_fid`); a
@@ -425,26 +493,26 @@ pub(crate) fn classify(
 /// one hash lookup, no path built — and still drop clean, so an excluded subtree still
 /// costs the source nothing. What newly takes the barrier is only the case where the map
 /// itself says an admitted, reportable object was destroyed.
-fn fence(map: &FidMap, event: &RawFanotifyEvent, exclusions: &[PathBuf]) -> Option<Admission> {
-  // Exclusions are rare and this runs per decoded event: answer the empty set without
-  // resolving anything. With no exclusions the fence has no opinion at all, so the
-  // action is bit-for-bit what it was before exclusions existed.
-  if exclusions.is_empty() {
+fn fence_verdict(map: &FidMap, event: &RawFanotifyEvent, fence: Fence<'_>) -> Option<Admission> {
+  // Both seats are rare and this runs per decoded event: answer the unengaged fence
+  // without resolving anything. With neither seat the fence has no opinion at all, so
+  // the action is bit-for-bit what it was before either existed.
+  if fence.unengaged() {
     return None;
   }
-  // The root's own death outranks every exclusion, including one covering the watched
+  // The root's own death outranks every seat, including one covering the watched
   // root itself.
   if reports_root_death(map, event) {
     return None;
   }
-  if !names_no_reported_path(map, event, exclusions) {
+  if !names_no_reported_path(map, event, fence) {
     return None;
   }
   // Every path the event NAMES is outside the reported tree. That is not yet a licence to
   // drop it: the object it ACTS ON is a separate question, and an admitted one at a
   // reported path makes this event destructive to state the map holds rather than merely
   // unreported. Take the barrier for it and let the reseed rebuild the truth.
-  if affects_reported_object(map, event, exclusions) {
+  if affects_reported_object(map, event, fence) {
     return Some(Admission::Lossy);
   }
   Some(Admission::ExcludedDrop)
@@ -467,12 +535,14 @@ fn fence(map: &FidMap, event: &RawFanotifyEvent, exclusions: &[PathBuf]) -> Opti
 /// together decide "reported" by the SAME [`super::excluded`] predicate everything else
 /// uses. An object the map holds at an EXCLUDED path (a state the walk fence makes
 /// unreachable) is correctly not reported, so a self-event on it still drops clean.
-fn affects_reported_object(map: &FidMap, event: &RawFanotifyEvent, exclusions: &[PathBuf]) -> bool {
+fn affects_reported_object(map: &FidMap, event: &RawFanotifyEvent, fence: Fence<'_>) -> bool {
   affected_object_fids(event).any(|fid| {
     map.contains(fid)
       && map
         .resolve_path(fid)
-        .is_some_and(|path| !super::excluded(exclusions, &path))
+        // Every object the map holds is a DIRECTORY (files never enter it), so the
+        // prune half is asked on its own name as well as its ancestors'.
+        .is_some_and(|path| !fence.fences(true, &path))
   })
 }
 
@@ -547,18 +617,24 @@ fn affected_object_fids(event: &RawFanotifyEvent) -> impl Iterator<Item = &Fid> 
 /// moved directory is forgotten rather than re-parented or walked in. The same is true
 /// of a move that merely STRADDLES an exclusion — both endpoints reportable, but an
 /// exclusion beneath one of them, so the moved subtree's own descendants change sides
-/// ([`exclusion_geometry_changed`]) — which is a map question, not a suppression one:
+/// ([`fence_geometry_changed`]) — which is a map question, not a suppression one:
 /// the pair is reported either way, and the subtree is relearned and re-walked there.
 ///
 /// The ROOT'S OWN DEATH is exempted by the caller ([`fence`] consults
 /// [`reports_root_death`] before ever asking this): an exclusion covering the watched
 /// root — a caller excluding the very tree it asked to watch — would otherwise silence
 /// the one record that says the watch is over.
-fn names_no_reported_path(map: &FidMap, event: &RawFanotifyEvent, exclusions: &[PathBuf]) -> bool {
-  let excluded = |path: &Path| super::excluded(exclusions, path);
+fn names_no_reported_path(map: &FidMap, event: &RawFanotifyEvent, fence: Fence<'_>) -> bool {
+  // The event's own proof of its object's class — `FAN_ONDIR` is set exactly when the
+  // object the event is about is a directory — which is the prune half's question and
+  // the exclusion half ignores. Without it a file named like a pruned directory would
+  // be suppressed here while the core's fence delivers it, and the two would disagree
+  // about the same object.
+  let directory = event.mask.ondir();
+  let fenced = |path: &Path| fence.fences(directory, path);
   if let Some(rename) = &event.rename {
     let reported = |dir: &Fid, name: &[u8]| {
-      rename_end(map.resolve_path(dir).as_deref(), name, exclusions).is_reported()
+      rename_end(map.resolve_path(dir).as_deref(), name, fence, directory).is_reported()
     };
     return !reported(&rename.old_dir, &rename.old_name)
       && !reported(&rename.new_dir, &rename.new_name);
@@ -569,7 +645,7 @@ fn names_no_reported_path(map: &FidMap, event: &RawFanotifyEvent, exclusions: &[
       .dir_fid
       .as_ref()
       .and_then(|dir| map.resolve_path(dir))
-      .is_some_and(|dir| excluded(&join_name(&dir, name))),
+      .is_some_and(|dir| fenced(&join_name(&dir, name))),
     // A name-less event addresses its OWN object, `dir_fid` first — the same self-FID
     // [`classify_nameless`] resolves.
     None => event
@@ -577,7 +653,7 @@ fn names_no_reported_path(map: &FidMap, event: &RawFanotifyEvent, exclusions: &[
       .as_ref()
       .or(event.target_fid.as_ref())
       .and_then(|fid| map.resolve_path(fid))
-      .is_some_and(|path| excluded(&path)),
+      .is_some_and(|path| fenced(&path)),
   }
 }
 
@@ -623,12 +699,12 @@ impl RenameEnd {
 /// act — so the resolution is the caller's and only the CLASSIFICATION lives here. That
 /// keeps one rule for what "reported" means across both, and it is the shared
 /// [`super::excluded`] predicate doing the matching, never a second one.
-fn rename_end(dir: Option<&Path>, name: &[u8], exclusions: &[PathBuf]) -> RenameEnd {
+fn rename_end(dir: Option<&Path>, name: &[u8], fence: Fence<'_>, directory: bool) -> RenameEnd {
   let Some(dir) = dir else {
     return RenameEnd::Outside;
   };
   let path = join_name(dir, name);
-  if super::excluded(exclusions, &path) {
+  if fence.fences(directory, &path) {
     RenameEnd::Excluded
   } else {
     RenameEnd::Reported(path)
@@ -989,7 +1065,7 @@ fn root_death_mask(mask: FanMask) -> Option<FanMask> {
 ///   if a later in-root rename in the same batch re-parents the node first.
 /// - **re-parent across a change in exclusion geometry** (moved dir known,
 ///   destination in-root, an exclusion beneath EITHER endpoint —
-///   [`exclusion_geometry_changed`]): the carried-across descendants are no longer the
+///   [`fence_geometry_changed`]): the carried-across descendants are no longer the
 ///   set the fence describes, so the node is `forget`-ten and relearned as a move-in
 ///   top and the subtree is walked in afresh under the destination's geometry. This is
 ///   the ONE re-parent that owes a walk; see the helper for why both directions of the
@@ -1024,7 +1100,7 @@ fn classify_rename(
   event: &RawFanotifyEvent,
   rename: &RenameInfo,
   memo: &mut MemoBatch,
-  exclusions: &[PathBuf],
+  fence: Fence<'_>,
 ) -> Admission {
   let old_dir = memo.admit(map, &rename.old_dir);
   let new_dir = memo.admit(map, &rename.new_dir);
@@ -1074,7 +1150,7 @@ fn classify_rename(
     // the caller asked not to hear about (and whose later creates would then grow the
     // map against the cap). The reported arm carries the destination PATH, which is what
     // lets the geometry test below name the tree the subtree is landing in.
-    let destination = match rename_end(new_dir.as_deref(), &rename.new_name, exclusions) {
+    let destination = match rename_end(new_dir.as_deref(), &rename.new_name, fence, true) {
       RenameEnd::Reported(destination) => Some(destination),
       RenameEnd::Excluded | RenameEnd::Outside => None,
     };
@@ -1082,7 +1158,7 @@ fn classify_rename(
       // Destination in-root and reported. Whether the moved object was ALREADY a known
       // in-root directory (its descendants already mapped) splits the flavors — read it
       // BEFORE `learn` overwrites the node.
-      if map.contains(moved) && !exclusion_geometry_changed(map, moved, &destination, exclusions) {
+      if map.contains(moved) && !fence_geometry_changed(map, moved, &destination, fence) {
         // In-root re-parent: `learn` overwrites the node in place, and its
         // already-mapped descendants follow via the updated parent link — no walk. Sound
         // ONLY because the descendants the map holds are still exactly the descendants
@@ -1165,20 +1241,29 @@ fn classify_rename(
 /// A `moved` whose ancestry no longer reaches the root has no old path to compare
 /// against and answers `true`: relearning it as a move-in top rebuilds the subtree from
 /// the destination rather than re-parenting an orphan.
-fn exclusion_geometry_changed(
-  map: &FidMap,
-  moved: &Fid,
-  destination: &Path,
-  exclusions: &[PathBuf],
-) -> bool {
-  if exclusions.is_empty() {
+fn fence_geometry_changed(map: &FidMap, moved: &Fid, destination: &Path, fence: Fence<'_>) -> bool {
+  if fence.unengaged() {
     return false;
   }
   let Some(source) = map.resolve_path(moved) else {
     return true;
   };
+  // The PRUNE half cannot be answered the exclusion half's way. A prune pattern is
+  // a glob over the ROOT-RELATIVE path, so which descendants of a subtree it covers
+  // is a function of the whole path — there is no finite set of "relevant patterns"
+  // to run the containment against, and a rename rewrites that path by definition.
+  // So an engaged prune seat answers `true` for every mapped-directory re-parent: the
+  // subtree is relearned and re-walked through the fence, which is the only way to
+  // get a map that agrees with the seat at the destination. The cost is one bounded
+  // subtree walk per directory rename on a pruned kernel-recursive root, and it buys
+  // the invariant the seat is documented on — a pruned subtree is never mapped, and a
+  // revealed one is never left blind.
+  if !fence.prune.is_empty() {
+    return true;
+  }
   let endpoints = [source, destination.to_path_buf()];
-  exclusions
+  fence
+    .exclusions
     .iter()
     .any(|exclusion| super::excluded(&endpoints, exclusion))
 }

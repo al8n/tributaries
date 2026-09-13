@@ -625,6 +625,16 @@ impl<R> Source<OsString> for FsSource<R> {
     Some(SourceEvent::from_fs(&raw))
   }
 
+  /// The fs binding's make-before-break retarget.
+  ///
+  /// It carries the seam's re-basing clause literally, because
+  /// [`Watcher::replace_root`](tributary_fs::Watcher::replace_root) does: the scope keeps the
+  /// [`RootOptions`](tributary_fs::RootOptions) it was armed with — its interest and BOTH glob
+  /// seats — and those seats are root-relative, so the same patterns are read against the new
+  /// root. A depth-anchored `prune` therefore names a different directory after the widen, in
+  /// either direction (`replace_root`'s own docs name the over- and under-coverage cases);
+  /// `include` matches the object's name and re-bases unchanged. Nothing here restates a root's
+  /// words — only an [`arm`](Source::arm) does.
   async fn replace(
     &mut self,
     handle: RootHandle,
@@ -689,30 +699,7 @@ impl<R> Source<OsString> for FsSource<R> {
       Ok(path) => Ok(path_components(&path)),
       // The umbrella never retries `sync_root` at this level, so a returned
       // admission is dropped; the mapping is over the carried `error`.
-      Err(SyncRootDenied { error, .. }) => Err(match error {
-        SyncRootError::UnknownRoot | SyncRootError::Retired => SyncError::Retired,
-        SyncRootError::DirOutsideRoot { .. } => SyncError::CookieDirUncovered,
-        SyncRootError::Write { source, .. } => {
-          let kind = match source.kind() {
-            std::io::ErrorKind::NotFound => FaultKind::NotFound,
-            std::io::ErrorKind::PermissionDenied => FaultKind::PermissionDenied,
-            _ => FaultKind::Other,
-          };
-          SyncError::CookieWrite(SourceFault::new(kind).with_source(source))
-        }
-        // A second sync raced one already in flight for this root: no physical write happened, and it
-        // is a transient, retryable refusal — surfaced as the dedicated `Busy` rather than a
-        // write-failure the caller might read as terminal.
-        SyncRootError::WriteInFlight => SyncError::Busy,
-        // The root's cookie cleanup is backlogged (too many unremoved cookies —
-        // a failing unlink the driver is retrying). No physical write happened;
-        // it is transient and retryable, the same shape as `WriteInFlight`.
-        SyncRootError::CleanupBacklog => SyncError::Busy,
-        SyncRootError::Closed => SyncError::Closed,
-        // The fs error type is `#[non_exhaustive]`: a variant added later is a
-        // failed write until it is classified here, never a silent success.
-        _ => SyncError::CookieWrite(SourceFault::new(FaultKind::Other)),
-      }),
+      Err(SyncRootDenied { error, .. }) => Err(sync_error_from_fs(error)),
     }
   }
 
@@ -942,10 +929,72 @@ fn watch_error_from_fs(err: WatchRootError) -> WatchError {
     // failed-widen unwind reads that difference to decide whether to RETIRE established roots.
     // The sync seam already draws the same line (`SyncRootError::CleanupBacklog` → `Busy`).
     WatchRootError::CleanupBacklog => FaultKind::Capacity,
+    // A CALLER-CONFIGURATION refusal, and deliberately the unclassified kind. The watcher
+    // refused the per-root household before any coverage existed — a seat carrying more glob
+    // patterns than it bounds — so nothing was watched, nothing was lost, and the fix is the
+    // caller's own words rather than anything about the source. None of the classified kinds
+    // says that: `Capacity` is the one kind the umbrella RETRIES, and re-offering a household
+    // the watcher will refuse identically forever would spin; `Unsupported` is read as a verdict
+    // on the platform, which a caller answers by abandoning watching altogether. `Other` keeps
+    // the concrete `WatchRootError::InvalidOptions` (with the typed `OptionsError` behind it)
+    // recoverable through `WatchError::as_fs`, which is exactly where the seat and its ceiling
+    // are named. The arm is explicit so the classification is a decision, not the catch-all's
+    // leftovers.
+    WatchRootError::InvalidOptions(_) => FaultKind::Other,
     WatchRootError::Closed => return WatchError::Closed,
     _ => FaultKind::Other,
   };
   WatchError::source(SourceFault::new(kind).with_source(err))
+}
+
+/// Classifies a refused sync-cookie write into the neutral barrier vocabulary — the third of
+/// this binding's seam mappings, beside [`watch_error_from_fs`] and
+/// [`replace_error_to_watch_error`], and standalone for the same reason they are: the
+/// classification is the contract, so it is asserted directly rather than through a barrier that
+/// has to be provoked.
+///
+/// The line it draws is between a barrier that FAILED and one that could never have been met:
+///
+/// - **the cookie directory is not covered** — outside the root, under a watcher exclusion, or
+///   under this root's own `prune` seat. All three are refused before any write, and all three
+///   mean the same thing to the caller: a cookie written there would produce no event on this
+///   subscription's stream, so the barrier would wait for something that cannot arrive. The
+///   glob-shaped one ([`DirPruned`](SyncRootError::DirPruned)) is the newest of the three and no
+///   different in kind — reported as a write failure it read as "your filesystem refused this",
+///   which is neither true nor actionable.
+/// - **transient** ([`Busy`](SyncError::Busy)) — a write already in flight for this root, or a
+///   cookie-cleanup backlog. Nothing was written; ask again.
+/// - **a genuine write failure**, carrying the concrete `io::Error` behind an honest
+///   [`FaultKind`] (a read-only tree is `PermissionDenied`).
+///
+/// The fs error type is `#[non_exhaustive]`, and the wildcard is deliberately the FAILED-write
+/// arm: a variant added later is a refused barrier until it is classified here, never a silent
+/// success.
+fn sync_error_from_fs(error: SyncRootError) -> SyncError {
+  match error {
+    SyncRootError::UnknownRoot | SyncRootError::Retired => SyncError::Retired,
+    SyncRootError::DirOutsideRoot { .. }
+    | SyncRootError::DirExcluded { .. }
+    | SyncRootError::DirPruned { .. } => SyncError::CookieDirUncovered,
+    SyncRootError::Write { source, .. } => {
+      let kind = match source.kind() {
+        std::io::ErrorKind::NotFound => FaultKind::NotFound,
+        std::io::ErrorKind::PermissionDenied => FaultKind::PermissionDenied,
+        _ => FaultKind::Other,
+      };
+      SyncError::CookieWrite(SourceFault::new(kind).with_source(source))
+    }
+    // A second sync raced one already in flight for this root: no physical write happened, and it
+    // is a transient, retryable refusal — surfaced as the dedicated `Busy` rather than a
+    // write-failure the caller might read as terminal.
+    SyncRootError::WriteInFlight => SyncError::Busy,
+    // The root's cookie cleanup is backlogged (too many unremoved cookies —
+    // a failing unlink the driver is retrying). No physical write happened;
+    // it is transient and retryable, the same shape as `WriteInFlight`.
+    SyncRootError::CleanupBacklog => SyncError::Busy,
+    SyncRootError::Closed => SyncError::Closed,
+    _ => SyncError::CookieWrite(SourceFault::new(FaultKind::Other)),
+  }
 }
 
 /// Classifies a failed in-place root replacement into the neutral vocabulary.

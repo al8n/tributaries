@@ -3,7 +3,7 @@ use std::{
   ffi::OsString,
   io,
   marker::PhantomData,
-  num::NonZeroU64,
+  num::{NonZeroU64, NonZeroUsize},
   path::{Path, PathBuf},
   time::Duration,
 };
@@ -1843,6 +1843,252 @@ async fn widen_falls_back_to_release_and_rearm_without_replace_support() {
       Call::Arm(PathBuf::from("/a")),
     ],
     "without in-place support the widen still releases and re-arms"
+  );
+}
+
+/// One validated pattern for the per-root-words cells.
+fn glob(pattern: &str) -> tributary_proto::glob::Glob {
+  pattern.parse().expect("a valid pattern compiles")
+}
+
+/// The patterns a seat carries, as their source text — what a cell can compare against a literal
+/// list.
+fn texts(patterns: &[tributary_proto::glob::Glob]) -> Vec<&str> {
+  patterns
+    .iter()
+    .map(tributary_proto::glob::Glob::as_str)
+    .collect()
+}
+
+/// The per-watch options carrying just the `prune` seat — the smallest engaged words a cell can
+/// put on a root.
+fn pruning(pattern: &str) -> WatchOptions<OsString> {
+  WatchOptions::new().with_prune([glob(pattern)])
+}
+
+/// The per-watch options carrying just the `include` seat — the ANCHOR-FREE half, which matches
+/// an object's name and so means the same thing under every root.
+fn including(pattern: &str) -> WatchOptions<OsString> {
+  WatchOptions::new().with_include([glob(pattern)])
+}
+
+/// ONE ROOT, ONE SET OF WORDS, on the covered path: a newcomer an existing root would serve arms
+/// nothing of its own, so seats that differ from that root's cannot be honoured — the watch is
+/// REFUSED instead of being quietly served under the root's words.
+///
+/// The reading that matters is what the source was asked to do about it: nothing. The refusal is
+/// the planner's, taken off the root record, so the ledger holds exactly the covering root's own
+/// arm and the cohort is untouched — a caller can retry with matching words against state that
+/// never moved.
+#[tokio::test]
+async fn a_covered_watch_whose_words_conflict_is_refused_with_no_source_call() {
+  let mut h = Harness::new();
+
+  let covering = h
+    .watch_with("/a", pruning("**/node_modules"))
+    .await
+    .expect("watch /a under its own words");
+
+  // The newcomer asks for the UNENGAGED words, which are a different request rather than no
+  // request at all.
+  let refused = h
+    .watch_with("/a/b", WatchOptions::new())
+    .await
+    .expect_err("a covered newcomer under different words is refused");
+  assert!(
+    refused.is_root_words_conflict(),
+    "the refusal is the typed one: {refused:?}"
+  );
+  assert!(
+    refused.fault().is_none(),
+    "it is the umbrella's own verdict, not a source fault"
+  );
+  match &refused {
+    WatchError::RootWordsConflict {
+      root_depth,
+      armed,
+      requested,
+      reason,
+    } => {
+      assert_eq!(*root_depth, key("/a").len());
+      assert_eq!(texts(armed.prune()), ["**/node_modules"]);
+      assert!(requested.is_unengaged(), "and what this watch asked for");
+      assert_eq!(
+        *reason,
+        crate::WordsConflict::Differ,
+        "the TEXT is what conflicts here"
+      );
+    }
+    other => panic!("expected RootWordsConflict, got {other:?}"),
+  }
+  // The Display NAMES the root it conflicts with — by the depth of that root's own key, the one
+  // coordinate this layer can render for a caller-typed component.
+  assert!(
+    refused
+      .to_string()
+      .contains(&format!("{} key component", key("/a").len())),
+    "the message names the conflicting root: {refused}"
+  );
+
+  assert_eq!(
+    h.owner.source.calls(),
+    vec![Call::Arm(PathBuf::from("/a"))],
+    "the refused watch asked the source for nothing at all"
+  );
+  assert_eq!(
+    h.owner.subsumer.subscribers(1),
+    vec![covering],
+    "and joined nobody's cohort"
+  );
+  assert_eq!(
+    h.owner.subsumer.pending_len(),
+    0,
+    "no reservation was minted for the refusal to abort"
+  );
+}
+
+/// The same rule on the WIDEN path, with several subsumed roots — and the property the whole
+/// placement of this check exists for: the refusal lands BEFORE any disarm. The wider watch would
+/// have released both subsumed roots and re-pointed their subscribers onto its own words; refused
+/// in the planner, it releases nothing, so no coverage gap is opened and nobody is owed a `Rescan`.
+///
+/// The disagreeing root is the SECOND one, so this also pins that the planner reads every root it
+/// would subsume rather than the first.
+#[tokio::test]
+async fn a_widen_whose_words_conflict_is_refused_before_any_disarm() {
+  let mut h = Harness::new();
+
+  let s_b = h
+    .watch_with("/a/b", pruning("**/skip"))
+    .await
+    .expect("watch /a/b");
+  let s_c = h
+    .watch_with("/a/c", WatchOptions::new())
+    .await
+    .expect("watch /a/c");
+
+  let refused = h
+    .watch_with("/a", pruning("**/skip"))
+    .await
+    .expect_err("a widen over a root armed with other words is refused");
+  assert!(
+    refused.is_root_words_conflict(),
+    "the typed refusal: {refused:?}"
+  );
+
+  assert_eq!(
+    h.owner.source.calls(),
+    vec![
+      Call::Arm(PathBuf::from("/a/b")),
+      Call::Arm(PathBuf::from("/a/c")),
+    ],
+    "not one disarm and not one wider arm: the refusal precedes every teardown"
+  );
+  let roots: Vec<PathBuf> = h
+    .owner
+    .subsumer
+    .roots()
+    .map(|(k, _)| PathBuf::from_iter(k))
+    .collect();
+  assert_eq!(
+    roots,
+    vec![PathBuf::from("/a/b"), PathBuf::from("/a/c")],
+    "both subsumed roots are still live"
+  );
+  assert_eq!(h.owner.subsumer.subscribers(1), vec![s_b]);
+  assert_eq!(h.owner.subsumer.subscribers(2), vec![s_c]);
+  assert!(
+    h.drain().is_empty(),
+    "a refused widen owes no subscriber a Rescan"
+  );
+}
+
+/// And on the GAPLESS widen — the sole-subsumed-root path that would retarget the source's own
+/// root in place. `Source::replace` re-keys a watch, it does not re-configure it, so a retarget
+/// under words the newcomer did not write for THAT root would leave the newcomer riding seats it
+/// never asked for, with the handle preserved and nothing to fall back to. The planner refuses
+/// first, so the retarget is never issued.
+///
+/// Both refusals are here because they are the same seam: differing text, and equal text whose
+/// ANCHOR the retarget would move — a `prune` is matched root-relative, and `replace` re-bases
+/// it onto the wider key. The `include`-only widen that still succeeds is what keeps the two
+/// refusals verdicts on the WORDS rather than on the path.
+#[tokio::test]
+async fn a_conflicting_in_place_widen_is_refused_before_the_retarget() {
+  let mut h = Harness::new();
+  h.owner.source.supports_replace = true;
+
+  let s_narrow = h
+    .watch_with("/a/b", pruning("**/skip"))
+    .await
+    .expect("watch /a/b");
+
+  let refused = h
+    .watch_with("/a", pruning("**/other"))
+    .await
+    .expect_err("the in-place widen is refused on the words, not attempted and rolled back");
+  assert!(
+    refused.is_root_words_conflict(),
+    "the typed refusal: {refused:?}"
+  );
+
+  // EQUAL text, and still refused: the retarget re-bases the seat onto `/a`, where `**/skip`
+  // is a different instruction than it was under `/a/b`.
+  let refused = h
+    .watch_with("/a", pruning("**/skip"))
+    .await
+    .expect_err("an equal-worded PRUNE widen moves the anchor, so it is refused too");
+  match &refused {
+    WatchError::RootWordsConflict { reason, .. } => assert_eq!(
+      *reason,
+      crate::WordsConflict::Anchored,
+      "the text is equal — the anchor is what conflicts"
+    ),
+    other => panic!("expected RootWordsConflict, got {other:?}"),
+  }
+  assert_eq!(
+    h.owner.source.calls(),
+    vec![Call::Arm(PathBuf::from("/a/b"))],
+    "no Replace was issued for either refusal — the root keeps its key and its words"
+  );
+  assert_eq!(
+    h.owner.subsumer.subscribers(1),
+    vec![s_narrow],
+    "and its cohort is untouched"
+  );
+
+  // An `include`-only household carries no anchor, so an equal-worded widen over one DOES
+  // retarget in place — the gapless path is intact for the seat it is safe for.
+  let mut h = Harness::new();
+  h.owner.source.supports_replace = true;
+  let s_narrow = h
+    .watch_with("/a/b", including("*.mp4"))
+    .await
+    .expect("watch /a/b");
+  let s_wide = h
+    .watch_with("/a", including("*.mp4"))
+    .await
+    .expect("an equal-worded include-only widen still retargets in place");
+  assert_eq!(
+    h.owner.source.calls(),
+    vec![
+      Call::Arm(PathBuf::from("/a/b")),
+      Call::Replace(1, PathBuf::from("/a")),
+    ],
+    "the gapless retarget is unaffected by the check that precedes it"
+  );
+  assert_eq!(
+    h.owner.subsumer.subscribers(1),
+    vec![s_narrow, s_wide],
+    "both subscriptions ride the retargeted root"
+  );
+  assert_eq!(
+    h.owner
+      .subsumer
+      .root_globs(1)
+      .map(|g| texts(g.include().unwrap_or_default())),
+    Some(vec!["*.mp4"]),
+    "under the words they both carry"
   );
 }
 
@@ -5886,7 +6132,8 @@ async fn watch_admission_backpressures_when_the_mailbox_is_full() {
       gate: gate_rx,
     },
     TributariesOptions::new().with_command_capacity(std::num::NonZeroUsize::new(1).unwrap()),
-  );
+  )
+  .expect("the default capacities are in range");
 
   // Watch 1 is consumed by the owner, which parks inside the gated arm. Watch 2 then
   // fills the capacity-1 mailbox. Watch 3's submission must AWAIT admission.
@@ -5956,7 +6203,8 @@ async fn parts_future_drives_the_watcher_when_caller_spawned() {
   }
 
   let (w, driver): (super::Tributaries<OsString, (), TokioRuntime, u32>, _) =
-    super::Tributaries::parts(AliveSource(FakeSource::new()), TributariesOptions::new());
+    super::Tributaries::parts(AliveSource(FakeSource::new()), TributariesOptions::new())
+      .expect("the default capacities are in range");
   let driver = tokio::spawn(driver);
 
   let sub = w
@@ -5974,13 +6222,51 @@ async fn parts_future_drives_the_watcher_when_caller_spawned() {
     .expect("driver task");
 }
 
+/// A capacity no channel could ever be allocated at is REFUSED at construction, on
+/// every path and before anything is allocated or spawned.
+///
+/// The channels are opened eagerly with one slot per item, so `usize::MAX` is not a
+/// generous buffer but an allocation-size overflow — a panic raised deep inside the
+/// channel, where no caller can read it. The verdict belongs at the door instead, and
+/// the door is every constructor: the spawning one, the caller-spawned one, and the
+/// thread-local one all funnel through the same check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_out_of_range_capacity_is_refused_at_every_construction_path() {
+  type Watcher = super::Tributaries<OsString, (), TokioRuntime, u32>;
+
+  let event = TributariesOptions::new().with_event_capacity(NonZeroUsize::MAX);
+  let command = TributariesOptions::new().with_command_capacity(NonZeroUsize::MAX);
+
+  let Err(err) = Watcher::parts(FakeSource::new(), event.clone()) else {
+    panic!("the caller-spawned path refuses an unallocatable event channel")
+  };
+  assert!(err.is_event_capacity_too_large(), "got {err:?}");
+
+  let Err(err) = Watcher::with_source(FakeSource::new(), event) else {
+    panic!("the spawning path refuses it too")
+  };
+  assert!(err.is_event_capacity_too_large(), "got {err:?}");
+
+  let Err(err) = Watcher::parts_local(FakeSource::new(), command) else {
+    panic!("the thread-local path refuses an unallocatable mailbox")
+  };
+  assert!(err.is_command_capacity_too_large(), "got {err:?}");
+
+  // And the ordinary household still builds, through the same check.
+  let (w, driver) = Watcher::parts(FakeSource::new(), TributariesOptions::new())
+    .expect("the default capacities are in range");
+  drop(driver);
+  drop(w);
+}
+
 /// `parts()` caveat two, pinned: DROPPING the un-spawned driver future is hard
 /// teardown — the owner's drop publishes an empty read plane and closes every channel,
 /// so calls surface Closed/Stopped rather than hanging.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropping_the_parts_future_is_hard_teardown() {
   let (mut w, driver): (super::Tributaries<OsString, (), TokioRuntime, u32>, _) =
-    super::Tributaries::parts(FakeSource::new(), TributariesOptions::new());
+    super::Tributaries::parts(FakeSource::new(), TributariesOptions::new())
+      .expect("the default capacities are in range");
   drop(driver);
 
   let err = w
@@ -6061,7 +6347,8 @@ async fn dropping_the_parts_future_mid_arm_drops_the_source_for_reclamation() {
         dropped: std::sync::Arc::clone(&dropped),
       },
       TributariesOptions::new(),
-    );
+    )
+    .expect("the default capacities are in range");
   let driver = tokio::spawn(driver);
 
   // Submit a watch and wait until the owner is provably INSIDE the gated arm.
@@ -6162,7 +6449,8 @@ async fn dropping_the_parts_future_mid_grow_drops_the_source_for_reclamation() {
         dropped: std::sync::Arc::clone(&dropped),
       },
       TributariesOptions::new(),
-    );
+    )
+    .expect("the default capacities are in range");
   let driver = tokio::spawn(driver);
 
   // Build the covered-outside state through the real loop: /a/b, widen /a, unwatch the widening
@@ -6274,7 +6562,8 @@ async fn parts_local_drives_a_thread_local_source_end_to_end() {
     events: event_rx,
   };
   let (mut w, driver): (super::Tributaries<OsString, (), TokioRuntime, u32>, _) =
-    super::Tributaries::parts_local(source, TributariesOptions::new());
+    super::Tributaries::parts_local(source, TributariesOptions::new())
+      .expect("the default capacities are in range");
 
   let local = tokio::task::LocalSet::new();
   local
@@ -8804,7 +9093,8 @@ async fn teardown_publishes_empty_read_plane_so_view_stops_advertising_dead_subs
     drain: drain_rx,
   };
   let mut w: super::Tributaries<OsString, (), TokioRuntime, u32> =
-    super::Tributaries::with_source(source, TributariesOptions::new());
+    super::Tributaries::with_source(source, TributariesOptions::new())
+      .expect("the default capacities are in range");
 
   // A view clone taken WHILE watching — the pre-taken handle the regression is about.
   let view = w.view();
@@ -8838,6 +9128,124 @@ async fn teardown_publishes_empty_read_plane_so_view_stops_advertising_dead_subs
     view.covering(&watched).is_none(),
     "…and attribution resolves to nothing (the owner + source are gone)"
   );
+}
+
+/// Regression (the seat ceiling is enforced BEFORE arming): a watch whose per-root glob
+/// seat carries more patterns than [`WatchOptions::MAX_SEAT_PATTERNS`] is refused by
+/// [`Tributaries::watch`](super::Tributaries::watch) itself, with the typed verdict, and
+/// the source is never entered at all.
+///
+/// The seats are not a delivery gate this crate applies: they are handed to
+/// [`Source::arm`] as the words the root is armed with, and asked by the source once per
+/// candidate for as long as the root lives. So a length nobody checked is per-event work
+/// a caller writes and a source pays — which is why the refusal has to stand ahead of the
+/// arm rather than inside whatever the source chooses to do with the words.
+///
+/// The counters are the proof it stands EARLY: not one `canonicalize_key` and not one
+/// `arm`, so the request never even reached the owner. A watch AT the ceiling still
+/// commits, so the cell pins the boundary rather than merely "large is refused".
+#[tokio::test]
+async fn an_over_full_seat_is_refused_before_the_source_is_entered() {
+  #[derive(Clone, Default)]
+  struct Counts {
+    canonicalizations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    arms: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+  }
+
+  fn bump(counter: &std::sync::atomic::AtomicUsize) {
+    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+  }
+
+  fn read(counter: &std::sync::atomic::AtomicUsize) -> usize {
+    counter.load(std::sync::atomic::Ordering::Relaxed)
+  }
+
+  /// A [`DrainableSource`] that records every entry into the two calls a watch makes
+  /// on it.
+  struct CountingSource {
+    inner: DrainableSource,
+    counts: Counts,
+  }
+
+  impl Source<OsString> for CountingSource {
+    type Handle = u32;
+
+    fn canonicalize_key(&self, key: &[OsString]) -> Result<Vec<OsString>, WatchError> {
+      bump(&self.counts.canonicalizations);
+      self.inner.canonicalize_key(key)
+    }
+
+    async fn arm(
+      &mut self,
+      key: &[OsString],
+      globs: &RootGlobs,
+    ) -> Result<Armed<OsString, u32>, WatchError> {
+      bump(&self.counts.arms);
+      self.inner.arm(key, globs).await
+    }
+
+    fn disarm(&mut self, handle: u32) {
+      self.inner.disarm(handle);
+    }
+
+    async fn next(&mut self) -> Option<SourceEvent<OsString, u32>> {
+      self.inner.next().await
+    }
+
+    fn root_key(&self, handle: u32) -> Option<Vec<OsString>> {
+      self.inner.root_key(handle)
+    }
+  }
+
+  let counts = Counts::default();
+  let (_drain_tx, drain_rx) = async_channel::bounded::<std::convert::Infallible>(1);
+  let source = CountingSource {
+    inner: DrainableSource {
+      next_handle: 0,
+      live: HashMap::new(),
+      drain: drain_rx,
+    },
+    counts: counts.clone(),
+  };
+  let w: super::Tributaries<OsString, (), TokioRuntime, u32> =
+    super::Tributaries::with_source(source, TributariesOptions::new())
+      .expect("the default capacities are in range");
+
+  let cap = WatchOptions::<OsString>::MAX_SEAT_PATTERNS;
+  let words = |count: usize| (0..count).map(|n| glob(&std::format!("**/w{n}")));
+
+  for options in [
+    WatchOptions::new().with_prune(words(cap + 1)),
+    WatchOptions::new().with_include(words(cap + 1)),
+  ] {
+    let err = w
+      .watch(key("/a"), (), options)
+      .await
+      .expect_err("a seat past the ceiling is refused");
+    assert!(err.is_invalid_options(), "the typed verdict: {err}");
+    let refused = err.options().expect("it carries the options verdict");
+    assert!(
+      refused.is_too_many_prune_patterns() || refused.is_too_many_include_patterns(),
+      "…naming the seat: {refused}"
+    );
+    assert_eq!(
+      read(&counts.arms),
+      0,
+      "nothing was armed for a watch refused at the door"
+    );
+    assert_eq!(
+      read(&counts.canonicalizations),
+      0,
+      "…and the source was not entered at all: the request never reached the owner"
+    );
+  }
+
+  // The ceiling itself is not refused: the boundary is exactly one past it.
+  let _sub = w
+    .watch(key("/a"), (), WatchOptions::new().with_prune(words(cap)))
+    .await
+    .expect("a seat AT the ceiling commits");
+  assert_eq!(read(&counts.arms), 1, "and that one did arm");
 }
 
 /// A `u64`-valued [`Owner`] over a [`FakeSource`], with its drainable event stream — the
@@ -16928,7 +17336,8 @@ async fn unpolled_grant_across_source_drain_teardown_is_poisoned() {
     drain: drain_rx,
   };
   let w: super::Tributaries<OsString, (), TokioRuntime, u32> =
-    super::Tributaries::with_source(source, TributariesOptions::new());
+    super::Tributaries::with_source(source, TributariesOptions::new())
+      .expect("the default capacities are in range");
 
   // A hand-built Watch whose reply receiver is HELD UNPOLLED: the owner commits the sub and sends
   // the grant into the slot, where it sits (unclaimed, no Cleanup fired).
@@ -17171,7 +17580,8 @@ async fn parked_rescan_delivers_under_sustained_command_load() {
   let mut w: super::Tributaries<OsString, (), TokioRuntime, u32> = super::Tributaries::with_source(
     source,
     TributariesOptions::new().with_event_capacity(std::num::NonZeroUsize::new(1).expect("nonzero")),
-  );
+  )
+  .expect("the default capacities are in range");
 
   // Two claimed narrow watches, then the widen: two re-point Rescans — one fills bounded(1), the
   // other parks as overflow debt for a CLAIMED subscription.
@@ -17374,7 +17784,8 @@ async fn raw_source_event_delivers_under_sustained_command_load() {
     grows: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
   };
   let mut w: super::Tributaries<OsString, (), TokioRuntime, u32> =
-    super::Tributaries::with_source(source, TributariesOptions::new());
+    super::Tributaries::with_source(source, TributariesOptions::new())
+      .expect("the default capacities are in range");
   let sub = w
     .watch(key("/a"), (), WatchOptions::new())
     .await
@@ -17418,7 +17829,8 @@ async fn valve_pumped_rescan_still_degrades_the_retained_cover() {
     grows: grows.clone(),
   };
   let mut w: super::Tributaries<OsString, (), TokioRuntime, u32> =
-    super::Tributaries::with_source(source, TributariesOptions::new());
+    super::Tributaries::with_source(source, TributariesOptions::new())
+      .expect("the default capacities are in range");
 
   // Narrow the wide /a root to {/a/b}: widen /a over /a/b (handle 2), then prune the widener.
   let s_b = w
@@ -17520,7 +17932,8 @@ async fn due_debounced_event_drains_under_sustained_command_load() {
     .with_quiet_window(Duration::from_millis(20))
     .with_max_hold(Duration::from_millis(100));
   let mut w: super::Tributaries<OsString, (), TokioRuntime, u32> =
-    super::Tributaries::with_source(source, TributariesOptions::new().debounce(cfg));
+    super::Tributaries::with_source(source, TributariesOptions::new().debounce(cfg))
+      .expect("the default capacities are in range");
   let sub = w
     .watch(key("/a"), (), WatchOptions::new())
     .await
@@ -17561,7 +17974,8 @@ async fn close_is_not_starved_by_a_prefilled_command_backlog_and_flood() {
     // The mailbox is BOUNDED; size it to this test's full 500-deep
     // prefill so the close-vs-deepest-possible-backlog shape is preserved.
     TributariesOptions::new().with_command_capacity(std::num::NonZeroUsize::new(500).unwrap()),
-  );
+  )
+  .expect("the default capacities are in range");
 
   // A live claimed subscription, so the owner is genuinely running with real state (the finding's
   // "owner/source kept alive while shutdown is requested").
@@ -18818,7 +19232,8 @@ async fn a_sync_admitted_through_the_dedicated_mailbox_still_resolves() {
     observe: true,
   };
   let w: super::Tributaries<OsString, (), TokioRuntime, u32> =
-    super::Tributaries::with_source(source, TributariesOptions::new());
+    super::Tributaries::with_source(source, TributariesOptions::new())
+      .expect("the default capacities are in range");
   let sub = w
     .watch(key("/a"), (), WatchOptions::new())
     .await
@@ -18847,7 +19262,8 @@ async fn a_sync_times_out_when_never_observed() {
     observe: false,
   };
   let w: super::Tributaries<OsString, (), TokioRuntime, u32> =
-    super::Tributaries::with_source(source, TributariesOptions::new());
+    super::Tributaries::with_source(source, TributariesOptions::new())
+      .expect("the default capacities are in range");
   let sub = w
     .watch(key("/a"), (), WatchOptions::new())
     .await
@@ -18923,7 +19339,8 @@ async fn a_command_flood_does_not_starve_the_sync_mailbox() {
     // A deep BOUNDED mailbox, so the prefill below is a genuinely deep backlog the flood can hold
     // saturated — the shape a starved sync arm would never get out from under.
     TributariesOptions::new().with_command_capacity(std::num::NonZeroUsize::new(500).unwrap()),
-  );
+  )
+  .expect("the default capacities are in range");
   let sub = w
     .watch(key("/a"), (), WatchOptions::new())
     .await
@@ -19048,7 +19465,8 @@ async fn a_timed_out_sync_frees_the_owner_when_the_caller_drops() {
     begin_gate: begin_rx,
   };
   let w: super::Tributaries<OsString, (), TokioRuntime, u32> =
-    super::Tributaries::with_source(source, TributariesOptions::new());
+    super::Tributaries::with_source(source, TributariesOptions::new())
+      .expect("the default capacities are in range");
   let sub = w
     .watch(key("/a"), (), WatchOptions::new())
     .await
@@ -19103,7 +19521,8 @@ async fn a_close_during_a_held_sync_tears_down_promptly() {
     begin_gate: begin_rx,
   };
   let w: super::Tributaries<OsString, (), TokioRuntime, u32> =
-    super::Tributaries::with_source(source, TributariesOptions::new());
+    super::Tributaries::with_source(source, TributariesOptions::new())
+      .expect("the default capacities are in range");
   let sub = w
     .watch(key("/a"), (), WatchOptions::new())
     .await
@@ -19225,7 +19644,8 @@ async fn assert_a_held_retarget_does_not_wedge_close(
     replace_calls: 0,
   };
   let w: super::Tributaries<OsString, (), TokioRuntime, u32> =
-    super::Tributaries::with_source(source, TributariesOptions::new());
+    super::Tributaries::with_source(source, TributariesOptions::new())
+      .expect("the default capacities are in range");
   // The SOLE root the widen below subsumes — which is what sends it down the in-place retarget path
   // (`unwatch.as_slice()` matching `[only]`) rather than release-and-rearm.
   w.watch(key("/a/b"), (), WatchOptions::new())
@@ -20977,7 +21397,8 @@ mod reserved_namespace {
       super::super::Tributaries::with_source(
         source,
         TributariesOptions::new().debounce(settle_in_20ms_hold_100ms()),
-      );
+      )
+      .expect("the default capacities are in range");
     let sub = w
       .watch(key("/a"), (), WatchOptions::new())
       .await
@@ -21142,7 +21563,8 @@ mod reserved_namespace {
           stop: worker_stop,
         };
         let mut w: super::super::Tributaries<OsString, (), TokioRuntime, u32> =
-          super::super::Tributaries::with_source(source, TributariesOptions::new());
+          super::super::Tributaries::with_source(source, TributariesOptions::new())
+            .expect("the default capacities are in range");
         let sub = w
           .watch(key("/a"), (), WatchOptions::new())
           .await
@@ -21340,7 +21762,8 @@ mod ownership {
         entered: std::sync::Arc::clone(&entered),
       },
       TributariesOptions::new(),
-    );
+    )
+    .expect("the default capacities are in range");
 
     let watching = {
       let w = w.clone();
@@ -22077,7 +22500,8 @@ mod ownership {
         joined: std::sync::Arc::clone(&joined),
       },
       TributariesOptions::new(),
-    );
+    )
+    .expect("the default capacities are in range");
     w.watch(key("/a"), (), WatchOptions::new())
       .await
       .expect("watch /a");

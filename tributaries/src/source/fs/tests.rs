@@ -73,6 +73,68 @@ fn watch_error_from_fs_classifies_honestly() {
   );
 }
 
+/// A REFUSED per-root household is a caller-configuration verdict, and the seam
+/// classifies it as one deliberately rather than letting it fall through the catch-all.
+///
+/// Nothing was watched and nothing was lost — the layer below refused the words before any
+/// coverage existed — so the two kinds that would mislead are both wrong: `Capacity` is the
+/// one kind the umbrella RETRIES, and a household the watcher refuses identically forever
+/// would spin on it, while `Unsupported` reads as a verdict on the platform, which a caller
+/// answers by abandoning watching altogether. The unclassified kind is the honest one, and
+/// the concrete refusal stays recoverable so the seat and its ceiling can be named.
+#[test]
+fn a_refused_root_household_is_a_configuration_verdict_not_a_retryable_fault() {
+  use tributary_fs::{OptionsError, WatchRootError};
+
+  use crate::error::FaultKind;
+
+  let mapped = super::watch_error_from_fs(WatchRootError::InvalidOptions(
+    OptionsError::TooManyPrunePatterns { supplied: 300 },
+  ));
+  let fault = mapped
+    .fault()
+    .expect("a refused household arrives as a classified arm failure");
+  assert_eq!(fault.kind(), FaultKind::Other);
+  assert!(
+    !fault.kind().is_capacity(),
+    "asking again cannot change a refused household"
+  );
+  assert!(
+    !fault.kind().is_unsupported(),
+    "the platform can watch; these words it cannot"
+  );
+  let concrete = fault
+    .downcast_ref::<WatchRootError>()
+    .expect("the whole fs error is preserved in the box");
+  assert!(
+    concrete.is_invalid_options(),
+    "the typed refusal is what a caller reads to fix its own words"
+  );
+}
+
+/// The pure-fs constructor answers the UMBRELLA's own refusal in its own vocabulary,
+/// and answers it before a native watcher exists: building one starts kernel work, and
+/// a household this constructor will refuse anyway should cost none of it.
+#[cfg(feature = "tokio")]
+#[test]
+fn the_fs_constructor_refuses_an_out_of_range_capacity_before_it_builds_a_watcher() {
+  use core::num::NonZeroUsize;
+
+  use crate::{TributariesOptions, WatcherOptions};
+
+  let Err(err) = crate::TokioTributaries::new(
+    WatcherOptions::new(),
+    TributariesOptions::new().with_event_capacity(NonZeroUsize::MAX),
+  ) else {
+    panic!("a capacity no channel could be allocated at is refused")
+  };
+  assert!(err.is_invalid_options(), "got {err:?}");
+  assert!(
+    err.fault().is_none(),
+    "no source ever saw this household, so it carries no source fault"
+  );
+}
+
 /// The SAME reclassification on the in-place retarget's seam
 /// ([`replace_error_to_watch_error`](super::replace_error_to_watch_error)), which is a separate
 /// mapping over a separate fs error enum. Both are load-bearing and for different reasons: the
@@ -132,6 +194,87 @@ fn replace_error_from_fs_classifies_both_capacity_refusals_as_capacity_refusals(
       .map(crate::error::SourceFault::kind),
     Some(FaultKind::Unsupported),
     "a root that died mid-replace still falls through to release-and-rearm"
+  );
+}
+
+/// The THIRD seam mapping ([`sync_error_from_fs`](super::sync_error_from_fs)): a refused
+/// sync-cookie write classified into the barrier vocabulary.
+///
+/// The line that carries the weight is "the cookie directory is not covered". There are three ways
+/// to be uncovered — outside the root, under a watcher exclusion, or under this ROOT's own `prune`
+/// seat — and they mean one thing to a caller: a cookie written there produces no event on the
+/// stream the barrier waits on, so the barrier could never be met. The glob-shaped one is the
+/// newest, and reaching the wildcard it read as
+/// [`CookieWrite`](crate::error::SyncError::CookieWrite) — "your filesystem refused this" — which
+/// is neither true (nothing was written) nor actionable (no retry and no permission change would
+/// alter it). It is [`CookieDirUncovered`](crate::error::SyncError::CookieDirUncovered) like its
+/// two twins, and the caller's fix is the same: name a cookie directory the seats leave alone.
+///
+/// The transient refusals and the genuine write failure are asserted beside them, because the
+/// value of the classification is the DISTINCTION: a `Busy` is retried, an uncovered directory is
+/// re-chosen, and a `CookieWrite` carries the concrete `io::Error` for a caller to read.
+#[test]
+fn sync_error_from_fs_classifies_a_refused_cookie_honestly() {
+  use std::path::PathBuf;
+
+  use tributary_fs::SyncRootError;
+
+  use crate::error::{FaultKind, SyncError};
+
+  // The three shapes of "that directory could never report the cookie".
+  let uncovered = [
+    SyncRootError::DirOutsideRoot {
+      dir: PathBuf::from("/elsewhere"),
+      root: PathBuf::from("/root"),
+    },
+    SyncRootError::DirExcluded {
+      dir: PathBuf::from("/root/.cache"),
+      exclusion: PathBuf::from("/root/.cache"),
+    },
+    SyncRootError::DirPruned {
+      dir: PathBuf::from("/root/.cache"),
+      pattern: "**/.cache".parse().expect("a valid pattern compiles"),
+    },
+  ];
+  for err in uncovered {
+    let mapped = super::sync_error_from_fs(err);
+    assert!(
+      mapped.is_cookie_dir_uncovered(),
+      "an uncovered cookie directory is never a write failure: {mapped:?}"
+    );
+  }
+
+  // Transient and retryable — nothing was written.
+  assert!(super::sync_error_from_fs(SyncRootError::WriteInFlight).is_busy());
+  assert!(super::sync_error_from_fs(SyncRootError::CleanupBacklog).is_busy());
+  // The subscription's coverage went away underneath the barrier.
+  assert!(super::sync_error_from_fs(SyncRootError::UnknownRoot).is_retired());
+  assert!(super::sync_error_from_fs(SyncRootError::Retired).is_retired());
+  assert!(super::sync_error_from_fs(SyncRootError::Closed).is_closed());
+
+  // A genuine write failure keeps its honest kind AND the concrete error.
+  let write = super::sync_error_from_fs(SyncRootError::Write {
+    path: PathBuf::from("/root/.cookie"),
+    source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+  });
+  match &write {
+    SyncError::CookieWrite(fault) => {
+      assert_eq!(fault.kind(), FaultKind::PermissionDenied);
+      assert!(
+        fault.downcast_ref::<std::io::Error>().is_some(),
+        "the concrete io error survives in the box"
+      );
+    }
+    other => panic!("expected CookieWrite, got {other:?}"),
+  }
+
+  // The `#[non_exhaustive]` wildcard stays the FAILED-write arm: an unclassified refusal is never
+  // read as a barrier that was met.
+  assert!(
+    super::sync_error_from_fs(SyncRootError::BadCookieName {
+      name: String::from("a/b"),
+    })
+    .is_cookie_write()
   );
 }
 
@@ -452,6 +595,17 @@ mod integration {
   /// proves the root's ordered queue has already passed the window they would have
   /// occupied. The grace drain after it is belt-and-suspenders for a backend that
   /// batches on its own timer.
+  ///
+  /// `keep` pre-exists the arm, so its coverage must settle before any of the three
+  /// writes: on a descending backend `arm` resolves once the ROOT's own native stream is
+  /// live, never once the cold crawl has armed a subtree that already existed beneath it,
+  /// so a write issued right after `arm` can land in a window with no kernel record and no
+  /// listing to report it either. The settle probe is a DIRECTORY create rather than a
+  /// file, because `include` narrows FILE delivery to `**/*.mp4` — a plain-named probe
+  /// file is exactly what the seat is meant to silence and would never come back to end
+  /// the retry loop, while a directory change is not subject to `include` at all. `skip`
+  /// needs no such handshake: it is pruned, so nothing under it is ever observed, settled
+  /// or not — that silence is the cell's own point.
   #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
   async fn fs_source_arm_forwards_the_root_globs_to_the_watcher() {
     let (_dir, root) = scratch();
@@ -467,6 +621,29 @@ mod integration {
       .arm(&root_key, &globs)
       .await
       .expect("arm the tempdir under both seats");
+
+    let settled = tokio::time::timeout(DEADLINE, async {
+      let mut attempt = 0u32;
+      loop {
+        let probe = root.join("keep").join(format!("settle-{attempt}"));
+        attempt += 1;
+        std::fs::create_dir(&probe).expect("create the settle probe dir");
+        let seen = wait_for(&mut source, Duration::from_millis(250), |event| {
+          !event.is_rescan()
+            && event.handle() == armed.handle()
+            && key_to_path(event.key()) == probe
+        })
+        .await;
+        if seen.is_some() {
+          return;
+        }
+      }
+    })
+    .await;
+    assert!(
+      settled.is_ok(),
+      "coverage under `keep` never settled: no directory change there came back"
+    );
 
     let silent_kind = root.join("keep").join("notes.txt");
     let pruned = root.join("skip").join("clip.mp4");
@@ -2136,7 +2313,8 @@ mod the_invalid_uid_sentinel {
       trigger,
     };
     let mut w: crate::Tributaries<OsString, (), TokioRuntime, u32> =
-      crate::Tributaries::with_source(source, TributariesOptions::new());
+      crate::Tributaries::with_source(source, TributariesOptions::new())
+        .expect("the default capacities are in range");
     let sub = w
       .watch(key("/r"), (), WatchOptions::new())
       .await

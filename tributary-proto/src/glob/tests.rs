@@ -5,7 +5,7 @@ fn glob(pattern: &str) -> Glob {
 }
 
 fn globs(patterns: &[&str]) -> Globs {
-  Globs::new(patterns.iter().copied().map(glob))
+  Globs::new(patterns.iter().copied().map(glob)).expect("a bounded set compiles")
 }
 
 /// A valid pattern compiles through every constructor, and each keeps the
@@ -85,7 +85,7 @@ fn the_empty_path_never_matches() {
 /// nothing.
 #[test]
 fn an_empty_set_matches_nothing() {
-  let empty = Globs::new(Vec::new());
+  let empty = Globs::new(Vec::new()).expect("an empty set compiles");
   assert!(empty.is_empty());
   assert!(empty.patterns().is_empty());
   assert!(!empty.is_match("anything/at/all"));
@@ -105,8 +105,10 @@ fn a_set_reports_the_patterns_it_was_built_from() {
     std::format!("{set:?}"),
     r#"[Glob("**/node_modules"), Glob("**/.git")]"#
   );
-  let collected: Globs = set.patterns().iter().cloned().collect();
-  assert_eq!(collected.patterns(), set.patterns());
+  // `TryFrom` rather than `collect`: the set's own bound has no infallible
+  // spelling, by design.
+  let rebuilt = Globs::try_from(set.patterns().to_vec()).expect("a bounded set rebuilds");
+  assert_eq!(rebuilt.patterns(), set.patterns());
 }
 
 /// The compiled set is shared, not copied: a clone answers identically without
@@ -180,6 +182,247 @@ fn the_per_pattern_fallback_answers_what_the_union_answers() {
 
   // And the empty set is the empty set on either arm.
   assert!(Globs::each(Vec::new()).is_empty());
+}
+
+/// A SET is bounded too, and the bound lives HERE rather than at a
+/// configuration household above: a direct caller reaches the matcher without
+/// passing any household, and an unbounded set buys `patterns × prefix depth`
+/// automaton passes per event on the arm that could not union.
+///
+/// The refusal names how many were supplied, so a person reading it can act on
+/// it — and the ceiling itself is legal, only the step past it is not.
+#[test]
+fn a_set_past_the_pattern_ceiling_is_a_typed_refusal() {
+  let many = |count: usize| {
+    (0..count)
+      .map(|n| glob(&std::format!("**/w{n}")))
+      .collect::<std::vec::Vec<_>>()
+  };
+
+  let full = Globs::new(many(MAX_SEAT_PATTERNS)).expect("the ceiling itself is honoured");
+  assert_eq!(full.patterns().len(), MAX_SEAT_PATTERNS);
+  assert!(full.is_match("a/w0"));
+
+  let err = Globs::new(many(MAX_SEAT_PATTERNS + 1)).expect_err("one past it is refused");
+  assert_eq!(err.supplied(), MAX_SEAT_PATTERNS + 1);
+  let rendered = err.to_string();
+  assert!(
+    rendered.contains(&std::format!("{}", MAX_SEAT_PATTERNS + 1))
+      && rendered.contains(&std::format!("{MAX_SEAT_PATTERNS}")),
+    "{rendered}"
+  );
+
+  // The `TryFrom` spelling is the same door, and there is no `collect` that
+  // could have walked around it.
+  assert_eq!(
+    Globs::try_from(many(MAX_SEAT_PATTERNS + 1)).unwrap_err(),
+    err
+  );
+
+  // A source that knows its own length reports the TRUE total rather than the
+  // ceiling it stopped reading at.
+  let far_past = Globs::new(many(MAX_SEAT_PATTERNS * 2)).expect_err("well past it is refused too");
+  assert_eq!(far_past.supplied(), MAX_SEAT_PATTERNS * 2);
+}
+
+/// An over-long pattern is a typed refusal, and it is refused BEFORE the
+/// matcher is asked. It parses perfectly — the syntax is a few hundred thousand
+/// single-character wildcards — and every step after this one is priced by its
+/// length, up to and including an automaton the builder would have refused from
+/// a place with no value to report it as.
+///
+/// Every face of this type comes through here, so a configuration file, a
+/// command line, or a programmatic build of such a pattern all refuse the same
+/// way instead of spending the process's memory on it.
+///
+/// Built as a string rather than by looping the compiler: the cell is about ONE
+/// pattern's cost, and the refusal is reached before a single compile.
+#[test]
+fn a_pattern_over_the_length_limit_is_a_typed_refusal() {
+  let huge = "?".repeat(300_000);
+  let err = Glob::new(&huge).expect_err("a pattern past the length limit is refused");
+  // The refusal reports the TRUE length of what it refused, in the message —
+  // it just never pays to copy that much of it into the error value itself.
+  assert!(
+    err.message().contains(&huge.len().to_string()),
+    "the true length is reported: {}",
+    err.message()
+  );
+  assert!(
+    err.pattern().len() <= 64,
+    "only a bounded prefix is stored, not the whole {}-byte input",
+    huge.len()
+  );
+  assert_eq!(
+    err.pattern(),
+    &huge[..err.pattern().len()],
+    "and what is stored is a genuine prefix of the input, not something else"
+  );
+  assert!(!err.message().is_empty());
+  assert!(huge.parse::<Glob>().is_err(), "and through `FromStr`");
+  assert!(Glob::try_from(huge.as_str()).is_err(), "and `TryFrom`");
+
+  // The boundary is where the constant says it is, and nowhere else.
+  assert!(
+    Glob::new(&"?".repeat(MAX_GLOB_LEN)).is_ok(),
+    "the ceiling itself compiles"
+  );
+  assert!(
+    Glob::new(&"?".repeat(MAX_GLOB_LEN + 1)).is_err(),
+    "and one byte past it does not"
+  );
+
+  // Non-vacuity: the size, not the syntax, is what is refused — the same shape
+  // at a sane length compiles and matches.
+  let ok = globs(&[&"?".repeat(4)]);
+  assert!(ok.is_match("abcd"));
+  assert!(!ok.is_match("abc"));
+}
+
+/// Alternation is the vocabulary's only recursive construct, and the matcher
+/// parses and renders it recursively — so a balanced, syntactically PERFECT
+/// pattern of a few thousand nested braces overflows the process stack inside
+/// the builder, before any automaton exists for the size limit to catch. A
+/// caller's configuration value must never be able to end the process, so the
+/// depth is counted in a flat scan first.
+///
+/// Reachable from every face, which is why the refusal lives at the one door
+/// they all come through.
+#[test]
+fn a_pattern_nested_past_the_limit_is_a_typed_refusal() {
+  let nest = |depth: usize| std::format!("{}a{}", "{".repeat(depth), "}".repeat(depth));
+
+  assert!(
+    Glob::new(&nest(MAX_GLOB_NESTING)).is_ok(),
+    "the ceiling itself compiles"
+  );
+  let err = Glob::new(&nest(MAX_GLOB_NESTING + 1)).expect_err("one level past it is refused");
+  assert!(!err.message().is_empty());
+
+  // The shape that motivates the ceiling: balanced, valid, and deep enough to
+  // recurse the parser off the stack. Nothing is compiled — the scan answers
+  // before the matcher is called at all.
+  let deep = nest(50_000);
+  assert!(Glob::new(&deep).is_err(), "and so is anything deeper");
+  assert!(deep.parse::<Glob>().is_err(), "through `FromStr` too");
+
+  // Depth is NESTING, not count: a hundred sibling alternations never nest.
+  assert!(
+    Glob::new(&"{a,b}".repeat(100)).is_ok(),
+    "siblings are not depth"
+  );
+  // And an escaped brace is a literal, exactly as it is to the matcher.
+  assert!(
+    Glob::new(&"\\{".repeat(100)).is_ok(),
+    "an escaped brace opens nothing"
+  );
+}
+
+/// One serialized word means the same ground on every host. The matcher's
+/// default for backslash escapes is the HOST's — escapes on Unix, a path
+/// SEPARATOR on Windows — so `foo\*` would be the literal name `foo*` on one
+/// platform and `foo/*` on the other, and one configuration would subtract
+/// different trees depending on where it was read. Escapes are stated instead,
+/// on every build.
+///
+/// This cell runs on both hosts and asserts the same answers on each.
+#[test]
+fn a_backslash_escapes_on_every_host() {
+  let escaped = globs(&["foo\\*"]);
+  assert!(
+    escaped.is_match("foo*"),
+    "the backslash escapes the wildcard, so the pattern names one literal name"
+  );
+  assert!(
+    !escaped.is_match("foobar"),
+    "it is not a wildcard the escape failed to reach"
+  );
+  assert!(
+    !escaped.is_match("foo/bar"),
+    "and above all it is not a separator: `foo\\*` is not `foo/*`"
+  );
+
+  // The separator spelling this vocabulary actually has still means what it says.
+  let separated = globs(&["foo/*"]);
+  assert!(separated.is_match("foo/bar"));
+  assert!(!separated.is_match("foo*"));
+
+  // A dangling escape has nothing to escape, and enabling escapes is what makes
+  // that a refusal rather than a host-dependent guess.
+  let err = Glob::new("foo\\").expect_err("a trailing backslash is refused");
+  assert_eq!(err.pattern(), "foo\\");
+  assert!(!err.message().is_empty());
+}
+
+/// A `Glob` that exists carries its own compiled matcher, so a [`Globs`] whose
+/// UNION is refused has nothing left to compile — the fallback arm cannot fail
+/// and cannot panic, whatever the caller configured.
+#[test]
+fn the_fallback_arm_compiles_nothing() {
+  let each = Globs::each([glob("**/*.mp4"), glob("**/node_modules")]);
+  assert!(each.is_match("a/b.mp4"));
+  assert!(each.is_match("a/node_modules"));
+  assert!(!each.is_match("a/b.txt"));
+}
+
+/// The two spellings of one name — composed (NFC, what an editor and a JSON
+/// document write) and decomposed (NFD, what HFS+ stores and FSEvents reports) —
+/// are DIFFERENT byte strings, so a seat that compared them raw would silently
+/// match nothing on one of the three supported platforms. Both sides are folded
+/// to NFC, so either spelling of the pattern matches either spelling of the path.
+#[test]
+fn a_pattern_matches_either_spelling_of_a_name() {
+  // "Café.mp4", composed and decomposed.
+  let composed = "Caf\u{e9}.mp4";
+  let decomposed = "Cafe\u{301}.mp4";
+  assert_ne!(composed, decomposed, "staging: the two spellings differ");
+
+  let from_composed = globs(&[&std::format!("**/{composed}")]);
+  assert!(from_composed.is_match(composed));
+  assert!(from_composed.is_match(decomposed));
+  assert!(from_composed.is_match(&std::format!("a/b/{decomposed}")));
+
+  let from_decomposed = globs(&[&std::format!("**/{decomposed}")]);
+  assert!(from_decomposed.is_match(decomposed));
+  assert!(from_decomposed.is_match(composed));
+
+  // And a name that is not the one either pattern names still misses.
+  assert!(!from_composed.is_match("Cafe.mp4"));
+  assert!(!from_decomposed.is_match("Cafe.mp4"));
+}
+
+/// The folding is for MATCHING only: a pattern keeps the caller's own bytes for
+/// `as_str`, `Display`, equality and every format built on them, so a document
+/// round-trips unchanged whichever spelling it was written in.
+#[test]
+fn the_source_text_is_never_normalized() {
+  let decomposed = "**/Cafe\u{301}.mp4";
+  let pattern = glob(decomposed);
+  assert_eq!(pattern.as_str(), decomposed);
+  assert_eq!(pattern.to_string(), decomposed);
+  assert_ne!(
+    pattern,
+    glob("**/Caf\u{e9}.mp4"),
+    "two spellings are two patterns, however identically they match"
+  );
+}
+
+/// The pattern a set matched is nameable, which is what lets a refusal tell a
+/// caller which word closed the door — and it agrees with the plain verdict on
+/// every path, including the empty one.
+#[test]
+fn a_set_names_the_pattern_that_matched() {
+  let set = globs(&["**/node_modules", "**/.git", "a/cache"]);
+  assert_eq!(
+    set.matched("x/node_modules").map(Glob::as_str),
+    Some("**/node_modules")
+  );
+  assert_eq!(set.matched("a/cache").map(Glob::as_str), Some("a/cache"));
+  assert_eq!(set.matched("a/b/cache"), None);
+  for path in ["", "node_modules", "a/cache", "src", "a/b/.git", "cache"] {
+    assert_eq!(set.matched(path).is_some(), set.is_match(path), "{path}");
+  }
+  assert_eq!(Globs::default().matched("anything"), None);
 }
 
 /// The `serde` face: a plain string, in both directions, compiled on the way in.

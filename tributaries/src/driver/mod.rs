@@ -55,7 +55,7 @@ use crate::{
   event::Event,
   filter::{Filter, FilterInput},
   interest::Interest,
-  options::{Debounce, DebounceConfig, RootGlobs, TributariesOptions, WatchOptions},
+  options::{Debounce, DebounceConfig, OptionsError, RootGlobs, TributariesOptions, WatchOptions},
   route::{ReservedEndpoints, RoutableEvent},
   source::{Armed, LocalSource, Source, SourceEvent, SyncOutcome, SyncToken},
   subscription::Subscription,
@@ -407,6 +407,11 @@ impl<C, V, R, H> Clone for Tributaries<C, V, R, H> {
   }
 }
 
+/// What the shared construction body hands back: the caller's handle and the owner
+/// the driver future runs — or the typed refusal it took on the household before it
+/// allocated either.
+type Assembled<C, V, R, S, H> = Result<(Tributaries<C, V, R, H>, Owner<C, V, R, S>), OptionsError>;
+
 impl<C, V, R, H> Tributaries<C, V, R, H>
 where
   C: Ord + Clone + Send + Sync + 'static,
@@ -433,13 +438,22 @@ where
   /// [`parts`](Self::parts) and spawn the returned driver future yourself; for a
   /// thread-local source that cannot promise `Send` futures (a [`LocalSource`]
   /// implementor), use [`parts_local`](Self::parts_local).
-  pub fn with_source<S>(source: S, options: impl Into<TributariesOptions>) -> Self
+  ///
+  /// # Errors
+  ///
+  /// [`OptionsError`] when a capacity in `options` is above its documented ceiling
+  /// — refused before any channel is allocated and before the owner task is
+  /// spawned, so nothing was started to unwind.
+  pub fn with_source<S>(
+    source: S,
+    options: impl Into<TributariesOptions>,
+  ) -> Result<Self, OptionsError>
   where
     S: Source<C, Handle = H> + Send + 'static,
   {
-    let (this, driver) = Self::parts(source, options);
+    let (this, driver) = Self::parts(source, options)?;
     R::spawn_detach(driver);
-    this
+    Ok(this)
   }
 
   /// Builds a watcher over any [`Source`] WITHOUT spawning: returns the handle and the
@@ -481,15 +495,20 @@ where
   /// The returned future is `Send` (pinned by the crate's compile-time owner proofs),
   /// so it is spawnable on both work-stealing and local executors. For a source that
   /// cannot promise `Send` futures at all, use [`parts_local`](Self::parts_local).
+  ///
+  /// # Errors
+  ///
+  /// [`OptionsError`] when a capacity in `options` is above its documented ceiling
+  /// — refused before any channel is allocated.
   pub fn parts<S>(
     source: S,
     options: impl Into<TributariesOptions>,
-  ) -> (Self, impl Future<Output = ()> + Send + 'static)
+  ) -> Result<(Self, impl Future<Output = ()> + Send + 'static), OptionsError>
   where
     S: Source<C, Handle = H> + Send + 'static,
   {
-    let (this, owner) = Self::assemble(source, options.into());
-    (this, run(owner))
+    let (this, owner) = Self::assemble(source, options.into())?;
+    Ok((this, run(owner)))
   }
 
   /// Builds a watcher over a **thread-local** [`LocalSource`] WITHOUT spawning — the
@@ -521,15 +540,20 @@ where
   /// Every [`Source`] is a [`LocalSource`] through the crate's blanket impl, so a `Send`
   /// source constructs here too — but then [`parts`](Self::parts) is strictly more
   /// capable (its driver future can ALSO be polled locally).
+  ///
+  /// # Errors
+  ///
+  /// [`OptionsError`] when a capacity in `options` is above its documented ceiling
+  /// — refused before any channel is allocated.
   pub fn parts_local<S>(
     source: S,
     options: impl Into<TributariesOptions>,
-  ) -> (Self, impl Future<Output = ()> + 'static)
+  ) -> Result<(Self, impl Future<Output = ()> + 'static), OptionsError>
   where
     S: LocalSource<C, Handle = H> + 'static,
   {
-    let (this, owner) = Self::assemble(source, options.into());
-    (this, run(owner))
+    let (this, owner) = Self::assemble(source, options.into())?;
+    Ok((this, run(owner)))
   }
 
   /// The shared construction body of [`parts`](Self::parts) and
@@ -537,10 +561,17 @@ where
   /// constructor wraps [`run`]`(owner)` in its own opaque return type itself, so its
   /// `Send` promise (or [`parts_local`](Self::parts_local)'s deliberate lack of one) is
   /// proven directly against the owner future's hidden type.
-  fn assemble<S>(source: S, options: TributariesOptions) -> (Self, Owner<C, V, R, S>)
+  ///
+  /// The capacities are checked HERE, at the one choke point every constructor
+  /// funnels through, and before the first `bounded` call: each channel is
+  /// allocated eagerly with one slot per item, so an out-of-range capacity would
+  /// otherwise be an allocation-size panic inside the channel instead of a verdict
+  /// the caller can read.
+  fn assemble<S>(source: S, options: TributariesOptions) -> Assembled<C, V, R, S, H>
   where
     S: LocalSource<C, Handle = H>,
   {
+    options.validate()?;
     let (event_capacity, command_capacity, debounce) = options.into_parts();
     let subsumer = Subsumer::new();
     let view = subsumer.view();
@@ -615,7 +646,7 @@ where
       observed_handles: ObservedHandles::new(),
       _rt: PhantomData::<R>,
     };
-    (
+    Ok((
       Self {
         commands: command_tx,
         sync_commands: sync_command_tx,
@@ -626,7 +657,7 @@ where
         _rt: PhantomData,
       },
       owner,
-    )
+    ))
   }
 }
 
@@ -669,7 +700,14 @@ impl<C, V, R, H> Tributaries<C, V, R, H> {
   ///   ([`TributariesOptions::debounce`](crate::TributariesOptions::debounce)):
   ///   [`Debounce::Off`] passes its events through raw even while siblings settle, and
   ///   [`Debounce::Custom`] settles under its own windows even when the global debounce
-  ///   is off.
+  ///   is off;
+  /// - the two glob seats — **[`prune`](WatchOptions::with_prune)** (which subtracts SUBTREES
+  ///   from the watch itself, matched against root-relative directory paths) and
+  ///   **[`include`](WatchOptions::with_include)** (which narrows file delivery, matched against
+  ///   the object's NAME alone) — are not delivery gates of this subscription but the words the
+  ///   ROOT is armed with, and roots are shared. One root carries one set of words: a watch whose
+  ///   seats differ from those of the root that would serve it — or from any root it would subsume
+  ///   — is refused with [`WatchError::RootWordsConflict`], never silently re-scoped.
   ///
   /// # Key canonicalization
   ///
@@ -705,6 +743,11 @@ impl<C, V, R, H> Tributaries<C, V, R, H> {
   /// - [`WatchError::CoverageIncomplete`] when the key is covered by a root whose coverage was
   ///   narrowed and the awaited coverage grow could not be applied — nothing was committed and
   ///   the coverage record did not broaden; retryable;
+  /// - [`WatchError::RootWordsConflict`] when the per-root glob seats differ from those of the
+  ///   root whose coverage this watch would share — refused by the planner, so nothing was
+  ///   armed, disarmed or re-pointed;
+  /// - [`WatchError::InvalidOptions`] when a glob seat carries more patterns than
+  ///   [`WatchOptions::MAX_SEAT_PATTERNS`] — refused here, before the request is even submitted;
   /// - [`WatchError::Closed`] when the owner is gone.
   pub async fn watch(
     &self,
@@ -712,6 +755,17 @@ impl<C, V, R, H> Tributaries<C, V, R, H> {
     value: V,
     options: WatchOptions<C>,
   ) -> Result<Subscription, WatchError> {
+    // THE SEAT CEILING, ahead of the mailbox — the earliest point a watch request exists, and
+    // the last one before the words leave the caller's hands. The two glob seats are not a
+    // delivery gate this crate applies: they are handed to [`Source::arm`] as the words the root
+    // is armed with, and asked by the source once per candidate thereafter. So a length nobody
+    // checked is per-event work a caller writes and a source pays, on a set past the ceiling the
+    // matcher unions at (see [`WatchOptions::MAX_SEAT_PATTERNS`]).
+    //
+    // It is checked HERE rather than in the reconcile because refusing before the submission is
+    // what makes "the source never saw it" true of the whole request: nothing is canonicalized,
+    // nothing is planned, and no command occupies a mailbox slot behind a busy owner.
+    options.validate().map_err(WatchError::InvalidOptions)?;
     let (reply, response) = futures_channel::oneshot::channel();
     if self
       .commands
@@ -990,10 +1044,17 @@ impl<R: RuntimeLite> Tributaries<OsString, (), R, RootHandle> {
   ///
   /// # Errors
   ///
-  /// [`BuildError::Source`] when the underlying `tributary-fs` watcher cannot be built.
+  /// [`BuildError::InvalidOptions`] when a capacity in `options` is above its
+  /// documented ceiling; [`BuildError::Source`] when the underlying `tributary-fs`
+  /// watcher cannot be built. Both households are refused before anything is
+  /// started — the fs watcher checks its own knobs before it spawns, and this one
+  /// is checked before that watcher exists.
   pub fn new(watcher: WatcherOptions, options: TributariesOptions) -> Result<Self, BuildError> {
+    // Ahead of the source, not after it: building one starts a native watcher, and a
+    // household the umbrella will refuse anyway should cost nothing to be told about.
+    options.validate()?;
     let source = FsSource::<R>::new(watcher)?;
-    Ok(Self::with_source(source, options))
+    Ok(Self::with_source(source, options)?)
   }
 }
 
@@ -3996,7 +4057,43 @@ where
     // double-arms — the `Covered` path arms nothing; only the terminal `Disjoint`/`Widen` arms, once,
     // after the loop exits.
     let outcome = loop {
-      let outcome = self.subsumer.plan_watch(key, value.clone(), interest);
+      let outcome = match self
+        .subsumer
+        .plan_watch(key, value.clone(), interest, globs)
+      {
+        Ok(outcome) => outcome,
+        // ONE ROOT, ONE SET OF WORDS: this watch's per-root seats differ from those of a
+        // recorded root whose coverage it would share, so it is refused — but only once that
+        // root is known to be LIVE. A source-forgotten root owes nobody a refusal (nothing it
+        // recorded is being honoured any more), and the planner would go on refusing against it
+        // until the terminal event that retires it is consumed — which the command-biased loop
+        // runs strictly after this reconcile. So retire it here, exactly as the `Covered`
+        // liveness probe below does, and re-plan against the updated watch-set.
+        //
+        // Terminating for the same reason that probe's loop is: each pass force-removes one root
+        // from the finite, pairwise-disjoint index, and nothing adds one before the plan settles.
+        Err(conflict) => {
+          let mut salvage = Salvage::new();
+          salvage.keep_value(conflict.value);
+          self.retire_salvage(salvage);
+          if self.source.root_key(conflict.root).is_none() {
+            self.retire_root_with_terminal_rescan(conflict.root);
+            continue;
+          }
+          // Refused BEFORE mutation, which is the whole point of deciding it in the planner:
+          // nothing was armed, disarmed, retargeted or re-pointed, no reservation was minted to
+          // abort, and no subscriber is owed a `Rescan`.
+          return Err(
+            WatchError::RootWordsConflict {
+              root_depth: conflict.root_depth,
+              armed: conflict.armed,
+              requested: globs.clone(),
+              reason: conflict.reason,
+            }
+            .into(),
+          );
+        }
+      };
       if let WatchOutcome::Covered { fs_root, .. } = &outcome {
         let covering = *fs_root;
         if self.source.root_key(covering).is_none() {
@@ -4248,7 +4345,11 @@ where
             // The retarget PRESERVED the handle, so the root keeps the words it was
             // armed with — a source that widens in place re-keys its watch, it does not
             // re-configure it. Record what the source actually holds rather than the
-            // newcomer's seats, which this path never asked it to adopt.
+            // newcomer's seats, which this path never asked it to adopt. The two are EQUAL
+            // here in any case: the planner refused this widen outright had the sole subsumed
+            // root's recorded words differed from the newcomer's, so the retained words are the
+            // requested ones — read off the root rather than assumed, since the record is what
+            // the source was actually asked for.
             let armed_globs = self
               .subsumer
               .root_globs(handle)
@@ -8322,7 +8423,8 @@ fn assert_rc_local_source_constructs<R: RuntimeLite>() {
       state: Rc::new(Cell::new(0)),
     },
     TributariesOptions::new(),
-  );
+  )
+  .expect("the default capacities are in range");
 }
 
 /// A [`Tributaries`] driven by the tokio runtime, over the local filesystem.

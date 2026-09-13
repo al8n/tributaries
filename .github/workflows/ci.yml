@@ -139,7 +139,7 @@ jobs:
         # Cargo.lock is not committed, so this resolves from the manifests
         # alone and the lockfile it writes IS the assertion.
         run: cargo +nightly generate-lockfile -Z direct-minimal-versions
-      - name: Lift the three floors that sit above their major
+      - name: Lift the four floors that sit above their major
         # The manifests advertise plain MAJOR requirements by the owner's choice,
         # so `-Z direct-minimal-versions` lands each of these below the version
         # that actually compiles. These are the tested floors, pinned in the
@@ -153,13 +153,24 @@ jobs:
         #   group rests on — landed in 4.2.0.
         # - serde_json (dev only): `json!` is usable from a 2018+ edition caller
         #   from 1.0.25; 1.0.10 still fails to resolve `json_internal!`.
+        # - unicode-normalization: the glob seats fold both pattern and candidate
+        #   to NFC and take the already-NFC fast path through the free function
+        #   `unicode_normalization::is_nfc`, which landed in 0.1.6; 0.1.5 and below
+        #   is `cannot find function is_nfc`.
         #
-        # `--precise` is one version per invocation, hence three.
+        # `globset` deliberately has NO line: 0.4.0 — what the minimizer picks —
+        # already carries every API the seats use (`GlobBuilder` with
+        # `case_insensitive`/`literal_separator`, `GlobSetBuilder`, `GlobSet::is_match`
+        # and `GlobSet::matches`), so its floor is its major and a pin here would be a
+        # no-op that only hid a future regression.
+        #
+        # `--precise` is one version per invocation, hence four.
         run: |
           set -eu
           cargo +nightly update -Z direct-minimal-versions -p serde --precise 1.0.229
           cargo +nightly update -Z direct-minimal-versions -p clap --precise 4.2.0
           cargo +nightly update -Z direct-minimal-versions -p serde_json --precise 1.0.25
+          cargo +nightly update -Z direct-minimal-versions -p unicode-normalization --precise 0.1.6
       - name: Show the floors that were selected
         run: cargo tree --depth 1 --locked
       - name: Build at the floors

@@ -168,4 +168,56 @@ mod clap_face {
       Interest::new().with_created().with_moved().with_ondir()
     );
   }
+
+  /// An UPDATE writes only the bits the command line NAMED.
+  ///
+  /// The flags are the whole value on a parse — what they do not name is the mask's
+  /// `false` — but an update is handed a mask that already means something, and a
+  /// derived one cannot tell a flag's own `false` default from a `false` someone asked
+  /// for. So `--attrib` alone used to unsubscribe every other kind, and an update for
+  /// an argument belonging to some other group in the same command emptied the mask
+  /// outright.
+  #[test]
+  fn an_update_writes_only_the_bits_the_command_line_named() {
+    use clap::{CommandFactory as _, FromArgMatches as _};
+
+    fn matches(args: &[&str]) -> clap::ArgMatches {
+      Cli::command_for_update().get_matches_from(std::iter::once("app").chain(args.iter().copied()))
+    }
+
+    // One named bit joins the mask; the five nobody named keep their values.
+    let mut interest = Interest::new().with_created().with_moved();
+    interest
+      .update_from_arg_matches(&matches(&["--attrib"]))
+      .expect("the update applies");
+    assert_eq!(
+      interest,
+      Interest::new().with_created().with_moved().with_attrib()
+    );
+
+    // An update carrying no flag of this group at all leaves the mask untouched.
+    interest
+      .update_from_arg_matches(&matches(&[]))
+      .expect("the update applies");
+    assert_eq!(
+      interest,
+      Interest::new().with_created().with_moved().with_attrib(),
+      "a flagless update is not the flagless PARSE — it states nothing, so it changes nothing"
+    );
+
+    // And the full mask survives one, bit for bit.
+    let mut all = Interest::all();
+    all
+      .update_from_arg_matches(&matches(&[]))
+      .expect("the update applies");
+    assert_eq!(all, Interest::all());
+  }
+
+  /// The PARSE rule is unchanged: no flag at all is the empty mask, which is what
+  /// makes the group's flags the whole value they are.
+  #[test]
+  fn the_flagless_parse_is_still_the_empty_mask() {
+    assert_eq!(parse(&[]), Interest::new());
+    assert!(parse(&[]).is_empty());
+  }
 }

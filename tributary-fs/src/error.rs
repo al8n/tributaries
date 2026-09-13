@@ -87,12 +87,25 @@ pub enum WatchRootError {
   /// a bug in whatever minted the id; retrying cannot clear it.
   #[error("the minted scope already names a live watched root")]
   ScopeInUse,
+  /// A bounded quantity in the per-root household is out of range — the same
+  /// door-side refusal [`BuildError::InvalidOptions`] is for the watcher-wide
+  /// one, and for the same reason: a legal-but-extreme configuration value
+  /// becomes a typed error before any coverage exists rather than a cost nothing
+  /// bounds afterwards.
+  #[error(transparent)]
+  InvalidOptions(#[from] OptionsError),
   /// The watcher's driver has already stopped.
   #[error("the watcher is closed")]
   Closed,
 }
 
 impl WatchRootError {
+  /// Whether this is [`InvalidOptions`](Self::InvalidOptions).
+  #[inline]
+  pub const fn is_invalid_options(&self) -> bool {
+    matches!(self, Self::InvalidOptions(_))
+  }
+
   /// Whether this is [`NotFound`](Self::NotFound).
   #[inline]
   pub const fn is_not_found(&self) -> bool {
@@ -286,6 +299,39 @@ pub enum SyncRootError {
     dir: PathBuf,
     /// The exclusion covering it, as supplied in the options.
     exclusion: PathBuf,
+  },
+  /// The cookie directory lies inside the root but under a subtree the root's
+  /// own [`prune`](crate::RootOptions::prune) seat covers — the per-root,
+  /// glob-shaped twin of [`DirExcluded`](Self::DirExcluded), refused for exactly
+  /// the same reason. The write would succeed and its event would then be
+  /// suppressed by the very pattern that asked for the suppression, leaving the
+  /// barrier waiting on an event that cannot exist.
+  ///
+  /// The pattern is carried because it is the actionable half: a caller reading
+  /// "your cookie directory is pruned" cannot fix it, and one reading "…by
+  /// `**/.cache`" can. The verdict is taken on the DIRECTORY path, which with a
+  /// seat that speaks for directories alone is the only thing a pattern can
+  /// prune; pick a cookie directory no pattern covers, or widen the seat.
+  ///
+  /// [`dir`](Self::DirPruned::dir) is the CANONICAL directory the write itself
+  /// resolved — the target's own directory, or its parent when the target is a
+  /// file, with every symlink on the way followed — rather than the spelling the
+  /// caller passed. That is the path the cookie would truly have landed in, and
+  /// judging any other one gets the answer wrong in both directions: a link into a
+  /// pruned subtree passes a lexical test it should fail, and a file
+  /// subscription's own key fails a test it should never have been given (the seat
+  /// speaks for directories, and the file's parent is what the cookie goes in).
+  /// The refusal is taken there, before anything is created — which is also why
+  /// the admission's sequence is spent by it.
+  ///
+  /// Unlike the exclusions this is per ROOT, so the same directory may be
+  /// perfectly writable for a sync on another root of the same watcher.
+  #[error("cookie directory {} is pruned by {pattern}", dir.display())]
+  DirPruned {
+    /// The requested cookie directory.
+    dir: PathBuf,
+    /// The pattern of the root's prune seat that covers it.
+    pattern: tributary_proto::glob::Glob,
   },
   /// The cookie name is not a single normal filename component — it holds a
   /// path separator, a `.`/`..`, or is absolute or empty. A name like this

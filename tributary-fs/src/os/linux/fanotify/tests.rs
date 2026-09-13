@@ -3,8 +3,10 @@ use std::{
   path::{Path, PathBuf},
 };
 
+use tributary_proto::glob::{Glob, Globs};
+
 use super::{
-  Admission, AdmittedEvent, MemoBatch, classify,
+  Admission, AdmittedEvent, Fence, MemoBatch, classify,
   fid::{
     FAN_ATTRIB, FAN_CREATE, FAN_DELETE, FAN_DELETE_SELF, FAN_EVENT_INFO_TYPE_DFID_NAME, FAN_MODIFY,
     FAN_MOVE_SELF, FAN_ONDIR, FAN_RENAME, FanMask, Fid, RawFanotifyEvent, RenameInfo,
@@ -17,10 +19,17 @@ fn fid(tag: u8) -> Fid {
   Fid::new([tag; 8], Box::from(&[tag][..]))
 }
 
+/// The UNENGAGED fence — neither seat — which is what every row test outside the
+/// fence suite classifies under, so their actions are the pre-fence ones verbatim.
+fn unfenced() -> Fence<'static> {
+  static NONE: std::sync::LazyLock<Globs> = std::sync::LazyLock::new(Globs::default);
+  Fence::new(Path::new("/root"), &[], &NONE)
+}
+
 /// Classifies a single event through a fresh one-shot memo — the per-event shape
 /// most of these row tests use (the batch-spanning memo has its own suite below).
 fn classify_one(map: &mut FidMap, event: &RawFanotifyEvent) -> Admission {
-  classify(map, event, &mut MemoBatch::new(), &[])
+  classify(map, event, &mut MemoBatch::new(), unfenced())
 }
 
 fn seeded() -> FidMap {
@@ -1336,12 +1345,12 @@ mod batch_memo {
     let a = dirent(FAN_MODIFY, fid(2), b"a.txt", None);
     let b = dirent(FAN_MODIFY, fid(2), b"b.txt", None);
     assert!(matches!(
-      classify(&mut map, &a, &mut memo, &[]),
+      classify(&mut map, &a, &mut memo, unfenced()),
       Admission::Forward(_)
     ));
     assert_eq!((memo.hits, memo.misses), (0, 1), "the first is a cold miss");
     assert!(matches!(
-      classify(&mut map, &b, &mut memo, &[]),
+      classify(&mut map, &b, &mut memo, unfenced()),
       Admission::Forward(_)
     ));
     assert_eq!(
@@ -1361,13 +1370,13 @@ mod batch_memo {
     let mut memo = MemoBatch::new();
     let modify = dirent(FAN_MODIFY, fid(2), b"a.txt", None);
     assert!(matches!(
-      classify(&mut map, &modify, &mut memo, &[]),
+      classify(&mut map, &modify, &mut memo, unfenced()),
       Admission::Forward(_)
     ));
     assert_eq!((memo.hits, memo.misses), (0, 1));
     let mkdir = dirent(FAN_CREATE | FAN_ONDIR, fid(2), b"newdir", Some(fid(3)));
     assert!(matches!(
-      classify(&mut map, &mkdir, &mut memo, &[]),
+      classify(&mut map, &mkdir, &mut memo, unfenced()),
       Admission::LearnDir(_)
     ));
     assert_eq!(
@@ -1377,7 +1386,7 @@ mod batch_memo {
     );
     let modify2 = dirent(FAN_MODIFY, fid(2), b"b.txt", None);
     assert!(matches!(
-      classify(&mut map, &modify2, &mut memo, &[]),
+      classify(&mut map, &modify2, &mut memo, unfenced()),
       Admission::Forward(_)
     ));
     assert_eq!(
@@ -1400,18 +1409,18 @@ mod batch_memo {
     let mut memo = MemoBatch::new();
     let under_root = dirent(FAN_MODIFY, fid(1), b"x.txt", None);
     assert!(matches!(
-      classify(&mut map, &under_root, &mut memo, &[]),
+      classify(&mut map, &under_root, &mut memo, unfenced()),
       Admission::Forward(_)
     ));
     // Delete directory /root/b (a DELETE_SELF forgets it) — a mutation.
     let delete_b = self_dfid(FAN_DELETE_SELF | FAN_ONDIR, fid(3));
     assert!(matches!(
-      classify(&mut map, &delete_b, &mut memo, &[]),
+      classify(&mut map, &delete_b, &mut memo, unfenced()),
       Admission::ForgetDir(_)
     ));
     let under_root2 = dirent(FAN_MODIFY, fid(1), b"y.txt", None);
     assert!(matches!(
-      classify(&mut map, &under_root2, &mut memo, &[]),
+      classify(&mut map, &under_root2, &mut memo, unfenced()),
       Admission::Forward(_)
     ));
     assert_eq!(memo.hits, 0, "the forget invalidated the root's memo entry");
@@ -1425,13 +1434,13 @@ mod batch_memo {
     let modify = dirent(FAN_MODIFY, fid(2), b"a.txt", None);
     let mut first = MemoBatch::new();
     assert!(matches!(
-      classify(&mut map, &modify, &mut first, &[]),
+      classify(&mut map, &modify, &mut first, unfenced()),
       Admission::Forward(_)
     ));
     assert_eq!((first.hits, first.misses), (0, 1));
     let mut second = MemoBatch::new();
     assert!(matches!(
-      classify(&mut map, &modify, &mut second, &[]),
+      classify(&mut map, &modify, &mut second, unfenced()),
       Admission::Forward(_)
     ));
     assert_eq!(
@@ -1886,7 +1895,7 @@ mod classification_oracle {
     // not off the action name.
     let map_neutral = map_neutral_merge_spec(&map, event);
     let generation = map.generation();
-    let admission = classify(&mut map, event, &mut MemoBatch::new(), &[]);
+    let admission = classify(&mut map, event, &mut MemoBatch::new(), unfenced());
     let got = action_of(&admission);
 
     // (1) Agreement: classify selects exactly the spec's action.
@@ -2142,7 +2151,7 @@ mod classification_oracle {
       for mask in [FAN_ATTRIB, FAN_MODIFY, FAN_ATTRIB | FAN_ONDIR] {
         let mut map = oracle_map();
         let event = self_fid_only(mask, self_fid.clone());
-        let admission = classify(&mut map, &event, &mut MemoBatch::new(), &[]);
+        let admission = classify(&mut map, &event, &mut MemoBatch::new(), unfenced());
         assert!(
           matches!(admission, Admission::Forward(_)),
           "a FID-only {mask:#x} on admitted {self_fid:?} forwards, not drops: {admission:?}"
@@ -2183,7 +2192,7 @@ mod classification_oracle {
       b"top.txt",
       None,
     );
-    let admission = classify(&mut map, &merged, &mut MemoBatch::new(), &[]);
+    let admission = classify(&mut map, &merged, &mut MemoBatch::new(), unfenced());
     assert!(
       matches!(admission, Admission::Forward(_)),
       "a merged file create+delete mutates nothing, so it keeps its buffer: {admission:?}"
@@ -2403,7 +2412,31 @@ mod exclusion_fence {
     event: &RawFanotifyEvent,
     exclusions: &[PathBuf],
   ) -> Admission {
-    classify(map, event, &mut MemoBatch::new(), exclusions)
+    let prune = Globs::default();
+    classify(
+      map,
+      event,
+      &mut MemoBatch::new(),
+      Fence::new(Path::new("/root"), exclusions, &prune),
+    )
+  }
+
+  /// The PRUNE half's twin of [`classify_fenced`]: the same one-shot classify, with
+  /// the root's own words engaged and no exclusion at all, so a cell proves the seat
+  /// carries the fence on its own rather than riding an exclusion's coat-tails.
+  fn classify_pruned(map: &mut FidMap, event: &RawFanotifyEvent, patterns: &[&str]) -> Admission {
+    let prune = Globs::new(
+      patterns
+        .iter()
+        .map(|pattern| Glob::new(pattern).expect("a valid pattern compiles")),
+    )
+    .expect("a bounded set compiles");
+    classify(
+      map,
+      event,
+      &mut MemoBatch::new(),
+      Fence::new(Path::new("/root"), &[], &prune),
+    )
   }
 
   /// A live `mkdir` of the excluded directory: its parent is `/root/sub`'s parent — the
@@ -2428,6 +2461,42 @@ mod exclusion_fence {
       "no learn ran — the map is provably untouched"
     );
     assert!(!map.contains(&fid(10)));
+  }
+
+  /// The PRUNE half at the same decision, with no exclusion in force at all — the seat
+  /// is a fence in its own right, not a rider on the exclusion set.
+  ///
+  /// The two rows are the seat's whole rule at this boundary. An `ONDIR` create of the
+  /// pruned NAME is refused before the learn, so the pruned directory never enters the
+  /// map and nothing beneath it can ever resolve. A plain FILE create of the SAME name
+  /// classifies normally: prune speaks for directories, so `**/.*` written to skip
+  /// dot-directories does not silently ban every dotfile — and the class comes off
+  /// `FAN_ONDIR`, the kernel's own answer, so this backend and the common layer judge
+  /// one object one way.
+  #[test]
+  fn a_pruned_directory_create_is_refused_while_a_file_of_that_name_is_not() {
+    let mut map = seeded();
+    let generation = map.generation();
+    let count = map.dir_count();
+    let mkdir = dirent(FAN_CREATE | FAN_ONDIR, fid(1), b"cache", Some(fid(10)));
+    let admission = classify_pruned(&mut map, &mkdir, &["**/cache"]);
+    assert!(
+      matches!(admission, Admission::ExcludedDrop),
+      "the pruned create is refused at admission: {admission:?}"
+    );
+    assert_eq!(
+      (map.generation(), map.dir_count()),
+      (generation, count),
+      "no learn ran — the map is provably untouched"
+    );
+    assert!(!map.contains(&fid(10)));
+
+    let touch = dirent(FAN_CREATE, fid(1), b"cache", Some(fid(10)));
+    let admission = classify_pruned(&mut map, &touch, &["**/cache"]);
+    assert!(
+      matches!(admission, Admission::Forward(_)),
+      "a proven non-directory is judged on its ancestors alone: {admission:?}"
+    );
   }
 
   /// The same directory's own delete, modify, and name-less self-events: each resolves
@@ -3205,7 +3274,7 @@ mod exclusion_fence {
     for (label, event) in rows {
       let mut fenced = seeded();
       let mut plain = seeded();
-      let with_empty = classify(&mut fenced, &event, &mut MemoBatch::new(), &[]);
+      let with_empty = classify(&mut fenced, &event, &mut MemoBatch::new(), unfenced());
       let without = classify_one(&mut plain, &event);
       assert_eq!(
         format!("{with_empty:?}"),
