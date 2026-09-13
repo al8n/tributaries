@@ -117,6 +117,12 @@ All notable changes to this workspace are documented here. The format is based o
     every other face of that household, and giving any narrows to those alone. The
     standalone `tributary_proto::Interest` group keeps its own face, where a flagless
     parse is the empty mask.
+  - Every `Duration` key/flag on both faces (`WatcherOptions::latency`,
+    `move_window` and `root_liveness_interval`; `DebounceConfig::quiet_window` and
+    `max_hold`) reads its text through a bounded visitor that refuses anything past
+    a small byte ceiling with a fixed message naming the bound and the length,
+    never the text, before `humantime` ever parses it — so a rejected value costs
+    nothing proportional to its own size.
 
 - **`tributaries`** — the two glob seats reach the umbrella, so a subscription carries
   them and every source is armed with them.
