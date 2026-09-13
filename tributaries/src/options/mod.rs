@@ -561,26 +561,18 @@ where
 /// knobs the command line actually carried: updating `--quiet-window` alone leaves
 /// the hold ceiling and the buffered cap exactly as they stood.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct DebounceConfig {
   #[cfg_attr(
     feature = "serde",
-    serde(
-      serialize_with = "humantime_serde::serialize",
-      deserialize_with = "deserialize_bounded_duration"
-    )
+    serde(serialize_with = "humantime_serde::serialize")
   )]
   quiet_window: Duration,
   #[cfg_attr(
     feature = "serde",
-    serde(
-      serialize_with = "humantime_serde::serialize",
-      deserialize_with = "deserialize_bounded_duration"
-    )
+    serde(serialize_with = "humantime_serde::serialize")
   )]
   max_hold: Duration,
-  #[cfg_attr(feature = "serde", serde(deserialize_with = "de_max_buffered"))]
   max_buffered: usize,
 }
 
@@ -941,6 +933,216 @@ impl Default for DebounceConfig {
   }
 }
 
+/// The `serde` face's `Deserialize` half, kept by hand rather than derived: a
+/// document's KEY is read through a bounded identifier visitor, measured
+/// against the longest legal field name before it is matched against this
+/// household's own fields or echoed into an `unknown_field` refusal.
+///
+/// The identifier visitor `derive(Deserialize)` would otherwise generate hands
+/// the WHOLE rejected key to that refusal's formatter, so an untrusted key of
+/// unbounded length cost an allocation proportional to its own size before the
+/// vocabulary it was about to fail was ever consulted. So the ceiling is judged
+/// first, on the bytes the format is already holding: a key past it is refused
+/// with a FIXED message naming the bound and the length, never the key itself;
+/// a key within it is matched, or refused by `unknown_field` exactly as the
+/// derive would. Every VALUE keeps the exact per-field rule the derive's own
+/// `deserialize_with` named (each wrapped in a private newtype below, since a
+/// map's value has no attribute of its own to carry a function name), every key
+/// is optional and defaulted from [`DebounceConfig::new`], and a repeated key is
+/// refused with `duplicate_field`.
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for DebounceConfig {
+  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+  where
+    D: serde::Deserializer<'de>,
+  {
+    const FIELDS: &[&str] = &["quiet_window", "max_hold", "max_buffered"];
+
+    const MAX_FIELD_LEN: usize = {
+      let mut longest = 0;
+      let mut index = 0;
+      while index < FIELDS.len() {
+        if FIELDS[index].len() > longest {
+          longest = FIELDS[index].len();
+        }
+        index += 1;
+      }
+      longest
+    };
+
+    enum Field {
+      QuietWindow,
+      MaxHold,
+      MaxBuffered,
+    }
+
+    impl<'de> serde::Deserialize<'de> for Field {
+      fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+      where
+        D: serde::Deserializer<'de>,
+      {
+        struct FieldVisitor;
+
+        impl serde::de::Visitor<'_> for FieldVisitor {
+          type Value = Field;
+
+          fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            write!(f, "a field name of at most {MAX_FIELD_LEN} bytes")
+          }
+
+          /// The one door, and the one every other text arm reaches:
+          /// `visit_borrowed_str` and `visit_string` are serde's own forwards
+          /// to it, so a key the format borrows out of its input is measured
+          /// without being copied at all, and one the format already owns is
+          /// measured before this face does anything with it.
+          fn visit_str<E>(self, name: &str) -> Result<Self::Value, E>
+          where
+            E: serde::de::Error,
+          {
+            if name.len() > MAX_FIELD_LEN {
+              // The length, never the value: an over-long key is exactly the
+              // input whose echo is the hazard.
+              return Err(E::custom(format_args!(
+                "field name longer than the {MAX_FIELD_LEN}-byte bound ({} bytes)",
+                name.len()
+              )));
+            }
+            match name {
+              "quiet_window" => Ok(Field::QuietWindow),
+              "max_hold" => Ok(Field::MaxHold),
+              "max_buffered" => Ok(Field::MaxBuffered),
+              _ => Err(E::unknown_field(name, FIELDS)),
+            }
+          }
+
+          /// The bytes-identifier door a format reads when its key comes as
+          /// raw bytes rather than `str` — bounded and echoed the same way
+          /// [`visit_str`](Self::visit_str) is.
+          fn visit_bytes<E>(self, name: &[u8]) -> Result<Self::Value, E>
+          where
+            E: serde::de::Error,
+          {
+            if name.len() > MAX_FIELD_LEN {
+              return Err(E::custom(format_args!(
+                "field name longer than the {MAX_FIELD_LEN}-byte bound ({} bytes)",
+                name.len()
+              )));
+            }
+            match name {
+              b"quiet_window" => Ok(Field::QuietWindow),
+              b"max_hold" => Ok(Field::MaxHold),
+              b"max_buffered" => Ok(Field::MaxBuffered),
+              _ => Err(E::unknown_field(&String::from_utf8_lossy(name), FIELDS)),
+            }
+          }
+
+          /// The identifier door a NON-self-describing format answers with —
+          /// the field's declaration-order INDEX.
+          fn visit_u64<E>(self, index: u64) -> Result<Self::Value, E>
+          where
+            E: serde::de::Error,
+          {
+            match index {
+              0 => Ok(Field::QuietWindow),
+              1 => Ok(Field::MaxHold),
+              2 => Ok(Field::MaxBuffered),
+              _ => Err(E::invalid_value(
+                serde::de::Unexpected::Unsigned(index),
+                &"a field index within DebounceConfig",
+              )),
+            }
+          }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+      }
+    }
+
+    struct QuietWindowValue(Duration);
+    impl<'de> serde::Deserialize<'de> for QuietWindowValue {
+      fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+      where
+        D: serde::Deserializer<'de>,
+      {
+        deserialize_bounded_duration(deserializer).map(QuietWindowValue)
+      }
+    }
+
+    struct MaxHoldValue(Duration);
+    impl<'de> serde::Deserialize<'de> for MaxHoldValue {
+      fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+      where
+        D: serde::Deserializer<'de>,
+      {
+        deserialize_bounded_duration(deserializer).map(MaxHoldValue)
+      }
+    }
+
+    struct MaxBufferedValue(usize);
+    impl<'de> serde::Deserialize<'de> for MaxBufferedValue {
+      fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+      where
+        D: serde::Deserializer<'de>,
+      {
+        de_max_buffered(deserializer).map(MaxBufferedValue)
+      }
+    }
+
+    struct Visitor;
+
+    impl<'de> serde::de::Visitor<'de> for Visitor {
+      type Value = DebounceConfig;
+
+      fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("struct DebounceConfig")
+      }
+
+      fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+      where
+        A: serde::de::MapAccess<'de>,
+      {
+        use serde::de::Error as _;
+
+        let mut quiet_window = None;
+        let mut max_hold = None;
+        let mut max_buffered = None;
+
+        while let Some(key) = map.next_key::<Field>()? {
+          match key {
+            Field::QuietWindow => {
+              if quiet_window.is_some() {
+                return Err(A::Error::duplicate_field("quiet_window"));
+              }
+              quiet_window = Some(map.next_value::<QuietWindowValue>()?.0);
+            }
+            Field::MaxHold => {
+              if max_hold.is_some() {
+                return Err(A::Error::duplicate_field("max_hold"));
+              }
+              max_hold = Some(map.next_value::<MaxHoldValue>()?.0);
+            }
+            Field::MaxBuffered => {
+              if max_buffered.is_some() {
+                return Err(A::Error::duplicate_field("max_buffered"));
+              }
+              max_buffered = Some(map.next_value::<MaxBufferedValue>()?.0);
+            }
+          }
+        }
+
+        let default = DebounceConfig::default();
+        Ok(DebounceConfig {
+          quiet_window: quiet_window.unwrap_or(default.quiet_window),
+          max_hold: max_hold.unwrap_or(default.max_hold),
+          max_buffered: max_buffered.unwrap_or(default.max_buffered),
+        })
+      }
+    }
+
+    deserializer.deserialize_struct("DebounceConfig", FIELDS, Visitor)
+  }
+}
+
 /// A subscription's debounce posture, resolved against the watcher-global default
 /// ([`TributariesOptions::debounce`]) at delivery time.
 ///
@@ -1298,12 +1500,9 @@ impl<'de> serde::Deserialize<'de> for Debounce {
 /// options: Option<TributariesOptions>` is `Some` exactly when one of them was
 /// given.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct TributariesOptions {
-  #[cfg_attr(feature = "serde", serde(deserialize_with = "de_event_capacity"))]
   event_capacity: NonZeroUsize,
-  #[cfg_attr(feature = "serde", serde(deserialize_with = "de_command_capacity"))]
   command_capacity: NonZeroUsize,
   debounce: Option<DebounceConfig>,
 }
@@ -1673,6 +1872,207 @@ impl Default for TributariesOptions {
   }
 }
 
+/// The `serde` face's `Deserialize` half, kept by hand rather than derived: a
+/// document's KEY is read through a bounded identifier visitor, measured
+/// against the longest legal field name before it is matched against this
+/// household's own fields or echoed into an `unknown_field` refusal.
+///
+/// The identifier visitor `derive(Deserialize)` would otherwise generate hands
+/// the WHOLE rejected key to that refusal's formatter, so an untrusted key of
+/// unbounded length cost an allocation proportional to its own size before the
+/// vocabulary it was about to fail was ever consulted. So the ceiling is judged
+/// first, on the bytes the format is already holding: a key past it is refused
+/// with a FIXED message naming the bound and the length, never the key itself;
+/// a key within it is matched, or refused by `unknown_field` exactly as the
+/// derive would. Both capacities keep the exact per-field rule the derive's own
+/// `deserialize_with` named (each wrapped in a private newtype below, since a
+/// map's value has no attribute of its own to carry a function name); `debounce`
+/// keeps its own opt-in `Option` shape untouched. Every key is optional and
+/// defaulted from [`TributariesOptions::new`], and a repeated key is refused
+/// with `duplicate_field`.
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for TributariesOptions {
+  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+  where
+    D: serde::Deserializer<'de>,
+  {
+    const FIELDS: &[&str] = &["event_capacity", "command_capacity", "debounce"];
+
+    const MAX_FIELD_LEN: usize = {
+      let mut longest = 0;
+      let mut index = 0;
+      while index < FIELDS.len() {
+        if FIELDS[index].len() > longest {
+          longest = FIELDS[index].len();
+        }
+        index += 1;
+      }
+      longest
+    };
+
+    enum Field {
+      EventCapacity,
+      CommandCapacity,
+      Debounce,
+    }
+
+    impl<'de> serde::Deserialize<'de> for Field {
+      fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+      where
+        D: serde::Deserializer<'de>,
+      {
+        struct FieldVisitor;
+
+        impl serde::de::Visitor<'_> for FieldVisitor {
+          type Value = Field;
+
+          fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            write!(f, "a field name of at most {MAX_FIELD_LEN} bytes")
+          }
+
+          /// The one door, and the one every other text arm reaches:
+          /// `visit_borrowed_str` and `visit_string` are serde's own forwards
+          /// to it, so a key the format borrows out of its input is measured
+          /// without being copied at all, and one the format already owns is
+          /// measured before this face does anything with it.
+          fn visit_str<E>(self, name: &str) -> Result<Self::Value, E>
+          where
+            E: serde::de::Error,
+          {
+            if name.len() > MAX_FIELD_LEN {
+              // The length, never the value: an over-long key is exactly the
+              // input whose echo is the hazard.
+              return Err(E::custom(format_args!(
+                "field name longer than the {MAX_FIELD_LEN}-byte bound ({} bytes)",
+                name.len()
+              )));
+            }
+            match name {
+              "event_capacity" => Ok(Field::EventCapacity),
+              "command_capacity" => Ok(Field::CommandCapacity),
+              "debounce" => Ok(Field::Debounce),
+              _ => Err(E::unknown_field(name, FIELDS)),
+            }
+          }
+
+          /// The bytes-identifier door a format reads when its key comes as
+          /// raw bytes rather than `str` — bounded and echoed the same way
+          /// [`visit_str`](Self::visit_str) is.
+          fn visit_bytes<E>(self, name: &[u8]) -> Result<Self::Value, E>
+          where
+            E: serde::de::Error,
+          {
+            if name.len() > MAX_FIELD_LEN {
+              return Err(E::custom(format_args!(
+                "field name longer than the {MAX_FIELD_LEN}-byte bound ({} bytes)",
+                name.len()
+              )));
+            }
+            match name {
+              b"event_capacity" => Ok(Field::EventCapacity),
+              b"command_capacity" => Ok(Field::CommandCapacity),
+              b"debounce" => Ok(Field::Debounce),
+              _ => Err(E::unknown_field(&String::from_utf8_lossy(name), FIELDS)),
+            }
+          }
+
+          /// The identifier door a NON-self-describing format answers with —
+          /// the field's declaration-order INDEX.
+          fn visit_u64<E>(self, index: u64) -> Result<Self::Value, E>
+          where
+            E: serde::de::Error,
+          {
+            match index {
+              0 => Ok(Field::EventCapacity),
+              1 => Ok(Field::CommandCapacity),
+              2 => Ok(Field::Debounce),
+              _ => Err(E::invalid_value(
+                serde::de::Unexpected::Unsigned(index),
+                &"a field index within TributariesOptions",
+              )),
+            }
+          }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+      }
+    }
+
+    struct EventCapacityValue(NonZeroUsize);
+    impl<'de> serde::Deserialize<'de> for EventCapacityValue {
+      fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+      where
+        D: serde::Deserializer<'de>,
+      {
+        de_event_capacity(deserializer).map(EventCapacityValue)
+      }
+    }
+
+    struct CommandCapacityValue(NonZeroUsize);
+    impl<'de> serde::Deserialize<'de> for CommandCapacityValue {
+      fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+      where
+        D: serde::Deserializer<'de>,
+      {
+        de_command_capacity(deserializer).map(CommandCapacityValue)
+      }
+    }
+
+    struct Visitor;
+
+    impl<'de> serde::de::Visitor<'de> for Visitor {
+      type Value = TributariesOptions;
+
+      fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("struct TributariesOptions")
+      }
+
+      fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+      where
+        A: serde::de::MapAccess<'de>,
+      {
+        use serde::de::Error as _;
+
+        let mut event_capacity = None;
+        let mut command_capacity = None;
+        let mut debounce = None;
+
+        while let Some(key) = map.next_key::<Field>()? {
+          match key {
+            Field::EventCapacity => {
+              if event_capacity.is_some() {
+                return Err(A::Error::duplicate_field("event_capacity"));
+              }
+              event_capacity = Some(map.next_value::<EventCapacityValue>()?.0);
+            }
+            Field::CommandCapacity => {
+              if command_capacity.is_some() {
+                return Err(A::Error::duplicate_field("command_capacity"));
+              }
+              command_capacity = Some(map.next_value::<CommandCapacityValue>()?.0);
+            }
+            Field::Debounce => {
+              if debounce.is_some() {
+                return Err(A::Error::duplicate_field("debounce"));
+              }
+              debounce = Some(map.next_value()?);
+            }
+          }
+        }
+
+        let default = TributariesOptions::default();
+        Ok(TributariesOptions {
+          event_capacity: event_capacity.unwrap_or(default.event_capacity),
+          command_capacity: command_capacity.unwrap_or(default.command_capacity),
+          debounce: debounce.unwrap_or(default.debounce),
+        })
+      }
+    }
+
+    deserializer.deserialize_struct("TributariesOptions", FIELDS, Visitor)
+  }
+}
+
 /// The per-ROOT glob words a [`Source`](crate::Source) is armed with — the two
 /// seats a subscription's [`WatchOptions`] carries, extracted for the seam
 /// ([`Source::arm`](crate::Source::arm)).
@@ -1826,16 +2226,198 @@ impl Default for TributariesOptions {
 /// explicitly populated, so `#[command(flatten)] globs: Option<RootGlobs>` is
 /// `Some` exactly when one of the four flags was given.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct RootGlobs {
-  #[cfg_attr(feature = "serde", serde(deserialize_with = "deserialize_seat"))]
   prune: Vec<Glob>,
-  #[cfg_attr(
-    feature = "serde",
-    serde(deserialize_with = "deserialize_optional_seat")
-  )]
   include: Option<Vec<Glob>>,
+}
+
+/// The `serde` face's `Deserialize` half, kept by hand rather than derived: a
+/// document's KEY is read through a bounded identifier visitor, measured
+/// against the longest legal field name before it is matched against this
+/// household's own fields or echoed into an `unknown_field` refusal.
+///
+/// The identifier visitor `derive(Deserialize)` would otherwise generate hands
+/// the WHOLE rejected key to that refusal's formatter, so an untrusted key of
+/// unbounded length cost an allocation proportional to its own size before the
+/// vocabulary it was about to fail was ever consulted. So the ceiling is judged
+/// first, on the bytes the format is already holding: a key past it is refused
+/// with a FIXED message naming the bound and the length, never the key itself;
+/// a key within it is matched, or refused by `unknown_field` exactly as the
+/// derive would. Each glob seat keeps the exact per-field rule the derive's own
+/// `deserialize_with` named (wrapped in a private newtype below, since a map's
+/// value has no attribute of its own to carry a function name), every key is
+/// optional and defaulted from [`RootGlobs::new`], and a repeated key is
+/// refused with `duplicate_field`.
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for RootGlobs {
+  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+  where
+    D: serde::Deserializer<'de>,
+  {
+    const FIELDS: &[&str] = &["prune", "include"];
+
+    const MAX_FIELD_LEN: usize = {
+      let mut longest = 0;
+      let mut index = 0;
+      while index < FIELDS.len() {
+        if FIELDS[index].len() > longest {
+          longest = FIELDS[index].len();
+        }
+        index += 1;
+      }
+      longest
+    };
+
+    enum Field {
+      Prune,
+      Include,
+    }
+
+    impl<'de> serde::Deserialize<'de> for Field {
+      fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+      where
+        D: serde::Deserializer<'de>,
+      {
+        struct FieldVisitor;
+
+        impl serde::de::Visitor<'_> for FieldVisitor {
+          type Value = Field;
+
+          fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            write!(f, "a field name of at most {MAX_FIELD_LEN} bytes")
+          }
+
+          /// The one door, and the one every other text arm reaches:
+          /// `visit_borrowed_str` and `visit_string` are serde's own forwards
+          /// to it, so a key the format borrows out of its input is measured
+          /// without being copied at all, and one the format already owns is
+          /// measured before this face does anything with it.
+          fn visit_str<E>(self, name: &str) -> Result<Self::Value, E>
+          where
+            E: serde::de::Error,
+          {
+            if name.len() > MAX_FIELD_LEN {
+              // The length, never the value: an over-long key is exactly the
+              // input whose echo is the hazard.
+              return Err(E::custom(format_args!(
+                "field name longer than the {MAX_FIELD_LEN}-byte bound ({} bytes)",
+                name.len()
+              )));
+            }
+            match name {
+              "prune" => Ok(Field::Prune),
+              "include" => Ok(Field::Include),
+              _ => Err(E::unknown_field(name, FIELDS)),
+            }
+          }
+
+          /// The bytes-identifier door a format reads when its key comes as
+          /// raw bytes rather than `str` — bounded and echoed the same way
+          /// [`visit_str`](Self::visit_str) is.
+          fn visit_bytes<E>(self, name: &[u8]) -> Result<Self::Value, E>
+          where
+            E: serde::de::Error,
+          {
+            if name.len() > MAX_FIELD_LEN {
+              return Err(E::custom(format_args!(
+                "field name longer than the {MAX_FIELD_LEN}-byte bound ({} bytes)",
+                name.len()
+              )));
+            }
+            match name {
+              b"prune" => Ok(Field::Prune),
+              b"include" => Ok(Field::Include),
+              _ => Err(E::unknown_field(&String::from_utf8_lossy(name), FIELDS)),
+            }
+          }
+
+          /// The identifier door a NON-self-describing format answers with —
+          /// the field's declaration-order INDEX.
+          fn visit_u64<E>(self, index: u64) -> Result<Self::Value, E>
+          where
+            E: serde::de::Error,
+          {
+            match index {
+              0 => Ok(Field::Prune),
+              1 => Ok(Field::Include),
+              _ => Err(E::invalid_value(
+                serde::de::Unexpected::Unsigned(index),
+                &"a field index within RootGlobs",
+              )),
+            }
+          }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+      }
+    }
+
+    struct PruneValue(Vec<Glob>);
+    impl<'de> serde::Deserialize<'de> for PruneValue {
+      fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+      where
+        D: serde::Deserializer<'de>,
+      {
+        deserialize_seat(deserializer).map(PruneValue)
+      }
+    }
+
+    struct IncludeValue(Option<Vec<Glob>>);
+    impl<'de> serde::Deserialize<'de> for IncludeValue {
+      fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+      where
+        D: serde::Deserializer<'de>,
+      {
+        deserialize_optional_seat(deserializer).map(IncludeValue)
+      }
+    }
+
+    struct Visitor;
+
+    impl<'de> serde::de::Visitor<'de> for Visitor {
+      type Value = RootGlobs;
+
+      fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("struct RootGlobs")
+      }
+
+      fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+      where
+        A: serde::de::MapAccess<'de>,
+      {
+        use serde::de::Error as _;
+
+        let mut prune = None;
+        let mut include = None;
+
+        while let Some(key) = map.next_key::<Field>()? {
+          match key {
+            Field::Prune => {
+              if prune.is_some() {
+                return Err(A::Error::duplicate_field("prune"));
+              }
+              prune = Some(map.next_value::<PruneValue>()?.0);
+            }
+            Field::Include => {
+              if include.is_some() {
+                return Err(A::Error::duplicate_field("include"));
+              }
+              include = Some(map.next_value::<IncludeValue>()?.0);
+            }
+          }
+        }
+
+        let default = RootGlobs::default();
+        Ok(RootGlobs {
+          prune: prune.unwrap_or(default.prune),
+          include: include.unwrap_or(default.include),
+        })
+      }
+    }
+
+    deserializer.deserialize_struct("RootGlobs", FIELDS, Visitor)
+  }
 }
 
 #[cfg(feature = "clap")]
@@ -2149,19 +2731,14 @@ impl RootGlobs {
 /// The group is explicitly populated with every argument the household carries, the
 /// nested interest flags included, so `#[command(flatten)] watch:
 /// Option<WatchOptions<C>>` is `Some` exactly when one of them was given.
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(default, bound = "", deny_unknown_fields))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(bound = ""))]
 pub struct WatchOptions<C> {
   interest: Interest,
   #[cfg_attr(feature = "serde", serde(skip))]
   filter: Filter<C>,
   debounce: Debounce,
-  #[cfg_attr(feature = "serde", serde(deserialize_with = "deserialize_seat"))]
   prune: Vec<Glob>,
-  #[cfg_attr(
-    feature = "serde",
-    serde(deserialize_with = "deserialize_optional_seat")
-  )]
   include: Option<Vec<Glob>>,
 }
 
@@ -2522,6 +3099,224 @@ impl<C> Default for WatchOptions<C> {
   #[inline]
   fn default() -> Self {
     Self::new()
+  }
+}
+
+/// The `serde` face's `Deserialize` half, kept by hand rather than derived: a
+/// document's KEY is read through a bounded identifier visitor, measured
+/// against the longest legal field name before it is matched against this
+/// household's own fields or echoed into an `unknown_field` refusal.
+///
+/// The identifier visitor `derive(Deserialize)` would otherwise generate hands
+/// the WHOLE rejected key to that refusal's formatter, so an untrusted key of
+/// unbounded length cost an allocation proportional to its own size before the
+/// vocabulary it was about to fail was ever consulted. So the ceiling is judged
+/// first, on the bytes the format is already holding: a key past it is refused
+/// with a FIXED message naming the bound and the length, never the key itself;
+/// a key within it is matched, or refused by `unknown_field` exactly as the
+/// derive would. `filter` is on no face at all — a caller's closure is not
+/// something a document can name — so it never has a legal key and always comes
+/// back [`WatchOptions::new`]'s accept-all default; the two glob seats keep the
+/// exact per-field rule the derive's own `deserialize_with` named (wrapped in a
+/// private newtype below, since a map's value has no attribute of its own to
+/// carry a function name). Every other key is optional and defaulted from
+/// [`WatchOptions::new`], a repeated key is refused with `duplicate_field`, and
+/// — exactly as the derive's own `bound = ""` stated — this impl adds no bound
+/// on `C` at all, since the one field mentioning it is never read here.
+#[cfg(feature = "serde")]
+impl<'de, C> serde::Deserialize<'de> for WatchOptions<C> {
+  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+  where
+    D: serde::Deserializer<'de>,
+  {
+    const FIELDS: &[&str] = &["interest", "debounce", "prune", "include"];
+
+    const MAX_FIELD_LEN: usize = {
+      let mut longest = 0;
+      let mut index = 0;
+      while index < FIELDS.len() {
+        if FIELDS[index].len() > longest {
+          longest = FIELDS[index].len();
+        }
+        index += 1;
+      }
+      longest
+    };
+
+    enum Field {
+      Interest,
+      Debounce,
+      Prune,
+      Include,
+    }
+
+    impl<'de> serde::Deserialize<'de> for Field {
+      fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+      where
+        D: serde::Deserializer<'de>,
+      {
+        struct FieldVisitor;
+
+        impl serde::de::Visitor<'_> for FieldVisitor {
+          type Value = Field;
+
+          fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            write!(f, "a field name of at most {MAX_FIELD_LEN} bytes")
+          }
+
+          /// The one door, and the one every other text arm reaches:
+          /// `visit_borrowed_str` and `visit_string` are serde's own forwards
+          /// to it, so a key the format borrows out of its input is measured
+          /// without being copied at all, and one the format already owns is
+          /// measured before this face does anything with it.
+          fn visit_str<E>(self, name: &str) -> Result<Self::Value, E>
+          where
+            E: serde::de::Error,
+          {
+            if name.len() > MAX_FIELD_LEN {
+              // The length, never the value: an over-long key is exactly the
+              // input whose echo is the hazard.
+              return Err(E::custom(format_args!(
+                "field name longer than the {MAX_FIELD_LEN}-byte bound ({} bytes)",
+                name.len()
+              )));
+            }
+            match name {
+              "interest" => Ok(Field::Interest),
+              "debounce" => Ok(Field::Debounce),
+              "prune" => Ok(Field::Prune),
+              "include" => Ok(Field::Include),
+              _ => Err(E::unknown_field(name, FIELDS)),
+            }
+          }
+
+          /// The bytes-identifier door a format reads when its key comes as
+          /// raw bytes rather than `str` — bounded and echoed the same way
+          /// [`visit_str`](Self::visit_str) is.
+          fn visit_bytes<E>(self, name: &[u8]) -> Result<Self::Value, E>
+          where
+            E: serde::de::Error,
+          {
+            if name.len() > MAX_FIELD_LEN {
+              return Err(E::custom(format_args!(
+                "field name longer than the {MAX_FIELD_LEN}-byte bound ({} bytes)",
+                name.len()
+              )));
+            }
+            match name {
+              b"interest" => Ok(Field::Interest),
+              b"debounce" => Ok(Field::Debounce),
+              b"prune" => Ok(Field::Prune),
+              b"include" => Ok(Field::Include),
+              _ => Err(E::unknown_field(&String::from_utf8_lossy(name), FIELDS)),
+            }
+          }
+
+          /// The identifier door a NON-self-describing format answers with —
+          /// the field's declaration-order INDEX (`filter` is skipped, so it
+          /// never occupies one).
+          fn visit_u64<E>(self, index: u64) -> Result<Self::Value, E>
+          where
+            E: serde::de::Error,
+          {
+            match index {
+              0 => Ok(Field::Interest),
+              1 => Ok(Field::Debounce),
+              2 => Ok(Field::Prune),
+              3 => Ok(Field::Include),
+              _ => Err(E::invalid_value(
+                serde::de::Unexpected::Unsigned(index),
+                &"a field index within WatchOptions",
+              )),
+            }
+          }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+      }
+    }
+
+    struct PruneValue(Vec<Glob>);
+    impl<'de> serde::Deserialize<'de> for PruneValue {
+      fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+      where
+        D: serde::Deserializer<'de>,
+      {
+        deserialize_seat(deserializer).map(PruneValue)
+      }
+    }
+
+    struct IncludeValue(Option<Vec<Glob>>);
+    impl<'de> serde::Deserialize<'de> for IncludeValue {
+      fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+      where
+        D: serde::Deserializer<'de>,
+      {
+        deserialize_optional_seat(deserializer).map(IncludeValue)
+      }
+    }
+
+    struct Visitor<C>(core::marker::PhantomData<fn() -> C>);
+
+    impl<'de, C> serde::de::Visitor<'de> for Visitor<C> {
+      type Value = WatchOptions<C>;
+
+      fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("struct WatchOptions")
+      }
+
+      fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+      where
+        A: serde::de::MapAccess<'de>,
+      {
+        use serde::de::Error as _;
+
+        let mut interest = None;
+        let mut debounce = None;
+        let mut prune = None;
+        let mut include = None;
+
+        while let Some(key) = map.next_key::<Field>()? {
+          match key {
+            Field::Interest => {
+              if interest.is_some() {
+                return Err(A::Error::duplicate_field("interest"));
+              }
+              interest = Some(map.next_value()?);
+            }
+            Field::Debounce => {
+              if debounce.is_some() {
+                return Err(A::Error::duplicate_field("debounce"));
+              }
+              debounce = Some(map.next_value()?);
+            }
+            Field::Prune => {
+              if prune.is_some() {
+                return Err(A::Error::duplicate_field("prune"));
+              }
+              prune = Some(map.next_value::<PruneValue>()?.0);
+            }
+            Field::Include => {
+              if include.is_some() {
+                return Err(A::Error::duplicate_field("include"));
+              }
+              include = Some(map.next_value::<IncludeValue>()?.0);
+            }
+          }
+        }
+
+        let default = WatchOptions::<C>::default();
+        Ok(WatchOptions {
+          interest: interest.unwrap_or(default.interest),
+          filter: default.filter,
+          debounce: debounce.unwrap_or(default.debounce),
+          prune: prune.unwrap_or(default.prune),
+          include: include.unwrap_or(default.include),
+        })
+      }
+    }
+
+    deserializer.deserialize_struct("WatchOptions", FIELDS, Visitor(core::marker::PhantomData))
   }
 }
 

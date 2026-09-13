@@ -45,8 +45,7 @@
 /// the mask's `false`s — but an update is handed an existing mask, and writing
 /// `false` over a bit nobody mentioned would silently unsubscribe it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Interest {
   created: bool,
   removed: bool,
@@ -54,6 +53,228 @@ pub struct Interest {
   moved: bool,
   attrib: bool,
   ondir: bool,
+}
+
+/// The `serde` face's `Deserialize` half, kept by hand rather than derived: a
+/// document's KEY is read through a bounded identifier visitor, measured
+/// against the longest legal field name before it is matched against this
+/// household's own fields or echoed into an `unknown_field` refusal.
+///
+/// The identifier visitor `derive(Deserialize)` would otherwise generate hands
+/// the WHOLE rejected key to that refusal's formatter, so an untrusted key of
+/// unbounded length cost an allocation proportional to its own size — live at
+/// the same instant as the copy the format made to read it — before the
+/// six-word vocabulary it was about to fail was ever consulted. So the ceiling
+/// is judged first, on the bytes the format is already holding: a key past it
+/// is refused with a FIXED message naming the bound and the length, never the
+/// key itself; a key within it is matched, or refused by `unknown_field`
+/// exactly as the derive would. Every key is optional, defaulted from
+/// [`Interest::new`] (the struct-level default the derive's own `default`
+/// attribute read), and a repeated key is refused with `duplicate_field`.
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for Interest {
+  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+  where
+    D: serde::Deserializer<'de>,
+  {
+    const FIELDS: &[&str] = &["created", "removed", "modified", "moved", "attrib", "ondir"];
+
+    const MAX_FIELD_LEN: usize = {
+      let mut longest = 0;
+      let mut index = 0;
+      while index < FIELDS.len() {
+        if FIELDS[index].len() > longest {
+          longest = FIELDS[index].len();
+        }
+        index += 1;
+      }
+      longest
+    };
+
+    enum Field {
+      Created,
+      Removed,
+      Modified,
+      Moved,
+      Attrib,
+      Ondir,
+    }
+
+    impl<'de> serde::Deserialize<'de> for Field {
+      fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+      where
+        D: serde::Deserializer<'de>,
+      {
+        struct FieldVisitor;
+
+        impl serde::de::Visitor<'_> for FieldVisitor {
+          type Value = Field;
+
+          fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            write!(f, "a field name of at most {MAX_FIELD_LEN} bytes")
+          }
+
+          /// The one door, and the one every other text arm reaches:
+          /// `visit_borrowed_str` and `visit_string` are serde's own forwards
+          /// to it, so a key the format borrows out of its input is measured
+          /// without being copied at all, and one the format already owns is
+          /// measured before this face does anything with it.
+          fn visit_str<E>(self, name: &str) -> Result<Self::Value, E>
+          where
+            E: serde::de::Error,
+          {
+            if name.len() > MAX_FIELD_LEN {
+              // The length, never the value: an over-long key is exactly the
+              // input whose echo is the hazard.
+              return Err(E::custom(format_args!(
+                "field name longer than the {MAX_FIELD_LEN}-byte bound ({} bytes)",
+                name.len()
+              )));
+            }
+            match name {
+              "created" => Ok(Field::Created),
+              "removed" => Ok(Field::Removed),
+              "modified" => Ok(Field::Modified),
+              "moved" => Ok(Field::Moved),
+              "attrib" => Ok(Field::Attrib),
+              "ondir" => Ok(Field::Ondir),
+              _ => Err(E::unknown_field(name, FIELDS)),
+            }
+          }
+
+          /// The bytes-identifier door a format reads when its key comes as
+          /// raw bytes rather than `str` — bounded and echoed the same way
+          /// [`visit_str`](Self::visit_str) is.
+          fn visit_bytes<E>(self, name: &[u8]) -> Result<Self::Value, E>
+          where
+            E: serde::de::Error,
+          {
+            if name.len() > MAX_FIELD_LEN {
+              return Err(E::custom(format_args!(
+                "field name longer than the {MAX_FIELD_LEN}-byte bound ({} bytes)",
+                name.len()
+              )));
+            }
+            match name {
+              b"created" => Ok(Field::Created),
+              b"removed" => Ok(Field::Removed),
+              b"modified" => Ok(Field::Modified),
+              b"moved" => Ok(Field::Moved),
+              b"attrib" => Ok(Field::Attrib),
+              b"ondir" => Ok(Field::Ondir),
+              // Fully qualified: this crate is `no_std` without the `std`
+              // feature, and aliases `alloc` to the `std` name at the crate
+              // root for exactly this reason (see `lib.rs`) rather than
+              // bringing `String` into scope unqualified.
+              _ => Err(E::unknown_field(
+                &std::string::String::from_utf8_lossy(name),
+                FIELDS,
+              )),
+            }
+          }
+
+          /// The identifier door a NON-self-describing format answers with —
+          /// the field's declaration-order INDEX.
+          fn visit_u64<E>(self, index: u64) -> Result<Self::Value, E>
+          where
+            E: serde::de::Error,
+          {
+            match index {
+              0 => Ok(Field::Created),
+              1 => Ok(Field::Removed),
+              2 => Ok(Field::Modified),
+              3 => Ok(Field::Moved),
+              4 => Ok(Field::Attrib),
+              5 => Ok(Field::Ondir),
+              _ => Err(E::invalid_value(
+                serde::de::Unexpected::Unsigned(index),
+                &"a field index within Interest",
+              )),
+            }
+          }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+      }
+    }
+
+    struct Visitor;
+
+    impl<'de> serde::de::Visitor<'de> for Visitor {
+      type Value = Interest;
+
+      fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("struct Interest")
+      }
+
+      fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+      where
+        A: serde::de::MapAccess<'de>,
+      {
+        use serde::de::Error as _;
+
+        let mut created = None;
+        let mut removed = None;
+        let mut modified = None;
+        let mut moved = None;
+        let mut attrib = None;
+        let mut ondir = None;
+
+        while let Some(key) = map.next_key::<Field>()? {
+          match key {
+            Field::Created => {
+              if created.is_some() {
+                return Err(A::Error::duplicate_field("created"));
+              }
+              created = Some(map.next_value()?);
+            }
+            Field::Removed => {
+              if removed.is_some() {
+                return Err(A::Error::duplicate_field("removed"));
+              }
+              removed = Some(map.next_value()?);
+            }
+            Field::Modified => {
+              if modified.is_some() {
+                return Err(A::Error::duplicate_field("modified"));
+              }
+              modified = Some(map.next_value()?);
+            }
+            Field::Moved => {
+              if moved.is_some() {
+                return Err(A::Error::duplicate_field("moved"));
+              }
+              moved = Some(map.next_value()?);
+            }
+            Field::Attrib => {
+              if attrib.is_some() {
+                return Err(A::Error::duplicate_field("attrib"));
+              }
+              attrib = Some(map.next_value()?);
+            }
+            Field::Ondir => {
+              if ondir.is_some() {
+                return Err(A::Error::duplicate_field("ondir"));
+              }
+              ondir = Some(map.next_value()?);
+            }
+          }
+        }
+
+        let default = Interest::default();
+        Ok(Interest {
+          created: created.unwrap_or(default.created),
+          removed: removed.unwrap_or(default.removed),
+          modified: modified.unwrap_or(default.modified),
+          moved: moved.unwrap_or(default.moved),
+          attrib: attrib.unwrap_or(default.attrib),
+          ondir: ondir.unwrap_or(default.ondir),
+        })
+      }
+    }
+
+    deserializer.deserialize_struct("Interest", FIELDS, Visitor)
+  }
 }
 
 /// The `clap` face of [`Interest`]: the same six flags the mask derived before,

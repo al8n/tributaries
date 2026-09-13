@@ -319,6 +319,32 @@ fn an_empty_or_relative_exclusion_is_refused_by_validate() {
     .expect("an absolute exclusion is admissible");
 }
 
+/// A non-UTF-8 exclusion is refused the same way an empty or relative one is:
+/// the `serde` face can only ever hold UTF-8 (`deserialize_str`), so a
+/// household built through the programmatic builders must be held to the same
+/// domain, or a value they alone accepted could never be persisted and read
+/// back.
+#[cfg(unix)]
+#[test]
+fn a_non_utf8_exclusion_is_refused_by_validate() {
+  use std::{ffi::OsString, os::unix::ffi::OsStringExt as _};
+
+  assert_eq!(
+    WatcherOptions::new()
+      .with_exclusions(vec![PathBuf::from(OsString::from_vec(
+        b"/tmp/\xff".to_vec()
+      ))])
+      .validate(),
+    Err(OptionsError::ExclusionNotUtf8 { index: 0 })
+  );
+
+  // A UTF-8 absolute exclusion is unaffected.
+  WatcherOptions::new()
+    .with_exclusions(vec![PathBuf::from(abs_exclusion("repo/target"))])
+    .validate()
+    .expect("a UTF-8 absolute exclusion is admissible");
+}
+
 /// The `serde` face: one object keyed by the field names, every key optional.
 #[cfg(feature = "serde")]
 mod serde_face {
@@ -411,6 +437,22 @@ mod serde_face {
     );
   }
 
+  /// A household is not limited to one exclusion, and the `serde` face must be
+  /// able to hold whatever the programmatic and `clap` faces accept — every
+  /// legal exclusion, not just the first.
+  #[test]
+  fn two_exclusions_round_trip() {
+    let options = WatcherOptions::new().with_exclusions(vec![
+      PathBuf::from(abs_exclusion("repo/target")),
+      PathBuf::from(abs_exclusion("repo/node_modules")),
+    ]);
+    let json = serde_json::to_string(&options).unwrap();
+    assert_eq!(
+      serde_json::from_str::<WatcherOptions>(&json).unwrap(),
+      options
+    );
+  }
+
   /// A document naming ONE key leaves every other knob at the value `new()` gives
   /// it — the struct-level `#[serde(default)]`.
   #[test]
@@ -421,7 +463,10 @@ mod serde_face {
   }
 
   /// An unknown key is refused rather than silently ignored — a typo in a key
-  /// name must not silently drop the knob it was meant to set.
+  /// name must not silently drop the knob it was meant to set. The key is short
+  /// enough to stay inside the bounded identifier visitor's own ceiling (the
+  /// longest legal field name, `root_liveness_interval` at 22 bytes), so this is
+  /// the JUNK KEY INSIDE THE BOUND cell: the vocabulary answers, naming it.
   #[test]
   fn an_unknown_key_is_refused() {
     let err =
@@ -431,6 +476,40 @@ mod serde_face {
       err.to_string().contains("some_future_knob"),
       "the error names the unknown key: {err}"
     );
+  }
+
+  /// The struct-key sibling of the duration-text bound: a rejected key past the
+  /// bounded identifier visitor's ceiling costs a FIXED message and never an
+  /// allocation proportional to its own size.
+  #[test]
+  fn an_over_long_unknown_key_is_refused_without_echoing_it() {
+    let key: String = core::iter::repeat_n('z', 1024 * 1024).collect();
+    let document = format!(r#"{{"{key}": true}}"#);
+    let refusal = serde_json::from_str::<WatcherOptions>(&document)
+      .expect_err("a key past the longest field name is refused")
+      .to_string();
+
+    assert!(
+      refusal.contains("22-byte bound"),
+      "the refusal names the bound: {refusal}"
+    );
+    assert!(
+      refusal.contains(&key.len().to_string()),
+      "and the length it measured: {refusal}"
+    );
+    assert!(
+      !refusal.contains(&"z".repeat(9)),
+      "and none of the key itself: {refusal}"
+    );
+  }
+
+  /// A repeated key is refused rather than silently taking the last (or first)
+  /// value — the same `duplicate_field` verdict the derive would give.
+  #[test]
+  fn a_duplicate_key_is_refused() {
+    let err = serde_json::from_str::<WatcherOptions>(r#"{"latency": "10ms", "latency": "20ms"}"#)
+      .expect_err("a duplicate key is refused");
+    assert!(err.to_string().contains("duplicate field"), "{err}");
   }
 
   /// Every bounded key is judged WHERE IT IS READ: the bound itself parses, and one
@@ -1119,6 +1198,36 @@ mod clap_face {
     }
   }
 
+  /// A value whose bytes are not valid UTF-8 is refused as the parse reads it,
+  /// with the fixed message and never the bytes themselves — the same domain
+  /// `validate` and the `serde` face agree on.
+  #[cfg(unix)]
+  #[test]
+  fn a_non_utf8_exclusion_value_is_refused() {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt as _};
+
+    let argv: Vec<OsString> = vec![
+      OsString::from("app"),
+      OsString::from("--exclusions"),
+      OsString::from_vec(b"/tmp/\xff".to_vec()),
+    ];
+    let err = Cli::try_parse_from(argv)
+      .err()
+      .expect("a non-UTF-8 exclusion is refused by the parse");
+    assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    assert!(
+      err.render().to_string().contains("UTF-8"),
+      "the refusal is the fixed UTF-8 message: {}",
+      err.render()
+    );
+
+    // A UTF-8 absolute exclusion still parses.
+    assert_eq!(
+      parse(&["--exclusions", EXCLUSION_REPO_TARGET]).exclusions_slice(),
+      [PathBuf::from(EXCLUSION_REPO_TARGET)]
+    );
+  }
+
   /// And the ceiling, at the same flag: the occurrence past
   /// [`WatcherOptions::MAX_EXCLUSIONS`] is refused before the household is built.
   ///
@@ -1805,15 +1914,52 @@ mod root_options {
     }
 
     /// An unknown key is refused rather than silently ignored — a typo in a key
-    /// name must not silently drop the seat it was meant to set.
+    /// name must not silently drop the seat it was meant to set. The key is
+    /// short enough to stay inside the bounded identifier visitor's own ceiling
+    /// (the longest legal field name, `interest` at 8 bytes), so this is the
+    /// JUNK KEY INSIDE THE BOUND cell: the vocabulary answers, naming it.
     #[test]
     fn an_unknown_key_is_refused() {
-      let err = serde_json::from_str::<RootOptions>(r#"{"prune": [], "some_future_seat": 7}"#)
+      let err = serde_json::from_str::<RootOptions>(r#"{"prune": [], "future": 7}"#)
         .expect_err("an unknown key is refused");
       assert!(
-        err.to_string().contains("some_future_seat"),
+        err.to_string().contains("future"),
         "the error names the unknown key: {err}"
       );
+    }
+
+    /// The struct-key sibling of the per-pattern length bound: a rejected key
+    /// past the bounded identifier visitor's ceiling costs a FIXED message and
+    /// never an allocation proportional to its own size.
+    #[test]
+    fn an_over_long_unknown_key_is_refused_without_echoing_it() {
+      let key: String = core::iter::repeat_n('z', 1024 * 1024).collect();
+      let document = format!(r#"{{"{key}": true}}"#);
+      let refusal = serde_json::from_str::<RootOptions>(&document)
+        .expect_err("a key past the longest field name is refused")
+        .to_string();
+
+      assert!(
+        refusal.contains("8-byte bound"),
+        "the refusal names the bound: {refusal}"
+      );
+      assert!(
+        refusal.contains(&key.len().to_string()),
+        "and the length it measured: {refusal}"
+      );
+      assert!(
+        !refusal.contains(&"z".repeat(9)),
+        "and none of the key itself: {refusal}"
+      );
+    }
+
+    /// A repeated key is refused rather than silently taking the last (or
+    /// first) value — the same `duplicate_field` verdict the derive would give.
+    #[test]
+    fn a_duplicate_key_is_refused() {
+      let err = serde_json::from_str::<RootOptions>(r#"{"prune": [], "prune": []}"#)
+        .expect_err("a duplicate key is refused");
+      assert!(err.to_string().contains("duplicate field"), "{err}");
     }
 
     /// An invalid pattern is refused by the DOCUMENT, not carried as a seat that
