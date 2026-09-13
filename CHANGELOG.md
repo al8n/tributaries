@@ -789,6 +789,37 @@ domination `Rescan` is stood — and nothing else in either crate behaves differ
 
 ### Added
 
+- **`tributary-fs`** — a mount arriving, departing or being replaced **below a
+  watched root** is now covered (#74). No kernel signals such a change on any
+  backend — a lazy `umount -l` just stops the watches under it from meaning
+  anything, and an arriving mount hides ground that was already enumerated — so
+  the periodic mount sample (`WatcherOptions::root_liveness_interval`, now armed
+  by both Linux profiles rather than fanotify alone) compares the table under the
+  root against the last one it read, and answers ANY difference with one
+  whole-root `Rescan`. Deliberately coarse: there is no census of boundaries and
+  no ledger, so the statement is "the tree under this root changed, re-read it"
+  rather than a located one, and the cost is one whole-root re-read per interval
+  in which the table moved. A fanotify root RESEEDS its FID map over the whole
+  root before the `Rescan` is emitted — its sight stops at mount boundaries, so a
+  consumer told to re-read first would see the revealed subtree once and never
+  hear about it again. On a kernel below 6.8 (no never-recycled mount id) a
+  mount-namespace transition anywhere on the host is consumed as a cover, since
+  a recycled id can make a replacement compare equal to continuity. That rule is
+  per ROW: a sample speaks for itself only when EVERY row carries the id, so one
+  row whose read was refused still consults the transition count. The baseline
+  itself is seeded at every world start from that world's own barrier table
+  (spawn, replace, widen), which is read before the tree is walked — so a mount
+  that departs between the barrier and the first sample is covered rather than
+  absorbed into it. And every coverage walk now REPORTS the mount boundaries it
+  honored, so a mount that arrives over ground a walk was about to read and departs
+  before any sample lists it — invisible to a row-to-row diff, since no table ever
+  held it — is covered by the next sample instead of leaving that ground unread.
+  Finally, `/proc/self/mountinfo` is now STREAMED under explicit line and row
+  ceilings and only the rows strictly under the root are retained, so a namespace
+  with a huge mount table no longer allocates its whole representation once per due
+  scope; a reading past either ceiling is refused whole and answered with one
+  whole-root `Rescan`, never truncated and never trusted.
+
 - **`tributaries`** — a caller-visible **sync barrier** (#23): `Tributaries::sync(sub,
   timeout)` resolves once every change made under the subscription's key BEFORE the
   call is deliverable. It is kernel-mediated, not an owner-side drain: a cookie file

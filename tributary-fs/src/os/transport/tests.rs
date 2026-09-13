@@ -69,6 +69,10 @@ impl Model {
         self.processed.push((pos, Kind::Overflow));
       }
       SourceMessage::Fatal(_) => self.fatals += 1,
+      // Not a queue position the dedup reasons about: it neither delivers nor
+      // loses, so this model records nothing for it.
+      #[cfg(all(target_os = "linux", not(miri)))]
+      SourceMessage::Honored(_) => {}
     }
     true
   }

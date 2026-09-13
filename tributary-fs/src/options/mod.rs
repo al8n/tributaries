@@ -1782,15 +1782,19 @@ impl WatcherOptions {
   /// fanotify-FILESYSTEM and falls back to inotify).
   pub const DEFAULT_BACKEND: Backend = Backend::Auto;
 
-  /// The default periodic root-liveness interval (30 s) — the detection-latency
-  /// bound for a root death no in-band signal reports in time. A
+  /// The default periodic mount-table sample (30 s) — the detection-latency
+  /// bound for the changes no in-band signal reports in time. A
   /// `FAN_MARK_FILESYSTEM`-watched superblock unmounted out from under the watch
-  /// emits NO kernel signal, and an inotify root's
-  /// `IN_DELETE_SELF` is queued only once the last reference to it drops, so a
-  /// periodic root re-stat is what bounds both. FSEvents' `RootChanged` and both
-  /// Windows backends' own fatal-source-error report on a lost root or volume
-  /// arrive regardless of anything this crate holds, so those ignore this knob.
-  /// See [`root_liveness_interval`](Self::root_liveness_interval).
+  /// emits NO kernel signal, an inotify root's `IN_DELETE_SELF` is queued only
+  /// once the last reference to it drops, and a mount arriving, departing or
+  /// being replaced BELOW the root is signalled by no backend at all — one
+  /// periodic sample bounds all three. Both Linux profiles sample; FSEvents'
+  /// `RootChanged` and both Windows backends' own fatal-source-error report on a
+  /// lost root or volume arrive regardless of anything this crate holds, and
+  /// their streams follow nested volumes themselves, so those ignore this knob.
+  /// Any table difference costs one whole-root
+  /// [`Rescan`](crate::EventKind::Rescan) — see
+  /// [`root_liveness_interval`](Self::root_liveness_interval).
   pub const DEFAULT_ROOT_LIVENESS_INTERVAL: Duration = Duration::from_secs(30);
 
   /// The largest periodic root-liveness interval (one day).
@@ -1798,7 +1802,8 @@ impl WatcherOptions {
   /// The interval is armed as a deadline (`now + interval`) whose arithmetic
   /// SATURATES, so an enormous one does not crash — it silently arms a deadline
   /// that never fires, disabling the Linux profiles' out-of-band root-death
-  /// detector while looking configured. [`Duration::ZERO`](Duration::ZERO) is
+  /// detector — and every sampling profile's only mount-change detector — while
+  /// looking configured. [`Duration::ZERO`](Duration::ZERO) is
   /// how a caller says
   /// "disabled"; anything past a day is the accidental spelling of it, and gets
   /// a typed refusal instead. One day is also the ceiling
@@ -2214,16 +2219,16 @@ impl WatcherOptions {
     self
   }
 
-  /// The periodic root-liveness interval — the detection-latency bound for a
-  /// root death the backend's own signal does not report in time.
+  /// The periodic mount-table sample — the detection-latency bound for the
+  /// filesystem changes no kernel signal describes in time.
   ///
-  /// The driver re-stats such a root on this cadence and lowers its death (a
-  /// terminal [`Rescan`](crate::EventKind::Rescan) and registry reclamation)
-  /// when the path no longer names the watched object. This is the WORST-CASE
-  /// latency: a death is also caught immediately by any loss signal (which
-  /// already re-reads the mount table), so the tick only bounds the quiet case.
+  /// # The silences
   ///
-  /// Both Linux backends consult it, for two different reasons:
+  /// **The ROOT itself, dead with no signal this crate can wait on.** The driver
+  /// re-stats such a root on this cadence and lowers its death (a terminal
+  /// [`Rescan`](crate::EventKind::Rescan) and registry reclamation) when the path
+  /// no longer names the watched object. Both Linux backends need it, for two
+  /// different reasons:
   ///
   /// - **fanotify** (`FAN_MARK_FILESYSTEM`) unmounted out from under the watch
   ///   delivers no kernel signal at all — the mark holds the superblock alive
@@ -2235,14 +2240,50 @@ impl WatcherOptions {
   ///   stalled filesystem has no bound. The tick is the observation that does not
   ///   wait on them.
   ///
-  /// FSEvents (`RootChanged`) and both Windows backends (a fatal source error the
-  /// moment the root or its volume is gone) report root death through their own
-  /// streams, with nothing this crate holds able to postpone it, so they never
-  /// arm the tick and the knob is inert for them.
+  /// **A mount BELOW the root arriving, departing or being replaced.** There is
+  /// no such signal on any backend, for any backend: a lazy unmount
+  /// (`umount -l`) simply stops the watches under it from meaning anything, with
+  /// no `IN_UNMOUNT` and no `IN_IGNORED`, and a mount that arrives hides ground
+  /// that was already enumerated. The same sample sees both, by comparing the
+  /// table under the root against the last one it read.
   ///
-  /// [`Duration::ZERO`] DISABLES the tick: such a death is then observed only at
-  /// the next loss-triggered refresh (or never, if none occurs) — the pre-L4.2
-  /// behavior, quiet-but-alive with the root observably gone on re-access.
+  /// Either way this is the WORST-CASE latency: both are also caught immediately
+  /// by any loss signal, which already re-reads the table, so the cadence only
+  /// bounds the quiet case.
+  ///
+  /// # What a change costs
+  ///
+  /// **Any difference between two samples of the table under the root costs one
+  /// whole-root [`Rescan`](crate::EventKind::Rescan)** — unconditionally, on
+  /// every kernel and every backend that samples. Not a located statement about
+  /// the mount that moved: the crate keeps no census of the boundaries under a
+  /// root and no ledger to keep one honest across renames, so what it can say is
+  /// that the tree changed and the consumer should re-read it. A `Rescan` is a
+  /// coverage statement, not a delivery, and re-reading the root is what the
+  /// consumer would do for a located one anyway.
+  ///
+  /// Two consequences worth budgeting for, both bounded by this interval:
+  ///
+  /// - a root over a directory that mounts and unmounts frequently (an
+  ///   automounter, a container runtime's per-container tree) pays one whole-root
+  ///   `Rescan` per interval in which the table moved;
+  /// - on a Linux kernel below 6.8, which has no never-recycled mount id, the
+  ///   sample cannot always tell a replacement from continuity — so a
+  ///   mount-namespace transition ANYWHERE on the host is consumed as a cover for
+  ///   every such root. On 6.8+ the per-row unique ids answer for themselves and
+  ///   unrelated churn costs nothing.
+  ///
+  /// # Which backends consult it
+  ///
+  /// Both Linux profiles, fanotify and inotify. FSEvents (`RootChanged`) and both
+  /// Windows backends (a fatal source error the moment the root or its volume is
+  /// gone) report root death through their own streams with nothing this crate
+  /// holds able to postpone it, and their streams follow nested volumes
+  /// themselves, so they never arm the tick and the knob is inert for them.
+  ///
+  /// [`Duration::ZERO`] DISABLES the sample: a root death no in-band signal
+  /// reports — and a quiet unmount of anything under the root — is then observed
+  /// only at the next loss-triggered refresh (or never, if none occurs).
   #[inline]
   pub const fn root_liveness_interval(&self) -> Duration {
     self.root_liveness_interval

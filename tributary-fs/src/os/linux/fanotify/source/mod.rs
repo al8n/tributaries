@@ -67,7 +67,7 @@ use std::{
     fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
     unix::fs::MetadataExt,
   },
-  path::Path,
+  path::{Path, PathBuf},
   sync::{Arc, mpsc},
   thread::JoinHandle,
 };
@@ -275,7 +275,8 @@ impl Source {
         source,
       }),
     })?;
-    map.seed(seed);
+    let honored = seed.honored;
+    map.seed(seed.entries);
 
     let stats = Arc::new(super::super::super::BackendStatsShared::default());
     let (queue_tx, queue_rx) = async_channel::unbounded();
@@ -285,6 +286,26 @@ impl Source {
       buffer_bytes: config.os_buffer_bytes.get() as usize,
       stats: Arc::clone(&stats),
     });
+
+    // The seed walk's honored mount boundaries (#74), reported on the source's OWN
+    // ordered queue rather than on the barrier's return value. Every walk this
+    // source ever runs reports the same way — the spawn seed here, the loss reseed
+    // and the requested whole-root reseed and each moved-in subtree walk from the
+    // reader thread — so there is one report channel and one rule, instead of a
+    // barrier field that only the first walk could ever use.
+    //
+    // Queued BEFORE the reader thread starts, so it sits at the head of the lane
+    // and the core learns of these boundaries at the earliest moment it learns
+    // anything from this source at all. It is checked against the first
+    // authoritative mount sample that follows its arrival — the birth refresh when
+    // the driver drains the lane first, the next one otherwise; either way within
+    // one liveness interval, and only a boundary the table no longer carries costs
+    // anything.
+    if !honored.is_empty() {
+      let _ = shared
+        .queue
+        .try_send(crate::os::SourceMessage::Honored(honored));
+    }
 
     let wake = WakeState::new()?;
     let (control_tx, control_rx) = mpsc::channel();
@@ -512,7 +533,7 @@ impl ReseedContext {
   /// path-authority is lost, and the mount/liveness refresh — which re-resolves the
   /// root BY PATH — will reject it and kill the scope regardless; a fatal now is
   /// that same death, sooner and without the map ever rebinding to the replacement.
-  pub(crate) fn walk(&self) -> io::Result<Vec<SeedEntry>> {
+  pub(crate) fn walk(&self) -> io::Result<SeedWalk> {
     seed_walk(
       &self.root,
       self.fsid,
@@ -535,7 +556,7 @@ impl ReseedContext {
   /// viable → fall back / typed error) from a vanished root (root-unavailable). Only
   /// the pre-live spawn calls this; the live reseed re-opens the path via the
   /// `io::Error`-folding [`walk`](Self::walk).
-  fn seed_at_fd(&self, root_fd: BorrowedFd<'_>) -> Result<Vec<SeedEntry>, WalkError> {
+  fn seed_at_fd(&self, root_fd: BorrowedFd<'_>) -> Result<SeedWalk, WalkError> {
     let root_fd = root_fd.try_clone_to_owned().map_err(WalkError::RootGone)?;
     // The spawn passes the CAPTURED `root_mnt_id` (unlike the reseed/subtree walks,
     // which re-read it from the fd they reopened): it was read from THIS very pin at
@@ -582,7 +603,7 @@ impl ReseedContext {
     subtree: &Path,
     subtree_fid: &Fid,
     budget: Option<usize>,
-  ) -> io::Result<Vec<SeedEntry>> {
+  ) -> io::Result<SeedWalk> {
     subtree_walk(
       subtree,
       subtree_fid,
@@ -667,6 +688,30 @@ fn classify_walk_skip(err: Errno) -> WalkSkip {
     Errno::NOENT | Errno::LOOP | Errno::NOTDIR => WalkSkip::VanishedRace,
     _ => WalkSkip::Incomplete,
   }
+}
+
+/// What one completed walk produced: the directories it mapped, and the mount
+/// boundaries it HONORED on the way (#74).
+///
+/// The two travel together because they are two halves of one statement about the
+/// tree. The entries say what this source can now see; the boundaries say where it
+/// deliberately stopped, and therefore which ground is covered by a mount rather
+/// than by this map. A boundary that is gone by the next authoritative mount
+/// sample was hiding ground no walk ever read and no table ever listed, which is
+/// the one shape the periodic row diff cannot see on its own — so the core is told
+/// about it and asks the next sample whether the mount is still there.
+///
+/// Only a PROVEN mount boundary is listed: the walk compared two mount ids and
+/// they differed. A child declined by the device belt alone is not listed, because
+/// a differing device is not necessarily a mount (a btrfs subvolume has its own
+/// and no mountinfo row), and a location no table will ever carry would cover the
+/// whole root on every interval for the life of the scope.
+#[derive(Debug)]
+pub(crate) struct SeedWalk {
+  /// One entry per directory the walk mapped, each linked to its parent.
+  pub(crate) entries: Vec<SeedEntry>,
+  /// The absolute location of every mount boundary the walk stopped at.
+  pub(crate) honored: Vec<PathBuf>,
 }
 
 /// Why the seed walk stopped, when it did not complete. The reseed path folds
@@ -754,7 +799,7 @@ fn seed_walk(
   expected: &Fid,
   fence: super::Fence<'_>,
   max_directories: Option<usize>,
-) -> Result<Vec<SeedEntry>, WalkError> {
+) -> Result<SeedWalk, WalkError> {
   // Pin the root as an fd (no-symlink resolution) BEFORE anything else: its
   // handle and its children both come from this fd, never a re-resolved name. A
   // failure to open it is a race reported as root-unavailable (the probe already
@@ -858,7 +903,7 @@ fn seed_from_fd(
   fence_mnt_id: Option<u64>,
   fence: super::Fence<'_>,
   max_directories: Option<usize>,
-) -> Result<Vec<SeedEntry>, WalkError> {
+) -> Result<SeedWalk, WalkError> {
   // The root anchor is load-bearing: without its handle the map has no base to
   // resolve any path against, so its absence is a spawn/reseed failure, never an
   // empty success. Encoded from the pinned fd, so it names exactly the object we
@@ -883,6 +928,7 @@ fn seed_from_fd(
     )));
   }
   let mut seed = vec![SeedEntry::root(root_fid.clone(), root)];
+  let mut honored = Vec::new();
   descend(
     root_fd,
     root_fid,
@@ -895,8 +941,12 @@ fn seed_from_fd(
       budget: max_directories,
     },
     &mut seed,
+    &mut honored,
   )?;
-  Ok(seed)
+  Ok(SeedWalk {
+    entries: seed,
+    honored,
+  })
 }
 
 /// Walks the descendants of a directory MOVED IN from outside the root and
@@ -934,7 +984,7 @@ fn subtree_walk(
   root_dev: u64,
   fence: super::Fence<'_>,
   budget: Option<usize>,
-) -> Result<Vec<SeedEntry>, WalkError> {
+) -> Result<SeedWalk, WalkError> {
   // The moved directory is still in-map and pending its walk, so pinning it must
   // succeed: any failure (a vanish/shape-change included) is a coverage hole, not
   // a race — Incomplete, escalated through the reader's retry-then-fatal. Pinned
@@ -963,6 +1013,7 @@ fn subtree_walk(
   let fence_mnt_id =
     root_mount_id(subtree_fd.as_fd()).map_err(|err| WalkError::Incomplete(err.into()))?;
   let mut seed = Vec::new();
+  let mut honored = Vec::new();
   descend(
     subtree_fd,
     subtree_fid.clone(),
@@ -975,8 +1026,12 @@ fn subtree_walk(
       budget,
     },
     &mut seed,
+    &mut honored,
   )?;
-  Ok(seed)
+  Ok(SeedWalk {
+    entries: seed,
+    honored,
+  })
 }
 
 /// One open directory in the descent: the pinned fd (the descent reads its
@@ -1091,6 +1146,7 @@ fn descend(
   root_path: &Path,
   frame: &WalkFrame<'_>,
   seed: &mut Vec<SeedEntry>,
+  honored: &mut Vec<PathBuf>,
 ) -> Result<(), WalkError> {
   let &WalkFrame {
     fsid,
@@ -1199,12 +1255,30 @@ fn descend(
     // `st_dev`/`st_mode` are `u64`/`u32` on every Linux target (the 32-bit
     // `Stat` declares them so explicitly, the 64-bit `c_ulong`/`c_uint` aliases
     // resolve to the same), so the comparisons need no conversion.
-    if stat.st_dev != root_dev {
-      // A mount boundary (the cheap belt): a different device is always a different
-      // superblock, not descended. `O_DIRECTORY` already guaranteed it is a
-      // directory, so this is purely the device fence.
-      continue;
-    }
+    // The child's own mount id, read BEFORE either fence decides rather than only
+    // for the children the device belt let through. The extra read buys the one
+    // distinction the walk now owes the mount-change cover (#74): a child skipped
+    // for a differing MOUNT was a boundary this walk HONORED, and every mount has
+    // a row in the table, so its later absence from a sample is provable. A child
+    // skipped only for its DEVICE need not be a mount at all — a btrfs subvolume
+    // carries its own `st_dev` with no mountinfo row anywhere — and reporting one
+    // as an honored boundary would have every sample look for a row that never
+    // existed and cover the whole root for it, on every interval, forever. Where
+    // the kernel answers no mount id, no row of a sample carries a never-recycled
+    // one either, so the namespace-transition clause is live and covers what this
+    // fence cannot prove.
+    //
+    // A statx SYSCALL failure on the child is classified like the `fstat` above
+    // ([`classify_walk_skip`]) — a vanish/shape-change race is skipped, anything
+    // else is `Incomplete` — never laundered into a belt-only admission of a child
+    // whose mount could not be read.
+    let child_mnt_id = match root_mount_id(child_fd.as_fd()) {
+      Ok(child_mnt_id) => child_mnt_id,
+      Err(err) => match classify_walk_skip(err) {
+        WalkSkip::VanishedRace => continue,
+        WalkSkip::Incomplete => return Err(WalkError::Incomplete(err.into())),
+      },
+    };
     // The PRIMARY mount fence: a child on a different MOUNT is a submount the mark
     // never reports on — skipped exactly as the device belt skips a foreign device.
     // This is what the device belt cannot catch: a `mount --bind` of a
@@ -1221,16 +1295,26 @@ fn descend(
     // ([`classify_walk_skip`]) — a vanish/shape-change race is skipped, anything else
     // is `Incomplete` — never laundered into a belt-only admission of a child whose
     // mount could not be read.
-    let child_mnt_id = match root_mount_id(child_fd.as_fd()) {
-      Ok(child_mnt_id) => child_mnt_id,
-      Err(err) => match classify_walk_skip(err) {
-        WalkSkip::VanishedRace => continue,
-        WalkSkip::Incomplete => return Err(WalkError::Incomplete(err.into())),
-      },
-    };
     if let (Some(root_mnt), Some(child_mnt)) = (fence_mnt_id, child_mnt_id)
       && root_mnt != child_mnt
     {
+      // The one place this walk PROVES it stopped at a mount, and therefore the
+      // one place it reports a boundary it honored. The ground below is another
+      // mount's and never this scope's; the ground BENEATH the mount is this
+      // scope's and is hidden for exactly as long as the mount stands. So the
+      // location is carried out to the core, which asks one question of the next
+      // authoritative sample: is this mount still in the table? Gone, and nothing
+      // ever sampled it, so the ground it was hiding is unread — one whole-root
+      // cover. Still there, and it enters the fingerprint like any other row, so
+      // its eventual departure is an ordinary difference.
+      honored.push(child_path);
+      continue;
+    }
+    if stat.st_dev != root_dev {
+      // The device belt, asked second: a different device is always a different
+      // superblock and is never descended. `O_DIRECTORY` already guaranteed it is
+      // a directory, so this is purely the device fence — and deliberately SILENT,
+      // because what it stops at need not be a mount at all.
       continue;
     }
     if stat.st_mode & S_IFMT != S_IFDIR {
@@ -1397,6 +1481,57 @@ impl SourceHandle {
     if let Err(payload) = thread.join() {
       let _ = tributary_proto::unwind::dispose_panic_payload(payload);
     }
+  }
+}
+
+impl SourceHandle {
+  /// The clonable port a whole-root recovery is requested through — the control
+  /// channel plus the wake that makes the reader look at it.
+  ///
+  /// Handed to the driver at attach, exactly as the inotify source hands over its
+  /// arm port, so the request never needs the (non-clonable, teardown-owning)
+  /// handle itself.
+  pub(crate) fn recovery_port(&self) -> RecoveryPort {
+    RecoveryPort {
+      control: self.control.clone(),
+      wake: Arc::clone(&self.wake),
+    }
+  }
+}
+
+/// The clonable port one whole-root FID-map reseed is requested through (#74).
+///
+/// `Debug` because [`ScopePort`](crate::os::ScopePort) derives it and carries this
+/// variant: a port with no `Debug` form makes the whole seam underivable on Linux
+/// while every other host still compiles.
+#[derive(Debug, Clone)]
+pub(crate) struct RecoveryPort {
+  control: mpsc::Sender<Control>,
+  wake: Arc<WakeState>,
+}
+
+impl RecoveryPort {
+  /// Requests one whole-root reseed and BLOCKS until the reader has done it.
+  ///
+  /// Called on the driver's blocking pool. Blocking is the point: the core may
+  /// not tell the consumer to re-read until the source can see the ground it will
+  /// read, so the answer has to be waited for somewhere, and the pool is the one
+  /// place in the driver where waiting costs nothing but a thread.
+  ///
+  /// Every failure is [`RootRecovery::Unreachable`](crate::os::RootRecovery::Unreachable)
+  /// and none of them is guessed at: a reader already gone refuses the send, and a
+  /// reader that dies mid-request drops the reply sender, which ends the wait. A
+  /// source whose sight cannot be rebuilt is blind, and blind is what the core is
+  /// told.
+  pub(crate) fn recover(&self) -> crate::os::RootRecovery {
+    let (reply, answer) = mpsc::sync_channel(1);
+    if self.control.send(Control::Reseed { reply }).is_err() {
+      return crate::os::RootRecovery::Unreachable;
+    }
+    self.wake.wake();
+    answer
+      .recv()
+      .unwrap_or(crate::os::RootRecovery::Unreachable)
   }
 }
 

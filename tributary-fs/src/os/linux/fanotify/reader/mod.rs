@@ -60,7 +60,7 @@ use super::{
   Admission, MemoBatch, classify,
   fid::{AbiMismatch, FANOTIFY_METADATA_VERSION, decode_events},
   map::{FidMap, SeedEntry},
-  source::ReseedContext,
+  source::{ReseedContext, SeedWalk},
 };
 
 /// What the reader shares with the handle side: the ordered queue, the
@@ -76,10 +76,88 @@ pub(crate) struct ReaderShared {
   pub(crate) stats: std::sync::Arc<BackendStatsShared>,
 }
 
-/// One control request. fanotify has no arm traffic, so shutdown is the only
-/// message.
+/// One control request. fanotify has no arm traffic; the two messages are the
+/// teardown and the whole-root reseed the core asks for when the mount table
+/// under the root changed (#74).
 pub(crate) enum Control {
   Shutdown,
+  /// Rebuild the FID map over the WHOLE root and answer on `reply`.
+  ///
+  /// Served on the reader thread because the map lives there and nowhere else,
+  /// and served BETWEEN reads so a walk never runs concurrently with a decode of
+  /// the same map. The requester blocks on `reply` on the driver's blocking pool
+  /// — never on its task — so a long walk costs a pool thread and nothing else;
+  /// a reader that exits without answering DROPS the sender, which the requester
+  /// reads as the failure it is rather than waiting forever.
+  Reseed {
+    reply: mpsc::SyncSender<crate::os::RootRecovery>,
+  },
+}
+
+/// Drains every pending control message, SERVICING each reseed inline, and
+/// answers whether a shutdown was among them.
+///
+/// One drain rather than one `try_recv`, because a `Reseed` sitting in front of a
+/// `Shutdown` would otherwise be taken off the queue and discarded by a
+/// shutdown-only match — leaving the requester blocked until the reader's exit
+/// dropped the channel. Every message is looked at; teardown still wins, because
+/// the answer only says whether one was seen.
+fn service_control(
+  control: &mpsc::Receiver<Control>,
+  map: &mut FidMap,
+  reseed: &ReseedContext,
+  shared: &ReaderShared,
+) -> bool {
+  let mut shutdown = false;
+  while let Ok(message) = control.try_recv() {
+    match message {
+      Control::Shutdown => shutdown = true,
+      Control::Reseed { reply } => {
+        // A refused send is a requester that gave up (its pool thread went away
+        // with the scope); the map is rebuilt either way, which is the half that
+        // matters to the stream.
+        let recovered = run_root_recovery(map, reseed, &shared.stats, |msg| {
+          shared.queue.try_send(msg).is_ok()
+        });
+        let _ = reply.send(recovered);
+      }
+    }
+  }
+  shutdown
+}
+
+/// Rebuilds the map over the whole root for one [`Control::Reseed`], on the same
+/// retry-then-concede policy a post-loss reseed uses.
+///
+/// It does NOT signal a fatal on failure, and that is the one difference. A
+/// loss-driven reseed that goes blind has no other reporting path, so it
+/// escalates itself; this one is a REQUEST with a reply, and the core is owed the
+/// verdict — it turns an unreachable root into the same death lifecycle a
+/// refresh's liveness gate does. Escalating here as well would race two terminals
+/// for one fact.
+fn run_root_recovery<Q>(
+  map: &mut FidMap,
+  reseed: &ReseedContext,
+  stats: &BackendStatsShared,
+  send: Q,
+) -> crate::os::RootRecovery
+where
+  Q: FnMut(crate::os::SourceMessage) -> bool,
+{
+  stats.record_reseed();
+  let started = std::time::Instant::now();
+  let outcome = reseed_map(map, || reseed.walk());
+  stats.record_walk(walk_micros(started));
+  match outcome {
+    // The boundaries this walk honored go out on the QUEUE, not on the reply: the
+    // reply answers whether the map was rebuilt, and the boundaries are a fact
+    // about the tree that every walk of this source reports the same way (#74).
+    ReseedOutcome::Reseeded { honored } => {
+      report_honored(honored, send);
+      crate::os::RootRecovery::Reseeded
+    }
+    ReseedOutcome::Blind => crate::os::RootRecovery::Unreachable,
+  }
 }
 
 /// Starts the reader thread. The fd, the wake eventfd, the seeded `FidMap`, and
@@ -142,7 +220,7 @@ fn run(
     // (the lost-wakeup guard — see `WakeState`; a shutdown enqueued before the
     // fence is visible here).
     wake.arm_park();
-    if matches!(control.try_recv(), Ok(Control::Shutdown)) {
+    if service_control(control, map, reseed, shared) {
       return;
     }
     let event = wake.event_fd();
@@ -168,7 +246,7 @@ fn run(
 
     if event_ready {
       wake.drain();
-      if matches!(control.try_recv(), Ok(Control::Shutdown)) {
+      if service_control(control, map, reseed, shared) {
         return;
       }
     }
@@ -203,8 +281,9 @@ enum DrainExit {
 /// the top of the loop, before the next read/decode, so a reseed or subtree walk
 /// from the PREVIOUS buffer has fully completed before it runs: a shutdown that
 /// lands mid-reseed quiesces cleanly at the next read boundary rather than
-/// interrupting the walk. fanotify has no arm traffic, so shutdown is the only
-/// control message. Returns [`DrainExit::Died`] when the stream died (fatal
+/// interrupting the walk. A requested whole-root reseed ([`Control::Reseed`]) is
+/// served at that same boundary and for the same reason — the walk and a decode
+/// of the map never overlap. Returns [`DrainExit::Died`] when the stream died (fatal
 /// already signaled — a failed read, a foreign event-metadata ABI version, or a
 /// recovery that could not restore sight), [`DrainExit::Shutdown`] on a
 /// mid-drain shutdown, and [`DrainExit::Parked`] when the instance drained
@@ -218,7 +297,7 @@ fn drain_events(
   shared: &ReaderShared,
 ) -> DrainExit {
   loop {
-    if matches!(control.try_recv(), Ok(Control::Shutdown)) {
+    if service_control(control, map, reseed, shared) {
       return DrainExit::Shutdown;
     }
     let n = match rustix::io::read(fd, &mut *buf) {
@@ -320,8 +399,8 @@ fn process_decoded<R, S, Q>(
   mut send: Q,
 ) -> bool
 where
-  R: FnMut() -> std::io::Result<Vec<SeedEntry>>,
-  S: FnMut(&std::path::Path, &super::fid::Fid, Option<usize>) -> std::io::Result<Vec<SeedEntry>>,
+  R: FnMut() -> std::io::Result<SeedWalk>,
+  S: FnMut(&std::path::Path, &super::fid::Fid, Option<usize>) -> std::io::Result<SeedWalk>,
   Q: FnMut(crate::os::SourceMessage) -> bool,
 {
   let &BufferContext {
@@ -424,10 +503,18 @@ where
             // stays `None`.
             let budget = map.remaining_capacity();
             let started = std::time::Instant::now();
+            // The subtree walk is a walk like any other, so it accounts for where
+            // it stopped like any other (#74): a directory moved in from outside
+            // the root can carry submounts, and one that departs before any sample
+            // lists it leaves ground inside the moved subtree that nothing read.
+            let mut walked_boundaries = Vec::new();
             let outcome = seed_moved_in_subtree(map, &moved_fid, |subtree, subtree_fid| {
-              subtree_walk(subtree, subtree_fid, budget)
+              let walked = subtree_walk(subtree, subtree_fid, budget)?;
+              walked_boundaries.extend(walked.honored);
+              Ok(walked.entries)
             });
             stats.record_walk(walk_micros(started));
+            report_honored(walked_boundaries, &mut send);
             if matches!(outcome, SeedOutcome::Blind) {
               // The subtree could not be mapped from the path the map resolves it
               // to. Take the loss barrier rather than the terminal: a reseed both
@@ -534,35 +621,63 @@ fn reseed_after_loss<R, Q>(
   stats: &BackendStatsShared,
   reseed_walk: R,
   transport: &transport::TransportState,
-  send: Q,
+  mut send: Q,
 ) -> bool
 where
-  R: FnMut() -> std::io::Result<Vec<SeedEntry>>,
+  R: FnMut() -> std::io::Result<SeedWalk>,
   Q: FnMut(crate::os::SourceMessage) -> bool,
 {
   stats.record_reseed();
   let started = std::time::Instant::now();
   let outcome = reseed_map(map, reseed_walk);
   stats.record_walk(walk_micros(started));
-  if matches!(outcome, ReseedOutcome::Blind) {
-    transport::signal_fatal_once(
-      transport,
-      SourceError::ReadFailed {
-        source: reseed_blind_error(),
-      },
-      send,
-    );
-    return false;
+  match outcome {
+    ReseedOutcome::Blind => {
+      transport::signal_fatal_once(
+        transport,
+        SourceError::ReadFailed {
+          source: reseed_blind_error(),
+        },
+        &mut send,
+      );
+      false
+    }
+    // The rebuilt map stops at the same mount boundaries the old one did, and a
+    // boundary this walk honored may be gone before any sample ever lists it
+    // (#74). Reported in band, AHEAD of the `Overflow` this branch goes on to
+    // signal, so it cannot be reordered behind the cover it may itself cause.
+    ReseedOutcome::Reseeded { honored } => {
+      report_honored(honored, &mut send);
+      true
+    }
   }
-  true
+}
+
+/// Forwards one walk's honored mount boundaries on the source's own ordered queue
+/// (#74), and does nothing at all for a walk that honored none.
+///
+/// The empty case is the common one — a root with no submounts under it — and
+/// sending for it would put one message per walk on the lane to say nothing. The
+/// core's rule is the same either way: a boundary reported is checked against the
+/// next authoritative sample and costs a whole-root cover only when the table no
+/// longer carries it.
+fn report_honored<Q>(honored: Vec<std::path::PathBuf>, mut send: Q)
+where
+  Q: FnMut(crate::os::SourceMessage) -> bool,
+{
+  if !honored.is_empty() {
+    let _ = send(crate::os::SourceMessage::Honored(honored));
+  }
 }
 
 /// Whether a loss-triggered reseed restored the map's sight.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ReseedOutcome {
   /// The walk succeeded (on the first try or the single retry) and the map was
-  /// rebuilt.
-  Reseeded,
+  /// rebuilt, honoring the mount boundaries it carries (#74) — the walk's own
+  /// account of where it stopped, which the caller reports in band so the next
+  /// authoritative mount sample can ask whether those mounts are still there.
+  Reseeded { honored: Vec<std::path::PathBuf> },
   /// The walk failed twice: the map is stale and the source is blind. The caller
   /// escalates to the terminal `Fatal` rather than run on permanently.
   Blind,
@@ -576,12 +691,14 @@ enum ReseedOutcome {
 /// (a directory momentarily unreadable mid-walk) without killing the scope.
 fn reseed_map<W>(map: &mut FidMap, mut walk: W) -> ReseedOutcome
 where
-  W: FnMut() -> std::io::Result<Vec<SeedEntry>>,
+  W: FnMut() -> std::io::Result<SeedWalk>,
 {
   for _ in 0..2 {
-    if let Ok(entries) = walk() {
-      map.reseed(entries);
-      return ReseedOutcome::Reseeded;
+    if let Ok(walked) = walk() {
+      map.reseed(walked.entries);
+      return ReseedOutcome::Reseeded {
+        honored: walked.honored,
+      };
     }
   }
   ReseedOutcome::Blind
