@@ -18708,20 +18708,24 @@ mod prune {
   /// The probe-parked half of the same claim, which the batch-time fence alone
   /// cannot make: an FSEvents word carrying several verbs is a PLACEHOLDER when
   /// the fence runs — its planned inputs are minted only when the probe answers —
-  /// so a second judgement is owed at that resolution.
+  /// so a second judgement is owed at that resolution. But the pre-probe seat
+  /// ([`DriverCore::under_closed_ground`]) only ever speaks for ANCESTORS, so a
+  /// placeholder survives to a probe iff its OWN name is what the seat would
+  /// match — its class is exactly what the probe establishes. A word strictly
+  /// UNDER fenced ground never reaches a probe at all; see
+  /// `an_ambiguous_word_under_pruned_ground_mints_no_probe` for that half.
   ///
-  /// Revert witness: drop `fence_resolved` from `on_probe_result` and the
-  /// multi-verb word inside the pruned subtree is delivered at
-  /// `node_modules/deep/o.tmp`.
+  /// Revert witness: drop `fence_resolved` from `on_probe_result` and the word
+  /// naming the pruned directory itself is delivered at `node_modules`.
   #[test]
-  fn a_probe_parked_word_inside_a_pruned_subtree_is_fenced_at_its_resolution() {
+  fn a_probe_parked_word_naming_the_pruned_directory_is_fenced_at_its_resolution() {
     let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
     let scope = live_fsevents(&mut core, &pruning(&["**/node_modules"]));
 
     core.on_batch_events(
       scope,
       vec![ev(
-        "/r/node_modules/deep/o.tmp",
+        "/r/node_modules",
         flags(&[
           FsEventFlags::ITEM_CREATED,
           FsEventFlags::ITEM_REMOVED,
@@ -18747,7 +18751,7 @@ mod prune {
     core.on_probe_result(
       reqs[0].0,
       ProbeOutcome::Present {
-        kind: FileKind::File,
+        kind: FileKind::Dir,
         file_id: NonZeroU64::new(7),
         dev: 1,
       },
