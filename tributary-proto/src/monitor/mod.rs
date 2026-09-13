@@ -5128,12 +5128,31 @@ impl Monitor {
   /// it) cannot settle before every binding acknowledgement lands. Located
   /// ([`Scope::Subtree`]) overflows carry no kernel-loss evidence and never
   /// re-prove.
+  ///
+  /// Reports whether the covering [`ChangeKind::Rescan`] for the slice STANDS —
+  /// the answer a caller retiring an obligation over this ground needs, since an
+  /// instruction it cannot see is one it must stand itself. Wherever the scope is
+  /// registered this leaves one standing and reports `true`; the one `false` is a
+  /// slice naming ground this Monitor does not cover, which owes nothing. A slice
+  /// naming a held move source stands its instruction at the scope's ROOT rather
+  /// than at the stale pre-move path — see the arm below — so it reports `true`
+  /// like any other. A mint that COALESCED into an identical still-queued
+  /// `Rescan` reports `true` too: that twin is undelivered, its single generation
+  /// speaks for the whole contiguous run, and it is itself the covering
+  /// instruction.
+  ///
+  /// The return value is a semver-relevant addition to this method — the crates
+  /// in this workspace ship together and none is published, so it lands as an
+  /// ordinary change rather than a deprecation.
   #[cfg_attr(not(tarpaulin), inline)]
-  pub fn on_overflow(&mut self, scope: Scope, _now: Instant) {
-    match scope {
+  pub fn on_overflow(&mut self, scope: Scope, _now: Instant) -> bool {
+    let stands = match scope {
       Scope::All => {
         let roots: std::vec::Vec<(ScopeId, WatchId)> =
           self.roots.iter().map(|(s, w)| (*s, *w)).collect();
+        // Every registered scope gets its own covering root `Rescan` below; a
+        // Monitor holding none covers no ground this slice could instruct.
+        let covered = !roots.is_empty();
         for (scope_id, root) in roots {
           // A whole-scope loss is a transition anywhere under the root, so every
           // unheld pending half's window was interleaved (the root location prefixes
@@ -5145,6 +5164,7 @@ impl Monitor {
         // move; the pairing reparent would drop it and re-arm nothing if the temp re-arm
         // already completed. Dirty every held source so pairing re-scans/re-arms it.
         self.dirty_held_sources(None);
+        covered
       }
       Scope::Root(scope_id) => {
         // Only a registered scope has a watch set to reconcile; an overflow
@@ -5155,18 +5175,41 @@ impl Monitor {
           self.dirty_pending_sources_touching(scope_id, &Location::new(), None, None);
           self.scope_loss_recovery(scope_id, root);
           self.dirty_held_sources(Some(scope_id));
+          true
+        } else {
+          false
         }
       }
       Scope::Subtree(sub) => {
         // A subtree overflow on a held source (or a node in its subtree) would `Rescan`
-        // and re-arm at the stale PRE-move path, just like a record would. Fence it the
-        // same way: mark the enclosing hold dirtied and dirty the watch's outstanding
-        // enumerate, then leave the pairing reparent to `Rescan`/re-arm the real
-        // destination. Only a non-held subtree rescans-and-rearms in place.
+        // and re-arm at the stale PRE-move path, just like a record would. Fence the
+        // LOCATED mint the same way: mark the enclosing hold dirtied and dirty the
+        // watch's outstanding enumerate, then leave the pairing reparent to re-scan
+        // and re-arm the real destination. Only a non-held subtree rescans-and-rearms
+        // in place.
+        //
+        // The instruction itself is not deferred with them. Standing it only when
+        // whatever resolves the hold comes round lets a pairing fed later in the same
+        // batch queue its `Moved` delta first, and a retirement answered over this
+        // ground would then be overtaken by the very delta its covering `Rescan` must
+        // precede. So this arm mints one here and now, at the scope's ROOT, whose
+        // location is stable across the move — exactly the stability the located path
+        // lacks, and the whole reason the located mint is fenced. Through the loss
+        // seat: a dropped window IS a loss, and the root `Rescan` carries the loss
+        // flavour every other overflow mint carries.
         let watch = sub.watch();
         if let Some(source) = self.in_held_subtree(watch) {
+          let covered = self
+            .scope_of(watch)
+            .and_then(|scope_id| self.roots.get(&scope_id).map(|&root| (scope_id, root)));
           self.book_hold(source);
           self.mark_enumerate_dirty(watch);
+          if let Some((scope_id, root)) = covered {
+            self.emit_rescan(scope_id, self.location_of(root));
+            true
+          } else {
+            false
+          }
         } else if let Some(scope_id) = self.scope_of(watch) {
           // The Rescan lands at the located directory (the watch's own location plus
           // the descent). The re-arm starts from the nearest watch: the descent has no
@@ -5178,10 +5221,14 @@ impl Monitor {
           self.dirty_pending_sources_touching(scope_id, &at, None, None);
           self.emit_rescan(scope_id, at);
           let _ = self.start_rearm(watch);
+          true
+        } else {
+          false
         }
       }
-    }
+    };
     self.settle_bridges();
+    stands
   }
 
   /// Queues the covering root [`Rescan`](ChangeKind::Rescan) for a loss the
@@ -5222,11 +5269,8 @@ impl Monitor {
     queued
   }
 
-  /// Emits the located [`Rescan`](ChangeKind::Rescan) one dominated sync barrier
-  /// is retired with, and reconciles nothing itself — though for the held-subtree
-  /// case below, `book_hold` schedules the pairing's own re-scan by proxy:
-  /// whichever move eventually resolves the hold emits its own `Rescan` and
-  /// re-arms the destination on the pairing's behalf.
+  /// Emits the [`Rescan`](ChangeKind::Rescan) one dominated sync barrier is
+  /// retired with, and reconciles nothing itself.
   ///
   /// A DOMINATION `Rescan` is not a coverage loss: it tells the dominated
   /// barrier's caller to re-read, it does not say the watched world lost
@@ -5242,19 +5286,26 @@ impl Monitor {
   /// The instruction carries every delivery property a located `Rescan` minted
   /// anywhere else carries — the same scope attribution, the same epoch bump
   /// (so it strictly dominates every change the consumer already holds and
-  /// every later one for the scope), the same dedup, the same
-  /// [`Scope::Subtree`] placement guard against a stale pre-move path (below)
-  /// — EXCEPT the bridge window's loss accounting: this mints through
-  /// `mint_rescan`, not `emit_rescan`, because a domination is not a loss and
-  /// must not supply the window's loss half (see `mint_rescan`'s doc for why).
+  /// every later one for the scope), the same dedup — EXCEPT the bridge
+  /// window's loss accounting: this mints through `mint_rescan`, not
+  /// `emit_rescan`, because a domination is not a loss and must not supply the
+  /// window's loss half (see `mint_rescan`'s doc for why).
+  ///
+  /// A retirement's instruction is NEVER deferred. Where the slice's watch sits
+  /// inside a held move source, a located mint would reconstruct through the
+  /// source's stale pre-move parent link and land at ground the subtree has
+  /// already left, so this seat answers at the scope's ROOT instead — which no
+  /// hold can defer and no stale link reconstructs — still latched as a
+  /// domination and not as a loss. Deferring it to the pairing would leave the
+  /// retirement owing an instruction a move window later, while the barrier it
+  /// retires is answered now and the pairing's own `Moved` delta would reach
+  /// the consumer first.
   ///
   /// Reports the [`ChangeId`] it queued, or [`None`] where nothing was queued:
-  /// an identical `Rescan` already stands undelivered for this ground, the
-  /// slice names a scope or watch this Monitor does not cover, or (for
-  /// [`Scope::Subtree`]) the watch sits inside a held move source, in which
-  /// case the pairing that eventually resolves the hold owes the retirement's
-  /// `Rescan` instead. A backend-wide slice ([`Scope::All`]) names no one
-  /// barrier's ground and is never one of these retirements; it queues
+  /// an identical `Rescan` already stands undelivered for this ground — that
+  /// twin IS the covering instruction — or the slice names a scope or watch
+  /// this Monitor does not cover. A backend-wide slice ([`Scope::All`]) names
+  /// no one barrier's ground and is never one of these retirements; it queues
   /// nothing.
   #[cfg_attr(not(tarpaulin), inline)]
   pub fn cover_domination(&mut self, scope: Scope) -> Option<ChangeId> {
@@ -5266,26 +5317,25 @@ impl Monitor {
       }
       Scope::Subtree(sub) => {
         let watch = sub.watch();
-        // Mirrors `on_overflow`'s `Scope::Subtree` placement guard: a watch
-        // sitting inside a held move source would reconstruct through the
-        // source's stale pre-move parent link, so minting the Rescan here
-        // would land it at ground the subtree has already left. Book the
-        // hold instead of minting — the pairing that eventually resolves it
-        // owes the destination a Rescan and a re-arm — and queue nothing.
-        // Only the placement guard is mirrored, not `on_overflow`'s recovery
-        // half (`dirty_pending_sources_touching`, `mark_enumerate_dirty`, the
-        // re-arm): a domination reconciles nothing directly of its own.
-        //
-        // This guard is currently unreachable from the only in-tree caller:
-        // `covering_rescan` always passes the scope's root watch, never a
-        // held source, so `in_held_subtree` never matches here today. It is
-        // kept for parity with `on_overflow`'s guard against the day a
-        // non-root caller reaches this arm.
-        if let Some(source) = self.in_held_subtree(watch) {
-          self.book_hold(source);
-          return None;
-        }
         let scope_id = self.scope_of(watch)?;
+        // A watch sitting inside a held move source would reconstruct through
+        // the source's stale pre-move parent link, so a located mint would land
+        // at ground the subtree has already left. The retirement's instruction
+        // is never deferred for that: answer at the scope's ROOT, which no hold
+        // can defer. `on_overflow`'s recovery half
+        // (`dirty_pending_sources_touching`, `mark_enumerate_dirty`, the
+        // re-arm) is still not mirrored here, nor is its hold booking — a
+        // domination is not a loss and reconciles nothing of its own; the
+        // pairing carries the subtree over as it would for any move.
+        //
+        // The in-tree retirement never reaches this arm: `covering_rescan`
+        // lowers the obligation's path against the scope's root and anchors the
+        // slice at the ROOT WATCH, which is never a held source. The arm is the
+        // public seat's own contract for any caller that anchors deeper.
+        if self.in_held_subtree(watch).is_some() {
+          let root = *self.roots.get(&scope_id)?;
+          return self.mint_rescan(scope_id, self.location_of(root));
+        }
         let at = self.location_of(watch).join(sub.descent());
         self.mint_rescan(scope_id, at)
       }

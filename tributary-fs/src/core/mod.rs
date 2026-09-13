@@ -81,7 +81,10 @@ use std::{
   collections::{BTreeMap, BTreeSet, VecDeque},
   num::NonZeroU64,
   path::{Path, PathBuf},
-  sync::Arc,
+  sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+  },
   time::Duration,
 };
 
@@ -1565,6 +1568,21 @@ struct DyingDelivery {
 #[derive(Debug)]
 struct ScopeState {
   watch: WatchId,
+  /// The scope's RETIREMENT interlock: the flag every dispatched cookie write of
+  /// this scope re-reads as it hands its file over, minted by the driver when the
+  /// scope goes live and cloned in here
+  /// ([`bind_retiring`](DriverCore::bind_retiring)).
+  ///
+  /// The core stores `true` into it BEFORE it removes the scope's root-watch
+  /// mapping or its state, so the store is the irrevocable transition point:
+  /// a claim on another OS thread cannot observe a live flag for a scope that
+  /// is gone. The removal happens on the driver thread and a write claims on
+  /// another, and no yield separates the two. An atomic store is not I/O, so
+  /// holding it here leaves the core sans-I/O.
+  ///
+  /// `None` for a scope that never went live — it has no dispatchable write to
+  /// revoke, and its stream teardown publishes for it anyway.
+  retiring: Option<Arc<AtomicBool>>,
   /// The [`ArmAttempt`] of the root's BOOTSTRAP arm — the one
   /// `Action::Watch(Root)` a registration ever queues, captured when the
   /// action is consumed because the spawn path answers it out of band (a
@@ -2093,6 +2111,20 @@ pub(crate) struct DriverCore {
   /// Bounded by [`MAX_BARRIER_MOVES_PER_SCOPE`] per scope, and moves naming the
   /// same `(scope, location)` between two drains coalesce rather than stack.
   barrier_moves: VecDeque<BarrierMove>,
+  /// Every scope this core has ENDED since the driver last drained them
+  /// ([`take_ended_scopes`](Self::take_ended_scopes)).
+  ///
+  /// A terminal transition publishes its interlock at its linearization point,
+  /// and a scope ends HERE — at the one site that queues its `TeardownStream` —
+  /// not when that effect is later polled. The list rides beside
+  /// `barrier_moves` and is taken by the same drain, which runs at every loop
+  /// top and before every effect, so the retirement is published in the same
+  /// synchronous pass as the input that ended the scope, before any effect and
+  /// before the next flush.
+  ///
+  /// The scope is removed from `scopes` in the same step that records it here,
+  /// so it can never be recorded twice.
+  ended_scopes: Vec<ScopeId>,
   scope_seq: u64,
   probe_seq: u64,
   fence_seq: u64,
@@ -2151,6 +2183,27 @@ pub(crate) struct DriverCore {
   /// exempt (and its backend is kernel-recursive, which `on_set_cover` refuses
   /// before the rule is ever reached).
   reserved_cookie_dir: Option<Arc<str>>,
+  /// Test-only seam for the removal-order cell (A19.1): invoked with the
+  /// scope id, whether `scopes` still holds that scope, and whether
+  /// `watch_scopes` still holds its mapping, at the point between the
+  /// retirement store and the two removals. No production code installs one.
+  #[cfg(test)]
+  removal_hook: Option<RemovalHook>,
+}
+
+/// A test-only callback slot on [`DriverCore`], run between the retirement
+/// store and the two removals it precedes so a cell can observe the
+/// transition order directly rather than inferring it from state after the
+/// fact. Wrapped so `DriverCore`'s derived `Debug` has something to print.
+/// `Send` because `DriverCore` itself must stay `Send`.
+#[cfg(test)]
+struct RemovalHook(Box<dyn FnMut(ScopeId, bool, bool) + Send>);
+
+#[cfg(test)]
+impl std::fmt::Debug for RemovalHook {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.write_str("RemovalHook(..)")
+  }
 }
 
 impl DriverCore {
@@ -2179,6 +2232,7 @@ impl DriverCore {
       settled_covers: Vec::new(),
       cover_flush_due: false,
       barrier_moves: VecDeque::new(),
+      ended_scopes: Vec::new(),
       scope_seq: 0,
       probe_seq: 0,
       fence_seq: 0,
@@ -2186,6 +2240,8 @@ impl DriverCore {
       root_liveness_interval,
       exclusions: Vec::new(),
       reserved_cookie_dir,
+      #[cfg(test)]
+      removal_hook: None,
     }
   }
 
@@ -2443,6 +2499,7 @@ impl DriverCore {
       scope,
       ScopeState {
         watch,
+        retiring: None,
         root_attempt: None,
         profile,
         requested: root,
@@ -2834,6 +2891,41 @@ impl DriverCore {
     self.barrier_moves.drain(..).collect()
   }
 
+  /// Drains the scopes this core has ended since the last drain.
+  ///
+  /// Taken by the same drain as [`take_barrier_moves`](Self::take_barrier_moves),
+  /// which the driver runs at every loop top and before every effect: the
+  /// retirement of each scope named here is published in the same synchronous
+  /// pass as the input that ended it, before the teardown effect takes the
+  /// delivery lane away and before the next flush.
+  pub(crate) fn take_ended_scopes(&mut self) -> Vec<ScopeId> {
+    std::mem::take(&mut self.ended_scopes)
+  }
+
+  /// Whether a scope this core has ended is still awaiting its publication or
+  /// its teardown — the driver's gate for giving an ended scope UNCONDITIONAL
+  /// priority over a ready command or op result.
+  ///
+  /// An ended scope's teardown must run before anything else is serviced: a due
+  /// fence's settlement can consume a fatal and remove the scope with its
+  /// teardown still queued, and a ready replacement completion would otherwise
+  /// be taken first and install a successor for a scope this core no longer
+  /// holds — a successful replacement the old death's teardown then dismantles.
+  ///
+  /// BOTH terms are needed. `ended_scopes` alone goes blind whenever the drain
+  /// inside the settlement resolution takes the list in the very pass that ended
+  /// the scope; the queued `TeardownStream` is what remains true until the
+  /// loop-top flush executes it. Ended scopes are finite per input and the loop
+  /// top clears both, so re-topping on this cannot spin.
+  pub(crate) fn has_ended_scopes(&self) -> bool {
+    !self.ended_scopes.is_empty()
+      || (!self.effects.is_empty()
+        && self
+          .effects
+          .iter()
+          .any(|effect| matches!(effect, Effect::TeardownStream { .. })))
+  }
+
   /// Whether anything is waiting in the effect queue.
   ///
   /// The driver consults this immediately before it builds its timer and enters
@@ -2864,13 +2956,17 @@ impl DriverCore {
   /// THE BARRIER FUNNEL: advances `scope`'s [`BarrierEpoch`] and records the
   /// coverage transition that moved it.
   ///
-  /// Called from the nine sites through which every coverage transition of a
+  /// Called from the ten sites through which every coverage transition of a
   /// scope passes — a child watch armed or dropped, a located `Rescan` fed to the
   /// Monitor, a root replace, a real mount-refresh loss, a root overflow, a
-  /// routed `Rescan`'s cover degrade, the settle observation's lossy rewind, and
-  /// a probe-budget loss — and from nowhere else. The probe-budget loss is the
-  /// NINTH and last so the eight that precede it keep the numbers every seat in
-  /// this crate already cites. The list is short and auditable because it names
+  /// routed `Rescan`'s cover degrade, the settle observation's lossy rewind, a
+  /// probe-budget loss, and a delivery the consumer refused — and from nowhere
+  /// else. Each new funnel is appended rather than inserted, so the ones that
+  /// precede it keep the numbers every seat in this crate already cites: the
+  /// probe-budget loss is the NINTH and the lag entry the TENTH. A site that
+  /// synthesizes a root overflow of its own is its own funnel rather than a
+  /// caller of the root-overflow one, which is why the last two both have the
+  /// shape `on_root_overflow` has. The list is short and auditable because it names
   /// FUNNELS rather than their callers: a caller list is exactly the enumeration
   /// discipline that the pairwise-check rounds kept defeating.
   ///
@@ -4295,6 +4391,29 @@ impl DriverCore {
     self.scopes.get(&scope).map(|state| state.watch)
   }
 
+  /// Binds `scope`'s RETIREMENT interlock — the flag the driver mints when the
+  /// scope goes live and clones into every write it dispatches for it.
+  ///
+  /// The core stores `true` into this flag BEFORE it removes the scope's
+  /// root-watch mapping or its state — the store is the irrevocable
+  /// transition point, not a publication a later drain makes: the removal
+  /// runs on the driver thread while a write claims on another, and no yield
+  /// separates the two. Without the store landing first, a writer released in
+  /// that gap reads `retiring = false`, publishes `Owned` and answers `Ok`
+  /// for a marker no stream will ever deliver — a claim on another OS thread
+  /// cannot observe a live flag for a scope that is gone.
+  ///
+  /// Taken on the same transitions the cookie floor is (birth, and a commit that
+  /// re-records the root under a surviving scope), and idempotent: the flag a
+  /// live scope already carries is the one handed back, so a write already in
+  /// the pool keeps reading the flag this store will raise. A scope this core no
+  /// longer holds binds nothing — it has already been retired.
+  pub(crate) fn bind_retiring(&mut self, scope: ScopeId, flag: Arc<AtomicBool>) {
+    if let Some(state) = self.scopes.get_mut(&scope) {
+      state.retiring = Some(flag);
+    }
+  }
+
   /// A live scope's canonical root — the commit-time authority the driver's
   /// widen predicate (old ⊂ new) compares against.
   pub(crate) fn root_path(&self, scope: ScopeId) -> Option<Arc<PathBuf>> {
@@ -5210,6 +5329,30 @@ impl DriverCore {
         // being minted below; delivering any of it after the refusal would
         // put an ordinary event ahead of the Rescan that covers the drop.
         Self::purge_scope_emits(&mut self.effects, scope);
+        // BARRIER FUNNEL: the lag entry synthesizes a root overflow, and it is
+        // one about the whole scope for the same reason `on_root_overflow` is —
+        // everything this scope drops from here until the lag exits is a window
+        // it cannot account for. The routed cover degrade cannot stand in for
+        // it: that funnel is gated on a recorded claim, so a never-narrowed
+        // scope — and every kernel-recursive scope, which never records one —
+        // would get no move, no child-watch funnel would fire either, and an
+        // in-pool write would claim `Ok` after the covering `Rescan` was
+        // queued, its marker then dropped while lagged or delivered behind the
+        // instruction. Raised in the order the probe-budget decline uses —
+        // purge the queued emits, raise the move, then synthesize the overflow
+        // — so the retirement withdraws the in-pool marker and answers
+        // `Dominated` before the write can claim. The instruction this
+        // retirement owes is the overflow's own `Rescan`, parked below as the
+        // lag's dominating change: while the lag stands every other change of
+        // this scope is dropped, so the parked one precedes every later delta
+        // the consumer will see, and the retirement stands none of its own.
+        Self::barrier_moved(
+          &mut self.barrier_moves,
+          state,
+          scope,
+          BarrierLocation::Scope,
+          true,
+        );
         self.monitor.on_overflow(Scope::Root(scope), now);
         self.drain_monitor();
       }
@@ -6564,19 +6707,31 @@ impl DriverCore {
       Planned::Rec(rec) => monitor.on_os_record(rec, now),
       Planned::Over(target) => {
         // The ground is read BEFORE the overflow reshapes the watch tree the
-        // anchor is placed against. A located `Rescan` IS the covering
-        // instruction a retirement would otherwise owe, so this funnel stands
-        // one.
+        // anchor is placed against. The `Rescan` the Monitor stands IS the
+        // covering instruction a retirement would otherwise owe — but only where
+        // it actually stands one, and a slice naming ground the Monitor does not
+        // cover stands nothing (and owes nothing). A slice naming a held move
+        // source stands its instruction at the scope's ROOT, at this item: the
+        // located path is the stale pre-move one, and an instruction deferred to
+        // whichever move resolves the hold would be overtaken by the delta a
+        // pairing fed later in the same batch queues. The Monitor REPORTS which
+        // it did, and the funnel records that rather than assuming.
         let ground = Self::barrier_ground(monitor, state, &target);
-        Self::barrier_moved(moves, state, scope, ground, true);
-        monitor.on_overflow(target, now);
+        let rescan_stands = monitor.on_overflow(target, now);
+        Self::barrier_moved(moves, state, scope, ground, rescan_stands);
         RecordOutcome::Nothing
       }
       Planned::Dominated(target) => {
         // The same funnel bump the overflow arm raises, for the same reason and
-        // with the same claim: the located `Rescan` this stands IS the covering
+        // with the same claim: the `Rescan` this stands IS the covering
         // instruction every obligation it retires is owed. The ground is read
         // first here too, so the two arms record one ground the same way.
+        //
+        // The claim needs no report from the Monitor, because a retirement's
+        // instruction is never deferred: `Monitor::cover_domination` answers at
+        // the scope's ROOT where the slice lies inside a held move source, so
+        // this seat always stands one. A mint that coalesced stands one too —
+        // the twin it folded into is undelivered and covers this ground.
         let ground = Self::barrier_ground(monitor, state, &target);
         Self::barrier_moved(moves, state, scope, ground, true);
         // Latched so the routing seat can tell this instruction from a loss —
@@ -6976,7 +7131,8 @@ impl DriverCore {
   /// `SyncOutcome::Dominated`'s public contract promises exactly that — a
   /// re-enumeration instruction is on the caller's stream, so its obligation is
   /// to re-read rather than to worry. Three of the funnels stand none of their
-  /// own, and this is what those retirements call.
+  /// own, and a fourth stands none whenever the Monitor deferred its mint to a
+  /// held move source's pairing; this is what those retirements call.
   ///
   /// It goes through [`covering_rescan`](Self::covering_rescan) and
   /// [`feed`](Self::feed) rather than reaching for the Monitor directly, so the
@@ -6985,6 +7141,13 @@ impl DriverCore {
   /// ordering ahead of every later delta. `covering_rescan` covers the PARENT
   /// of what it is given, which subsumes `at` itself. Its own funnel bump is
   /// idempotent: it names ground already dominated, and it stands a `Rescan`.
+  ///
+  /// It needs no widening to the root when the obligation's ground lies inside a
+  /// held move source. `covering_rescan` lowers `at` TEXTUALLY against the
+  /// scope's root and anchors the slice at the scope's ROOT WATCH, which is
+  /// never a held source, so the Monitor reconstructs the location from the root
+  /// rather than through a hold's stale pre-move parent link: the instruction is
+  /// minted synchronously and lands exactly at the ground the obligation named.
   ///
   /// It is stood as a DOMINATION ([`Planned::Dominated`]) and not as a loss: a
   /// domination `Rescan` is not a coverage loss of the applied cover — it tells
@@ -7289,7 +7452,47 @@ impl DriverCore {
             }
             continue;
           }
-          if let Some(scope) = self.watch_scopes.remove(&watch) {
+          if let Some(scope) = self.watch_scopes.get(&watch).copied() {
+            // THE STORE IS THE IRREVOCABLE TRANSITION POINT, and it comes
+            // before anything else moves: before the root-watch mapping is
+            // removed, before the scope state is removed, before the fences
+            // resolve, before the scope is reported ended and before the
+            // teardown is queued. A claim on another OS thread cannot observe
+            // a live flag for a scope that is gone — reading the flag through
+            // the still-live `scopes` entry and storing `true` first closes
+            // the gap a store made AFTER either removal would leave open: a
+            // writer claiming in that gap would read `retiring = false`,
+            // publish `Owned` and answer `Ok` for a marker no stream will
+            // ever deliver. An atomic store is not I/O, so the core stays
+            // sans-I/O.
+            //
+            // The two removals below are not equally load-bearing.
+            // `CookieGuard::precedence` reads only this flag — it never
+            // consults `watch_scopes` — so the store landing ahead of
+            // `self.scopes.remove(&scope)` is what actually closes the claim
+            // window; ahead of `self.watch_scopes.remove(&watch)` is
+            // defense-in-depth, keeping the whole transition on one side of
+            // the store rather than splitting it across a mixed order.
+            if let Some(flag) = self
+              .scopes
+              .get(&scope)
+              .and_then(|state| state.retiring.as_ref())
+            {
+              flag.store(true, Ordering::SeqCst);
+            }
+            // Test-only seam for the removal-order cell: invoked between the
+            // store above and the removals below, so a test can observe the
+            // flag already raised while both the scope state and the
+            // root-watch mapping are still present. Not part of the
+            // production transition; the facts are read only when a hook is
+            // installed, so an uninstalled hook costs nothing.
+            #[cfg(test)]
+            if let Some(hook) = self.removal_hook.as_mut() {
+              let scope_present = self.scopes.contains_key(&scope);
+              let watch_mapping_present = self.watch_scopes.contains_key(&watch);
+              (hook.0)(scope, scope_present, watch_mapping_present);
+            }
+            self.watch_scopes.remove(&watch);
             // The scope's terminal `Rescan` — parked by lag, or still queued
             // as a plain effect — is the only signal covering whatever the
             // dead scope dropped, and it must survive refusals: a queued
@@ -7372,6 +7575,15 @@ impl DriverCore {
               self.watch_scopes.remove(&watch);
             }
             self.enum_reqs.retain(|_, (s, _)| *s != scope);
+            // THE SCOPE ENDS HERE. Every way a scope dies by an input — a root
+            // death by event, a source fatal, an unregistered root — funnels
+            // through this one arm, and this is the instant the scope stops
+            // existing: it is out of `scopes`, its fences are resolved `Dead`
+            // and its teardown is merely QUEUED. Reporting it beside the barrier
+            // moves is what lets the driver's drain publish the writes'
+            // retirement in this same synchronous pass, ahead of the effect that
+            // takes the delivery lane away.
+            self.ended_scopes.push(scope);
             self.effects.push_back(Effect::TeardownStream { scope });
           }
         }
