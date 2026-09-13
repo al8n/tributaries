@@ -504,6 +504,17 @@ pub trait LocalSource<C> {
   ///
   /// `retained` is a prefix-free antichain in the same `C` key space as [`arm`](Self::arm): every key
   /// lies under exactly one member, and no member descends from another.
+  ///
+  /// # A cover change dominates every barrier in flight on the pruned ground
+  ///
+  /// Clause 5 is about DELIVERY, and a barrier is not a delivery. A cover change is a
+  /// coverage transition, so a source that narrows here retires every
+  /// [`begin_sync`](Self::begin_sync) barrier of this handle standing on the ground it
+  /// prunes — [`SyncOutcome::Dominated`], carried by the located `Rescan` each retirement
+  /// stands — rather than holding the narrowing back until those barriers settle. Holding
+  /// it back would let a caller's cover change be deferred indefinitely by a sync it knows
+  /// nothing about; a dominated caller loses nothing, its barrier being met by
+  /// re-enumeration instead of by delivery.
   fn set_cover(&mut self, handle: Self::Handle, retained: &[Vec<C>]) {
     let _ = (handle, retained);
   }
@@ -584,11 +595,25 @@ pub trait LocalSource<C> {
     }
   }
 
-  /// Places a **sync-barrier cookie** under `dir_key` for the root `handle`, returning the
-  /// cookie's canonical key. AWAITED, and it resolves at **write-complete — never at
-  /// observe**: the cookie's event arrives through the very [`next`](Self::next) pump the
-  /// owner would otherwise be blocking, so awaiting the observation here would deadlock by
-  /// construction. Observation is the owner's funnel-driven business.
+  /// Places a **sync-barrier cookie** under `dir_key` for the root `handle`, answering
+  /// [`Begun::Installed`] with the cookie's canonical key. AWAITED, and it resolves at
+  /// **write-complete — never at observe**: the cookie's event arrives through the very
+  /// [`next`](Self::next) pump the owner would otherwise be blocking, so awaiting the
+  /// observation here would deadlock by construction. Observation is the owner's
+  /// funnel-driven business.
+  ///
+  /// # A barrier certifies delivery only within one coverage epoch
+  ///
+  /// A source whose coverage can move under a live barrier answers
+  /// [`Begun::Dominated`] instead when a coverage transition on the barrier's ground
+  /// retires it before the marker is installed: there is no key to hand back, and the
+  /// outcome is no longer something a later observation could mint. The owner resolves
+  /// the caller at once with [`SyncOutcome::Dominated`], so the source OWES the covering
+  /// `Rescan` that variant promises — on the stream, or durably parked ahead of every
+  /// later delta — before it answers. This is not a refusal: a caller whose barrier is
+  /// already met by re-enumeration must not be told to retry, or it livelocks against a
+  /// tree churning faster than one round trip. A source whose coverage cannot move under
+  /// a barrier never answers it.
   ///
   /// The cookie's whole purpose is the kernel event its creation mints: that event rides the
   /// root's ordered queue BEHIND every change the backend reported before the write, so
@@ -631,7 +656,7 @@ pub trait LocalSource<C> {
     handle: Self::Handle,
     dir_key: &[C],
     token: SyncToken,
-  ) -> impl Future<Output = Result<Vec<C>, SyncError>> {
+  ) -> impl Future<Output = Result<Begun<C>, SyncError>> {
     let _ = (handle, dir_key, token);
     async { Err(SyncError::Unsupported) }
   }
@@ -650,8 +675,9 @@ pub trait LocalSource<C> {
   /// Abandons the sync identified by `token` — SYNCHRONOUS, non-blocking, fire-and-forget, in the
   /// [`end_sync`](Self::end_sync)/[`disarm`](Self::disarm) mold. Called when the owner abandons an
   /// IN-FLIGHT [`begin_sync`](Self::begin_sync) (the caller timed out, or a close won the owner's
-  /// race): the owner never learned the cookie's key — only a completed `begin_sync` returns it — but
-  /// it still knows the `token` it minted, and the binding recovers the sync's identity from it.
+  /// race): the owner never learned the cookie's key — only a `begin_sync` answering
+  /// [`Begun::Installed`] returns one — but it still knows the `token` it minted, and the binding
+  /// recovers the sync's identity from it.
   ///
   /// The binding must ensure a cookie this sync ALREADY created — even one whose completion the owner
   /// never read — is eventually removed, and that a write still in flight leaves no cookie behind when
@@ -937,11 +963,25 @@ pub trait Source<C> {
     }
   }
 
-  /// Places a **sync-barrier cookie** under `dir_key` for the root `handle`, returning the
-  /// cookie's canonical key. AWAITED, and it resolves at **write-complete — never at
-  /// observe**: the cookie's event arrives through the very [`next`](Self::next) pump the
-  /// owner would otherwise be blocking, so awaiting the observation here would deadlock by
-  /// construction. Observation is the owner's funnel-driven business.
+  /// Places a **sync-barrier cookie** under `dir_key` for the root `handle`, answering
+  /// [`Begun::Installed`] with the cookie's canonical key. AWAITED, and it resolves at
+  /// **write-complete — never at observe**: the cookie's event arrives through the very
+  /// [`next`](Self::next) pump the owner would otherwise be blocking, so awaiting the
+  /// observation here would deadlock by construction. Observation is the owner's
+  /// funnel-driven business.
+  ///
+  /// # A barrier certifies delivery only within one coverage epoch
+  ///
+  /// A source whose coverage can move under a live barrier answers
+  /// [`Begun::Dominated`] instead when a coverage transition on the barrier's ground
+  /// retires it before the marker is installed: there is no key to hand back, and the
+  /// outcome is no longer something a later observation could mint. The owner resolves
+  /// the caller at once with [`SyncOutcome::Dominated`], so the source OWES the covering
+  /// `Rescan` that variant promises — on the stream, or durably parked ahead of every
+  /// later delta — before it answers. This is not a refusal: a caller whose barrier is
+  /// already met by re-enumeration must not be told to retry, or it livelocks against a
+  /// tree churning faster than one round trip. A source whose coverage cannot move under
+  /// a barrier never answers it.
   ///
   /// The cookie's whole purpose is the kernel event its creation mints: that event rides the
   /// root's ordered queue BEHIND every change the backend reported before the write, so
@@ -984,7 +1024,7 @@ pub trait Source<C> {
     handle: Self::Handle,
     dir_key: &[C],
     token: SyncToken,
-  ) -> impl Future<Output = Result<Vec<C>, SyncError>> + Send {
+  ) -> impl Future<Output = Result<Begun<C>, SyncError>> + Send {
     let _ = (handle, dir_key, token);
     async { Err(SyncError::Unsupported) }
   }
@@ -1003,8 +1043,9 @@ pub trait Source<C> {
   /// Abandons the sync identified by `token` — SYNCHRONOUS, non-blocking, fire-and-forget, in the
   /// [`end_sync`](Self::end_sync)/[`disarm`](Self::disarm) mold. Called when the owner abandons an
   /// IN-FLIGHT [`begin_sync`](Self::begin_sync) (the caller timed out, or a close won the owner's
-  /// race): the owner never learned the cookie's key — only a completed `begin_sync` returns it — but
-  /// it still knows the `token` it minted, and the binding recovers the sync's identity from it.
+  /// race): the owner never learned the cookie's key — only a `begin_sync` answering
+  /// [`Begun::Installed`] returns one — but it still knows the `token` it minted, and the binding
+  /// recovers the sync's identity from it.
   ///
   /// The binding must ensure a cookie this sync ALREADY created — even one whose completion the owner
   /// never read — is eventually removed, and that a write still in flight leaves no cookie behind when
@@ -1165,7 +1206,7 @@ impl<C, T: Source<C>> LocalSource<C> for T {
     handle: Self::Handle,
     dir_key: &[C],
     token: SyncToken,
-  ) -> impl Future<Output = Result<Vec<C>, SyncError>> {
+  ) -> impl Future<Output = Result<Begun<C>, SyncError>> {
     <T as Source<C>>::begin_sync(self, handle, dir_key, token)
   }
 
@@ -1260,6 +1301,60 @@ impl SyncToken {
   }
 }
 
+/// What a completed [`Source::begin_sync`] hands back.
+///
+/// A barrier is dispatched under a coverage epoch and certifies delivery only
+/// within it, so the seam has two things to say and not one: the marker the
+/// owner is to install the barrier on, or the fact that a coverage transition
+/// on the barrier's ground already retired it — *dominated by the located
+/// `Rescan` that transition stands* — before a marker could be installed.
+///
+/// A key alone could not carry the second: there is no marker to name, and no
+/// later observation to mint the outcome from.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Begun<C> {
+  /// The marker is placed: its canonical key, whose LAST component is the name
+  /// the owner resolves the barrier by.
+  Installed(Vec<C>),
+  /// A coverage transition on the barrier's ground retired it before it was
+  /// installed, and the covering `Rescan` it stood is already on the caller's
+  /// stream.
+  ///
+  /// The owner resolves the caller at once with
+  /// [`SyncOutcome::Dominated`] — which is exactly that variant's public
+  /// contract, and never a retryable refusal: a caller whose barrier is
+  /// already met by re-enumeration must not be told to wait, or it livelocks
+  /// against a tree churning faster than one round trip. A source answering
+  /// this OWES the covering `Rescan`; one that cannot guarantee it must refuse
+  /// with an error instead.
+  Dominated,
+}
+
+impl<C> Begun<C> {
+  /// Whether the marker was placed.
+  #[inline]
+  pub const fn is_installed(&self) -> bool {
+    matches!(self, Self::Installed(_))
+  }
+
+  /// Whether a coverage transition retired the barrier before it was installed.
+  #[inline]
+  pub const fn is_dominated(&self) -> bool {
+    matches!(self, Self::Dominated)
+  }
+
+  /// The marker's canonical key, or `None` when the barrier was dominated
+  /// before it was installed.
+  #[inline]
+  pub fn installed(&self) -> Option<&[C]> {
+    match self {
+      Self::Installed(key) => Some(key),
+      Self::Dominated => None,
+    }
+  }
+}
+
 /// How a [`sync`](crate::Tributaries::sync) barrier was met.
 ///
 /// Both variants are success — the promise is *deliverable-or-dominated*, and
@@ -1274,10 +1369,19 @@ pub enum SyncOutcome {
   /// subscription's interest and filter gates).
   Delivered,
   /// A covering `Rescan` stood in for the cookie — a loss ate the cookie's
-  /// event, or the root died — so the barrier is met by re-enumeration
-  /// instead of by delivery. The `Rescan` is on the stream (or durably parked
-  /// ahead of every later delta), so the caller's obligation is to re-read,
-  /// not to worry.
+  /// event, the root died, or a COVERAGE TRANSITION on the barrier's ground
+  /// retired it — so the barrier is met by re-enumeration instead of by
+  /// delivery. The `Rescan` is on the stream (or durably parked ahead of every
+  /// later delta), so the caller's obligation is to re-read, not to worry.
+  ///
+  /// A barrier certifies delivery only within one coverage epoch: a change to
+  /// the root's coverage on the barrier's ground while it is in flight — a
+  /// watch armed or dropped beneath it, a cover shrunk over it, a root
+  /// replaced — resolves it here rather than as a certificate. The transition
+  /// can reach the barrier before it is installed, in which case
+  /// [`Source::begin_sync`] answers [`Begun::Dominated`] and the caller is
+  /// resolved at once, or while it waits on its marker, in which case the
+  /// located `Rescan` resolves it — again at once, never at the timeout.
   Dominated,
 }
 

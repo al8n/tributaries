@@ -331,6 +331,17 @@ All notable changes to this workspace are documented here. The format is based o
   spells its seats with. A consumer arming its own `Source` configures the words from a
   document or a command line instead of re-deriving the vocabulary.
 
+- **`tributary-fs`**, **`tributaries`** — a barrier a coverage transition retired before
+  it was installed is the new typed `SyncRootError::Dominated` refusal, and the umbrella
+  carries it to the caller as `Ok(SyncOutcome::Dominated)`. It is a barrier MET by
+  re-enumeration, not a failed write: the retirement stands the covering `Rescan` for the
+  obligation's own ground before the terminal is answered, which is exactly what
+  `SyncOutcome::Dominated` promises. It is deliberately not the retryable `Busy` its
+  neighbours `WriteInFlight` and `CleanupBacklog` are — a caller whose barrier is already
+  met must not be told to wait, or a tree churning faster than one round trip livelocks
+  it. The admission's sequence is spent (re-minting is what takes a fresh cut over the
+  ground the `Rescan` names).
+
 ### Changed
 
 - **`tributaries`** — **BREAKING**: `Tributaries::with_source`, `parts` and
@@ -538,6 +549,66 @@ All notable changes to this workspace are documented here. The format is based o
   unengaged) asks for exactly the behaviour every source had before the seats existed.
   Every other seam item is unchanged, including canonical-key adoption.
 
+- **`tributary-fs`**, **`tributaries`** — **a sync barrier certifies delivery only within
+  one coverage epoch; any change to the root's coverage on the barrier's ground while it
+  is in flight resolves it as dominated by a rescan.** A child watch armed or dropped
+  beneath the marker's ground, a `set_cover` shrunk over it, a root replaced, a trust or
+  overflow verdict on the whole scope: each is a coverage transition, each stands a
+  located `Rescan`, and a barrier whose ground one of them touches is retired by it
+  rather than certified past it. A barrier is never retired silently — the covering
+  `Rescan` is on the stream before the caller is answered.
+
+  The caller learns it one of two ways, both at once rather than at its deadline: before
+  the marker is installed, `Watcher::sync_root` answers `SyncRootError::Dominated` and
+  `Tributaries::sync` answers `Ok(SyncOutcome::Dominated)`; afterwards, the located
+  `Rescan` resolves the waiting barrier. `SyncOutcome::Dominated` therefore has one more
+  producer than it did — coverage transitions, beside the losses and root deaths it
+  always named — and its obligation is unchanged: re-read the ground the `Rescan` names.
+
+  The rule bites where the kernel gives per-directory watch lifecycle (inotify). On a
+  kernel-recursive backend (fanotify, FSEvents, `ReadDirectoryChangesW`, the USN journal)
+  one whole-subtree stream holds the only watch there is, so only the root-wide
+  transitions can fire and the barrier rests on the descriptors the watcher pins, as
+  before. A busy tree with a stable watch set dominates nothing, and a transition deep in
+  the tree dominates only the barriers standing on that ground.
+
+  What this replaces is a cover change that WIDENED itself to keep a live barrier's
+  ground, and the refusal that widening made necessary: `Watcher::set_cover` and
+  `request_set_cover` now always apply the cover asked for, and a shrink dominates the
+  barriers in flight it touches instead of deferring a caller's narrowing behind a sync
+  it knows nothing about. A shrink currently touches every barrier in flight on the root
+  rather than only those on the pruned ground — a dropped watch is reported after the
+  node carrying its path is gone, so the transition cannot be placed — which costs an
+  extra `Dominated`, never a wider instruction: each dominated caller's covering `Rescan`
+  is minted from its own obligation's ground. A shrink that dominates a barrier also
+  settles `CoverOutcome::Degraded` where it used to settle `Applied`, the retirement's
+  `Rescan` standing inside the reconcile's own settle window.
+
+- **`tributaries`** — **BREAKING for a custom `Source`**: `Source::begin_sync` and
+  `LocalSource::begin_sync` return `Result<Begun<C>, SyncError>` instead of
+  `Result<Vec<C>, SyncError>`. The new `tributaries::Begun` enum is
+  `Installed(Vec<C>)` — the marker's canonical key, what the old `Ok` carried — or
+  `Dominated`, for a barrier a coverage transition retired before a marker could be
+  installed. A key alone could not express the second: there is no marker to name and no
+  later observation to mint the outcome from, so such a barrier could only be reported as
+  a refusal the caller would then be told to retry. A source that never narrows coverage
+  under a live barrier wraps its existing key in `Begun::Installed` and is otherwise
+  unaffected; a source that answers `Begun::Dominated` OWES the covering `Rescan` before
+  it does. `Source::end_sync`, `cancel_sync` and `is_sync_artifact` are unchanged.
+
+- **`tributary-fs`** — `WatcherOptions::cookie_global_cap` now defaults to **64 on macOS
+  and 128 everywhere else**, and the watcher's sync door admits at most `min(cap, 8)`
+  concurrent admission samplings on macOS against `min(cap, 32)` elsewhere. The cap
+  bounds sync obligations, and an obligation is also descriptors: macOS defaults to a
+  256-descriptor soft limit against 1024 elsewhere, and its kernel-recursive lowering is
+  the one that holds a target and a reserved-directory pin per barrier in flight, where a
+  descending lowering releases both at the door. Both faces carry the platform value —
+  the `serde` key's omitted default and the `--cookie-global-cap` flag's printed default
+  are the host's — and `WatcherOptions::DEFAULT_COOKIE_GLOBAL_CAP` carries the
+  arithmetic. macOS callers therefore get half the previous effective cap and a quarter
+  of the previous door; raising either back is one call, with the host's descriptor
+  budget in mind.
+
 ### Known limitations
 
 - **`tributary-fs`**, **`tributaries`** — on Windows, `Watcher::sync_root` and
@@ -547,23 +618,43 @@ All notable changes to this workspace are documented here. The format is based o
   resolving or reporting a definite refusal. Tracked as
   [#134](https://github.com/al8n/tributaries/issues/134).
 
-- **`tributary-fs`**, **`tributaries`** — on Linux and macOS, the ordering certificate a
-  sync returns assumes that no process running with the watcher's OWN uid rewrites,
-  between the sync's admission and the observation of its marker, either the ancestry
-  chain from the watched root to the sync target (renaming or replacing a component,
-  aliasing it through a same-superblock bind mount, or moving the pinned objects across
-  pruned, excluded or mount-frame boundaries) or the reserved cookie directory's entries
-  (renaming, hard-linking or replacing the marker, or planting entries beside it). The
-  watcher pins the admitted objects with held descriptors, re-verifies identity, mount
-  frame and ground at the write, proves a minted directory holds only its marker, and
-  decides every cleanup terminal by the pinned object's link count; the reserved
-  directory's owner-only mode is the boundary the watcher enforces, and owner and mode
-  are verified on every open. On macOS an inheritable ACL on an ancestor that grants
+- **`tributary-fs`**, **`tributaries`** — on Linux and macOS the ordering certificate a
+  sync returns rests on the coverage epoch: a change to the root's coverage on the
+  barrier's ground while it is in flight retires the barrier, dominated by the located
+  `Rescan` that change stands, rather than certifying past it. Where the kernel gives
+  per-directory watch lifecycle (inotify) that rule carries the substitutions this entry
+  once fenced by hand: arming a watch drops the incumbent before it arms the arrival, so
+  every same-name substitution on the chain from the watched root down to the marker's
+  landing is itself a watch-lifecycle transition and retires the barriers standing on
+  it. On a kernel-recursive backend (FSEvents, fanotify) there are no per-directory
+  watches to transition, so the certificate rests where it always did — on the
+  descriptors the watcher pins for the sync target and the reserved cookie directory for
+  the sync's duration. The assumption below is the same one this entry always stated; it
+  does not widen.
+
+  Identity, mount frame and landing are re-verified at the write on every backend, a
+  minted reserved directory is proved to hold only its marker, every cleanup terminal is
+  decided by the pinned object's link count, and the reserved directory's owner-only
+  mode is re-read off the descriptor on every open. Those verdicts are the belt UNDER
+  the rule rather than a substitute for it: an inode number is reusable, so an identity
+  comparison alone cannot separate the admitted object from a replacement that received
+  its number back. On a descending backend a barrier parked on the coverage-settle fence
+  holds no descriptor on the objects it was admitted against — the door samples them and
+  releases — so what it carries into the write is a REMEMBERED tuple, and a replacement
+  reusing the admitted inode inside that parked window is no longer refused
+  `SyncRootError::DirReplaced`. Where such a reuse is a watch-lifecycle event the epoch
+  retires the barrier instead; where it is not, it is the same-uid residual this entry
+  already names.
+
+  What remains outside the contract is therefore a process running with the watcher's
+  OWN uid acting BEHIND coverage that never transitions: renaming, hard-linking or
+  replacing the marker, or planting entries beside it, inside a directory that stays
+  armed throughout, between the write and the observation of the marker. An adversary
+  holding the watcher's own credentials can always win one more race against a
+  pathname-based filesystem API. On macOS an inheritable ACL on an ancestor that grants
   other users write rights is inherited by the reserved directory and extends the
-  trusted set by the tree owner's own configuration — the watcher does not inspect
-  ACLs. What remains outside the contract is an adversary holding the watcher's own
-  credentials, which can always win one more race against a pathname-based filesystem
-  API — the watcher is not a security boundary against its own uid. Tracked as
+  trusted set by the tree owner's own configuration — the watcher does not inspect ACLs.
+  The watcher is not a security boundary against its own uid. Tracked as
   [#135](https://github.com/al8n/tributaries/issues/135), companion of
   [#134](https://github.com/al8n/tributaries/issues/134).
 

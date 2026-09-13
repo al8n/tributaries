@@ -28,7 +28,7 @@ fn manual_watcher() -> (Watcher<TokioRuntime>, async_channel::Receiver<Command>)
       sync_tickets: Arc::new(AtomicU64::new(1)),
       nonces: super::sync_nonce_generator().map(|generator| Arc::new(Mutex::new(generator))),
       pins: crate::driver::SyncPinAllowance::new(
-        crate::driver::DriverConfig::DEFAULT_COOKIE_GLOBAL_CAP,
+        crate::WatcherOptions::DEFAULT_COOKIE_GLOBAL_CAP.get(),
       ),
       blocking: Arc::new(TokioRuntime::spawn_blocking_detach),
       events: Box::pin(event_rx),

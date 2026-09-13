@@ -29,7 +29,7 @@ pub use interest::Interest;
 pub use options::{
   Debounce, DebounceConfig, OptionsError, RootGlobs, TributariesOptions, WatchOptions,
 };
-pub use source::{Armed, LocalSource, Source, SourceEvent, SyncOutcome, SyncToken};
+pub use source::{Armed, Begun, LocalSource, Source, SourceEvent, SyncOutcome, SyncToken};
 pub use subscription::{InstanceId, Subscription};
 pub use view::{Snapshot, WatchView};
 

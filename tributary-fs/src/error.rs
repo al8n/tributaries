@@ -561,6 +561,24 @@ pub enum SyncRootError {
   /// a marker behind.
   #[error("the root died while the sync cookie was pending")]
   Retired,
+  /// A coverage transition on the barrier's ground retired it before it was
+  /// installed; the covering `Rescan` is on the stream; retry.
+  ///
+  /// The barrier is dispatched under a coverage epoch and certifies delivery only
+  /// within it. A transition that touches the ground the barrier depends on —
+  /// a watch armed or dropped beneath it, a root replaced, a cover shrunk over
+  /// it — while the barrier is live retires it, dominated by the located `Rescan`
+  /// that transition stands, never as a certificate.
+  ///
+  /// This is the PRE-INSTALL half of that answer: the obligation was retired
+  /// before its reply was sent. It is not
+  /// [`CleanupBacklog`](Self::CleanupBacklog)-shaped backpressure — the caller's
+  /// barrier is already met by the re-enumeration instruction now on its stream,
+  /// so telling it to retry-because-busy would livelock it against a tree
+  /// churning faster than one round trip. Re-read the ground the `Rescan` names,
+  /// then re-mint if a fresh barrier is still wanted.
+  #[error("a coverage transition retired the sync barrier; the covering rescan is on the stream")]
+  Dominated,
   /// The watcher is closed.
   #[error("the watcher is closed")]
   Closed,

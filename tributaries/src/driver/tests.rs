@@ -231,6 +231,10 @@ struct FakeSource {
   /// unaffected; a cell driving the real `on_sync`/end-to-end install path turns it on, and
   /// `begin_sync` then returns a deterministic `<dir>/cookie-<seq>` key the test can deliver.
   supports_sync: bool,
+  /// When set, every `begin_sync` answers [`Begun::Dominated`](crate::source::Begun::Dominated):
+  /// a coverage transition on the barrier's ground retired it before the marker was installed.
+  /// OFF by default, so every other sync cell keeps exercising the installed arm.
+  dominate_syncs: bool,
   /// When set, `grow` never resolves — a coverage widening against a hung mount,
   /// the state the close race exists for.
   grow_pending: bool,
@@ -449,6 +453,7 @@ impl FakeSource {
       boom_on_cancel_replace: None,
       boom_on_cancel_grow: None,
       boom_on_cancel_begin_sync: None,
+      dominate_syncs: false,
       future_owed: std::sync::Arc::new(core::sync::atomic::AtomicUsize::new(0)),
       panic_begin_close: None,
       panic_disarms: HashMap::new(),
@@ -948,12 +953,20 @@ impl Source<OsString> for FakeSource {
     handle: u32,
     dir_key: &[OsString],
     token: SyncToken,
-  ) -> Result<Vec<OsString>, crate::error::SyncError> {
+  ) -> Result<crate::source::Begun<OsString>, crate::error::SyncError> {
     self.note(SourceCall::BeginSync(handle));
     if !self.supports_sync {
       return Err(crate::error::SyncError::Unsupported);
     }
     self.begun_syncs += 1;
+    // A coverage transition on the barrier's ground retired it before it could be installed.
+    // Answered AFTER the call is recorded and BEFORE any key is rendered: the fake writes no
+    // marker for it, which is what makes the arm a PRE-install retirement rather than a
+    // completed write the owner then discards.
+    if self.dominate_syncs {
+      self.begun_token = Some(token);
+      return Ok(crate::source::Begun::Dominated);
+    }
     // The token the abandon arm will later cancel — recorded so a cell can prove the cancel
     // names EXACTLY the sync that began (the nonce is owner-random, so the token cannot be
     // reconstructed from outside).
@@ -977,7 +990,7 @@ impl Source<OsString> for FakeSource {
     // side-effect-delivers the cookie yet returns `Pending`, letting a later ready arm win the
     // same `select` pass.
     if self.sync_script.is_empty() {
-      return Ok(cookie_key);
+      return Ok(crate::source::Begun::Installed(cookie_key));
     }
     let delivered = ScriptedBegin {
       script: &mut self.sync_script,
@@ -985,7 +998,7 @@ impl Source<OsString> for FakeSource {
       cookie_key,
     }
     .await;
-    Ok(delivered)
+    Ok(crate::source::Begun::Installed(delivered))
   }
 
   async fn replace(
@@ -18899,6 +18912,80 @@ async fn on_sync_skips_an_already_canceled_barrier() {
   );
 }
 
+/// A `begin_sync` answering [`Begun::Dominated`](crate::source::Begun::Dominated) — a coverage
+/// transition on the barrier's ground retired it before the marker could be installed — resolves
+/// the caller AT ONCE with `Ok(SyncOutcome::Dominated)`, and leaves nothing of the barrier
+/// behind.
+///
+/// The three residues this pins are the three a pre-install retirement could plausibly grow.
+/// No [`super::PendingSync`] is parked: the record that would carry it is never created, so the
+/// loop-top prune has nothing of this barrier to reap and no cookie key it could hand
+/// [`Source::end_sync`]. No [`Source::cancel_sync`] is issued: the write returned NORMALLY, so
+/// the by-name reclamation the abandon arms use would name a sync that has already resolved.
+/// And the reply is READY without the owner ever pumping `next`, which is what "at once, never
+/// at the caller's deadline" means — the retirement stood the covering `Rescan` before it
+/// answered, so there is no later observation to wait for.
+///
+/// FAIL-ON-REVERT: answer this arm `Err(SyncError::Busy)` (the placeholder this replaced) and
+/// the outcome assertion fails — a caller whose barrier is already met by re-enumeration would
+/// be told to retry, and a tree churning faster than one round trip livelocks it.
+#[tokio::test]
+async fn a_pre_install_domination_resolves_the_caller_dominated() {
+  use core::sync::atomic::Ordering;
+
+  use futures_util::FutureExt;
+
+  use crate::source::SyncOutcome;
+
+  let mut h = Harness::new();
+  h.owner.source.supports_sync = true;
+  // Every `begin_sync` of this source answers the pre-install retirement.
+  h.owner.source.dominate_syncs = true;
+  let sub = h.watch("/a", Interest::all()).await.expect("watch /a");
+
+  let loss_gen = h.owner.loss_gen.load(Ordering::SeqCst);
+  let (reply_tx, reply_rx) = futures_channel::oneshot::channel();
+  h.owner.on_sync(sub, loss_gen, reply_tx).await;
+
+  // Read WITHOUT awaiting: a reply that is not ready already means the barrier was installed and
+  // parked on a marker, which is the thing this arm must not do.
+  let answered = reply_rx
+    .now_or_never()
+    .expect("a pre-install domination answers the caller on the spot, never at its deadline")
+    .expect("the owner did not drop the reply");
+  let outcome = answered.expect("a dominated barrier is a MET barrier, not a refusal");
+  assert!(
+    outcome.is_dominated(),
+    "the barrier is met by re-enumeration, so the caller is told which arm met it: {outcome:?}"
+  );
+  assert_eq!(
+    outcome,
+    SyncOutcome::Dominated,
+    "the only outcome a pre-install retirement can carry"
+  );
+
+  assert_eq!(
+    h.owner.source.begun_syncs, 1,
+    "the write WAS reached — the retirement is the source's answer, not an admission refusal \
+     that never got there"
+  );
+  assert!(
+    h.owner.pending_syncs.is_empty(),
+    "no PendingSync is parked for a barrier that will never have a marker: {:?}",
+    h.owner.pending_syncs.len()
+  );
+  assert!(
+    h.owner.source.cancelled_syncs.is_empty(),
+    "the write returned normally, so nothing is cancelled by token: {:?}",
+    h.owner.source.cancelled_syncs
+  );
+  assert!(
+    h.owner.source.ended_syncs.is_empty(),
+    "no marker exists, so none is reaped: {:?}",
+    h.owner.source.ended_syncs
+  );
+}
+
 /// The FIRST sync an owner admits mints `seq = 1`. [`Owner::sync_seq`] starts at 0 and
 /// `on_sync` PRE-increments it before minting the token, so 0 is a value no cookie name has
 /// ever carried — which is what entitles the fs binding's classifier to refuse a `seq` of 0
@@ -19189,7 +19276,7 @@ impl Source<OsString> for SyncSource {
     handle: u32,
     dir_key: &[OsString],
     token: SyncToken,
-  ) -> Result<Vec<OsString>, crate::error::SyncError> {
+  ) -> Result<crate::source::Begun<OsString>, crate::error::SyncError> {
     let mut cookie_key = dir_key.to_vec();
     cookie_key.push(OsString::from(format!("cookie-{}", token.seq())));
     if self.observe {
@@ -19203,7 +19290,7 @@ impl Source<OsString> for SyncSource {
         Some(ChangeId::new(NonZeroU64::MIN)),
       ));
     }
-    Ok(cookie_key)
+    Ok(crate::source::Begun::Installed(cookie_key))
   }
 
   async fn next(&mut self) -> Option<SourceEvent<OsString, u32>> {
@@ -19431,13 +19518,13 @@ impl Source<OsString> for HeldBeginSyncSource {
     _handle: u32,
     dir_key: &[OsString],
     token: SyncToken,
-  ) -> Result<Vec<OsString>, crate::error::SyncError> {
+  ) -> Result<crate::source::Begun<OsString>, crate::error::SyncError> {
     // Park on the test's gate: the write is held until the test releases it (it never does), so the
     // owner would wedge here forever under an inline `begin_sync().await`.
     let _ = self.begin_gate.recv().await;
     let mut cookie_key = dir_key.to_vec();
     cookie_key.push(OsString::from(format!("cookie-{}", token.seq())));
-    Ok(cookie_key)
+    Ok(crate::source::Begun::Installed(cookie_key))
   }
 
   async fn next(&mut self) -> Option<SourceEvent<OsString, u32>> {

@@ -1222,6 +1222,7 @@ fn identity_minting_respects_devices_and_mounts() {
     prune: Globs::default(),
     include: None,
     markers: BTreeMap::new(),
+    barrier_epoch: BarrierEpoch::BIRTH,
   };
   let fid = NonZeroU64::new(7);
   assert!(mint(&state, Path::new("/r/a"), fid, None).is_some());
@@ -1265,6 +1266,7 @@ fn blind_mount_table_refuses_event_side_trust() {
     prune: Globs::default(),
     include: None,
     markers: BTreeMap::new(),
+    barrier_epoch: BarrierEpoch::BIRTH,
   };
   let fid = NonZeroU64::new(7);
   assert!(
@@ -3030,6 +3032,7 @@ mod lowering {
       prune: Globs::default(),
       include: None,
       markers: BTreeMap::new(),
+      barrier_epoch: BarrierEpoch::BIRTH,
     }
   }
 
@@ -9207,6 +9210,769 @@ mod descending {
       "under a covering Rescan for the content the read could not report: {effects:?}"
     );
   }
+
+  mod barrier {
+    //! The barrier epoch and the eight funnels that move it, the deliberate
+    //! non-bumps, and the drain-order substitution a retirement is built on.
+    //!
+    //! Every cell here is sans-I/O and reads the stamp through
+    //! [`DriverCore::barrier_epoch`]: nothing in production compares one, so the
+    //! stamp's only reader is the proof that a funnel fired.
+
+    use super::*;
+
+    const MARKER: &str = ".tributaries-sync-1-2-3-abcdef";
+    const OWNER: crate::driver::CookieId = crate::driver::CookieId(1);
+
+    /// The scope's stamp, for a scope the core still holds.
+    fn epoch(core: &DriverCore, scope: ScopeId) -> BarrierEpoch {
+      core
+        .barrier_epoch(scope)
+        .expect("a live scope carries a barrier stamp")
+    }
+
+    /// One located ground, spelled as a funnel records it.
+    fn ground(path: &str) -> BarrierLocation {
+      BarrierLocation::Path(Arc::new(PathBuf::from(path)))
+    }
+
+    /// Discards whatever the harness raised on its way to the state under test,
+    /// and reports the stamp the cell's own transition moves from.
+    fn quiesce(core: &mut DriverCore, scope: ScopeId) -> BarrierEpoch {
+      let _ = core.take_barrier_moves();
+      epoch(core, scope)
+    }
+
+    /// A live descending scope holding one child watch at `/r/sub`.
+    fn with_a_child() -> (DriverCore, ScopeId, WatchId) {
+      let (mut core, scope, req, root) = live_descending();
+      core.on_enumerated(req, listed(vec![entry("sub", FileKind::Dir, 1, 11)]));
+      run_cascade(&mut core, &BTreeMap::new());
+      (core, scope, root)
+    }
+
+    // ---- the eight funnels -------------------------------------------------
+
+    /// Funnel 1. Every route into the watch map — a crawl, a cascade, a cold
+    /// enumeration, a `set_cover` grow, the slot reconcile's move-in arm — lands
+    /// as one `Action::Watch(as_child)`, so the bump is raised there and at none
+    /// of them.
+    #[test]
+    fn an_armed_child_watch_bumps_at_its_own_path() {
+      let (mut core, scope, req, _root) = live_descending();
+      let before = quiesce(&mut core, scope);
+      core.on_enumerated(req, listed(vec![entry("sub", FileKind::Dir, 1, 11)]));
+      let _ = drain(&mut core);
+      assert_eq!(
+        epoch(&core, scope).0,
+        before.0 + 1,
+        "the arm moved the scope's stamp exactly once"
+      );
+      assert_eq!(
+        core.take_barrier_moves(),
+        vec![BarrierMove {
+          scope,
+          location: ground("/r/sub"),
+          rescan_stands: false,
+        }],
+        "located at the watch's own path, and standing no `Rescan` of its own"
+      );
+    }
+
+    /// Funnel 2. The drop funnel, reached by a prune, the reconcile's
+    /// drop-before-arm and a subtree drop alike.
+    ///
+    /// The ground is the WHOLE SCOPE rather than the dropped watch's path, and
+    /// that is a property of the Monitor rather than a choice made here:
+    /// `drop_subtree` erases the node before it queues the node's `Unwatch`, so
+    /// by the time the drain sees the action the watch is no longer placeable.
+    /// Fail-wide is the only sound direction — a narrower ground guessed from a
+    /// remembered path would spare a barrier standing on ground that really did
+    /// stop being watched.
+    #[test]
+    fn a_dropped_child_watch_bumps_the_scope_it_left() {
+      let (mut core, scope, root) = with_a_child();
+      let before = quiesce(&mut core, scope);
+      core.on_inotify_events(
+        scope,
+        vec![inotify(&[root], IN_DELETE | IN_ISDIR, 0, Some(b"sub"))],
+        at(1),
+      );
+      let _ = drain(&mut core);
+      assert!(
+        epoch(&core, scope).0 > before.0,
+        "the drop moved the scope's stamp"
+      );
+      assert_eq!(
+        core.take_barrier_moves(),
+        vec![BarrierMove {
+          scope,
+          location: BarrierLocation::Scope,
+          rescan_stands: false,
+        }],
+        "an unplaceable drop names the whole scope, and stands no `Rescan`"
+      );
+    }
+
+    /// Funnel 3. Every located `Rescan` this core mints reaches the Monitor
+    /// through `feed`, so the bump rides that one hand-off rather than the twenty
+    /// construction sites that reach it.
+    #[test]
+    fn a_located_rescan_fed_to_the_monitor_bumps_at_its_ground() {
+      let (mut core, scope) = live_core();
+      let before = quiesce(&mut core, scope);
+      core.on_batch_events(
+        scope,
+        vec![ev("/r/dirty", FsEventFlags::new(0), 1, 0)],
+        at(1),
+      );
+      let _ = drain(&mut core);
+      assert_eq!(
+        epoch(&core, scope).0,
+        before.0 + 1,
+        "the escalation moved the stamp exactly once"
+      );
+      assert_eq!(
+        core.take_barrier_moves(),
+        vec![BarrierMove {
+          scope,
+          location: ground("/r/dirty"),
+          rescan_stands: true,
+        }],
+        "at the ground the `Rescan` names, and the `Rescan` IS the covering \
+         instruction a retirement would otherwise owe"
+      );
+    }
+
+    /// Funnel 4. A replaced root is a different object, so the ground under
+    /// every obligation of the scope moved.
+    #[test]
+    fn a_root_replace_bumps_the_whole_scope() {
+      let (mut core, scope) = live_core();
+      let before = quiesce(&mut core, scope);
+      core.on_root_replaced(
+        scope,
+        RootMeta {
+          root: PathBuf::from("/r"),
+          root_dev: 1,
+          root_mnt_id: None,
+          mounts: Vec::new(),
+          identity: crate::os::RootIdentity::new(1, 2),
+          ancestors: Vec::new(),
+          backend: BackendKind::FsEvents,
+        },
+        at(1),
+      );
+      assert_eq!(
+        epoch(&core, scope).0,
+        before.0 + 1,
+        "the commit moved the stamp exactly once"
+      );
+      assert_eq!(
+        core.take_barrier_moves(),
+        vec![BarrierMove {
+          scope,
+          location: BarrierLocation::Scope,
+          rescan_stands: true,
+        }],
+        "over the whole scope, under the cut's own covering `Rescan`"
+      );
+    }
+
+    /// Funnel 5, the death verdict: the registered path no longer names the
+    /// watched object.
+    ///
+    /// The stamp dies with the scope this verdict tears down, so the recorded
+    /// move is the witness the cell reads.
+    #[test]
+    fn a_mount_refresh_finding_the_root_gone_bumps_the_whole_scope() {
+      let (mut core, scope) = live_core();
+      let _ = quiesce(&mut core, scope);
+      core.on_mounts_refreshed(
+        scope,
+        MountRefresh {
+          mounts: Vec::new(),
+          authoritative: true,
+          root: RootLiveness::Missing,
+          root_mnt_id: None,
+        },
+        at(1),
+      );
+      assert_eq!(
+        core.take_barrier_moves(),
+        vec![BarrierMove {
+          scope,
+          location: BarrierLocation::Scope,
+          rescan_stands: true,
+        }],
+        "the death lowers through the terminal `Rescan` path, so one stands"
+      );
+    }
+
+    /// Funnel 5, the frame-change verdict: a same-object re-mount moved the root
+    /// to a different mount, so every child the last enumerate classified
+    /// carries the old frame's verdict.
+    #[test]
+    fn a_refreshed_mount_frame_bumps_the_whole_scope() {
+      let (mut core, scope, _req, _root) = live_descending_mnt(5);
+      let before = quiesce(&mut core, scope);
+      core.on_mounts_refreshed(
+        scope,
+        MountRefresh {
+          mounts: Vec::new(),
+          authoritative: true,
+          root: RootLiveness::Present(crate::os::RootIdentity::new(1, 1)),
+          root_mnt_id: Some(6),
+        },
+        at(1),
+      );
+      assert!(
+        epoch(&core, scope).0 > before.0,
+        "the adopted frame moved the stamp"
+      );
+      assert_eq!(
+        core.take_barrier_moves(),
+        vec![BarrierMove {
+          scope,
+          location: BarrierLocation::Scope,
+          rescan_stands: true,
+        }],
+        "over the whole scope, under the replay's own covering `Rescan`"
+      );
+    }
+
+    /// Funnel 5, the cross-world path: the refresh answering here was addressed
+    /// to a root this scope REPLACED, so its whole snapshot is about a world
+    /// that ended and the live one has not been read.
+    ///
+    /// Unlike the other two verdicts it emits no `Rescan` — it only re-arms the
+    /// read — so it reports standing none, and a retirement under it owes the
+    /// covering instruction itself.
+    #[test]
+    fn a_cross_world_refresh_bumps_the_whole_scope_and_stands_no_rescan() {
+      let (mut core, scope) = live_core();
+      // A loss arms a refresh, and the replace that follows disowns it: the
+      // completion below is the old world's.
+      core.on_root_overflow(scope, at(1));
+      core.on_root_replaced(
+        scope,
+        RootMeta {
+          root: PathBuf::from("/r"),
+          root_dev: 1,
+          root_mnt_id: None,
+          mounts: Vec::new(),
+          identity: crate::os::RootIdentity::new(1, 2),
+          ancestors: Vec::new(),
+          backend: BackendKind::FsEvents,
+        },
+        at(2),
+      );
+      let before = quiesce(&mut core, scope);
+      core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(3));
+      assert_eq!(
+        epoch(&core, scope).0,
+        before.0 + 1,
+        "the discarded snapshot moved the stamp exactly once"
+      );
+      assert_eq!(
+        core.take_barrier_moves(),
+        vec![BarrierMove {
+          scope,
+          location: BarrierLocation::Scope,
+          rescan_stands: false,
+        }],
+      );
+    }
+
+    /// Funnel 6. A transport-level loss may have swallowed any coverage
+    /// transition at all, so it is one about the whole scope.
+    #[test]
+    fn a_root_overflow_bumps_the_whole_scope() {
+      let (mut core, scope) = live_core();
+      let before = quiesce(&mut core, scope);
+      core.on_root_overflow(scope, at(1));
+      assert_eq!(
+        epoch(&core, scope).0,
+        before.0 + 1,
+        "the loss moved the stamp exactly once"
+      );
+      assert_eq!(
+        core.take_barrier_moves(),
+        vec![BarrierMove {
+          scope,
+          location: BarrierLocation::Scope,
+          rescan_stands: true,
+        }],
+        "under the cut's own covering `Rescan`"
+      );
+    }
+
+    /// Funnel 7. A routed `Rescan` degrades the scope's recorded cover claim to
+    /// the empty one — a wholesale change of what "covered" means for every
+    /// admission after it.
+    ///
+    /// It is NOT subsumed by `feed`'s funnel: this `Rescan` is minted inside the
+    /// Monitor by the declined-probe loss funnel and never passes `feed` at all.
+    #[test]
+    fn a_routed_rescan_degrading_the_cover_bumps_without_passing_feed() {
+      let (mut core, scope, _root) = shrunk_to_keep();
+      assert!(
+        core.scopes[&scope].applied_cover.is_some(),
+        "staging: the scope carries a narrowed claim for the degrade to take"
+      );
+      let before = quiesce(&mut core, scope);
+      core.on_refresh_declined(scope, at(1), DeclineReason::BudgetFull);
+      assert_eq!(
+        epoch(&core, scope).0,
+        before.0 + 1,
+        "the degrade moved the stamp exactly once"
+      );
+      assert_eq!(
+        core.take_barrier_moves(),
+        vec![BarrierMove {
+          scope,
+          location: BarrierLocation::Scope,
+          rescan_stands: true,
+        }],
+        "at the root ground the `Rescan` names, which is the whole scope"
+      );
+      assert_eq!(
+        core.scopes[&scope].applied_cover,
+        Some(Vec::new()),
+        "non-vacuity: the claim really did degrade"
+      );
+    }
+
+    /// The drain-order hole's one escape (B-1), closed: `on_refresh_declined`
+    /// runs INSIDE `execute_effects`, fed back from the effect executor, so its
+    /// `BudgetFull` arm cannot rely on the next loop-top drain — anything this
+    /// scope already queued must be purged before the funnel's covering
+    /// `Rescan` is minted, exactly as `on_delivery`'s `Refused` arm purges
+    /// before ITS overflow.
+    ///
+    /// An `Owned` obligation's marker emit is queued first (an ordinary
+    /// `Created` change at the reserved leaf, the shape a real sync cookie's
+    /// create arrives as); a tick then declines at a full liveness-probe
+    /// budget. Without the purge the marker would still be sitting in the
+    /// queue ahead of the `Rescan` appended at the tail, and a consumer
+    /// draining in order would match it before the domination it should have
+    /// read instead.
+    ///
+    /// Revert witness: drop the `purge_scope_emits` call from
+    /// `on_refresh_declined`'s `unproven` arm and the marker is delivered
+    /// first — `emitted.len()` becomes 2 and `emitted[0]` is the marker, not
+    /// the `Rescan`.
+    #[test]
+    fn a_budget_declined_tick_purges_the_scopes_queued_marker_before_its_rescan() {
+      let (mut core, scope) = live_core();
+      core.on_batch_events(
+        scope,
+        vec![ev(
+          &format!("/r/{COOKIE_DIR}/marker"),
+          flags(&[FsEventFlags::ITEM_CREATED]),
+          1,
+          10,
+        )],
+        at(1),
+      );
+
+      core.on_refresh_declined(scope, at(2), DeclineReason::BudgetFull);
+
+      let effects = drain(&mut core);
+      let emitted = emits(&effects);
+      assert_eq!(
+        emitted.len(),
+        1,
+        "the marker's queued emit is purged, leaving only the declined tick's \
+         Rescan: {effects:?}"
+      );
+      assert!(
+        emitted[0].kind().is_rescan(),
+        "the consumer sees the Rescan, never the marker: {effects:?}"
+      );
+    }
+
+    /// Funnel 7 and funnel 3 on one `Rescan`: the overlap is real, it names ONE
+    /// ground, and the drain coalesces the two moves rather than retiring the
+    /// same barrier twice. Documented rather than deduped — deleting either
+    /// funnel would leave the other's population uncovered.
+    #[test]
+    fn an_overflow_rescan_bumps_both_funnels_at_one_coalesced_ground() {
+      let (mut core, scope, _root) = shrunk_to_keep();
+      let before = quiesce(&mut core, scope);
+      core.stand_covering_rescan(scope, Path::new("/r/keep/deep"), at(1));
+      assert_eq!(
+        epoch(&core, scope).0,
+        before.0 + 2,
+        "the feed and the degrade each moved the stamp"
+      );
+      assert_eq!(
+        core.take_barrier_moves(),
+        vec![BarrierMove {
+          scope,
+          location: ground("/r/keep"),
+          rescan_stands: true,
+        }],
+        "and both named the same ground, so the drain sees one move"
+      );
+    }
+
+    /// Funnel 8, and its independence. The settle observation narrows the
+    /// scope's claim to the provable under-claim, many passes after whatever
+    /// made the window lossy — and the `Rescan` that did need not have covered
+    /// the obligation's ground at all, so this funnel always owes its own.
+    #[test]
+    fn a_lossy_settle_rewind_bumps_and_stands_no_rescan_of_its_own() {
+      let (mut core, scope, _root) = shrunk_to_keep();
+      assert_eq!(
+        core.on_set_cover(scope, &[p("/r/keep"), p("/r/drop")]),
+        CoverReconcile::Reconciling
+      );
+      let fence = core.open_cover_fence(scope);
+      run_cascade(
+        &mut core,
+        &BTreeMap::from([("/r", root_listing_with_unknown())]),
+      );
+      core.mark_cut_inflight(scope, 1);
+      core.prove_cut(scope, 1);
+      assert_eq!(
+        core.poll_cover_settlements(DRAINED),
+        Vec::new(),
+        "the observation stands the standing loss's cover and holds the tranche"
+      );
+      let _ = drain(&mut core);
+      core.on_delivery(scope, Delivery::Accepted, at(1));
+
+      // Everything up to the rewind is staging; what follows is the funnel.
+      let before = quiesce(&mut core, scope);
+      assert_eq!(
+        core.poll_cover_settlements(DRAINED),
+        vec![(fence, CoverSettle::Degraded)],
+      );
+      assert_eq!(
+        epoch(&core, scope).0,
+        before.0 + 1,
+        "the rewind moved the stamp exactly once"
+      );
+      assert_eq!(
+        core.take_barrier_moves(),
+        vec![BarrierMove {
+          scope,
+          location: BarrierLocation::Scope,
+          rescan_stands: false,
+        }],
+      );
+      assert!(
+        drain(&mut core).is_empty(),
+        "and it queued no `Rescan` of its own: the covering one is owed by \
+         whoever retires under this move"
+      );
+    }
+
+    /// The queue's BOUND, and the honest degrade that keeps it. A burst past
+    /// [`MAX_BARRIER_MOVES_PER_SCOPE`] distinct grounds folds the scope's
+    /// entries into ONE whole-scope move rather than forgetting any of them —
+    /// the whole-scope move retires a superset of what the folded ones would
+    /// have, and owes its own covering `Rescan`.
+    #[test]
+    fn a_burst_past_the_bound_folds_to_one_whole_scope_move() {
+      let (mut core, scope, req, _root) = live_descending();
+      let before = quiesce(&mut core, scope);
+      let entries: Vec<RawDirEntry> = (0..=MAX_BARRIER_MOVES_PER_SCOPE)
+        .map(|i| entry(&format!("d{i}"), FileKind::Dir, 1, 20 + i as u64))
+        .collect();
+      let armed = entries.len() as u64;
+      core.on_enumerated(req, listed(entries));
+      let _ = drain(&mut core);
+      assert_eq!(
+        epoch(&core, scope).0,
+        before.0 + armed,
+        "every arm still passed the funnel and moved the stamp"
+      );
+      assert_eq!(
+        core.take_barrier_moves(),
+        vec![BarrierMove {
+          scope,
+          location: BarrierLocation::Scope,
+          rescan_stands: false,
+        }],
+        "and the queue holds the one move that subsumes them, never a forgotten \
+         transition"
+      );
+    }
+
+    /// The bound's fold-UP must not carry a located `true` into the scope-wide
+    /// move it produces: a located `rescan_stands = true` means "a `Rescan`
+    /// covering THIS ground stands", which is a claim about `MAX_BARRIER_MOVES_PER_SCOPE`
+    /// particular grounds, not about the whole scope. A burst of funnel-3 moves —
+    /// every one of them standing its own located `Rescan` — must still fold to a
+    /// `Scope` move that owes its OWN covering `Rescan`, exactly like the
+    /// standing-nothing burst above. (Before the fold's fix this asserted
+    /// `rescan_stands == true`, and failed: the fold carried the incoming
+    /// located move's flag straight through.)
+    #[test]
+    fn a_true_standing_burst_past_the_bound_still_folds_to_a_false_standing_scope_move() {
+      let (mut core, scope) = live_core();
+      let before = quiesce(&mut core, scope);
+      let bursts = MAX_BARRIER_MOVES_PER_SCOPE as u64 + 1;
+      for i in 0..bursts {
+        core.on_batch_events(
+          scope,
+          vec![ev(&format!("/r/dirty{i}"), FsEventFlags::new(0), i + 1, 0)],
+          at(1),
+        );
+      }
+      let _ = drain(&mut core);
+      assert_eq!(
+        epoch(&core, scope).0,
+        before.0 + bursts,
+        "every escalation still passed the funnel and moved the stamp"
+      );
+      assert_eq!(
+        core.take_barrier_moves(),
+        vec![BarrierMove {
+          scope,
+          location: BarrierLocation::Scope,
+          rescan_stands: false,
+        }],
+        "the fold widens the location to the whole scope, so it must not also \
+         claim a scope-wide `Rescan` that nothing actually stood"
+      );
+    }
+
+    // ---- the deliberate non-bumps -----------------------------------------
+
+    /// Data events — the creates, modifies and renames of files the watches
+    /// already attribute — are what the barrier ORDERS, not what moves it.
+    #[test]
+    fn data_events_never_move_the_stamp() {
+      let (mut core, scope, root) = with_a_child();
+      let before = quiesce(&mut core, scope);
+      core.on_inotify_events(
+        scope,
+        vec![
+          inotify(&[root], IN_CREATE, 0, Some(b"a.txt")),
+          inotify(&[root], IN_DELETE, 0, Some(b"a.txt")),
+        ],
+        at(1),
+      );
+      let _ = drain(&mut core);
+      assert_eq!(epoch(&core, scope).0, before.0, "no funnel was passed");
+      assert!(core.take_barrier_moves().is_empty());
+    }
+
+    /// A watched directory that moves WITHIN the scope arms nothing and drops
+    /// nothing, so it passes no funnel. The belt is the write's own
+    /// descriptor-relative walk and identity comparison, which refuses a moved
+    /// target — not the epoch.
+    #[test]
+    fn a_reparent_within_the_scope_never_moves_the_stamp() {
+      let (mut core, scope, root) = with_a_child();
+      let before = quiesce(&mut core, scope);
+      core.on_inotify_events(
+        scope,
+        vec![
+          inotify(&[root], IN_MOVED_FROM | IN_ISDIR, 7, Some(b"sub")),
+          inotify(&[root], IN_MOVED_TO | IN_ISDIR, 7, Some(b"moved")),
+        ],
+        at(1),
+      );
+      let _ = drain(&mut core);
+      assert_eq!(epoch(&core, scope).0, before.0, "no funnel was passed");
+      assert!(core.take_barrier_moves().is_empty());
+    }
+
+    /// A reply-less re-issue of a settled cover prunes nothing and grows
+    /// nothing, so it reaches no action and no funnel. The umbrella re-issues
+    /// covers periodically; a bump here would dominate every barrier in flight
+    /// on a cover that changed nothing.
+    #[test]
+    fn a_no_op_cover_re_issue_never_moves_the_stamp() {
+      let (mut core, scope, _root) = shrunk_to_keep();
+      let before = quiesce(&mut core, scope);
+      assert_eq!(
+        core.on_set_cover(scope, &[p("/r/keep")]),
+        CoverReconcile::Reconciling,
+        "staging: the same cover is applied again"
+      );
+      let _ = drain(&mut core);
+      assert_eq!(epoch(&core, scope).0, before.0, "no funnel was passed");
+      assert!(core.take_barrier_moves().is_empty());
+    }
+
+    /// A scope's BIRTH inserts its root into the watch map directly, outside the
+    /// child-arm funnel — and owes no bump, since no obligation of the scope can
+    /// exist yet.
+    #[test]
+    fn a_scope_is_born_at_the_never_bumped_floor() {
+      let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
+      let scope = core
+        .on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Inotify)
+        .expect("a fresh scope registers");
+      assert_eq!(epoch(&core, scope), BarrierEpoch::BIRTH);
+      assert!(core.take_barrier_moves().is_empty());
+    }
+
+    /// A scope TEARDOWN takes the root arm, never the child one, and owes no
+    /// bump of its own: `retire_scope` and a `Dead` cover settlement already give
+    /// every obligation of a dead scope a typed terminal, which is the stronger
+    /// outcome.
+    #[test]
+    fn a_scope_teardown_raises_no_bump_of_its_own() {
+      let (mut core, scope, _req, _root) = live_descending();
+      let before = quiesce(&mut core, scope);
+      core.on_unwatch(scope);
+      let _ = drain(&mut core);
+      assert!(
+        core.barrier_epoch(scope).is_none(),
+        "the stamp dies with the scope"
+      );
+      assert!(
+        core.take_barrier_moves().is_empty(),
+        "and the root arm raised nothing on the way out"
+      );
+      assert_eq!(
+        before,
+        BarrierEpoch::BIRTH,
+        "non-vacuity: nothing had moved the stamp before the teardown either"
+      );
+    }
+
+    // ---- the drain-order hole, and the substitution that closes it ---------
+
+    /// One batch carrying a same-name substitution of the watched `/r/sub` — a
+    /// prepared sibling renamed OVER it, which the slot reconcile answers by
+    /// dropping the incumbent watch before it takes the arrival — and, behind it,
+    /// the create of a marker-shaped leaf. That is the kernel order Premise 1
+    /// guarantees: the swap's records precede the marker's create in ONE queue.
+    fn swap_then_marker() -> (DriverCore, ScopeId) {
+      let (mut core, scope, req, root) = live_descending();
+      core.on_enumerated(
+        req,
+        listed(vec![
+          entry("sub", FileKind::Dir, 1, 11),
+          entry("other", FileKind::Dir, 1, 12),
+        ]),
+      );
+      run_cascade(&mut core, &BTreeMap::new());
+      core.arm_sync_marker(scope, Arc::from(MARKER), OWNER);
+      let _ = core.take_barrier_moves();
+      let _ = drain(&mut core);
+      core.on_inotify_events(
+        scope,
+        vec![
+          inotify(&[root], IN_MOVED_FROM | IN_ISDIR, 7, Some(b"other")),
+          inotify(&[root], IN_MOVED_TO | IN_ISDIR, 7, Some(b"sub")),
+          inotify(&[root], IN_CREATE, 0, Some(MARKER.as_bytes())),
+        ],
+        at(1),
+      );
+      (core, scope)
+    }
+
+    /// THE DRAIN-ORDER HOLE, closed. The core routes every change before it
+    /// processes any action, so the marker's `Emit` is queued AHEAD of the funnel
+    /// bump the substitution in the same batch raises: the kernel's order is
+    /// right and the drain's is not, and a consumer matching the marker first
+    /// would read a certificate over a window whose ground moved.
+    ///
+    /// The retirement therefore PURGES the marker's queued emit and stands the
+    /// covering `Rescan` in its place, both before the effect queue is flushed.
+    ///
+    /// Revert witness:
+    /// [`skipping_the_purge_leaves_the_marker_ahead_of_the_covering_rescan`].
+    #[test]
+    fn a_swap_and_a_marker_create_in_one_batch_leave_the_rescan_not_the_marker() {
+      let (mut core, scope) = swap_then_marker();
+      assert!(
+        core
+          .effects
+          .iter()
+          .any(|e| matches!(e, Effect::Emit { change, .. } if names_leaf(change, MARKER))),
+        "staging: the marker's emit is queued by the change loop"
+      );
+      let moves = core.take_barrier_moves();
+      assert!(
+        !moves.is_empty(),
+        "and the substitution's bump only reaches the driver now, behind it: \
+         {moves:?}"
+      );
+
+      assert_eq!(
+        core.purge_marker_emits(scope, MARKER),
+        1,
+        "the retirement takes its own marker's emit, and only that"
+      );
+      core.stand_covering_rescan(scope, Path::new("/r"), at(2));
+
+      let effects = drain(&mut core);
+      let emitted = emits(&effects);
+      assert!(
+        !emitted.iter().any(|change| names_leaf(change, MARKER)),
+        "the consumer never sees the marker: {effects:?}"
+      );
+      assert!(
+        emitted.iter().any(|change| change.kind().is_rescan()),
+        "it sees the covering `Rescan` in its place: {effects:?}"
+      );
+    }
+
+    /// The revert witness: skip the purge and the marker emit is still in the
+    /// queue AHEAD of everything the retirement could put there — which is
+    /// exactly the false certificate the substitution exists to stop.
+    #[test]
+    fn skipping_the_purge_leaves_the_marker_ahead_of_the_covering_rescan() {
+      let (mut core, scope) = swap_then_marker();
+      let _ = core.take_barrier_moves();
+      core.stand_covering_rescan(scope, Path::new("/r"), at(2));
+
+      let effects = drain(&mut core);
+      let emitted = emits(&effects);
+      let marker = emitted
+        .iter()
+        .position(|change| names_leaf(change, MARKER))
+        .expect("without the purge the marker is still queued");
+      let covering = emitted
+        .iter()
+        .rposition(|change| change.kind().is_rescan())
+        .expect("the covering `Rescan` was queued behind it");
+      assert!(
+        marker < covering,
+        "and the consumer would match the marker first: {effects:?}"
+      );
+    }
+
+    /// The purge is keyed on the leaf AND the scope, never on the scope alone: a
+    /// scope-wide purge would take the emit of an obligation the location test
+    /// spared and time that barrier out. A `Rescan` is never taken either.
+    #[test]
+    fn the_purge_takes_only_the_named_marker() {
+      let (mut core, scope, root) = with_a_child();
+      core.arm_sync_marker(scope, Arc::from(MARKER), OWNER);
+      core.on_inotify_events(
+        scope,
+        vec![
+          inotify(&[root], IN_CREATE, 0, Some(MARKER.as_bytes())),
+          inotify(&[root], IN_CREATE, 0, Some(b"notes.txt")),
+        ],
+        at(1),
+      );
+      core.stand_covering_rescan(scope, Path::new("/r"), at(2));
+      assert_eq!(core.purge_marker_emits(scope, MARKER), 1);
+      let effects = drain(&mut core);
+      let emitted = emits(&effects);
+      assert!(
+        emitted
+          .iter()
+          .any(|change| change.location() == &loc(&["notes.txt"])),
+        "the caller's own file is untouched: {effects:?}"
+      );
+      assert!(
+        emitted.iter().any(|change| change.kind().is_rescan()),
+        "and so is the covering `Rescan`: {effects:?}"
+      );
+    }
+  }
 }
 
 mod kernel_recursive_fanotify {
@@ -12507,6 +13273,41 @@ mod root_widened {
     );
     let _ = drain(&mut core);
     (core, scope, root_watch, req)
+  }
+
+  /// A widen commit ADDS ground: the old subtree's watches, states, reads and
+  /// deficits ride across untouched, and a barrier standing under it is still
+  /// valid. So the commit raises no barrier bump of its own — neither for the
+  /// SPLICE, which inserts the widened root into the watch map outside the
+  /// child-arm funnel, nor for the unconditional `trust_lost` it calls, which is
+  /// a stale-world mark on a commit that is signal-free by design. A bump here
+  /// would cost every barrier in flight a domination for ground that only grew.
+  #[test]
+  fn a_widen_commit_and_its_splice_raise_no_barrier_bump() {
+    let (mut core, scope, _root_watch, _boot) = live_at("/r/sub", 1, true);
+    let _ = core.take_barrier_moves();
+    let before = core
+      .barrier_epoch(scope)
+      .expect("a live scope carries a barrier stamp");
+
+    let reserved = widen(&mut core, scope, meta("/r", 9), at(2));
+    assert_eq!(
+      core.watch_scopes.get(&reserved),
+      Some(&scope),
+      "staging: the splice really did put the widened root in the watch map"
+    );
+    assert_eq!(
+      core
+        .barrier_epoch(scope)
+        .expect("the widened scope is still live")
+        .0,
+      before.0,
+      "and neither the splice nor the commit's trust mark moved the stamp"
+    );
+    assert!(
+      core.take_barrier_moves().is_empty(),
+      "so nothing is queued for a retirement to act on"
+    );
   }
 
   #[test]

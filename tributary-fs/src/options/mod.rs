@@ -96,6 +96,16 @@ pub enum OptionsError {
     /// The interval the options carried.
     supplied: Duration,
   },
+  /// The unremoved-sync-marker ceiling exceeds
+  /// [`WatcherOptions::MAX_COOKIE_GLOBAL_CAP`].
+  #[error(
+    "a cookie global cap of {supplied} exceeds the {} ceiling",
+    WatcherOptions::MAX_COOKIE_GLOBAL_CAP
+  )]
+  CookieGlobalCapTooLarge {
+    /// The cap the options carried.
+    supplied: NonZeroUsize,
+  },
   /// The per-root [`prune`](RootOptions::prune) seat carries more patterns than
   /// [`RootOptions::MAX_SEAT_PATTERNS`].
   #[error(
@@ -221,6 +231,14 @@ const fn check_root_liveness_interval(interval: Duration) -> Result<Duration, Op
   Ok(interval)
 }
 
+/// The same one rule for [`WatcherOptions::cookie_global_cap`].
+const fn check_cookie_global_cap(cap: NonZeroUsize) -> Result<NonZeroUsize, OptionsError> {
+  if cap.get() > WatcherOptions::MAX_COOKIE_GLOBAL_CAP.get() {
+    return Err(OptionsError::CookieGlobalCapTooLarge { supplied: cap });
+  }
+  Ok(cap)
+}
+
 /// Configuration for a [`Watcher`](crate::Watcher).
 ///
 /// [`new`](Self::new) returns the defaults; every knob has a `with_*` builder,
@@ -252,8 +270,9 @@ const fn check_root_liveness_interval(interval: Duration) -> Result<Duration, Op
 /// it, so a document names only what it overrides, and an unknown key is ignored
 /// (a document written for a later version still loads). Durations are humantime
 /// text (`"10ms"`, `"2s"`), the capacities plain integers (a `0` is refused — they
-/// are non-zero types), the exclusions plain paths, and `max_map_directories` is
-/// either an integer cap or `null` for uncapped.
+/// are non-zero types), the exclusions plain paths, `cookie_global_cap` a non-zero
+/// integer whose omitted default is the host platform's, and
+/// `max_map_directories` either an integer cap or `null` for uncapped.
 ///
 /// ```json
 /// {
@@ -312,6 +331,12 @@ const fn check_root_liveness_interval(interval: Duration) -> Result<Duration, Op
 /// flag — its own documentation explains why the default is finite — nor from a
 /// document format without a null literal; a caller that wants it says so in code.
 ///
+/// `--cookie-global-cap` is the one flag whose printed default is the HOST's rather
+/// than a constant of this crate: 64 where the watcher is built for macOS and 128
+/// elsewhere, because the descriptor budget a sync obligation is drawn against differs
+/// by platform ([`DEFAULT_COOKIE_GLOBAL_CAP`](Self::DEFAULT_COOKIE_GLOBAL_CAP) carries
+/// the arithmetic). The flag itself, and the range it accepts, are the same everywhere.
+///
 /// An UPDATE (`clap::FromArgMatches::update_from_arg_matches`) changes only the
 /// knobs the command line actually carried: `--latency` alone leaves the backend,
 /// the buffer size, the exclusions and both capacities exactly as they stood.
@@ -354,6 +379,8 @@ pub struct WatcherOptions {
   )]
   root_liveness_interval: Duration,
   max_map_directories: Option<usize>,
+  #[cfg_attr(feature = "serde", serde(deserialize_with = "de_cookie_global_cap"))]
+  cookie_global_cap: NonZeroUsize,
 }
 
 /// ONE exclusion path, read through a STRING VISITOR so
@@ -608,6 +635,17 @@ where
   check_os_buffer_bytes(NonZeroU32::deserialize(deserializer)?).map_err(D::Error::custom)
 }
 
+/// The same, for the `cookie_global_cap` key.
+#[cfg(feature = "serde")]
+fn de_cookie_global_cap<'de, D>(deserializer: D) -> Result<NonZeroUsize, D::Error>
+where
+  D: serde::Deserializer<'de>,
+{
+  use serde::{Deserialize as _, de::Error as _};
+
+  check_cookie_global_cap(NonZeroUsize::deserialize(deserializer)?).map_err(D::Error::custom)
+}
+
 /// The `--latency` parser: the flag refuses out of range what
 /// [`WatcherOptions::validate`] refuses at construction, so a command line hears
 /// the ceiling where the value is written rather than at the watcher. The refusal
@@ -650,6 +688,14 @@ fn parse_os_buffer_bytes(
   text: &str,
 ) -> Result<NonZeroU32, Box<dyn core::error::Error + Send + Sync>> {
   Ok(check_os_buffer_bytes(text.parse()?)?)
+}
+
+/// The same, for `--cookie-global-cap`.
+#[cfg(feature = "clap")]
+fn parse_cookie_global_cap(
+  text: &str,
+) -> Result<NonZeroUsize, Box<dyn core::error::Error + Send + Sync>> {
+  Ok(check_cookie_global_cap(text.parse()?)?)
 }
 
 #[cfg(feature = "clap")]
@@ -723,6 +769,12 @@ struct WatcherOptionsArgs {
   root_liveness_interval: Duration,
   #[arg(long, default_value = clap_default_max_map_directories())]
   max_map_directories: Option<usize>,
+  #[arg(
+    long,
+    value_parser = parse_cookie_global_cap,
+    default_value = clap_default(WatcherOptions::DEFAULT_COOKIE_GLOBAL_CAP.to_string()),
+  )]
+  cookie_global_cap: NonZeroUsize,
 }
 
 /// The value an argument carried, but ONLY when the COMMAND LINE is where it came
@@ -777,6 +829,7 @@ impl From<WatcherOptionsArgs> for WatcherOptions {
       backend,
       root_liveness_interval,
       max_map_directories,
+      cookie_global_cap,
     } = args;
     Self {
       latency,
@@ -788,6 +841,7 @@ impl From<WatcherOptionsArgs> for WatcherOptions {
       backend,
       root_liveness_interval,
       max_map_directories,
+      cookie_global_cap,
     }
   }
 }
@@ -837,6 +891,9 @@ impl clap::FromArgMatches for WatcherOptions {
     // cap — an update never says "remove the ceiling".
     if let Some(cap) = command_line_value::<usize>(matches, "max_map_directories") {
       self.max_map_directories = Some(cap);
+    }
+    if let Some(cap) = command_line_value::<NonZeroUsize>(matches, "cookie_global_cap") {
+      self.cookie_global_cap = cap;
     }
     Ok(())
   }
@@ -1000,6 +1057,67 @@ impl WatcherOptions {
   /// what exceeding it does and for the memory table it is derived from.
   pub const DEFAULT_MAX_MAP_DIRECTORIES: Option<usize> = Some(1_000_000);
 
+  /// The default ceiling on unremoved sync markers across every root of one
+  /// watcher — **64 on macOS, 128 everywhere else**.
+  ///
+  /// It bounds ADMISSION: at most this many sync obligations exist at once, and
+  /// a [`sync_root`](crate::Watcher::sync_root) past it is refused
+  /// `CleanupBacklog` until the cleanup drains. What makes it worth sizing per
+  /// platform is that each obligation is also DESCRIPTORS, and the budget for
+  /// those is not the same everywhere: macOS defaults to a 256-descriptor soft
+  /// limit against 1024 elsewhere, and a kernel-recursive lowering (FSEvents) is
+  /// the one that holds a target and a reserved-directory pin per barrier in
+  /// flight, where a descending lowering (inotify) releases both at its door and
+  /// keeps only the marker pin plus the obligation's OWN `CookieDir` descriptor
+  /// — never a descriptor shared across obligations: a cache reused across
+  /// syncs would answer for an earlier admission's `Replaced`/`CrossesMount`
+  /// reading rather than this one's, so each obligation opens and holds its
+  /// own, bounded by the per-scope backlog cap of 8.
+  ///
+  /// The watcher's sync door is sized from this in turn — at most `min(cap, 8)`
+  /// concurrent samplings on macOS and `min(cap, 32)` elsewhere — so raising the
+  /// cap widens both terms. Raise it only with the descriptor budget of the host
+  /// in mind; lowering it is always safe and costs only admission throughput.
+  #[cfg(target_os = "macos")]
+  pub const DEFAULT_COOKIE_GLOBAL_CAP: NonZeroUsize = NonZeroUsize::new(64).unwrap();
+  /// The default ceiling on unremoved sync markers across every root of one
+  /// watcher — **64 on macOS, 128 everywhere else**.
+  ///
+  /// It bounds ADMISSION: at most this many sync obligations exist at once, and
+  /// a [`sync_root`](crate::Watcher::sync_root) past it is refused
+  /// `CleanupBacklog` until the cleanup drains. What makes it worth sizing per
+  /// platform is that each obligation is also DESCRIPTORS, and the budget for
+  /// those is not the same everywhere: macOS defaults to a 256-descriptor soft
+  /// limit against 1024 elsewhere, and a kernel-recursive lowering (FSEvents) is
+  /// the one that holds a target and a reserved-directory pin per barrier in
+  /// flight, where a descending lowering (inotify) releases both at its door and
+  /// keeps only the marker pin plus the obligation's OWN `CookieDir` descriptor
+  /// — never a descriptor shared across obligations: a cache reused across
+  /// syncs would answer for an earlier admission's `Replaced`/`CrossesMount`
+  /// reading rather than this one's, so each obligation opens and holds its
+  /// own, bounded by the per-scope backlog cap of 8.
+  ///
+  /// The watcher's sync door is sized from this in turn — at most `min(cap, 8)`
+  /// concurrent samplings on macOS and `min(cap, 32)` elsewhere — so raising the
+  /// cap widens both terms. Raise it only with the descriptor budget of the host
+  /// in mind; lowering it is always safe and costs only admission throughput.
+  #[cfg(not(target_os = "macos"))]
+  pub const DEFAULT_COOKIE_GLOBAL_CAP: NonZeroUsize = NonZeroUsize::new(128).unwrap();
+
+  /// The largest [`cookie_global_cap`](Self::cookie_global_cap) this crate
+  /// accepts on any face.
+  ///
+  /// Sized against the same descriptor arithmetic the default is (the
+  /// driver's own `sync_door_allowance` doc carries the full derivation):
+  /// `cap`'s own dominant peak term is `cap × 2`
+  /// on a descending profile, and that term alone must stay comfortably under
+  /// the common 4096-descriptor budget most hosts carry, leaving room for the
+  /// door's `× 4` and the walk term rather than consuming the whole table by
+  /// itself. `1024 × 2 = 2048` — half of 4096 — is that room; nothing routes a
+  /// value past this ceiling without a typed refusal
+  /// ([`OptionsError::CookieGlobalCapTooLarge`]).
+  pub const MAX_COOKIE_GLOBAL_CAP: NonZeroUsize = NonZeroUsize::new(1024).unwrap();
+
   /// The default options.
   #[inline]
   pub const fn new() -> Self {
@@ -1013,6 +1131,7 @@ impl WatcherOptions {
       backend: Self::DEFAULT_BACKEND,
       root_liveness_interval: Self::DEFAULT_ROOT_LIVENESS_INTERVAL,
       max_map_directories: Self::DEFAULT_MAX_MAP_DIRECTORIES,
+      cookie_global_cap: Self::DEFAULT_COOKIE_GLOBAL_CAP,
     }
   }
 
@@ -1058,6 +1177,7 @@ impl WatcherOptions {
     check_os_batch_capacity(self.os_batch_capacity)?;
     check_os_buffer_bytes(self.os_buffer_bytes)?;
     check_root_liveness_interval(self.root_liveness_interval)?;
+    check_cookie_global_cap(self.cookie_global_cap)?;
     Ok(())
   }
 
@@ -1423,6 +1543,30 @@ impl WatcherOptions {
   #[inline]
   pub const fn set_max_map_directories(&mut self, max_map_directories: Option<usize>) -> &mut Self {
     self.max_map_directories = max_map_directories;
+    self
+  }
+
+  /// The ceiling on unremoved sync markers across every root of this watcher —
+  /// by default 64 on macOS and 128 elsewhere, for the descriptor-budget reason
+  /// [`DEFAULT_COOKIE_GLOBAL_CAP`](Self::DEFAULT_COOKIE_GLOBAL_CAP) gives.
+  #[inline]
+  #[must_use]
+  pub const fn cookie_global_cap(&self) -> NonZeroUsize {
+    self.cookie_global_cap
+  }
+
+  /// Returns these options with the unremoved-sync-marker ceiling set.
+  #[inline]
+  #[must_use]
+  pub const fn with_cookie_global_cap(mut self, cookie_global_cap: NonZeroUsize) -> Self {
+    self.cookie_global_cap = cookie_global_cap;
+    self
+  }
+
+  /// Sets the unremoved-sync-marker ceiling.
+  #[inline]
+  pub const fn set_cookie_global_cap(&mut self, cookie_global_cap: NonZeroUsize) -> &mut Self {
+    self.cookie_global_cap = cookie_global_cap;
     self
   }
 }

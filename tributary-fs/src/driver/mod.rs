@@ -48,9 +48,9 @@ use tributary_proto::{
 
 use crate::{
   core::{
-    CoverNoop, CoverReconcile, CoverSettle, DeclineReason, Delivery, DriverCore, Effect,
-    ExpectedObject, FenceId, MountRefresh, ProbeId, ProbeOutcome, RawDirEntry, RawEnumerate,
-    RootLiveness, SettlePass, WidenCommit, WidenTaint,
+    BarrierEpoch, BarrierLocation, BarrierMove, CoverNoop, CoverReconcile, CoverSettle,
+    DeclineReason, Delivery, DriverCore, Effect, ExpectedObject, FenceId, MountRefresh, ProbeId,
+    ProbeOutcome, RawDirEntry, RawEnumerate, RootLiveness, SettlePass, WidenCommit, WidenTaint,
   },
   error::WatchRootError,
   os::{
@@ -141,10 +141,47 @@ impl DriverConfig {
   pub(crate) const DEFAULT_COOKIE_RETRY_BUDGET: u8 = 8;
   /// Per-scope unremoved-cookie cap (§1.9 default).
   pub(crate) const DEFAULT_COOKIE_BACKLOG_CAP: usize = 8;
-  /// Global unremoved-cookie cap across all scopes — several scopes' worth of
-  /// per-scope headroom, so ordinary multi-root use never trips it while a
-  /// permafailing-unlink churn stays bounded.
-  pub(crate) const DEFAULT_COOKIE_GLOBAL_CAP: usize = 128;
+  /// How many samplings the admission door admits at once, given `cap`.
+  ///
+  /// The door is the transient term of the descriptor arithmetic: each sampling
+  /// opens three directories and duplicates one more, all of it microseconds of
+  /// syscalls on one pool job at a time, and a caller waiting at the door holds
+  /// NOTHING — no descriptor, no ledger record, no place in the mailbox — so the
+  /// wait costs latency and never a resource.
+  ///
+  /// Sized per platform against the same budgets the cap is, and then floored by
+  /// the cap itself: a watcher that may hold ten records has no use for
+  /// thirty-two doors.
+  ///
+  /// | term | descending (Linux) | kernel-recursive (macOS) |
+  /// |---|---|---|
+  /// | retained per obligation | marker pin 1 | marker pin 1 + target pin 1 + reserved pin 1 |
+  /// | per obligation after the claim | `CookieDir` fd 1 (≤ 8 per scope, the backlog cap) | `CookieDir` fd 1 |
+  /// | transient per sampling | 3 opens + 1 duplicate | same: 4 |
+  /// | transient per write | walk depth + marker + enumeration (bounded by the walk) | same |
+  /// | **peak** | `cap × 2 + door × 4 + walk` | `S × 3 + min(cap, 8S) + door × 4 + walk` |
+  ///
+  /// There is no descriptor shared per (scope, reserved directory): a cache of
+  /// one would answer for an EARLIER sync's admission and bypass this sync's own
+  /// `Replaced`/`CrossesMount` comparison, so every obligation opens its own
+  /// `CookieDir`, bounded by the per-scope backlog cap of 8.
+  ///
+  /// With `cap = 64`, `door = min(cap, 8) = 8` and S = 16 on macOS:
+  /// `S × 3 + min(cap, 8S) + door × 4` = `48 + min(64, 128) + 32` = `48 + 64 +
+  /// 32` ≈ 144 + walk, inside a 256 soft limit. With `cap = 128` and `door =
+  /// min(cap, 32) = 32` on Linux: `cap × 2 + door × 4` = `256 + 128` ≈ 384 +
+  /// walk, inside a 1024 default.
+  pub(crate) const fn sync_door_allowance(cap: usize) -> usize {
+    // [`MAX_SYNC_SAMPLINGS`] is the ceiling the common 1024-descriptor budget has
+    // always carried. macOS's default soft limit is 256 — a QUARTER of it — and
+    // the ceiling is scaled by exactly that, so the two platforms state one
+    // relationship rather than two unrelated numbers.
+    #[cfg(target_os = "macos")]
+    let platform = MAX_SYNC_SAMPLINGS / 4;
+    #[cfg(not(target_os = "macos"))]
+    let platform = MAX_SYNC_SAMPLINGS;
+    if cap < platform { cap } else { platform }
+  }
 
   /// The platform's native backend profile — PROVISIONAL under
   /// `Backend::Auto` (the resolved `RootMeta.backend` supersedes it at
@@ -191,7 +228,11 @@ struct ParkedCookie {
   /// What the admission read about the two directories the marker's ordering
   /// rests on — carried so the detached write can prove the objects it reaches
   /// are the ones the barrier was promised for ([`AdmittedDirs`]).
-  admitted: AdmittedDirs,
+  ///
+  /// Still boxed, as it arrived: this record waits on a coverage fence that may
+  /// hold for as long as a scope's re-arm work takes, and the routing map it
+  /// waits in is bounded by the sync caps rather than by one entry.
+  admitted: Box<AdmittedDirs>,
   reply: futures_channel::oneshot::Sender<Result<PathBuf, crate::error::SyncRootError>>,
 }
 
@@ -3697,20 +3738,21 @@ struct Obligation {
   scope: ScopeId,
   /// WHERE this obligation's marker actually lands: the admission's PINNED
   /// target landing when the door read one, and the caller's lexical directory
-  /// only when it could not. Held for as long as the record lives so a set-cover
-  /// can widen its retained cover by it ([`CookieRegistry::live_sync_dirs`]), in
-  /// EVERY phase and not merely while the write is still in flight. Nothing else
-  /// reads it: the write addresses its own pinned descriptors, and every removal
-  /// goes through the residue's landing.
+  /// only when it could not. Held for as long as the record lives, in EVERY
+  /// phase and not merely while the write is still in flight, because it is the
+  /// coordinate a coverage transition's ground is INTERSECTED against
+  /// ([`CookieRegistry::invalidate_barriers`]) — which barriers a move retires
+  /// is decided by this field and nothing else. The write addresses its own
+  /// pinned descriptors, and every removal goes through the residue's landing.
   ///
   /// The landing rather than the spelling, because the two differ exactly where
   /// it matters. A sync of `/r/alias/sub` under an intermediate `alias →
   /// /r/actual` writes at `/r/actual/sub`; that is where the core's watches are
   /// addressed and where the marker's create comes off, while the spelling names
-  /// ground no watch of this marker stands on. Widening by the spelling would
-  /// retain the wrong subtree and prune the right one — the very ground the
-  /// admission's own landing test ([`admitted_ground_refusal`]) had just proved
-  /// this sync was inside of.
+  /// ground no watch of this marker stands on. Intersecting on the spelling
+  /// would judge the wrong subtree moved and spare the right one — the very
+  /// ground the admission's own landing test ([`admitted_ground_refusal`]) had
+  /// just proved this sync was inside of.
   ///
   /// The fallback is not a weakening: it applies on the arms that hold TUPLES
   /// rather than descriptors — Windows, Miri, the unsupported platforms — where
@@ -3789,6 +3831,41 @@ struct Obligation {
   /// finds the cookie owned (and reaps it through the phase machine) or refuses
   /// the claim before ownership ever lands — no third interleaving.
   reap_requested: bool,
+  /// This obligation's barrier is DOMINATED: a coverage transition touched the
+  /// ground it depends on while it was live, so it certifies nothing and the
+  /// located `Rescan` that transition stands is what the caller reads instead.
+  ///
+  /// The claim interlock, and deliberately NOT the scope-wide generation
+  /// counter: a located transition must not refuse an `InPool` write standing on
+  /// unrelated ground. It is set under the ledger lock by
+  /// [`invalidate_barriers`](CookieRegistry::invalidate_barriers) and read by
+  /// [`CookieGuard::claim`] in the SAME critical section that reads the reap mark
+  /// and publishes `Owned` — so a retirement either finds the cookie owned (and
+  /// reaps it through the phase machine) or refuses the claim before ownership
+  /// ever lands. There is no third interleaving, which is the discipline the reap
+  /// mark beside it already documents.
+  ///
+  /// It rides the record for the reason the reap mark does: it cannot be set for
+  /// an obligation that does not exist, and it dies with the record it marks.
+  dominated: bool,
+  /// The [`BarrierEpoch`] this obligation's write was DISPATCHED under, stamped
+  /// at the dispatch itself and `None` for as long as the record is still parked
+  /// on its fence.
+  ///
+  /// Stamped there rather than at the fence's open because the fence parks until
+  /// the scope's re-arm work quiesces, and every arm landing during that park is
+  /// a coverage transition that would otherwise dominate the barrier by its own
+  /// settle wait. It is taken after the dispatch's fourth drain, so a transition
+  /// raised by the effects this iteration already executed is in hand before the
+  /// stamp rather than one loop pass behind it.
+  ///
+  /// NOTHING in production compares one. The decision "this barrier is
+  /// dominated" is carried by the [`dominated`](Self::dominated) flag, so there
+  /// is one representation of that fact rather than two; this is the stamp a
+  /// dispatched obligation records and the witness a cell reads — a cell proves a
+  /// funnel bumped by watching the stamp move.
+  #[cfg_attr(not(test), allow(dead_code))]
+  barrier_epoch: Option<BarrierEpoch>,
   /// The R11-1 LRU re-arm key — the `failure_clock` value stamped at the
   /// record's most recent transition into `RemoveFailed` (0 = never failed;
   /// unreachable for a parked record, which required ≥ 1 failure). Refreshed
@@ -4132,15 +4209,34 @@ impl CookieGuard {
   /// An ABSENT record means the abnormal-path [`Drop`] already took the ledger;
   /// its flag is raised before that take, so this refuses on either observation
   /// and the write reaps its own file.
-  fn claim(&self, residue: &CookieResidue) -> Option<CookieId> {
+  ///
+  /// The record's DOMINATION flag is the last of the refusals read in this same
+  /// section: a coverage transition touched the ground this barrier depends on
+  /// while the write was in the pool, so the write certifies nothing. It answers
+  /// its own refusal reason rather than the shared one, because the caller learns
+  /// a different fact from it — a dominated barrier has a located `Rescan` on its
+  /// stream and is to re-read, where a retired one has no stream left at all.
+  /// Last, and not first, because the two overlap: a transition that also ends
+  /// the scope is reported as the end of the scope, which is the stronger fact.
+  fn claim(&self, residue: &CookieResidue) -> Result<CookieId, ClaimRefused> {
     let mut inner = lock_ledger(&self.ledger);
-    let ob = inner.obligations.get_mut(&self.id)?;
+    let Some(ob) = inner.obligations.get_mut(&self.id) else {
+      return Err(ClaimRefused::Retired);
+    };
     if ob.reap_requested
       || self.shutdown.load(Ordering::SeqCst)
       || self.retiring.load(Ordering::SeqCst)
       || self.generation.load(Ordering::SeqCst) != self.dispatched_generation
     {
-      return None;
+      return Err(ClaimRefused::Retired);
+    }
+    // Read LAST of the refusals, so domination is answered only where nothing
+    // else refuses. The reasons overlap — a root replace both moves the scope's
+    // coverage and supersedes the generation the write was dispatched under —
+    // and where they do, the older word is the more specific one: there is no
+    // stream left to carry the covering `Rescan` that `Dominated` promises.
+    if ob.dominated {
+      return Err(ClaimRefused::Dominated);
     }
     // Transition THIS write's own record — born at its dispatch under this same
     // lock — rather than inserting one: there is no insert-by-path anywhere, so
@@ -4163,7 +4259,45 @@ impl CookieGuard {
     ob.residue = Some(residue.clone());
     ob.phase = Phase::Owned;
     inner.by_path.insert(residue.path().to_path_buf(), self.id);
-    Some(self.id)
+    Ok(self.id)
+  }
+}
+
+/// One barrier a coverage transition retired, and what its retirement still owes
+/// the caller's stream.
+///
+/// Read off the record under the ledger lock, because the record is about to
+/// stop existing: the marker LEAF names the emit that has to be purged before
+/// the flush (a certificate the consumer would otherwise match first), and the
+/// ground names what the covering `Rescan` has to cover.
+struct DominatedBarrier {
+  /// The rendered marker leaf whose queued emit the purge takes.
+  name: Arc<str>,
+  /// Where this barrier's marker lands — the ground its covering `Rescan` owes.
+  cover_dir: PathBuf,
+}
+
+/// Why [`CookieGuard::claim`] refused a handover — the two facts a caller learns
+/// APART, because their answers to the barrier differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimRefused {
+  /// The obligation is gone or its scope is: a cancel named it, the registry is
+  /// gone, the scope is retiring, or the root generation moved past the one this
+  /// write was dispatched under. There is no stream left to report the cookie on.
+  Retired,
+  /// A coverage transition on this barrier's ground retired it while the write
+  /// was in the pool. The retirement stood the covering `Rescan` its terminal
+  /// promises, so the caller is told to re-read rather than that its root died.
+  Dominated,
+}
+
+impl ClaimRefused {
+  /// The barrier's answer to this refusal.
+  fn terminal(self) -> crate::error::SyncRootError {
+    match self {
+      Self::Retired => crate::error::SyncRootError::Retired,
+      Self::Dominated => crate::error::SyncRootError::Dominated,
+    }
   }
 }
 
@@ -4305,12 +4439,11 @@ impl<F: FsOps> CookieRegistry<F> {
   /// `ticket` is the caller's [`SyncTicket`] sequence — the `by_ticket` key an
   /// incarnation-precise cancel resolves through. `dir` is the directory the
   /// caller SPELLED and `landing` is where the door's pin found it; the record
-  /// keeps the second in preference to the first, because a later set-cover has
-  /// to keep the ground this obligation depends on for as long as the record
-  /// lives, and that ground is where the marker lands rather than how the caller
-  /// wrote it ([`Obligation::cover_dir`],
-  /// [`live_sync_dirs`](Self::live_sync_dirs)). `None` is the platforms with no
-  /// landing to read, where the spelling is the coordinate.
+  /// keeps the second in preference to the first, because the ground a coverage
+  /// transition is judged against is where the marker LANDS rather than how the
+  /// caller wrote it ([`Obligation::cover_dir`],
+  /// [`invalidate_barriers`](Self::invalidate_barriers)). `None` is the
+  /// platforms with no landing to read, where the spelling is the coordinate.
   ///
   /// Called only AFTER every admission refusal has passed: a refused sync must
   /// create nothing at all.
@@ -4336,6 +4469,8 @@ impl<F: FsOps> CookieRegistry<F> {
         id,
         residue: None,
         reap_requested: false,
+        dominated: false,
+        barrier_epoch: None,
         last_failure_seq: 0,
         phase: Phase::Parked { fence },
       },
@@ -4361,16 +4496,20 @@ impl<F: FsOps> CookieRegistry<F> {
     id
   }
 
-  /// The parked obligation on `fence` — its id, scope, and rendered name. The
-  /// LEDGER is what knows a sync is parked; `parked_cookies` only routes the
-  /// fence to its caller's reply, so this reads the truth rather than the local.
-  /// O(ledger), which the global cap bounds.
-  fn parked_on(&self, fence: FenceId) -> Option<(CookieId, ScopeId, Arc<str>)> {
+  /// The parked obligation on `fence` — its id, scope, rendered name and the
+  /// ground its marker will land in. The LEDGER is what knows a sync is parked;
+  /// `parked_cookies` only routes the fence to its caller's reply, so this reads
+  /// the truth rather than the local. O(ledger), which the global cap bounds.
+  ///
+  /// The ground travels with the rest because the dispatch RE-JUDGES it: a
+  /// parked obligation carries no stamp, so it is exempt from move-retirement
+  /// and is judged instead at the one instant it acquires one.
+  fn parked_on(&self, fence: FenceId) -> Option<(CookieId, ScopeId, Arc<str>, PathBuf)> {
     lock_ledger(&self.ledger)
       .obligations
       .values()
       .find(|ob| matches!(ob.phase, Phase::Parked { fence: on } if on == fence))
-      .map(|ob| (ob.id, ob.scope, Arc::clone(&ob.name)))
+      .map(|ob| (ob.id, ob.scope, Arc::clone(&ob.name), ob.cover_dir.clone()))
   }
 
   /// The DISPATCH decision for the obligation parked on a settled fence: either
@@ -4389,7 +4528,17 @@ impl<F: FsOps> CookieRegistry<F> {
   /// are taken here, at dispatch, so they cover the whole in-flight window:
   /// everything that retires the cookie between here and the write's landing is
   /// visible to the write itself.
-  fn dispatch_guard(&mut self, scope: ScopeId, id: CookieId) -> Option<CookieGuard> {
+  ///
+  /// `epoch` is the scope's [`BarrierEpoch`] read at this instant — the stamp the
+  /// record keeps ([`Obligation::barrier_epoch`]). It rides the same transition
+  /// as the phase so that the window the stamp opens and the window the write
+  /// runs in are the same window.
+  fn dispatch_guard(
+    &mut self,
+    scope: ScopeId,
+    id: CookieId,
+    epoch: Option<BarrierEpoch>,
+  ) -> Option<CookieGuard> {
     let generation = Arc::clone(
       self
         .generations
@@ -4405,6 +4554,10 @@ impl<F: FsOps> CookieRegistry<F> {
         inner.retire(id, Reaped::NeverCreated);
         return None;
       }
+      // The stamp and the `InPool` transition are the same step: the epoch is the
+      // one this write is dispatched under, and a record that never reaches the
+      // pool was never dispatched under any.
+      ob.barrier_epoch = epoch;
       ob.phase = Phase::InPool;
     }
     Some(CookieGuard {
@@ -4467,46 +4620,6 @@ impl<F: FsOps> CookieRegistry<F> {
       .obligations
       .values()
       .any(|ob| ob.scope == scope && matches!(ob.phase, Phase::Parked { .. } | Phase::InPool))
-  }
-
-  /// The ground `scope`'s LIVE syncs depend on — every obligation of that scope,
-  /// in every phase, from its admission to its retirement, each named by the
-  /// coordinate its marker actually lands at ([`Obligation::cover_dir`]) rather
-  /// than by the spelling its caller used.
-  ///
-  /// A set-cover widens its retained cover by these before the core reconciles
-  /// ([`DriverCore::on_set_cover`]). The admission proved the ground covered when
-  /// it let the sync through, and nothing binds the obligation to the cover it
-  /// was admitted under — so a shrink arriving inside that window would drop the
-  /// very watches the marker's create has to come off, and the caller's barrier
-  /// could only time out over a write that succeeded.
-  ///
-  /// The window does NOT close at the claim, and that is the whole of why the
-  /// filter is the record's EXISTENCE rather than a phase. `sync_root` answers
-  /// the instant the file exists, while everything that gives the marker its
-  /// meaning happens strictly after: the barrier still has to OBSERVE the create
-  /// through that directory's watch, the cleanup still has to prove its unlink
-  /// against the same ground, and a failed unlink still has to be retried there.
-  /// A cover narrowing past a claimed obligation disarms the watch while the
-  /// create is merely QUEUED — a reader takes its control traffic first, and the
-  /// disarm empties the attribution the queued create would have been read
-  /// against — so the create is discarded and the successful write becomes
-  /// unobservable. The residue phases are kept for the same reason: a record
-  /// whose unlink is still failing keeps its directory armed, which is what makes
-  /// its retry observable.
-  ///
-  /// A record exists exactly until its typed terminal ([`retire`]), so "not
-  /// retired" is read off the map itself. One O(ledger) walk, which the global
-  /// cap bounds — as it bounds the number of directories this can return.
-  ///
-  /// [`retire`]: LedgerInner::retire
-  fn live_sync_dirs(&self, scope: ScopeId) -> Vec<PathBuf> {
-    lock_ledger(&self.ledger)
-      .obligations
-      .values()
-      .filter(|ob| ob.scope == scope)
-      .map(|ob| ob.cover_dir.clone())
-      .collect()
   }
 
   /// Whether a LIVE obligation already holds this rendered cookie name — the
@@ -4836,6 +4949,91 @@ impl<F: FsOps> CookieRegistry<F> {
     for (residue, id) in dispatch {
       self.spawn_unlink::<R>(op_tx, residue, id);
     }
+  }
+
+  /// Retires every barrier of `scope` that the coverage transition at `location`
+  /// DOMINATES, and reports what each retirement still owes the caller's stream.
+  ///
+  /// The golden rule's ledger half. A barrier is dispatched under a coverage
+  /// epoch and certifies delivery only within it, so a transition touching the
+  /// ground it depends on retires it — dominated by the located `Rescan` that
+  /// transition stands, never as a certificate.
+  ///
+  /// WHICH obligations: those of this scope whose `cover_dir` INTERSECTS the
+  /// ground ([`BarrierLocation::intersects`]) — a whole-scope move reaching all
+  /// of them, a located one only the barriers standing on that ground, so a
+  /// `mkdir` deep in the tree retires nothing that did not move. Never a `Parked`
+  /// one: it has not been stamped yet, and a bump raised during its own settle
+  /// wait is exactly what stamping at DISPATCH exists to not count against it —
+  /// it is judged there instead, against the epoch this move has already
+  /// advanced.
+  ///
+  /// WHAT each retirement does, in one critical section per record: it sets the
+  /// [`dominated`](Obligation::dominated) flag — the claim interlock, so an
+  /// `InPool` write either finds its claim refused or has already become an
+  /// `Owned` record this same pass reaches — and then withdraws the marker
+  /// through the ordinary phase machine
+  /// ([`removal_decision_locked`](Self::removal_decision_locked)), which is what
+  /// makes a failed withdrawal a counted residue rather than an orphan: `Owned`
+  /// and parked-`RemoveFailed` dispatch an unlink and retire on its confirm, a
+  /// `Removing` or scheduled record coalesces onto the arming that owns it, and
+  /// an `InPool` one is left to the claim it has just been refused — only its own
+  /// write knows where its cookie will land. No I/O runs under the lock, and none
+  /// runs on the owner loop at all: the withdrawal is a pool job like every other
+  /// removal.
+  ///
+  /// The returned rows are what the CORE half then owes: the marker leaf whose
+  /// already-queued emit has to be purged before the flush, and the ground the
+  /// covering `Rescan` has to cover. Both are read here because the record is
+  /// about to stop existing.
+  fn invalidate_barriers<R>(
+    &self,
+    op_tx: &async_channel::Sender<OpResult<F::Handle>>,
+    scope: ScopeId,
+    location: &BarrierLocation,
+  ) -> Vec<DominatedBarrier>
+  where
+    R: RuntimeLite,
+  {
+    let (dominated, dispatch) = {
+      let mut inner = lock_ledger(&self.ledger);
+      let hit: Vec<CookieId> = inner
+        .obligations
+        .values()
+        .filter(|ob| ob.scope == scope && !matches!(ob.phase, Phase::Parked { .. }))
+        .filter(|ob| location.intersects(&ob.cover_dir))
+        .map(|ob| ob.id)
+        .collect();
+      let mut dominated = Vec::with_capacity(hit.len());
+      let mut dispatch = Vec::new();
+      for id in hit {
+        let Some(ob) = inner.obligations.get_mut(&id) else {
+          continue;
+        };
+        // Idempotent: a second move on the same ground re-reads a record that is
+        // already dominated and owes nothing new. The rows are reported once,
+        // which is what keeps a funnel that overlaps another from standing two
+        // `Rescan`s and purging a marker that is already gone.
+        if ob.dominated {
+          continue;
+        }
+        ob.dominated = true;
+        dominated.push(DominatedBarrier {
+          name: Arc::clone(&ob.name),
+          cover_dir: ob.cover_dir.clone(),
+        });
+        if let Some(decided) =
+          Self::removal_decision_locked(&mut inner, &RemovalRequest::Targeted(id))
+        {
+          dispatch.push(decided);
+        }
+      }
+      (dominated, dispatch)
+    };
+    for (residue, id) in dispatch {
+      self.spawn_unlink::<R>(op_tx, residue, id);
+    }
+    dominated
   }
 
   /// The earliest scheduled cookie-unlink retry, or `None` if every failed record
@@ -5507,7 +5705,14 @@ pub(crate) enum Command {
     /// is made — the write is detached from it by a settle fence and a blocking
     /// pool, and only these say whether the objects it reaches are still the ones
     /// that were judged ([`AdmittedDirs`]).
-    admitted: AdmittedDirs,
+    ///
+    /// BOXED because this is by far the widest thing any command carries — three
+    /// readings, each a descriptor slot, an identity, a landing and a mount frame
+    /// — and every other variant is a handle or two. An enum is as large as its
+    /// widest arm, so carrying it inline made every `Watch`, `Unwatch` and
+    /// `SetCover` on the channel pay for a sync's sampling. One allocation, at a
+    /// door that has already made three opens.
+    admitted: Box<AdmittedDirs>,
     /// The minted cookie name (the caller owns the reserved namespace).
     name: String,
     /// The watcher-minted ticket keying this admission — the `by_ticket` address a
@@ -5733,6 +5938,7 @@ fn resolve_cover_settlements<R, F>(
   cookies: &mut CookieRegistry<F>,
   exclusions: &[PathBuf],
   live: &dyn Fn(ScopeId) -> bool,
+  now: &impl Fn() -> Instant,
   pass: SettlePass<'_>,
 ) -> bool
 where
@@ -5784,7 +5990,7 @@ where
       // lockstep ever be broken by a later change, the caller is still ANSWERED
       // rather than left to read a bare `Closed` off a dropped reply: no routing
       // entry may be discarded without resolving the barrier it carries.
-      let Some((id, scope, name)) = cookies.parked_on(fence) else {
+      let Some((id, scope, name, cover_dir)) = cookies.parked_on(fence) else {
         let _ = cookie.reply.send(Err(crate::error::SyncRootError::Retired));
         continue;
       };
@@ -5829,6 +6035,47 @@ where
       // batch input), and the loop-top `execute_effects` flushes them to the
       // consumer before that record can be routed.
       let _ = core.resignal_coverage_deficits(scope);
+      // The FOURTH drain. The loop's other three sit above `execute_effects`,
+      // which feeds its outcomes straight back into the core — so a coverage
+      // transition raised by this iteration's effects is otherwise in hand only
+      // at the NEXT loop top, after the stamp below has already been taken, and
+      // the barrier would be retired by a transition it was dispatched after.
+      // Re-signal first, then drain, then stamp: a deficit whose re-arm failed
+      // neither dominates nor proceeds by accident.
+      drain_barrier_moves::<R, F>(core, cookies, op_tx, now);
+      // THE DISPATCH RE-JUDGES THE COVER — the other half of stamping here.
+      //
+      // A parked obligation carries no stamp, so a transition raised during its
+      // own settle wait does not retire it; it is judged HERE instead, against
+      // the coverage those transitions left behind. The applied cover is the one
+      // fact a move changes that nothing else on this path re-checks: the
+      // admission judged it before the park, and the write judges its prune
+      // seat, the exclusions, the mount frame and the root floor — never the
+      // cover. So a shrink that landed while this sync was parked would
+      // otherwise dispatch a marker into ground holding no watch, and the
+      // caller's barrier could only time out over a write that reported success.
+      //
+      // Nothing physical exists for a parked record, so there is no marker to
+      // withdraw and no emit to purge — only the covering `Rescan` the terminal
+      // promises, which a shrink stands none of, aimed at the ground itself
+      // (`covering_rescan` covers the PARENT of what it is given). The other two
+      // ways a parked write dies under a moved world are already answered
+      // elsewhere and are not re-taken here: a root replace revokes it through
+      // the dispatched generation, and a directory the crawl dropped is caught
+      // by the write's own descent.
+      if !core.covers(scope, &cover_dir) {
+        lock_ledger(&cookies.ledger).retire(id, Reaped::NeverCreated);
+        core.stand_covering_rescan(scope, &cover_dir.join(&*name), now());
+        let _ = cookie
+          .reply
+          .send(Err(crate::error::SyncRootError::Dominated));
+        continue;
+      }
+      // Read AFTER the drain, and after the fence has settled: the fence parks
+      // until the scope's re-arm work quiesces, and every arm landing during that
+      // park is a transition that would dominate this barrier by its own settle
+      // wait if the stamp had been taken at the fence's open.
+      let epoch = core.barrier_epoch(scope);
       // The dispatched write is a TRACKED, single-flighted job: from here its
       // obligation is an `InPool` record rather than a `Parked` one — still the
       // scope's single-flight gate (a second sync is refused while it stands),
@@ -5842,7 +6089,7 @@ where
       // instead: the obligation is retired pre-physically and no write is ever
       // made, which is the same refusal the claim would make on the same mark, one
       // phase earlier and without creating the file first.
-      let Some(guard) = cookies.dispatch_guard(scope, id) else {
+      let Some(guard) = cookies.dispatch_guard(scope, id, epoch) else {
         let _ = cookie.reply.send(Err(crate::error::SyncRootError::Retired));
         continue;
       };
@@ -5863,7 +6110,7 @@ where
           admitted,
           reply,
         } = cookie;
-        match ops.write_cookie(&root, &dir, admitted, &name, &prune, &exclusions) {
+        match ops.write_cookie(&root, &dir, *admitted, &name, &prune, &exclusions) {
           Ok(file) => {
             // Hand the cookie to the registry — the path the write ACTUALLY
             // landed at (which only the write knows: a covered FILE
@@ -5873,15 +6120,18 @@ where
             let landing = file.path().to_path_buf();
             let residue = CookieResidue::File(file);
             match guard.claim(&residue) {
-              None => {
-                // A refused claim means a cancel named this obligation, the
-                // registry is gone, the scope is retiring, or the generation
-                // moved: its cookie must not survive, so the write self-reaps
-                // (never discarding ownership before the unlink confirms).
+              Err(refused) => {
+                // A refused claim means a coverage transition dominated this
+                // barrier, or a cancel named this obligation, the registry is
+                // gone, the scope is retiring, or the generation moved: its
+                // cookie must not survive, so the write self-reaps (never
+                // discarding ownership before the unlink confirms). The refusal
+                // carries its own terminal, so a caller whose barrier was
+                // dominated is told to re-read rather than that its root died.
                 self_reap(&ops, &guard, residue, None);
-                let _ = reply.send(Err(crate::error::SyncRootError::Retired));
+                let _ = reply.send(Err(refused.terminal()));
               }
-              Some(id) => {
+              Ok(id) => {
                 // The caller names cookies by path, so only the path crosses the
                 // reply; the identity stays with the record, which is the only
                 // thing that ever unlinks.
@@ -6000,7 +6250,7 @@ where
             // fails again leaves the record `RemoveFailed`: counted, owned, and
             // swept at the scope's teardown.
             let residue = *residue;
-            let claimed = guard.claim(&residue);
+            let claimed = guard.claim(&residue).ok();
             self_reap(&ops, &guard, residue, claimed);
             let _ = reply.send(Err(crate::error::SyncRootError::Write {
               path: dir.join(&*name),
@@ -7548,17 +7798,23 @@ fn cookie_dir<'a>(root: &Path, dir: &'a Path) -> &'a Path {
 /// is then SHARED by everything that can be holding a descriptor it authorized —
 /// the door's own accumulating readings, and each sampling job while it is in
 /// flight — which makes it a bound on DESCRIPTORS rather than on calls. The slot
-/// comes back when the LAST of those holders drops: on the happy path with the
-/// pins, when the write, the refusal or the retirement drops the obligation; and
-/// when a caller walks away mid-sampling, the readings it had already accumulated
-/// drop with its future while the job still inside a syscall keeps the slot until
-/// that syscall returns and its own descriptor goes with it. Nothing the caller
-/// owns is waiting for any of that.
+/// comes back when the LAST of those holders drops it, which is NOT uniform
+/// across profiles: on a DESCENDING profile the door releases the target and
+/// reserved pins and drops the permit itself the moment admission finishes
+/// sampling (`AdmittedDirs::held`), so the slot is free again well before the
+/// write runs; on a KERNEL-RECURSIVE profile the permit rides the pins to the
+/// claim and comes back there instead. On both, a caller that walks away
+/// mid-sampling drops the readings it had already accumulated with its future,
+/// while the job still inside a syscall keeps the slot until that syscall
+/// returns and its own descriptor goes with it. Nothing the caller owns is
+/// waiting for any of that.
 ///
-/// It is sized by [`MAX_SYNC_SAMPLINGS`] rather than by the ledger's cookie cap,
-/// because a permit is not a RECORD: one permit authorizes three descriptors,
-/// so a cap counted in records is three times too generous read as a descriptor
-/// bound. A door that has to wait for a slot is a door under exactly the
+/// It is sized by [`DriverConfig::sync_door_allowance`] — itself derived from
+/// this const and floored by `cookie_global_cap` — rather than by the ledger's
+/// cookie cap directly, because a permit is not a RECORD: one permit
+/// authorizes four descriptors (three opens plus one duplicate), so a cap
+/// counted in records is a generous stand-in for a descriptor bound, not an
+/// exact one. A door that has to wait for a slot is a door under exactly the
 /// pressure that ceiling describes, and waiting is what a caller can act on —
 /// its own timeout, or dropping the future — where an exhausted descriptor
 /// table is not.
@@ -7575,24 +7831,35 @@ fn cookie_dir<'a>(root: &Path, dir: &'a Path) -> &'a Path {
 /// The most samplings one watcher's sync door admits at once — the ceiling its
 /// [`SyncPinAllowance`] is sized to.
 ///
-/// This is a DESCRIPTOR bound wearing a sampling's clothes, and it is deliberately
-/// not the ledger's cookie cap. Each admitted sampling retains three descriptors —
-/// the root every descent starts from, the directory the sync names, and the
-/// reserved directory — and macOS duplicates one more per open for as long as the
-/// sample lasts. At 32 that is 96 retained plus at most one transient duplicate in
-/// flight (the door samples one directory at a time, on one pool job), comfortably
-/// inside macOS's 256 soft limit with room left for the watcher's own sources,
-/// its event channel and the application's unrelated I/O. The cookie cap read as a
-/// descriptor bound gives 3 × 128 = 384, which is past that limit before a single
-/// cap has an opinion — and every watcher in the process has an allowance of its
-/// own, so the peak multiplies.
+/// This is a DESCRIPTOR bound wearing a sampling's clothes, and it is
+/// deliberately not the ledger's cookie cap. Each in-flight sampling opens
+/// FOUR descriptors transiently — the three directories `AdmittedDirs` reads
+/// (the root, the directory the sync names, the reserved directory) plus one
+/// duplicate (`identity_of_dir`'s `try_clone`) — held only for the syscalls
+/// the sampling job makes, NOT for the obligation's lifetime: the root is
+/// released inside the same call that reads it on EVERY profile
+/// (`watched_root_identity`), and on a descending profile the other two are
+/// released the moment admission finishes too (`AdmittedDirs::held`). Nothing
+/// is "retained" by the door itself; what a claimed obligation keeps past it
+/// afterwards is the separate, profile-split arithmetic
+/// [`DriverConfig::sync_door_allowance`]'s own doc carries. At this door's own
+/// ceiling that is at most `door × 4` transient descriptors in flight at
+/// once, comfortably inside either platform's soft limit with room left for
+/// whatever a kernel-recursive obligation is separately holding to its claim,
+/// the watcher's own sources, its event channel and the application's
+/// unrelated I/O.
 ///
-/// Thirty-two is not a throughput compromise. A sampling is three opens and a
+/// Thirty-two is not a throughput compromise. A SAMPLING is three opens and a
 /// send, all of it microseconds of syscalls; the driver single-flights a scope's
 /// physical writes anyway, so a wider door would only queue more callers deeper
 /// inside the same funnel; and a caller waiting at the door holds NOTHING — no
 /// descriptor, no ledger record, no place in the mailbox — so the wait costs
-/// latency and never a resource.
+/// latency and never a resource. That "microseconds" bound is on the sampling
+/// itself, not on how long a SLOT stays taken: on a descending profile the two
+/// coincide (the permit drops at the door), so a caller waiting there really is
+/// waiting on syscalls; on a kernel-recursive profile a claimed obligation holds
+/// its permit until its write is dispatched, so a caller queued behind a full
+/// door there can be waiting on a fence settle, not a `stat`.
 pub(crate) const MAX_SYNC_SAMPLINGS: usize = 32;
 
 #[derive(Debug, Clone)]
@@ -7711,6 +7978,20 @@ pub(crate) struct AdmittedDir {
   /// is no object here for a later reading to be equal to.
   #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
   pin: Option<std::os::fd::OwnedFd>,
+  /// The identity the pin answered, read at the instant it was RELEASED — and
+  /// `None` wherever a pin is still held, which is where the reading is taken
+  /// live instead ([`identity`](Self::identity)).
+  ///
+  /// A remembered tuple is weaker than a held object, and deliberately so on the
+  /// profiles that release: an inode number nothing holds is a SLOT the
+  /// filesystem may reclaim, so an equality at write time is a coincidence the
+  /// door cannot rule out on its own. What rules it out there is the coverage
+  /// epoch — a per-directory-watch profile sees a replacement on the
+  /// root→landing chain as a watch armed or dropped, which retires the barrier —
+  /// and the pin is kept exactly where that is not true
+  /// ([`AdmittedDirs::held`]).
+  #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+  released: Option<RootIdentity>,
   /// WHERE the pinned object stood when the door took it, read off that same
   /// descriptor in the same breath — a location the OS answered, never a spelling
   /// a caller supplied.
@@ -7765,10 +8046,25 @@ impl AdmittedDir {
   /// a write that cannot say which object the admission judged cannot claim to
   /// have reached it.
   fn identity(&self) -> Option<RootIdentity> {
-    self
-      .pin
-      .as_ref()
-      .and_then(|pin| identity_of_dir(pin).ok().flatten())
+    match self.pin.as_ref() {
+      Some(pin) => identity_of_dir(pin).ok().flatten(),
+      // Released: the reading taken at the release is the only one left, and it
+      // describes an object nothing is keeping allocated. See the field.
+      None => self.released,
+    }
+  }
+
+  /// Drops the descriptor, keeping the identity it answered.
+  ///
+  /// The reading is taken HERE, while the object is still held, so what survives
+  /// is what the door actually saw rather than whatever later stands at the name.
+  /// Idempotent: a reading with no pin has nothing to release and nothing to
+  /// re-read.
+  fn release_pin(&mut self) {
+    if self.pin.is_some() {
+      self.released = self.identity();
+      self.pin = None;
+    }
   }
 
   /// Where the door found this object, as the descriptor answered it at the cut.
@@ -7803,6 +8099,7 @@ impl AdmittedDir {
   pub(crate) fn framed_at(landing: Option<PathBuf>, dev: u64, mnt_id: Option<u64>) -> Self {
     Self {
       pin: None,
+      released: None,
       landing,
       frame: Some(MountFrame { dev, mnt_id }),
     }
@@ -7816,6 +8113,12 @@ impl AdmittedDir {
   fn identity(&self) -> Option<RootIdentity> {
     self.identity
   }
+
+  /// Nothing to release: this reading never held an object. The profile split
+  /// still CALLS it on every platform, because which pins a door keeps is a
+  /// statement about the lowering rather than about the host — a reading that
+  /// holds nothing is simply already in the state the release produces.
+  fn release_pin(&mut self) {}
 
   /// No landing, because there is no held descriptor to have read one off — the
   /// same silence these arms keep about the write's own read-backs.
@@ -7952,6 +8255,7 @@ fn pinned_where_it_stands(
   let frame = pin.as_ref().map(frame_of_dir).transpose()?;
   Ok(AdmittedDir {
     pin,
+    released: None,
     landing,
     frame,
   })
@@ -8029,16 +8333,28 @@ fn reserved_cookie_dir_identity(root: &Path, dir: &Path) -> Result<AdmittedDir, 
 /// fences its own descent on. A frame the OS will not answer is a failed sampling
 /// here too — a door that cannot say which mount the root is in cannot say
 /// anything about whether the objects beneath it share one.
+///
+/// NOTHING IS HELD, on any profile. The descriptor is opened, read, and released
+/// inside this call: the root is the one object a barrier has no need to keep
+/// alive, because every write proves it afresh against the identity the scope was
+/// armed on ([`open_verified_root`]) and refuses outright when it differs. Holding
+/// it bought a lifetime argument the scope's own arm already makes, and cost the
+/// thing that matters — an open descriptor on the root defers its
+/// `IN_DELETE_SELF`, so a barrier that held one could postpone the notice of its
+/// own root's death for as long as the sync lasted.
 fn watched_root_identity(root: &Path) -> Result<AdmittedDir, std::io::Error> {
   #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
   {
     let pin = definite_pin(open_dir_no_follow(root))?;
     let frame = pin.as_ref().map(frame_of_dir).transpose()?;
-    Ok(AdmittedDir {
+    let mut read = AdmittedDir {
       pin,
+      released: None,
       landing: None,
       frame,
-    })
+    };
+    read.release_pin();
+    Ok(read)
   }
   #[cfg(not(all(any(target_os = "linux", target_os = "macos"), not(miri))))]
   {
@@ -8151,10 +8467,6 @@ pub(crate) struct AdmittedDirs {
   /// path, and with the hung job's own descriptor on a cancelled one. The bound
   /// stays a bound on descriptors that may exist rather than on calls still being
   /// waited for.
-  #[expect(
-    dead_code,
-    reason = "the slot is HELD, never read: dropping this field is what gives it back"
-  )]
   permit: Option<Arc<SyncPinPermit>>,
 }
 
@@ -8340,13 +8652,54 @@ impl AdmittedDirs {
     root: AdmittedDir,
     target: AdmittedDir,
     cookies: AdmittedDir,
+    profile: BackendKind,
   ) -> Self {
-    Self {
+    let mut held = Self {
       root,
       target,
       cookies,
       permit: Some(permit),
+    };
+    if !profile.is_kernel_recursive() {
+      // DESCENDING: the readings travel, the descriptors do not.
+      //
+      // What a sync-long pin buys is a lifetime — an inode number that is held
+      // cannot be handed to another object — and on a per-directory-watch
+      // profile the coverage epoch already buys it. Every same-name substitution
+      // on the root→landing chain drops the incumbent watch before arming the
+      // arrival, which is a coverage transition, which retires the barrier. The
+      // pin would be a second answer to a question already answered, paid for in
+      // descriptors held from admission all the way to observation.
+      //
+      // The write re-pins transiently: it descends by descriptor-relative walk
+      // anyway, so the objects it compares against are ones it is holding at the
+      // moment it compares them.
+      //
+      // The permit goes with them. It bounds DESCRIPTORS, and once none are held
+      // there is nothing left for it to bound — which is what makes the door's
+      // allowance a transient cost on this profile rather than one paid for the
+      // life of every barrier.
+      held.target.release_pin();
+      held.cookies.release_pin();
+      held.permit = None;
     }
+    held
+  }
+
+  /// How many of the three readings are still HOLDING their descriptor, and
+  /// whether the door's allowance slot is still occupied — the profile split's
+  /// observable ([`held`](Self::held)).
+  ///
+  /// Counted off the readings themselves rather than off the process's
+  /// descriptor table: what the split is about is which objects this value keeps
+  /// alive, and a table count cannot separate those from the runtime's own.
+  #[cfg(all(test, any(target_os = "linux", target_os = "macos"), not(miri)))]
+  pub(crate) fn pins_held(&self) -> (usize, bool) {
+    let pinned = [&self.root, &self.target, &self.cookies]
+      .into_iter()
+      .filter(|read| read.pin.is_some())
+      .count();
+    (pinned, self.permit.is_some())
   }
 
   /// The watched root, as the door held it.
@@ -9109,19 +9462,28 @@ impl FsOps for RealFs {
         "the cookie directory resolves outside the watched root",
       )));
     }
-    // The ROOT the admission held, against the object the scope was armed on.
+    // The ROOT identity the door READ at admission, against the object the
+    // scope was armed on.
     //
-    // The walk below proves the root by name and identity per write, which is the
-    // question of WHICH object answers now; this is the question of whether the
-    // number that answer is taken on has been out of the allocator's reach since
-    // the cut. A root removed after the admission, whose inode a replacement then
-    // received, satisfies the walk's own comparison exactly — and the door's
-    // descriptor is what makes that impossible, so long as the door was holding
-    // this scope's root and not something already standing in its place.
+    // The walk below proves the root by name and identity per write, which is
+    // the question of WHICH object answers now; this compares that answer
+    // against `watched_root_identity`'s reading. No profile holds the root's
+    // pin (`watched_root_identity` opens, reads, and releases inside the one
+    // call), so this is a comparison against a REMEMBERED tuple, not a held
+    // descriptor — it does not by itself exclude an inode number's reuse in
+    // the window between the read and this write, which is the residual
+    // <https://github.com/al8n/tributaries/issues/135> names. What closes
+    // reuse for a DISPATCHED obligation is the epoch, not this reading: every same-name
+    // substitution on the root→landing chain is a funnel-1/2 bump, and the
+    // stamp taken at dispatch is older than that bump, so a barrier whose
+    // root was substituted after admission is retired before this write ever
+    // runs. This identity mismatch is the belt underneath that, on EVERY
+    // profile, and it is what a PARKED obligation still has — its dispatch
+    // re-judges only the cover, not the root.
     //
-    // A door that held NOTHING narrows nothing: the platform pins none (its
-    // identities are the tuples they always were), or the open failed, and the
-    // per-write proof below is then exactly the proof this write always had.
+    // A door that held NOTHING narrows nothing beyond that belt: no profile
+    // pins the root's descriptor any longer, so the per-write proof below is
+    // exactly the proof this write always had.
     if admitted
       .root()
       .is_some_and(|pinned| pinned != root.identity())
@@ -11124,6 +11486,7 @@ pub(crate) async fn run<R, F>(
   let (unwind_tx, unwind_rx) = async_channel::unbounded::<ScopeId>();
 
   let close_reply = loop {
+    drain_barrier_moves::<R, F>(&mut core, &cookies, &op_tx, &now);
     execute_effects::<R, F>(
       &mut core,
       &ops,
@@ -11179,6 +11542,7 @@ pub(crate) async fn run<R, F>(
       // so this second flush carries only post-commit (new-world) effects —
       // the G3-1 pre/post ordering is untouched. Conditional: one extra
       // flush per RESOLVED widen, never a steady-state cost.
+      drain_barrier_moves::<R, F>(&mut core, &cookies, &op_tx, &now);
       execute_effects::<R, F>(
         &mut core,
         &ops,
@@ -11407,6 +11771,7 @@ pub(crate) async fn run<R, F>(
       &mut cookies,
       &config.exclusions,
       &|scope| streams.handles.contains_key(&scope),
+      &now,
       SettlePass::Live {
         unspent: &source_unspent,
       },
@@ -12704,7 +13069,7 @@ pub(crate) async fn run<R, F>(
             let _ = reply.send(admitted_verdict(&unproven_scopes, scope, UnwatchAck::Unknown));
           }
         }
-        Ok(Command::SetCover { scope, mut retained, mut reply }) => {
+        Ok(Command::SetCover { scope, retained, mut reply }) => {
           // In-place bidirectional coverage reconcile. The core is the authority on whether
           // a reconcile ran: every refusal — unknown scope, not yet publicly live,
           // kernel-recursive profile, refused cover — comes back as a typed `Noop` and is
@@ -12731,30 +13096,20 @@ pub(crate) async fn run<R, F>(
             let _ = reply.send(CoverOutcome::Skipped(SkipReason::Backlogged));
             continue;
           }
-          // A shrink may not take the ground an ADMITTED sync depends on. The
-          // admission proved that ground covered, but nothing binds the
-          // obligation to the cover it was admitted under: a cover arriving
-          // inside that window would prune the watches the marker's create has to
-          // come off, and the caller would then wait out its barrier over a write
-          // that reported success. So every LIVE obligation's LANDING joins the
-          // retained cover here — one term per unretired obligation of this
-          // scope, bounded by the cookie caps — and the R24 reserved-directory
-          // exemption keeps the marker's own directory with it, that directory's
-          // parent now being retained. The landing and not the caller's spelling,
-          // because an intermediate symlink puts the marker — and the watch that
-          // has to report it — somewhere the spelling does not name.
+          // A cover change DOMINATES every barrier in flight on the pruned
+          // ground: the shrink is a coverage transition like any other, so the
+          // barriers standing where it prunes are retired — each with the located
+          // `Rescan` its terminal promises — and the cover the caller asked for
+          // is the cover that applies. The alternative, holding the pruned ground
+          // for as long as an obligation names it, made `set_cover` answer for a
+          // cover it had not applied and let a caller's narrowing be deferred
+          // indefinitely by a sync it knows nothing about.
           //
-          // The cover is held to the obligation's RETIREMENT, not to its claim:
-          // the write returns the moment the file exists, while the barrier's
-          // observation, the cleanup's proof and any retry all happen after that
-          // — a claimed marker whose create is still queued is exactly the case a
-          // disarm makes unobservable ([`CookieRegistry::live_sync_dirs`]).
-          //
-          // Widening only ever ADDS coverage, so it cannot lose an event; what it
-          // costs is that the applied cover is briefly a superset of the one the
-          // caller asked for, until the next `set_cover` — by which time these
-          // obligations have retired and name nothing.
-          retained.extend(cookies.live_sync_dirs(scope));
+          // A retirement reached this way stands its covering `Rescan` INSIDE
+          // this reconcile's own settle window — before the fence below has
+          // resolved — so a shrink that dominates a live barrier settles
+          // [`CoverOutcome::Degraded`], never `Applied`: the domination's
+          // `Rescan` is exactly the loss that verdict reports.
           match core.on_set_cover(scope, &retained) {
             CoverReconcile::Reconciling => {
               if let Some(reply) = reply {
@@ -12812,7 +13167,7 @@ pub(crate) async fn run<R, F>(
                   dir,
                   exclusion,
                 }));
-              } else if !core.covers(scope, &dir) {
+              } else if admitted.target_landing().is_none() && !core.covers(scope, &dir) {
                 // Inside the root, outside the root's own APPLIED COVER: a
                 // `set_cover` narrowed this scope's per-directory coverage past
                 // this directory, so the ground the marker would land in holds no
@@ -12832,12 +13187,20 @@ pub(crate) async fn run<R, F>(
                 // directory's SECOND sync (the one that reuses the reserved
                 // directory and so provokes no directory create) observable at all.
                 //
-                // This is a SPELLING test and cannot be the whole answer: a
-                // resolved landing under an intermediate symlink is judged again
-                // against the same cover, off the pins ([`admitted_ground_refusal`]).
-                // Kept here because it is cheap and pre-pin: a caller naming
-                // uncovered ground outright is turned away before the door opens a
-                // descriptor.
+                // This is a SPELLING test, gated on `target_landing().is_none()` —
+                // an arm with NO landing (Windows, Miri, or an unsupported
+                // platform tuple) has no other way to ask this question, so the
+                // caller's spelling is the only ground there is; an arm WITH a
+                // landing asks it again, with authority, off the pins
+                // ([`admitted_ground_refusal`]'s own `DirUncovered` arm), which is
+                // where an intermediate symlink resolving out of covered ground
+                // is caught and this spelling test cannot be. Keeping both would
+                // let the spelling test refuse a sync whose LANDING the door
+                // already proved covered — the opposite of turning a caller away
+                // early, since the door has already opened its descriptors by the
+                // time this command is read (`Watcher::sync_root` samples before
+                // sending it), so nothing here runs "before the door opens
+                // anything" any more.
                 let _ = reply.send(Err(crate::error::SyncRootError::DirUncovered { dir }));
               } else if let Some(refusal) = admitted_ground_refusal(
                 &root,
@@ -13326,6 +13689,7 @@ pub(crate) async fn run<R, F>(
   // unwedges with more time, so a longer window would only delay the honest
   // signal.
   let _ = R::timeout(grace, drain).await;
+  drain_barrier_moves::<R, F>(&mut core, &cookies, &op_tx, &now);
   execute_effects::<R, F>(
     &mut core,
     &ops,
@@ -13400,6 +13764,7 @@ pub(crate) async fn run<R, F>(
     &mut cookies,
     &config.exclusions,
     &|_| false,
+    &now,
     SettlePass::Closing,
   );
   // The close reply counts every distinct outstanding obligation exactly once:
@@ -15973,6 +16338,64 @@ fn kick_control_queue<R, F>(
   }
   control_inflight.insert(scope, generation);
   submit_control_batch::<R, F>(ops, op_tx, scope, generation, requests, cut_token);
+}
+
+/// Drains the coverage transitions the core's barrier funnels raised, at the one
+/// seam that can act on them: after the core input that raised them, and BEFORE
+/// the effect queue is executed.
+///
+/// The ordering is the whole reason they are not an [`Effect`]. The core routes
+/// every change before it processes any action, so a sync marker's `Emit` is
+/// queued AHEAD of the funnel bump raised by the same drain — an effect drained
+/// in queue order could only ever arrive behind the emit it has to purge, and the
+/// consumer would match the marker and read a certificate over a window whose
+/// ground moved. Draining here, and calling back into the core's
+/// `purge_marker_emits` / `stand_covering_rescan` — which mutate the queue in
+/// place — is what puts the covering `Rescan` where the marker was.
+///
+/// What each move RETIRES is the ledger's business
+/// ([`CookieRegistry::invalidate_barriers`]); the two halves meet here because
+/// only here are both in hand at once — the ledger knows which barriers stood on
+/// the ground that moved, and the core owns the queue their certificates are
+/// sitting in.
+///
+/// The covering `Rescan` is stood at `cover_dir.join(<marker leaf>)` and not at
+/// `cover_dir` itself, because
+/// [`covering_rescan`](DriverCore::stand_covering_rescan) covers the PARENT of
+/// what it is given: handing it the ground directly would name the ground's
+/// parent, which for a cover directly under the root degenerates to a
+/// whole-scope re-enumeration — sound, but far wider than the terminal needs.
+///
+/// Only a move that stood NO `Rescan` of its own owes one here. A move that
+/// stands its own instruction covers exactly the ground it names, and standing a
+/// second would ask the caller to re-read the same subtree twice.
+///
+/// Standing one raises a funnel bump of its own, and that terminates rather than
+/// ping-pongs: the move it raises is drained on the next pass, by which point the
+/// obligations it would retire are already retired, so no further `Rescan` is
+/// stood and the round stops.
+fn drain_barrier_moves<R, F>(
+  core: &mut DriverCore,
+  cookies: &CookieRegistry<F>,
+  op_tx: &async_channel::Sender<OpResult<F::Handle>>,
+  now: &impl Fn() -> Instant,
+) where
+  R: RuntimeLite,
+  F: FsOps,
+{
+  for BarrierMove {
+    scope,
+    location,
+    rescan_stands,
+  } in core.take_barrier_moves()
+  {
+    for barrier in cookies.invalidate_barriers::<R>(op_tx, scope, &location) {
+      core.purge_marker_emits(scope, &barrier.name);
+      if !rescan_stands {
+        core.stand_covering_rescan(scope, &barrier.cover_dir.join(barrier.name.as_ref()), now());
+      }
+    }
+  }
 }
 
 /// Executes the core's queued effects, feeding each outcome straight back.
