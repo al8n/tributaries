@@ -2782,7 +2782,13 @@ impl<R> Watcher<R> {
   /// Gated on its one consumer's cfg rather than on the command's: the kernel
   /// cells are the only callers, so wherever they are compiled out this probe is
   /// dead code and `-D warnings` says so.
-  #[cfg(all(test, target_os = "linux", feature = "tokio", not(miri)))]
+  #[cfg(all(
+    test,
+    target_os = "linux",
+    feature = "tokio",
+    not(miri),
+    feature = "sync"
+  ))]
   #[must_use = "an expired budget leaves the baseline lossy, which is a staging failure"]
   pub(crate) async fn cover_fence_entry_spent(&self, root: RootHandle) -> bool {
     for _ in 0..200 {

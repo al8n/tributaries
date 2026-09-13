@@ -71,6 +71,11 @@ pub struct Interest {
 /// exactly as the derive would. Every key is optional, defaulted from
 /// [`Interest::new`] (the struct-level default the derive's own `default`
 /// attribute read), and a repeated key is refused with `duplicate_field`.
+///
+/// The visitor also accepts, through `visit_seq`, the SEQUENCE form the
+/// derived `Serialize` itself emits for a non-self-describing format — the
+/// six fields in declaration order, a short sequence defaulting its tail
+/// exactly as a missing key does.
 #[cfg(feature = "serde")]
 impl<'de> serde::Deserialize<'de> for Interest {
   fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -269,6 +274,96 @@ impl<'de> serde::Deserialize<'de> for Interest {
           moved: moved.unwrap_or(default.moved),
           attrib: attrib.unwrap_or(default.attrib),
           ondir: ondir.unwrap_or(default.ondir),
+        })
+      }
+
+      /// The derive's own SEQUENCE form, for a non-self-describing format: the
+      /// six fields in declaration order, a `None` (short sequence) filling
+      /// that field and every later one from [`Interest::default`], and
+      /// nothing read past the last field.
+      fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+      where
+        A: serde::de::SeqAccess<'de>,
+      {
+        let default = Interest::default();
+
+        let created = match seq.next_element::<bool>()? {
+          Some(value) => value,
+          None => {
+            return Ok(Interest {
+              created: default.created,
+              removed: default.removed,
+              modified: default.modified,
+              moved: default.moved,
+              attrib: default.attrib,
+              ondir: default.ondir,
+            });
+          }
+        };
+        let removed = match seq.next_element::<bool>()? {
+          Some(value) => value,
+          None => {
+            return Ok(Interest {
+              created,
+              removed: default.removed,
+              modified: default.modified,
+              moved: default.moved,
+              attrib: default.attrib,
+              ondir: default.ondir,
+            });
+          }
+        };
+        let modified = match seq.next_element::<bool>()? {
+          Some(value) => value,
+          None => {
+            return Ok(Interest {
+              created,
+              removed,
+              modified: default.modified,
+              moved: default.moved,
+              attrib: default.attrib,
+              ondir: default.ondir,
+            });
+          }
+        };
+        let moved = match seq.next_element::<bool>()? {
+          Some(value) => value,
+          None => {
+            return Ok(Interest {
+              created,
+              removed,
+              modified,
+              moved: default.moved,
+              attrib: default.attrib,
+              ondir: default.ondir,
+            });
+          }
+        };
+        let attrib = match seq.next_element::<bool>()? {
+          Some(value) => value,
+          None => {
+            return Ok(Interest {
+              created,
+              removed,
+              modified,
+              moved,
+              attrib: default.attrib,
+              ondir: default.ondir,
+            });
+          }
+        };
+        let ondir = match seq.next_element::<bool>()? {
+          Some(value) => value,
+          None => default.ondir,
+        };
+
+        Ok(Interest {
+          created,
+          removed,
+          modified,
+          moved,
+          attrib,
+          ondir,
         })
       }
     }

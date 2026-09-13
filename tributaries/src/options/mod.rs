@@ -1016,6 +1016,11 @@ impl Default for DebounceConfig {
 /// map's value has no attribute of its own to carry a function name), every key
 /// is optional and defaulted from [`DebounceConfig::new`], and a repeated key is
 /// refused with `duplicate_field`.
+///
+/// The visitor also accepts, through `visit_seq`, the SEQUENCE form the
+/// derived `Serialize` itself emits for a non-self-describing format — the
+/// three fields in declaration order, a short sequence defaulting its tail
+/// exactly as a missing key does.
 #[cfg(feature = "serde")]
 impl<'de> serde::Deserialize<'de> for DebounceConfig {
   fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -1201,6 +1206,49 @@ impl<'de> serde::Deserialize<'de> for DebounceConfig {
           quiet_window: quiet_window.unwrap_or(default.quiet_window),
           max_hold: max_hold.unwrap_or(default.max_hold),
           max_buffered: max_buffered.unwrap_or(default.max_buffered),
+        })
+      }
+
+      /// The derive's own SEQUENCE form, for a non-self-describing format: the
+      /// three fields in declaration order through the same bounded wrappers
+      /// the map arm uses, a `None` (short sequence) filling that field and
+      /// every later one from [`DebounceConfig::default`], and nothing read
+      /// past the last field.
+      fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+      where
+        A: serde::de::SeqAccess<'de>,
+      {
+        let default = DebounceConfig::default();
+
+        let quiet_window = match seq.next_element::<QuietWindowValue>()? {
+          Some(value) => value.0,
+          None => {
+            return Ok(DebounceConfig {
+              quiet_window: default.quiet_window,
+              max_hold: default.max_hold,
+              max_buffered: default.max_buffered,
+            });
+          }
+        };
+        let max_hold = match seq.next_element::<MaxHoldValue>()? {
+          Some(value) => value.0,
+          None => {
+            return Ok(DebounceConfig {
+              quiet_window,
+              max_hold: default.max_hold,
+              max_buffered: default.max_buffered,
+            });
+          }
+        };
+        let max_buffered = match seq.next_element::<MaxBufferedValue>()? {
+          Some(value) => value.0,
+          None => default.max_buffered,
+        };
+
+        Ok(DebounceConfig {
+          quiet_window,
+          max_hold,
+          max_buffered,
         })
       }
     }
@@ -1956,6 +2004,11 @@ impl Default for TributariesOptions {
 /// keeps its own opt-in `Option` shape untouched. Every key is optional and
 /// defaulted from [`TributariesOptions::new`], and a repeated key is refused
 /// with `duplicate_field`.
+///
+/// The visitor also accepts, through `visit_seq`, the SEQUENCE form the
+/// derived `Serialize` itself emits for a non-self-describing format — the
+/// three fields in declaration order, a short sequence defaulting its tail
+/// exactly as a missing key does.
 #[cfg(feature = "serde")]
 impl<'de> serde::Deserialize<'de> for TributariesOptions {
   fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -2131,6 +2184,49 @@ impl<'de> serde::Deserialize<'de> for TributariesOptions {
           event_capacity: event_capacity.unwrap_or(default.event_capacity),
           command_capacity: command_capacity.unwrap_or(default.command_capacity),
           debounce: debounce.unwrap_or(default.debounce),
+        })
+      }
+
+      /// The derive's own SEQUENCE form, for a non-self-describing format: the
+      /// three fields in declaration order through the same bounded wrappers
+      /// the map arm uses, a `None` (short sequence) filling that field and
+      /// every later one from [`TributariesOptions::default`], and nothing
+      /// read past the last field.
+      fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+      where
+        A: serde::de::SeqAccess<'de>,
+      {
+        let default = TributariesOptions::default();
+
+        let event_capacity = match seq.next_element::<EventCapacityValue>()? {
+          Some(value) => value.0,
+          None => {
+            return Ok(TributariesOptions {
+              event_capacity: default.event_capacity,
+              command_capacity: default.command_capacity,
+              debounce: default.debounce,
+            });
+          }
+        };
+        let command_capacity = match seq.next_element::<CommandCapacityValue>()? {
+          Some(value) => value.0,
+          None => {
+            return Ok(TributariesOptions {
+              event_capacity,
+              command_capacity: default.command_capacity,
+              debounce: default.debounce,
+            });
+          }
+        };
+        let debounce = match seq.next_element::<Option<DebounceConfig>>()? {
+          Some(value) => value,
+          None => default.debounce,
+        };
+
+        Ok(TributariesOptions {
+          event_capacity,
+          command_capacity,
+          debounce,
         })
       }
     }
@@ -2317,6 +2413,11 @@ pub struct RootGlobs {
 /// value has no attribute of its own to carry a function name), every key is
 /// optional and defaulted from [`RootGlobs::new`], and a repeated key is
 /// refused with `duplicate_field`.
+///
+/// The visitor also accepts, through `visit_seq`, the SEQUENCE form the
+/// derived `Serialize` itself emits for a non-self-describing format — the
+/// two fields in declaration order, a short sequence defaulting its tail
+/// exactly as a missing key does.
 #[cfg(feature = "serde")]
 impl<'de> serde::Deserialize<'de> for RootGlobs {
   fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -2481,6 +2582,34 @@ impl<'de> serde::Deserialize<'de> for RootGlobs {
           prune: prune.unwrap_or(default.prune),
           include: include.unwrap_or(default.include),
         })
+      }
+
+      /// The derive's own SEQUENCE form, for a non-self-describing format: the
+      /// two fields in declaration order through the same bounded wrappers the
+      /// map arm uses, a `None` (short sequence) filling that field and every
+      /// later one from [`RootGlobs::default`], and nothing read past the last
+      /// field.
+      fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+      where
+        A: serde::de::SeqAccess<'de>,
+      {
+        let default = RootGlobs::default();
+
+        let prune = match seq.next_element::<PruneValue>()? {
+          Some(value) => value.0,
+          None => {
+            return Ok(RootGlobs {
+              prune: default.prune,
+              include: default.include,
+            });
+          }
+        };
+        let include = match seq.next_element::<IncludeValue>()? {
+          Some(value) => value.0,
+          None => default.include,
+        };
+
+        Ok(RootGlobs { prune, include })
       }
     }
 
@@ -3195,6 +3324,12 @@ impl<C> Default for WatchOptions<C> {
 /// [`WatchOptions::new`], a repeated key is refused with `duplicate_field`, and
 /// — exactly as the derive's own `bound = ""` stated — this impl adds no bound
 /// on `C` at all, since the one field mentioning it is never read here.
+///
+/// The visitor also accepts, through `visit_seq`, the SEQUENCE form the
+/// derived `Serialize` itself emits for a non-self-describing format — the
+/// four fields `visit_map` reads, in declaration order (`filter` stays out
+/// of the sequence too), a short sequence defaulting its tail exactly as a
+/// missing key does.
 #[cfg(feature = "serde")]
 impl<'de, C> serde::Deserialize<'de> for WatchOptions<C> {
   fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -3384,6 +3519,68 @@ impl<'de, C> serde::Deserialize<'de> for WatchOptions<C> {
           debounce: debounce.unwrap_or(default.debounce),
           prune: prune.unwrap_or(default.prune),
           include: include.unwrap_or(default.include),
+        })
+      }
+
+      /// The derive's own SEQUENCE form, for a non-self-describing format: the
+      /// four fields `visit_map` reads, in declaration order through the same
+      /// bounded wrappers it uses (`filter` is never part of the sequence
+      /// either), a `None` (short sequence) filling that field and every later
+      /// one from [`WatchOptions::default`], and nothing read past the last
+      /// field.
+      fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+      where
+        A: serde::de::SeqAccess<'de>,
+      {
+        let default = WatchOptions::<C>::default();
+
+        let interest = match seq.next_element::<Interest>()? {
+          Some(value) => value,
+          None => {
+            return Ok(WatchOptions {
+              interest: default.interest,
+              filter: default.filter,
+              debounce: default.debounce,
+              prune: default.prune,
+              include: default.include,
+            });
+          }
+        };
+        let debounce = match seq.next_element::<Debounce>()? {
+          Some(value) => value,
+          None => {
+            return Ok(WatchOptions {
+              interest,
+              filter: default.filter,
+              debounce: default.debounce,
+              prune: default.prune,
+              include: default.include,
+            });
+          }
+        };
+        let prune = match seq.next_element::<PruneValue>()? {
+          Some(value) => value.0,
+          None => {
+            return Ok(WatchOptions {
+              interest,
+              filter: default.filter,
+              debounce,
+              prune: default.prune,
+              include: default.include,
+            });
+          }
+        };
+        let include = match seq.next_element::<IncludeValue>()? {
+          Some(value) => value.0,
+          None => default.include,
+        };
+
+        Ok(WatchOptions {
+          interest,
+          filter: default.filter,
+          debounce,
+          prune,
+          include,
         })
       }
     }

@@ -408,6 +408,117 @@ mod serde_face {
     );
   }
 
+  /// The derived `Serialize` writes a non-self-describing format's struct as a
+  /// plain SEQUENCE, not the map this face otherwise documents — the ten
+  /// fields' own values, read out of a self-describing document in their
+  /// declaration order and driven through serde_json's array deserializer,
+  /// exercise that same `visit_seq` arm a non-self-describing format's decoder
+  /// would.
+  #[test]
+  fn a_full_value_round_trips_through_the_sequence_form() {
+    const FIELDS: &[&str] = &[
+      "latency",
+      "move_window",
+      "event_capacity",
+      "os_batch_capacity",
+      "os_buffer_bytes",
+      "exclusions",
+      "backend",
+      "root_liveness_interval",
+      "max_map_directories",
+      "cookie_global_cap",
+    ];
+
+    let options = WatcherOptions::new()
+      .with_latency(Duration::from_millis(250))
+      .with_move_window(Duration::from_secs(2))
+      .with_event_capacity(NonZeroUsize::new(4096).unwrap())
+      .with_os_batch_capacity(NonZeroUsize::new(8).unwrap())
+      .with_os_buffer_bytes(NonZeroU32::new(8 * 1024).unwrap())
+      .with_exclusions(vec![PathBuf::from(abs_exclusion("repo/target"))])
+      .with_backend(Backend::Fanotify)
+      .with_root_liveness_interval(Duration::from_secs(5))
+      .with_max_map_directories(Some(250_000))
+      .with_cookie_global_cap(NonZeroUsize::new(7).unwrap());
+    let json = serde_json::to_value(&options).unwrap();
+    let values: Vec<serde_json::Value> = FIELDS
+      .iter()
+      .map(|field| json.get(field).unwrap().clone())
+      .collect();
+    let parsed =
+      serde_json::from_value::<WatcherOptions>(serde_json::Value::Array(values)).unwrap();
+    assert_eq!(parsed, options);
+  }
+
+  /// A non-self-describing format's own struct decoding has no length prefix
+  /// to shorten (a short buffer is an EOF error, never a clean end of
+  /// sequence), so the tail-default rule `visit_seq` carries is pinned
+  /// directly against it through a hand-written `SeqAccess` that yields one
+  /// element and then ends.
+  #[test]
+  fn a_short_sequence_defaults_the_tail() {
+    /// Yields exactly one element (deserialized through `serde_json::Value`, so
+    /// any field's shape can be produced without a second wire format) and then
+    /// `None` for every call after.
+    struct OneThenDone(Option<serde_json::Value>);
+
+    impl<'de> serde::de::SeqAccess<'de> for OneThenDone {
+      type Error = serde_json::Error;
+
+      fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>, Self::Error>
+      where
+        T: serde::de::DeserializeSeed<'de>,
+      {
+        match self.0.take() {
+          Some(value) => seed.deserialize(value).map(Some),
+          None => Ok(None),
+        }
+      }
+    }
+
+    /// The one door back to the struct visitor's private `visit_seq`: every
+    /// other `Deserializer` method is unreachable, since
+    /// `WatcherOptions::deserialize` calls `deserialize_struct` directly and
+    /// nothing it reads recurses back into a top-level deserializer.
+    struct StructAsSeq(OneThenDone);
+
+    impl<'de> serde::Deserializer<'de> for StructAsSeq {
+      type Error = serde_json::Error;
+
+      fn deserialize_struct<V>(
+        self,
+        _name: &'static str,
+        _fields: &'static [&'static str],
+        visitor: V,
+      ) -> Result<V::Value, Self::Error>
+      where
+        V: serde::de::Visitor<'de>,
+      {
+        visitor.visit_seq(self.0)
+      }
+
+      fn deserialize_any<V>(self, _visitor: V) -> Result<V::Value, Self::Error>
+      where
+        V: serde::de::Visitor<'de>,
+      {
+        unreachable!("this fixture only exercises deserialize_struct")
+      }
+
+      serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+        bytes byte_buf option unit unit_struct newtype_struct seq tuple
+        tuple_struct map enum identifier ignored_any
+      }
+    }
+
+    let deserializer = StructAsSeq(OneThenDone(Some(serde_json::json!("250ms"))));
+    let parsed: WatcherOptions = serde::Deserialize::deserialize(deserializer).unwrap();
+    assert_eq!(
+      parsed,
+      WatcherOptions::new().with_latency(Duration::from_millis(250))
+    );
+  }
+
   /// An empty or relative exclusion is refused where the visitor reads it, in
   /// the same fixed-message mold as the duration-text faces: it never echoes
   /// the value (there is none worth echoing here, but the rule is the same
@@ -1760,6 +1871,98 @@ mod root_options {
         .with_include([glob("**/*.{mp4,mov}")]);
       let json = serde_json::to_string(&options).unwrap();
       assert_eq!(serde_json::from_str::<RootOptions>(&json).unwrap(), options);
+    }
+
+    /// The derived `Serialize` writes a non-self-describing format's struct as
+    /// a plain SEQUENCE, not the map this face otherwise documents — the
+    /// three fields' own values, read out of a self-describing document in
+    /// their declaration order and driven through serde_json's array
+    /// deserializer, exercise that same `visit_seq` arm a non-self-describing
+    /// format's decoder would.
+    #[test]
+    fn a_full_value_round_trips_through_the_sequence_form() {
+      const FIELDS: &[&str] = &["interest", "prune", "include"];
+
+      let options = RootOptions::new()
+        .with_interest(Interest::new().with_created().with_moved())
+        .with_prune([glob("**/node_modules"), glob("**/.git")])
+        .with_include([glob("**/*.{mp4,mov}")]);
+      let json = serde_json::to_value(&options).unwrap();
+      let values: Vec<serde_json::Value> = FIELDS
+        .iter()
+        .map(|field| json.get(field).unwrap().clone())
+        .collect();
+      let parsed = serde_json::from_value::<RootOptions>(serde_json::Value::Array(values)).unwrap();
+      assert_eq!(parsed, options);
+    }
+
+    /// A non-self-describing format's own struct decoding has no length
+    /// prefix to shorten (a short buffer is an EOF error, never a clean end
+    /// of sequence), so the tail-default rule `visit_seq` carries is pinned
+    /// directly against it through a hand-written `SeqAccess` that yields one
+    /// element and then ends.
+    #[test]
+    fn a_short_sequence_defaults_the_tail() {
+      /// Yields exactly one element (deserialized through `serde_json::Value`,
+      /// so any field's shape can be produced without a second wire format)
+      /// and then `None` for every call after.
+      struct OneThenDone(Option<serde_json::Value>);
+
+      impl<'de> serde::de::SeqAccess<'de> for OneThenDone {
+        type Error = serde_json::Error;
+
+        fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>, Self::Error>
+        where
+          T: serde::de::DeserializeSeed<'de>,
+        {
+          match self.0.take() {
+            Some(value) => seed.deserialize(value).map(Some),
+            None => Ok(None),
+          }
+        }
+      }
+
+      /// The one door back to the struct visitor's private `visit_seq`: every
+      /// other `Deserializer` method is unreachable, since
+      /// `RootOptions::deserialize` calls `deserialize_struct` directly and
+      /// nothing it reads recurses back into a top-level deserializer.
+      struct StructAsSeq(OneThenDone);
+
+      impl<'de> serde::Deserializer<'de> for StructAsSeq {
+        type Error = serde_json::Error;
+
+        fn deserialize_struct<V>(
+          self,
+          _name: &'static str,
+          _fields: &'static [&'static str],
+          visitor: V,
+        ) -> Result<V::Value, Self::Error>
+        where
+          V: serde::de::Visitor<'de>,
+        {
+          visitor.visit_seq(self.0)
+        }
+
+        fn deserialize_any<V>(self, _visitor: V) -> Result<V::Value, Self::Error>
+        where
+          V: serde::de::Visitor<'de>,
+        {
+          unreachable!("this fixture only exercises deserialize_struct")
+        }
+
+        serde::forward_to_deserialize_any! {
+          bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+          bytes byte_buf option unit unit_struct newtype_struct seq tuple
+          tuple_struct map enum identifier ignored_any
+        }
+      }
+
+      let deserializer = StructAsSeq(OneThenDone(Some(serde_json::json!({"created": true}))));
+      let parsed: RootOptions = serde::Deserialize::deserialize(deserializer).unwrap();
+      assert_eq!(
+        parsed,
+        RootOptions::new().with_interest(Interest::new().with_created())
+      );
     }
 
     /// The seats are lists of STRINGS, in both directions.

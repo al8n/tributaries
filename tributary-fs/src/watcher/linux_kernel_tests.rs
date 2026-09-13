@@ -22,9 +22,9 @@ use std::{
 };
 
 use super::Watcher;
-use crate::{Backend, CoverOutcome, Event, Interest, WatcherOptions};
+use crate::{Backend, Event, Interest, WatcherOptions};
 #[cfg(feature = "sync")]
-use crate::{SyncRootDenied, error::SyncRootError};
+use crate::{CoverOutcome, SyncRootDenied, error::SyncRootError};
 
 type TokioWatcher = Watcher<agnostic_lite::tokio::TokioRuntime>;
 
