@@ -33,14 +33,16 @@
 //! umbrella never re-implements it; it orchestrates subsumption and fan-out over `C`
 //! alone.
 
-use std::vec::Vec;
+use std::{time::SystemTime, vec::Vec};
+
+use futures_util::Stream;
 
 use tributary_proto::{ChangeId, Epoch, Location};
 
 #[cfg(feature = "sync")]
 use crate::error::SyncError;
 use crate::{
-  error::{SourceCloseError, WatchError},
+  error::{ListError, SourceCloseError, WatchError},
   event::EventKind,
   options::RootGlobs,
 };
@@ -760,6 +762,104 @@ pub trait LocalSource<C> {
     async { Ok(()) }
   }
 
+  /// Enumerates what the root `handle` names HOLDS — the reconciliation half of the
+  /// seam, narrowed by the same per-root words [`arm`](Self::arm) takes.
+  ///
+  /// A watch answers "what changed from now on"; this answers "what is there", and a
+  /// consumer that maintains its own picture of a tree needs both from the SAME layer.
+  /// Without it the picture is built by a walk the consumer writes itself — against the
+  /// local filesystem, because that is the only tree it can walk — so a source whose
+  /// keys are not paths (an object store) cannot be reconciled at all, and the walk and
+  /// the subscription can disagree about which entries the words admit. Both close here:
+  /// the listing is the source's own, and it applies the words the arm applies.
+  ///
+  /// # What it yields
+  ///
+  /// Each item is one entry's located key — in the same `C` component space
+  /// [`arm`](Self::arm) and [`SourceEvent::key`] use, so an entry can be compared with a
+  /// change with no re-spelling — paired with the [`Metadata`] the source read for it.
+  /// The ROOT itself is not an entry: a listing reports what a root holds, not the root.
+  ///
+  /// A per-key failure ([`ListError::Io`](crate::ListError::Io)) is an ITEM, not the end
+  /// of the stream: one unreadable directory leaves the listing incomplete below that
+  /// key and complete everywhere else, and a consumer that needs to know which half it
+  /// got must be told which key failed.
+  ///
+  /// # The words are the ARM's words, applied the same way
+  ///
+  /// [`prune`](RootGlobs::prune) is matched against root-relative DIRECTORY paths: a
+  /// matching directory is not descended and not reported, exactly as the arm never
+  /// enters it — so nothing a listing yields can be under ground the watch refuses.
+  /// [`include`](RootGlobs::include), where engaged, narrows FILES by their last
+  /// segment and never a directory, exactly as the arm narrows delivery. A source that
+  /// cannot honour a word must say so in its own docs, as it must for
+  /// [`arm`](Self::arm).
+  ///
+  /// # Symbolic links are reported, never followed
+  ///
+  /// A link is one entry ([`EntryKind::Symlink`]) and the walk stops there. Following
+  /// one is how a listing leaves the root it was asked about — and how it loops — and a
+  /// watch does not follow them either, so a listing that did would report keys no
+  /// change could ever arrive for.
+  ///
+  /// # The default says so, and that is not the same as an empty root
+  ///
+  /// It yields ONE [`ListError::Unsupported`](crate::ListError::Unsupported) and ends.
+  /// A backend that cannot enumerate must be distinguishable from a root that holds
+  /// nothing, because the second is an instruction to a reconciling consumer to forget
+  /// everything it remembers under that root.
+  ///
+  /// The returned stream carries no `Send` promise on either trait: the owner never
+  /// drives it — a listing is the CONSUMER's to drive, at its own pace — so nothing in
+  /// this crate needs one, and requiring it would put a `C: Send` bound on a seam whose
+  /// other items have none. A concrete source's stream is `Send` when its own captures
+  /// are (`FsSource`'s is).
+  fn list(
+    &self,
+    handle: Self::Handle,
+    globs: &RootGlobs,
+  ) -> impl Stream<Item = Result<(Vec<C>, Metadata), ListError<C>>> {
+    let _ = (handle, globs);
+    futures_util::stream::once(core::future::ready(Err(ListError::Unsupported)))
+  }
+
+  /// Whether this source can currently PROVE the coverage of the root `handle` names —
+  /// the state behind the [`CoverageLost`](EventKind::CoverageLost) /
+  /// [`CoverageRegained`](EventKind::CoverageRegained) transitions the owner delivers.
+  ///
+  /// A **synchronous, out-of-band** read, exactly like [`root_key`](Self::root_key), and the
+  /// owner asks it on every event that arrives for the root — so the answer must be cheap
+  /// (a registry/snapshot read, never I/O) and must not block.
+  ///
+  /// # A STATE, whose every edge is announced by an event
+  ///
+  /// The owner derives the transitions from this answer alone, which is why it never
+  /// has to poll on a clock of its own — and why a source that can lose coverage MUST
+  /// put an event on the root's stream at **both** edges, including the regaining one.
+  /// Without the second the owner would have nothing to re-read this on, and the
+  /// subscribers would keep enumerating on their own forever. A source whose backing
+  /// coverage can lapse therefore owes, per root:
+  ///
+  /// 1. an event (the covering [`Rescan`](EventKind::Rescan) it already stands for the
+  ///    unaccountable window will do) when the answer turns [`Unproven`](Coverage::Unproven);
+  /// 2. an event when it turns [`Proven`](Coverage::Proven) again.
+  ///
+  /// While the answer is `Unproven`, a root-located `Rescan` is read as the episode's own
+  /// repeated instruction and folded into the transition rather than delivered — a
+  /// consumer that was told coverage is unproven is already re-enumerating at its own
+  /// cadence, and the ONE `Rescan` the owner stands at the regain covers the whole window
+  /// regardless. A `Rescan` **below** the root is delivered as usual.
+  ///
+  /// The default is [`Proven`](Coverage::Proven): a source whose coverage never lapses —
+  /// or that cannot tell — reports the state it can honestly claim, and the owner then
+  /// delivers no transition at all. A root this source does not know (never armed,
+  /// already retired) reports `Proven` too: its death is the stream's terminal signal to
+  /// report, not this one's.
+  fn coverage(&self, handle: Self::Handle) -> Coverage {
+    let _ = handle;
+    Coverage::Proven
+  }
+
   /// The **canonical key** of the root `handle` names, or [`None`] once that root is dead
   /// or retired — a **synchronous** liveness probe (mirroring the `tributary-fs`
   /// watcher's `root_path`, which reads a live registry snapshot without I/O).
@@ -1134,6 +1234,104 @@ pub trait Source<C> {
     async { Ok(()) }
   }
 
+  /// Enumerates what the root `handle` names HOLDS — the reconciliation half of the
+  /// seam, narrowed by the same per-root words [`arm`](Self::arm) takes.
+  ///
+  /// A watch answers "what changed from now on"; this answers "what is there", and a
+  /// consumer that maintains its own picture of a tree needs both from the SAME layer.
+  /// Without it the picture is built by a walk the consumer writes itself — against the
+  /// local filesystem, because that is the only tree it can walk — so a source whose
+  /// keys are not paths (an object store) cannot be reconciled at all, and the walk and
+  /// the subscription can disagree about which entries the words admit. Both close here:
+  /// the listing is the source's own, and it applies the words the arm applies.
+  ///
+  /// # What it yields
+  ///
+  /// Each item is one entry's located key — in the same `C` component space
+  /// [`arm`](Self::arm) and [`SourceEvent::key`] use, so an entry can be compared with a
+  /// change with no re-spelling — paired with the [`Metadata`] the source read for it.
+  /// The ROOT itself is not an entry: a listing reports what a root holds, not the root.
+  ///
+  /// A per-key failure ([`ListError::Io`](crate::ListError::Io)) is an ITEM, not the end
+  /// of the stream: one unreadable directory leaves the listing incomplete below that
+  /// key and complete everywhere else, and a consumer that needs to know which half it
+  /// got must be told which key failed.
+  ///
+  /// # The words are the ARM's words, applied the same way
+  ///
+  /// [`prune`](RootGlobs::prune) is matched against root-relative DIRECTORY paths: a
+  /// matching directory is not descended and not reported, exactly as the arm never
+  /// enters it — so nothing a listing yields can be under ground the watch refuses.
+  /// [`include`](RootGlobs::include), where engaged, narrows FILES by their last
+  /// segment and never a directory, exactly as the arm narrows delivery. A source that
+  /// cannot honour a word must say so in its own docs, as it must for
+  /// [`arm`](Self::arm).
+  ///
+  /// # Symbolic links are reported, never followed
+  ///
+  /// A link is one entry ([`EntryKind::Symlink`]) and the walk stops there. Following
+  /// one is how a listing leaves the root it was asked about — and how it loops — and a
+  /// watch does not follow them either, so a listing that did would report keys no
+  /// change could ever arrive for.
+  ///
+  /// # The default says so, and that is not the same as an empty root
+  ///
+  /// It yields ONE [`ListError::Unsupported`](crate::ListError::Unsupported) and ends.
+  /// A backend that cannot enumerate must be distinguishable from a root that holds
+  /// nothing, because the second is an instruction to a reconciling consumer to forget
+  /// everything it remembers under that root.
+  ///
+  /// The returned stream carries no `Send` promise on either trait: the owner never
+  /// drives it — a listing is the CONSUMER's to drive, at its own pace — so nothing in
+  /// this crate needs one, and requiring it would put a `C: Send` bound on a seam whose
+  /// other items have none. A concrete source's stream is `Send` when its own captures
+  /// are (`FsSource`'s is).
+  fn list(
+    &self,
+    handle: Self::Handle,
+    globs: &RootGlobs,
+  ) -> impl Stream<Item = Result<(Vec<C>, Metadata), ListError<C>>> {
+    let _ = (handle, globs);
+    futures_util::stream::once(core::future::ready(Err(ListError::Unsupported)))
+  }
+
+  /// Whether this source can currently PROVE the coverage of the root `handle` names —
+  /// the state behind the [`CoverageLost`](EventKind::CoverageLost) /
+  /// [`CoverageRegained`](EventKind::CoverageRegained) transitions the owner delivers.
+  ///
+  /// A **synchronous, out-of-band** read, exactly like [`root_key`](Self::root_key), and the
+  /// owner asks it on every event that arrives for the root — so the answer must be cheap
+  /// (a registry/snapshot read, never I/O) and must not block.
+  ///
+  /// # A STATE, whose every edge is announced by an event
+  ///
+  /// The owner derives the transitions from this answer alone, which is why it never
+  /// has to poll on a clock of its own — and why a source that can lose coverage MUST
+  /// put an event on the root's stream at **both** edges, including the regaining one.
+  /// Without the second the owner would have nothing to re-read this on, and the
+  /// subscribers would keep enumerating on their own forever. A source whose backing
+  /// coverage can lapse therefore owes, per root:
+  ///
+  /// 1. an event (the covering [`Rescan`](EventKind::Rescan) it already stands for the
+  ///    unaccountable window will do) when the answer turns [`Unproven`](Coverage::Unproven);
+  /// 2. an event when it turns [`Proven`](Coverage::Proven) again.
+  ///
+  /// While the answer is `Unproven`, a root-located `Rescan` is read as the episode's own
+  /// repeated instruction and folded into the transition rather than delivered — a
+  /// consumer that was told coverage is unproven is already re-enumerating at its own
+  /// cadence, and the ONE `Rescan` the owner stands at the regain covers the whole window
+  /// regardless. A `Rescan` **below** the root is delivered as usual.
+  ///
+  /// The default is [`Proven`](Coverage::Proven): a source whose coverage never lapses —
+  /// or that cannot tell — reports the state it can honestly claim, and the owner then
+  /// delivers no transition at all. A root this source does not know (never armed,
+  /// already retired) reports `Proven` too: its death is the stream's terminal signal to
+  /// report, not this one's.
+  fn coverage(&self, handle: Self::Handle) -> Coverage {
+    let _ = handle;
+    Coverage::Proven
+  }
+
   /// The **canonical key** of the root `handle` names, or [`None`] once that root is dead
   /// or retired — a **synchronous** liveness probe (mirroring the `tributary-fs`
   /// watcher's `root_path`, which reads a live registry snapshot without I/O).
@@ -1193,6 +1391,18 @@ impl<C, T: Source<C>> LocalSource<C> for T {
     <T as Source<C>>::root_key(self, handle)
   }
 
+  fn coverage(&self, handle: Self::Handle) -> Coverage {
+    <T as Source<C>>::coverage(self, handle)
+  }
+
+  fn list(
+    &self,
+    handle: Self::Handle,
+    globs: &RootGlobs,
+  ) -> impl Stream<Item = Result<(Vec<C>, Metadata), ListError<C>>> {
+    <T as Source<C>>::list(self, handle, globs)
+  }
+
   fn begin_close(&mut self) {
     <T as Source<C>>::begin_close(self)
   }
@@ -1231,6 +1441,179 @@ impl<C, T: Source<C>> LocalSource<C> for T {
 
   fn is_sync_artifact(&self, key: &[C]) -> bool {
     <T as Source<C>>::is_sync_artifact(self, key)
+  }
+}
+
+/// One entry's facts, as [`Source::list`] reports them: what the object IS, how big
+/// it is, and when it last changed.
+///
+/// The three a re-enumerating consumer reconciles on — "is this the object I already
+/// hold" is answered by the size and the modification time, and "may I descend into
+/// it" by the kind. Nothing here is a promise about the object NOW: a listing is a
+/// walk, and an entry describes what the source read when it read it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Metadata {
+  kind: EntryKind,
+  len: u64,
+  modified: Option<SystemTime>,
+}
+
+impl Metadata {
+  /// The facts every source can state: the object's class and its size in bytes.
+  #[inline]
+  pub const fn new(kind: EntryKind, len: u64) -> Self {
+    Self {
+      kind,
+      len,
+      modified: None,
+    }
+  }
+
+  /// Returns these facts with the modification time the source read.
+  #[inline]
+  #[must_use]
+  pub const fn with_modified(mut self, modified: SystemTime) -> Self {
+    self.modified = Some(modified);
+    self
+  }
+
+  /// What the object is.
+  #[inline]
+  pub const fn kind(&self) -> EntryKind {
+    self.kind
+  }
+
+  /// The object's size in bytes — zero for a kind that has no content of its own.
+  #[inline]
+  pub const fn len(&self) -> u64 {
+    self.len
+  }
+
+  /// Whether the object's size is zero. Named for the lint, not for a caller: a
+  /// zero-length file is an object, not an absence.
+  #[inline]
+  pub const fn is_empty(&self) -> bool {
+    self.len == 0
+  }
+
+  /// When the object last changed, where the source read it — `None` where nothing
+  /// did, which is the honest answer rather than an epoch-zero default.
+  #[inline]
+  pub const fn modified(&self) -> Option<SystemTime> {
+    self.modified
+  }
+
+  /// Whether the entry is a directory — the descend test, which is `false` for a
+  /// symbolic link to one (a listing never follows).
+  #[inline]
+  pub const fn is_dir(&self) -> bool {
+    self.kind.is_dir()
+  }
+}
+
+/// What one listed object is — the source-neutral class [`Metadata::kind`] carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum EntryKind {
+  /// An ordinary object with content: a file, or whatever a non-filesystem source
+  /// calls the thing a key finally names.
+  File,
+  /// A container of other keys, which a listing descends into.
+  Dir,
+  /// A link to another key. A listing reports it and NEVER follows it — following
+  /// is how a walk leaves the root it was asked about, and how it loops.
+  Symlink,
+  /// Something the source read but cannot classify as any of the above (a device
+  /// node, a socket, a FIFO). Reported rather than dropped: it occupies the key.
+  Other,
+}
+
+impl EntryKind {
+  /// The stable snake_case name of this kind.
+  #[inline]
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::File => "file",
+      Self::Dir => "dir",
+      Self::Symlink => "symlink",
+      Self::Other => "other",
+    }
+  }
+
+  /// Whether this is [`Dir`](Self::Dir).
+  #[inline]
+  pub const fn is_dir(&self) -> bool {
+    matches!(self, Self::Dir)
+  }
+
+  /// Whether this is [`File`](Self::File).
+  #[inline]
+  pub const fn is_file(&self) -> bool {
+    matches!(self, Self::File)
+  }
+
+  /// Whether this is [`Symlink`](Self::Symlink).
+  #[inline]
+  pub const fn is_symlink(&self) -> bool {
+    matches!(self, Self::Symlink)
+  }
+}
+
+impl core::fmt::Display for EntryKind {
+  #[inline]
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str(self.as_str())
+  }
+}
+
+/// Whether a [`Source`] can currently prove the coverage of ONE armed root —
+/// the state [`coverage`](Source::coverage) reports and the owner turns into
+/// the [`CoverageLost`](EventKind::CoverageLost) /
+/// [`CoverageRegained`](EventKind::CoverageRegained) transitions.
+///
+/// It is a statement about the WATCH, never about a change: an `Unproven` root
+/// is still watched and the events it does see are still delivered. What it
+/// says is that the source can no longer promise the stream is the whole story
+/// for that root, so a consumer must re-enumerate at a cadence of its own until
+/// the state returns to `Proven`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Coverage {
+  /// Something is establishing the root's coverage: the stream is the whole
+  /// story, as it is for every source that never reports otherwise.
+  Proven,
+  /// Nothing is: whatever the source relies on to know the root still exists is
+  /// unavailable, so a loss it cannot see would go unreported until the state
+  /// returns to [`Proven`](Self::Proven).
+  Unproven,
+}
+
+impl Coverage {
+  /// The stable snake_case name of this state.
+  #[inline]
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Proven => "proven",
+      Self::Unproven => "unproven",
+    }
+  }
+
+  /// Whether this is [`Proven`](Self::Proven).
+  #[inline]
+  pub const fn is_proven(&self) -> bool {
+    matches!(self, Self::Proven)
+  }
+
+  /// Whether this is [`Unproven`](Self::Unproven).
+  #[inline]
+  pub const fn is_unproven(&self) -> bool {
+    matches!(self, Self::Unproven)
+  }
+}
+
+impl core::fmt::Display for Coverage {
+  #[inline]
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str(self.as_str())
   }
 }
 

@@ -34,10 +34,11 @@ use std::{
 
 #[cfg(feature = "sync")]
 use futures_util::FutureExt;
+use futures_util::StreamExt;
 use tempfile::TempDir;
 use tributaries::{
-  Debounce, DebounceConfig, Event, Filter, Glob, Subscription, TokioTributaries,
-  TributariesOptions, WatchOptions, WatcherOptions,
+  Debounce, DebounceConfig, EntryKind, Event, Filter, FsSource, Glob, Metadata, RootGlobs, Source,
+  Subscription, TokioTributaries, TributariesOptions, WatchOptions, WatcherOptions,
 };
 
 /// The concrete delivered-event type of the local-fs driver (`C = OsString`, `V = ()`).
@@ -1113,4 +1114,98 @@ async fn include_silences_a_non_matching_file_but_never_a_directory() {
   }
 
   w.close().await.expect("close");
+}
+
+/// [`Source::list`] over a real tree: the entries the root's own words admit, with their
+/// metadata — and the SAME key spelling the watch later reports for them.
+///
+/// The spelling is the half that cannot be checked by reading the code. A consumer
+/// reconciles an enumeration against a change stream by KEY, so a listing that spelled a
+/// path even slightly differently from the watch (a canonicalized root, a normalization,
+/// a separator) would reconcile two pictures that never meet — which is exactly what a
+/// consumer writing its own `read_dir` walk beside the subscription risks, and what
+/// enumerating through the same source removes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_reports_the_admitted_entries_and_the_watchs_own_spelling() {
+  let dir = TempDir::new().expect("a temp dir");
+  let root = dir.path().to_path_buf();
+  std::fs::write(root.join("kept.txt"), b"a").expect("write");
+  std::fs::write(root.join("dropped.log"), b"b").expect("write");
+  std::fs::create_dir(root.join("sub")).expect("mkdir");
+  std::fs::write(root.join("sub").join("deep.txt"), b"c").expect("write");
+  std::fs::create_dir(root.join("cache")).expect("mkdir");
+  std::fs::write(root.join("cache").join("nope.txt"), b"d").expect("write");
+
+  let globs = RootGlobs::new()
+    .with_prune([Glob::new("cache").expect("a pattern")])
+    .with_include([Glob::new("*.txt").expect("a pattern")]);
+
+  let mut source: FsSource<agnostic_lite::tokio::TokioRuntime> =
+    FsSource::new(WatcherOptions::new()).expect("the watcher builds");
+  let key: Vec<OsString> = root
+    .components()
+    .map(|c| c.as_os_str().to_owned())
+    .collect();
+  let armed = Source::arm(&mut source, &key, &globs)
+    .await
+    .expect("the root arms");
+  let handle = armed.handle();
+  let root_key = armed.canonical_key().to_vec();
+
+  let listed: Vec<(Vec<OsString>, Metadata)> = Source::list(&source, handle, &globs)
+    .collect::<Vec<_>>()
+    .await
+    .into_iter()
+    .map(|item| item.expect("every entry of a readable tree is reported"))
+    .collect();
+
+  let named = |name: &str| -> Option<&(Vec<OsString>, Metadata)> {
+    listed
+      .iter()
+      .find(|(key, _)| key.last().map(|leaf| leaf.as_os_str()) == Some(name.as_ref()))
+  };
+  assert!(
+    named("kept.txt").is_some_and(|(_, meta)| meta.kind() == EntryKind::File && meta.len() == 1),
+    "an admitted file is reported with what was read for it: {listed:?}"
+  );
+  assert!(
+    named("deep.txt").is_some(),
+    "and so is one the walk had to descend for: {listed:?}"
+  );
+  assert!(
+    named("sub").is_some_and(|(_, meta)| meta.is_dir()),
+    "the directory it descended is an entry of its own: {listed:?}"
+  );
+  assert!(
+    named("dropped.log").is_none(),
+    "the include words narrow files by their last segment, exactly as delivery does: {listed:?}"
+  );
+  assert!(
+    named("cache").is_none() && named("nope.txt").is_none(),
+    "and a pruned subtree is absent entirely — root and all, as the watch never enters it: {listed:?}"
+  );
+
+  // THE SPELLING. Touch the listed file and read the key the watch reports for it.
+  let listed_key = named("deep.txt").expect("staging").0.clone();
+  assert!(
+    listed_key.starts_with(&root_key),
+    "a listed key is located under the key the arm committed: {listed_key:?}"
+  );
+  std::fs::write(root.join("sub").join("deep.txt"), b"touched").expect("write");
+  let delivered = tokio::time::timeout(Duration::from_secs(10), async {
+    loop {
+      let event = Source::next(&mut source)
+        .await
+        .expect("the source is still live");
+      if event.key().last() == listed_key.last() {
+        return event.key().to_vec();
+      }
+    }
+  })
+  .await
+  .expect("the change arrives");
+  assert_eq!(
+    delivered, listed_key,
+    "the enumeration and the subscription spell the same object the same way"
+  );
 }

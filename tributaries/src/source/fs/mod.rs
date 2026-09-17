@@ -10,27 +10,31 @@
 use std::{
   collections::{HashMap, HashSet, VecDeque},
   ffi::OsString,
-  path::PathBuf,
+  path::{Path, PathBuf},
+  sync::Arc,
   vec::Vec,
 };
 
 use agnostic_lite::RuntimeLite;
 use tributary_fs::{
-  CloseError as FsCloseError, CoverOutcome, Event as FsEvent, EventKind as FsEventKind,
-  ReplaceRootError, RequestOutcome, RootHandle, RootOptions, SkipReason, SourceError,
-  UnwatchError as FsUnwatchError, WatchRootError, Watcher, WatcherOptions,
+  CloseError as FsCloseError, CoverOutcome, Coverage as FsCoverage, Event as FsEvent,
+  EventKind as FsEventKind, ReplaceRootError, RequestOutcome, RootHandle, RootOptions, SkipReason,
+  SourceError, UnwatchError as FsUnwatchError, WatchRootError, Watcher, WatcherOptions,
 };
 #[cfg(feature = "sync")]
 use tributary_fs::{SyncRootDenied, SyncRootError, SyncTicket};
 use tributary_proto::Interest;
 
-use super::{Armed, Source, SourceEvent};
+use futures_util::Stream;
+use tributary_proto::glob::Glob;
+
+use super::{Armed, Coverage, EntryKind, Metadata, Source, SourceEvent};
 #[cfg(feature = "sync")]
 use super::{Begun, SyncToken};
 #[cfg(feature = "sync")]
 use crate::error::SyncError;
 use crate::{
-  error::{BuildError, FaultKind, SourceCloseError, SourceFault, WatchError},
+  error::{BuildError, FaultKind, ListError, SourceCloseError, SourceFault, WatchError},
   event::{EventKind, path_components},
   options::RootGlobs,
 };
@@ -45,6 +49,11 @@ mod tests;
 /// raw filesystem event back into a key.
 pub struct FsSource<R> {
   watcher: Watcher<R>,
+  /// The blocking-job spawner [`list`](Source::list)'s walk runs its `read_dir` and
+  /// per-entry metadata reads on — captured from `R` at construction, in the mold of the
+  /// lower watcher's own detached pool handle, so the [`Source`] impl below still names
+  /// no `R` item and every walk stays off the caller's executor thread.
+  blocking: BlockingSpawner,
   /// Roots whose release was requested (via the synchronous [`disarm`](Source::disarm)) but not yet
   /// handed to the [`Watcher`]'s control channel, each paired with the released root's **canonical
   /// path** captured at `disarm` time (while it was still live in the registry). [`arm`](Source::arm)
@@ -156,6 +165,7 @@ impl<R: RuntimeLite> FsSource<R> {
       .map_err(|err| BuildError::Source(SourceFault::new(FaultKind::Other).with_source(err)))?;
     Ok(Self {
       watcher,
+      blocking: Arc::new(|job| R::spawn_blocking_detach(job)),
       pending_releases: VecDeque::new(),
       enqueued: Vec::new(),
       pending_set: HashSet::new(),
@@ -218,6 +228,156 @@ impl<R> FsSource<R> {
       self.deferred_forwards += forwards;
     }
   }
+}
+
+/// The blocking-job spawner a [`FsSource`] hands its listing reads to — the shape the
+/// lower watcher's own pool handle has, captured once from the runtime at construction.
+type BlockingSpawner = Arc<dyn Fn(Box<dyn FnOnce() + Send>) + Send + Sync + 'static>;
+
+/// One directory still to read, with the root-relative `/`-joined text its children are
+/// matched against (empty for the root itself).
+type Pending = (PathBuf, String);
+
+/// One [`FsSource::list`](Source::list) walk in progress: a BREADTH-FIRST enumeration of
+/// the root, one `read_dir` per step on the blocking pool.
+///
+/// Breadth-first rather than depth-first because a listing is consumed to reconcile a
+/// tree: the shallow entries are the ones a consumer can act on first (they name the
+/// directories it will hold state for), and a queue of directories costs one path per
+/// pending directory where a recursive descent would hold an open reader per level.
+struct Walk {
+  blocking: BlockingSpawner,
+  /// The pruned subtrees, matched against root-relative directory paths.
+  prune: Vec<Glob>,
+  /// The file narrowing, matched against a file's last segment. `None` is unengaged.
+  include: Option<Vec<Glob>>,
+  /// Directories read but not yet descended, oldest first.
+  queue: VecDeque<Pending>,
+  /// Entries read from the last directory and not yet yielded.
+  ready: VecDeque<Result<(Vec<OsString>, Metadata), ListError<OsString>>>,
+}
+
+impl Walk {
+  /// Seeds a walk at `root`, or — for a handle naming no live root — a walk whose one
+  /// item is that refusal.
+  fn new(root: Option<PathBuf>, globs: &RootGlobs, blocking: BlockingSpawner) -> Self {
+    let mut queue = VecDeque::new();
+    let mut ready = VecDeque::new();
+    match root {
+      Some(root) => queue.push_back((root, String::new())),
+      None => ready.push_back(Err(ListError::UnknownRoot)),
+    }
+    Self {
+      blocking,
+      prune: globs.prune().to_vec(),
+      include: globs.include().map(<[Glob]>::to_vec),
+      queue,
+      ready,
+    }
+  }
+
+  /// The next item, reading one more directory whenever the last one is exhausted.
+  async fn step(
+    mut self,
+  ) -> Option<(Result<(Vec<OsString>, Metadata), ListError<OsString>>, Self)> {
+    loop {
+      if let Some(item) = self.ready.pop_front() {
+        return Some((item, self));
+      }
+      let (dir, at) = self.queue.pop_front()?;
+      match self.read_dir(dir.clone()).await {
+        Ok(entries) => self.absorb(&at, entries),
+        // One unreadable directory is an ITEM: the listing is incomplete below this key
+        // and complete everywhere else, and only the key says which half the consumer
+        // got.
+        Err(source) => self.ready.push_back(Err(ListError::Io {
+          key: path_components(&dir),
+          source,
+        })),
+      }
+    }
+  }
+
+  /// Files one directory's entries: admitted ones onto [`ready`](Self::ready),
+  /// descendable ones onto [`queue`](Self::queue).
+  fn absorb(&mut self, at: &str, entries: Vec<(PathBuf, Metadata)>) {
+    for (path, metadata) in entries {
+      let Some(name) = path.file_name() else {
+        continue;
+      };
+      let name = name.to_string_lossy();
+      let relative = if at.is_empty() {
+        name.into_owned()
+      } else {
+        std::format!("{at}/{name}")
+      };
+      if metadata.is_dir() {
+        // THE PRUNE WORDS, applied exactly where the arm applies them: a matching
+        // directory is neither descended nor reported, so nothing this listing yields
+        // can sit under ground the watch refuses to enter.
+        if self.prune.iter().any(|glob| glob.is_match(&relative)) {
+          continue;
+        }
+        self.queue.push_back((path.clone(), relative));
+      } else if let Some(include) = self.include.as_ref() {
+        // THE INCLUDE WORDS, likewise: they narrow FILES by their last segment and
+        // never a directory — the rule the delivery seat applies to a change.
+        let leaf = path
+          .file_name()
+          .map(|leaf| leaf.to_string_lossy().into_owned())
+          .unwrap_or_default();
+        if !include.iter().any(|glob| glob.is_match(&leaf)) {
+          continue;
+        }
+      }
+      self.ready.push_back(Ok((path_components(&path), metadata)));
+    }
+  }
+
+  /// Reads ONE directory on the blocking pool and awaits its answer.
+  ///
+  /// The oneshot is what makes the await cancellation-safe: a consumer that drops the
+  /// stream mid-directory drops the receiver where it stands, and the job's send then
+  /// fails on a pool thread the moment its syscall returns. A job that answers NOTHING —
+  /// the pool refused it, or it unwound — is a failure to READ and is reported as one,
+  /// rather than as an empty directory, which is a different statement entirely.
+  async fn read_dir(&self, dir: PathBuf) -> Result<Vec<(PathBuf, Metadata)>, std::io::Error> {
+    let (tx, rx) = futures_channel::oneshot::channel();
+    (self.blocking)(Box::new(move || {
+      let _ = tx.send(read_dir_blocking(&dir));
+    }));
+    rx.await.unwrap_or_else(|_| {
+      Err(std::io::Error::other(
+        "the listing's blocking job answered nothing",
+      ))
+    })
+  }
+}
+
+/// One directory's entries and their metadata, read with the blocking calls — never
+/// following a symbolic link ([`std::fs::DirEntry::metadata`] does not traverse one), so
+/// a link is reported as itself and the walk never leaves the root it was asked about.
+fn read_dir_blocking(dir: &Path) -> Result<Vec<(PathBuf, Metadata)>, std::io::Error> {
+  let mut entries = Vec::new();
+  for entry in std::fs::read_dir(dir)? {
+    let entry = entry?;
+    let metadata = entry.metadata()?;
+    let kind = if metadata.is_dir() {
+      EntryKind::Dir
+    } else if metadata.is_symlink() {
+      EntryKind::Symlink
+    } else if metadata.is_file() {
+      EntryKind::File
+    } else {
+      EntryKind::Other
+    };
+    let mut listed = Metadata::new(kind, metadata.len());
+    if let Ok(modified) = metadata.modified() {
+      listed = listed.with_modified(modified);
+    }
+    entries.push((entry.path(), listed));
+  }
+  Ok(entries)
 }
 
 /// How many pending releases one `arm` hands to the watcher's control channel via the
@@ -827,6 +987,38 @@ impl<R> Source<OsString> for FsSource<R> {
       .is_some_and(|leaf| {
         tributary_fs::is_sync_cookie_name(leaf) || tributary_fs::is_sync_cookie_dir_name(leaf)
       })
+  }
+
+  fn list(
+    &self,
+    handle: RootHandle,
+    globs: &RootGlobs,
+  ) -> impl Stream<Item = Result<(Vec<OsString>, Metadata), ListError<OsString>>> {
+    futures_util::stream::unfold(
+      Walk::new(
+        self.watcher.root_path(handle),
+        globs,
+        Arc::clone(&self.blocking),
+      ),
+      Walk::step,
+    )
+  }
+
+  fn coverage(&self, handle: RootHandle) -> Coverage {
+    // A released handle is logically dead the instant `disarm` returns (contract clause 3),
+    // and a dead root has no coverage state to report: its terminal signal is the stream's.
+    if self.pending_set.contains(&handle) {
+      return Coverage::Proven;
+    }
+    // The watcher answers `Unproven` exactly while this root's periodic liveness tick is
+    // being refused at its probe budget — the one condition under which nothing is
+    // establishing that the root still exists. Every other root (including a backend with
+    // no tick, whose root death has its own event) reads `Proven`, and so does a handle the
+    // registry has forgotten.
+    match self.watcher.coverage(handle) {
+      Some(FsCoverage::Unproven) => Coverage::Unproven,
+      Some(FsCoverage::Proven) | None => Coverage::Proven,
+    }
   }
 
   fn root_key(&self, handle: RootHandle) -> Option<Vec<OsString>> {

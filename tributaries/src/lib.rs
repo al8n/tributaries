@@ -20,8 +20,8 @@ mod view;
 pub use demux::{Demux, Lane};
 pub use driver::Tributaries;
 pub use error::{
-  BuildError, CloseError, FaultKind, SourceCloseError, SourceFault, UnwatchError, WatchError,
-  WordsConflict,
+  BuildError, CloseError, FaultKind, ListError, SourceCloseError, SourceFault, UnwatchError,
+  WatchError, WordsConflict,
 };
 pub use event::{Event, EventKind};
 pub use filter::{Filter, FilterInput};
@@ -29,7 +29,12 @@ pub use interest::Interest;
 pub use options::{
   Debounce, DebounceConfig, OptionsError, RootGlobs, TributariesOptions, WatchOptions,
 };
-pub use source::{Armed, LocalSource, Source, SourceEvent};
+pub use source::{Armed, Coverage, EntryKind, LocalSource, Metadata, Source, SourceEvent};
+
+/// The stream trait [`Source::list`] returns, re-exported so an implementor can
+/// name it without taking its own `futures` dependency — and so the one this crate
+/// means is the one it compiles against.
+pub use futures_util::Stream;
 
 /// The sync barrier's vocabulary, behind the experimental `sync` feature.
 #[cfg(feature = "sync")]

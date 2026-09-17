@@ -193,6 +193,7 @@ fn reservations_collide_on_object_identity() {
         ancestors: Vec::new().into(),
         backend: BackendKind::FsEvents,
         stats: None,
+        coverage: Coverage::Proven,
       },
     );
   let err = Reservation::take(&roots, PathBuf::from("/live/root"), Some(id), None)
@@ -243,6 +244,7 @@ async fn backend_stats_is_fanotify_only_and_gated() {
         ancestors: Vec::new().into(),
         backend: BackendKind::FsEvents,
         stats: None,
+        coverage: Coverage::Proven,
       },
     );
     set.entries.insert(
@@ -253,6 +255,7 @@ async fn backend_stats_is_fanotify_only_and_gated() {
         ancestors: Vec::new().into(),
         backend: BackendKind::Fanotify,
         stats: Some(Arc::clone(&shared)),
+        coverage: Coverage::Proven,
       },
     );
   }
@@ -2012,6 +2015,7 @@ fn reservation_exemption_excludes_exactly_the_replaced_scope() {
         ancestors: vec![RootIdentity::new(1, 1)].into(),
         backend: crate::os::BackendKind::FsEvents,
         stats: None,
+        coverage: Coverage::Proven,
       },
     );
     set.insert_live(
@@ -2022,6 +2026,7 @@ fn reservation_exemption_excludes_exactly_the_replaced_scope() {
         ancestors: vec![RootIdentity::new(1, 2)].into(),
         backend: crate::os::BackendKind::FsEvents,
         stats: None,
+        coverage: Coverage::Proven,
       },
     );
   }
@@ -2080,6 +2085,7 @@ fn final_root_conflict_exemption_mirrors_the_reservation() {
         ancestors: vec![RootIdentity::new(1, 1)].into(),
         backend: crate::os::BackendKind::FsEvents,
         stats: None,
+        coverage: Coverage::Proven,
       },
     );
   }

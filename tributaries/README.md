@@ -125,6 +125,46 @@ while let Some(event) = tributaries.next().await {
 # }
 ```
 
+## The event vocabulary
+
+`EventKind` is source-neutral; every source maps its raw kinds into it at its binding,
+degrading only ever toward the conservative signal.
+
+| Kind | What it says | Where it is keyed |
+|---|---|---|
+| `Created` / `Modified` / `Removed` | a change at the event's key | the object |
+| `Moved { from }` | one object, two endpoints — the move is delivered whole, and projected to `Removed` / `Created` for a subscriber that covers only one end | destination (`from` is the source) |
+| `Rescan` | coverage below this key became uncertain: re-enumerate it. Strictly dominates every prior delivery to its subscription and bypasses interest, filter and coalescing | the lost ground, clamped to the subscriber's own key |
+| `CoverageLost` | nothing is establishing that the watched root still exists — the stream is no longer a statement about this subtree, and re-enumerating it is yours to schedule | the subscription's own key |
+| `CoverageRegained` | it is being established again, followed by exactly ONE covering `Rescan` | the subscription's own key |
+
+The two transitions are a STATE reported at its edges, not a reminder: one
+`CoverageLost` per episode, silence while it lasts however many times the backend
+re-checks, and one `CoverageRegained` + one `Rescan` when it ends. A root that loses
+coverage again after regaining it reports a second `CoverageLost`. Neither is a terminal
+error for the root — it is still watched, and what it does see is still delivered; a root
+that genuinely dies is retired with its own dominating `Rescan`, as it always was.
+
+A source reports the state through `Source::coverage`, and the owner derives the
+transitions from it, so a custom source gets the same vocabulary for free by answering
+one synchronous question. The local-filesystem source answers `Unproven` exactly while a
+root's periodic liveness probe is being refused at the watcher's probe budget.
+
+## Enumeration
+
+`Source::list(handle, globs)` streams what a root HOLDS — each entry's located key in the
+same component space events are keyed in, paired with the `Metadata` (kind, size,
+modification time) the source read for it.
+
+A consumer that maintains its own picture of a tree needs both halves from the SAME
+layer: a walk it writes itself can only walk the local filesystem (so an object-store
+root has no enumerator at all), and it can disagree with the subscription about which
+entries the per-root words admit or how a path is spelled. The listing applies the words
+the arm applies — `prune` against root-relative directory paths, `include` against a
+file's last segment — reports symbolic links without ever following one, and yields a
+per-key `ListError::Io` as an ITEM, so one unreadable directory leaves the listing
+incomplete below that key and complete everywhere else.
+
 ## Sync barrier (experimental)
 
 A sync barrier certifies that every change made under a subscription **before** the

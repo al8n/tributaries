@@ -93,6 +93,58 @@ fn sync_nonce_seed() -> Option<[u8; 32]> {
   None
 }
 
+/// Whether a watcher can currently PROVE a watched root's coverage — the state
+/// [`Watcher::coverage`](Watcher::coverage) reports and the periodic liveness
+/// tick moves.
+///
+/// A ROOT-level statement, not a per-change one: it says whether anything is
+/// still establishing that this root exists, never whether a particular change
+/// was delivered. The stream keeps its own contract either way — a window this
+/// watcher cannot account for is always covered by a
+/// [`Rescan`](crate::EventKind::Rescan).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Coverage {
+  /// Something is establishing the root's liveness: it is watched, and its
+  /// death would be reported.
+  Proven,
+  /// Nothing is: the root's periodic liveness probe was refused because every
+  /// probe slot in the watcher was held, so a death that only the probe could
+  /// see would go unreported until a probe runs again. The stream carries a
+  /// covering `Rescan` per refused tick while this lasts, and one more when it
+  /// ends.
+  Unproven,
+}
+
+impl Coverage {
+  /// The stable snake_case name of this state.
+  #[inline]
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Proven => "proven",
+      Self::Unproven => "unproven",
+    }
+  }
+
+  /// Whether the root's coverage is [`Proven`](Self::Proven).
+  #[inline]
+  pub const fn is_proven(&self) -> bool {
+    matches!(self, Self::Proven)
+  }
+
+  /// Whether the root's coverage is [`Unproven`](Self::Unproven).
+  #[inline]
+  pub const fn is_unproven(&self) -> bool {
+    matches!(self, Self::Unproven)
+  }
+}
+
+impl core::fmt::Display for Coverage {
+  #[inline]
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str(self.as_str())
+  }
+}
+
 /// An opaque handle to one watched root of a [`Watcher`].
 ///
 /// A handle is a capability scoped to the watcher that issued it: scope ids
@@ -625,6 +677,10 @@ struct RootEntry {
   ancestors: Arc<[RootIdentity]>,
   backend: BackendKind,
   stats: Option<crate::os::BackendStatsHandle>,
+  /// This root's coverage state, as the driver last published it — what
+  /// [`Watcher::coverage`](Watcher::coverage) answers. A root is born
+  /// [`Coverage::Proven`]; only a refused liveness tick moves it.
+  coverage: Coverage,
 }
 
 /// One in-flight `watch`'s reservation record: the watcher-side canonical
@@ -870,6 +926,7 @@ impl ScopeRegistry for RegistryWriter {
         ancestors: ancestors.into(),
         backend,
         stats,
+        coverage: Coverage::Proven,
       },
     );
   }
@@ -878,6 +935,17 @@ impl ScopeRegistry for RegistryWriter {
     let mut set = self.roots.write().unwrap_or_else(PoisonError::into_inner);
     if let Some(entry) = set.entries.remove(&scope) {
       set.unindex_live(scope, &entry);
+    }
+  }
+
+  fn scope_coverage(&self, scope: ScopeId, unproven: bool) {
+    let mut set = self.roots.write().unwrap_or_else(PoisonError::into_inner);
+    if let Some(entry) = set.entries.get_mut(&scope) {
+      entry.coverage = if unproven {
+        Coverage::Unproven
+      } else {
+        Coverage::Proven
+      };
     }
   }
 
@@ -2702,6 +2770,47 @@ impl<R> Watcher<R> {
       .entries
       .get(&root.scope())
       .map(|entry| entry.backend)
+  }
+
+  /// Whether this watcher can currently PROVE the coverage of a watched root —
+  /// the state behind the periodic liveness tick, for a consumer that wants the
+  /// transition rather than the cadence of instructions it produces.
+  ///
+  /// [`Coverage::Unproven`] from the moment a root's liveness tick is refused
+  /// because every probe slot in the watcher is held — nothing is checking
+  /// whether that root still exists, and on a backend whose only death signal
+  /// is the probe (fanotify over a whole filesystem) nothing would report its
+  /// death either — until a probe completes and finds it alive, which stands
+  /// one covering [`Rescan`](crate::EventKind::Rescan) for the window and returns the
+  /// answer to [`Coverage::Proven`]. A backend that does not tick (FSEvents,
+  /// ReadDirectoryChangesW, the USN journal — each has its own root-death
+  /// signal) never leaves `Proven`.
+  ///
+  /// `None` when the handle does not name a live root of this watcher (never
+  /// watched, already gone, or foreign) — exactly as
+  /// [`backend_of`](Self::backend_of) answers. A root whose death is already
+  /// terminal is reported by the stream, not here.
+  ///
+  /// # This is a STATE, and the stream carries its edges
+  ///
+  /// Both edges put an event on the root's stream: the first refused tick
+  /// stands the covering `Rescan` it owes, and so does the probe that ends the
+  /// episode. A consumer therefore never has to poll on a timer of its own — it
+  /// reads this the way it reads [`Event::root`](crate::Event::root) — but it also must not read a
+  /// repeated `Rescan` as a repeated transition: while the answer stays
+  /// `Unproven` the liveness interval keeps standing instructions, and they all
+  /// describe the ONE window this call names.
+  pub fn coverage(&self, root: RootHandle) -> Option<Coverage> {
+    if root.instance() != self.instance {
+      return None;
+    }
+    self
+      .roots
+      .read()
+      .unwrap_or_else(PoisonError::into_inner)
+      .entries
+      .get(&root.scope())
+      .map(|entry| entry.coverage)
   }
 
   /// A pollable snapshot of a watched root's backend internals (design §4.9):

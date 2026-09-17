@@ -8,6 +8,57 @@ All notable changes to this workspace are documented here. The format is based o
 
 ### Added
 
+- **`tributaries`** — **root-coverage TRANSITIONS** on the umbrella's event vocabulary:
+  `EventKind::CoverageLost` and `EventKind::CoverageRegained`, delivered at the
+  subscription's own key.
+
+  A watcher that cannot currently establish that a root still exists stands its covering
+  `Rescan` once per liveness interval, for as long as that lasts — a reminder stream a
+  consumer would have to coalesce, and one it could not tell apart from the ordinary
+  losses mixed into it. The umbrella reports it as a STATE at its EDGES instead: ONE
+  `CoverageLost` when the root's coverage stops being provable, silence for as long as it
+  stays that way, and ONE `CoverageRegained` followed by exactly ONE covering `Rescan`
+  when it is provable again — the one re-enumeration that closes the whole window. A root
+  that loses coverage again after regaining it reports a second `CoverageLost`. Neither is
+  a terminal error for the root: it is still watched, a change it does see is still
+  delivered, and a root that genuinely dies is still retired with its own dominating
+  `Rescan`. A `Rescan` naming ground BELOW the root is a different loss and is delivered
+  while an episode is open, exactly as before.
+
+  The state comes from the seam: `Source::coverage(handle) -> Coverage`
+  (`Proven` / `Unproven`), a synchronous read the owner takes on every event that arrives
+  for the root — so there is no clock to configure and no window in which the state has
+  moved but nothing has looked. It defaults to `Proven`, so a source that cannot lose
+  coverage is unchanged and delivers no transition at all; a source that CAN must put an
+  event on the root's stream at both edges (the covering `Rescan` it already stands is
+  one), which is what the owner reads the state on.
+
+- **`tributaries`** — **`Source::list(handle, globs)`**, the enumeration half of the
+  binding seam: a stream of each entry's located key — in the same component space events
+  are keyed in — paired with the `Metadata` (`EntryKind`, size, modification time) the
+  source read for it.
+
+  A consumer that reconciles its own picture of a tree against a change stream needs both
+  halves from the same layer. A walk it writes itself can only walk the local filesystem
+  (so a non-path key space has no enumerator at all), and it can disagree with the
+  subscription about which entries the per-root words admit and about how a path is
+  spelled. The listing applies the words the ARM applies — `prune` against root-relative
+  directory paths, `include` against a file's last segment — reports a symbolic link
+  without ever following it, and yields a per-key `ListError::Io` as an ITEM, so one
+  unreadable directory leaves the listing incomplete below that key and complete
+  everywhere else. The default answers one `ListError::Unsupported`, which a reconciling
+  consumer must be able to tell from a root that holds nothing. `FsSource`'s is a
+  breadth-first `read_dir` walk on the runtime's blocking pool.
+
+- **`tributary-fs`** — `Watcher::coverage(root) -> Option<Coverage>`, the same state for a
+  consumer of the direct fs stream, plus the covering `Rescan` the regaining probe now
+  stands. The per-refused-tick `Rescan` is unchanged on this face: it is the rate-bounded
+  report, and the transition is the fact underneath it.
+
+- **`tributary-proto`** — `Glob::is_match(path)`, the single-pattern twin of
+  `Globs::is_match` with the same NFC fold and the same "the empty path names the root and
+  matches nothing" rule. Matching ONE pattern no longer costs building a one-element set.
+
 - **`tributary-fs`**, **`tributary-proto`** — two per-ROOT **glob seats**, carried by a
   new `tributary_fs::RootOptions` and armed through `Watcher::watch_with(root, options)`.
   `Watcher::watch(root, interest)` stays, unchanged, as the shorthand for
