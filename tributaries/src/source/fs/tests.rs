@@ -2473,3 +2473,152 @@ mod the_invalid_uid_sentinel {
     );
   }
 }
+
+/// [`super::Walk::absorb`] must never match, yield, or descend an entry `read_dir` handed
+/// back whose name is not valid UTF-8: `prune`/`include` are TEXT patterns, and matching
+/// them against a LOSSY rendering would decide the entry on words the tree does not hold.
+/// The watch side makes the identical refusal (`tributary-fs`'s `on_enumerated` drops such
+/// an entry and marks the listing lossy); the walk instead says it out loud, once, as the
+/// directory's own incompleteness — while a genuine UTF-8 sibling the same `include`
+/// pattern admits stays admitted.
+///
+/// The entries are synthesized in memory rather than written to a real directory: a local
+/// filesystem that itself requires valid UTF-8 names (APFS) could never produce the entry
+/// `read_dir` is meant to hand back here, so exercising the refusal has to start one layer
+/// in, at what `read_dir` returns rather than at the syscall that would have to write it.
+///
+/// Unix-only because building a non-UTF-8 name needs the byte-oriented path namespace
+/// (`OsStrExt::from_bytes`), which does not exist on Windows.
+#[cfg(unix)]
+#[test]
+fn absorb_refuses_a_non_utf8_leaf_an_include_pattern_would_match_lossily() {
+  use std::{
+    ffi::{OsStr, OsString},
+    os::unix::ffi::OsStrExt,
+    path::PathBuf,
+    sync::Arc,
+  };
+
+  use crate::{EntryKind, Glob, ListError, Metadata, RootGlobs, event::path_components};
+
+  let dir = PathBuf::from("/root");
+  let bad_leaf = OsStr::from_bytes(b"a\xff.txt");
+  let entries = vec![
+    (dir.join("kept.txt"), Metadata::new(EntryKind::File, 1)),
+    (dir.join(bad_leaf), Metadata::new(EntryKind::File, 1)),
+  ];
+
+  let globs = RootGlobs::new().with_include([Glob::new("*.txt").expect("a pattern")]);
+  let mut walk = super::Walk {
+    blocking: Arc::new(|_| unreachable!("absorb never touches the blocking spawner")),
+    prune: globs.prune().to_vec(),
+    include: globs.include().map(<[Glob]>::to_vec),
+    queue: Default::default(),
+    ready: Default::default(),
+  };
+
+  walk.absorb(&dir, "", entries);
+
+  assert!(
+    walk.queue.is_empty(),
+    "no directory was read here; nothing is descendable"
+  );
+  assert_eq!(
+    walk.ready.len(),
+    2,
+    "the UTF-8 sibling and the one refusal, nothing else: {:?}",
+    walk.ready
+  );
+
+  let kept_admitted = walk
+    .ready
+    .iter()
+    .any(|item| matches!(item, Ok((key, _)) if key.last() == Some(&OsString::from("kept.txt"))));
+  assert!(
+    kept_admitted,
+    "the UTF-8 sibling is still admitted: {:?}",
+    walk.ready
+  );
+
+  let refusals: Vec<_> = walk
+    .ready
+    .iter()
+    .filter_map(|item| match item {
+      Err(ListError::Io { key, source }) => Some((key, source)),
+      _ => None,
+    })
+    .collect();
+  assert_eq!(
+    refusals.len(),
+    1,
+    "exactly one `Io` refusal for the unrepresentable leaf: {:?}",
+    walk.ready
+  );
+  let (key, source) = refusals[0];
+  assert_eq!(
+    key,
+    &path_components(&dir),
+    "the refusal's key is the directory being listed, not the unrepresentable entry"
+  );
+  assert_eq!(
+    source.kind(),
+    std::io::ErrorKind::InvalidData,
+    "the refusal is InvalidData, not a real read failure: {source}"
+  );
+}
+
+/// The directory half of the same refusal: a name that is not valid UTF-8 is refused
+/// before `prune` is ever consulted, so a `prune` pattern that would NOT have matched the
+/// entry's lossy rendering makes no difference — the entry is still neither descended nor
+/// yielded, and its child never reaches the listing at all.
+#[cfg(unix)]
+#[test]
+fn absorb_refuses_a_non_utf8_directory_a_prune_pattern_would_not_match_lossily() {
+  use std::{ffi::OsStr, os::unix::ffi::OsStrExt, path::PathBuf, sync::Arc};
+
+  use crate::{EntryKind, Glob, ListError, Metadata, RootGlobs, event::path_components};
+
+  let dir = PathBuf::from("/root");
+  let bad_dir = OsStr::from_bytes(b"n\xffdir");
+  let entries = vec![(dir.join(bad_dir), Metadata::new(EntryKind::Dir, 0))];
+
+  // `skip` cannot match `n\xFFdir`'s lossy rendering under any glob semantics, so this
+  // entry is refused for being unnameable, never for being pruned.
+  let globs = RootGlobs::new().with_prune([Glob::new("skip").expect("a pattern")]);
+  let mut walk = super::Walk {
+    blocking: Arc::new(|_| unreachable!("absorb never touches the blocking spawner")),
+    prune: globs.prune().to_vec(),
+    include: globs.include().map(<[Glob]>::to_vec),
+    queue: Default::default(),
+    ready: Default::default(),
+  };
+
+  walk.absorb(&dir, "", entries);
+
+  assert!(
+    walk.queue.is_empty(),
+    "the unnameable directory is never descended, so its child can never surface: {:?}",
+    walk.queue
+  );
+  assert_eq!(
+    walk.ready.len(),
+    1,
+    "exactly one item: the refusal, and nothing admitted: {:?}",
+    walk.ready
+  );
+  match &walk.ready[0] {
+    Err(ListError::Io { key, source }) => {
+      assert_eq!(
+        key,
+        &path_components(&dir),
+        "the refusal's key is the directory being listed"
+      );
+      assert_eq!(
+        source.kind(),
+        std::io::ErrorKind::InvalidData,
+        "the refusal is InvalidData, not a real read failure: {source}"
+      );
+    }
+    other => panic!("expected a single `Io` refusal, got {other:?}"),
+  }
+}

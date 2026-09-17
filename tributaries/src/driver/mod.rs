@@ -779,7 +779,10 @@ impl<C, V, R, H> Tributaries<C, V, R, H> {
   /// listing starts at `key` and covers that subtree. It runs under the words THAT ROOT
   /// WAS ARMED WITH — never words supplied here — because every subscription a root
   /// serves carries those same words, so a listing under any others would report
-  /// entries the stream will never mention.
+  /// entries the stream will never mention. A listing is served for ARMED roots only —
+  /// there is no enumeration without a covering watch — so a consumer that wants the
+  /// tree without deliveries arms the root with [`Interest::none()`](Interest::none)
+  /// and lists under it.
   ///
   /// # Errors
   ///

@@ -357,7 +357,7 @@ impl Walk {
       }
       let (dir, at) = self.queue.pop_front()?;
       match self.read_dir(dir.clone()).await {
-        Ok(entries) => self.absorb(&at, entries),
+        Ok(entries) => self.absorb(&dir, &at, entries),
         // One unreadable directory is an ITEM: the listing is incomplete below this key
         // and complete everywhere else, and only the key says which half the consumer
         // got.
@@ -371,14 +371,33 @@ impl Walk {
 
   /// Files one directory's entries: admitted ones onto [`ready`](Self::ready),
   /// descendable ones onto [`queue`](Self::queue).
-  fn absorb(&mut self, at: &str, entries: Vec<(PathBuf, Metadata)>) {
+  ///
+  /// `dir` is the directory just read — the ground an entry this loop cannot even NAME
+  /// is reported under, exactly as a directory this loop cannot READ is reported under
+  /// its own key in [`step`](Self::step).
+  fn absorb(&mut self, dir: &Path, at: &str, entries: Vec<(PathBuf, Metadata)>) {
     for (path, metadata) in entries {
       let Some(name) = path.file_name() else {
         continue;
       };
-      let name = name.to_string_lossy();
+      // A name that is not valid UTF-8 cannot be matched, yielded, or descended
+      // honestly: `prune`/`include` are text patterns, and matching them against a
+      // LOSSY rendering would admit, prune, or descend the entry on words the tree
+      // does not hold. The watch side makes the same refusal (`tributary-fs`'s
+      // `on_enumerated` drops the entry and marks the listing lossy); a listing says
+      // it out loud instead, as the one item this entry can honestly be.
+      let Some(name) = name.to_str() else {
+        self.ready.push_back(Err(ListError::Io {
+          key: path_components(dir),
+          source: std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the entry's name is not UTF-8, so neither the listing nor the watch can name it",
+          ),
+        }));
+        continue;
+      };
       let relative = if at.is_empty() {
-        name.into_owned()
+        name.to_owned()
       } else {
         std::format!("{at}/{name}")
       };
@@ -393,11 +412,7 @@ impl Walk {
       } else if let Some(include) = self.include.as_ref() {
         // THE INCLUDE WORDS, likewise: they narrow FILES by their last segment and
         // never a directory — the rule the delivery seat applies to a change.
-        let leaf = path
-          .file_name()
-          .map(|leaf| leaf.to_string_lossy().into_owned())
-          .unwrap_or_default();
-        if !include.iter().any(|glob| glob.is_match(&leaf)) {
+        if !include.iter().any(|glob| glob.is_match(name)) {
           continue;
         }
       }
