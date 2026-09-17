@@ -63,6 +63,26 @@ pub enum EventKind<C> {
   /// Delivered with an epoch that strictly dominates every prior delivery to its
   /// subscription; bypasses coverage, interest, filter, and coalescing.
   Rescan,
+  /// Nothing is establishing that the watched root behind this subscription
+  /// still exists: from here on the stream is not a statement about the
+  /// subscription's tree, and re-enumerating it is the consumer's own to
+  /// schedule.
+  ///
+  /// Delivered ONCE per episode, at the subscription's own key — never a
+  /// repeated reminder and never a terminal error for the root (the root is
+  /// still watched, and a delta it does see is still delivered). The matching
+  /// [`CoverageRegained`](Self::CoverageRegained) closes the episode; a root
+  /// that loses coverage again after regaining it reports a second
+  /// `CoverageLost`.
+  CoverageLost,
+  /// The watched root's coverage is being established again, closing the
+  /// episode a [`CoverageLost`](Self::CoverageLost) opened.
+  ///
+  /// Followed immediately by exactly ONE [`Rescan`](Self::Rescan) at the same
+  /// key: whatever happened while coverage was unproven is covered by
+  /// re-enumerating it once, which is why nothing was reported per interval
+  /// while it lasted.
+  CoverageRegained,
 }
 
 impl<C> EventKind<C> {
@@ -75,6 +95,8 @@ impl<C> EventKind<C> {
       Self::Removed => "removed",
       Self::Moved { .. } => "moved",
       Self::Rescan => "rescan",
+      Self::CoverageLost => "coverage_lost",
+      Self::CoverageRegained => "coverage_regained",
     }
   }
 
@@ -106,6 +128,32 @@ impl<C> EventKind<C> {
   #[inline]
   pub const fn is_rescan(&self) -> bool {
     matches!(self, Self::Rescan)
+  }
+
+  /// Whether this is [`CoverageLost`](Self::CoverageLost).
+  #[inline]
+  pub const fn is_coverage_lost(&self) -> bool {
+    matches!(self, Self::CoverageLost)
+  }
+
+  /// Whether this is [`CoverageRegained`](Self::CoverageRegained).
+  #[inline]
+  pub const fn is_coverage_regained(&self) -> bool {
+    matches!(self, Self::CoverageRegained)
+  }
+
+  /// Whether this is one of the two root-coverage TRANSITIONS
+  /// ([`CoverageLost`](Self::CoverageLost) /
+  /// [`CoverageRegained`](Self::CoverageRegained)) rather than a change at the
+  /// event's key.
+  ///
+  /// A transition names no object: it reports what the watch behind the
+  /// subscription can currently establish about its root. A consumer that
+  /// applies deltas to an index tests this first and treats the two as state,
+  /// not as content.
+  #[inline]
+  pub const fn is_coverage_transition(&self) -> bool {
+    matches!(self, Self::CoverageLost | Self::CoverageRegained)
   }
 
   /// The move's source key, iff this is [`Moved`](Self::Moved) — the second endpoint
@@ -522,6 +570,15 @@ impl<C, V> Event<C, V> {
     self.kind.is_rescan()
   }
 
+  /// Whether this is one of the two root-coverage transitions
+  /// ([`is_coverage_transition`](EventKind::is_coverage_transition)) — a statement about
+  /// what the watch behind this subscription can establish, rather than a change at its
+  /// key.
+  #[inline]
+  pub fn is_coverage_transition(&self) -> bool {
+    self.kind.is_coverage_transition()
+  }
+
   /// Whether this event bears on `key` — true iff `key` is one of the event's
   /// **affected endpoints**, or the event obliges re-enumeration of `key`:
   ///
@@ -530,8 +587,11 @@ impl<C, V> Event<C, V> {
   ///   ([`move_from`](Self::move_from)) is `key` — a rename has two affected endpoints
   ///   and the object left that one, which is a fact about `key` as much as the arrival
   ///   is a fact about the destination;
-  /// - it is a [`Rescan`](EventKind::Rescan) at `key` or an ancestor of it (a rescan
-  ///   obliges re-enumeration of everything below its key).
+  /// - it is a [`Rescan`](EventKind::Rescan), or a root-coverage transition
+  ///   ([`CoverageLost`](EventKind::CoverageLost) /
+  ///   [`CoverageRegained`](EventKind::CoverageRegained)), at `key` or an ancestor of it
+  ///   — a rescan obliges re-enumeration of everything below its key, and a transition
+  ///   is a statement about the whole subtree below its own.
   ///
   /// The dispatch idiom every re-enumeration-class consumer needs: a consumer tracking
   /// one object asks `reaches(that_object)` and re-reads it whenever the answer is true.
@@ -551,7 +611,8 @@ impl<C, V> Event<C, V> {
   {
     self.key() == key
       || self.move_from() == Some(key)
-      || (self.kind().is_rescan() && key.starts_with(self.key()))
+      || ((self.kind().is_rescan() || self.kind().is_coverage_transition())
+        && key.starts_with(self.key()))
   }
 
   /// The move's source key, if this is a whole [`Moved`](EventKind::Moved) delivery —

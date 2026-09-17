@@ -891,3 +891,78 @@ impl SourceCloseError {
     matches!(self, Self::NotQuiesced { .. })
   }
 }
+
+/// Why a [`Source::list`](crate::Source::list) could not report an entry — the
+/// failure half of one listing's items.
+///
+/// A listing is a WALK, so a failure is usually about one piece of ground rather
+/// than about the whole call: [`Io`](Self::Io) names the key it could not read and
+/// the walk goes on with the rest. The other two end it, and both are about the
+/// call rather than the tree.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ListError<C> {
+  /// The handle names no live root of this source (never armed, already released,
+  /// or another instance's), so there is nothing to enumerate.
+  UnknownRoot,
+  /// This source cannot enumerate a root's contents at all — the answer of every
+  /// backend that has not implemented [`list`](crate::Source::list).
+  ///
+  /// Said out loud, as one item, and never mistaken for an empty root: a consumer
+  /// reconciling a tree against a listing must be able to tell "this root holds
+  /// nothing" from "this backend cannot tell you what this root holds", because
+  /// the first is a instruction to delete everything it remembers.
+  Unsupported,
+  /// One piece of ground under the root could not be read. The walk continues past
+  /// it, so the listing is INCOMPLETE below `key` and complete elsewhere.
+  Io {
+    /// The key whose read failed — the directory the walk could not open or whose
+    /// entries it could not stat.
+    key: std::vec::Vec<C>,
+    /// What the read reported.
+    source: std::io::Error,
+  },
+}
+
+impl<C> ListError<C> {
+  /// Whether this is [`UnknownRoot`](Self::UnknownRoot).
+  #[inline]
+  pub const fn is_unknown_root(&self) -> bool {
+    matches!(self, Self::UnknownRoot)
+  }
+
+  /// Whether this is [`Unsupported`](Self::Unsupported).
+  #[inline]
+  pub const fn is_unsupported(&self) -> bool {
+    matches!(self, Self::Unsupported)
+  }
+
+  /// The key of the ground a read failed on, iff this is [`Io`](Self::Io).
+  #[inline]
+  pub fn key(&self) -> Option<&[C]> {
+    match self {
+      Self::Io { key, .. } => Some(key),
+      _ => None,
+    }
+  }
+}
+
+impl<C> core::fmt::Display for ListError<C> {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    match self {
+      Self::UnknownRoot => f.write_str("the handle names no live root of this source"),
+      Self::Unsupported => f.write_str("this source cannot enumerate a root's contents"),
+      Self::Io { source, .. } => write!(f, "a listed key could not be read: {source}"),
+    }
+  }
+}
+
+impl<C: core::fmt::Debug> Error for ListError<C> {
+  #[inline]
+  fn source(&self) -> Option<&(dyn Error + 'static)> {
+    match self {
+      Self::Io { source, .. } => Some(source),
+      _ => None,
+    }
+  }
+}

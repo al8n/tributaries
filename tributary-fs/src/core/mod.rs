@@ -218,6 +218,23 @@ pub(crate) enum Effect {
     /// The absolute path to stat.
     path: PathBuf,
   },
+  /// Publish one scope's root-coverage state to the watcher-side registry, so
+  /// [`Watcher::coverage`](crate::Watcher::coverage) answers what the core
+  /// holds.
+  ///
+  /// Emitted only on a CHANGE of the state and only for a publicly live scope,
+  /// so a root whose coverage is never in doubt costs nothing. The publish is
+  /// fire-and-forget: the registry is the driver task's own single-writer
+  /// table, and a scope whose entry is already reclaimed simply has nothing to
+  /// write.
+  Coverage {
+    /// The scope whose root-coverage state changed.
+    scope: ScopeId,
+    /// `true` once the root's liveness is unproven (its periodic probe was
+    /// refused at the watcher's budget), `false` once a probe completes and
+    /// finds the root alive.
+    unproven: bool,
+  },
   /// Deliver one change to the consumer, reporting the delivery outcome back
   /// through [`on_delivery`](DriverCore::on_delivery).
   Emit {
@@ -1734,6 +1751,26 @@ struct ScopeState {
   /// still queued is not doubled — the tick that finds this latch set stands no
   /// second instruction, and records only the window it could not prove.
   budget_report_owed: bool,
+  /// Whether this scope's root coverage is currently UNPROVEN — the state
+  /// behind the coverage transitions a consumer reads through
+  /// [`Watcher::coverage`](crate::Watcher::coverage).
+  ///
+  /// It is the EPISODE as a state, where
+  /// [`budget_recovered`](Self::budget_recovered) and
+  /// [`budget_report_owed`](Self::budget_report_owed) are its two per-tick
+  /// obligations: set on the first liveness tick refused
+  /// [`BudgetFull`](DeclineReason::BudgetFull) after the scope is publicly
+  /// live, cleared by the first refresh that COMPLETES and finds the root
+  /// alive. Each edge publishes an [`Effect::Coverage`] so the watcher-side
+  /// registry answers the same fact the core holds, and the clearing edge
+  /// stands one covering `Rescan` besides — the event a consumer polling this
+  /// state needs in order to learn that the episode ended at all (nothing else
+  /// about a resumed probe reaches the stream).
+  ///
+  /// Never set before the scope is publicly live: no caller holds a handle to
+  /// ask with, and the registry entry the publish would write does not exist
+  /// yet.
+  coverage_unproven: bool,
   lag: LagState,
   park: Park,
   /// The journal id counter wrapped; any minted resume token is invalid.
@@ -2576,6 +2613,7 @@ impl DriverCore {
         refresh_stale: false,
         budget_recovered: false,
         budget_report_owed: false,
+        coverage_unproven: false,
         lag: LagState::Normal,
         park: Park::default(),
         resume_poisoned: false,
@@ -5154,6 +5192,19 @@ impl DriverCore {
       DeclineReason::ScopeBusy => return,
       DeclineReason::BudgetFull => !std::mem::replace(&mut state.budget_recovered, true),
     };
+    // THE COVERAGE-LOST EDGE. The latches below bound the RATE of the covering
+    // instruction; this one is the STATE behind them, and it moves once per
+    // episode: from here until a probe completes, nothing is proving this
+    // root's liveness, and a consumer reading
+    // [`Watcher::coverage`](crate::Watcher::coverage) is told so rather than
+    // having to infer it from the cadence of the instructions.
+    if state.publicly_live && !state.coverage_unproven {
+      state.coverage_unproven = true;
+      self.effects.push_back(Effect::Coverage {
+        scope,
+        unproven: true,
+      });
+    }
     let report = !recover && state.publicly_live && !state.budget_report_owed;
     if state.publicly_live && (recover || report) {
       // An instruction is about to be minted, and it is owed until the consumer
@@ -5315,6 +5366,18 @@ impl DriverCore {
       self.drain_monitor();
       return;
     }
+    // THE COVERAGE-REGAINED EDGE, taken the moment a probe both ANSWERED and
+    // found the root alive — the death gate above owns the other outcome, and a
+    // root that is terminal regained nothing. Read before the stale gate
+    // returns: staleness governs what this snapshot may PUBLISH about the
+    // world, never what its completion proves about this root's liveness.
+    let regained = std::mem::replace(&mut state.coverage_unproven, false);
+    if regained {
+      self.effects.push_back(Effect::Coverage {
+        scope,
+        unproven: false,
+      });
+    }
     // Alive past the death gate. Deliberately NOT a barrier release edge: a
     // single-sample identity match proves the PATH still names the same
     // object, never that OUR watch is still its live binding (a same-identity
@@ -5335,6 +5398,9 @@ impl DriverCore {
     if state.refresh_stale {
       state.refresh_stale = false;
       Self::trust_lost(&mut self.effects, scope, state);
+      if regained {
+        self.stand_coverage_regained(scope);
+      }
       return;
     }
 
@@ -5407,6 +5473,29 @@ impl DriverCore {
       self.monitor.on_overflow(Scope::Root(scope), now);
       self.drain_monitor();
     }
+    if regained {
+      self.stand_coverage_regained(scope);
+    }
+  }
+
+  /// Stands the ONE covering [`Rescan`](ChangeKind::Rescan) a root owes the
+  /// stream when its liveness is proven again.
+  ///
+  /// The instruction is what makes the transition OBSERVABLE. A resumed probe
+  /// reaches the stream in no other way — the tick that completes emits
+  /// nothing, and the refused ticks that preceded it have stopped — so without
+  /// it a consumer that stopped trusting this root's coverage would have no
+  /// event on which to ask whether it may trust it again, and would keep
+  /// enumerating on its own forever.
+  ///
+  /// It carries the full loss flavour ([`Monitor::report_loss`], not a
+  /// domination): the window this root could not account for ends here, and
+  /// what closes it is a re-enumeration. `None` — an identical `Rescan` already
+  /// standing undelivered at this root — needs no retry: that twin is the
+  /// covering instruction, and it is itself the event the consumer will see.
+  fn stand_coverage_regained(&mut self, scope: ScopeId) {
+    let _ = self.monitor.report_loss(scope);
+    self.drain_monitor();
   }
 
   /// Feeds a dead-stream signal: the scope's coverage ended with no parent
@@ -7377,7 +7466,10 @@ impl DriverCore {
       | Effect::Enumerate { scope: s, .. }
       | Effect::Probe { scope: s, .. }
       | Effect::RefreshMounts { scope: s, .. } => *s != scope,
-      Effect::SpawnStream { .. } | Effect::TeardownStream { .. } | Effect::Emit { .. } => true,
+      Effect::SpawnStream { .. }
+      | Effect::TeardownStream { .. }
+      | Effect::Emit { .. }
+      | Effect::Coverage { .. } => true,
     });
   }
 
@@ -7420,7 +7512,10 @@ impl DriverCore {
             *stamp = incarnation;
           }
         }
-        Effect::SpawnStream { .. } | Effect::TeardownStream { .. } | Effect::Emit { .. } => {}
+        Effect::SpawnStream { .. }
+        | Effect::TeardownStream { .. }
+        | Effect::Emit { .. }
+        | Effect::Coverage { .. } => {}
       }
     }
   }

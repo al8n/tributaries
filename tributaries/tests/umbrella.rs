@@ -34,10 +34,12 @@ use std::{
 
 #[cfg(feature = "sync")]
 use futures_util::FutureExt;
+use futures_util::StreamExt;
 use tempfile::TempDir;
 use tributaries::{
-  Debounce, DebounceConfig, Event, Filter, Glob, Subscription, TokioTributaries,
-  TributariesOptions, WatchOptions, WatcherOptions,
+  Debounce, DebounceConfig, EntryKind, Event, Filter, FsSource, Glob, ListError, Metadata,
+  RootGlobs, Source, Subscription, TokioTributaries, TributariesOptions, WatchOptions,
+  WatcherOptions,
 };
 
 /// The concrete delivered-event type of the local-fs driver (`C = OsString`, `V = ()`).
@@ -1113,4 +1115,196 @@ async fn include_silences_a_non_matching_file_but_never_a_directory() {
   }
 
   w.close().await.expect("close");
+}
+
+/// [`Source::list`] over a real tree: the entries the root's own words admit, with their
+/// metadata — and the SAME key spelling the watch later reports for them.
+///
+/// The spelling is the half that cannot be checked by reading the code. A consumer
+/// reconciles an enumeration against a change stream by KEY, so a listing that spelled a
+/// path even slightly differently from the watch (a canonicalized root, a normalization,
+/// a separator) would reconcile two pictures that never meet — which is exactly what a
+/// consumer writing its own `read_dir` walk beside the subscription risks, and what
+/// enumerating through the same source removes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_reports_the_admitted_entries_and_the_watchs_own_spelling() {
+  let dir = TempDir::new().expect("a temp dir");
+  let root = dir.path().to_path_buf();
+  std::fs::write(root.join("kept.txt"), b"a").expect("write");
+  std::fs::write(root.join("dropped.log"), b"b").expect("write");
+  std::fs::create_dir(root.join("sub")).expect("mkdir");
+  std::fs::write(root.join("sub").join("deep.txt"), b"c").expect("write");
+  std::fs::create_dir(root.join("cache")).expect("mkdir");
+  std::fs::write(root.join("cache").join("nope.txt"), b"d").expect("write");
+
+  let globs = RootGlobs::new()
+    .with_prune([Glob::new("cache").expect("a pattern")])
+    .with_include([Glob::new("*.txt").expect("a pattern")]);
+
+  let mut source: FsSource<agnostic_lite::tokio::TokioRuntime> =
+    FsSource::new(WatcherOptions::new()).expect("the watcher builds");
+  let key: Vec<OsString> = root
+    .components()
+    .map(|c| c.as_os_str().to_owned())
+    .collect();
+  let armed = Source::arm(&mut source, &key, &globs)
+    .await
+    .expect("the root arms");
+  let handle = armed.handle();
+  let root_key = armed.canonical_key().to_vec();
+
+  let listed: Vec<(Vec<OsString>, Metadata)> = Source::list(&source, handle, &globs)
+    .collect::<Vec<_>>()
+    .await
+    .into_iter()
+    .map(|item| item.expect("every entry of a readable tree is reported"))
+    .collect();
+
+  let named = |name: &str| -> Option<&(Vec<OsString>, Metadata)> {
+    listed
+      .iter()
+      .find(|(key, _)| key.last().map(|leaf| leaf.as_os_str()) == Some(name.as_ref()))
+  };
+  assert!(
+    named("kept.txt").is_some_and(|(_, meta)| meta.kind() == EntryKind::File && meta.len() == 1),
+    "an admitted file is reported with what was read for it: {listed:?}"
+  );
+  assert!(
+    named("deep.txt").is_some(),
+    "and so is one the walk had to descend for: {listed:?}"
+  );
+  assert!(
+    named("sub").is_some_and(|(_, meta)| meta.is_dir()),
+    "the directory it descended is an entry of its own: {listed:?}"
+  );
+  assert!(
+    named("dropped.log").is_none(),
+    "the include words narrow files by their last segment, exactly as delivery does: {listed:?}"
+  );
+  assert!(
+    named("cache").is_none() && named("nope.txt").is_none(),
+    "and a pruned subtree is absent entirely — root and all, as the watch never enters it: {listed:?}"
+  );
+
+  // THE SPELLING. Touch the listed file and read the key the watch reports for it.
+  let listed_key = named("deep.txt").expect("staging").0.clone();
+  assert!(
+    listed_key.starts_with(&root_key),
+    "a listed key is located under the key the arm committed: {listed_key:?}"
+  );
+  std::fs::write(root.join("sub").join("deep.txt"), b"touched").expect("write");
+  let delivered = tokio::time::timeout(Duration::from_secs(10), async {
+    loop {
+      let event = Source::next(&mut source)
+        .await
+        .expect("the source is still live");
+      if event.key().last() == listed_key.last() {
+        return event.key().to_vec();
+      }
+    }
+  })
+  .await
+  .expect("the change arrives");
+  assert_eq!(
+    delivered, listed_key,
+    "the enumeration and the subscription spell the same object the same way"
+  );
+}
+
+/// The ENUMERATION DOOR: a consumer that never holds the source lists through the
+/// umbrella handle and gets exactly what the source's own `list` gives — and a key no
+/// armed root covers is told so rather than answered with an empty tree.
+///
+/// This is the half that makes the listing usable at all. `Tributaries` takes the
+/// `Source` by value into its owner task, so a consumer holding only the handle had no
+/// way to reach `Source::list` and was back to writing its own walk — the walk that can
+/// disagree with the subscription about the root's words and about how a key is spelled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_umbrella_door_lists_what_the_source_lists() {
+  let (_dir, root) = scratch("umbrella-list");
+  std::fs::write(root.join("kept.txt"), b"a").expect("write");
+  std::fs::write(root.join("dropped.log"), b"b").expect("write");
+  std::fs::create_dir(root.join("sub")).expect("mkdir");
+  std::fs::write(root.join("sub").join("deep.txt"), b"c").expect("write");
+  std::fs::create_dir(root.join("cache")).expect("mkdir");
+  std::fs::write(root.join("cache").join("nope.txt"), b"d").expect("write");
+
+  let globs = RootGlobs::new()
+    .with_prune([Glob::new("cache").expect("a pattern")])
+    .with_include([Glob::new("*.txt").expect("a pattern")]);
+
+  // The umbrella: the source is built inside it and is unreachable from here on.
+  let watcher = watcher(TributariesOptions::new());
+  let root_key = key(&root);
+  watcher
+    .watch(
+      root_key.clone(),
+      (),
+      WatchOptions::new()
+        .with_prune([Glob::new("cache").expect("a pattern")])
+        .with_include([Glob::new("*.txt").expect("a pattern")]),
+    )
+    .await
+    .expect("the root arms");
+
+  let mut through_door: Vec<Vec<OsString>> = collect_keys(watcher.list(&root_key)).await;
+  through_door.sort();
+
+  // The same tree, the same words, listed by a source this test DOES hold — the oracle.
+  let mut direct: FsSource<agnostic_lite::tokio::TokioRuntime> =
+    FsSource::new(WatcherOptions::new()).expect("the watcher builds");
+  let armed = Source::arm(&mut direct, &root_key, &globs)
+    .await
+    .expect("the oracle root arms");
+  let mut by_source: Vec<Vec<OsString>> =
+    collect_keys(Source::list(&direct, armed.handle(), &globs)).await;
+  by_source.sort();
+
+  assert_eq!(
+    through_door, by_source,
+    "the door and the source answer the same entries"
+  );
+  assert!(
+    through_door
+      .iter()
+      .any(|k| k.last().is_some_and(|leaf| leaf == "deep.txt")),
+    "staging: the tree really was walked: {through_door:?}"
+  );
+  assert!(
+    !through_door.iter().any(|k| k
+      .last()
+      .is_some_and(|leaf| leaf == "nope.txt" || leaf == "dropped.log")),
+    "and the root's own words narrowed it: {through_door:?}"
+  );
+
+  // A key NO armed root covers: the door says so, rather than reporting an empty tree —
+  // the two are opposite instructions to a consumer reconciling against the answer.
+  let (_other, elsewhere) = scratch("umbrella-list-unwatched");
+  let refused: Vec<tributaries::ListItem<OsString>> =
+    watcher.list(&key(&elsewhere)).collect::<Vec<_>>().await;
+  assert!(
+    refused.len() == 1
+      && refused[0]
+        .as_ref()
+        .err()
+        .is_some_and(ListError::is_unknown_root),
+    "an unwatched key is UnknownRoot, once: {refused:?}"
+  );
+
+  watcher.close().await.expect("the owner closes");
+}
+
+/// Collects the located keys a listing yielded, in order, panicking on any failure item.
+///
+/// Generic over the stream so it takes BOTH doors: the umbrella's boxed `'static` one and
+/// the trait method's, which borrows the source it was asked of.
+async fn collect_keys(
+  listing: impl futures_util::Stream<Item = tributaries::ListItem<OsString>>,
+) -> Vec<Vec<OsString>> {
+  listing
+    .collect::<Vec<_>>()
+    .await
+    .into_iter()
+    .map(|item| item.expect("every entry of a readable tree is reported").0)
+    .collect()
 }

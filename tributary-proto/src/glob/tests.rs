@@ -548,6 +548,65 @@ mod serde_face {
 
 /// The `clap` face rides `FromStr`, which is what makes a `Vec<Glob>` field a
 /// repeatable flag.
+
+/// ONE pattern answers exactly what a set holding only it answers — over a table that
+/// covers every rule the two share: the leaf wildcard, the `**` descent, the alternation,
+/// the NFC fold, and the empty candidate no pattern may ever match.
+///
+/// They must agree because they are the same question asked at two grains. A caller
+/// matching one word builds no set for it (that compiles a union automaton and allocates
+/// the set's storage for a single pattern), and the moment the two answers can differ,
+/// which grain a caller happened to reach for becomes a behaviour.
+#[test]
+fn one_pattern_agrees_with_a_set_holding_only_it() {
+  // (pattern, candidate, expected)
+  let table: &[(&str, &str, bool)] = &[
+    ("*.txt", "a.txt", true),
+    ("*.txt", "a.log", false),
+    // A leaf pattern is a leaf pattern at either grain: it does not cross a separator.
+    ("*.txt", "sub/a.txt", false),
+    ("**/*.txt", "sub/a.txt", true),
+    ("**/*.txt", "a.txt", true),
+    ("cache", "cache", true),
+    ("cache", "cache/inner", false),
+    ("cache/**", "cache/inner", true),
+    ("*.{mp4,mov}", "clip.mov", true),
+    ("*.{mp4,mov}", "clip.mkv", false),
+    // The NFC fold, on the one candidate whose two spellings are the same name.
+    ("caf\u{e9}.txt", "cafe\u{301}.txt", true),
+    ("caf\u{e9}.txt", "caf\u{e9}.txt", true),
+    // The root itself is named by no pattern, at either grain.
+    ("*", "", false),
+    ("**", "", false),
+  ];
+  for (pattern, candidate, expected) in table {
+    let one = glob(pattern);
+    let set = globs(&[pattern]);
+    assert_eq!(
+      one.is_match(candidate),
+      *expected,
+      "`{pattern}` against `{candidate}`"
+    );
+    assert_eq!(
+      one.is_match(candidate),
+      set.is_match(candidate),
+      "the two grains disagree on `{pattern}` against `{candidate}`"
+    );
+  }
+}
+
+/// And a pattern the set does NOT hold answers for itself: the set's answer is the
+/// union's, the pattern's is its own, so a caller walking patterns one at a time can tell
+/// WHICH word matched without asking the set to name it.
+#[test]
+fn a_pattern_answers_for_itself_inside_a_wider_set() {
+  let set = globs(&["*.txt", "*.log"]);
+  assert!(set.is_match("a.log"));
+  assert!(!glob("*.txt").is_match("a.log"));
+  assert!(glob("*.log").is_match("a.log"));
+  assert_eq!(set.matched("a.log").map(Glob::as_str), Some("*.log"));
+}
+
 #[cfg(feature = "clap")]
 mod clap_face {
   use super::*;

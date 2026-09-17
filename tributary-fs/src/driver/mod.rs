@@ -7093,6 +7093,18 @@ pub(crate) trait ScopeRegistry: Send + Sync + 'static {
   /// reclaimed.
   fn scope_dead(&self, scope: ScopeId);
 
+  /// `scope`'s root coverage became unproven (its periodic liveness probe was
+  /// refused at the watcher's budget) or proven again — the fact
+  /// [`Watcher::coverage`](crate::Watcher::coverage) reads back.
+  ///
+  /// A REPORT, not an obligation: it records what the core already decided and
+  /// nothing downstream of the registry depends on it, so the default ignores
+  /// it. A registry that does answers `Proven` for every root, which is exactly
+  /// what a backend with no liveness tick of its own reports anyway.
+  fn scope_coverage(&self, scope: ScopeId, unproven: bool) {
+    let _ = (scope, unproven);
+  }
+
   /// The live or reserved root that overlaps `final_root`, ignoring the one
   /// reservation at `reserved` (the checking watch's own). The backend
   /// re-canonicalizes during spawn, so disjointness must hold for the FINAL
@@ -18349,6 +18361,7 @@ fn execute_effects<R, F>(
           });
         }
       }
+      Effect::Coverage { scope, unproven } => registry.scope_coverage(scope, unproven),
       Effect::Emit {
         scope,
         root,

@@ -129,6 +129,12 @@ tokio = { version = "1.30", features = ["macros", "rt-multi-thread", "time", "te
 name = "umbrella"
 required-features = ["fs", "tokio"]
 
+# The coverage-transition laws: an in-memory `Source` whose coverage state the cells
+# flip, so no `fs` binding and no kernel backend is involved — only a runtime.
+[[test]]
+name = "coverage"
+required-features = ["tokio"]
+
 # The custom-source proof: it binds its own `Source` over the `tributary-fs`
 # DEV-dependency, so it deliberately does NOT require `fs` — it must keep compiling
 # and running with the umbrella's fs feature off.
