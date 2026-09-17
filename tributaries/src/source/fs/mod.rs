@@ -28,7 +28,7 @@ use tributary_proto::Interest;
 use futures_util::Stream;
 use tributary_proto::glob::Glob;
 
-use super::{Armed, Coverage, EntryKind, Metadata, Source, SourceEvent};
+use super::{Armed, Coverage, EntryKind, ListItem, Metadata, Source, SourceEvent};
 #[cfg(feature = "sync")]
 use super::{Begun, SyncToken};
 #[cfg(feature = "sync")]
@@ -254,7 +254,7 @@ struct Walk {
   /// Directories read but not yet descended, oldest first.
   queue: VecDeque<Pending>,
   /// Entries read from the last directory and not yet yielded.
-  ready: VecDeque<Result<(Vec<OsString>, Metadata), ListError<OsString>>>,
+  ready: VecDeque<ListItem<OsString>>,
 }
 
 impl Walk {
@@ -277,9 +277,7 @@ impl Walk {
   }
 
   /// The next item, reading one more directory whenever the last one is exhausted.
-  async fn step(
-    mut self,
-  ) -> Option<(Result<(Vec<OsString>, Metadata), ListError<OsString>>, Self)> {
+  async fn step(mut self) -> Option<(ListItem<OsString>, Self)> {
     loop {
       if let Some(item) = self.ready.pop_front() {
         return Some((item, self));
@@ -989,11 +987,7 @@ impl<R> Source<OsString> for FsSource<R> {
       })
   }
 
-  fn list(
-    &self,
-    handle: RootHandle,
-    globs: &RootGlobs,
-  ) -> impl Stream<Item = Result<(Vec<OsString>, Metadata), ListError<OsString>>> {
+  fn list(&self, handle: RootHandle, globs: &RootGlobs) -> impl Stream<Item = ListItem<OsString>> {
     futures_util::stream::unfold(
       Walk::new(
         self.watcher.root_path(handle),

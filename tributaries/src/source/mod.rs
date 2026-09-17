@@ -814,11 +814,7 @@ pub trait LocalSource<C> {
   /// this crate needs one, and requiring it would put a `C: Send` bound on a seam whose
   /// other items have none. A concrete source's stream is `Send` when its own captures
   /// are (`FsSource`'s is).
-  fn list(
-    &self,
-    handle: Self::Handle,
-    globs: &RootGlobs,
-  ) -> impl Stream<Item = Result<(Vec<C>, Metadata), ListError<C>>> {
+  fn list(&self, handle: Self::Handle, globs: &RootGlobs) -> impl Stream<Item = ListItem<C>> {
     let _ = (handle, globs);
     futures_util::stream::once(core::future::ready(Err(ListError::Unsupported)))
   }
@@ -1286,11 +1282,7 @@ pub trait Source<C> {
   /// this crate needs one, and requiring it would put a `C: Send` bound on a seam whose
   /// other items have none. A concrete source's stream is `Send` when its own captures
   /// are (`FsSource`'s is).
-  fn list(
-    &self,
-    handle: Self::Handle,
-    globs: &RootGlobs,
-  ) -> impl Stream<Item = Result<(Vec<C>, Metadata), ListError<C>>> {
+  fn list(&self, handle: Self::Handle, globs: &RootGlobs) -> impl Stream<Item = ListItem<C>> {
     let _ = (handle, globs);
     futures_util::stream::once(core::future::ready(Err(ListError::Unsupported)))
   }
@@ -1395,11 +1387,7 @@ impl<C, T: Source<C>> LocalSource<C> for T {
     <T as Source<C>>::coverage(self, handle)
   }
 
-  fn list(
-    &self,
-    handle: Self::Handle,
-    globs: &RootGlobs,
-  ) -> impl Stream<Item = Result<(Vec<C>, Metadata), ListError<C>>> {
+  fn list(&self, handle: Self::Handle, globs: &RootGlobs) -> impl Stream<Item = ListItem<C>> {
     <T as Source<C>>::list(self, handle, globs)
   }
 
@@ -1443,6 +1431,11 @@ impl<C, T: Source<C>> LocalSource<C> for T {
     <T as Source<C>>::is_sync_artifact(self, key)
   }
 }
+
+/// One item of a [`Source::list`] stream: an entry's located key paired with the
+/// [`Metadata`] read for it, or the failure the walk met — at ONE key, where the failure
+/// is an [`Io`](crate::ListError::Io).
+pub type ListItem<C> = Result<(Vec<C>, Metadata), ListError<C>>;
 
 /// One entry's facts, as [`Source::list`] reports them: what the object IS, how big
 /// it is, and when it last changed.

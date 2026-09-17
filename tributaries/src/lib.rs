@@ -29,7 +29,9 @@ pub use interest::Interest;
 pub use options::{
   Debounce, DebounceConfig, OptionsError, RootGlobs, TributariesOptions, WatchOptions,
 };
-pub use source::{Armed, Coverage, EntryKind, LocalSource, Metadata, Source, SourceEvent};
+pub use source::{
+  Armed, Coverage, EntryKind, ListItem, LocalSource, Metadata, Source, SourceEvent,
+};
 
 /// The stream trait [`Source::list`] returns, re-exported so an implementor can
 /// name it without taking its own `futures` dependency — and so the one this crate
