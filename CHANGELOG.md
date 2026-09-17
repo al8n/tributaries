@@ -50,6 +50,20 @@ All notable changes to this workspace are documented here. The format is based o
   consumer must be able to tell from a root that holds nothing. `FsSource`'s is a
   breadth-first `read_dir` walk on the runtime's blocking pool.
 
+- **`tributaries`** — **`Tributaries::list(key)`**, the same enumeration through the
+  umbrella HANDLE, for the consumer that never holds the source: the owner takes it by
+  value, so `Source::list` was reachable only to whoever built the source. The door
+  resolves the armed root covering `key` from the last committed watch-set, starts the
+  walk there, and runs it under the words that root was ARMED with — never words supplied
+  at the call, because every subscription a root serves carries those same words, so a
+  listing under any others would report entries the stream will never mention. A key no
+  armed root covers answers `ListError::UnknownRoot`, which is the opposite instruction to
+  an empty tree. A source opts in with `Source::lister() -> Option<Arc<dyn RootLister>>`,
+  taken once at assembly while the source is still in hand; the default is `None`, which
+  the door reports as `ListError::Unsupported`. `FsSource`'s lister shares the watcher's
+  root registry (`tributary_fs::RootView`) and its blocking pool rather than the source,
+  and both doors run the ONE walk.
+
 - **`tributary-fs`** — `Watcher::coverage(root) -> Option<Coverage>`, the same state for a
   consumer of the direct fs stream, plus the covering `Rescan` the regaining probe now
   stands. The per-refused-tick `Rescan` is unchanged on this face: it is the rate-bounded

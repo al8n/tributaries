@@ -17,7 +17,7 @@
 
 use core::ops::Deref;
 
-use crate::subsume::Shared;
+use crate::{options::RootGlobs, subsume::Shared};
 
 #[cfg(test)]
 mod tests;
@@ -113,6 +113,26 @@ where
   #[must_use]
   pub fn is_watched(&self, key: &[C]) -> bool {
     self.shared.load().covers.get_ancestor(key).is_some()
+  }
+
+  /// The ARMED ROOT covering `key` — its handle and the words it was armed with — or
+  /// `None` when no armed root does.
+  ///
+  /// The root plane, not the live-subscription plane: it answers what actually backs
+  /// `key` in the source, which is what an enumeration has to run against. Crate-internal
+  /// because the handle is the source's capability and the umbrella's own door
+  /// ([`Tributaries::list`](crate::Tributaries::list)) is what a consumer needs it for.
+  #[inline]
+  pub(crate) fn root_covering(&self, key: &[C]) -> Option<(H, RootGlobs)>
+  where
+    H: Copy,
+  {
+    self
+      .shared
+      .load()
+      .roots
+      .get_ancestor(key)
+      .map(|root| (root.handle, root.globs.clone()))
   }
 
   /// Whether `key` is watched by an **exact armed root** (not merely covered by an

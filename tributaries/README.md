@@ -165,6 +165,27 @@ file's last segment — reports symbolic links without ever following one, and y
 per-key `ListError::Io` as an ITEM, so one unreadable directory leaves the listing
 incomplete below that key and complete everywhere else.
 
+**`Tributaries::list(key)` is the same listing through the umbrella handle**, for the
+consumer that never holds the source (it went into the owner task by value). It resolves
+the armed root covering `key` from the last committed watch-set, starts the walk at `key`,
+and runs it under **the words that root was armed with** — never words supplied at the
+call, because every subscription a root serves carries those same words. A key no armed
+root covers is `ListError::UnknownRoot`, which is not the same statement as an empty tree.
+
+```rust,ignore
+let sub = tributaries.watch(key("/path/to/project"), (), WatchOptions::new()).await?;
+// … and the other half: what is there now, from the same layer, spelled the same way.
+let mut entries = tributaries.list(&key("/path/to/project"));
+while let Some(entry) = entries.next().await {
+    let (key, metadata) = entry?;
+    println!("{} {}", metadata.kind(), key.iter().collect::<PathBuf>().display());
+}
+```
+
+A source opts in by handing out a `RootLister` (`Source::lister`) before it is given
+away; `FsSource` does, and its lister shares the watcher's root registry and blocking
+pool rather than the source itself.
+
 ## Sync barrier (experimental)
 
 A sync barrier certifies that every change made under a subscription **before** the

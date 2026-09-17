@@ -93,6 +93,73 @@ fn sync_nonce_seed() -> Option<[u8; 32]> {
   None
 }
 
+/// A cheap `Clone + Send + Sync` read handle over a [`Watcher`]'s LIVE ROOTS: what a
+/// root's canonical path is, and whether its coverage is currently provable.
+///
+/// It shares the watcher's own root registry and carries NO command channel, so it
+/// answers with no round trip to the driver and with no power to change anything — a
+/// reader, never a second control plane. It exists because the thing that wants to WALK
+/// a root is not always the thing that owns the watcher: an enumeration needs a root's
+/// path, and a caller that has handed the watcher away (to a driver task, to an
+/// umbrella) keeps this and can still ask.
+///
+/// Every answer is `None` for a handle this watcher did not issue, exactly as the
+/// watcher's own queries answer.
+#[derive(Clone)]
+pub struct RootView {
+  instance: u64,
+  roots: Arc<RwLock<RootSet>>,
+}
+
+impl core::fmt::Debug for RootView {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.debug_struct("RootView").finish_non_exhaustive()
+  }
+}
+
+impl RootView {
+  /// The canonical path `root` is watched at — [`Watcher::root_path`]'s answer, read
+  /// from the same registry.
+  #[inline]
+  pub fn root_path(&self, root: RootHandle) -> Option<PathBuf> {
+    root_path_in(self.instance, &self.roots, root)
+  }
+
+  /// Whether this watcher can currently prove `root`'s coverage —
+  /// [`Watcher::coverage`]'s answer, read from the same registry.
+  #[inline]
+  pub fn coverage(&self, root: RootHandle) -> Option<Coverage> {
+    coverage_in(self.instance, &self.roots, root)
+  }
+}
+
+/// The ONE read behind [`Watcher::root_path`] and [`RootView::root_path`], so the two
+/// can never drift.
+fn root_path_in(instance: u64, roots: &RwLock<RootSet>, root: RootHandle) -> Option<PathBuf> {
+  if root.instance() != instance {
+    return None;
+  }
+  roots
+    .read()
+    .unwrap_or_else(PoisonError::into_inner)
+    .entries
+    .get(&root.scope())
+    .map(|entry| entry.path.as_ref().clone())
+}
+
+/// The ONE read behind [`Watcher::coverage`] and [`RootView::coverage`].
+fn coverage_in(instance: u64, roots: &RwLock<RootSet>, root: RootHandle) -> Option<Coverage> {
+  if root.instance() != instance {
+    return None;
+  }
+  roots
+    .read()
+    .unwrap_or_else(PoisonError::into_inner)
+    .entries
+    .get(&root.scope())
+    .map(|entry| entry.coverage)
+}
+
 /// Whether a watcher can currently PROVE a watched root's coverage — the state
 /// [`Watcher::coverage`](Watcher::coverage) reports and the periodic liveness
 /// tick moves.
@@ -2742,16 +2809,18 @@ impl<R> Watcher<R> {
   /// The canonical path of a watched root, if the handle names a live root
   /// of this watcher.
   pub fn root_path(&self, root: RootHandle) -> Option<PathBuf> {
-    if root.instance() != self.instance {
-      return None;
+    root_path_in(self.instance, &self.roots, root)
+  }
+
+  /// A cheap `Clone` reader over this watcher's live roots, for something that must ask
+  /// about them without owning the watcher — see [`RootView`].
+  #[inline]
+  #[must_use]
+  pub fn root_view(&self) -> RootView {
+    RootView {
+      instance: self.instance,
+      roots: Arc::clone(&self.roots),
     }
-    self
-      .roots
-      .read()
-      .unwrap_or_else(PoisonError::into_inner)
-      .entries
-      .get(&root.scope())
-      .map(|entry| entry.path.as_ref().clone())
   }
 
   /// The backend the spawn barrier selected for a watched root — the capability
@@ -2801,16 +2870,7 @@ impl<R> Watcher<R> {
   /// `Unproven` the liveness interval keeps standing instructions, and they all
   /// describe the ONE window this call names.
   pub fn coverage(&self, root: RootHandle) -> Option<Coverage> {
-    if root.instance() != self.instance {
-      return None;
-    }
-    self
-      .roots
-      .read()
-      .unwrap_or_else(PoisonError::into_inner)
-      .entries
-      .get(&root.scope())
-      .map(|entry| entry.coverage)
+    coverage_in(self.instance, &self.roots, root)
   }
 
   /// A pollable snapshot of a watched root's backend internals (design §4.9):

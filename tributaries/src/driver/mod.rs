@@ -29,6 +29,7 @@ use std::{
   hash::Hash,
   marker::PhantomData,
   ops::Bound,
+  sync::Arc,
   time::{Duration, Instant},
   vec::Vec,
 };
@@ -39,10 +40,7 @@ use std::{
 #[cfg(feature = "sync")]
 use std::{
   collections::HashMap,
-  sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-  },
+  sync::atomic::{AtomicU64, Ordering},
 };
 
 use agnostic_lite::RuntimeLite;
@@ -59,13 +57,13 @@ use tributary_fs::{RootHandle, WatcherOptions};
 
 use crate::{
   coalesce::Coalescer,
-  error::{CloseError, SourceCloseError, UnwatchError, WatchError},
+  error::{CloseError, ListError, SourceCloseError, UnwatchError, WatchError},
   event::{Event, EventKind},
   filter::{Filter, FilterInput},
   interest::Interest,
   options::{Debounce, DebounceConfig, OptionsError, RootGlobs, TributariesOptions, WatchOptions},
   route::{ReservedEndpoints, RoutableEvent},
-  source::{Armed, LocalSource, Source, SourceEvent},
+  source::{Armed, BoxListing, LocalSource, RootLister, Source, SourceEvent},
   subscription::Subscription,
   subsume::{Salvage, Subsumer, UnwatchOutcome, WatchOutcome},
   view::WatchView,
@@ -427,6 +425,15 @@ pub struct Tributaries<C, V, R, H> {
   /// The concurrent read plane (design §5): a cheap `Clone` handle over the last
   /// committed watch-set, read wait-free by any thread.
   view: WatchView<C, V, H>,
+  /// The ENUMERATION plane: the source's own [`RootLister`], taken once at assembly —
+  /// before the source was handed to the owner — so [`list`](Self::list) can answer
+  /// without reaching a source no handle can reach. `None` from a source that cannot
+  /// enumerate, which `list` reports as
+  /// [`Unsupported`](crate::ListError::Unsupported).
+  ///
+  /// It rides an `Arc`, so every clone of this handle shares the one lister, and it is
+  /// `Send + Sync` by the trait's own bound — the handle's auto traits are unaffected.
+  lister: Option<Arc<dyn RootLister<C, H>>>,
   // `fn() -> R`, not `R`: the handle holds no runtime value, so its auto
   // traits (`Send`/`Sync`) must not condition on `R`'s.
   _rt: PhantomData<fn() -> R>,
@@ -465,6 +472,7 @@ impl<C, V, R, H> Clone for Tributaries<C, V, R, H> {
       closes: self.closes.clone(),
       events: self.events.clone(),
       view: self.view.clone(),
+      lister: self.lister.clone(),
       _rt: PhantomData,
     }
   }
@@ -638,6 +646,9 @@ where
     let (event_capacity, command_capacity, debounce) = options.into_parts();
     let subsumer = Subsumer::new();
     let view = subsumer.view();
+    // Taken HERE, while the source is still in hand: the owner below takes it by value
+    // and nothing afterwards can ask it for anything.
+    let lister = source.lister();
     // Bounded (design backpressure doc): the owner **never awaits** this channel — every
     // emit is a non-blocking `try_send` (`try_emit`), so `Close` is always serviced and the
     // loop can never deadlock mid-push. A generous capacity absorbs ordinary bursts
@@ -729,6 +740,7 @@ where
         closes: close_tx,
         events: event_rx,
         view,
+        lister,
         _rt: PhantomData,
       },
       owner,
@@ -747,6 +759,54 @@ impl<C, V, R, H> Tributaries<C, V, R, H> {
   #[must_use]
   pub fn view(&self) -> WatchView<C, V, H> {
     self.view.clone()
+  }
+
+  /// Enumerates what the watch holds at and under `key` — the ENUMERATION door, answered
+  /// without a round trip to the owner.
+  ///
+  /// A consumer that keeps its own picture of a tree needs two things from this crate:
+  /// the changes, and what is there NOW. The second used to be unreachable through this
+  /// handle — the owner takes the [`Source`](crate::Source) by value — so the picture
+  /// was built by a walk the consumer wrote itself, which can only walk a local
+  /// filesystem and which can disagree with the subscription about what the root's words
+  /// admit and how a key is spelled. This is that walk, run by the source instead: same
+  /// words, same key spelling, same layer.
+  ///
+  /// # What it enumerates, and under whose words
+  ///
+  /// `key` need not be an armed root: the armed root COVERING it is resolved from the
+  /// last committed watch-set (the same snapshot [`view`](Self::view) reads), and the
+  /// listing starts at `key` and covers that subtree. It runs under the words THAT ROOT
+  /// WAS ARMED WITH — never words supplied here — because every subscription a root
+  /// serves carries those same words, so a listing under any others would report
+  /// entries the stream will never mention.
+  ///
+  /// # Errors
+  ///
+  /// Each item is one entry or one failure (see
+  /// [`ListError`](crate::ListError)). The two that end the stream after a single item
+  /// are [`UnknownRoot`](crate::ListError::UnknownRoot) — no armed root covers `key`
+  /// (never watched, already gone, or a `watch` that has not committed yet: this reads
+  /// the last COMMITTED watch-set, so re-read after your `watch().await` returns) — and
+  /// [`Unsupported`](crate::ListError::Unsupported), from a source that cannot
+  /// enumerate. A per-key [`Io`](crate::ListError::Io) is an item and the walk goes on.
+  #[must_use]
+  pub fn list(&self, key: &[C]) -> BoxListing<C>
+  where
+    C: Ord + Clone + Send + 'static,
+    H: Copy,
+  {
+    let Some(lister) = self.lister.as_ref() else {
+      return Box::pin(futures_util::stream::once(core::future::ready(Err(
+        ListError::Unsupported,
+      ))));
+    };
+    let Some((root, globs)) = self.view.root_covering(key) else {
+      return Box::pin(futures_util::stream::once(core::future::ready(Err(
+        ListError::UnknownRoot,
+      ))));
+    };
+    lister.list(root, key, &globs)
   }
 
   /// Subscribes to `key` (carrying caller `value`) under the per-watch

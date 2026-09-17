@@ -17,7 +17,9 @@ pub use error::{BuildError, CloseError, ReplaceRootError, UnwatchError, WatchRoo
 pub use event::{Event, EventKind, MovedEvent};
 pub use options::{OptionsError, RootOptions, WatcherOptions};
 pub use os::{Backend, BackendKind, BackendStats, ProbeStage, SourceError};
-pub use watcher::{CoverOutcome, Coverage, RequestOutcome, RootHandle, SkipReason, Watcher};
+pub use watcher::{
+  CoverOutcome, Coverage, RequestOutcome, RootHandle, RootView, SkipReason, Watcher,
+};
 
 /// The sync barrier's vocabulary, behind the experimental `sync` feature.
 #[cfg(feature = "sync")]

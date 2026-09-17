@@ -819,6 +819,21 @@ pub trait LocalSource<C> {
     futures_util::stream::once(core::future::ready(Err(ListError::Unsupported)))
   }
 
+  /// An independent [`RootLister`] for this source's roots, or [`None`] from a source
+  /// that cannot enumerate.
+  ///
+  /// Taken ONCE, when the source is handed to the driver, and kept beside the watch-set
+  /// so [`Tributaries::list`](crate::Tributaries::list) can answer without reaching the
+  /// source — which no handle can, the owner having taken it by value. It is the same
+  /// listing [`list`](Self::list) answers.
+  ///
+  /// The default is `None`, which the umbrella reports as
+  /// [`ListError::Unsupported`](crate::ListError::Unsupported) — the same answer
+  /// [`list`](Self::list)'s own default gives, and never an empty root.
+  fn lister(&self) -> Option<std::sync::Arc<dyn RootLister<C, Self::Handle>>> {
+    None
+  }
+
   /// Whether this source can currently PROVE the coverage of the root `handle` names —
   /// the state behind the [`CoverageLost`](EventKind::CoverageLost) /
   /// [`CoverageRegained`](EventKind::CoverageRegained) transitions the owner delivers.
@@ -1287,6 +1302,21 @@ pub trait Source<C> {
     futures_util::stream::once(core::future::ready(Err(ListError::Unsupported)))
   }
 
+  /// An independent [`RootLister`] for this source's roots, or [`None`] from a source
+  /// that cannot enumerate.
+  ///
+  /// Taken ONCE, when the source is handed to the driver, and kept beside the watch-set
+  /// so [`Tributaries::list`](crate::Tributaries::list) can answer without reaching the
+  /// source — which no handle can, the owner having taken it by value. It is the same
+  /// listing [`list`](Self::list) answers.
+  ///
+  /// The default is `None`, which the umbrella reports as
+  /// [`ListError::Unsupported`](crate::ListError::Unsupported) — the same answer
+  /// [`list`](Self::list)'s own default gives, and never an empty root.
+  fn lister(&self) -> Option<std::sync::Arc<dyn RootLister<C, Self::Handle>>> {
+    None
+  }
+
   /// Whether this source can currently PROVE the coverage of the root `handle` names —
   /// the state behind the [`CoverageLost`](EventKind::CoverageLost) /
   /// [`CoverageRegained`](EventKind::CoverageRegained) transitions the owner delivers.
@@ -1391,6 +1421,10 @@ impl<C, T: Source<C>> LocalSource<C> for T {
     <T as Source<C>>::list(self, handle, globs)
   }
 
+  fn lister(&self) -> Option<std::sync::Arc<dyn RootLister<C, Self::Handle>>> {
+    <T as Source<C>>::lister(self)
+  }
+
   fn begin_close(&mut self) {
     <T as Source<C>>::begin_close(self)
   }
@@ -1436,6 +1470,45 @@ impl<C, T: Source<C>> LocalSource<C> for T {
 /// [`Metadata`] read for it, or the failure the walk met — at ONE key, where the failure
 /// is an [`Io`](crate::ListError::Io).
 pub type ListItem<C> = Result<(Vec<C>, Metadata), ListError<C>>;
+
+/// A listing stream with its type erased — what a [`RootLister`] answers, and what the
+/// umbrella hands a caller that never held the source.
+///
+/// Boxed because it crosses a door that cannot name a source's own stream type: the
+/// umbrella's handle is generic over the KEY and the root handle, never over the
+/// [`Source`] it was assembled with. `Send` because the thing that walks a tree and the
+/// thing that subscribed to it are routinely on different tasks.
+pub type BoxListing<C> = core::pin::Pin<Box<dyn Stream<Item = ListItem<C>> + Send>>;
+
+/// An independent enumerator for a source's armed roots — the door
+/// [`Source::lister`] hands out so something that does NOT own the source can still
+/// list what a root holds.
+///
+/// A [`Tributaries`](crate::Tributaries) takes the source BY VALUE: it lives in the
+/// owner task, behind a command channel, and no handle can reach it. Yet enumerating is
+/// exactly what a consumer of the events must also do — it reconciles the picture the
+/// stream updates — and a walk it writes itself can neither honour the words the root
+/// was armed with nor spell a key the way the subscription spells it. So a source that
+/// can enumerate hands out a lister BEFORE the hand-off, the umbrella keeps it beside
+/// the watch-set, and [`Tributaries::list`](crate::Tributaries::list) is that door.
+///
+/// # What an implementor owes
+///
+/// - **Independence from the source.** The lister is used while the owner task is
+///   driving the source, so it may SHARE state (a registry snapshot, a pool handle) but
+///   must never need the source itself.
+/// - **`Send + Sync`**, because the umbrella handle it rides on is both.
+/// - **The same answers [`Source::list`] gives** for the same root and words — a listing
+///   that disagreed with the source's own would be worse than no door at all. Implement
+///   one in terms of the other rather than writing two walks.
+/// - **`from` is a key at or under the root**: the listing starts there and covers that
+///   subtree. A `from` outside the root is
+///   [`UnknownRoot`](crate::ListError::UnknownRoot), never a silently re-rooted walk.
+pub trait RootLister<C, H>: Send + Sync {
+  /// Enumerates what `root` holds at and under `from`, narrowed by `globs` — the same
+  /// stream [`Source::list`] answers, boxed.
+  fn list(&self, root: H, from: &[C], globs: &RootGlobs) -> BoxListing<C>;
+}
 
 /// One entry's facts, as [`Source::list`] reports them: what the object IS, how big
 /// it is, and when it last changed.

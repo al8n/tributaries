@@ -28,7 +28,9 @@ use tributary_proto::Interest;
 use futures_util::Stream;
 use tributary_proto::glob::Glob;
 
-use super::{Armed, Coverage, EntryKind, ListItem, Metadata, Source, SourceEvent};
+use super::{
+  Armed, BoxListing, Coverage, EntryKind, ListItem, Metadata, RootLister, Source, SourceEvent,
+};
 #[cfg(feature = "sync")]
 use super::{Begun, SyncToken};
 #[cfg(feature = "sync")]
@@ -230,6 +232,54 @@ impl<R> FsSource<R> {
   }
 }
 
+/// The local filesystem's [`RootLister`]: a cheap `Clone` enumerator over one
+/// [`Watcher`]'s live roots, independent of the [`FsSource`] that handed it out.
+///
+/// It holds exactly what a walk needs — a reader over the watcher's root registry (to
+/// resolve a handle to its canonical path) and the blocking-pool spawner — and nothing
+/// that could drive the watcher. So it stays useful after the source has been handed to
+/// a [`Tributaries`](crate::Tributaries) owner, which is the whole reason it exists.
+#[derive(Clone)]
+pub struct FsLister {
+  view: tributary_fs::RootView,
+  blocking: BlockingSpawner,
+}
+
+impl core::fmt::Debug for FsLister {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.debug_struct("FsLister").finish_non_exhaustive()
+  }
+}
+
+impl FsLister {
+  /// The ONE walk both doors run: [`FsSource::list`](Source::list) and
+  /// [`RootLister::list`] differ in how they are reached, never in what they answer.
+  fn walk(
+    view: tributary_fs::RootView,
+    blocking: BlockingSpawner,
+    root: RootHandle,
+    from: &[OsString],
+    globs: &RootGlobs,
+  ) -> impl Stream<Item = ListItem<OsString>> + Send + use<> {
+    futures_util::stream::unfold(
+      Walk::new(view.root_path(root), from, globs, blocking),
+      Walk::step,
+    )
+  }
+}
+
+impl RootLister<OsString, RootHandle> for FsLister {
+  fn list(&self, root: RootHandle, from: &[OsString], globs: &RootGlobs) -> BoxListing<OsString> {
+    Box::pin(Self::walk(
+      self.view.clone(),
+      Arc::clone(&self.blocking),
+      root,
+      from,
+      globs,
+    ))
+  }
+}
+
 /// The blocking-job spawner a [`FsSource`] hands its listing reads to — the shape the
 /// lower watcher's own pool handle has, captured once from the runtime at construction.
 type BlockingSpawner = Arc<dyn Fn(Box<dyn FnOnce() + Send>) + Send + Sync + 'static>;
@@ -258,14 +308,37 @@ struct Walk {
 }
 
 impl Walk {
-  /// Seeds a walk at `root`, or — for a handle naming no live root — a walk whose one
-  /// item is that refusal.
-  fn new(root: Option<PathBuf>, globs: &RootGlobs, blocking: BlockingSpawner) -> Self {
+  /// Seeds a walk of `root`'s subtree at `from`, or — for a handle naming no live root,
+  /// or a `from` that is not under the root — a walk whose one item is that refusal.
+  ///
+  /// `from` decides where the walk STARTS and the root still anchors the WORDS: the
+  /// relative text a pattern is matched against is built from the root down, so listing
+  /// a subtree admits exactly what listing the whole root would have admitted there. A
+  /// `from` outside the root is refused rather than re-rooted — a walk that quietly
+  /// changed which tree it was about would report entries the watch behind the root can
+  /// never mention.
+  fn new(
+    root: Option<PathBuf>,
+    from: &[OsString],
+    globs: &RootGlobs,
+    blocking: BlockingSpawner,
+  ) -> Self {
     let mut queue = VecDeque::new();
     let mut ready = VecDeque::new();
-    match root {
-      Some(root) => queue.push_back((root, String::new())),
-      None => ready.push_back(Err(ListError::UnknownRoot)),
+    match root.map(|root| (path_components(&root), root)) {
+      Some((root_key, root)) if from.starts_with(&root_key) => {
+        let below = &from[root_key.len()..];
+        let at = below
+          .iter()
+          .map(|segment| segment.to_string_lossy().into_owned())
+          .collect::<Vec<_>>()
+          .join("/");
+        let start = below.iter().fold(root, |path, segment| path.join(segment));
+        queue.push_back((start, at));
+      }
+      // Either the handle names no live root of this source, or the caller named ground
+      // outside the one it does name.
+      _ => ready.push_back(Err(ListError::UnknownRoot)),
     }
     Self {
       blocking,
@@ -988,14 +1061,27 @@ impl<R> Source<OsString> for FsSource<R> {
   }
 
   fn list(&self, handle: RootHandle, globs: &RootGlobs) -> impl Stream<Item = ListItem<OsString>> {
-    futures_util::stream::unfold(
-      Walk::new(
-        self.watcher.root_path(handle),
-        globs,
-        Arc::clone(&self.blocking),
-      ),
-      Walk::step,
+    // Through the lister's own walk, so the door the umbrella opens and the one a direct
+    // caller opens can never be two walks that answer differently. The root's own key is
+    // where it starts: listing a root is listing all of it.
+    let from = self
+      .watcher
+      .root_path(handle)
+      .map(|root| path_components(&root));
+    FsLister::walk(
+      self.watcher.root_view(),
+      Arc::clone(&self.blocking),
+      handle,
+      from.as_deref().unwrap_or(&[]),
+      globs,
     )
+  }
+
+  fn lister(&self) -> Option<Arc<dyn RootLister<OsString, RootHandle>>> {
+    Some(Arc::new(FsLister {
+      view: self.watcher.root_view(),
+      blocking: Arc::clone(&self.blocking),
+    }))
   }
 
   fn coverage(&self, handle: RootHandle) -> Coverage {

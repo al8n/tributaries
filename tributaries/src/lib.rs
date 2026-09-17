@@ -30,7 +30,8 @@ pub use options::{
   Debounce, DebounceConfig, OptionsError, RootGlobs, TributariesOptions, WatchOptions,
 };
 pub use source::{
-  Armed, Coverage, EntryKind, ListItem, LocalSource, Metadata, Source, SourceEvent,
+  Armed, BoxListing, Coverage, EntryKind, ListItem, LocalSource, Metadata, RootLister, Source,
+  SourceEvent,
 };
 
 /// The stream trait [`Source::list`] returns, re-exported so an implementor can
