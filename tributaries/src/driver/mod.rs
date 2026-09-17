@@ -1455,9 +1455,11 @@ where
   /// makes the vocabulary's contract hold for every source: a repeated answer is a
   /// repeated answer, never a repeated event.
   ///
-  /// Bounded by the live-root count: an entry is added only for a recorded root and
-  /// removed when the root retires (the handle is generation-unique, so a retired entry
-  /// can never be re-read as a fresh root's).
+  /// Bounded by the live-root count: an entry is added only for a recorded root, and it
+  /// leaves at the instant the root does — every [`Source::disarm`](crate::Source::disarm)
+  /// (where the contract makes the handle dead on return) and the terminal retirement.
+  /// Removing it can never take a live root's state with it: a handle is
+  /// generation-unique, so the value a release retires is never reissued.
   coverage_lost: std::collections::HashSet<S::Handle>,
   /// Where the next [`flush_pending_rescans`](Self::flush_pending_rescans) pass
   /// resumes: the subscription whose offer found the channel full last pass —
@@ -4445,6 +4447,7 @@ where
         // abort cleanly rather than commit a mis-keyed or overlapping entry.
         let (handle, fs_key) = armed;
         if !self.subsumer.fs_path_preserves_plan(&fs_key, &[]) {
+          self.coverage_lost.remove(&handle);
           self.source.disarm(handle);
           let salvage = self.subsumer.abort_watch(&outcome);
           self.retire_salvage(salvage);
@@ -4638,6 +4641,7 @@ where
           // source watch — otherwise it leaks coverage and trips future
           // overlap checks (never a silent strand).
           self.retire_root_with_terminal_rescan(handle);
+          self.coverage_lost.remove(&handle);
           self.source.disarm(handle);
           let salvage = self.subsumer.abort_watch(&outcome);
           self.retire_salvage(salvage);
@@ -4651,6 +4655,7 @@ where
         // cannot race a still-live subsumed root. The coverage gap is closed by the dominating
         // Rescan each re-pointed subscription receives below.
         for &old in unwatch {
+          self.coverage_lost.remove(&old);
           self.source.disarm(old);
         }
         let armed = match self.arm(key, globs).await {
@@ -4709,6 +4714,7 @@ where
           // as that branch (keeping the owner's await surface greppable — no `disarm` shares an
           // `.await` line). The wider arm SUCCEEDED here, so no close reply was consumed on the
           // way in and the restore may wait out a capacity refusal on its own budget.
+          self.coverage_lost.remove(&handle);
           self.source.disarm(handle);
           let restore = self.restore_disarmed_roots(unwatch);
           let terminal = restore.await;
@@ -5290,6 +5296,7 @@ where
   ) -> Result<(S::Handle, Vec<C>), ReconcileStop> {
     let handle = armed.handle();
     if self.source.root_key(handle).is_none() {
+      self.coverage_lost.remove(&handle);
       self.source.disarm(handle);
       return Err(WatchError::DeadOnArrival.into());
     }
@@ -5464,6 +5471,7 @@ where
         // source that will see it again at its own `Drop`; the outcome is discarded because a
         // release that has already committed its removal has nothing left to decide either way.
         let source = &mut self.source;
+        self.coverage_lost.remove(&fs_root);
         let _ = offer_source(&mut self.source_disposals, move || source.disarm(fs_root));
       }
       UnwatchOutcome::Dropped {
@@ -5761,6 +5769,7 @@ where
           // Re-armed, but at a divergent key we cannot cleanly rebind: request release of the stray
           // new handle (synchronous, fire-and-forget) and retire the old root so its subs
           // re-enumerate and it leaves the view.
+          self.coverage_lost.remove(&new_handle);
           self.source.disarm(new_handle);
           self.retire_root_with_terminal_rescan(old);
         }
