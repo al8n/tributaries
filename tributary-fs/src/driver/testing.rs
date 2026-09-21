@@ -110,6 +110,13 @@ struct FakeState {
   /// observably HELD, and therefore the one under which the bounds on holding it
   /// can be driven at all (#74).
   cuts_withheld: AtomicBool,
+  /// Every cut this fake's streams accepted, in request order, as
+  /// `(root, seq)` — so a cell can answer one LATE, by hand, with the very
+  /// sequence the driver minted instead of guessing at the driver's counter
+  /// (#74). Kept only where a cell reads it: the suites that drive a held
+  /// refresh are the interpreter's, not miri's.
+  #[cfg(not(miri))]
+  cut_requests: Mutex<Vec<(PathBuf, u64)>>,
   /// What every subsequent recovery answers. `None` is the default a source with
   /// a healthy map gives.
   recovery_answer: Mutex<Option<crate::os::RootRecovery>>,
@@ -405,6 +412,8 @@ impl Default for FakeState {
       recovery_requests: Mutex::default(),
       cuts_accepted: AtomicBool::new(false),
       cuts_withheld: AtomicBool::new(false),
+      #[cfg(not(miri))]
+      cut_requests: Mutex::default(),
       recovery_answer: Mutex::default(),
       root_liveness: Mutex::default(),
       spawn_mounts: Mutex::default(),
@@ -769,6 +778,7 @@ impl FakeFs {
   /// Makes every stream of this fake ACCEPT a lane cut (#74), so a mount refresh
   /// is held until the marker the driver asked for comes back up the lane — the
   /// descending backends' behaviour, modelled.
+  #[cfg(not(miri))]
   pub(crate) fn accept_cuts(&self) {
     self.state.cuts_accepted.store(true, Ordering::SeqCst);
   }
@@ -776,8 +786,34 @@ impl FakeFs {
   /// Makes every accepted cut go UNANSWERED (#74): the request is taken and no
   /// marker ever comes back, which is how a cell holds a refresh in the driver's
   /// stash long enough to drive what may empty it.
+  #[cfg(not(miri))]
   pub(crate) fn withhold_cuts(&self) {
     self.state.cuts_withheld.store(true, Ordering::SeqCst);
+  }
+
+  /// The cut sequences `root`'s streams have been asked for, in request order
+  /// (#74).
+  #[cfg(not(miri))]
+  pub(crate) fn cut_requests(&self, root: impl AsRef<Path>) -> Vec<u64> {
+    self
+      .state
+      .cut_requests
+      .lock()
+      .unwrap()
+      .iter()
+      .filter(|(asked, _)| asked == root.as_ref())
+      .map(|(_, seq)| *seq)
+      .collect()
+  }
+
+  /// Pushes one marker onto `root`'s newest lane by hand, as the reader would
+  /// have (#74): the LATE answer to a withheld cut, or a sequence that answers
+  /// nothing at all. Answers whether a lane was there to take it.
+  #[cfg(not(miri))]
+  pub(crate) fn answer_cut(&self, root: impl AsRef<Path>, seq: u64) -> bool {
+    self
+      .state
+      .push_to_lane(root.as_ref(), SourceMessage::Cut { seq })
   }
 
   /// Forces every subsequent refresh to report `liveness` as the root's state,
@@ -1691,6 +1727,13 @@ impl SourceControl for FakeHandle {
     if !self.state.cuts_accepted.load(Ordering::SeqCst) {
       return false;
     }
+    #[cfg(not(miri))]
+    self
+      .state
+      .cut_requests
+      .lock()
+      .unwrap()
+      .push((self.root.clone(), seq));
     if self.state.cuts_withheld.load(Ordering::SeqCst) {
       return true;
     }

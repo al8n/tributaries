@@ -6013,6 +6013,15 @@ pub(crate) enum Command {
   DebugLaneCount {
     reply: futures_channel::oneshot::Sender<usize>,
   },
+  /// The same, for the mount refreshes held behind a lane cut (#74): one
+  /// snapshot can be large (every row path under the root), and scope ids are
+  /// never reused, so a scope that ended while one was held must leave nothing
+  /// behind. Counted rather than inspected — the leak is a POPULATION that grows
+  /// with watch/defer/unwatch churn, which is exactly what a count proves.
+  #[cfg(all(test, feature = "tokio"))]
+  DebugDeferredRefreshes {
+    reply: futures_channel::oneshot::Sender<usize>,
+  },
   /// A test-only count of the awaited-unwatch waiters parked for `scope`, so a
   /// suite can prove an issue-and-cancel storm leaves the waiter vector
   /// bounded rather than growing without limit.
@@ -11867,6 +11876,23 @@ struct LivenessProbes {
   /// live probe thread (a pool fallback included), which is also what bounds the
   /// map above.
   in_flight: BTreeSet<(ScopeId, u64)>,
+  /// The one answered probe per scope whose VERDICT is being held back behind a
+  /// cut of the scope's source lane (#74) — a probe's result, kept where the
+  /// probe's own bookkeeping is, because it has the same lifetime: every site
+  /// that retires a scope's tag is a site whose world the held snapshot no
+  /// longer describes.
+  deferred: BTreeMap<ScopeId, PendingRefresh>,
+  /// The cut each scope has been asked for and not yet been answered — the
+  /// sequence alone, since presence IS the question. Absent means the lane is
+  /// answering promptly and the next refresh may be ordered behind a marker;
+  /// present means one is already outstanding, so a further refresh applies at
+  /// once rather than queueing behind a reader that is not keeping up (#74).
+  outstanding_cut: BTreeMap<ScopeId, u64>,
+  /// The sequence the next accepted cut is minted under — driver-wide, so no
+  /// two markers in flight anywhere can be confused for one another, and
+  /// monotone, so a superseded question can never be answered by a later
+  /// marker (#74).
+  next_cut_seq: u64,
 }
 
 impl LivenessProbes {
@@ -11895,14 +11921,122 @@ impl LivenessProbes {
     }
   }
 
-  /// Retires `scope`'s current tag — a root REPLACE committed, or the scope tore
-  /// down. Whatever is in flight stays counted (the thread is alive), but its
-  /// answer is no longer current, so it will be dropped rather than applied to a
-  /// world it does not describe.
+  /// Retires `scope`'s current tag — a root REPLACE or a same-transport WIDEN
+  /// committed, or the scope tore down. Whatever is in flight stays counted (the
+  /// thread is alive), but its answer is no longer current, so it will be dropped
+  /// rather than applied to a world it does not describe.
+  ///
+  /// Which is exactly why the HELD verdict goes with it (#74): a snapshot taken
+  /// of the world this call ends describes ground the scope has left, and the
+  /// world starting here seeds its own baseline and arms its own refresh. The
+  /// outstanding cut goes too — it was asked of the lane this transition
+  /// retires, or of a world whose answer no longer means anything — so the new
+  /// world starts able to order its first cover instead of inheriting a debt
+  /// nobody will pay. This is also where both maps are RECLAIMED: scope ids are
+  /// never reused, and a teardown that left an entry behind would keep one
+  /// bounded-but-large mount table per dead scope for the driver's whole life.
   fn retire_generation(&mut self, scope: ScopeId) {
     let tag = self.generation.entry(scope).or_default();
     *tag = tag.wrapping_add(1);
+    self.deferred.remove(&scope);
+    self.outstanding_cut.remove(&scope);
     self.forget_settled(scope);
+  }
+
+  /// How many scopes are holding a refresh right now — the population a leak
+  /// would grow, answered for the suites through `DebugDeferredRefreshes`.
+  #[cfg(all(test, feature = "tokio"))]
+  fn deferred_refreshes(&self) -> usize {
+    self.deferred.len()
+  }
+
+  /// Whether `scope` is still waiting on a cut it already asked for: the one
+  /// test the ordering degrade is built on (#74).
+  ///
+  /// A reader that has not answered cannot prove an ordering, so the next
+  /// refresh is applied where it lands (main's behaviour before the cut existed)
+  /// rather than joining a queue behind it. Bounded by construction: at most one
+  /// marker is ever outstanding, and the next one that arrives clears this.
+  fn cut_outstanding(&self, scope: ScopeId) -> bool {
+    self.outstanding_cut.contains_key(&scope)
+  }
+
+  /// The sequence the next cut would be minted under. Reading it does not spend
+  /// it: a stream that REFUSES the cut leaves the sequence for the next one, so
+  /// the driver never burns a marker nobody was asked for (#74).
+  fn cut_seq(&self) -> u64 {
+    self.next_cut_seq
+  }
+
+  /// Records one refresh held back behind the cut `record.seq` names, spending
+  /// that sequence (#74).
+  fn defer_refresh(&mut self, scope: ScopeId, record: PendingRefresh) {
+    self.next_cut_seq = self.next_cut_seq.wrapping_add(1);
+    self.outstanding_cut.insert(scope, record.seq);
+    self.deferred.insert(scope, record);
+  }
+
+  /// Takes `scope`'s held reading away, whatever it was waiting for. The cut is
+  /// deliberately LEFT outstanding: the marker is still coming up a lane that is
+  /// still alive, and forgetting the debt would order the next refresh behind a
+  /// second marker while the first is still in flight.
+  fn take_deferred(&mut self, scope: ScopeId) -> Option<MountRefresh> {
+    self.deferred.remove(&scope).map(|held| held.refresh)
+  }
+
+  /// The same, but only for a reading deferred on `lane` — what every
+  /// lane-addressed transition uses (a loss, a terminal, a retired lane's
+  /// stragglers), so a reclamation can never take a reading belonging to the
+  /// world that replaced the lane it names.
+  fn take_deferred_on_lane(&mut self, scope: ScopeId, lane: u64) -> Option<MountRefresh> {
+    self
+      .deferred
+      .get(&scope)
+      .is_some_and(|held| held.world.0 == lane)
+      .then(|| self.take_deferred(scope))
+      .flatten()
+  }
+
+  /// Books one arriving marker: answers whether it is the cut this scope is
+  /// waiting for, and clears the debt when it is (#74).
+  ///
+  /// Clearing on the SEQUENCE rather than on the held refresh is what keeps the
+  /// degrade from latching: a marker that arrives after its refresh was
+  /// superseded still proves the reader is answering, and the scope goes back to
+  /// ordering its covers. A marker naming any other sequence answers a question
+  /// that has since been replaced and is ignored whole.
+  ///
+  /// Gated with the marker itself: a build where no `Cut` can arrive has no
+  /// question to book.
+  #[cfg(any(all(target_os = "linux", not(miri)), test))]
+  fn answer_cut(&mut self, scope: ScopeId, seq: u64) -> bool {
+    if self.outstanding_cut.get(&scope) != Some(&seq) {
+      return false;
+    }
+    self.outstanding_cut.remove(&scope);
+    true
+  }
+
+  /// Takes `scope`'s held refresh if the marker that just landed names the world
+  /// it was stamped in: its own sequence, the lane it was stashed on, and the
+  /// incarnation the scope watched then (#74).
+  ///
+  /// Both, because each catches what the other cannot: the sequence separates
+  /// this cut from a superseded one, and the world separates a stream from the
+  /// successor that replaced it AND the incarnations a same-transport widen
+  /// moves through without touching the lane.
+  /// A stamp that does not match is not merely ignored — the record is dropped,
+  /// because nothing will ever make it current again. Gated with the marker that
+  /// is its only caller.
+  #[cfg(any(all(target_os = "linux", not(miri)), test))]
+  fn take_deferred_current(
+    &mut self,
+    scope: ScopeId,
+    seq: u64,
+    world: (u64, u64),
+  ) -> Option<MountRefresh> {
+    let held = self.deferred.remove(&scope)?;
+    (held.seq == seq && held.world == world).then_some(held.refresh)
   }
 
   /// Claims a slot for one probe of `scope`, returning the tag to dispatch it
@@ -12283,11 +12417,10 @@ pub(crate) async fn run<R, F>(
   // the replace commit's covering Rescan) — its end marker is not a death.
   let mut lanes: BTreeMap<ScopeId, u64> = BTreeMap::new();
   let mut next_lane: u64 = 0;
-  // Mount refreshes held behind a cut of their scope's lane (#74), one per
-  // scope at most. Emptied by the marker they are waiting for, by a newer
-  // refresh, and by the end of the stream that was asked to cut.
-  let mut pending_refreshes: BTreeMap<ScopeId, PendingRefresh> = BTreeMap::new();
-  let mut next_cut_seq: u64 = 0;
+  // Mount refreshes held behind a cut of their scope's lane live with the probe
+  // bookkeeping they came from ([`LivenessProbes`]), because their lifetime is
+  // the probe tag's: every site that retires a scope's tag is a site whose world
+  // a held snapshot no longer describes (#74).
   // Off-loop work that owns — or is about to own — a native stream: spawns
   // dispatched to the blocking pool but not yet returned, teardowns handed to
   // `reaper` but not yet confirmed. Close quiesces BOTH alongside the live
@@ -12658,7 +12791,7 @@ pub(crate) async fn run<R, F>(
             &lanes,
             &mut streams.replace_states,
             &streams.handles,
-            &mut pending_refreshes,
+            &mut probes,
             item,
             &now,
           );
@@ -12961,7 +13094,7 @@ pub(crate) async fn run<R, F>(
         &lanes,
         &mut streams.replace_states,
         &streams.handles,
-        &mut pending_refreshes,
+        &mut probes,
         item,
         &now,
       );
@@ -13454,8 +13587,8 @@ pub(crate) async fn run<R, F>(
             if probes.retire(scope, generation) {
               apply_or_stash_refresh::<F>(
                 &mut core,
-                &mut pending_refreshes,
-                &mut next_cut_seq,
+                &mut probes,
+                &lanes,
                 &streams.handles,
                 scope,
                 refresh,
@@ -14605,6 +14738,10 @@ pub(crate) async fn run<R, F>(
         Ok(Command::DebugLaneCount { reply }) => {
           let _ = reply.send(lanes.len());
         }
+        #[cfg(all(test, feature = "tokio"))]
+        Ok(Command::DebugDeferredRefreshes { reply }) => {
+          let _ = reply.send(probes.deferred_refreshes());
+        }
         #[cfg(all(test, feature = "tokio", feature = "sync"))]
         Ok(Command::DebugCookieCount { reply }) => {
           let _ = reply.send(cookies.len());
@@ -14748,7 +14885,7 @@ pub(crate) async fn run<R, F>(
       },
       msg = os.next() => {
         if let Some(item) = msg {
-          ingest_source_item::<F>(&mut core, &lanes, &mut streams.replace_states, &streams.handles, &mut pending_refreshes, item, &now);
+          ingest_source_item::<F>(&mut core, &lanes, &mut streams.replace_states, &streams.handles, &mut probes, item, &now);
         }
       },
     }
@@ -14782,6 +14919,12 @@ pub(crate) async fn run<R, F>(
   cookies.begin_shutdown();
   while let Some((scope, stream)) = streams.take_live() {
     registry.scope_dead(scope);
+    // This sweep ends scopes without ever raising the teardown effect that
+    // normally reclaims them, so the one piece of per-scope state a refresh can
+    // leave behind is dropped here instead (#74). The probe TAG is deliberately
+    // not retired with it: a straggling answer inside the grace is still the
+    // verdict for a scope that was live when it was dispatched.
+    probes.take_deferred(scope);
     // The same detachment normal `TeardownStream` performs, at the same point
     // relative to the registry reclaim: `attach_scope` runs only where a handle
     // is stored, so this sweep covers every attached scope. Without it the arm
@@ -15132,7 +15275,7 @@ pub(crate) async fn run<R, F>(
         &lanes,
         &mut streams.replace_states,
         &streams.handles,
-        &mut pending_refreshes,
+        &mut probes,
         item,
         &now,
       );
@@ -16740,14 +16883,34 @@ const fn root_arm_outcome(outcome: WatchOutcome) -> WatchOutcome {
 
 /// One mount refresh held back until the scope's source lane has been CUT
 /// (#74) — the cover it may stand must not overtake events the reader pushed
-/// before the sample was taken — paired with the marker sequence it waits for.
+/// before the sample was taken — stamped with the world it was taken in.
 ///
-/// The sequence is minted once per accepted cut and never reused, which is also
-/// what carries the WORLD: a marker from a lane a replace has retired never
-/// reaches the driver (the ingest fence drops it) and could not match this
-/// sequence if it did, so a refresh left waiting on a retired lane's cut is
-/// applied by the next refresh instead of answered by a stranger.
-type PendingRefresh = (u64, MountRefresh);
+/// A snapshot is a statement about ONE world on ONE lane at ONE moment, and
+/// between the sample and the marker any of the three can move. So the record
+/// carries all three and is applied only under the same three, single-use: a
+/// marker that does not match them cannot make it current, so it is dropped
+/// rather than kept for a later one. Nothing is ever fed to the core out of the
+/// world it describes, and nothing outlives the lane, the incarnation or the
+/// scope it was stamped in.
+#[derive(Debug)]
+struct PendingRefresh {
+  /// The marker sequence this refresh waits for — minted once per accepted cut
+  /// and never reused, so a superseded question can never be answered by a
+  /// later marker.
+  seq: u64,
+  /// The WORLD the sample was taken in: the delivery lane the cut was asked of,
+  /// and the core incarnation the scope watched then.
+  ///
+  /// Compared as a pair, because each half catches what the other cannot. A
+  /// replace installs a successor stream under a fresh lane, and this snapshot
+  /// belongs to neither the successor nor anything it will say. A same-transport
+  /// widen keeps the lane and mints no new marker at all — the incarnation is
+  /// the only thing that moves — so without the second half the widened world
+  /// would answer the narrow root's question with the narrow root's table.
+  world: (u64, u64),
+  /// The reading itself, unread until the marker lands.
+  refresh: MountRefresh,
+}
 
 /// Applies one mount refresh, or STASHES it behind a cut of the scope's source
 /// lane (#74).
@@ -16758,41 +16921,61 @@ type PendingRefresh = (u64, MountRefresh);
 /// the mount sample can be ingested after the cover, naming ground the change
 /// has since hidden, with a stable table firing no later cover to correct it.
 ///
-/// At most ONE refresh is ever held, and a newer one applies the held refresh
-/// first, in arrival order. That is what bounds the wait on a reader: a cut that
-/// has not been answered within a liveness interval costs the ORDERING and
-/// nothing else — the refresh still lands, exactly as it did before the cut
-/// existed. It has to, because a refresh is not only a cover: its first gate is
-/// the root-liveness verdict, and on a kernel-recursive backend that gate is the
-/// scope's only root-death check.
+/// The wait on a reader is bounded by the CUT'S OWN HEALTH, not by the held
+/// snapshot: a refresh is ordered behind a marker only while no marker is
+/// already outstanding. When one is, the reader has not kept up within a
+/// liveness interval, so this reading applies where it lands — main's behaviour
+/// before the cut existed — and the one still held is SUPERSEDED, dropped
+/// rather than applied, because a newer sample is a newer verdict on the same
+/// question and the older one describes a world that has since been re-read.
+/// Nothing is lost by dropping it: `on_mounts_refreshed` runs the root-liveness
+/// gate first and unconditionally, so the newer sample answers the death
+/// question the older one was carrying — which on a kernel-recursive backend is
+/// the scope's only root-death check. The next marker to arrive restores the
+/// ordering; the degrade costs covers their order for one interval and never
+/// wedges, never latches, and never applies a snapshot ahead of its own cut.
 fn apply_or_stash_refresh<F: FsOps>(
   core: &mut DriverCore,
-  pending: &mut BTreeMap<ScopeId, PendingRefresh>,
-  next_seq: &mut u64,
+  probes: &mut LivenessProbes,
+  lanes: &BTreeMap<ScopeId, u64>,
   handles: &BTreeMap<ScopeId, F::Handle>,
   scope: ScopeId,
   refresh: MountRefresh,
   now: &impl Fn() -> Instant,
 ) {
-  if let Some((_, held)) = pending.remove(&scope) {
-    core.on_mounts_refreshed(scope, held, now());
+  // A cut already outstanding means the ordering cannot be proven for this
+  // sample either: land it, and drop whatever the unanswered marker was holding.
+  if probes.cut_outstanding(scope) {
+    probes.take_deferred(scope);
+    core.on_mounts_refreshed(scope, refresh, now());
+    return;
   }
-  let seq = *next_seq;
+  let seq = probes.cut_seq();
   // A stream with no reader to cut applies at once and is unchanged from what it
   // always did: FSEvents has no descriptor to drain, Windows and the unsupported
   // host have no such request, the fanotify source publishes its cover through
   // its own in-band recovery completion, which already orders it — and a scope
   // whose stream has ended has no lane for a marker to arrive on at all.
+  let Some(&lane) = lanes.get(&scope) else {
+    core.on_mounts_refreshed(scope, refresh, now());
+    return;
+  };
   if !handles.get(&scope).is_some_and(|handle| handle.cut(seq)) {
     core.on_mounts_refreshed(scope, refresh, now());
     return;
   }
-  *next_seq = next_seq.wrapping_add(1);
+  probes.defer_refresh(
+    scope,
+    PendingRefresh {
+      seq,
+      world: (lane, core.incarnation_of(scope)),
+      refresh,
+    },
+  );
   // The probe is over even though its verdict is not read yet: the core must be
-  // free to arm the NEXT refresh, because that refresh is what bounds how long
-  // this one may wait on a reader.
-  core.on_refresh_deferred(scope);
-  pending.insert(scope, (seq, refresh));
+  // free to arm the NEXT refresh — and to hold the deadline that produces it —
+  // because that refresh is what bounds how long this one may wait on a reader.
+  core.on_refresh_deferred(scope, now());
 }
 
 /// Applies one source-lane message to the core — the ONE body both the run
@@ -16801,8 +16984,9 @@ fn apply_or_stash_refresh<F: FsOps>(
 /// channel message, so only the arm can see it and it stays there.)
 fn apply_source_message(
   core: &mut DriverCore,
-  pending_refreshes: &mut BTreeMap<ScopeId, PendingRefresh>,
+  probes: &mut LivenessProbes,
   scope: ScopeId,
+  lane: u64,
   msg: SourceMessage,
   now: &impl Fn() -> Instant,
 ) {
@@ -16826,6 +17010,15 @@ fn apply_source_message(
     // fresh message or is covered by the rescan this becomes.
     SourceMessage::Overflow(ack) => {
       drop(ack);
+      // A snapshot taken BEFORE a loss is not authoritative about the window the
+      // loss covers, and a held one is exactly that: the reader can discover an
+      // overflow and enqueue it ahead of the very marker the refresh is waiting
+      // for, so without this the marker behind it would install a pre-loss table
+      // as current and reopen device trust across the lost window (#74). Dropped
+      // ahead of the overflow, not after, because the overflow is what arms the
+      // replacement read — the deferral already told the core no refresh was
+      // outstanding — and that read must be the one that speaks next.
+      probes.take_deferred_on_lane(scope, lane);
       core.on_root_overflow(scope, now());
     }
     SourceMessage::Fatal(_) => {
@@ -16833,7 +17026,7 @@ fn apply_source_message(
       // refresh behind it is moot: the death below is the terminal verdict for
       // the whole scope, and it dominates any cover the refresh could have
       // asked for.
-      pending_refreshes.remove(&scope);
+      probes.take_deferred_on_lane(scope, lane);
       core.on_source_fatal(scope, now());
     }
     // Where one of this source's walks stopped (#74). It carries no coverage
@@ -16845,15 +17038,23 @@ fn apply_source_message(
     // The cut landed (#74): everything this reader had to say about the world
     // before the mount change is behind us on this lane, so the refresh held for
     // it applies HERE — its cover cannot overtake what it must dominate. A
-    // marker whose sequence is not the one being waited on answers a question
-    // that has since been replaced, and leaves the stash for its own.
+    // marker naming any other sequence answers a question that has since been
+    // replaced and is ignored whole, leaving this scope's debt where it is.
+    //
+    // The marker also PROVES THE READER IS ANSWERING, which is the half that
+    // outlives the refresh: a cut whose refresh was superseded still clears the
+    // debt, so one slow interval costs the ordering for that interval instead of
+    // for the life of the scope. And the stamp is verified HERE, where the
+    // reading is actually fed, rather than trusted from the lane fence one frame
+    // above: the fence cannot see a same-transport widen at all, and a snapshot
+    // that no longer names this world is dropped rather than applied.
     #[cfg(any(all(target_os = "linux", not(miri)), test))]
     SourceMessage::Cut { seq } => {
-      if pending_refreshes
-        .get(&scope)
-        .is_some_and(|(awaited, _)| *awaited == seq)
-      {
-        let (_, held) = pending_refreshes.remove(&scope).expect("just checked");
+      if !probes.answer_cut(scope, seq) {
+        return;
+      }
+      let world = (lane, core.incarnation_of(scope));
+      if let Some(held) = probes.take_deferred_current(scope, seq, world) {
         core.on_mounts_refreshed(scope, held, now());
       }
     }
@@ -16880,7 +17081,7 @@ fn ingest_source_item<F: FsOps>(
   lanes: &BTreeMap<ScopeId, u64>,
   replace_states: &mut BTreeMap<ScopeId, ReplaceState<F::Handle>>,
   handles: &BTreeMap<ScopeId, F::Handle>,
-  pending_refreshes: &mut BTreeMap<ScopeId, PendingRefresh>,
+  probes: &mut LivenessProbes,
   item: (ScopeId, u64, Option<SourceMessage>),
   now: &impl Fn() -> Instant,
 ) {
@@ -16891,11 +17092,15 @@ fn ingest_source_item<F: FsOps>(
   // lane for its whole life, so this gate never fires — pinned by the
   // existing suites.)
   if lanes.get(&scope) != Some(&lane) {
+    // Anything this lane was still holding is reclaimed as it is refused, and
+    // only what is keyed on THIS lane: a refresh stamped on the successor
+    // belongs to the world that replaced this one (#74).
+    probes.take_deferred_on_lane(scope, lane);
     return;
   }
   match msg {
     Some(msg) => {
-      apply_source_message(core, pending_refreshes, scope, msg, now);
+      apply_source_message(core, probes, scope, lane, msg, now);
       // The catch-up ledger: one prefix message consumed in the arm's own
       // frame — delivered, tainted, or funneled exactly as any other.
       // Saturating: post-snapshot arrivals are transport-concurrent with
@@ -16922,7 +17127,7 @@ fn ingest_source_item<F: FsOps>(
       // for it would sit here for the life of the driver. It is moot either way:
       // a dead stream funnels below, and a retired one belongs to a world that
       // has ended (#74).
-      pending_refreshes.remove(&scope);
+      probes.take_deferred_on_lane(scope, lane);
       if handles.contains_key(&scope) {
         core.on_source_fatal(scope, now());
       }

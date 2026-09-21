@@ -4030,6 +4030,59 @@ mod mount_change_cover {
     );
   }
 
+  /// A birth refresh the driver HELD BACK behind a lane cut still arms the
+  /// liveness deadline (#74).
+  ///
+  /// A new scope starts with no deadline at all and takes its first one from a
+  /// refresh completion. Clearing the outstanding mark without arming would
+  /// therefore leave a scope with nothing in flight, nothing scheduled and no
+  /// tick to produce the next read — and since it is the NEXT refresh that
+  /// bounds how long a held one may wait, and on a kernel-recursive backend a
+  /// refresh is the only root-death check there is, a quiet unmount would stay
+  /// live for as long as the reader stayed silent.
+  ///
+  /// FAIL-ON-REVERT: clear the marks without arming and the deadline below
+  /// stays `None`.
+  #[test]
+  fn a_deferred_birth_refresh_arms_the_liveness_deadline() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
+    let scope = core
+      .on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Inotify)
+      .expect("a fresh scope registers");
+    let _ = drain(&mut core);
+    core.on_stream_spawned(
+      scope,
+      Ok(RootMeta {
+        root: PathBuf::from("/r"),
+        root_dev: 1,
+        root_mnt_id: None,
+        mounts: Vec::new(),
+        identity: crate::os::RootIdentity::new(1, 1),
+        ancestors: Vec::new(),
+        backend: BackendKind::Inotify,
+      }),
+    );
+    let _ = drain(&mut core);
+    assert_eq!(
+      core.scopes[&scope].liveness_deadline, None,
+      "staging: the birth refresh is what seeds the cadence, and it has not \
+       been read yet"
+    );
+
+    core.on_refresh_deferred(scope, at(7));
+    assert_eq!(
+      core.scopes[&scope].liveness_deadline,
+      Some(at(7) + LIVENESS),
+      "a held verdict is still a completed probe: the next tick is scheduled \
+       off the moment it finished"
+    );
+    assert!(
+      !core.scopes[&scope].refresh_pending,
+      "and nothing is outstanding, so that tick may arm the refresh which \
+       bounds how long this one waits"
+    );
+  }
+
   /// A TORN read is the same refusal reached one layer down: the producer read
   /// the table, saw the mount namespace move under it mid-`seq_file`, and threw
   /// the rows away rather than hand up two halves of different moments. It

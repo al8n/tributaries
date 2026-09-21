@@ -5099,9 +5099,18 @@ impl DriverCore {
   /// The incarnation a scope-bound effect queued NOW belongs to — the ONE place
   /// a stamp is read off the scope, so every push site stamps the same way.
   ///
+  /// Read from OUTSIDE the core too, by the one driver record that outlives the
+  /// call which made it: a mount refresh held back behind a cut of the scope's
+  /// source lane (#74) is stamped with this and applied only under the same
+  /// value, so a world that ended between the sample and the marker takes the
+  /// snapshot with it. Path equality would not serve — a same-path replacement
+  /// leaves the root bytes equal across a world the refresh did not survive —
+  /// and the lane alone would not either, since a same-transport widen moves
+  /// this without ever moving the lane.
+  ///
   /// An unknown scope answers the birth value: it queues no effect anyone will
   /// poll, and the poll site refuses it on the scope's absence in any case.
-  fn incarnation_of(&self, scope: ScopeId) -> u64 {
+  pub(crate) fn incarnation_of(&self, scope: ScopeId) -> u64 {
     self.scopes.get(&scope).map_or(0, |state| state.incarnation)
   }
 
@@ -5798,10 +5807,22 @@ impl DriverCore {
   /// refresh that bounds how long a held one may wait, a reader that never
   /// answered its cut would wedge this scope's sampling for good. Liveness, the
   /// table and the frame all stay unread until the marker lands.
-  pub(crate) fn on_refresh_deferred(&mut self, scope: ScopeId) {
+  ///
+  /// And it ARMS THE LIVENESS DEADLINE, exactly as the applied and the declined
+  /// completions do, off the time this one finished. Clearing the outstanding
+  /// mark alone is not enough to keep the cadence: a new scope starts with NO
+  /// deadline and takes its first one from the birth refresh's own completion,
+  /// so a birth refresh handed to a reader that then blocks would leave the
+  /// scope with nothing outstanding, nothing armed and no tick to produce the
+  /// next read — a quiet unmount staying live indefinitely on a backend whose
+  /// only root-death check this cadence is. The deadline is what makes the
+  /// bound above real: it is what produces the next refresh.
+  pub(crate) fn on_refresh_deferred(&mut self, scope: ScopeId, now: Instant) {
+    let interval = self.root_liveness_interval;
     if let Some(state) = self.scopes.get_mut(&scope) {
       state.budget_recovered = false;
       state.refresh_pending = false;
+      Self::arm_liveness(state, interval, now);
     }
   }
 
