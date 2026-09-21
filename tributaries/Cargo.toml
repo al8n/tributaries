@@ -103,9 +103,11 @@ getrandom = { version = "0.3", optional = true }
 # directory was, so every descent is DESCRIPTOR-RELATIVE (`openat`/`statat`, no-follow) with
 # one reader per open level — none of which `std` has a door to. Enabled by the `fs` feature
 # alone, on unix alone: the non-unix fallback is std's own `read_dir`, and a consumer with
-# no fs binding pulls nothing.
+# no fs binding pulls nothing. The floor mirrors `tributary-fs`'s, because one major cannot
+# hold two versions and a minimal-versions lockfile has to resolve a single rustix for the
+# whole workspace.
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", default-features = false, features = [
+rustix = { version = "1.1.3", default-features = false, features = [
   "fs",
   "std",
 ], optional = true }

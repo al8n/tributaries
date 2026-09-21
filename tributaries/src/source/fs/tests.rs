@@ -2636,7 +2636,11 @@ fn absorb_refuses_a_non_utf8_directory_a_prune_pattern_would_not_match_lossily()
 /// Unix-only because the guarantees under test are the descriptor-relative ones: the
 /// non-unix fallback states a weaker rule (a no-follow check immediately before the read),
 /// and asserting the stronger one there would assert something the platform does not give.
-#[cfg(unix)]
+///
+/// not(miri): a descriptor-relative walk is raw `openat`/`getdents`/`statx`, which an
+/// interpreter has no filesystem to answer — the safe-code invariants the walk itself owns
+/// are pinned by the `absorb` cells above, which touch no descriptor.
+#[cfg(all(unix, not(miri)))]
 mod listing {
   use std::{
     ffi::OsString,

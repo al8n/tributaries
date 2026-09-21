@@ -64,9 +64,14 @@ run_msan() {
   # results the kernel writes) and ABORTS the lib binary, so the suite reports no result at
   # all. Any future cell driving a real kernel watch belongs on this list: `cfg(sanitize)`
   # cannot gate one out, being feature-gated (E0658) on the stable this workspace targets.
+  #
+  # The listing suite is the same class once more: its walk reads real directories through
+  # raw `getdents64`/`statx`, so the kernel-filled buffers read as uninitialized and the
+  # whole module is named here rather than one cell at a time.
   RUSTFLAGS="-Z sanitizer=memory" \
   cargo -Zbuild-std test --lib --target "$TARGET" --all-features --workspace --exclude tributary-fs \
     -- --skip source::fs::tests::integration \
+       --skip source::fs::tests::listing \
        --skip source::fs::tests::a_real_fs_move_carries_its_source_coordinate_into_the_move_out_projection
 }
 
