@@ -33,6 +33,15 @@ All notable changes to this workspace are documented here. The format is based o
   event on the root's stream at both edges (the covering `Rescan` it already stands is
   one), which is what the owner reads the state on.
 
+  A coverage transition is DURABLE DEBT, not a notice: the umbrella tracks the state each
+  subscription has actually RECEIVED against the state its source reports, and delivers the
+  difference before any later event reaches that consumer — so an edge a full event channel
+  refuses is retried rather than dropped, a `CoverageLost` always precedes the deltas that
+  follow it, and a `CoverageRegained` always precedes the covering `Rescan` it licenses. The
+  debt is derived rather than queued, so a loss the consumer never received and a regain
+  that follows it cancel to nothing instead of replaying a pair of edges that described no
+  picture it ever held.
+
 - **`tributaries`** — **`Source::list(handle, globs)`**, the enumeration half of the
   binding seam: a stream of each entry's located key — in the same component space events
   are keyed in — paired with the `Metadata` (`EntryKind`, size, modification time) the
@@ -47,8 +56,18 @@ All notable changes to this workspace are documented here. The format is based o
   without ever following it, and yields a per-key `ListError::Io` as an ITEM, so one
   unreadable directory leaves the listing incomplete below that key and complete
   everywhere else. The default answers one `ListError::Unsupported`, which a reconciling
-  consumer must be able to tell from a root that holds nothing. `FsSource`'s is a
-  breadth-first `read_dir` walk on the runtime's blocking pool.
+  consumer must be able to tell from a root that holds nothing. `FsSource`'s is a pre-order
+  DEPTH-FIRST walk on the runtime's blocking pool, reading each directory in bounded chunks
+  through an open descriptor of its own — so its memory follows the tree's depth and the
+  chunk size rather than the width of any one directory, and a listing NEVER follows a
+  symbolic link, at its starting key or anywhere below it. On unix that is a guarantee of
+  the traversal rather than a check: every descent is descriptor-relative with no-follow
+  semantics, so a directory replaced by a link after it was read cannot re-point the walk
+  out of the tree. Elsewhere the fallback checks immediately before each read, which leaves
+  a rename window. A start key that is not a plain name under the root — a `..` or absolute
+  component, an empty or non-UTF-8 segment — or that sits at or under ground the root's
+  `prune` words refuse, answers one `ListError::UnknownRoot`, because a key the watch would
+  never have entered is not a key this root covers.
 
 - **`tributaries`** — **`Tributaries::list(key)`**, the same enumeration through the
   umbrella HANDLE, for the consumer that never holds the source: the owner takes it by
@@ -66,7 +85,10 @@ All notable changes to this workspace are documented here. The format is based o
 
 - **`tributary-fs`** — `Watcher::coverage(root) -> Option<Coverage>`, the same state for a
   consumer of the direct fs stream, plus the covering `Rescan` the regaining probe now
-  stands. The per-refused-tick `Rescan` is unchanged on this face: it is the rate-bounded
+  stands. A root REPLACE or WIDEN reconciles the episode instead of resetting it: the
+  commit opened, read and armed the new root, which is the proof a completed probe carries,
+  so an open episode is closed at the commit and a refusal after it opens a second one.
+  The core is the sole writer of the state — the registry mirrors it and never sets it. The per-refused-tick `Rescan` is unchanged on this face: it is the rate-bounded
   report, and the transition is the fact underneath it.
 
 - **`tributary-proto`** — `Glob::is_match(path)`, the single-pattern twin of

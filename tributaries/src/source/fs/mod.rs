@@ -280,61 +280,125 @@ impl RootLister<OsString, RootHandle> for FsLister {
   }
 }
 
+/// The deepest a listing descends below its starting key.
+///
+/// The walk holds one OPEN directory per level, and on unix that is two descriptors — the
+/// one `openat`/`statat` name, and the one the reader takes, because `rustix::fs::Dir` does
+/// not lend its own back. So the ceiling is a descriptor budget as much as a cycle guard:
+/// 64 levels is deeper than a real tree and still a small fraction of a default
+/// `RLIMIT_NOFILE`. A directory AT the ceiling is reported as one `Io` item for its own key
+/// and is not descended, so the listing is incomplete exactly there and complete everywhere
+/// else.
+const MAX_LIST_DEPTH: usize = 64;
+
+/// How many entries one blocking job reads before it hands the open directory back.
+///
+/// The walk yields a chunk before it asks for the next one, so a directory of any width is
+/// read in pieces this size: memory is bounded by the depth and this number, never by how
+/// many entries a single directory holds.
+const LIST_CHUNK: usize = 256;
+
 /// The blocking-job spawner a [`FsSource`] hands its listing reads to — the shape the
 /// lower watcher's own pool handle has, captured once from the runtime at construction.
 type BlockingSpawner = Arc<dyn Fn(Box<dyn FnOnce() + Send>) + Send + Sync + 'static>;
 
-/// One directory still to read, with the root-relative `/`-joined text its children are
-/// matched against (empty for the root itself).
-type Pending = (PathBuf, String);
+/// One open directory the walk is consuming, with everything the items it yields are
+/// named from.
+struct Level {
+  dir: OpenDir,
+  /// The absolute path of this directory — what an item's key is built from.
+  path: PathBuf,
+  /// Its root-relative `/`-joined text, empty at the root: what the pattern words are
+  /// matched against.
+  at: String,
+  /// The child directories this level has read and not yet descended into, oldest first.
+  /// At most one chunk's worth, which is what keeps the walk's memory independent of a
+  /// directory's width.
+  pending: VecDeque<(OsString, String)>,
+  /// Whether the reader has reached the end of the directory.
+  exhausted: bool,
+  /// How far below the starting key this level sits; the start is zero.
+  depth: usize,
+}
 
-/// One [`FsSource::list`](Source::list) walk in progress: a BREADTH-FIRST enumeration of
-/// the root, one `read_dir` per step on the blocking pool.
+impl Level {
+  fn new(dir: OpenDir, path: PathBuf, at: String, depth: usize) -> Self {
+    Self {
+      dir,
+      path,
+      at,
+      pending: VecDeque::new(),
+      exhausted: false,
+      depth,
+    }
+  }
+}
+
+/// What one chunk job answers: the open directory it was lent (absent only when the job
+/// never answered at all), the entries it read, and whether it reached the end.
+struct Chunk {
+  dir: Option<OpenDir>,
+  entries: Result<Vec<(OsString, Metadata)>, std::io::Error>,
+  exhausted: bool,
+}
+
+/// One [`FsSource::list`](Source::list) walk in progress: a pre-order DEPTH-FIRST
+/// enumeration of the root at and under the starting key, read in bounded chunks on the
+/// blocking pool.
 ///
-/// Breadth-first rather than depth-first because a listing is consumed to reconcile a
-/// tree: the shallow entries are the ones a consumer can act on first (they name the
-/// directories it will hold state for), and a queue of directories costs one path per
-/// pending directory where a recursive descent would hold an open reader per level.
+/// Depth-first over a stack of OPEN directories rather than breadth-first over a queue of
+/// paths, for two reasons that are really one. A frontier of paths grows with the width of
+/// every level, so a single wide directory costs memory proportional to its entry count
+/// before the consumer receives one item; a stack costs one open directory per LEVEL. And a
+/// queued PATH has to be re-opened to be read, which is the window a rename uses to put a
+/// symbolic link where a directory was — an open descriptor cannot be re-pointed, so the
+/// walk stays inside the tree it was asked about by construction rather than by a check
+/// that can be raced.
 struct Walk {
   blocking: BlockingSpawner,
   /// The pruned subtrees, matched against root-relative directory paths.
   prune: Vec<Glob>,
   /// The file narrowing, matched against a file's last segment. `None` is unengaged.
   include: Option<Vec<Glob>>,
-  /// Directories read but not yet descended, oldest first.
-  queue: VecDeque<Pending>,
-  /// Entries read from the last directory and not yet yielded.
+  /// The start still to be opened: the root's path and the validated plain names that
+  /// lead down to the starting key, with the root-relative text of that key.
+  ///
+  /// The open is deferred to the first step because it is a syscall per component, and
+  /// every syscall this walk makes belongs on the blocking pool.
+  seed: Option<(PathBuf, Vec<OsString>, String)>,
+  /// The open directories of the current descent, outermost first.
+  stack: Vec<Level>,
+  /// Items read and not yet yielded — at most one chunk, plus the refusals it produced.
   ready: VecDeque<ListItem<OsString>>,
 }
 
 impl Walk {
-  /// Seeds a walk of `root`'s subtree at `from`, or — for a handle naming no live root,
-  /// or a `from` that is not under the root — a walk whose one item is that refusal.
+  /// Seeds a walk of `root`'s subtree at `from`, or — for a handle naming no live root, or
+  /// a `from` that is not a key UNDER the root — a walk whose one item is that refusal.
   ///
   /// `from` decides where the walk STARTS and the root still anchors the WORDS: the
-  /// relative text a pattern is matched against is built from the root down, so listing
-  /// a subtree admits exactly what listing the whole root would have admitted there. A
-  /// `from` outside the root is refused rather than re-rooted — a walk that quietly
-  /// changed which tree it was about would report entries the watch behind the root can
-  /// never mention.
+  /// relative text a pattern is matched against is built from the root down, so listing a
+  /// subtree admits exactly what listing the whole root would have admitted there. A `from`
+  /// outside the root is refused rather than re-rooted — a walk that quietly changed which
+  /// tree it was about would report entries the watch behind the root can never mention.
   fn new(
     root: Option<PathBuf>,
     from: &[OsString],
     globs: &RootGlobs,
     blocking: BlockingSpawner,
   ) -> Self {
-    let mut queue = VecDeque::new();
+    let prune = globs.prune().to_vec();
+    let mut seed = None;
     let mut ready = VecDeque::new();
     match root.map(|root| (path_components(&root), root)) {
       Some((root_key, root)) if from.starts_with(&root_key) => {
-        let below = &from[root_key.len()..];
-        let at = below
-          .iter()
-          .map(|segment| segment.to_string_lossy().into_owned())
-          .collect::<Vec<_>>()
-          .join("/");
-        let start = below.iter().fold(root, |path, segment| path.join(segment));
-        queue.push_back((start, at));
+        match Self::start_below(&from[root_key.len()..], &prune) {
+          Some((names, at)) => seed = Some((root, names, at)),
+          // A suffix that is not a plain name under the root, or that starts on ground the
+          // root's own words refuse: a key that is not a key under this root is covered by
+          // no armed root, which is the same answer an unwatched key gets.
+          None => ready.push_back(Err(ListError::UnknownRoot)),
+        }
       }
       // Either the handle names no live root of this source, or the caller named ground
       // outside the one it does name.
@@ -342,53 +406,185 @@ impl Walk {
     }
     Self {
       blocking,
-      prune: globs.prune().to_vec(),
+      prune,
       include: globs.include().map(<[Glob]>::to_vec),
-      queue,
+      seed,
+      stack: Vec::new(),
       ready,
     }
   }
 
-  /// The next item, reading one more directory whenever the last one is exhausted.
+  /// The plain names leading to the starting key and its root-relative text, or `None`
+  /// where `from` is not a key under the root after all.
+  ///
+  /// Every component below the root must be a PLAIN NAME: `Path::components` over it must
+  /// yield exactly one [`Component::Normal`](std::path::Component::Normal) equal to the
+  /// component itself, non-empty and valid UTF-8. That refuses `..`, an absolute or prefix
+  /// component, an embedded separator, an empty segment and a name no pattern can be
+  /// matched against — each of which, joined onto the root, addresses ground the root does
+  /// not cover, and a walk is not the place to discover that.
+  ///
+  /// `prune` is applied to EVERY root-relative directory prefix, the starting key
+  /// included. The watch never entered pruned ground, so a listing that started inside it
+  /// would hand a consumer entries no change stream will ever mention.
+  fn start_below(below: &[OsString], prune: &[Glob]) -> Option<(Vec<OsString>, String)> {
+    let mut names = Vec::with_capacity(below.len());
+    let mut at = String::new();
+    for segment in below {
+      let text = segment.to_str()?;
+      if text.is_empty() {
+        return None;
+      }
+      let mut components = std::path::Path::new(segment).components();
+      match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(only)), None) if only == segment.as_os_str() => {}
+        _ => return None,
+      }
+      if !at.is_empty() {
+        at.push('/');
+      }
+      at.push_str(text);
+      if prune.iter().any(|glob| glob.is_match(&at)) {
+        return None;
+      }
+      names.push(segment.clone());
+    }
+    Some((names, at))
+  }
+
+  /// The next item, opening or reading one more directory whenever the last chunk is
+  /// exhausted.
   async fn step(mut self) -> Option<(ListItem<OsString>, Self)> {
     loop {
       if let Some(item) = self.ready.pop_front() {
         return Some((item, self));
       }
-      let (dir, at) = self.queue.pop_front()?;
-      match self.read_dir(dir.clone()).await {
-        Ok(entries) => self.absorb(&dir, &at, entries),
-        // One unreadable directory is an ITEM: the listing is incomplete below this key
-        // and complete everywhere else, and only the key says which half the consumer
-        // got.
-        Err(source) => self.ready.push_back(Err(ListError::Io {
-          key: path_components(&dir),
-          source,
-        })),
+      if let Some((root, names, at)) = self.seed.take() {
+        let start = names
+          .iter()
+          .fold(root.clone(), |path, name| path.join(name));
+        match Self::open_start(&self.blocking, root, names).await {
+          Ok(dir) => self.stack.push(Level::new(dir, start, at, 0)),
+          // A symbolic link anywhere on the way down — the starting key itself
+          // included — is refused by the kernel rather than followed, and arrives here as
+          // the one `Io` item that key can honestly be.
+          Err(source) => self.ready.push_back(Err(ListError::Io {
+            key: path_components(&start),
+            source,
+          })),
+        }
+        continue;
       }
+      // Nothing open and nothing seeded: the walk is over.
+      let level = self.stack.pop()?;
+      let Level {
+        dir,
+        path,
+        at,
+        mut pending,
+        exhausted,
+        depth,
+      } = level;
+      if let Some((name, relative)) = pending.pop_front() {
+        let child = path.join(&name);
+        if depth + 1 >= MAX_LIST_DEPTH {
+          // Deeper than the walk may hold open. Reported for the directory's OWN key, not
+          // its parent's: the ground that is missing is everything below this entry.
+          self.ready.push_back(Err(ListError::Io {
+            key: path_components(&child),
+            source: std::io::Error::new(
+              std::io::ErrorKind::InvalidInput,
+              "the listing's depth ceiling was reached, so this directory was not descended",
+            ),
+          }));
+          self.stack.push(Level {
+            dir,
+            path,
+            at,
+            pending,
+            exhausted,
+            depth,
+          });
+          continue;
+        }
+        let (parent, opened) = Self::open_child(&self.blocking, dir, name).await;
+        if let Some(dir) = parent {
+          self.stack.push(Level {
+            dir,
+            path,
+            at,
+            pending,
+            exhausted,
+            depth,
+          });
+        }
+        match opened {
+          Ok(dir) => self.stack.push(Level::new(dir, child, relative, depth + 1)),
+          Err(source) => self.ready.push_back(Err(ListError::Io {
+            key: path_components(&child),
+            source,
+          })),
+        }
+        continue;
+      }
+      if exhausted {
+        // Nothing left to read and nothing left to descend: the level's descriptors close
+        // with it here.
+        continue;
+      }
+      let chunk = Self::read_chunk(&self.blocking, dir).await;
+      let entries = match chunk.entries {
+        Ok(entries) => entries,
+        // One unreadable directory is an ITEM: the listing is incomplete below this key
+        // and complete everywhere else, and only the key says which half the consumer got.
+        // The level is not pushed back — nothing more can be read from it.
+        Err(source) => {
+          self.ready.push_back(Err(ListError::Io {
+            key: path_components(&path),
+            source,
+          }));
+          continue;
+        }
+      };
+      let Some(dir) = chunk.dir else {
+        continue;
+      };
+      let mut level = Level {
+        dir,
+        path,
+        at,
+        pending,
+        exhausted: chunk.exhausted,
+        depth,
+      };
+      self.absorb(&level.path, &level.at, &mut level.pending, entries);
+      self.stack.push(level);
     }
   }
 
-  /// Files one directory's entries: admitted ones onto [`ready`](Self::ready),
-  /// descendable ones onto [`queue`](Self::queue).
+  /// Files one chunk's entries: admitted ones onto [`ready`](Self::ready), descendable
+  /// ones onto the level's own pending list.
   ///
-  /// `dir` is the directory just read — the ground an entry this loop cannot even NAME
-  /// is reported under, exactly as a directory this loop cannot READ is reported under
-  /// its own key in [`step`](Self::step).
-  fn absorb(&mut self, dir: &Path, at: &str, entries: Vec<(PathBuf, Metadata)>) {
-    for (path, metadata) in entries {
-      let Some(name) = path.file_name() else {
-        continue;
-      };
+  /// `path` is the directory the chunk came from — the ground an entry this loop cannot
+  /// even NAME is reported under, exactly as a directory this loop cannot READ is reported
+  /// under its own key in [`step`](Self::step).
+  fn absorb(
+    &mut self,
+    path: &Path,
+    at: &str,
+    pending: &mut VecDeque<(OsString, String)>,
+    entries: Vec<(OsString, Metadata)>,
+  ) {
+    for (name, metadata) in entries {
       // A name that is not valid UTF-8 cannot be matched, yielded, or descended
       // honestly: `prune`/`include` are text patterns, and matching them against a
       // LOSSY rendering would admit, prune, or descend the entry on words the tree
       // does not hold. The watch side makes the same refusal (`tributary-fs`'s
       // `on_enumerated` drops the entry and marks the listing lossy); a listing says
       // it out loud instead, as the one item this entry can honestly be.
-      let Some(name) = name.to_str() else {
+      let Some(text) = name.to_str() else {
         self.ready.push_back(Err(ListError::Io {
-          key: path_components(dir),
+          key: path_components(path),
           source: std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "the entry's name is not UTF-8, so neither the listing nor the watch can name it",
@@ -397,10 +593,11 @@ impl Walk {
         continue;
       };
       let relative = if at.is_empty() {
-        name.to_owned()
+        text.to_owned()
       } else {
-        std::format!("{at}/{name}")
+        std::format!("{at}/{text}")
       };
+      let key = path_components(&path.join(&name));
       if metadata.is_dir() {
         // THE PRUNE WORDS, applied exactly where the arm applies them: a matching
         // directory is neither descended nor reported, so nothing this listing yields
@@ -408,62 +605,304 @@ impl Walk {
         if self.prune.iter().any(|glob| glob.is_match(&relative)) {
           continue;
         }
-        self.queue.push_back((path.clone(), relative));
+        pending.push_back((name, relative));
       } else if let Some(include) = self.include.as_ref() {
         // THE INCLUDE WORDS, likewise: they narrow FILES by their last segment and
         // never a directory — the rule the delivery seat applies to a change.
-        if !include.iter().any(|glob| glob.is_match(name)) {
+        if !include.iter().any(|glob| glob.is_match(text)) {
           continue;
         }
       }
-      self.ready.push_back(Ok((path_components(&path), metadata)));
+      self.ready.push_back(Ok((key, metadata)));
     }
   }
 
-  /// Reads ONE directory on the blocking pool and awaits its answer.
-  ///
-  /// The oneshot is what makes the await cancellation-safe: a consumer that drops the
-  /// stream mid-directory drops the receiver where it stands, and the job's send then
-  /// fails on a pool thread the moment its syscall returns. A job that answers NOTHING —
-  /// the pool refused it, or it unwound — is a failure to READ and is reported as one,
-  /// rather than as an empty directory, which is a different statement entirely.
-  async fn read_dir(&self, dir: PathBuf) -> Result<Vec<(PathBuf, Metadata)>, std::io::Error> {
+  /// Opens the walk's starting directory on the blocking pool: the root with no-follow
+  /// semantics, then one descriptor-relative open per validated name below it.
+  async fn open_start(
+    blocking: &BlockingSpawner,
+    root: PathBuf,
+    names: Vec<OsString>,
+  ) -> Result<OpenDir, std::io::Error> {
     let (tx, rx) = futures_channel::oneshot::channel();
-    (self.blocking)(Box::new(move || {
-      let _ = tx.send(read_dir_blocking(&dir));
+    (*blocking)(Box::new(move || {
+      let _ = tx.send(open_start_blocking(&root, &names));
     }));
-    rx.await.unwrap_or_else(|_| {
-      Err(std::io::Error::other(
-        "the listing's blocking job answered nothing",
-      ))
+    rx.await.unwrap_or_else(|_| Err(job_answered_nothing()))
+  }
+
+  /// Opens one child directory beneath `dir` on the blocking pool, handing `dir` back
+  /// with the answer so the parent stays readable.
+  async fn open_child(
+    blocking: &BlockingSpawner,
+    dir: OpenDir,
+    name: OsString,
+  ) -> (Option<OpenDir>, Result<OpenDir, std::io::Error>) {
+    let (tx, rx) = futures_channel::oneshot::channel();
+    (*blocking)(Box::new(move || {
+      let opened = dir.open_child(&name);
+      let _ = tx.send((dir, opened));
+    }));
+    match rx.await {
+      Ok((dir, opened)) => (Some(dir), opened),
+      Err(_) => (None, Err(job_answered_nothing())),
+    }
+  }
+
+  /// Reads at most [`LIST_CHUNK`] entries of `dir` on the blocking pool and awaits the
+  /// answer.
+  ///
+  /// The open directory is MOVED into the job and handed back with what it read, so no
+  /// descriptor is touched on the async task. That is also what makes the await
+  /// cancellation-safe: a consumer that drops the stream mid-chunk drops the receiver where
+  /// it stands, and the job then closes the directory it holds on a pool thread the moment
+  /// its syscall returns. A job that answers NOTHING — the pool refused it, or it unwound —
+  /// is a failure to READ and is reported as one, rather than as an empty directory, which
+  /// is a different statement entirely.
+  async fn read_chunk(blocking: &BlockingSpawner, dir: OpenDir) -> Chunk {
+    let (tx, rx) = futures_channel::oneshot::channel();
+    (*blocking)(Box::new(move || {
+      let mut dir = dir;
+      let mut read = Vec::new();
+      // A read that fails part way through has nothing to say about the entries it did
+      // get: they are half a directory, and half a directory is not a statement a
+      // consumer can act on. It answers the failure, once, for the whole key.
+      let (entries, exhausted) = match dir.read(LIST_CHUNK, &mut read) {
+        Ok(exhausted) => (Ok(read), exhausted),
+        Err(err) => (Err(err), true),
+      };
+      let _ = tx.send(Chunk {
+        dir: Some(dir),
+        entries,
+        exhausted,
+      });
+    }));
+    rx.await.unwrap_or_else(|_| Chunk {
+      dir: None,
+      entries: Err(job_answered_nothing()),
+      exhausted: true,
     })
   }
 }
 
-/// One directory's entries and their metadata, read with the blocking calls — never
-/// following a symbolic link ([`std::fs::DirEntry::metadata`] does not traverse one), so
-/// a link is reported as itself and the walk never leaves the root it was asked about.
-fn read_dir_blocking(dir: &Path) -> Result<Vec<(PathBuf, Metadata)>, std::io::Error> {
-  let mut entries = Vec::new();
-  for entry in std::fs::read_dir(dir)? {
-    let entry = entry?;
-    let metadata = entry.metadata()?;
-    let kind = if metadata.is_dir() {
-      EntryKind::Dir
-    } else if metadata.is_symlink() {
-      EntryKind::Symlink
-    } else if metadata.is_file() {
-      EntryKind::File
-    } else {
-      EntryKind::Other
-    };
-    let mut listed = Metadata::new(kind, metadata.len());
-    if let Ok(modified) = metadata.modified() {
-      listed = listed.with_modified(modified);
-    }
-    entries.push((entry.path(), listed));
+fn job_answered_nothing() -> std::io::Error {
+  std::io::Error::other("the listing's blocking job answered nothing")
+}
+
+/// Opens the root without following a final symbolic link, then walks down to the starting
+/// key one descriptor-relative open at a time. Each parent closes as its child opens, so
+/// reaching the start costs one open directory however deep it sits.
+fn open_start_blocking(root: &Path, names: &[OsString]) -> Result<OpenDir, std::io::Error> {
+  let mut dir = OpenDir::open_root(root)?;
+  for name in names {
+    dir = dir.open_child(name)?;
   }
-  Ok(entries)
+  Ok(dir)
+}
+
+/// One open directory of a unix listing: the descriptor every `openat`/`statat` beneath it
+/// names, and the reader its entries come out of.
+///
+/// Two descriptors rather than one because `rustix::fs::Dir` takes a descriptor and does
+/// not lend it back, and the walk needs one of its own to open and stat children RELATIVE
+/// to this directory. That is the whole containment argument: a child is reached through
+/// the descriptor of the directory it was read from, never by re-resolving a path that a
+/// rename may have re-pointed since, and both the open and the stat refuse to traverse a
+/// symbolic link.
+#[cfg(unix)]
+struct OpenDir {
+  fd: std::os::fd::OwnedFd,
+  reader: rustix::fs::Dir,
+}
+
+#[cfg(unix)]
+impl OpenDir {
+  /// `O_DIRECTORY` so only a directory can be opened at all, `O_NOFOLLOW` so a symbolic
+  /// link in the final position is `ELOOP` rather than a door out of the tree, and
+  /// `O_CLOEXEC` because a listing's descriptors are this process's business.
+  fn flags() -> rustix::fs::OFlags {
+    rustix::fs::OFlags::RDONLY
+      | rustix::fs::OFlags::DIRECTORY
+      | rustix::fs::OFlags::NOFOLLOW
+      | rustix::fs::OFlags::CLOEXEC
+  }
+
+  fn open_root(path: &Path) -> Result<Self, std::io::Error> {
+    let fd = rustix::fs::openat(
+      rustix::fs::CWD,
+      path,
+      Self::flags(),
+      rustix::fs::Mode::empty(),
+    )?;
+    Self::over(fd)
+  }
+
+  fn open_child(&self, name: &OsString) -> Result<Self, std::io::Error> {
+    let fd = rustix::fs::openat(
+      &self.fd,
+      name.as_os_str(),
+      Self::flags(),
+      rustix::fs::Mode::empty(),
+    )?;
+    Self::over(fd)
+  }
+
+  fn over(fd: std::os::fd::OwnedFd) -> Result<Self, std::io::Error> {
+    let reader = rustix::fs::Dir::read_from(&fd)?;
+    Ok(Self { fd, reader })
+  }
+
+  /// Reads at most `limit` entries with the metadata `statat` reads for each WITHOUT
+  /// following a symbolic link, and reports whether the directory is exhausted.
+  ///
+  /// `.` and `..` are not entries of the listing: one is the directory itself and the
+  /// other leaves it.
+  fn read(
+    &mut self,
+    limit: usize,
+    into: &mut Vec<(OsString, Metadata)>,
+  ) -> Result<bool, std::io::Error> {
+    use std::os::unix::ffi::OsStrExt;
+
+    while into.len() < limit {
+      let entry = match self.reader.read() {
+        None => return Ok(true),
+        Some(Ok(entry)) => entry,
+        Some(Err(err)) => return Err(err.into()),
+      };
+      let bytes = entry.file_name().to_bytes();
+      if bytes == b"." || bytes == b".." {
+        continue;
+      }
+      let name = std::ffi::OsStr::from_bytes(bytes).to_owned();
+      let stat = rustix::fs::statat(
+        &self.fd,
+        name.as_os_str(),
+        rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+      )?;
+      into.push((name, metadata_of(&stat)));
+    }
+    Ok(false)
+  }
+}
+
+/// One entry's facts, read from the `statat` that did not follow a link: a symbolic link
+/// is therefore reported as ITSELF, which is what keeps it out of the descent.
+#[cfg(unix)]
+fn metadata_of(stat: &rustix::fs::Stat) -> Metadata {
+  let class = rustix::fs::FileType::from_raw_mode(stat.st_mode);
+  let kind = if class == rustix::fs::FileType::Directory {
+    EntryKind::Dir
+  } else if class == rustix::fs::FileType::Symlink {
+    EntryKind::Symlink
+  } else if class == rustix::fs::FileType::RegularFile {
+    EntryKind::File
+  } else {
+    EntryKind::Other
+  };
+  let listed = Metadata::new(kind, u64::try_from(stat.st_size).unwrap_or(0));
+  match since_epoch(stat.st_mtime, stat.st_mtime_nsec) {
+    Some(offset) => listed.with_modified(std::time::UNIX_EPOCH + offset),
+    None => listed,
+  }
+}
+
+/// A `stat`'s seconds-and-nanoseconds pair as an offset from the epoch, or `None` for a
+/// time before it — which is the same answer a source that cannot read a time gives.
+///
+/// Generic over the two field types because they are not the same everywhere: the kernel's
+/// own `stat` carries unsigned seconds where the C library's carries a signed `time_t`, and
+/// writing the conversion once over whatever they are keeps one body for every unix.
+#[cfg(unix)]
+fn since_epoch<S, N>(secs: S, nanos: N) -> Option<std::time::Duration>
+where
+  u64: TryFrom<S>,
+  u32: TryFrom<N>,
+{
+  let secs = u64::try_from(secs).ok()?;
+  let nanos = u32::try_from(nanos).ok()?;
+  Some(std::time::Duration::new(secs, nanos))
+}
+
+/// The non-unix listing's open directory. `std` has no descriptor-relative open, so
+/// containment rests on a no-follow check taken immediately before the read rather than on
+/// a descriptor that cannot be re-pointed: a rename between the two still leaves a window.
+/// The residual is recorded rather than papered over — the platform this affects is the one
+/// whose backends are deferred.
+#[cfg(not(unix))]
+struct OpenDir {
+  path: PathBuf,
+  reader: std::fs::ReadDir,
+}
+
+#[cfg(not(unix))]
+impl OpenDir {
+  fn open_root(path: &Path) -> Result<Self, std::io::Error> {
+    Self::over(path.to_path_buf())
+  }
+
+  fn open_child(&self, name: &OsString) -> Result<Self, std::io::Error> {
+    Self::over(self.path.join(name))
+  }
+
+  fn over(path: PathBuf) -> Result<Self, std::io::Error> {
+    let metadata = std::fs::symlink_metadata(&path)?;
+    // A symbolic link and a non-directory are the same refusal here, under the kind that
+    // is stable to name: a listing descends directories, and it reaches one by opening it
+    // rather than by following anything to it. (`ErrorKind::FilesystemLoop`, which the
+    // unix side gets from the kernel's own `ELOOP`, is not stable to construct.)
+    if metadata.file_type().is_symlink() {
+      return Err(std::io::Error::new(
+        std::io::ErrorKind::NotADirectory,
+        "a listing reports a symbolic link and never opens one",
+      ));
+    }
+    if !metadata.is_dir() {
+      return Err(std::io::Error::new(
+        std::io::ErrorKind::NotADirectory,
+        "a listing descends directories only",
+      ));
+    }
+    let reader = std::fs::read_dir(&path)?;
+    Ok(Self { path, reader })
+  }
+
+  /// Reads at most `limit` entries with their own metadata — [`std::fs::DirEntry::metadata`]
+  /// does not traverse a symbolic link, so a link is reported as itself here too.
+  fn read(
+    &mut self,
+    limit: usize,
+    into: &mut Vec<(OsString, Metadata)>,
+  ) -> Result<bool, std::io::Error> {
+    while into.len() < limit {
+      let entry = match self.reader.next() {
+        None => return Ok(true),
+        Some(Ok(entry)) => entry,
+        Some(Err(err)) => return Err(err),
+      };
+      let metadata = entry.metadata()?;
+      into.push((entry.file_name(), metadata_of(&metadata)));
+    }
+    Ok(false)
+  }
+}
+
+#[cfg(not(unix))]
+fn metadata_of(metadata: &std::fs::Metadata) -> Metadata {
+  let kind = if metadata.is_dir() {
+    EntryKind::Dir
+  } else if metadata.is_symlink() {
+    EntryKind::Symlink
+  } else if metadata.is_file() {
+    EntryKind::File
+  } else {
+    EntryKind::Other
+  };
+  let listed = Metadata::new(kind, metadata.len());
+  match metadata.modified() {
+    Ok(modified) => listed.with_modified(modified),
+    Err(_) => listed,
+  }
 }
 
 /// How many pending releases one `arm` hands to the watcher's control channel via the

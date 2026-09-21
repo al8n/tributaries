@@ -17,7 +17,7 @@ default = ["fs"]
 # re-exports, the pure-fs constructor and runtime aliases). Off, the crate is the
 # generic core over `tributary-proto` alone — a custom-`Source` consumer skips the
 # whole fs stack.
-fs = ["dep:tributary-fs"]
+fs = ["dep:tributary-fs", "dep:rustix"]
 # Runtime features are orthogonal to `fs`: they gate the async driver's
 # `Tokio*`/`Smol*` aliases and forward the runtime into `tributary-fs` only when the
 # fs binding is enabled too (the weak `?` dependency). The sans-I/O engines need no
@@ -97,6 +97,18 @@ tributary-proto = { version = "0.2", path = "../tributary-proto", features = [
 # than running on a name something else can compute.
 [target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
 getrandom = { version = "0.3", optional = true }
+
+# The listing walk's traversal, and nothing else. A walk that re-opens a queued PATH can be
+# sent out of the tree it was asked about by a rename that puts a symbolic link where a
+# directory was, so every descent is DESCRIPTOR-RELATIVE (`openat`/`statat`, no-follow) with
+# one reader per open level — none of which `std` has a door to. Enabled by the `fs` feature
+# alone, on unix alone: the non-unix fallback is std's own `read_dir`, and a consumer with
+# no fs binding pulls nothing.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", default-features = false, features = [
+  "fs",
+  "std",
+], optional = true }
 
 [dev-dependencies]
 # Mirror a real consumer's manifest: the indexer-shaped integration suite

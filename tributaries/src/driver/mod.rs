@@ -794,7 +794,10 @@ impl<C, V, R, H> Tributaries<C, V, R, H> {
   /// the last COMMITTED watch-set, so re-read after your `watch().await` returns) — and
   /// [`Unsupported`](crate::ListError::Unsupported), from a source that cannot
   /// enumerate. A per-key [`Io`](crate::ListError::Io) is an item and the walk goes on.
-  #[must_use]
+  ///
+  /// The returned listing carries its own `#[must_use]`: it is a `Stream`, which does
+  /// nothing at all until it is driven, so a second one here would only repeat what the
+  /// type already says.
   pub fn list(&self, key: &[C]) -> BoxListing<C>
   where
     C: Ord + Clone + Send + 'static,

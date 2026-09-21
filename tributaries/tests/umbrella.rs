@@ -1247,6 +1247,8 @@ async fn the_umbrella_door_lists_what_the_source_lists() {
     .await
     .expect("the root arms");
 
+  // Sorted on both sides: the two doors run the ONE walk, so they answer the same SET of
+  // entries — which is the claim — and the walk's own order is not part of it.
   let mut through_door: Vec<Vec<OsString>> = collect_keys(watcher.list(&root_key)).await;
   through_door.sort();
 
@@ -1294,7 +1296,12 @@ async fn the_umbrella_door_lists_what_the_source_lists() {
   watcher.close().await.expect("the owner closes");
 }
 
-/// Collects the located keys a listing yielded, in order, panicking on any failure item.
+/// Collects the located keys a listing yielded, panicking on any failure item.
+///
+/// Compared as a SET by every caller: the walk's order is its own business — pre-order
+/// depth-first today, because a stack of open directories is what keeps the walk inside the
+/// tree and its memory off the width of any one directory — and a consumer reconciles by
+/// key, never by position.
 ///
 /// Generic over the stream so it takes BOTH doors: the umbrella's boxed `'static` one and
 /// the trait method's, which borrows the source it was asked of.
