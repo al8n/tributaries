@@ -746,7 +746,9 @@ struct RootEntry {
   stats: Option<crate::os::BackendStatsHandle>,
   /// This root's coverage state, as the driver last published it — what
   /// [`Watcher::coverage`](Watcher::coverage) answers. A root is born
-  /// [`Coverage::Proven`]; only a refused liveness tick moves it.
+  /// [`Coverage::Proven`] and the core moves it from there and nowhere else:
+  /// re-registering a live scope carries the published value across
+  /// ([`RootSet::insert_live`]), so the registry can only ever mirror the core.
   coverage: Coverage,
 }
 
@@ -873,9 +875,18 @@ impl RootSet {
   /// Records a live root: every index plus `entries`, so the two can never disagree. Any
   /// entry this displaces (a re-live of the same scope) is unindexed first — the single
   /// mutation point for a live root, so no caller can index half of one.
-  fn insert_live(&mut self, scope: ScopeId, entry: RootEntry) {
+  ///
+  /// The displaced entry's [`coverage`](RootEntry::coverage) is CARRIED FORWARD, because
+  /// the core is the only writer of that field ([`ScopeRegistry::scope_coverage`]). A root
+  /// replace or a widen re-registers a LIVE scope while the core's own episode is
+  /// untouched, so a re-registration that reset the field would have the registry claim a
+  /// liveness nothing has proven — and the core, whose state did not move, would publish
+  /// nothing to correct it. A scope the registry does not already hold is genuinely new and
+  /// starts at the caller's value.
+  fn insert_live(&mut self, scope: ScopeId, mut entry: RootEntry) {
     if let Some(previous) = self.entries.remove(&scope) {
       self.unindex_live(scope, &previous);
+      entry.coverage = previous.coverage;
     }
     self.index_live(scope, &entry);
     self.entries.insert(scope, entry);
@@ -993,6 +1004,8 @@ impl ScopeRegistry for RegistryWriter {
         ancestors: ancestors.into(),
         backend,
         stats,
+        // The BIRTH value only: a scope the registry already holds keeps the
+        // coverage the core last published ([`RootSet::insert_live`]).
         coverage: Coverage::Proven,
       },
     );

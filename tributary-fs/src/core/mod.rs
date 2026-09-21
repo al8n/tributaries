@@ -4515,6 +4515,11 @@ impl DriverCore {
     // reservation (INV-ROOT leg (i)).
     state.pending_widen = None;
     state.mounts_authoritative = false;
+    // The replacement was opened, read and armed to get here, so any episode the
+    // RETIRED root left open is closed by the commit itself — ahead of the
+    // covering `Rescan` the cut below mints, which is the regain's own
+    // instruction ([`close_coverage_episode`](Self::close_coverage_episode)).
+    Self::close_coverage_episode(&mut self.effects, scope, state);
 
     // The cut: old-world parked work and probes are dominated, and the
     // Monitor turns the swap into the epoch-bumped covering Rescan.
@@ -4972,6 +4977,10 @@ impl DriverCore {
     // its loss is signalled, and neither happened — so the binding is live
     // and correctly placed NOW, with no out-of-band sample consulted.
     state.pending_widen = None;
+    // The widened root was opened, read and pre-armed to reach this commit, so an
+    // episode the OLD root left open is closed here for the reason the stream
+    // replace closes one ([`close_coverage_episode`](Self::close_coverage_episode)).
+    Self::close_coverage_episode(&mut self.effects, scope, state);
     // The refresh alone is superseded, and the widen purges it for the reason the
     // stream replace does: it was armed against a different object, and the
     // driver's generation reaches only probes already dispatched (see
@@ -5082,6 +5091,40 @@ impl DriverCore {
       incarnation: state.incarnation,
       root,
     });
+  }
+
+  /// Closes an open coverage episode at a WORLD START, and resets the
+  /// probe-budget latches with it.
+  ///
+  /// A commit that swaps the root — a stream replace, a widen — opened, read and
+  /// armed the new root before it ran, and that is exactly what a completed
+  /// liveness probe establishes: [`on_mounts_refreshed`](Self::on_mounts_refreshed)
+  /// closes an episode on ONE of those. Leaving it open would have the scope go on
+  /// reporting that nothing is proving ground it has just read, with no bound on
+  /// the claim but the budget freeing a slot.
+  ///
+  /// The edge is pushed BEFORE the commit's own drain, so the effect queue — which
+  /// the driver executes front-first — hands the registry write over AHEAD of the
+  /// covering `Rescan` the commit mints. That instruction is the regain's: a
+  /// consumer reads the state when it arrives and must already find the new one.
+  ///
+  /// Both latches reset unconditionally, so the new world starts with the clean
+  /// pair a birth starts with: a refusal right after the swap opens a SECOND,
+  /// honest episode and stands its own instruction rather than inheriting a
+  /// recovery the retired root had already spent.
+  fn close_coverage_episode(
+    effects: &mut VecDeque<Effect>,
+    scope: ScopeId,
+    state: &mut ScopeState,
+  ) {
+    state.budget_recovered = false;
+    state.budget_report_owed = false;
+    if std::mem::replace(&mut state.coverage_unproven, false) {
+      effects.push_back(Effect::Coverage {
+        scope,
+        unproven: false,
+      });
+    }
   }
 
   /// Withdraws the refresh `scope` has pending because the driver DECLINED to

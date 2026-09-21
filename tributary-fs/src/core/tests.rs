@@ -14824,6 +14824,43 @@ mod root_widened {
     );
   }
 
+  /// The widen is a world start too: the splice ran because the widened root was
+  /// opened, read and pre-armed, which closes an episode the OLD root left open —
+  /// and the latches reset with it, so the next refused tick is a second episode
+  /// rather than a continuation of a retired one.
+  ///
+  /// Revert witness: leave the episode open and the registry, re-registered at
+  /// the widened root, reports a liveness the core is still not proving.
+  #[test]
+  fn a_widen_commit_closes_an_open_coverage_episode() {
+    let (mut core, scope, _root_watch, _boot) = live_at("/r/sub", 1, true);
+
+    core.on_refresh_declined(scope, at(1), DeclineReason::BudgetFull);
+    let lost = drain(&mut core);
+    assert_eq!(
+      coverage_publishes(&lost),
+      vec![true],
+      "staging: the episode is open: {lost:?}"
+    );
+    core.on_delivery(scope, Delivery::Accepted, at(2));
+
+    let _reserved = widen(&mut core, scope, meta("/r", 9), at(3));
+    let spliced = drain(&mut core);
+    assert_eq!(
+      coverage_publishes(&spliced),
+      vec![false],
+      "the commit closes the episode, exactly once: {spliced:?}"
+    );
+
+    core.on_refresh_declined(scope, at(4), DeclineReason::BudgetFull);
+    let again = drain(&mut core);
+    assert_eq!(
+      coverage_publishes(&again),
+      vec![true],
+      "and a refusal after it opens a second, honest episode: {again:?}"
+    );
+  }
+
   #[test]
   fn the_commit_splices_the_world_without_domination() {
     let (mut core, scope, root_watch, _boot) = live_at("/r/sub", 1, true);
@@ -22064,6 +22101,80 @@ mod coverage_transitions {
     assert!(
       coverage_publishes(&dead).is_empty(),
       "the death funnel owns this outcome, not the transition: {dead:?}"
+    );
+  }
+
+  /// A kernel-recursive replacement for `/r`'s live scope, on the same device.
+  fn replacement(root: &str, ino: u128) -> RootMeta {
+    RootMeta {
+      root: PathBuf::from(root),
+      root_dev: 1,
+      root_mnt_id: None,
+      mounts: Vec::new(),
+      identity: crate::os::RootIdentity::new(1, ino),
+      ancestors: Vec::new(),
+      backend: BackendKind::FsEvents,
+    }
+  }
+
+  /// A WORLD START closes an open episode, because opening, reading and arming
+  /// the new root is the same proof a completed probe carries — and it closes it
+  /// AHEAD of the covering `Rescan` the same commit mints, which is the regain's
+  /// own instruction: a consumer reads the state when that arrives.
+  ///
+  /// The latches go with it, so the swap is not a licence to stay silent: the
+  /// very next refused tick opens a second episode and stands its own
+  /// instruction.
+  ///
+  /// Revert witnesses: leave the episode open and the swap publishes nothing
+  /// while the registry claims a liveness the core never proved; push the edge
+  /// after the drain and it reaches the consumer behind its own `Rescan`.
+  #[test]
+  fn a_world_swap_closes_the_episode_before_its_covering_rescan() {
+    let (mut core, scope) = live_core();
+
+    core.on_refresh_declined(scope, at(1), DeclineReason::BudgetFull);
+    let lost = drain(&mut core);
+    assert_eq!(
+      coverage_publishes(&lost),
+      vec![true],
+      "staging: the episode is open: {lost:?}"
+    );
+    core.on_delivery(scope, Delivery::Accepted, at(2));
+
+    core.on_root_replaced(scope, replacement("/r2", 7), at(3));
+    let swapped = drain(&mut core);
+    assert_eq!(
+      coverage_publishes(&swapped),
+      vec![false],
+      "the commit closes the episode, exactly once: {swapped:?}"
+    );
+    let edge = swapped
+      .iter()
+      .position(|effect| matches!(effect, Effect::Coverage { .. }))
+      .expect("the commit published the closing edge");
+    let instruction = swapped
+      .iter()
+      .position(|effect| matches!(effect, Effect::Emit { change, .. } if change.kind().is_rescan()))
+      .expect("the commit stands its covering Rescan");
+    assert!(
+      edge < instruction,
+      "and the state reaches the registry BEFORE the event a consumer reads it \
+       on: {swapped:?}"
+    );
+
+    core.on_delivery(scope, Delivery::Accepted, at(4));
+    core.on_refresh_declined(scope, at(5), DeclineReason::BudgetFull);
+    let again = drain(&mut core);
+    assert_eq!(
+      coverage_publishes(&again),
+      vec![true],
+      "a refusal right after the swap is a second, honest episode: {again:?}"
+    );
+    assert!(
+      emits(&again).iter().any(|change| change.kind().is_rescan()),
+      "with an instruction of its own, because the swap reset the latches: \
+       {again:?}"
     );
   }
 }
