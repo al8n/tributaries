@@ -790,8 +790,10 @@ impl<C, V, R, H> Tributaries<C, V, R, H> {
   /// Each item is one entry or one failure (see
   /// [`ListError`](crate::ListError)). The two that end the stream after a single item
   /// are [`UnknownRoot`](crate::ListError::UnknownRoot) — no armed root covers `key`
-  /// (never watched, already gone, or a `watch` that has not committed yet: this reads
-  /// the last COMMITTED watch-set, so re-read after your `watch().await` returns) — and
+  /// (never watched, already gone, a `watch` that has not committed yet — this reads the
+  /// last COMMITTED watch-set, so re-read after your `watch().await` returns — or a key
+  /// under ground the covering root's source coverage was PRUNED back from, which is
+  /// unwatched in every sense that matters) — and
   /// [`Unsupported`](crate::ListError::Unsupported), from a source that cannot
   /// enumerate. A per-key [`Io`](crate::ListError::Io) is an item and the walk goes on.
   ///
@@ -808,12 +810,21 @@ impl<C, V, R, H> Tributaries<C, V, R, H> {
         ListError::Unsupported,
       ))));
     };
-    let Some((root, globs)) = self.view.root_covering(key) else {
+    let Some((root, globs, cover)) = self.view.root_covering(key) else {
       return Box::pin(futures_util::stream::once(core::future::ready(Err(
         ListError::UnknownRoot,
       ))));
     };
-    lister.list(root, key, &globs)
+    // A root whose coverage was PRUNED still answers above for every key under its
+    // original span, and the discarded region has no delivery behind it: a start there is
+    // as unwatched as a key no root covers at all. A start ABOVE the survivors is served —
+    // it is where a re-enumeration begins — and the walk is fenced to them.
+    if !crate::source::cover_reaches(cover.as_deref(), key) {
+      return Box::pin(futures_util::stream::once(core::future::ready(Err(
+        ListError::UnknownRoot,
+      ))));
+    }
+    lister.list(root, key, &globs, cover.as_deref())
   }
 
   /// Subscribes to `key` (carrying caller `value`) under the per-watch

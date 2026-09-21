@@ -260,20 +260,37 @@ impl FsLister {
     root: RootHandle,
     from: &[OsString],
     globs: &RootGlobs,
+    cover: Option<&[Vec<OsString>]>,
   ) -> impl Stream<Item = ListItem<OsString>> + Send + use<> {
     let bound = view.root_path(root).zip(view.root_identity(root));
-    futures_util::stream::unfold(Walk::new(bound, from, globs, blocking), Walk::step)
+    futures_util::stream::unfold(
+      Walk::new(
+        bound,
+        from,
+        globs,
+        cover.map(<[Vec<OsString>]>::to_vec),
+        blocking,
+      ),
+      Walk::step,
+    )
   }
 }
 
 impl RootLister<OsString, RootHandle> for FsLister {
-  fn list(&self, root: RootHandle, from: &[OsString], globs: &RootGlobs) -> BoxListing<OsString> {
+  fn list(
+    &self,
+    root: RootHandle,
+    from: &[OsString],
+    globs: &RootGlobs,
+    cover: Option<&[Vec<OsString>]>,
+  ) -> BoxListing<OsString> {
     Box::pin(Self::walk(
       self.view.clone(),
       Arc::clone(&self.blocking),
       root,
       from,
       globs,
+      cover,
     ))
   }
 }
@@ -370,6 +387,9 @@ struct Walk {
   prune: Vec<Glob>,
   /// The file narrowing, matched against a file's last segment. `None` is unengaged.
   include: Option<Vec<Glob>>,
+  /// The ground the source still backs for this root, as key prefixes. `None` is full
+  /// coverage; `Some` fences both what may be descended and what may be yielded.
+  cover: Option<Vec<Vec<OsString>>>,
   /// The start still to be opened: the root's path, the object identity that path must
   /// resolve to, and the validated plain names that lead down to the starting key, with
   /// the root-relative text of that key.
@@ -396,6 +416,7 @@ impl Walk {
     bound: Option<BoundRoot>,
     from: &[OsString],
     globs: &RootGlobs,
+    cover: Option<Vec<Vec<OsString>>>,
     blocking: BlockingSpawner,
   ) -> Self {
     let prune = globs.prune().to_vec();
@@ -419,6 +440,7 @@ impl Walk {
       blocking,
       prune,
       include: globs.include().map(<[Glob]>::to_vec),
+      cover,
       seed,
       stack: Vec::new(),
       ready,
@@ -614,7 +636,17 @@ impl Walk {
         std::format!("{at}/{text}")
       };
       let key = path_components(&path.join(&name));
+      // THE RETAINED COVER — the source's ACTUAL coverage rather than the root's geometric
+      // span. A pruned region has no delivery behind it, so listing it would hand a
+      // consumer entries it seeds its picture from and is then never told about again. A
+      // directory is ENTERED while it can still lead to retained ground and REPORTED only
+      // where the cover holds it: an ancestor of a surviving prefix is a door to retained
+      // ground, not retained ground itself.
+      let cover = self.cover.as_deref();
       if metadata.is_dir() {
+        if !crate::source::cover_reaches(cover, &key) {
+          continue;
+        }
         // THE PRUNE WORDS, applied exactly where the arm applies them: a matching
         // directory is neither descended nor reported, so nothing this listing yields
         // can sit under ground the watch refuses to enter.
@@ -622,10 +654,18 @@ impl Walk {
           continue;
         }
         pending.push_back((name, relative));
-      } else if let Some(include) = self.include.as_ref() {
+        if !crate::source::cover_holds(cover, &key) {
+          continue;
+        }
+      } else {
+        if !crate::source::cover_holds(cover, &key) {
+          continue;
+        }
         // THE INCLUDE WORDS, likewise: they narrow FILES by their last segment and
         // never a directory — the rule the delivery seat applies to a change.
-        if !include.iter().any(|glob| glob.is_match(text)) {
+        if let Some(include) = self.include.as_ref()
+          && !include.iter().any(|glob| glob.is_match(text))
+        {
           continue;
         }
       }
@@ -1600,6 +1640,10 @@ impl<R> Source<OsString> for FsSource<R> {
       handle,
       from.as_deref().unwrap_or(&[]),
       globs,
+      // No cover on the DIRECT seam: the retained cover is the umbrella's bookkeeping of
+      // what it asked this source to prune, and a caller holding the source itself has no
+      // umbrella above it to have narrowed anything.
+      None,
     )
   }
 

@@ -1315,3 +1315,120 @@ async fn collect_keys(
     .map(|item| item.expect("every entry of a readable tree is reported").0)
     .collect()
 }
+
+/// One narrowed root, staged the way the set-cover prune actually happens: sub A pins the
+/// root at its own key and sub B covers `/keep`; unwatching A leaves the root over-broad,
+/// so the umbrella prunes the source's coverage down to `{/keep}` and records it.
+async fn narrowed_root(prefix: &str) -> (TempDir, PathBuf, TokioTributaries) {
+  let (dir, root) = scratch(prefix);
+  let keep = root.join("keep");
+  let dropped = root.join("drop");
+  std::fs::create_dir_all(&keep).expect("create keep");
+  std::fs::create_dir_all(&dropped).expect("create drop");
+  std::fs::write(keep.join("kept.txt"), b"a").expect("write");
+  std::fs::write(dropped.join("gone.txt"), b"b").expect("write");
+
+  let w = watcher(TributariesOptions::new());
+  let sub_a = w
+    .watch(key(&root), (), WatchOptions::new())
+    .await
+    .expect("watch the root");
+  let _sub_b = w
+    .watch(key(&keep), (), WatchOptions::new())
+    .await
+    .expect("watch /keep");
+  w.unwatch(sub_a)
+    .await
+    .expect("unwatch the root-key subscription");
+  (dir, root, w)
+}
+
+/// A key under ground the root's coverage was PRUNED back from is `UnknownRoot`, not an
+/// enumeration. The armed root still answers for it geometrically — its key is still an
+/// ancestor — but the source no longer backs that region, so nothing will ever be
+/// delivered under it. Answering with a tree would be the opposite instruction to the one
+/// a consumer needs: it would seed a picture from entries it is never told about again.
+///
+/// Revert witness: resolve the listing by the armed root's key alone and the discarded
+/// subtree enumerates cleanly, with every key reading as being inside the watch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_under_a_pruned_region_answers_unknown_root() {
+  let (_dir, root, w) = narrowed_root("list-cover-pruned").await;
+
+  let refused: Vec<tributaries::ListItem<OsString>> =
+    w.list(&key(&root.join("drop"))).collect::<Vec<_>>().await;
+  assert!(
+    refused.len() == 1
+      && refused[0]
+        .as_ref()
+        .err()
+        .is_some_and(ListError::is_unknown_root),
+    "a start inside the pruned region is UnknownRoot, once: {refused:?}"
+  );
+
+  w.close().await.expect("close");
+}
+
+/// A start ABOVE the survivors is served — it is where a re-enumeration begins — and the
+/// walk is FENCED to them: the discarded subtree is neither descended nor reported, so
+/// everything the listing yields is ground a change would be delivered for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_root_wide_listing_of_a_narrowed_root_yields_only_its_retained_prefixes() {
+  let (_dir, root, w) = narrowed_root("list-cover-fence").await;
+
+  let mut listed = collect_keys(w.list(&key(&root))).await;
+  listed.sort();
+  let mut expected = vec![
+    key(&root.join("keep")),
+    key(&root.join("keep").join("kept.txt")),
+  ];
+  expected.sort();
+  assert_eq!(
+    listed, expected,
+    "only the retained prefix's ground is listed — the pruned subtree is not even entered"
+  );
+
+  w.close().await.expect("close");
+}
+
+/// And a root GROWN BACK to full coverage lists everything again: the cover is the
+/// source's live answer, not a latch, so the fence lifts exactly when the coverage returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_grown_back_root_lists_everything() {
+  let (_dir, root, w) = narrowed_root("list-cover-regrown").await;
+
+  // Re-watching the root's own key is the cancel-equivalent grow: the awaited `Source::grow`
+  // reclaims the whole span and the record goes back to full coverage.
+  // `CoverageIncomplete` is the documented retryable outcome of that fence, so the caller's
+  // contract is to re-issue (see `covered_outside_grow_fence_delivers_an_immediate_write`).
+  let mut regrown = None;
+  for _ in 0..40 {
+    match w.watch(key(&root), (), WatchOptions::new()).await {
+      Ok(sub) => {
+        regrown = Some(sub);
+        break;
+      }
+      Err(err) if err.is_coverage_incomplete() => {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+      }
+      Err(err) => panic!("the regrowing watch failed: {err}"),
+    }
+  }
+  let _regrown = regrown.expect("the root-wide watch grows back within the budget");
+
+  let mut listed = collect_keys(w.list(&key(&root))).await;
+  listed.sort();
+  let mut expected = vec![
+    key(&root.join("drop")),
+    key(&root.join("drop").join("gone.txt")),
+    key(&root.join("keep")),
+    key(&root.join("keep").join("kept.txt")),
+  ];
+  expected.sort();
+  assert_eq!(
+    listed, expected,
+    "full coverage lists the whole tree again: {listed:?}"
+  );
+
+  w.close().await.expect("close");
+}

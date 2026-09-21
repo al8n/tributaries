@@ -90,6 +90,16 @@ All notable changes to this workspace are documented here. The format is based o
   root registry (`tributary_fs::RootView`) and its blocking pool rather than the source,
   and both doors run the ONE walk.
 
+  A listing is bound to the root's OBJECT and to its LIVE coverage. On unix the opened root
+  descriptor is compared against the identity the registry holds, so a root directory
+  renamed away and re-created under its name — or reached through a replaced ancestor —
+  answers `ListError::UnknownRoot` instead of enumerating an unrelated tree under the root's
+  keys, while a path that reaches the registered object through a symlinked ancestor still
+  lists. And after a set-cover PRUNE the discarded region is neither descended nor reported,
+  with a start inside it answering `ListError::UnknownRoot`: ground the source no longer
+  backs has no change delivery behind it, so a listing there would seed a picture the
+  consumer is never told about again.
+
 - **`tributary-fs`** — `Watcher::coverage(root) -> Option<Coverage>`, the same state for a
   consumer of the direct fs stream, plus the covering `Rescan` the regaining probe now
   stands. A root REPLACE or WIDEN reconciles the episode instead of resetting it: the

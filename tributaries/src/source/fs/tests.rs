@@ -2516,6 +2516,7 @@ fn absorb_refuses_a_non_utf8_leaf_an_include_pattern_would_match_lossily() {
     blocking: Arc::new(|_| unreachable!("absorb never touches the blocking spawner")),
     prune: globs.prune().to_vec(),
     include: globs.include().map(<[Glob]>::to_vec),
+    cover: None,
     seed: None,
     stack: Vec::new(),
     ready: Default::default(),
@@ -2594,6 +2595,7 @@ fn absorb_refuses_a_non_utf8_directory_a_prune_pattern_would_not_match_lossily()
     blocking: Arc::new(|_| unreachable!("absorb never touches the blocking spawner")),
     prune: globs.prune().to_vec(),
     include: globs.include().map(<[Glob]>::to_vec),
+    cover: None,
     seed: None,
     stack: Vec::new(),
     ready: Default::default(),
@@ -2698,7 +2700,7 @@ mod listing {
     globs: &RootGlobs,
   ) -> (Vec<ListItem<OsString>>, usize) {
     let jobs = Arc::new(AtomicUsize::new(0));
-    drive(Walk::new(bound(root), from, globs, spawner(&jobs))).await
+    drive(Walk::new(bound(root), from, globs, None, spawner(&jobs))).await
   }
 
   /// The root as the lister receives it: its path plus the object identity the registry
@@ -2738,7 +2740,7 @@ mod listing {
       let mut from = path_components(&root);
       from.extend(suffix.iter().map(|part| (*part).to_owned()));
       let jobs = Arc::new(AtomicUsize::new(0));
-      let walk = Walk::new(Some((root, UNOPENED)), &from, globs, spawner(&jobs));
+      let walk = Walk::new(Some((root, UNOPENED)), &from, globs, None, spawner(&jobs));
       walk.seed.is_none()
         && walk.ready.len() == 1
         && matches!(walk.ready.front(), Some(Err(ListError::UnknownRoot)))
@@ -2774,7 +2776,13 @@ mod listing {
     let mut inside = path_components(&root);
     inside.push(OsString::from("sub"));
     let jobs = Arc::new(AtomicUsize::new(0));
-    let walk = Walk::new(Some((root, UNOPENED)), &inside, &plain, spawner(&jobs));
+    let walk = Walk::new(
+      Some((root, UNOPENED)),
+      &inside,
+      &plain,
+      None,
+      spawner(&jobs),
+    );
     assert!(
       walk.ready.is_empty() && walk.seed.is_some(),
       "staging: a plain name under the root is not refused"
@@ -2864,6 +2872,7 @@ mod listing {
       bound(&root),
       &path_components(&root),
       &RootGlobs::new(),
+      None,
       spawner(&jobs),
     ))
     .await;
@@ -2954,6 +2963,7 @@ mod listing {
       armed,
       &path_components(&watched),
       &RootGlobs::new(),
+      None,
       spawner(&jobs),
     ))
     .await;
@@ -2984,6 +2994,7 @@ mod listing {
       Some((through_link.clone(), identity)),
       &path_components(&through_link),
       &RootGlobs::new(),
+      None,
       spawner(&jobs),
     ))
     .await;

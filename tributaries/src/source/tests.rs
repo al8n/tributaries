@@ -108,7 +108,13 @@ fn blanket_local_source_forwards_every_item() {
   struct ProbeLister;
 
   impl RootLister<u8, u8> for ProbeLister {
-    fn list(&self, _root: u8, _from: &[u8], _globs: &RootGlobs) -> BoxListing<u8> {
+    fn list(
+      &self,
+      _root: u8,
+      _from: &[u8],
+      _globs: &RootGlobs,
+      _cover: Option<&[Vec<u8>]>,
+    ) -> BoxListing<u8> {
       Box::pin(futures_util::stream::once(core::future::ready(Err(
         ListError::Io {
           key: vec![9],
@@ -166,7 +172,7 @@ fn blanket_local_source_forwards_every_item() {
   );
   let listing = LocalSource::lister(&probe)
     .expect("the implementor's lister forwards")
-    .list(7, &[1u8], &RootGlobs::new())
+    .list(7, &[1u8], &RootGlobs::new(), None)
     .collect::<Vec<_>>()
     .now_or_never()
     .expect("the forwarded lister's listing is ready");

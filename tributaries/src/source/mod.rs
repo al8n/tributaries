@@ -1505,9 +1505,33 @@ pub type BoxListing<C> = core::pin::Pin<Box<dyn Stream<Item = ListItem<C>> + Sen
 ///   subtree. A `from` outside the root is
 ///   [`UnknownRoot`](crate::ListError::UnknownRoot), never a silently re-rooted walk.
 pub trait RootLister<C, H>: Send + Sync {
-  /// Enumerates what `root` holds at and under `from`, narrowed by `globs` — the same
-  /// stream [`Source::list`] answers, boxed.
-  fn list(&self, root: H, from: &[C], globs: &RootGlobs) -> BoxListing<C>;
+  /// Enumerates what `root` holds at and under `from`, narrowed by `globs` and FENCED by
+  /// `cover` — the same stream [`Source::list`] answers, boxed.
+  ///
+  /// `cover` is the ground the source still backs for this root: `None` for a root whose
+  /// coverage was never narrowed, `Some(prefixes)` for one pruned down to exactly those key
+  /// prefixes. Nothing outside it may be descended or yielded — a listing there reports
+  /// entries no change will ever be delivered for, which a consumer seeds its picture from
+  /// and then holds forever.
+  fn list(&self, root: H, from: &[C], globs: &RootGlobs, cover: Option<&[Vec<C>]>)
+  -> BoxListing<C>;
+}
+
+/// Whether `key` is at or under one of a root's retained cover prefixes — the ground its
+/// source still backs, and so the only ground a listing may YIELD. `None` is full coverage.
+pub(crate) fn cover_holds<C: PartialEq>(cover: Option<&[Vec<C>]>, key: &[C]) -> bool {
+  cover.is_none_or(|prefixes| prefixes.iter().any(|prefix| key.starts_with(prefix)))
+}
+
+/// Whether a listing may ENTER `key`: it is held by the cover, or it is an ancestor of some
+/// retained prefix and the ground below it is. The weaker test, because a narrowed root's
+/// own key is an ancestor of every survivor and is exactly where a re-enumeration starts.
+pub(crate) fn cover_reaches<C: PartialEq>(cover: Option<&[Vec<C>]>, key: &[C]) -> bool {
+  cover.is_none_or(|prefixes| {
+    prefixes
+      .iter()
+      .any(|prefix| key.starts_with(prefix) || prefix.starts_with(key))
+  })
 }
 
 /// One entry's facts, as [`Source::list`] reports them: what the object IS, how big
