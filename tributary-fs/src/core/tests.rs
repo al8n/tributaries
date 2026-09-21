@@ -4957,6 +4957,40 @@ mod descending {
     );
   }
 
+  /// And the scope's OWN ROOT reports nothing either, however the refusal was
+  /// decided. A boundary is a mount STRICTLY UNDER the root — a location with a
+  /// row in a table read under it — and the root's own location has none, so
+  /// recording it would hand every later sample a question whose only possible
+  /// answer is "gone" and buy a whole-root cover for a root that is already
+  /// taking the death path.
+  ///
+  /// FAIL-ON-REVERT: record the boundary for the root watch too and the set
+  /// below holds `/r`.
+  #[test]
+  fn a_foreign_root_arm_records_no_boundary() {
+    let (mut core, scope, req, root_watch) = live_descending_mnt(42);
+    core.on_enumerated(req, listed(Vec::new()));
+    let _ = drain(&mut core);
+
+    // The root re-mounted under its own watch: the re-arm lands on a different
+    // mount, which is the one refusal that reaches here as `Foreign`.
+    core.on_watch_installed(
+      root_watch,
+      core.arm_attempt(root_watch),
+      crate::os::linux::WatchOutcome::Foreign,
+    );
+    let _ = drain(&mut core);
+    assert!(
+      core
+        .scopes
+        .get(&scope)
+        .expect("the scope outlives its root's refusal")
+        .honored_boundaries
+        .is_empty(),
+      "the root's own location is no boundary under itself"
+    );
+  }
+
   /// The seat the descending crawl actually honors boundaries at. A listing marks
   /// a boundary entry and neither arms nor descends it, so no arm refusal ever
   /// speaks for it — and a mount that was there when the listing ran and gone by

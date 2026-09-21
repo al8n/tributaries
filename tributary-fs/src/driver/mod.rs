@@ -13507,6 +13507,10 @@ pub(crate) async fn run<R, F>(
           core.on_watch_installed(watch, attempt, outcome);
         }
         OpResult::RebindArmed { scope, outcome } => {
+          // A root that landed across its own mount is a failed pre-arm here,
+          // whatever the child-arm path makes of the same verdict
+          // ([`root_arm_outcome`]).
+          let outcome = root_arm_outcome(outcome);
           let Some(replace) = streams.replace_states.remove(&scope) else {
             // Swept by close (its stream already retired) or never ours.
             continue;
@@ -13773,6 +13777,10 @@ pub(crate) async fn run<R, F>(
           });
         }
         OpResult::WidenArmed { scope, outcome } => {
+          // Same normalization as the stream replace above: the widened root is
+          // still a ROOT, so a landing across its mount refuses the widen rather
+          // than committing over it ([`root_arm_outcome`]).
+          let outcome = root_arm_outcome(outcome);
           let Some(replace) = streams.replace_states.remove(&scope) else {
             // Swept by close: the armed descriptor died with the scope's
             // stream in the sweep.
@@ -16696,6 +16704,30 @@ const fn arm_error_kind(err: WatchError) -> std::io::ErrorKind {
 /// [`SourceError::RootUnavailable`] carries.
 fn arm_failure(err: WatchError) -> std::io::Error {
   std::io::Error::new(arm_error_kind(err), err.as_str())
+}
+
+/// One ROOT pre-arm's outcome with [`WatchOutcome::Foreign`] lowered to the
+/// refusal it always stands for at a root.
+///
+/// `Foreign` is a CHILD-arm verdict. It says an arm stopped at a mount boundary
+/// INSIDE the scope — a location with a row in the table, which the next
+/// authoritative sample can ask about — and it is deliberately not a plain
+/// failure, because the scope goes on covering everything above that boundary. A
+/// ROOT that answers it is not inside anything: the pre-arm landed across the
+/// mount the scope would be rooted on (the root re-mounted between the metadata
+/// capture and the arm keeps its `(dev, ino)` while its mount id moves), so this
+/// transport cannot cover this root at all.
+///
+/// Normalized BEFORE the commit gates rather than as a third arm inside each:
+/// the gates' business is a pre-arm that failed, each has exactly one unwind,
+/// and an `if let WatchOutcome::Failed(..)` that misses this variant COMMITS and
+/// publishes a root whose replayed refusal then drops it as `Gone` — leaving the
+/// caller holding `Ok` for a scope that is tearing down.
+const fn root_arm_outcome(outcome: WatchOutcome) -> WatchOutcome {
+  match outcome {
+    WatchOutcome::Foreign => WatchOutcome::Failed(WatchError::Gone),
+    WatchOutcome::Installed(_) | WatchOutcome::Aliased(_) | WatchOutcome::Failed(_) => outcome,
+  }
 }
 
 /// Applies one source-lane message to the core — the ONE body both the run

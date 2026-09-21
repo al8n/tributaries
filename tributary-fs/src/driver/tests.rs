@@ -10870,6 +10870,137 @@ mod descending {
         "nothing withdrew the marker of a barrier that was never dominated"
       );
     }
+  /// A replacement root whose PRE-ARM lands across its own mount is a failed
+  /// pre-arm, not a successful one (#74).
+  ///
+  /// The root re-mounts between the candidate stream's metadata capture and the
+  /// arm, so its `(dev, ino)` still match while its mount id moves — the one
+  /// shape that answers a ROOT arm with the mount-proved refusal. Read as a
+  /// success the replacement commits and publishes, its refusal then replays as
+  /// `Gone` and drops the root, and the caller is holding `Ok` for a scope that
+  /// is tearing down. The verdict here is the ordinary failed-pre-arm unwind:
+  /// `RootUnavailable`, the candidate retired, and the OLD world untouched and
+  /// still delivering.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_foreign_replacement_pre_arm_answers_root_unavailable_and_publishes_nothing() {
+    let rig = inotify_rig_mnt(5);
+    rig.fs.put("/r2", FileKind::Dir, 7);
+    let scope = watch(&rig, "/r").await;
+    let root_watch = rig
+      .fs
+      .arms()
+      .first()
+      .cloned()
+      .expect("the birth root arm")
+      .0;
+    fence_birth_crawl(&rig, scope, "/r").await;
+
+    let prearm = rig.fs.hold_prearms();
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Replace {
+        scope,
+        root: PathBuf::from("/r2"),
+        reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from("/r2")),
+        reply,
+      })
+      .await
+      .unwrap();
+    assert!(
+      settle(|| rig.fs.prearm_entries() == 1).await,
+      "staging: the replacement is pre-armed and parked, its metadata already sealed"
+    );
+    // `mount --move` under the parked arm: the same object, another mount.
+    rig.fs.put_on_mount("/r2", FileKind::Dir, 7, 99);
+    prearm.release();
+
+    let err = on_reply
+      .await
+      .expect("the driver replies")
+      .expect_err("a root across its own mount is not covered");
+    assert!(
+      matches!(
+        err,
+        crate::error::ReplaceRootError::Source(SourceError::RootUnavailable { .. })
+      ),
+      "{err:?}"
+    );
+    assert!(
+      settle(|| rig.fs.shutdowns() == 1).await,
+      "the candidate stream is retired, never committed"
+    );
+
+    // The old world was never swapped out: it still delivers, at the old root.
+    rig.fs.send_inotify_batch(
+      "/r",
+      vec![attributed(&[root_watch], IN_CREATE, b"alive.txt")],
+    );
+    let (s, root, change) = next_rooted(&rig).await;
+    assert_eq!((s, root.as_path()), (scope, std::path::Path::new("/r")));
+    assert_eq!(change.location(), &loc(&["alive.txt"]));
+  }
+
+  /// The same verdict for the WIDEN pre-arm, which runs the same gate over the
+  /// live transport: the widened root is still a root, so a landing across its
+  /// mount aborts the widen window and answers `RootUnavailable` with nothing
+  /// installed (#74).
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_foreign_widen_pre_arm_answers_root_unavailable_and_installs_nothing() {
+    let rig = inotify_rig_mnt(5);
+    rig.fs.put("/r/sub", FileKind::Dir, 2);
+    let scope = watch(&rig, "/r/sub").await;
+    let sub_watch = rig
+      .fs
+      .arms()
+      .first()
+      .cloned()
+      .expect("the birth root arm")
+      .0;
+    fence_birth_crawl(&rig, scope, "/r/sub").await;
+
+    // The widen resolves on the scope's own frame (so it takes the same-fd
+    // route), and the mount moves while the pre-arm is parked.
+    let prearm = rig.fs.hold_prearms();
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Replace {
+        scope,
+        root: PathBuf::from("/r"),
+        reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from("/r")),
+        reply,
+      })
+      .await
+      .unwrap();
+    assert!(
+      settle(|| rig.fs.prearm_entries() == 1).await,
+      "staging: the widen is pre-armed and parked, its metadata already sealed"
+    );
+    rig.fs.put_on_mount("/r", FileKind::Dir, 1, 7);
+    prearm.release();
+
+    let err = on_reply
+      .await
+      .expect("the driver replies")
+      .expect_err("a widened root across its own mount is not covered");
+    assert!(
+      matches!(
+        err,
+        crate::error::ReplaceRootError::Source(SourceError::RootUnavailable { .. })
+      ),
+      "{err:?}"
+    );
+    assert_eq!(rig.fs.spawns(), 1, "no fallback spawn on a refused pre-arm");
+    assert_eq!(rig.fs.shutdowns(), 0);
+
+    rig.fs.send_inotify_batch(
+      "/r/sub",
+      vec![attributed(&[sub_watch], IN_CREATE, b"alive.txt")],
+    );
+    let (s, root, change) = next_rooted(&rig).await;
+    assert_eq!((s, root.as_path()), (scope, std::path::Path::new("/r/sub")));
+    assert_eq!(change.location(), &loc(&["alive.txt"]));
   }
 
   /// The same-transport WIDEN (D2): a widening replace on the descending

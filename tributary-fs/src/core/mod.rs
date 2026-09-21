@@ -4598,9 +4598,17 @@ impl DriverCore {
     // honored, and the next authoritative sample can ask whether the mount is
     // still in the table. Read BEFORE the result is fed, because the `Err` below
     // drops the node this path is derived from.
+    //
+    // A boundary is a location STRICTLY UNDER the root, so the scope's own root
+    // watch never records one: the root's location has no row in a table read
+    // under it, and the question "is that mount still there?" would therefore be
+    // answered "no" by the next authoritative sample and cover a whole root that
+    // is already taking the death path. A foreign ROOT is a root this transport
+    // cannot cover, nothing else.
     if matches!(outcome, WatchOutcome::Foreign) {
       let placed = self.watch_scopes.get(&watch).copied().and_then(|scope| {
         let state = self.scopes.get(&scope)?;
+        (state.watch != watch).then_some(())?;
         Some((scope, watch_path(&self.monitor, state, watch)?))
       });
       if let Some((scope, path)) = placed
