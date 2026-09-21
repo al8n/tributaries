@@ -16,6 +16,7 @@
 use std::{
   collections::HashMap,
   ffi::OsString,
+  num::NonZeroUsize,
   sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -40,6 +41,19 @@ fn child_key(name: &str) -> Vec<OsString> {
   key
 }
 
+/// One instruction on the source's own stream: the coverage answer to adopt BEFORE the
+/// event is handed over, and the event itself.
+///
+/// Carrying the flip ON the stream — rather than storing it from the cell's own task — is
+/// what makes a BACKPRESSURE cell deterministic. The owner reads the coverage answer on
+/// every event it processes, so a flip stored from outside could land before an earlier
+/// event is processed and move the edge onto that one instead, against a channel in the
+/// other state entirely.
+struct Step {
+  unproven: Option<bool>,
+  event: SourceEvent<OsString, u32>,
+}
+
 /// A source whose root-coverage answer the cell flips, and whose raw stream the cell
 /// writes: the two halves of the seam the owner derives a transition from.
 struct Probe {
@@ -47,7 +61,7 @@ struct Probe {
   roots: HashMap<u32, Vec<OsString>>,
   /// The answer [`Source::coverage`] gives for every live root of this source.
   unproven: Arc<AtomicBool>,
-  events: async_channel::Receiver<SourceEvent<OsString, u32>>,
+  events: async_channel::Receiver<Step>,
 }
 
 impl Source<OsString> for Probe {
@@ -73,7 +87,11 @@ impl Source<OsString> for Probe {
   }
 
   async fn next(&mut self) -> Option<SourceEvent<OsString, u32>> {
-    self.events.recv().await.ok()
+    let step = self.events.recv().await.ok()?;
+    if let Some(unproven) = step.unproven {
+      self.unproven.store(unproven, Ordering::SeqCst);
+    }
+    Some(step.event)
   }
 
   fn root_key(&self, handle: u32) -> Option<Vec<OsString>> {
@@ -91,25 +109,39 @@ impl Source<OsString> for Probe {
 
 /// The cell's end of a [`Probe`]: the stream it writes and the coverage answer it flips.
 struct Pen {
-  events: async_channel::Sender<SourceEvent<OsString, u32>>,
+  events: async_channel::Sender<Step>,
   unproven: Arc<AtomicBool>,
 }
 
 impl Pen {
   /// Writes one raw event onto the source's stream, in the shape a source mints it.
   async fn push(&self, key: Vec<OsString>, kind: EventKind<OsString>) {
+    self.push_becoming(None, key, kind).await;
+  }
+
+  /// The same, with the coverage answer the source adopts as this event is handed over.
+  async fn push_becoming(
+    &self,
+    unproven: Option<bool>,
+    key: Vec<OsString>,
+    kind: EventKind<OsString>,
+  ) {
     self
       .events
-      .send(SourceEvent::new(
-        1,
-        key,
-        kind,
-        Location::new(),
-        Epoch::START,
-        None,
-      ))
+      .send(Step {
+        unproven,
+        event: SourceEvent::new(1, key, kind, Location::new(), Epoch::START, None),
+      })
       .await
       .expect("the owner is still draining the source");
+  }
+
+  /// The covering `Rescan` a source stands at the root, carrying the coverage flip that
+  /// makes it the episode's own edge.
+  async fn root_rescan_becoming(&self, unproven: bool) {
+    self
+      .push_becoming(Some(unproven), root_key(), EventKind::Rescan)
+      .await;
   }
 
   /// The covering `Rescan` a source stands at the root — what a refused liveness tick
@@ -134,6 +166,17 @@ fn assemble() -> (
   Tributaries<OsString, (), agnostic_lite::tokio::TokioRuntime, u32>,
   Pen,
 ) {
+  assemble_with(TributariesOptions::new())
+}
+
+/// The same rig under a chosen event capacity — one slot is what makes a refused offer a
+/// deterministic step rather than a flood.
+fn assemble_with(
+  options: TributariesOptions,
+) -> (
+  Tributaries<OsString, (), agnostic_lite::tokio::TokioRuntime, u32>,
+  Pen,
+) {
   let (tx, rx) = async_channel::unbounded();
   let unproven = Arc::new(AtomicBool::new(false));
   let source = Probe {
@@ -142,8 +185,8 @@ fn assemble() -> (
     unproven: Arc::clone(&unproven),
     events: rx,
   };
-  let watcher = Tributaries::with_source(source, TributariesOptions::new())
-    .expect("the default capacities are in range");
+  let watcher =
+    Tributaries::with_source(source, options).expect("the chosen capacities are in range");
   (
     watcher,
     Pen {
@@ -260,6 +303,141 @@ async fn a_proven_root_reports_nothing() {
   pen.fence("plain").await;
   let fenced = next_event(&mut watcher, "the fence").await;
   assert_eq!(fenced.kind(), &EventKind::Modified);
+
+  watcher.close().await.expect("the owner closes");
+}
+
+/// A ONE-SLOT event channel, so a refused offer is a deterministic step rather than a
+/// flood: one delta fills it, and whatever the owner offers next is refused.
+fn one_slot() -> TributariesOptions {
+  TributariesOptions::new().with_event_capacity(NonZeroUsize::new(1).expect("one is nonzero"))
+}
+
+/// A `CoverageLost` the channel had no room for is delivered at the first moment the
+/// consumer can take anything — and AHEAD of the delta that made the room, because a
+/// consumer must not apply changes still believing a coverage state its watch has left.
+///
+/// Revert witness: drop the refused notice and the episode is invisible; the consumer keeps
+/// applying deltas under a coverage claim nothing is checking, and the eventual regain
+/// arrives as a `CoverageRegained` for an episode it was never told about.
+#[tokio::test(flavor = "current_thread")]
+async fn a_refused_loss_is_delivered_before_the_next_delta() {
+  let (mut watcher, pen) = assemble_with(one_slot());
+  let sub = watcher
+    .watch(root_key(), (), WatchOptions::new())
+    .await
+    .expect("the root arms");
+
+  // Both writes ride the ONE source stream, so the owner processes them in this order: the
+  // delta takes the only slot, and the covering `Rescan` behind it carries the flip — the
+  // loss is therefore offered to a channel that is full by construction.
+  pen.fence("filler").await;
+  pen.root_rescan_becoming(true).await;
+
+  let filler = next_event(&mut watcher, "the delta that fills the channel").await;
+  assert_eq!(
+    filler.kind(),
+    &EventKind::Modified,
+    "staging: the slot was taken by a delta, not by the edge"
+  );
+
+  pen.fence("after").await;
+  let lost = next_event(&mut watcher, "the refused losing transition, retried").await;
+  assert_eq!(lost.subscription(), sub);
+  assert_eq!(
+    lost.kind(),
+    &EventKind::CoverageLost,
+    "the edge is owed until it is RECEIVED, and it goes first"
+  );
+  let covering = next_event(&mut watcher, "the stand-in the full channel parked").await;
+  assert_eq!(
+    covering.kind(),
+    &EventKind::Rescan,
+    "with the conservative `Rescan` the refusal parked behind it"
+  );
+
+  watcher.close().await.expect("the owner closes");
+}
+
+/// An edge is DERIVED from the difference between what the source reports and what the
+/// consumer received, never queued — so a loss the consumer never received, followed by a
+/// regain, cancels to nothing. Replaying the pair would describe a picture the consumer
+/// never held; the window itself is still closed, by the one covering `Rescan`.
+#[tokio::test(flavor = "current_thread")]
+async fn a_regain_cancels_a_loss_the_consumer_never_received() {
+  let (mut watcher, pen) = assemble_with(one_slot());
+  let _sub = watcher
+    .watch(root_key(), (), WatchOptions::new())
+    .await
+    .expect("the root arms");
+
+  pen.fence("filler").await;
+  pen.root_rescan_becoming(true).await;
+  pen.root_rescan_becoming(false).await;
+
+  let filler = next_event(&mut watcher, "the delta that fills the channel").await;
+  assert_eq!(filler.kind(), &EventKind::Modified, "staging");
+
+  pen.fence("after").await;
+  let closing = next_event(&mut watcher, "the covering rescan").await;
+  assert_eq!(
+    closing.kind(),
+    &EventKind::Rescan,
+    "no edge at all: the two cancel, and the window closes by re-enumeration"
+  );
+
+  pen.fence("drive").await;
+  let fenced = next_event(&mut watcher, "the fence past the regain").await;
+  assert_eq!(
+    fenced.kind(),
+    &EventKind::Modified,
+    "and nothing else stands behind it"
+  );
+
+  watcher.close().await.expect("the owner closes");
+}
+
+/// A `CoverageRegained` the channel refused still reaches the consumer BEFORE the covering
+/// `Rescan` that closes its episode: the `Rescan` is the re-enumeration the regain
+/// licenses, and reading it first would have the consumer act on an instruction whose
+/// premise it has not been told.
+#[tokio::test(flavor = "current_thread")]
+async fn a_refused_regain_still_precedes_its_covering_rescan() {
+  let (mut watcher, pen) = assemble_with(one_slot());
+  let _sub = watcher
+    .watch(root_key(), (), WatchOptions::new())
+    .await
+    .expect("the root arms");
+
+  pen.root_rescan_becoming(true).await;
+  let lost = next_event(&mut watcher, "the losing transition").await;
+  assert_eq!(
+    lost.kind(),
+    &EventKind::CoverageLost,
+    "staging: this consumer HAS the loss, so the regain is genuinely owed to it"
+  );
+
+  pen.fence("filler").await;
+  pen.root_rescan_becoming(false).await;
+
+  let filler = next_event(&mut watcher, "the delta that fills the channel").await;
+  assert_eq!(filler.kind(), &EventKind::Modified, "staging");
+
+  pen.fence("after").await;
+  let regained = next_event(&mut watcher, "the refused regaining transition, retried").await;
+  assert_eq!(
+    regained.kind(),
+    &EventKind::CoverageRegained,
+    "the edge the full channel refused is owed, and it goes first"
+  );
+
+  pen.fence("drive").await;
+  let covering = next_event(&mut watcher, "the covering rescan").await;
+  assert_eq!(
+    covering.kind(),
+    &EventKind::Rescan,
+    "and its covering `Rescan` follows it, never the other way round"
+  );
 
   watcher.close().await.expect("the owner closes");
 }

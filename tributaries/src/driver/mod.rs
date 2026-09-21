@@ -696,6 +696,7 @@ where
       suppressed_rescan: ParkedRescans::new(),
       unclaimed: std::collections::HashSet::new(),
       coverage_lost: std::collections::HashSet::new(),
+      coverage_told: std::collections::HashSet::new(),
       flush_cursor: None,
       #[cfg(test)]
       last_flush_visited: 0,
@@ -1524,6 +1525,29 @@ where
   /// Removing it can never take a live root's state with it: a handle is
   /// generation-unique, so the value a release retires is never reissued.
   coverage_lost: std::collections::HashSet<S::Handle>,
+  /// The subscriptions whose consumer has RECEIVED a
+  /// [`CoverageLost`](crate::EventKind::CoverageLost) and has not yet been handed the end
+  /// of that episode — the DELIVERED half of the state machine whose source-reported half
+  /// is [`coverage_lost`](Self::coverage_lost).
+  ///
+  /// An edge is OWED to a subscriber exactly while the two disagree
+  /// (`coverage_told.contains(sub) != coverage_lost.contains(root_of(sub))`), which makes
+  /// the debt DERIVED rather than queued. That is what a transition needs and a queue
+  /// cannot give: a `CoverageLost` a full channel refused, followed by a regain before it
+  /// could be retried, cancels to nothing rather than replaying a pair of edges that never
+  /// described the consumer's picture — and an edge that WAS refused stays owed until the
+  /// consumer has it, because no re-enumeration can reveal that a watch stopped being able
+  /// to prove its root.
+  ///
+  /// Per SUBSCRIPTION rather than per root, because one event channel serves every
+  /// subscription: a root's fan-out can be accepted for some of its subscribers and refused
+  /// for the rest, and a per-root record would mark the refused ones told. It also makes a
+  /// subscription that joined mid-episode owe nothing — it was never told the loss, so it
+  /// is not told a regain it cannot interpret.
+  ///
+  /// Bounded by the live-subscription count, and reclaimed with every other per-sub record
+  /// ([`retire_sub_state`](Self::retire_sub_state)).
+  coverage_told: std::collections::HashSet<Subscription>,
   /// Where the next [`flush_pending_rescans`](Self::flush_pending_rescans) pass
   /// resumes: the subscription whose offer found the channel full last pass —
   /// retried first (inclusive), then round-robin past it — fairness over a parked map
@@ -5660,6 +5684,9 @@ where
     let salvage = self.filters.take(sub);
     self.retire_salvage(salvage);
     self.epochs.remove(sub);
+    // The delivered-coverage record is this subscription's alone and is owed to nobody once
+    // it is gone ([`coverage_told`](Self::coverage_told)).
+    self.coverage_told.remove(&sub);
     #[cfg(feature = "sync")]
     self.loss_serial.remove(&sub);
   }
@@ -6311,11 +6338,11 @@ where
     match (unproven, was_lost) {
       (true, false) => {
         self.coverage_lost.insert(root);
-        self.notice_coverage(root, EventKind::CoverageLost);
+        self.notice_coverage(root, true);
       }
       (false, true) => {
         self.coverage_lost.remove(&root);
-        self.notice_coverage(root, EventKind::CoverageRegained);
+        self.notice_coverage(root, false);
         // THE ONE covering `Rescan` the episode owes, parked durably for every subscriber
         // of the root exactly as a terminal loss parks its own — a full channel cannot
         // drop it, so the re-enumeration that closes the unproven window is never the
@@ -6333,14 +6360,20 @@ where
       .is_some_and(|key| event.key() == key)
   }
 
-  /// Delivers one root-coverage transition to every subscriber of `root`, keyed at each
-  /// subscriber's OWN key.
+  /// Offers the root's new coverage state to every subscriber of `root` that is not
+  /// already holding it, keyed at each subscriber's OWN key.
   ///
   /// Clamped for the same reason a recovery `Rescan` is
   /// ([`rescan_key_for`](Self::rescan_key_for)): the statement is about everything the
   /// subscription owns and nothing above it, and naming the shared root would tell a
   /// per-subscription consumer about ground outside its own watch.
-  fn notice_coverage(&mut self, root: S::Handle, kind: EventKind<C>)
+  ///
+  /// A subscriber already holding `unproven` is SKIPPED, which is the whole of the
+  /// cancellation rule: it either joined after the episode opened (never told the loss, so
+  /// a bare regain would describe nothing it holds) or its own refused edge in the other
+  /// direction is cancelled by this one. No edge is queued; the debt is the disagreement
+  /// itself ([`coverage_told`](Self::coverage_told)).
+  fn notice_coverage(&mut self, root: S::Handle, unproven: bool)
   where
     C: Clone,
   {
@@ -6352,17 +6385,60 @@ where
       return;
     };
     for sub in subscribers {
-      let key = self.rescan_key_for(sub, &root_key);
-      let mut notice = Event::synthetic(
-        sub,
-        key,
-        Location::new(),
-        kind.clone(),
-        self.epochs.current(sub),
-      );
-      notice.set_value(self.subsumer.subscription_value(sub).cloned());
-      self.emit_notice(notice);
+      if self.coverage_told.contains(&sub) == unproven {
+        continue;
+      }
+      self.offer_coverage_edge(sub, &root_key, unproven);
     }
+  }
+
+  /// Hands `sub` the coverage edge it is OWED, if any, BEFORE the event the caller is about
+  /// to offer it.
+  ///
+  /// The ordering this exists for: a `CoverageLost` must precede every later delta of its
+  /// root, because a consumer that applies deltas while believing its coverage proven is
+  /// building a picture on an assumption the watch has withdrawn; and a `CoverageRegained`
+  /// must precede the covering `Rescan` that closes its episode, because that `Rescan` is
+  /// the instruction the regain licenses. Placing the check at the delivery seams rather
+  /// than at the transition is what makes both hold under backpressure — the edge is
+  /// retried at the first moment the consumer can take anything at all.
+  ///
+  /// The empty-set fast path is the cost argument: a watcher whose roots never lose
+  /// coverage pays two emptiness checks per delivery and nothing else.
+  fn deliver_owed_coverage(&mut self, sub: Subscription)
+  where
+    C: Clone,
+  {
+    if self.coverage_lost.is_empty() && self.coverage_told.is_empty() {
+      return;
+    }
+    let Some(root) = self.subsumer.subscription_root(sub) else {
+      return;
+    };
+    let unproven = self.coverage_lost.contains(&root);
+    if self.coverage_told.contains(&sub) == unproven {
+      return;
+    }
+    let Some(root_key) = self.subsumer.root_view(root).map(|(key, _)| key.to_vec()) else {
+      return;
+    };
+    self.offer_coverage_edge(sub, &root_key, unproven);
+  }
+
+  /// Mints one subscriber's coverage edge at its own key and offers it.
+  fn offer_coverage_edge(&mut self, sub: Subscription, root_key: &[C], unproven: bool)
+  where
+    C: Clone,
+  {
+    let kind = if unproven {
+      EventKind::CoverageLost
+    } else {
+      EventKind::CoverageRegained
+    };
+    let key = self.rescan_key_for(sub, root_key);
+    let mut notice = Event::synthetic(sub, key, Location::new(), kind, self.epochs.current(sub));
+    notice.set_value(self.subsumer.subscription_value(sub).cloned());
+    self.emit_notice(notice, unproven);
   }
 
   /// Offers one root-coverage transition to its subscriber, bypassing the parked-debt
@@ -6376,14 +6452,28 @@ where
   /// ([`EpochLedger::current`](epoch::EpochLedger::current)), so passing a parked `Rescan`
   /// cannot leave that `Rescan` failing to dominate it.
   ///
-  /// A FULL channel degrades to the conservative stand-in: the sub is parked a dominating
-  /// `Rescan` ([`park_rescan`](Self::park_rescan)), which says "re-enumerate" — less than
-  /// the notice said, never more, and the regain's own covering `Rescan` still follows.
-  fn emit_notice(&mut self, notice: Event<C, V>) {
+  /// A FULL channel parks the sub a dominating `Rescan`
+  /// ([`park_rescan`](Self::park_rescan)) — which says "re-enumerate", less than the notice
+  /// said and never more — and LEAVES THE EDGE OWED: the notice is not what was sent, so
+  /// [`coverage_told`](Self::coverage_told) does not move, and the next seam that can reach
+  /// this consumer offers the edge again. A `Rescan` is a point-in-time instruction and
+  /// cannot stand in for a state the consumer was never handed.
+  ///
+  /// `unproven` is the state the consumer holds ONCE this notice lands, so the two facts
+  /// move together at exactly the instant the send succeeds.
+  fn emit_notice(&mut self, notice: Event<C, V>, unproven: bool) {
     let sub = notice.subscription();
     match self.events.try_send(notice) {
-      Ok(()) => {}
+      Ok(()) => {
+        if unproven {
+          self.coverage_told.insert(sub);
+        } else {
+          self.coverage_told.remove(&sub);
+        }
+      }
       Err(async_channel::TrySendError::Full(_)) => self.park_rescan(sub),
+      // The consumer is gone: nothing is owed to a closed stream, and the
+      // subscription's record leaves with the rest of its per-sub state.
       Err(async_channel::TrySendError::Closed(refused)) => {
         let mut salvage = Salvage::new();
         salvage.keep_event(refused);
@@ -6537,6 +6627,11 @@ where
   ///   teardown arrives on the command mailbox.
   fn try_emit(&mut self, ev: Event<C, V>) {
     let sub = ev.subscription();
+    // An owed coverage edge goes FIRST, ahead of the debt gate below: a consumer must not
+    // apply this delta still believing a coverage state its watch has already left, and a
+    // `Rescan` parked for it cannot carry that fact (see
+    // [`deliver_owed_coverage`](Self::deliver_owed_coverage)).
+    self.deliver_owed_coverage(sub);
     if self.needs_rescan.contains_key(&sub) || self.suppressed_rescan.contains_key(&sub) {
       // An ordinary delta is dominated by the parked `Rescan` — suppress it. But a source
       // `Rescan` is an INDEPENDENT coverage-loss signal that may name a different located key
@@ -6851,6 +6946,13 @@ where
         !self.unclaimed.contains(&sub),
         "offerable parked debt for an unclaimed sub — a park missed the partition"
       );
+      // An owed coverage edge is handed over BEFORE this subscription's parked
+      // re-enumeration: a regain's `Rescan` is the instruction that regain licenses, and a
+      // loss parked here as a stand-in still owes the fact it stood in for. This is also
+      // the retry tick for an edge a full channel refused — every refusal parks the sub, so
+      // every owed edge is reachable from this pass (see
+      // [`deliver_owed_coverage`](Self::deliver_owed_coverage)).
+      self.deliver_owed_coverage(sub);
       let Some(parked) = self.needs_rescan.get(&sub) else {
         continue;
       };
