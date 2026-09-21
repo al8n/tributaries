@@ -58,6 +58,11 @@ fn recv_until(
       }
       Ok(SourceMessage::Overflow(_ack)) => overflow = true,
       Ok(SourceMessage::Fatal(err)) => panic!("stream died: {err}"),
+      // A mac source cuts no lane and rebuilds no map (#74): its whole-root
+      // cover is main's, published straight off the mount refresh.
+      Ok(SourceMessage::Cut { .. } | SourceMessage::Recovered { .. }) => {
+        unreachable!("an FSEvents stream answers no lane request")
+      }
       Err(async_channel::TryRecvError::Empty) => thread::sleep(Duration::from_millis(10)),
       Err(async_channel::TryRecvError::Closed) => break,
     }
@@ -385,8 +390,15 @@ fn the_mount_table_reader_fails_closed_on_every_unbounded_shape() {
 fn the_live_mount_table_is_still_readable() {
   let mounts = mounts_under(Path::new("/")).expect("the live mount table reads");
   assert!(
-    mounts.iter().all(|path| path != Path::new("/")),
+    mounts.iter().all(|row| row.location != Path::new("/")),
     "the root itself is not a mount UNDER the root"
+  );
+  assert!(
+    mounts
+      .iter()
+      .all(|row| row.mnt_id.is_none() && row.dev.is_none()),
+    "getfsstat answers no mount id and no device, and the rows say so rather \
+     than inventing one"
   );
   let dir = unique_dir("mounts");
   assert_eq!(
@@ -663,6 +675,11 @@ fn over_budget_batches_signal_one_inband_overflow() {
       Ok(SourceMessage::Overflow(ack)) => break ack,
       Ok(SourceMessage::Batch(_)) => {}
       Ok(SourceMessage::Fatal(err)) => panic!("stream died: {err}"),
+      // A mac source cuts no lane and rebuilds no map (#74): its whole-root
+      // cover is main's, published straight off the mount refresh.
+      Ok(SourceMessage::Cut { .. } | SourceMessage::Recovered { .. }) => {
+        unreachable!("an FSEvents stream answers no lane request")
+      }
       Err(_) => {
         assert!(
           Instant::now() < end,
@@ -695,6 +712,9 @@ fn over_budget_batches_signal_one_inband_overflow() {
         last_was_overflow = true;
       }
       SourceMessage::Fatal(err) => panic!("stream died: {err}"),
+      SourceMessage::Cut { .. } | SourceMessage::Recovered { .. } => {
+        unreachable!("an FSEvents stream answers no lane request")
+      }
     }
   }
 
@@ -712,6 +732,11 @@ fn over_budget_batches_signal_one_inband_overflow() {
       Ok(SourceMessage::Overflow(_)) => break,
       Ok(SourceMessage::Batch(_)) => {}
       Ok(SourceMessage::Fatal(err)) => panic!("stream died: {err}"),
+      // A mac source cuts no lane and rebuilds no map (#74): its whole-root
+      // cover is main's, published straight off the mount refresh.
+      Ok(SourceMessage::Cut { .. } | SourceMessage::Recovered { .. }) => {
+        unreachable!("an FSEvents stream answers no lane request")
+      }
       Err(_) => {
         assert!(
           Instant::now() < end,

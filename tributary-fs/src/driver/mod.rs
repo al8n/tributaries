@@ -23,9 +23,10 @@
 //! once up front and refuses a kernel below the floor (see `os::linux`), so this
 //! executor's live-path sample ([`stat_sample`]) is always a `statx` and never
 //! needs a sub-`statx` fallback. A `statx` mask miss (no `STATX_MNT_ID` below 5.8)
-//! still drops just the mount frame (absent, never mixed in from a second lookup)
-//! and the core fences that object on the device belt — so the rule holds either
-//! way: one object, one sample.
+//! costs the frame nothing: the sample is re-taken through an `O_PATH` pin
+//! ([`stat_sample_pinned`]) whose `/proc/self/fdinfo` line answers the id, and
+//! whose `statx` answers the identity — so all four facts still come from ONE
+//! object, and the rule holds either way: one object, one sample.
 
 #[cfg(feature = "sync")]
 use std::{
@@ -61,8 +62,8 @@ use crate::{
   },
   error::WatchRootError,
   os::{
-    Backend, BackendKind, EventReceiver, RootIdentity, RootMeta, ScopePort, SourceConfig,
-    SourceError, SourceHandle, SourceMessage, SpawnFailed, linux::WatchOutcome,
+    Backend, BackendKind, EventReceiver, RootIdentity, RootMeta, ScopeFrame, ScopePort,
+    SourceConfig, SourceError, SourceHandle, SourceMessage, SpawnFailed, linux::WatchOutcome,
   },
   watcher::{CoverOutcome, SkipReason},
 };
@@ -6012,6 +6013,15 @@ pub(crate) enum Command {
   DebugLaneCount {
     reply: futures_channel::oneshot::Sender<usize>,
   },
+  /// The same, for the mount refreshes held behind a lane cut (#74): one
+  /// snapshot can be large (every row path under the root), and scope ids are
+  /// never reused, so a scope that ended while one was held must leave nothing
+  /// behind. Counted rather than inspected — the leak is a POPULATION that grows
+  /// with watch/defer/unwatch churn, which is exactly what a count proves.
+  #[cfg(all(test, feature = "tokio"))]
+  DebugDeferredRefreshes {
+    reply: futures_channel::oneshot::Sender<usize>,
+  },
   /// A test-only count of the awaited-unwatch waiters parked for `scope`, so a
   /// suite can prove an issue-and-cancel storm leaves the waiter vector
   /// bounded rather than growing without limit.
@@ -7127,7 +7137,9 @@ pub(crate) enum ControlRequest {
   /// Install a per-directory watch for `watch` (arming `parent`'s child
   /// `name`, addressed by absolute `path`). `expected` is the `(dev, ino)` the
   /// opened object must still have before the watch installs (the enumerate→arm
-  /// rename guard); `None` leaves the arm unverified.
+  /// rename guard); `None` leaves the arm unverified. `frame` is the scope's
+  /// descent frame, which the executor refuses a crossing landing against —
+  /// unlike `expected`, it is checked on EVERY arm.
   Arm {
     watch: WatchId,
     /// The arm ATTEMPT this request executes, echoed back in its
@@ -7144,6 +7156,7 @@ pub(crate) enum ControlRequest {
     name: Segment,
     path: Arc<PathBuf>,
     expected: Option<ExpectedObject>,
+    frame: ScopeFrame,
   },
   /// Remove `watch`'s per-directory watch (fire-and-forget; no reply).
   Disarm { watch: WatchId },
@@ -7506,7 +7519,15 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
 
   /// Installs a per-directory kernel watch for `watch` at `path` (blocking).
   /// Reached only under a descending profile. `expected` is the object the arm
-  /// must confirm the open lands on (the enumerate→arm rename guard).
+  /// must confirm the open lands on (the enumerate→arm rename guard); `frame` is
+  /// the scope's descent frame, and an arm whose landing sits ACROSS it is
+  /// refused before anything installs (`ScopeFrame::crossed_by`).
+  ///
+  /// The two guards are independent and both are needed. `expected` asks "is
+  /// this the object the enumerate saw" and is `None` for the arms that never
+  /// met an enumerate — precisely the ones a mount can appear under. `frame`
+  /// asks "is this object inside the scope at all", and is asked every time.
+  #[allow(clippy::too_many_arguments)]
   fn add_watch(
     &self,
     scope: ScopeId,
@@ -7515,6 +7536,7 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
     path: &Path,
     name: &Segment,
     expected: Option<ExpectedObject>,
+    frame: ScopeFrame,
   ) -> WatchOutcome;
 
   /// Removes a per-directory kernel watch (blocking, fire-and-forget).
@@ -7555,10 +7577,11 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
           name,
           path,
           expected,
+          frame,
         } => outcomes.push(ArmResolution {
           watch,
           attempt,
-          outcome: self.add_watch(scope, watch, parent, &path, &name, expected),
+          outcome: self.add_watch(scope, watch, parent, &path, &name, expected, frame),
         }),
         ControlRequest::Disarm { watch } => self.remove_watch(scope, watch),
       }
@@ -7608,6 +7631,7 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
   /// commit-or-unwind is decided by the returned outcome. The default routes
   /// through [`add_watch`](Self::add_watch) — the right shape for executors
   /// (fakes) that answer arms themselves and carry `Inert` ports.
+  #[allow(clippy::too_many_arguments)]
   fn preflight_arm(
     &self,
     port: &ScopePort,
@@ -7616,9 +7640,10 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
     path: &Path,
     name: &Segment,
     expected: Option<ExpectedObject>,
+    frame: ScopeFrame,
   ) -> WatchOutcome {
     let _ = port;
-    self.add_watch(scope, watch, watch, path, name, expected)
+    self.add_watch(scope, watch, watch, path, name, expected, frame)
   }
 
   /// Takes `watch`'s transient directory anchor, TRANSFERRING ownership to the
@@ -7700,6 +7725,43 @@ pub(crate) trait SourceControl: Send + 'static {
     ScopePort::Inert
   }
 
+  /// Asks this source's reader to CUT its lane at `seq` (#74): drain everything
+  /// the kernel has already committed onto the queue, then push
+  /// [`SourceMessage::Cut`] behind it. Answers whether the request was
+  /// delivered.
+  ///
+  /// `false` is the honest answer wherever the ordering it establishes is not
+  /// this door's to give: a reader already gone, and every backend whose
+  /// whole-root cover is not published straight off the mount refresh —
+  /// fanotify, whose cover rides its own in-band recovery completion; FSEvents,
+  /// which has no descriptor to drain and no reader to ask; Windows;
+  /// unsupported. A refused cut makes the driver apply the refresh at once,
+  /// which is what it always did.
+  fn cut(&self, seq: u64) -> bool {
+    let _ = seq;
+    false
+  }
+
+  /// Asks this source to rebuild its sight of the WHOLE root under `epoch` and
+  /// answer IN BAND, on this source's own queue (#74). Answers whether the
+  /// request was delivered.
+  ///
+  /// Only the fanotify backend has anything to rebuild: its sight is a FID map
+  /// seeded by a walk that stops at mount boundaries, so ground a departed mount
+  /// revealed is ground the map has never seen. Every other backend covers
+  /// through a kernel-side mark or a per-directory re-arm the Monitor drives
+  /// itself and answers `false` — there was nothing to rebuild, and the driver
+  /// completes the recovery inline so the cover may proceed.
+  ///
+  /// The request is a send and a wake; nothing waits on it. The walk runs on the
+  /// source's own reader thread, between reads, and its completion arrives as
+  /// [`SourceMessage::Recovered`] behind every event the kernel held when it
+  /// began.
+  fn recover(&self, epoch: u64) -> bool {
+    let _ = epoch;
+    false
+  }
+
   /// The source's live stats handle, `Some` only for a fanotify source (every
   /// other backend has no pollable internals — design §4.9). The driver threads
   /// it into the registry so [`Watcher::backend_stats`](crate::Watcher::backend_stats)
@@ -7727,6 +7789,16 @@ impl SourceControl for SourceHandle {
   #[cfg(all(target_os = "linux", not(miri)))]
   fn scope_port(&self) -> ScopePort {
     SourceHandle::scope_port(self)
+  }
+
+  #[cfg(all(target_os = "linux", not(miri)))]
+  fn cut(&self, seq: u64) -> bool {
+    SourceHandle::cut(self, seq)
+  }
+
+  #[cfg(all(target_os = "linux", not(miri)))]
+  fn recover(&self, epoch: u64) -> bool {
+    SourceHandle::recover(self, epoch)
   }
 
   #[cfg(all(target_os = "linux", not(miri)))]
@@ -7804,21 +7876,26 @@ struct StatSample {
   kind: tributary_proto::FileKind,
   dev: u64,
   ino: u64,
-  /// The mount frame, `Some` only when the sample reported the mount id, `None`
-  /// on a `statx` mask miss (`STATX_MNT_ID` is 5.8; below it the bit stays unset)
-  /// — the core then fences on the device belt.
+  /// The mount frame — `Some` on every supported kernel, from the `statx` mask
+  /// (5.8+) or from the pinned fd's `/proc/self/fdinfo` line (3.15+, so below the
+  /// 4.11 `statx` floor). `None` only where NEITHER answers, which no supported
+  /// host reaches; the core then fences on the device belt.
   frame: Option<u64>,
 }
 
-/// ONE sample of the object at `path` (symlink not followed): the sole path-syscall
-/// behind every fact a caller reads about that object.
+/// ONE sample of the object at `path` (symlink not followed): every fact a caller
+/// reads about that object, always from ONE object.
 ///
-/// `statx(AT_FDCWD, path, AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS | STATX_MNT_ID)` —
-/// kind, device, inode, AND mount frame all from THAT one result. The Linux backends
-/// require `statx` (Linux 4.11+, gated once at spawn — see `os::linux`), so there is
-/// no sub-`statx` fallback: the sample is always this single syscall. A mask miss
-/// (`STATX_MNT_ID` is 5.8) declines only the frame (`None`), and the core then fences
-/// that object on the device belt.
+/// On a kernel that answers a mount id through `statx` — 5.8 and up, which the
+/// process settles once (`os::linux`'s tier memo) — that is a single
+/// `statx(AT_FDCWD, path, AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS | STATX_MNT_ID)`:
+/// kind, device, inode AND mount frame all from THAT one result, and no other
+/// syscall at all.
+///
+/// On a 4.11–5.7 kernel the mask carries no mount id, so the sample is taken
+/// through a PINNED fd instead ([`stat_sample_pinned`]) — the frame comes from
+/// `/proc/self/fdinfo`, and the identity is re-read from that same fd rather than
+/// paired with the earlier path lookup's. See that function for why.
 ///
 /// The path is resolved the same way `symlink_metadata` was, so an anchor
 /// (`/proc/self/fd/N`) enumerate reads every fact THROUGH the pinned fd too.
@@ -7834,25 +7911,94 @@ struct StatSample {
 /// never is.
 #[cfg(all(target_os = "linux", not(miri)))]
 fn stat_sample(path: &Path) -> Result<StatSample, rustix::io::Errno> {
-  use rustix::fs::{AtFlags, StatxFlags, makedev, statx};
+  use rustix::fs::{AtFlags, StatxFlags, statx};
+  if crate::os::linux::statx_answers_mount_id() {
+    let stx = loop {
+      match statx(
+        rustix::fs::CWD,
+        path,
+        AtFlags::SYMLINK_NOFOLLOW,
+        StatxFlags::BASIC_STATS.union(StatxFlags::MNT_ID),
+      ) {
+        Ok(stx) => break stx,
+        Err(rustix::io::Errno::INTR) => continue,
+        Err(err) => return Err(err),
+      }
+    };
+    let frame = crate::os::linux::mnt_id_from_mask(stx.stx_mask, stx.stx_mnt_id);
+    crate::os::linux::settle_mount_id_tier(frame.is_some());
+    if frame.is_some() {
+      return Ok(sample_of(&stx, frame));
+    }
+    // The mask missed, so this kernel has no `STATX_MNT_ID` and every later
+    // sample skips straight past the branch above. This one falls through and
+    // re-takes the object through a pin; the result just read is DISCARDED rather
+    // than half-kept, because keeping it is the mispairing the pinned read exists
+    // to avoid.
+  }
+  stat_sample_pinned(path)
+}
+
+/// [`stat_sample`] on a kernel whose `statx` answers no mount id: `open(path,
+/// O_PATH | O_NOFOLLOW | O_CLOEXEC)`, then `statx` and `/proc/self/fdinfo` through
+/// THAT one fd.
+///
+/// # Why the identity is re-read rather than carried over
+///
+/// The frame has to come from an fd, because the fdinfo line is addressed by
+/// descriptor and nothing else. The one-sample rule (see the module doc) then
+/// forbids pairing that fd's frame with the identity a SEPARATE path lookup
+/// returned: a rename or bind toggling `path` between the two would hand one
+/// object's `(kind, dev, ino)` to another object's mount id, and the arm
+/// downstream verifies `(dev, ino)` only — so a raced foreign bind could be
+/// classified descendable and armed, the precise failure the rule exists to
+/// prevent. Taking all four facts through the pinned fd keeps them one object's,
+/// at the cost of two extra syscalls on a kernel below 5.8 and none at all above
+/// it.
+///
+/// `O_PATH` asks no permission on the object itself and opens anything — a
+/// symlink (with `O_NOFOLLOW`), a socket, a device — so this reaches exactly what
+/// `AT_SYMLINK_NOFOLLOW` reached. A FAILED open yields the errno the `statx` would
+/// have yielded for the same path, so `NOENT` keeps its raced-away meaning and no
+/// failure is laundered into a `None` frame.
+#[cfg(all(target_os = "linux", not(miri)))]
+fn stat_sample_pinned(path: &Path) -> Result<StatSample, rustix::io::Errno> {
+  use std::os::fd::AsFd;
+
+  use rustix::fs::{AtFlags, Mode, OFlags, StatxFlags, open, statx};
+  let flags = OFlags::PATH.union(OFlags::NOFOLLOW).union(OFlags::CLOEXEC);
+  let fd = loop {
+    match open(path, flags, Mode::empty()) {
+      Ok(fd) => break fd,
+      Err(rustix::io::Errno::INTR) => continue,
+      Err(err) => return Err(err),
+    }
+  };
   let stx = loop {
     match statx(
-      rustix::fs::CWD,
-      path,
-      AtFlags::SYMLINK_NOFOLLOW,
-      StatxFlags::BASIC_STATS.union(StatxFlags::MNT_ID),
+      fd.as_fd(),
+      c"",
+      AtFlags::EMPTY_PATH,
+      StatxFlags::BASIC_STATS,
     ) {
       Ok(stx) => break stx,
       Err(rustix::io::Errno::INTR) => continue,
       Err(err) => return Err(err),
     }
   };
-  Ok(StatSample {
+  let frame = crate::os::linux::fdinfo_mount_id(fd.as_fd())?;
+  Ok(sample_of(&stx, frame))
+}
+
+/// One `statx` result and the frame decided for it, lowered to a [`StatSample`].
+#[cfg(all(target_os = "linux", not(miri)))]
+fn sample_of(stx: &rustix::fs::Statx, frame: Option<u64>) -> StatSample {
+  StatSample {
     kind: kind_of_mode(u32::from(stx.stx_mode)),
-    dev: makedev(stx.stx_dev_major, stx.stx_dev_minor),
+    dev: rustix::fs::makedev(stx.stx_dev_major, stx.stx_dev_minor),
     ino: stx.stx_ino,
-    frame: (stx.stx_mask & StatxFlags::MNT_ID.bits() != 0).then_some(stx.stx_mnt_id),
-  })
+    frame,
+  }
 }
 
 /// The proto file kind of a raw `st_mode`/`stx_mode` (symlinks are never followed).
@@ -7965,6 +8111,12 @@ pub(crate) struct RealFs {
   /// those apart.
   #[cfg(all(target_os = "linux", not(miri)))]
   anchors: std::sync::Arc<std::sync::Mutex<AnchorTable>>,
+  /// The mount-namespace transition counter every refresh reads its incarnation
+  /// token from ([`crate::os::NamespaceWatch`]). Shared across clones because the
+  /// namespace is one object: the counter is only meaningful when every refresh
+  /// polls the SAME held fd, and a per-clone watch would restart its baseline and
+  /// report each gap it did not span as quiet.
+  namespace: std::sync::Arc<crate::os::NamespaceWatch>,
 }
 
 impl RealFs {
@@ -8001,6 +8153,7 @@ impl RealFs {
   /// through `/proc/self/fd`, but the fallback is not — and it is the common case
   /// once the cold enumerate has consumed the parent anchor).
   #[cfg(all(target_os = "linux", not(miri)))]
+  #[allow(clippy::too_many_arguments)]
   fn build_arm_request(
     &self,
     watch: WatchId,
@@ -8008,6 +8161,7 @@ impl RealFs {
     path: &Path,
     name: &Segment,
     expected: Option<ExpectedObject>,
+    frame: ScopeFrame,
   ) -> crate::os::linux::AnchorRequest {
     let expected = expected.map(|e| crate::os::linux::ExpectedObject {
       dev: e.dev,
@@ -8029,12 +8183,14 @@ impl RealFs {
         parent: Some(fd),
         name: std::ffi::OsString::from(name.as_str()),
         expected,
+        frame,
       },
       None => crate::os::linux::AnchorRequest {
         watch,
         parent: None,
         name: path.as_os_str().to_os_string(),
         expected,
+        frame,
       },
     }
   }
@@ -8108,9 +8264,10 @@ impl RealFs {
           name,
           path,
           expected,
+          frame,
         } => {
           ops.push(ControlOp::Arm(
-            self.build_arm_request(watch, parent, &path, &name, expected),
+            self.build_arm_request(watch, parent, &path, &name, expected, frame),
           ));
           plan.push(Publication::Arm(watch, attempt));
         }
@@ -10493,10 +10650,6 @@ impl FsOps for RealFs {
   }
 
   fn refresh_mounts(&self, root: &Path) -> MountRefresh {
-    let (mounts, authoritative) = match crate::os::mounts_under(root) {
-      Some(mounts) => (mounts, true),
-      None => (Vec::new(), false),
-    };
     // ONE sample proves liveness AND reads the mount frame: `root_liveness_and_frame`
     // is a single `statx` (symlink not followed, so a root retargeted to a symlink is
     // a replacement, not a follow), yielding the `(dev, ino)` the death gate decides
@@ -10507,16 +10660,62 @@ impl FsOps for RealFs {
     // identity verdict with a different object's frame (a replace/remount between two
     // separate lookups would). A `Missing` root is DeleteSelf, any other stat failure
     // is Unreadable (MoveSelf) — the exact `RootChanged`-probe mapping; the mount id
-    // is inotify's best-effort belt (`None` below 5.8), taken from the same result's
-    // mask.
-    let (root_liveness, root_mnt_id) = root_liveness_and_frame(root);
+    // is inotify's descent boundary, taken from the SAME sample (`None` only where
+    // the host answers no id at all).
+    //
+    // The stat is taken INSIDE [`crate::os::mount_sample`] rather than beside it,
+    // and that is the second half of the same discipline. One atomic stat of the
+    // root proves the root's own facts belong together; it proves NOTHING about
+    // the table, which is a separate sample the kernel generates across many
+    // reads with the namespace lock dropped between them. Marking the pair
+    // authoritative required the pair to be coherent, and nothing established
+    // that: a torn table can present rows from before a transition beside a frame
+    // from after it, and because mount ids are recycled lowest-free, a row in the
+    // older half can carry the very id the newer root stat reports. `mount_sample`
+    // holds the namespace generation across BOTH halves and answers no table at
+    // all when it moved.
+    //
+    // The UNIQUE mount id rides the same window as a second `statx` (the kernel
+    // answers one id per call — see [`crate::os::root_mnt_unique_id`]), and the
+    // window is what pairs them: `stable` means the namespace demonstrably did not
+    // move between the two reads, so the legacy id the mount table is compared
+    // against and the unique id the incarnation token is built from describe the
+    // same mount. An unstable window yields NO token at all rather than a
+    // mismatched one, and the scope keeps the last token it proved.
+    let reading = crate::os::mount_sample(root, &self.namespace, || {
+      (
+        root_liveness_and_frame(root),
+        crate::os::root_mnt_unique_id(root),
+      )
+    });
+    let ((root_liveness, root_mnt_id), root_unique) = reading.root;
+    let (mounts, authoritative) = match reading.rows {
+      Some(mounts) => (mounts, true),
+      None => (Vec::new(), false),
+    };
+    // The unique id FIRST: it is exact in both directions and costs an unrelated
+    // namespace nothing, while the transition count is the pre-6.8 fallback that
+    // reads any mount anywhere as a possible move. A host answers one or the
+    // other for its whole life, never both.
+    let root_incarnation = reading
+      .stable
+      .then(|| {
+        root_unique
+          .map(crate::os::RootIncarnation::Unique)
+          .or(reading.namespace.map(crate::os::RootIncarnation::Namespace))
+      })
+      .flatten();
     MountRefresh {
       mounts,
       authoritative,
       root: root_liveness,
       root_mnt_id,
+      root_incarnation,
+      namespace_transitions: reading.namespace,
+      overflowed: reading.overflowed,
     }
   }
+
   #[cfg(all(target_os = "linux", not(miri)))]
   fn attach_scope(&self, scope: ScopeId, port: ScopePort, generation: u64) {
     self
@@ -10552,6 +10751,7 @@ impl FsOps for RealFs {
     path: &Path,
     name: &Segment,
     expected: Option<ExpectedObject>,
+    frame: ScopeFrame,
   ) -> WatchOutcome {
     // A direct single arm runs against the CURRENT transport (the caller is
     // synchronous, not a leftover batch), so it adopts the attached
@@ -10570,6 +10770,7 @@ impl FsOps for RealFs {
           name: name.clone(),
           path: Arc::new(path.to_path_buf()),
           expected,
+          frame,
         }],
       )
       .resolutions
@@ -10588,6 +10789,7 @@ impl FsOps for RealFs {
     _path: &Path,
     _name: &Segment,
     _expected: Option<ExpectedObject>,
+    _frame: ScopeFrame,
   ) -> WatchOutcome {
     WatchOutcome::Failed(WatchError::Io)
   }
@@ -10656,6 +10858,7 @@ impl FsOps for RealFs {
     path: &Path,
     name: &Segment,
     expected: Option<ExpectedObject>,
+    frame: ScopeFrame,
   ) -> WatchOutcome {
     use crate::os::linux::ControlOp;
 
@@ -10663,7 +10866,7 @@ impl FsOps for RealFs {
       return WatchOutcome::Failed(WatchError::Gone);
     };
     let ops = vec![ControlOp::Arm(
-      self.build_arm_request(watch, watch, path, name, expected),
+      self.build_arm_request(watch, watch, path, name, expected, frame),
     )];
     // A pre-arm needs no `answered`: a reader that never served it answers its one
     // arm `Failed(Io)`, and the commit is decided by that outcome alone — it
@@ -10738,9 +10941,10 @@ impl FsOps for RealFs {
 /// `(kind, dev, ino)` with another object's mount frame — the arm downstream
 /// verifies `(dev, ino)` only, so a raced foreign bind that split the sample
 /// could otherwise be classified descendable and armed. A `statx` mask miss (no
-/// `STATX_MNT_ID` below 5.8) drops just the frame (`None`) and descent runs on the
-/// device belt. Off Linux, one `symlink_metadata` (no mount-id notion; the core
-/// fences on device alone) — still a single object's facts.
+/// `STATX_MNT_ID` below 5.8) still answers a frame: the sample is re-taken whole
+/// through an `O_PATH` pin whose fdinfo carries the id. Off Linux, one
+/// `symlink_metadata` (no mount-id notion; the core fences on device alone) —
+/// still a single object's facts.
 #[cfg(all(target_os = "linux", not(miri)))]
 fn dir_entry_stat(entry_path: &Path) -> Option<(tributary_proto::FileKind, u64, u64, Option<u64>)> {
   let sample = stat_sample(entry_path).ok()?;
@@ -11672,6 +11876,23 @@ struct LivenessProbes {
   /// live probe thread (a pool fallback included), which is also what bounds the
   /// map above.
   in_flight: BTreeSet<(ScopeId, u64)>,
+  /// The one answered probe per scope whose VERDICT is being held back behind a
+  /// cut of the scope's source lane (#74) — a probe's result, kept where the
+  /// probe's own bookkeeping is, because it has the same lifetime: every site
+  /// that retires a scope's tag is a site whose world the held snapshot no
+  /// longer describes.
+  deferred: BTreeMap<ScopeId, PendingRefresh>,
+  /// The cut each scope has been asked for and not yet been answered — the
+  /// sequence alone, since presence IS the question. Absent means the lane is
+  /// answering promptly and the next refresh may be ordered behind a marker;
+  /// present means one is already outstanding, so a further refresh applies at
+  /// once rather than queueing behind a reader that is not keeping up (#74).
+  outstanding_cut: BTreeMap<ScopeId, u64>,
+  /// The sequence the next accepted cut is minted under — driver-wide, so no
+  /// two markers in flight anywhere can be confused for one another, and
+  /// monotone, so a superseded question can never be answered by a later
+  /// marker (#74).
+  next_cut_seq: u64,
 }
 
 impl LivenessProbes {
@@ -11700,14 +11921,122 @@ impl LivenessProbes {
     }
   }
 
-  /// Retires `scope`'s current tag — a root REPLACE committed, or the scope tore
-  /// down. Whatever is in flight stays counted (the thread is alive), but its
-  /// answer is no longer current, so it will be dropped rather than applied to a
-  /// world it does not describe.
+  /// Retires `scope`'s current tag — a root REPLACE or a same-transport WIDEN
+  /// committed, or the scope tore down. Whatever is in flight stays counted (the
+  /// thread is alive), but its answer is no longer current, so it will be dropped
+  /// rather than applied to a world it does not describe.
+  ///
+  /// Which is exactly why the HELD verdict goes with it (#74): a snapshot taken
+  /// of the world this call ends describes ground the scope has left, and the
+  /// world starting here seeds its own baseline and arms its own refresh. The
+  /// outstanding cut goes too — it was asked of the lane this transition
+  /// retires, or of a world whose answer no longer means anything — so the new
+  /// world starts able to order its first cover instead of inheriting a debt
+  /// nobody will pay. This is also where both maps are RECLAIMED: scope ids are
+  /// never reused, and a teardown that left an entry behind would keep one
+  /// bounded-but-large mount table per dead scope for the driver's whole life.
   fn retire_generation(&mut self, scope: ScopeId) {
     let tag = self.generation.entry(scope).or_default();
     *tag = tag.wrapping_add(1);
+    self.deferred.remove(&scope);
+    self.outstanding_cut.remove(&scope);
     self.forget_settled(scope);
+  }
+
+  /// How many scopes are holding a refresh right now — the population a leak
+  /// would grow, answered for the suites through `DebugDeferredRefreshes`.
+  #[cfg(all(test, feature = "tokio"))]
+  fn deferred_refreshes(&self) -> usize {
+    self.deferred.len()
+  }
+
+  /// Whether `scope` is still waiting on a cut it already asked for: the one
+  /// test the ordering degrade is built on (#74).
+  ///
+  /// A reader that has not answered cannot prove an ordering, so the next
+  /// refresh is applied where it lands (main's behaviour before the cut existed)
+  /// rather than joining a queue behind it. Bounded by construction: at most one
+  /// marker is ever outstanding, and the next one that arrives clears this.
+  fn cut_outstanding(&self, scope: ScopeId) -> bool {
+    self.outstanding_cut.contains_key(&scope)
+  }
+
+  /// The sequence the next cut would be minted under. Reading it does not spend
+  /// it: a stream that REFUSES the cut leaves the sequence for the next one, so
+  /// the driver never burns a marker nobody was asked for (#74).
+  fn cut_seq(&self) -> u64 {
+    self.next_cut_seq
+  }
+
+  /// Records one refresh held back behind the cut `record.seq` names, spending
+  /// that sequence (#74).
+  fn defer_refresh(&mut self, scope: ScopeId, record: PendingRefresh) {
+    self.next_cut_seq = self.next_cut_seq.wrapping_add(1);
+    self.outstanding_cut.insert(scope, record.seq);
+    self.deferred.insert(scope, record);
+  }
+
+  /// Takes `scope`'s held reading away, whatever it was waiting for. The cut is
+  /// deliberately LEFT outstanding: the marker is still coming up a lane that is
+  /// still alive, and forgetting the debt would order the next refresh behind a
+  /// second marker while the first is still in flight.
+  fn take_deferred(&mut self, scope: ScopeId) -> Option<MountRefresh> {
+    self.deferred.remove(&scope).map(|held| held.refresh)
+  }
+
+  /// The same, but only for a reading deferred on `lane` — what every
+  /// lane-addressed transition uses (a loss, a terminal, a retired lane's
+  /// stragglers), so a reclamation can never take a reading belonging to the
+  /// world that replaced the lane it names.
+  fn take_deferred_on_lane(&mut self, scope: ScopeId, lane: u64) -> Option<MountRefresh> {
+    self
+      .deferred
+      .get(&scope)
+      .is_some_and(|held| held.world.0 == lane)
+      .then(|| self.take_deferred(scope))
+      .flatten()
+  }
+
+  /// Books one arriving marker: answers whether it is the cut this scope is
+  /// waiting for, and clears the debt when it is (#74).
+  ///
+  /// Clearing on the SEQUENCE rather than on the held refresh is what keeps the
+  /// degrade from latching: a marker that arrives after its refresh was
+  /// superseded still proves the reader is answering, and the scope goes back to
+  /// ordering its covers. A marker naming any other sequence answers a question
+  /// that has since been replaced and is ignored whole.
+  ///
+  /// Gated with the marker itself: a build where no `Cut` can arrive has no
+  /// question to book.
+  #[cfg(any(all(target_os = "linux", not(miri)), test))]
+  fn answer_cut(&mut self, scope: ScopeId, seq: u64) -> bool {
+    if self.outstanding_cut.get(&scope) != Some(&seq) {
+      return false;
+    }
+    self.outstanding_cut.remove(&scope);
+    true
+  }
+
+  /// Takes `scope`'s held refresh if the marker that just landed names the world
+  /// it was stamped in: its own sequence, the lane it was stashed on, and the
+  /// incarnation the scope watched then (#74).
+  ///
+  /// Both, because each catches what the other cannot: the sequence separates
+  /// this cut from a superseded one, and the world separates a stream from the
+  /// successor that replaced it AND the incarnations a same-transport widen
+  /// moves through without touching the lane.
+  /// A stamp that does not match is not merely ignored — the record is dropped,
+  /// because nothing will ever make it current again. Gated with the marker that
+  /// is its only caller.
+  #[cfg(any(all(target_os = "linux", not(miri)), test))]
+  fn take_deferred_current(
+    &mut self,
+    scope: ScopeId,
+    seq: u64,
+    world: (u64, u64),
+  ) -> Option<MountRefresh> {
+    let held = self.deferred.remove(&scope)?;
+    (held.seq == seq && held.world == world).then_some(held.refresh)
   }
 
   /// Claims a slot for one probe of `scope`, returning the tag to dispatch it
@@ -12088,6 +12417,10 @@ pub(crate) async fn run<R, F>(
   // the replace commit's covering Rescan) — its end marker is not a death.
   let mut lanes: BTreeMap<ScopeId, u64> = BTreeMap::new();
   let mut next_lane: u64 = 0;
+  // Mount refreshes held behind a cut of their scope's lane live with the probe
+  // bookkeeping they came from ([`LivenessProbes`]), because their lifetime is
+  // the probe tag's: every site that retires a scope's tag is a site whose world
+  // a held snapshot no longer describes (#74).
   // Off-loop work that owns — or is about to own — a native stream: spawns
   // dispatched to the blocking pool but not yet returned, teardowns handed to
   // `reaper` but not yet confirmed. Close quiesces BOTH alongside the live
@@ -12458,6 +12791,7 @@ pub(crate) async fn run<R, F>(
             &lanes,
             &mut streams.replace_states,
             &streams.handles,
+            &mut probes,
             item,
             &now,
           );
@@ -12760,6 +13094,7 @@ pub(crate) async fn run<R, F>(
         &lanes,
         &mut streams.replace_states,
         &streams.handles,
+        &mut probes,
         item,
         &now,
       );
@@ -13048,6 +13383,11 @@ pub(crate) async fn run<R, F>(
                   dev: spawned.meta.identity.dev(),
                   ino,
                 });
+              // The REPLACEMENT world's frame, read off its own barrier: the core
+              // still holds the outgoing root's, and the two roots need not share
+              // a mount at all. Taken before the escrow is parked, which consumes
+              // the spawn.
+              let frame = spawned.meta.frame();
               match &mut streams.replace_states.get_mut(&scope).expect("just checked").mode {
                 // The slot is borrowed BEFORE the escrow is consumed, so the
                 // lookup and its `expect` are still on the guarded side.
@@ -13064,7 +13404,7 @@ pub(crate) async fn run<R, F>(
               let tx = op_tx.clone();
               R::spawn_blocking_detach(move || {
                 let outcome =
-                  ops_for_arm.preflight_arm(&port, scope, watch, &path, &name, expected);
+                  ops_for_arm.preflight_arm(&port, scope, watch, &path, &name, expected, frame);
                 let _ = tx.try_send(OpResult::RebindArmed { scope, outcome });
               });
               continue;
@@ -13245,7 +13585,15 @@ pub(crate) async fn run<R, F>(
             // a world it no longer watches (its liveness verdict above all), and
             // an answer for a torn-down scope has nothing left to feed.
             if probes.retire(scope, generation) {
-              core.on_mounts_refreshed(scope, refresh, now());
+              apply_or_stash_refresh::<F>(
+                &mut core,
+                &mut probes,
+                &lanes,
+                &streams.handles,
+                scope,
+                refresh,
+                &now,
+              );
             }
           }
           OpResult::WatchInstalled {
@@ -13278,8 +13626,18 @@ pub(crate) async fn run<R, F>(
                   core.on_unwatch(scope);
                 }
               }
+              // A root landing across the scope's own mount is refused to the
+              // caller exactly as `Gone` is; the boundary it also records is the
+              // core's business, not this grant's.
               WatchOutcome::Failed(err) => {
                 let _ = pending.reply.send(Err(arm_grant_error(err, pending.requested, root)));
+              }
+              WatchOutcome::Foreign => {
+                let _ = pending.reply.send(Err(arm_grant_error(
+                  WatchError::Gone,
+                  pending.requested,
+                  root,
+                )));
               }
             }
           }
@@ -13297,6 +13655,10 @@ pub(crate) async fn run<R, F>(
           core.on_watch_installed(watch, attempt, outcome);
         }
         OpResult::RebindArmed { scope, outcome } => {
+          // A root that landed across its own mount is a failed pre-arm here,
+          // whatever the child-arm path makes of the same verdict
+          // ([`root_arm_outcome`]).
+          let outcome = root_arm_outcome(outcome);
           let Some(replace) = streams.replace_states.remove(&scope) else {
             // Swept by close (its stream already retired) or never ours.
             continue;
@@ -13459,13 +13821,13 @@ pub(crate) async fn run<R, F>(
           // and the seed's own read is fresher than the spawn-time frames.
           let still_widen = core.root_path(scope).is_some_and(|old| {
             widen_predicate(&old, &meta.root)
-              && !meta.mounts.iter().any(|m| old.starts_with(m))
+              && !meta.mounts.iter().any(|row| old.starts_with(&row.location))
           }) && core.root_frame(scope).is_some_and(|(dev, mnt)| {
               meta.root_dev == dev
                 && match (meta.root_mnt_id, mnt) {
                   (Some(new_mnt), Some(old_mnt)) => new_mnt == old_mnt,
                   // Either frame unknown: the device belt governs alone — the
-                  // codebase's existing pre-5.8 degrade, inherited unchanged.
+                  // codebase's existing no-oracle degrade, inherited unchanged.
                   _ => true,
                 }
             });
@@ -13522,6 +13884,11 @@ pub(crate) async fn run<R, F>(
               dev: meta.identity.dev(),
               ino,
             });
+          // The WIDENED root's own frame, never the scope's. The commit has not
+          // landed, so the core still holds the OLD root's frame — and the old
+          // root is a DESCENDANT of this arm's target, so judging the wider root
+          // against it would refuse every widen that crosses a mount upward.
+          let frame = meta.frame();
           streams.replace_states.get_mut(&scope).expect("just checked").mode = ReplaceMode::SameFd {
             phase: SameFdPhase::Arming { reserved, meta },
           };
@@ -13529,7 +13896,7 @@ pub(crate) async fn run<R, F>(
           let tx = op_tx.clone();
           R::spawn_blocking_detach(move || {
             let mut outcome =
-              ops_for_arm.preflight_arm(&port, scope, reserved, &path, &name, expected);
+              ops_for_arm.preflight_arm(&port, scope, reserved, &path, &name, expected, frame);
             // The stale-Installed bracket: the arm's own open-then-verify ran
             // at ARM time, and the commit must never accept that outcome
             // alone — re-stat the path NOW, so an object swapped in right
@@ -13558,6 +13925,10 @@ pub(crate) async fn run<R, F>(
           });
         }
         OpResult::WidenArmed { scope, outcome } => {
+          // Same normalization as the stream replace above: the widened root is
+          // still a ROOT, so a landing across its mount refuses the widen rather
+          // than committing over it ([`root_arm_outcome`]).
+          let outcome = root_arm_outcome(outcome);
           let Some(replace) = streams.replace_states.remove(&scope) else {
             // Swept by close: the armed descriptor died with the scope's
             // stream in the sweep.
@@ -14367,6 +14738,10 @@ pub(crate) async fn run<R, F>(
         Ok(Command::DebugLaneCount { reply }) => {
           let _ = reply.send(lanes.len());
         }
+        #[cfg(all(test, feature = "tokio"))]
+        Ok(Command::DebugDeferredRefreshes { reply }) => {
+          let _ = reply.send(probes.deferred_refreshes());
+        }
         #[cfg(all(test, feature = "tokio", feature = "sync"))]
         Ok(Command::DebugCookieCount { reply }) => {
           let _ = reply.send(cookies.len());
@@ -14510,7 +14885,7 @@ pub(crate) async fn run<R, F>(
       },
       msg = os.next() => {
         if let Some(item) = msg {
-          ingest_source_item::<F>(&mut core, &lanes, &mut streams.replace_states, &streams.handles, item, &now);
+          ingest_source_item::<F>(&mut core, &lanes, &mut streams.replace_states, &streams.handles, &mut probes, item, &now);
         }
       },
     }
@@ -14544,6 +14919,12 @@ pub(crate) async fn run<R, F>(
   cookies.begin_shutdown();
   while let Some((scope, stream)) = streams.take_live() {
     registry.scope_dead(scope);
+    // This sweep ends scopes without ever raising the teardown effect that
+    // normally reclaims them, so the one piece of per-scope state a refresh can
+    // leave behind is dropped here instead (#74). The probe TAG is deliberately
+    // not retired with it: a straggling answer inside the grace is still the
+    // verdict for a scope that was live when it was dispatched.
+    probes.take_deferred(scope);
     // The same detachment normal `TeardownStream` performs, at the same point
     // relative to the registry reclaim: `attach_scope` runs only where a handle
     // is stored, so this sweep covers every attached scope. Without it the arm
@@ -14894,6 +15275,7 @@ pub(crate) async fn run<R, F>(
         &lanes,
         &mut streams.replace_states,
         &streams.handles,
+        &mut probes,
         item,
         &now,
       );
@@ -16475,13 +16857,136 @@ fn arm_failure(err: WatchError) -> std::io::Error {
   std::io::Error::new(arm_error_kind(err), err.as_str())
 }
 
+/// One ROOT pre-arm's outcome with [`WatchOutcome::Foreign`] lowered to the
+/// refusal it always stands for at a root.
+///
+/// `Foreign` is a CHILD-arm verdict. It says an arm stopped at a mount boundary
+/// INSIDE the scope — a location with a row in the table, which the next
+/// authoritative sample can ask about — and it is deliberately not a plain
+/// failure, because the scope goes on covering everything above that boundary. A
+/// ROOT that answers it is not inside anything: the pre-arm landed across the
+/// mount the scope would be rooted on (the root re-mounted between the metadata
+/// capture and the arm keeps its `(dev, ino)` while its mount id moves), so this
+/// transport cannot cover this root at all.
+///
+/// Normalized BEFORE the commit gates rather than as a third arm inside each:
+/// the gates' business is a pre-arm that failed, each has exactly one unwind,
+/// and an `if let WatchOutcome::Failed(..)` that misses this variant COMMITS and
+/// publishes a root whose replayed refusal then drops it as `Gone` — leaving the
+/// caller holding `Ok` for a scope that is tearing down.
+const fn root_arm_outcome(outcome: WatchOutcome) -> WatchOutcome {
+  match outcome {
+    WatchOutcome::Foreign => WatchOutcome::Failed(WatchError::Gone),
+    WatchOutcome::Installed(_) | WatchOutcome::Aliased(_) | WatchOutcome::Failed(_) => outcome,
+  }
+}
+
+/// One mount refresh held back until the scope's source lane has been CUT
+/// (#74) — the cover it may stand must not overtake events the reader pushed
+/// before the sample was taken — stamped with the world it was taken in.
+///
+/// A snapshot is a statement about ONE world on ONE lane at ONE moment, and
+/// between the sample and the marker any of the three can move. So the record
+/// carries all three and is applied only under the same three, single-use: a
+/// marker that does not match them cannot make it current, so it is dropped
+/// rather than kept for a later one. Nothing is ever fed to the core out of the
+/// world it describes, and nothing outlives the lane, the incarnation or the
+/// scope it was stamped in.
+#[derive(Debug)]
+struct PendingRefresh {
+  /// The marker sequence this refresh waits for — minted once per accepted cut
+  /// and never reused, so a superseded question can never be answered by a
+  /// later marker.
+  seq: u64,
+  /// The WORLD the sample was taken in: the delivery lane the cut was asked of,
+  /// and the core incarnation the scope watched then.
+  ///
+  /// Compared as a pair, because each half catches what the other cannot. A
+  /// replace installs a successor stream under a fresh lane, and this snapshot
+  /// belongs to neither the successor nor anything it will say. A same-transport
+  /// widen keeps the lane and mints no new marker at all — the incarnation is
+  /// the only thing that moves — so without the second half the widened world
+  /// would answer the narrow root's question with the narrow root's table.
+  world: (u64, u64),
+  /// The reading itself, unread until the marker lands.
+  refresh: MountRefresh,
+}
+
+/// Applies one mount refresh, or STASHES it behind a cut of the scope's source
+/// lane (#74).
+///
+/// The cover a refresh can stand is a whole-root `Rescan`, and the refresh
+/// arrives on the operation queue while the events it must dominate travel on
+/// the scope's own lane — so without the cut a batch the reader pushed BEFORE
+/// the mount sample can be ingested after the cover, naming ground the change
+/// has since hidden, with a stable table firing no later cover to correct it.
+///
+/// The wait on a reader is bounded by the CUT'S OWN HEALTH, not by the held
+/// snapshot: a refresh is ordered behind a marker only while no marker is
+/// already outstanding. When one is, the reader has not kept up within a
+/// liveness interval, so this reading applies where it lands — main's behaviour
+/// before the cut existed — and the one still held is SUPERSEDED, dropped
+/// rather than applied, because a newer sample is a newer verdict on the same
+/// question and the older one describes a world that has since been re-read.
+/// Nothing is lost by dropping it: `on_mounts_refreshed` runs the root-liveness
+/// gate first and unconditionally, so the newer sample answers the death
+/// question the older one was carrying — which on a kernel-recursive backend is
+/// the scope's only root-death check. The next marker to arrive restores the
+/// ordering; the degrade costs covers their order for one interval and never
+/// wedges, never latches, and never applies a snapshot ahead of its own cut.
+fn apply_or_stash_refresh<F: FsOps>(
+  core: &mut DriverCore,
+  probes: &mut LivenessProbes,
+  lanes: &BTreeMap<ScopeId, u64>,
+  handles: &BTreeMap<ScopeId, F::Handle>,
+  scope: ScopeId,
+  refresh: MountRefresh,
+  now: &impl Fn() -> Instant,
+) {
+  // A cut already outstanding means the ordering cannot be proven for this
+  // sample either: land it, and drop whatever the unanswered marker was holding.
+  if probes.cut_outstanding(scope) {
+    probes.take_deferred(scope);
+    core.on_mounts_refreshed(scope, refresh, now());
+    return;
+  }
+  let seq = probes.cut_seq();
+  // A stream with no reader to cut applies at once and is unchanged from what it
+  // always did: FSEvents has no descriptor to drain, Windows and the unsupported
+  // host have no such request, the fanotify source publishes its cover through
+  // its own in-band recovery completion, which already orders it — and a scope
+  // whose stream has ended has no lane for a marker to arrive on at all.
+  let Some(&lane) = lanes.get(&scope) else {
+    core.on_mounts_refreshed(scope, refresh, now());
+    return;
+  };
+  if !handles.get(&scope).is_some_and(|handle| handle.cut(seq)) {
+    core.on_mounts_refreshed(scope, refresh, now());
+    return;
+  }
+  probes.defer_refresh(
+    scope,
+    PendingRefresh {
+      seq,
+      world: (lane, core.incarnation_of(scope)),
+      refresh,
+    },
+  );
+  // The probe is over even though its verdict is not read yet: the core must be
+  // free to arm the NEXT refresh — and to hold the deadline that produces it —
+  // because that refresh is what bounds how long this one may wait on a reader.
+  core.on_refresh_deferred(scope, now());
+}
+
 /// Applies one source-lane message to the core — the ONE body both the run
 /// loop's source arm and the widen commit's lane drain use, so the two can
 /// never diverge. (The lane's `None` end marker is a stream artifact, not a
 /// channel message, so only the arm can see it and it stays there.)
 fn apply_source_message(
   core: &mut DriverCore,
+  probes: &mut LivenessProbes,
   scope: ScopeId,
+  lane: u64,
   msg: SourceMessage,
   now: &impl Fn() -> Instant,
 ) {
@@ -16505,9 +17010,64 @@ fn apply_source_message(
     // fresh message or is covered by the rescan this becomes.
     SourceMessage::Overflow(ack) => {
       drop(ack);
+      // A snapshot taken BEFORE a loss is not authoritative about the window the
+      // loss covers, and a held one is exactly that: the reader can discover an
+      // overflow and enqueue it ahead of the very marker the refresh is waiting
+      // for, so without this the marker behind it would install a pre-loss table
+      // as current and reopen device trust across the lost window (#74). Dropped
+      // ahead of the overflow, not after, because the overflow is what arms the
+      // replacement read — the deferral already told the core no refresh was
+      // outstanding — and that read must be the one that speaks next.
+      probes.take_deferred_on_lane(scope, lane);
       core.on_root_overflow(scope, now());
     }
-    SourceMessage::Fatal(_) => core.on_source_fatal(scope, now()),
+    SourceMessage::Fatal(_) => {
+      // The cut this scope may be waiting on will never be answered, and the
+      // refresh behind it is moot: the death below is the terminal verdict for
+      // the whole scope, and it dominates any cover the refresh could have
+      // asked for.
+      probes.take_deferred_on_lane(scope, lane);
+      core.on_source_fatal(scope, now());
+    }
+    // Where one of this source's walks stopped (#74). It carries no coverage
+    // consequence of its own — nothing is delivered, nothing is lost — so it
+    // needs neither barrier nor drain; the core simply remembers the locations
+    // until its next authoritative mount sample can check them.
+    #[cfg(all(target_os = "linux", not(miri)))]
+    SourceMessage::Honored(paths) => core.on_boundaries_honored(scope, paths),
+    // The cut landed (#74): everything this reader had to say about the world
+    // before the mount change is behind us on this lane, so the refresh held for
+    // it applies HERE — its cover cannot overtake what it must dominate. A
+    // marker naming any other sequence answers a question that has since been
+    // replaced and is ignored whole, leaving this scope's debt where it is.
+    //
+    // The marker also PROVES THE READER IS ANSWERING, which is the half that
+    // outlives the refresh: a cut whose refresh was superseded still clears the
+    // debt, so one slow interval costs the ordering for that interval instead of
+    // for the life of the scope. And the stamp is verified HERE, where the
+    // reading is actually fed, rather than trusted from the lane fence one frame
+    // above: the fence cannot see a same-transport widen at all, and a snapshot
+    // that no longer names this world is dropped rather than applied.
+    #[cfg(any(all(target_os = "linux", not(miri)), test))]
+    SourceMessage::Cut { seq } => {
+      if !probes.answer_cut(scope, seq) {
+        return;
+      }
+      let world = (lane, core.incarnation_of(scope));
+      if let Some(held) = probes.take_deferred_current(scope, seq, world) {
+        core.on_mounts_refreshed(scope, held, now());
+      }
+    }
+    // One requested whole-root recovery finished (#74), in band and therefore
+    // behind every event the kernel held when its walk began. The core decides
+    // whether the epoch still names this world; the boundaries the walk honored
+    // ride with it and are dropped by the same verdict.
+    #[cfg(any(all(target_os = "linux", not(miri)), test))]
+    SourceMessage::Recovered {
+      epoch,
+      outcome,
+      honored,
+    } => core.on_root_recovered(scope, epoch, outcome, honored, now()),
   }
 }
 
@@ -16521,6 +17081,7 @@ fn ingest_source_item<F: FsOps>(
   lanes: &BTreeMap<ScopeId, u64>,
   replace_states: &mut BTreeMap<ScopeId, ReplaceState<F::Handle>>,
   handles: &BTreeMap<ScopeId, F::Handle>,
+  probes: &mut LivenessProbes,
   item: (ScopeId, u64, Option<SourceMessage>),
   now: &impl Fn() -> Instant,
 ) {
@@ -16531,11 +17092,15 @@ fn ingest_source_item<F: FsOps>(
   // lane for its whole life, so this gate never fires — pinned by the
   // existing suites.)
   if lanes.get(&scope) != Some(&lane) {
+    // Anything this lane was still holding is reclaimed as it is refused, and
+    // only what is keyed on THIS lane: a refresh stamped on the successor
+    // belongs to the world that replaced this one (#74).
+    probes.take_deferred_on_lane(scope, lane);
     return;
   }
   match msg {
     Some(msg) => {
-      apply_source_message(core, scope, msg, now);
+      apply_source_message(core, probes, scope, lane, msg, now);
       // The catch-up ledger: one prefix message consumed in the arm's own
       // frame — delivered, tainted, or funneled exactly as any other.
       // Saturating: post-snapshot arrivals are transport-concurrent with
@@ -16558,6 +17123,11 @@ fn ingest_source_item<F: FsOps>(
     // the disconnect can arrive). The end marker fires only after the queue
     // yielded everything it held.
     None => {
+      // A cut this stream was asked for can no longer land, so a refresh held
+      // for it would sit here for the life of the driver. It is moot either way:
+      // a dead stream funnels below, and a retired one belongs to a world that
+      // has ended (#74).
+      probes.take_deferred_on_lane(scope, lane);
       if handles.contains_key(&scope) {
         core.on_source_fatal(scope, now());
       }
@@ -18136,6 +18706,7 @@ fn execute_effects<R, F>(
         name,
         path,
         expected,
+        frame,
       } => {
         // EVERY QUEUED EFFECT OF A SCOPE BELONGS TO ONE INCARNATION. A commit
         // that replaced this scope's root retired the ground this arm names, and
@@ -18166,6 +18737,7 @@ fn execute_effects<R, F>(
             name,
             path,
             expected,
+            frame,
           });
       }
       Effect::RemoveWatch {
@@ -18347,6 +18919,31 @@ fn execute_effects<R, F>(
               refresh,
             });
           });
+        }
+      }
+      Effect::RecoverRoot { scope, epoch } => {
+        // A send and a wake, on this task, with nothing waiting: the walk runs
+        // on the source's own reader thread and its completion rides that
+        // source's ordered lane, behind every event the kernel held when it
+        // began. That ordering is the whole point of the round trip — a reply on
+        // the operation queue would let the cover overtake the batches it has to
+        // follow — and it costs no pool thread to get.
+        //
+        // Nothing to rebuild (every backend but fanotify) or nobody left to ask
+        // (a stream already gone) completes it HERE. Leaving it unanswered would
+        // latch the scope's recovery in flight for good, and every later mount
+        // change would coalesce onto a walk that is never going to finish.
+        if !handles
+          .get(&scope)
+          .is_some_and(|handle| handle.recover(epoch))
+        {
+          core.on_root_recovered(
+            scope,
+            epoch,
+            crate::os::RootRecovery::Reseeded,
+            Vec::new(),
+            now(),
+          );
         }
       }
       Effect::Emit {

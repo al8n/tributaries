@@ -97,11 +97,27 @@ fn probes(effects: &[Effect]) -> Vec<(ProbeId, PathBuf)> {
 /// exercise device trust without tripping the folded-in root-death check.
 fn alive_refresh(mounts: Vec<PathBuf>, authoritative: bool) -> MountRefresh {
   MountRefresh {
-    mounts,
+    mounts: mounts.into_iter().map(bare).collect(),
     authoritative,
     root: RootLiveness::Present(crate::os::RootIdentity::new(1, 1)),
     // No frame change exercised: the captured `root_mnt_id` stays intact.
     root_mnt_id: None,
+    root_incarnation: None,
+    namespace_transitions: None,
+    overflowed: false,
+  }
+}
+
+/// A table row with no identity at all — what macOS' `getfsstat`, a kernel below
+/// every id oracle and every fake report. The suites that only care WHERE a mount
+/// is use this; the ones that exercise identity spell `MountRow` out.
+fn bare(location: impl Into<PathBuf>) -> crate::os::MountRow {
+  crate::os::MountRow {
+    location: location.into(),
+    mnt_id: None,
+    parent_id: None,
+    mnt_id_unique: None,
+    dev: None,
   }
 }
 
@@ -702,6 +718,9 @@ fn refresh_finding_root_gone_is_delete_self() {
       authoritative: true,
       root: RootLiveness::Missing,
       root_mnt_id: None,
+      root_incarnation: None,
+      namespace_transitions: None,
+      overflowed: false,
     },
     at(5),
   );
@@ -735,6 +754,9 @@ fn refresh_finding_root_replaced_is_move_self() {
         authoritative: true,
         root,
         root_mnt_id: None,
+        root_incarnation: None,
+        namespace_transitions: None,
+        overflowed: false,
       },
       at(5),
     );
@@ -755,19 +777,27 @@ fn refresh_finding_root_replaced_is_move_self() {
 }
 
 /// A refresh finding the root still ALIVE (same identity) is NOT a death: the
-/// folded-in liveness check is inert on the healthy path — no emission, no
-/// teardown — and the mount trust it carries still installs (a later loss no
-/// longer re-arms once authority is back).
+/// folded-in liveness check is inert on the healthy path — no teardown, and
+/// nothing self-shaped delivered — and the mount trust it carries still installs
+/// (a later loss no longer re-arms once authority is back).
+///
+/// What the refresh DOES carry here is a new row under the root, and a table that
+/// changed costs one whole-root cover (#74). That cover is the point of the
+/// second half of this cell: an arriving mount is answered with a `Rescan` at the
+/// ROOT, not with a death and not with a per-location statement.
 #[test]
 fn refresh_finding_root_alive_only_updates_trust() {
   let (mut core, scope) = live_core();
   core.on_mounts_refreshed(
     scope,
     MountRefresh {
-      mounts: vec![PathBuf::from("/r/vol")],
+      mounts: vec![bare("/r/vol")],
       authoritative: true,
       root: RootLiveness::Present(crate::os::RootIdentity::new(1, 1)),
       root_mnt_id: None,
+      root_incarnation: None,
+      namespace_transitions: None,
+      overflowed: false,
     },
     at(5),
   );
@@ -775,8 +805,23 @@ fn refresh_finding_root_alive_only_updates_trust() {
   assert!(
     !effects
       .iter()
-      .any(|e| matches!(e, Effect::TeardownStream { .. }) | matches!(e, Effect::Emit { .. })),
-    "an alive root neither dies nor emits: {effects:?}"
+      .any(|e| matches!(e, Effect::TeardownStream { .. })),
+    "an alive root does not die: {effects:?}"
+  );
+  let emitted = emits(&effects);
+  assert_eq!(
+    emitted.len(),
+    1,
+    "the arrival under the root costs exactly one cover: {effects:?}"
+  );
+  assert!(
+    emitted[0].kind().is_rescan(),
+    "coverage the host changed underneath is covered, never delivered: {emitted:?}"
+  );
+  assert_eq!(
+    emitted[0].location(),
+    &loc(&[]),
+    "and the cover is the WHOLE root: {emitted:?}"
   );
 }
 
@@ -1414,9 +1459,18 @@ fn identity_minting_respects_devices_and_mounts() {
     root: Some(Arc::new(PathBuf::from("/r"))),
     root_dev: Some(1),
     root_mnt_id: None,
+    root_incarnation: None,
     identity: Some(crate::os::RootIdentity::new(1, 1)),
-    mounts: vec![PathBuf::from("/r/vol")],
+    mount_table: vec![PathBuf::from("/r/vol")],
+    learned_mounts: Vec::new(),
     mounts_authoritative: true,
+    table_fingerprint: None,
+    honored_boundaries: BTreeSet::new(),
+    honored_saturated: false,
+    namespace_transitions_seen: None,
+    recovery_epoch: 0,
+    recovery_in_flight: false,
+    recovery_dirty: false,
     refresh_pending: false,
     refresh_stale: false,
     budget_recovered: false,
@@ -1462,9 +1516,18 @@ fn blind_mount_table_refuses_event_side_trust() {
     root: Some(Arc::new(PathBuf::from("/r"))),
     root_dev: Some(1),
     root_mnt_id: None,
+    root_incarnation: None,
     identity: Some(crate::os::RootIdentity::new(1, 1)),
-    mounts: Vec::new(),
+    mount_table: Vec::new(),
+    learned_mounts: Vec::new(),
     mounts_authoritative: false,
+    table_fingerprint: None,
+    honored_boundaries: BTreeSet::new(),
+    honored_saturated: false,
+    namespace_transitions_seen: None,
+    recovery_epoch: 0,
+    recovery_in_flight: false,
+    recovery_dirty: false,
     refresh_pending: false,
     refresh_stale: false,
     budget_recovered: false,
@@ -1529,9 +1592,12 @@ fn probed_foreign_device_is_learned_as_a_mount() {
   let _ = drain(&mut core);
   let state = core.scopes.get(&scope).expect("scope lives");
   assert!(
-    state.mounts.iter().any(|m| m == Path::new("/r/vol/x")),
+    state
+      .learned_mounts
+      .iter()
+      .any(|m| m == Path::new("/r/vol/x")),
     "the foreign device's prefix is remembered: {:?}",
-    state.mounts
+    state.learned_mounts
   );
 }
 
@@ -2110,7 +2176,7 @@ fn seeded_mount_blocks_pairing_before_any_probe_learns_it() {
       root: PathBuf::from("/r"),
       root_dev: 1,
       root_mnt_id: None,
-      mounts: vec![PathBuf::from("/r/vol")],
+      mounts: vec![bare("/r/vol")],
       identity: crate::os::RootIdentity::new(1, 1),
       ancestors: Vec::new(),
       backend: BackendKind::FsEvents,
@@ -2475,46 +2541,167 @@ fn failed_refresh_keeps_trust_closed() {
   );
 }
 
+/// An authoritative read is COMPLETE, so a row it does not list is a mount that
+/// is not there — and the table half of the veto takes the new snapshot whole.
+///
+/// The two halves pin opposite directions and neither alone is the invariant:
+/// point `install_mount_table` at `learned_mounts` as well and
+/// `a_learned_prefix_survives_the_table_replacement` fails instead.
 #[test]
-fn refresh_union_keeps_learned_foreign_prefixes() {
+fn an_authoritative_read_replaces_the_departed_table_row() {
   let (mut core, scope) = live_core();
-  // A probe learns a foreign-device prefix.
-  core.on_batch_events(
+  core.on_mounts_refreshed(
     scope,
-    vec![ev(
-      "/r/vol/x",
-      flags(&[FsEventFlags::ITEM_CREATED, FsEventFlags::ITEM_MODIFIED]),
-      1,
-      5,
-    )],
+    alive_refresh(vec![PathBuf::from("/r/vol")], true),
     at(1),
   );
-  let reqs = probes(&drain(&mut core));
-  core.on_probe_result(
-    reqs[0].0,
-    ProbeOutcome::Present {
-      kind: FileKind::File,
-      file_id: NonZeroU64::new(5),
-      dev: 9,
-    },
+  let _ = drain(&mut core);
+  let state = core.scopes.get(&scope).expect("scope is live");
+  assert!(
+    mint(state, Path::new("/r/vol/x"), NonZeroU64::new(7), None).is_none(),
+    "staging: while the row stands, an event-side identity under it refuses to mint"
+  );
+
+  core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(2));
+  let _ = drain(&mut core);
+
+  let state = core.scopes.get(&scope).expect("scope is live");
+  assert!(state.mounts_authoritative, "the read was authoritative");
+  assert!(
+    !state.mount_table.iter().any(|m| m == Path::new("/r/vol")),
+    "the departed row is gone from the table: an authoritative snapshot is \
+     complete, so a location it does not list is a mount that is not there — and \
+     retaining it forever is a leak, not a safe direction: {:?}",
+    state.mount_table
+  );
+  assert!(
+    mint(state, Path::new("/r/vol/x"), NonZeroU64::new(7), None).is_some(),
+    "and the ground the mount was hiding mints again"
+  );
+}
+
+/// N distinct mountpoints that arrive and depart leave nothing behind: the table
+/// component holds one snapshot's rows, never a history.
+///
+/// This is the leak itself. Every authoritative refresh used to append the
+/// locations it read to a vector nothing ever removed from on Linux, so a
+/// long-lived scope on a container host retained one `PathBuf` per HISTORICAL
+/// unique mountpoint — and paid a linear scan of that history per current row on
+/// every refresh, on a single-threaded driver whose stalls are the queue loss the
+/// whole file exists to avoid.
+///
+/// The cell counts against what is CURRENTLY mounted, not against a constant: the
+/// churn count is a loop bound, and the verdict is `mount_table.len()` versus the
+/// one row the last read listed. A ceiling of "at most N" would pass on the
+/// leaking code for N large enough.
+#[test]
+fn mount_churn_leaves_the_table_the_size_of_one_snapshot() {
+  let (mut core, scope) = live_core();
+  const CHURN: usize = 24;
+  for turn in 0..CHURN {
+    let vol = PathBuf::from(format!("/r/vol-{turn}"));
+    core.on_mounts_refreshed(
+      scope,
+      alive_refresh(vec![PathBuf::from("/r/live"), vol], true),
+      at(2 * turn as u64 + 1),
+    );
+    let _ = drain(&mut core);
+    // And it departs again, exactly as a container's private namespace churns.
+    core.on_mounts_refreshed(
+      scope,
+      alive_refresh(vec![PathBuf::from("/r/live")], true),
+      at(2 * turn as u64 + 2),
+    );
+    let _ = drain(&mut core);
+  }
+
+  let state = core.scopes.get(&scope).expect("scope is live");
+  assert_eq!(
+    state.mount_table.len(),
+    1,
+    "the table holds one snapshot, not a history: the last read listed one row, \
+     so one row is what a scope that watched {CHURN} mounts come and go retains: \
+     {:?}",
+    state.mount_table
+  );
+  assert!(
+    state.mount_table.iter().any(|m| m == Path::new("/r/live")),
+    "and it is the row that is still mounted: {:?}",
+    state.mount_table
+  );
+}
+
+/// The veto half. A prefix learned from something OTHER than a snapshot survives
+/// every table replacement, and only evidence its mount is gone retires it.
+///
+/// This is why the two components exist. An in-band `Mount` word can describe a
+/// mount that arrived AFTER the snapshot currently in flight was read, and a
+/// probe's foreign device is a path arbitrarily deep inside a volume that no
+/// mountinfo row will ever name — so neither is a row, and an install that
+/// replaced either away would re-trust a subtree this scope has direct evidence
+/// is foreign. The evidence that DOES retire one is the in-band unmount word,
+/// applied at settlement.
+#[test]
+fn a_learned_prefix_survives_the_table_replacement() {
+  let (mut core, scope) = live_core();
+  // An in-band mount word: the volume is live and the snapshot in flight predates
+  // it, which is exactly the case a table row cannot represent.
+  core.on_batch_events(
+    scope,
+    vec![ev("/r/late", flags(&[FsEventFlags::MOUNT]), 1, 0)],
+    at(1),
+  );
+  let _ = drain(&mut core);
+  core.on_mounts_refreshed(
+    scope,
+    alive_refresh(vec![PathBuf::from("/r/other")], true),
     at(2),
   );
   let _ = drain(&mut core);
 
-  core.on_root_overflow(scope, at(3));
-  let _ = drain(&mut core);
-  // The fresh snapshot does not list the learned prefix (it is not a real
-  // mount point); the union must keep it — replacement would re-trust a
-  // known-foreign subtree.
-  core.on_mounts_refreshed(
-    scope,
-    alive_refresh(vec![PathBuf::from("/r/other")], true),
-    at(0),
-  );
   let state = core.scopes.get(&scope).expect("scope is live");
   assert!(state.mounts_authoritative);
-  assert!(state.mounts.iter().any(|m| m == Path::new("/r/vol/x")));
-  assert!(state.mounts.iter().any(|m| m == Path::new("/r/other")));
+  assert!(
+    state.mount_table.iter().any(|m| m == Path::new("/r/other")),
+    "the snapshot's own row installed: {:?}",
+    state.mount_table
+  );
+  assert!(
+    state
+      .learned_mounts
+      .iter()
+      .any(|m| m == Path::new("/r/late")),
+    "the in-band mount word survives the authoritative install: the read that \
+     replaced the table was taken before the mount existed, so its silence about \
+     `/r/late` is ignorance rather than evidence: {:?}",
+    state.learned_mounts
+  );
+  assert!(
+    mint(state, Path::new("/r/late/x"), NonZeroU64::new(7), None).is_none(),
+    "and the veto still stands: nothing under it mints"
+  );
+
+  // The unmount word is the evidence that retires it — and the only thing that
+  // does.
+  core.on_batch_events(
+    scope,
+    vec![ev("/r/late", flags(&[FsEventFlags::UNMOUNT]), 2, 0)],
+    at(3),
+  );
+  let _ = drain(&mut core);
+  let state = core.scopes.get(&scope).expect("scope is live");
+  assert!(
+    !state
+      .learned_mounts
+      .iter()
+      .any(|m| m == Path::new("/r/late")),
+    "the unmount word retires it: {:?}",
+    state.learned_mounts
+  );
+  assert!(
+    mint(state, Path::new("/r/late/x"), NonZeroU64::new(7), None).is_some(),
+    "and the revealed ground mints again"
+  );
 }
 
 #[test]
@@ -2588,7 +2775,7 @@ fn same_batch_unmount_keeps_colliding_rename_foreign() {
       root: PathBuf::from("/r"),
       root_dev: 1,
       root_mnt_id: None,
-      mounts: vec![PathBuf::from("/r/vol")],
+      mounts: vec![bare("/r/vol")],
       identity: crate::os::RootIdentity::new(1, 1),
       ancestors: Vec::new(),
       backend: BackendKind::FsEvents,
@@ -2638,7 +2825,10 @@ fn same_batch_unmount_keeps_colliding_rename_foreign() {
   // The removal applies at settlement: the NEXT batch sees the prefix gone.
   let state = core.scopes.get(&scope).expect("scope is live");
   assert!(
-    !state.mounts.iter().any(|m| m == Path::new("/r/vol")),
+    !state
+      .learned_mounts
+      .iter()
+      .any(|m| m == Path::new("/r/vol")),
     "post-batch, the unmounted prefix leaves the table"
   );
 }
@@ -3218,6 +3408,787 @@ fn kernel_recursive_loss_rescan_marks_loss_memory() {
   );
 }
 
+/// The COARSE mount-change cover (#74): every difference between two
+/// authoritative samples of the table under the root costs one whole-root
+/// `Rescan`, and nothing less than a difference costs anything.
+///
+/// A mount that departs below a watched root emits no kernel signal on any
+/// backend — the watches under it simply stop meaning anything, and a mount that
+/// ARRIVES hides a subtree whose coverage now describes nothing reachable. The
+/// periodic sample is the only witness, so these cells are about exactly two
+/// questions: what counts as a difference, and what a difference costs.
+mod mount_change_cover {
+  use super::*;
+
+  /// A refresh carrying the root's CURRENT mount frame — what a real Linux
+  /// refresh answers and what `on_mounts_refreshed` adopts. The frame move is one
+  /// of the cover's three legs, so a cell that means to exercise the TABLE legs
+  /// passes the frame it already holds (`None` leaves the captured one intact).
+  fn framed_refresh(
+    mounts: Vec<crate::os::MountRow>,
+    authoritative: bool,
+    root_mnt_id: Option<u64>,
+  ) -> MountRefresh {
+    MountRefresh {
+      mounts,
+      authoritative,
+      root: RootLiveness::Present(crate::os::RootIdentity::new(1, 1)),
+      root_mnt_id,
+      root_incarnation: None,
+      namespace_transitions: None,
+      overflowed: false,
+    }
+  }
+
+  /// [`framed_refresh`] carrying the root's INCARNATION token as well — the fact
+  /// that separates two mounts sharing one recycled id.
+  fn incarnate_refresh(
+    mounts: Vec<crate::os::MountRow>,
+    authoritative: bool,
+    root_mnt_id: Option<u64>,
+    root_incarnation: Option<crate::os::RootIncarnation>,
+  ) -> MountRefresh {
+    MountRefresh {
+      root_incarnation,
+      ..framed_refresh(mounts, authoritative, root_mnt_id)
+    }
+  }
+
+  /// A refresh carrying the mount-namespace TRANSITION COUNT the sample was taken
+  /// under, and no root token at all — the pre-6.8 host, whose per-row ids the
+  /// kernel recycles and whose only other evidence is that something, somewhere,
+  /// moved.
+  fn sampled_refresh(
+    mounts: Vec<crate::os::MountRow>,
+    authoritative: bool,
+    namespace_transitions: Option<u64>,
+  ) -> MountRefresh {
+    MountRefresh {
+      namespace_transitions,
+      ..framed_refresh(mounts, authoritative, None)
+    }
+  }
+
+  /// A table row carrying the identity `/proc/self/mountinfo` supplies on a
+  /// kernel that answers mount ids, with the PARENT left unanswered.
+  fn row(location: &str, mnt_id: u64, dev: u64) -> crate::os::MountRow {
+    crate::os::MountRow {
+      mnt_id: Some(mnt_id),
+      dev: Some(dev),
+      ..bare(location)
+    }
+  }
+
+  /// A row that also names the mount it hangs off — field 2 of a mountinfo line.
+  fn row_under(location: &str, mnt_id: u64, parent_id: u64, dev: u64) -> crate::os::MountRow {
+    crate::os::MountRow {
+      parent_id: Some(parent_id),
+      ..row(location, mnt_id, dev)
+    }
+  }
+
+  /// A row carrying the NEVER-RECYCLED id as well (`statx(STATX_MNT_ID_UNIQUE)`,
+  /// Linux 6.8), read per row inside the sample's own namespace-stable window.
+  fn row_unique(
+    location: &str,
+    mnt_id: u64,
+    parent_id: u64,
+    unique: Option<u64>,
+    dev: u64,
+  ) -> crate::os::MountRow {
+    crate::os::MountRow {
+      mnt_id_unique: unique,
+      ..row_under(location, mnt_id, parent_id, dev)
+    }
+  }
+
+  /// The one covering `Rescan` at the scope ROOT this design answers every table
+  /// change with, asserted whole: exactly one delivery, of the covering kind, at
+  /// the root itself.
+  fn one_root_cover(effects: &[Effect]) {
+    let emitted = emits(effects);
+    assert_eq!(
+      emitted.len(),
+      1,
+      "a table change costs exactly one cover: {effects:?}"
+    );
+    assert!(
+      emitted[0].kind().is_rescan(),
+      "coverage the host changed underneath is covered, never delivered: {emitted:?}"
+    );
+    assert_eq!(
+      emitted[0].location(),
+      &loc(&[]),
+      "and the cover is the WHOLE root — no census, so no located statement: {emitted:?}"
+    );
+  }
+
+  /// A mount ARRIVING under the root hides whatever the scope had already
+  /// enumerated there, so the tree it believes it covers is no longer the tree
+  /// that is. One cover.
+  #[test]
+  fn a_mount_arriving_under_the_root_covers_it() {
+    let (mut core, scope) = live_core();
+    core.on_mounts_refreshed(
+      scope,
+      framed_refresh(vec![row("/r/vol", 40, 7)], true, None),
+      at(1),
+    );
+    one_root_cover(&drain(&mut core));
+  }
+
+  /// And a mount DEPARTING — `umount -l`, the case #74 was filed on — reveals
+  /// ground nothing ever enumerated, with no kernel signal of any kind. One
+  /// cover, off the same difference read backwards.
+  #[test]
+  fn a_mount_departing_under_the_root_covers_it() {
+    let (mut core, scope) = live_core();
+    core.on_mounts_refreshed(
+      scope,
+      framed_refresh(vec![row("/r/vol", 40, 7)], true, None),
+      at(1),
+    );
+    let _ = drain(&mut core);
+    core.on_mounts_refreshed(scope, framed_refresh(Vec::new(), true, None), at(2));
+    one_root_cover(&drain(&mut core));
+  }
+
+  /// A live scope whose spawn barrier listed `mounts` under the root and whose
+  /// birth refresh has NOT run yet: the next `on_mounts_refreshed` is this
+  /// world's first authoritative sample, and it compares against that barrier's
+  /// own table rather than installing itself as the truth.
+  fn spawned_holding(mounts: Vec<crate::os::MountRow>) -> (DriverCore, ScopeId) {
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
+    let scope = core
+      .on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::FsEvents)
+      .expect("a fresh scope registers");
+    let _ = drain(&mut core);
+    core.on_stream_spawned(
+      scope,
+      Ok(RootMeta {
+        root: PathBuf::from("/r"),
+        root_dev: 1,
+        root_mnt_id: None,
+        mounts,
+        identity: crate::os::RootIdentity::new(1, 1),
+        ancestors: Vec::new(),
+        backend: BackendKind::FsEvents,
+      }),
+    );
+    let _ = drain(&mut core);
+    (core, scope)
+  }
+
+  /// The window a birth refresh cannot answer on its own. The barrier reads the
+  /// table BEFORE the world walks the tree for coverage, so a mount that departs
+  /// in between leaves ground the walk stopped short of and nothing re-reads —
+  /// and a first sample that merely INSTALLED the post-departure table would bury
+  /// it for the life of the scope. Seeded from the barrier, the departure is
+  /// exactly what it is: a difference, and one cover.
+  #[test]
+  fn a_mount_departing_before_the_birth_refresh_covers_the_root() {
+    let (mut core, scope) = spawned_holding(vec![row("/r/vol", 40, 7)]);
+    core.on_mounts_refreshed(scope, framed_refresh(Vec::new(), true, None), at(1));
+    one_root_cover(&drain(&mut core));
+  }
+
+  /// The replacement world has the same window and takes the same seed: its
+  /// commit's covering `Rescan` speaks for the tree its barrier read, and the
+  /// mount that left after that read is not in it.
+  #[test]
+  fn a_mount_departing_before_the_replaces_first_refresh_covers_the_root() {
+    let (mut core, scope) = live_core();
+    core.on_root_replaced(
+      scope,
+      RootMeta {
+        root: PathBuf::from("/r"),
+        root_dev: 1,
+        root_mnt_id: None,
+        mounts: vec![row("/r/vol", 40, 7)],
+        identity: crate::os::RootIdentity::new(1, 1),
+        ancestors: Vec::new(),
+        backend: BackendKind::FsEvents,
+      },
+      at(1),
+    );
+    let _ = drain(&mut core);
+    core.on_mounts_refreshed(scope, framed_refresh(Vec::new(), true, None), at(2));
+    one_root_cover(&drain(&mut core));
+  }
+
+  /// And the seed costs nothing when nothing moved: a first sample that confirms
+  /// the barrier's table is not a change, so a scope born on a host with mounts
+  /// under its root pays no cover for having them.
+  #[test]
+  fn a_first_sample_equal_to_the_spawn_table_costs_nothing() {
+    let (mut core, scope) = spawned_holding(vec![row("/r/vol", 40, 7)]);
+    core.on_mounts_refreshed(
+      scope,
+      framed_refresh(vec![row("/r/vol", 40, 7)], true, None),
+      at(1),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).is_empty(),
+      "a baseline the first sample confirms is not a difference: {effects:?}"
+    );
+  }
+
+  /// The never-recycled id is a per-ROW fact, read by a per-row `statx` that can
+  /// be refused on one row and answered on the next. A row that answered vouches
+  /// for nothing about a row that did not, so a sample is self-identifying only
+  /// when EVERY row carries the id — otherwise the namespace transition count is
+  /// still the only evidence that can contradict two equal readings.
+  #[test]
+  fn a_namespace_transition_covers_when_any_row_lacks_a_unique_id() {
+    let (mut core, scope) = live_core();
+    let table = || {
+      vec![
+        row_unique("/r/a", 40, 36, Some(900), 7),
+        row_unique("/r/b", 41, 36, None, 7),
+      ]
+    };
+    core.on_mounts_refreshed(scope, sampled_refresh(table(), true, Some(11)), at(1));
+    let _ = drain(&mut core);
+
+    // `/r/b` could be replaced in place with the id the kernel just freed and
+    // these rows would read identically. The transition says something moved.
+    core.on_mounts_refreshed(scope, sampled_refresh(table(), true, Some(12)), at(2));
+    one_root_cover(&drain(&mut core));
+  }
+
+  /// Its dual, and the bound on the cost: when every row DOES carry the id the
+  /// rows are the whole evidence, and a namespace that moved elsewhere on the
+  /// host costs this scope nothing.
+  #[test]
+  fn a_namespace_transition_costs_nothing_when_every_row_carries_a_unique_id() {
+    let (mut core, scope) = live_core();
+    let table = || {
+      vec![
+        row_unique("/r/a", 40, 36, Some(900), 7),
+        row_unique("/r/b", 41, 36, Some(901), 7),
+      ]
+    };
+    core.on_mounts_refreshed(scope, sampled_refresh(table(), true, Some(11)), at(1));
+    let _ = drain(&mut core);
+    core.on_mounts_refreshed(scope, sampled_refresh(table(), true, Some(12)), at(2));
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).is_empty(),
+      "rows that can all speak for themselves consult nothing else: {effects:?}"
+    );
+  }
+
+  /// The shape no row diff can see, and the whole reason a walk reports where it
+  /// stopped. A mount arrives over ground the world's coverage walk was about to
+  /// read, the walk honors it (so nothing beneath it is mapped, armed or
+  /// enumerated), and it departs before any sample lists it. NEITHER table ever
+  /// held a row for it, so the rows compare equal — and the ground it hid is read
+  /// by nothing, forever. The boundary the walk reported is the only evidence
+  /// left, and a sample that cannot find it is proof it was never there.
+  #[test]
+  fn a_honored_boundary_gone_by_the_next_sample_covers_the_root() {
+    let (mut core, scope) = live_core();
+    core.on_boundaries_honored(scope, vec![PathBuf::from("/r/vol")]);
+    assert!(
+      emits(&drain(&mut core)).is_empty(),
+      "a report is not itself a cover — it is a question for the next sample"
+    );
+    core.on_mounts_refreshed(scope, framed_refresh(Vec::new(), true, None), at(1));
+    one_root_cover(&drain(&mut core));
+  }
+
+  /// Its bound, and why this costs nothing on an ordinary host: a boundary the
+  /// sample still finds in the table is answered by the table. It enters the
+  /// fingerprint like any other row, so no further memory is needed — and its
+  /// eventual departure is an ordinary difference, covered by the row diff alone.
+  #[test]
+  fn a_honored_boundary_still_mounted_costs_nothing_and_its_later_departure_covers() {
+    let (mut core, scope) = live_core();
+    // The mount is in the baseline, so the rows below never change and anything
+    // that fires is the boundary report and nothing else.
+    core.on_mounts_refreshed(
+      scope,
+      framed_refresh(vec![row("/r/vol", 40, 7)], true, None),
+      at(1),
+    );
+    let _ = drain(&mut core);
+
+    core.on_boundaries_honored(scope, vec![PathBuf::from("/r/vol")]);
+    core.on_mounts_refreshed(
+      scope,
+      framed_refresh(vec![row("/r/vol", 40, 7)], true, None),
+      at(2),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).is_empty(),
+      "the table carries the mount the walk stopped at, so nothing is owed: {effects:?}"
+    );
+
+    // Consumed by that sample: the row is the memory now, and the ordinary diff
+    // covers the departure.
+    core.on_mounts_refreshed(scope, framed_refresh(Vec::new(), true, None), at(3));
+    one_root_cover(&drain(&mut core));
+  }
+
+  /// Only an AUTHORITATIVE sample may answer a boundary. Absence from a table
+  /// that could not be read is not evidence of anything, so a blind refresh leaves
+  /// the set standing for the next real one rather than consuming it.
+  #[test]
+  fn a_blind_sample_keeps_the_honored_boundaries_for_an_authoritative_one() {
+    let (mut core, scope) = live_core();
+    core.on_boundaries_honored(scope, vec![PathBuf::from("/r/vol")]);
+    core.on_mounts_refreshed(scope, framed_refresh(Vec::new(), false, None), at(1));
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).is_empty(),
+      "an unreadable table judges nothing: {effects:?}"
+    );
+    core.on_mounts_refreshed(scope, framed_refresh(Vec::new(), true, None), at(2));
+    one_root_cover(&drain(&mut core));
+  }
+
+  /// A world swap forgets them, because the new world re-walks its whole tree and
+  /// every boundary it stops at is reported again by that walk. Keeping the old
+  /// world's locations would have the replacement's first sample cover a tree the
+  /// swap's own `Rescan` already covered.
+  #[test]
+  fn a_world_swap_forgets_honored_boundaries() {
+    let (mut core, scope) = live_core();
+    core.on_boundaries_honored(scope, vec![PathBuf::from("/r/vol")]);
+    core.on_root_replaced(
+      scope,
+      RootMeta {
+        root: PathBuf::from("/r"),
+        root_dev: 1,
+        root_mnt_id: None,
+        mounts: Vec::new(),
+        identity: crate::os::RootIdentity::new(1, 1),
+        ancestors: Vec::new(),
+        backend: BackendKind::FsEvents,
+      },
+      at(1),
+    );
+    let _ = drain(&mut core);
+    core.on_mounts_refreshed(scope, framed_refresh(Vec::new(), true, None), at(2));
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).is_empty(),
+      "the swap's own cover already spoke for the whole new root: {effects:?}"
+    );
+  }
+
+  /// The memory is BOUNDED, and it fails closed. Past the ceiling the set is
+  /// dropped whole rather than truncated — a truncated set would answer "none of
+  /// the ones I kept is missing" while saying nothing about the ones it threw away
+  /// — and the next authoritative sample covers once, unconditionally.
+  #[test]
+  // Sized to the ceiling: minutes under Miri, and nothing Miri checks is at stake in a safe-code loop.
+  #[cfg_attr(miri, ignore)]
+  fn honored_boundaries_saturate_into_one_unconditional_cover() {
+    let (mut core, scope) = live_core();
+    let rows: Vec<crate::os::MountRow> = (0..=MAX_HONORED_BOUNDARIES)
+      .map(|i| bare(format!("/r/vol{i}")))
+      .collect();
+    // Installed as the baseline first, so the rows never change again: every
+    // reported location IS in the table, and an intact set would find them all
+    // and cover nothing.
+    core.on_mounts_refreshed(scope, framed_refresh(rows.clone(), true, None), at(1));
+    let _ = drain(&mut core);
+
+    let flood: Vec<PathBuf> = rows.iter().map(|row| row.location.clone()).collect();
+    core.on_boundaries_honored(scope, flood);
+    core.on_mounts_refreshed(scope, framed_refresh(rows.clone(), true, None), at(2));
+    one_root_cover(&drain(&mut core));
+
+    // And the saturation is spent by that cover, not sticky.
+    core.on_mounts_refreshed(scope, framed_refresh(rows, true, None), at(3));
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).is_empty(),
+      "one unconditional cover, not one per interval forever: {effects:?}"
+    );
+  }
+
+  /// A reading the parser refused past a ceiling is not a table at all, and the
+  /// two refusals are deliberately different. A table that could not be READ is a
+  /// transient nothing the next tick retries — it installs nothing, trusts nothing
+  /// and says nothing. One that could not be JUDGED is a root this design can no
+  /// longer speak about, so it says so: one whole-root cover per such refresh,
+  /// bounded by the liveness interval, instead of an unguarded root or an
+  /// allocation with no ceiling above it.
+  #[test]
+  fn an_overflowed_sample_covers_the_root_and_trusts_no_table() {
+    let (mut core, scope) = live_core();
+    let overflowed = || MountRefresh {
+      overflowed: true,
+      ..framed_refresh(Vec::new(), false, None)
+    };
+    core.on_mounts_refreshed(scope, overflowed(), at(1));
+    one_root_cover(&drain(&mut core));
+    assert!(
+      !core
+        .scopes
+        .get(&scope)
+        .expect("the scope is live")
+        .mounts_authoritative,
+      "a table this parser refused grants no device trust"
+    );
+
+    // Once per overflowed refresh — loud, and bounded by the cadence.
+    core.on_mounts_refreshed(scope, overflowed(), at(2));
+    one_root_cover(&drain(&mut core));
+
+    // The honored boundaries are answered by that cover rather than asked again:
+    // a cover of the whole root is every answer they were owed.
+    core.on_boundaries_honored(scope, vec![PathBuf::from("/r/vol")]);
+    core.on_mounts_refreshed(scope, overflowed(), at(3));
+    one_root_cover(&drain(&mut core));
+    core.on_mounts_refreshed(scope, framed_refresh(Vec::new(), true, None), at(4));
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).is_empty(),
+      "and the overflow installed nothing, so the next good sample is a \
+       comparison against the baseline that still stands: {effects:?}"
+    );
+  }
+
+  /// A mount REPLACED at one location is the hard case, and on 6.8+ the rows
+  /// carry the answer themselves. Location, device, legacy id and parent are all
+  /// unchanged — the kernel handed the newcomer the id the old mount freed — and
+  /// the never-recycled `mnt_id_unique` is the single field that differs.
+  #[test]
+  fn a_replacement_at_one_location_covers_through_the_unique_id() {
+    let (mut core, scope) = live_core();
+    core.on_mounts_refreshed(
+      scope,
+      framed_refresh(vec![row_unique("/r/vol", 40, 36, Some(900), 7)], true, None),
+      at(1),
+    );
+    let _ = drain(&mut core);
+    core.on_mounts_refreshed(
+      scope,
+      framed_refresh(vec![row_unique("/r/vol", 40, 36, Some(901), 7)], true, None),
+      at(2),
+    );
+    one_root_cover(&drain(&mut core));
+  }
+
+  /// Below 6.8 no row can answer that, so the sample's OTHER fact does: the count
+  /// of mount-namespace transitions the host observed. A transition with rows that
+  /// compare equal is consumed as a whole-root cover — the conservative direction,
+  /// because the alternative is to read a recycled id as proof of continuity and
+  /// say nothing at all.
+  ///
+  /// The same clause is what bounds the cost: a count that did NOT move proves
+  /// nothing in the namespace moved, so identical rows beside it cover nothing.
+  #[test]
+  fn a_namespace_transition_covers_a_kernel_that_recycles_its_ids() {
+    let (mut core, scope) = live_core();
+    let table = || vec![row_under("/r/vol", 40, 36, 7)];
+    core.on_mounts_refreshed(scope, sampled_refresh(table(), true, Some(11)), at(1));
+    let _ = drain(&mut core);
+
+    // Identical rows, one transition later: something mounted or unmounted, and
+    // these rows cannot say it was not here.
+    core.on_mounts_refreshed(scope, sampled_refresh(table(), true, Some(12)), at(2));
+    one_root_cover(&drain(&mut core));
+
+    // Identical rows, the namespace provably still: nothing happened anywhere.
+    core.on_mounts_refreshed(scope, sampled_refresh(table(), true, Some(12)), at(3));
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).is_empty(),
+      "a quiet namespace beside unchanged rows covers nothing: {effects:?}"
+    );
+  }
+
+  /// A sample whose rows DO carry unique ids never consults the transition count,
+  /// so a mount elsewhere on the host costs this scope nothing. Same rows, same
+  /// unique ids, a namespace that moved twice: silence.
+  #[test]
+  fn a_namespace_transition_costs_a_kernel_with_unique_ids_nothing() {
+    let (mut core, scope) = live_core();
+    let table = || vec![row_unique("/r/vol", 40, 36, Some(900), 7)];
+    core.on_mounts_refreshed(scope, sampled_refresh(table(), true, Some(11)), at(1));
+    let _ = drain(&mut core);
+    core.on_mounts_refreshed(scope, sampled_refresh(table(), true, Some(13)), at(2));
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).is_empty(),
+      "rows that can speak for themselves are the whole evidence: {effects:?}"
+    );
+  }
+
+  /// Two consecutive samples that agree cover nothing. The cadence is a re-read,
+  /// not an event: a scope on a quiet host pays one table read per interval and
+  /// its consumer hears nothing at all.
+  #[test]
+  fn two_identical_samples_cover_nothing() {
+    let (mut core, scope) = live_core();
+    let table = || vec![row("/r/vol", 40, 7), row("/r/vol/inner", 41, 8)];
+    core.on_mounts_refreshed(scope, framed_refresh(table(), true, None), at(1));
+    let _ = drain(&mut core);
+    for tick in 2..6 {
+      core.on_mounts_refreshed(scope, framed_refresh(table(), true, None), at(tick));
+      let effects = drain(&mut core);
+      assert!(
+        emits(&effects).is_empty(),
+        "tick {tick} re-read the same table and covers nothing: {effects:?}"
+      );
+    }
+  }
+
+  /// Row ORDER is the kernel's own list order, and a mount created ELSEWHERE on
+  /// the host permutes it with nothing under this root having changed. The
+  /// fingerprint is sorted, so the permutation reads as the non-event it is.
+  #[test]
+  fn a_permuted_table_is_not_a_change() {
+    let (mut core, scope) = live_core();
+    core.on_mounts_refreshed(
+      scope,
+      framed_refresh(vec![row("/r/a", 40, 7), row("/r/b", 41, 8)], true, None),
+      at(1),
+    );
+    let _ = drain(&mut core);
+    core.on_mounts_refreshed(
+      scope,
+      framed_refresh(vec![row("/r/b", 41, 8), row("/r/a", 40, 7)], true, None),
+      at(2),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).is_empty(),
+      "the same rows in another order are the same rows: {effects:?}"
+    );
+  }
+
+  /// A world born BLIND to the table still holds a baseline, because the seed is
+  /// the spawn barrier's own read and a birth refresh that could not read the
+  /// table retires nothing. So the first AUTHORITATIVE sample of such a scope is a
+  /// comparison like every other one.
+  #[test]
+  fn a_born_blind_scope_still_compares_against_its_barrier_table() {
+    // Born blind: the birth refresh could not read the table, so the sample below
+    // is this scope's first authoritative one — and it carries a row the barrier
+    // never listed.
+    let (mut core, scope) = live_core_blind_mounts();
+    core.on_mounts_refreshed(
+      scope,
+      framed_refresh(vec![row("/r/vol", 40, 7)], true, None),
+      at(1),
+    );
+    one_root_cover(&drain(&mut core));
+
+    // And the sample that covered also INSTALLED: read back unchanged, it is no
+    // difference at all.
+    core.on_mounts_refreshed(
+      scope,
+      framed_refresh(vec![row("/r/vol", 40, 7)], true, None),
+      at(2),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).is_empty(),
+      "the covering sample became the baseline: {effects:?}"
+    );
+  }
+
+  /// A BLIND refresh — the table could not be read at all — installs nothing and
+  /// covers nothing. Its empty row set is not a table with no mounts in it, and
+  /// treating it as one would announce a departure for every mount under the root
+  /// on every transient `/proc/self/mountinfo` failure, then another arrival when
+  /// the next read succeeded.
+  #[test]
+  fn a_blind_refresh_never_covers() {
+    let (mut core, scope) = live_core();
+    core.on_mounts_refreshed(
+      scope,
+      framed_refresh(vec![row("/r/vol", 40, 7)], true, None),
+      at(1),
+    );
+    let _ = drain(&mut core);
+    core.on_mounts_refreshed(scope, framed_refresh(Vec::new(), false, None), at(2));
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).is_empty(),
+      "an unreadable table is not an empty one: {effects:?}"
+    );
+
+    // The held fingerprint stood: the same rows read back authoritatively are
+    // still no difference.
+    core.on_mounts_refreshed(
+      scope,
+      framed_refresh(vec![row("/r/vol", 40, 7)], true, None),
+      at(3),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).is_empty(),
+      "the blind read left the fingerprint alone: {effects:?}"
+    );
+  }
+
+  /// A birth refresh the driver HELD BACK behind a lane cut still arms the
+  /// liveness deadline (#74).
+  ///
+  /// A new scope starts with no deadline at all and takes its first one from a
+  /// refresh completion. Clearing the outstanding mark without arming would
+  /// therefore leave a scope with nothing in flight, nothing scheduled and no
+  /// tick to produce the next read — and since it is the NEXT refresh that
+  /// bounds how long a held one may wait, and on a kernel-recursive backend a
+  /// refresh is the only root-death check there is, a quiet unmount would stay
+  /// live for as long as the reader stayed silent.
+  ///
+  /// FAIL-ON-REVERT: clear the marks without arming and the deadline below
+  /// stays `None`.
+  #[test]
+  fn a_deferred_birth_refresh_arms_the_liveness_deadline() {
+    let mut core = DriverCore::new(WINDOW, LIVENESS, reserved_dir());
+    let scope = core
+      .on_watch(PathBuf::from("/r"), Interest::all(), BackendKind::Inotify)
+      .expect("a fresh scope registers");
+    let _ = drain(&mut core);
+    core.on_stream_spawned(
+      scope,
+      Ok(RootMeta {
+        root: PathBuf::from("/r"),
+        root_dev: 1,
+        root_mnt_id: None,
+        mounts: Vec::new(),
+        identity: crate::os::RootIdentity::new(1, 1),
+        ancestors: Vec::new(),
+        backend: BackendKind::Inotify,
+      }),
+    );
+    let _ = drain(&mut core);
+    assert_eq!(
+      core.scopes[&scope].liveness_deadline, None,
+      "staging: the birth refresh is what seeds the cadence, and it has not \
+       been read yet"
+    );
+
+    core.on_refresh_deferred(scope, at(7));
+    assert_eq!(
+      core.scopes[&scope].liveness_deadline,
+      Some(at(7) + LIVENESS),
+      "a held verdict is still a completed probe: the next tick is scheduled \
+       off the moment it finished"
+    );
+    assert!(
+      !core.scopes[&scope].refresh_pending,
+      "and nothing is outstanding, so that tick may arm the refresh which \
+       bounds how long this one waits"
+    );
+  }
+
+  /// A TORN read is the same refusal reached one layer down: the producer read
+  /// the table, saw the mount namespace move under it mid-`seq_file`, and threw
+  /// the rows away rather than hand up two halves of different moments. It
+  /// arrives as a non-authoritative refresh that still carries the transition it
+  /// observed — and neither half of it may cover, because the count moving is
+  /// exactly what made the rows untrustworthy.
+  #[test]
+  fn a_torn_read_never_covers() {
+    let (mut core, scope) = live_core();
+    core.on_mounts_refreshed(
+      scope,
+      sampled_refresh(vec![row("/r/vol", 40, 7)], true, Some(11)),
+      at(1),
+    );
+    let _ = drain(&mut core);
+    core.on_mounts_refreshed(scope, sampled_refresh(Vec::new(), false, Some(12)), at(2));
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).is_empty(),
+      "a reading the sampler refused is no evidence at all: {effects:?}"
+    );
+  }
+
+  /// A STALE refresh — an invalidating arming overlapped its read, so its
+  /// snapshot may predate the lost window — publishes nothing and covers nothing.
+  /// The comparison would be against a table read at an unknown moment, which can
+  /// differ from the held one in either direction; the loss that condemned it has
+  /// already covered the root anyway, and one fresh read re-arms.
+  #[test]
+  fn a_stale_refresh_never_covers() {
+    let (mut core, scope) = live_core();
+    core.on_mounts_refreshed(
+      scope,
+      framed_refresh(vec![row("/r/vol", 40, 7)], true, None),
+      at(1),
+    );
+    let _ = drain(&mut core);
+
+    // One loss arms the refresh; a second one, landing while it is outstanding,
+    // condemns it.
+    core.on_root_overflow(scope, at(2));
+    let _ = drain(&mut core);
+    core.on_root_overflow(scope, at(3));
+    let _ = drain(&mut core);
+
+    core.on_mounts_refreshed(scope, framed_refresh(Vec::new(), true, None), at(4));
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).is_empty(),
+      "a condemned snapshot is not a comparison: {effects:?}"
+    );
+    assert_eq!(
+      refresh_requests(&effects),
+      1,
+      "it re-arms one fresh read instead: {effects:?}"
+    );
+  }
+
+  /// The ROOT's own mount moving is the third leg, and it is a table change like
+  /// any other: the tree the scope covers now hangs off a different mount, so
+  /// every verdict the last crawl reached about what was and was not a boundary
+  /// under it was reached against a frame that no longer holds.
+  ///
+  /// The incarnation token is what makes it visible when the id did not change —
+  /// mount ids are allocated lowest-free, so a root that went A → B → new-A is
+  /// back on the id this scope still holds and the id comparison alone reads as
+  /// continuity.
+  #[test]
+  fn the_roots_own_incarnation_move_covers_it() {
+    let (mut core, scope) = live_core();
+    core
+      .scopes
+      .get_mut(&scope)
+      .expect("scope is live")
+      .root_mnt_id = Some(36);
+    core.on_mounts_refreshed(
+      scope,
+      incarnate_refresh(
+        Vec::new(),
+        true,
+        Some(36),
+        Some(crate::os::RootIncarnation::Unique(700)),
+      ),
+      at(1),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).is_empty(),
+      "staging: an unmoved id and the first token cover nothing: {effects:?}"
+    );
+
+    // The SAME mount id, a different mount: A -> B -> new-A between two samples.
+    core.on_mounts_refreshed(
+      scope,
+      incarnate_refresh(
+        Vec::new(),
+        true,
+        Some(36),
+        Some(crate::os::RootIncarnation::Unique(701)),
+      ),
+      at(2),
+    );
+    one_root_cover(&drain(&mut core));
+  }
+}
+
 mod lowering {
   use super::*;
 
@@ -3232,9 +4203,18 @@ mod lowering {
       root: Some(Arc::new(PathBuf::from(root))),
       root_dev: Some(1),
       root_mnt_id: None,
+      root_incarnation: None,
       identity: Some(crate::os::RootIdentity::new(1, 1)),
-      mounts: Vec::new(),
+      mount_table: Vec::new(),
+      learned_mounts: Vec::new(),
       mounts_authoritative: true,
+      table_fingerprint: None,
+      honored_boundaries: BTreeSet::new(),
+      honored_saturated: false,
+      namespace_transitions_seen: None,
+      recovery_epoch: 0,
+      recovery_in_flight: false,
+      recovery_dirty: false,
       refresh_pending: false,
       refresh_stale: false,
       budget_recovered: false,
@@ -3736,6 +4716,380 @@ mod descending {
   #[test]
   fn descending_registration_cold_enumerates_the_root() {
     let (_core, _scope, _req, _watch) = live_descending();
+  }
+
+  /// **#74, on the profile it was filed against.** A lazy unmount below the root
+  /// emits NO `IN_UNMOUNT` and no `IN_IGNORED` — the watches under it simply stop
+  /// meaning anything — so nothing in band tells this scope its coverage there
+  /// died. The periodic sample's table difference is the only signal, and what it
+  /// buys is one whole-root cover plus the re-arm that re-establishes descending
+  /// coverage under it.
+  ///
+  /// The verdict is deliberately COARSE. A located cover at `/vol` would need a
+  /// census of the boundaries under the root and a ledger to keep that census
+  /// honest across renames; the consumer gets the same tree back either way, and
+  /// what it costs here is one re-read it was going to be told to do anyway.
+  #[test]
+  fn a_lazily_departed_mount_covers_and_re_arms_the_descending_subtree() {
+    let (mut core, scope, req, root_watch) = live_descending();
+    // Close the birth crawl first: with its cold read still outstanding the
+    // re-arm below only marks that read dirty, and the fresh enumerate this cell
+    // is about never appears.
+    core.on_enumerated(req, listed(Vec::new()));
+    let _ = drain(&mut core);
+    // The birth refresh: this world's FIRST authoritative sample, so it installs
+    // the baseline and covers nothing of its own (the crawl just covered).
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(1));
+    let _ = drain(&mut core);
+
+    // The mount arrives — a difference against the baseline, so one cover. Its
+    // re-read must be CLOSED before the departure below: with it still
+    // outstanding the departure's cover only marks that read dirty, and the fresh
+    // enumerate this cell is about never appears.
+    core.on_mounts_refreshed(
+      scope,
+      alive_refresh(vec![PathBuf::from("/r/vol")], true),
+      at(2),
+    );
+    let effects = drain(&mut core);
+    assert_eq!(
+      emits(&effects).len(),
+      1,
+      "staging: the arrival covers the root once: {effects:?}"
+    );
+    settle_rearm(&mut core, effects);
+
+    // `umount -l /r/vol`: the table loses the row, the kernel says nothing.
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(3));
+    let effects = drain(&mut core);
+    let emitted = emits(&effects);
+    assert_eq!(emitted.len(), 1, "one cover for the departure: {effects:?}");
+    assert!(
+      emitted[0].kind().is_rescan(),
+      "coverage that died silently is covered, not delivered: {emitted:?}"
+    );
+    assert_eq!(
+      emitted[0].location(),
+      &loc(&[]),
+      "and the cover is the whole root: {emitted:?}"
+    );
+    // And the re-arm: the cover is a coverage statement, so the scope re-reads
+    // from the root's own watch and re-establishes the per-directory coverage
+    // the departed mount's ground never had.
+    let armed: Vec<_> = effects
+      .iter()
+      .filter_map(|e| match e {
+        Effect::AddWatch { watch, .. } => Some(*watch),
+        _ => None,
+      })
+      .collect();
+    assert!(
+      armed.contains(&root_watch),
+      "the cover re-arms the root's own watch: {effects:?}"
+    );
+    let reads = settle_rearm(&mut core, effects);
+    assert!(
+      reads
+        .iter()
+        .any(|e| matches!(e, Effect::Enumerate { watch, .. } if *watch == root_watch)),
+      "and that arm re-reads the whole root: {reads:?}"
+    );
+  }
+
+  /// Drives one whole-root cover's re-arm to its cold read: every `AddWatch` it
+  /// raised is answered installed, and the effects that answer opens are returned
+  /// so a cell can assert on the reads themselves.
+  fn settle_rearm(core: &mut DriverCore, effects: Vec<Effect>) -> Vec<Effect> {
+    let mut installed = 2;
+    for effect in &effects {
+      if let Effect::AddWatch { watch, .. } = effect {
+        core.on_watch_installed(
+          *watch,
+          core.arm_attempt(*watch),
+          crate::os::linux::WatchOutcome::Installed(installed),
+        );
+        installed += 1;
+      }
+    }
+    let opened = drain(core);
+    for effect in effects.iter().chain(opened.iter()) {
+      if let Effect::Enumerate { req, .. } = effect {
+        core.on_enumerated(*req, listed(Vec::new()));
+      }
+    }
+    let _ = drain(core);
+    opened
+  }
+
+  /// PREVENTION, both halves: what the core hands the executor for a
+  /// `Created`-learned child, and where a refusal of that arm terminates.
+  ///
+  /// A directory the Monitor learns from a `Created` record is armed with NO
+  /// enumerate in between, so `crosses_mount_boundary` never judges it — and
+  /// inotify's `Created` compiles to a bare record with no identity, so the arm's
+  /// own object guard (`expected`) is `None` and passes whatever it opens. The
+  /// scope FRAME is therefore the only thing that can refuse the landing, which
+  /// is why it rides every arm rather than being folded into `expected`.
+  ///
+  /// The refusal's terminal is the second half, and the design ACCEPTS it: a
+  /// failed arm reaches the Monitor's `Err` arm, which emits a located `Rescan`,
+  /// books a level-persistent slot deficit and drops the node. It queues no
+  /// enumerate and calls no re-arm — the recovery for a MOUNT-backed crossing is
+  /// the mount refresh's own whole-root cover, and for a device-only one (a btrfs
+  /// subvolume: no mountinfo row, ever) there is none, so the slot stays a
+  /// deficit re-signalled ahead of every sync cookie. Signalled, not silent.
+  #[test]
+  fn a_created_childs_arm_carries_the_frame_and_its_refusal_stands_a_deficit() {
+    let (mut core, scope, req, root_watch) = live_descending_mnt(42);
+    core.on_enumerated(req, listed(Vec::new()));
+    let _ = drain(&mut core);
+
+    core.on_inotify_events(
+      scope,
+      vec![inotify(
+        &[root_watch],
+        IN_CREATE | IN_ISDIR,
+        0,
+        Some(b"subvol"),
+      )],
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let (watch, expected, frame) = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch {
+          watch,
+          path,
+          expected,
+          frame,
+          ..
+        } if path.as_path() == Path::new("/r/subvol") => Some((*watch, *expected, *frame)),
+        _ => None,
+      })
+      .expect("a created directory is armed with no enumerate in between");
+    assert_eq!(
+      expected, None,
+      "the object guard is vacuous here — a `Created` record carries no identity"
+    );
+    assert_eq!(
+      (frame.root_dev, frame.root_mnt_id),
+      (Some(1), Some(42)),
+      "so the arm carries the SCOPE FRAME, which is what can still refuse it"
+    );
+
+    // What the executor answers when the landing sits across that frame.
+    core.on_watch_installed(
+      watch,
+      core.arm_attempt(watch),
+      crate::os::linux::WatchOutcome::Failed(WatchError::Gone),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects)
+        .iter()
+        .any(|c| c.kind().is_rescan() && c.location() == &loc(&["subvol"])),
+      "the refusal is never a silent blind spot: {effects:?}"
+    );
+    assert!(
+      !effects.iter().any(
+        |e| matches!(e, Effect::Enumerate { path, .. } if path.as_path() == Path::new("/r/subvol"))
+      ),
+      "and it summons no re-enumerate of its own: {effects:?}"
+    );
+    assert!(
+      core.resignal_coverage_deficits(scope),
+      "the refused slot is the accepted terminal: a standing deficit, \
+       re-signalled ahead of every sync cookie"
+    );
+  }
+
+  /// The same refusal when the MOUNT ids proved it. Everything the consumer sees
+  /// is identical — the same located `Rescan`, the same standing deficit — and the
+  /// one thing that differs is invisible to it: the arm stopped at a mount, which
+  /// is a boundary this profile honored, so the next authoritative sample asks
+  /// whether that mount is still in the table. It is not, so the whole root is
+  /// covered and the crawl that follows heals the deficit (#74).
+  #[test]
+  fn a_foreign_arm_on_the_descending_profile_stands_its_rescan_and_is_an_honored_boundary() {
+    let (mut core, scope, req, root_watch) = live_descending_mnt(42);
+    core.on_enumerated(req, listed(Vec::new()));
+    let _ = drain(&mut core);
+
+    core.on_inotify_events(
+      scope,
+      vec![inotify(
+        &[root_watch],
+        IN_CREATE | IN_ISDIR,
+        0,
+        Some(b"subvol"),
+      )],
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let watch = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch { watch, path, .. } if path.as_path() == Path::new("/r/subvol") => {
+          Some(*watch)
+        }
+        _ => None,
+      })
+      .expect("a created directory is armed with no enumerate in between");
+    core.on_watch_installed(
+      watch,
+      core.arm_attempt(watch),
+      crate::os::linux::WatchOutcome::Foreign,
+    );
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects)
+        .iter()
+        .any(|c| c.kind().is_rescan() && c.location() == &loc(&["subvol"])),
+      "the refusal still stands its located Rescan, exactly as `Gone` does: {effects:?}"
+    );
+
+    // The mount the arm stopped at is gone by the next sample, and no table ever
+    // held a row for it — so the rows say nothing and the boundary says
+    // everything.
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(2));
+    let effects = drain(&mut core);
+    let covers: Vec<_> = emits(&effects)
+      .into_iter()
+      .filter(|c| c.kind().is_rescan() && c.location() == &loc(&[]))
+      .collect();
+    assert_eq!(
+      covers.len(),
+      1,
+      "the honored boundary the table cannot find costs one whole-root cover: {effects:?}"
+    );
+  }
+
+  /// And a refusal the DEVICE alone decided reports nothing. A btrfs subvolume
+  /// carries its own device and has no mountinfo row anywhere, so a sample would
+  /// look for a row that never existed and cover the whole root to say so — every
+  /// interval, for the life of the scope. The refusal stands; the report does not.
+  #[test]
+  fn a_device_only_arm_refusal_reports_no_boundary() {
+    let (mut core, scope, req, root_watch) = live_descending_mnt(42);
+    core.on_enumerated(req, listed(Vec::new()));
+    let _ = drain(&mut core);
+
+    core.on_inotify_events(
+      scope,
+      vec![inotify(
+        &[root_watch],
+        IN_CREATE | IN_ISDIR,
+        0,
+        Some(b"subvol"),
+      )],
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let watch = effects
+      .iter()
+      .find_map(|e| match e {
+        Effect::AddWatch { watch, path, .. } if path.as_path() == Path::new("/r/subvol") => {
+          Some(*watch)
+        }
+        _ => None,
+      })
+      .expect("a created directory is armed with no enumerate in between");
+    core.on_watch_installed(
+      watch,
+      core.arm_attempt(watch),
+      crate::os::linux::WatchOutcome::Failed(WatchError::Gone),
+    );
+    let _ = drain(&mut core);
+
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(2));
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).is_empty(),
+      "a device-only refusal names nothing the mount table will ever carry: {effects:?}"
+    );
+  }
+
+  /// The scope's OWN ROOT reports nothing, however the refusal was decided: it
+  /// takes the DEATH path instead.
+  ///
+  /// A boundary is a mount STRICTLY UNDER the root — a location with a row in a
+  /// table read under it — and the root's own location has none, so a boundary
+  /// recorded for it could only ever be answered "gone". What a foreign ROOT
+  /// says is that this transport cannot cover this root at all, which is the
+  /// verdict `Gone` reaches: the scope ends here, and the set it was keeping
+  /// ends with it.
+  ///
+  /// The recording guard is therefore belt to the death's braces — the set is
+  /// read below for whatever survives — and the death is what this pins.
+  #[test]
+  fn a_foreign_root_arm_records_no_boundary() {
+    let (mut core, scope, req, root_watch) = live_descending_mnt(42);
+    core.on_enumerated(req, listed(Vec::new()));
+    let _ = drain(&mut core);
+
+    // The root re-mounted under its own watch: the re-arm lands on a different
+    // mount, which is the one refusal that reaches here as `Foreign`.
+    core.on_watch_installed(
+      root_watch,
+      core.arm_attempt(root_watch),
+      crate::os::linux::WatchOutcome::Foreign,
+    );
+    let _ = drain(&mut core);
+    let held = core
+      .scopes
+      .get(&scope)
+      .map_or(0, |state| state.honored_boundaries.len());
+    assert_eq!(
+      held, 0,
+      "the root's own location is no boundary under itself"
+    );
+    assert!(
+      !core.scopes.contains_key(&scope),
+      "and a root this transport cannot cover takes the death path, exactly as \
+       `Gone` does"
+    );
+  }
+
+  /// The seat the descending crawl actually honors boundaries at. A listing marks
+  /// a boundary entry and neither arms nor descends it, so no arm refusal ever
+  /// speaks for it — and a mount that was there when the listing ran and gone by
+  /// the next sample would otherwise leave that ground marked non-descendable with
+  /// nothing to re-read it. The MOUNT leg reports; the DEVICE leg does not.
+  #[test]
+  fn a_listing_reports_the_mounts_it_stopped_at_and_not_the_devices() {
+    let (mut core, scope, req, _root_watch) = live_descending_mnt(42);
+    core.on_enumerated(
+      req,
+      listed(vec![
+        entry_on_mount("vol", FileKind::Dir, 1, 10, 77),
+        entry("subvol", FileKind::Dir, 2, 11),
+      ]),
+    );
+    let _ = drain(&mut core);
+
+    // Both were declined as boundaries; only the one a mount id proved is a
+    // question for the table, and the table has no row for it.
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(1));
+    let effects = drain(&mut core);
+    let covers: Vec<_> = emits(&effects)
+      .into_iter()
+      .filter(|c| c.kind().is_rescan() && c.location() == &loc(&[]))
+      .collect();
+    assert_eq!(
+      covers.len(),
+      1,
+      "the mount the crawl stopped at is gone and unsampled: {effects:?}"
+    );
+
+    // The subvolume is not reported at all, so the next sample covers nothing —
+    // otherwise a root holding one would cover once per interval forever.
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(2));
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).is_empty(),
+      "a device-only boundary is never a report: {effects:?}"
+    );
   }
 
   /// 42-10, end to end through the core: the bootstrap listing installs and arms
@@ -4492,6 +5846,9 @@ mod descending {
         authoritative: true,
         root: RootLiveness::Present(crate::os::RootIdentity::new(1, 1)),
         root_mnt_id: Some(77),
+        root_incarnation: None,
+        namespace_transitions: None,
+        overflowed: false,
       },
       at(1),
     );
@@ -4570,6 +5927,9 @@ mod descending {
         authoritative: true,
         root: RootLiveness::Present(crate::os::RootIdentity::new(1, 1)),
         root_mnt_id: None,
+        root_incarnation: None,
+        namespace_transitions: None,
+        overflowed: false,
       },
       at(1),
     );
@@ -4652,6 +6012,9 @@ mod descending {
         authoritative: true,
         root: RootLiveness::Present(crate::os::RootIdentity::new(1, 999)),
         root_mnt_id: Some(77),
+        root_incarnation: None,
+        namespace_transitions: None,
+        overflowed: false,
       },
       at(1),
     );
@@ -4708,6 +6071,9 @@ mod descending {
         authoritative: true,
         root: RootLiveness::Present(crate::os::RootIdentity::new(1, 1)),
         root_mnt_id: Some(77),
+        root_incarnation: None,
+        namespace_transitions: None,
+        overflowed: false,
       },
       at(1),
     );
@@ -4749,6 +6115,9 @@ mod descending {
         authoritative: true,
         root: RootLiveness::Missing,
         root_mnt_id: Some(77),
+        root_incarnation: None,
+        namespace_transitions: None,
+        overflowed: false,
       },
       at(1),
     );
@@ -4810,6 +6179,9 @@ mod descending {
         authoritative: true,
         root: RootLiveness::Present(crate::os::RootIdentity::new(1, 1)),
         root_mnt_id: Some(77),
+        root_incarnation: None,
+        namespace_transitions: None,
+        overflowed: false,
       },
       at(1),
     );
@@ -9715,6 +11087,9 @@ mod descending {
           authoritative: true,
           root: RootLiveness::Missing,
           root_mnt_id: None,
+          root_incarnation: None,
+          namespace_transitions: None,
+          overflowed: false,
         },
         at(1),
       );
@@ -9743,6 +11118,9 @@ mod descending {
           authoritative: true,
           root: RootLiveness::Present(crate::os::RootIdentity::new(1, 1)),
           root_mnt_id: Some(6),
+          root_incarnation: None,
+          namespace_transitions: None,
+          overflowed: false,
         },
         at(1),
       );
@@ -11703,8 +13081,14 @@ mod kernel_recursive_fanotify {
   /// deadline at their birth refresh (`at(0)` → `+LIVENESS`) and both fire a
   /// `RefreshMounts` when it comes due.
   ///
+  /// The same tick is the mount SAMPLER (#74), which is a third reason both owe
+  /// it: a mount that departs BELOW the root is signal-silent on every backend —
+  /// an inotify scope's per-directory watches under it simply stop meaning
+  /// anything, with no `IN_UNMOUNT` and no `IN_IGNORED`.
+  ///
   /// FSEvents does not, and that is unchanged: its stream reports the root's
-  /// death itself, with nothing of ours able to postpone it.
+  /// death itself, with nothing of ours able to postpone it, and it follows
+  /// nested volumes itself, so a table sample would buy it nothing either.
   #[test]
   fn liveness_tick_refreshes_both_linux_profiles_but_not_fsevents() {
     for (profile, mut core) in [
@@ -11728,7 +13112,7 @@ mod kernel_recursive_fanotify {
       assert_eq!(
         refresh_requests(&drain(&mut core)),
         1,
-        "{profile}'s due tick fires the root-liveness refresh"
+        "{profile}'s due tick fires the mount/liveness refresh"
       );
       assert_eq!(
         core.poll_timeout(),
@@ -11742,13 +13126,115 @@ mod kernel_recursive_fanotify {
     assert_eq!(
       core.poll_timeout(),
       None,
-      "an FSEvents scope arms no liveness deadline (its stream reports the death)"
+      "an FSEvents scope arms no liveness deadline (its stream reports the death \
+       and covers nested volumes)"
     );
     core.on_timeout(at(1_000_000));
     assert_eq!(
       refresh_requests(&drain(&mut core)),
       0,
       "an FSEvents scope never fires a liveness tick"
+    );
+  }
+
+  /// The tick is COALESCING, not invalidation — and conflating the two starves
+  /// every publication behind `on_mounts_refreshed`'s stale gate.
+  ///
+  /// The interval is any nonzero duration the caller likes, and refresh latency
+  /// is whatever a blocking pool gives it, so latency at or past the interval is
+  /// an ordinary operating point rather than a corner. There EVERY completion
+  /// lands with a tick already fired on top of it. A tick that condemned the
+  /// in-flight snapshot would therefore discard every completion in turn — the
+  /// mount-table install and the frame adoption both sit BEHIND that gate — and
+  /// the re-armed read would be condemned by the next tick, forever. Only the
+  /// root-death check would survive, because it is evaluated in FRONT of the
+  /// gate.
+  ///
+  /// Driven here with no completion between two ticks, which is that steady
+  /// state exactly: every read this scope completes was tick-raced.
+  #[test]
+  fn a_tick_coalescing_onto_an_in_flight_refresh_still_publishes_it() {
+    let (mut core, scope) = live_fanotify();
+    // Tick one arms the read that carries the table...
+    core.on_timeout(at(30_000));
+    assert_eq!(
+      refresh_requests(&drain(&mut core)),
+      1,
+      "the due tick arms one refresh"
+    );
+    // ...and tick two comes due before it lands. Pure cadence: no second
+    // effect, and no condemnation of the read already out.
+    core.on_timeout(at(60_000));
+    assert_eq!(
+      refresh_requests(&drain(&mut core)),
+      0,
+      "a tick over an in-flight read stacks no second effect"
+    );
+
+    core.on_mounts_refreshed(
+      scope,
+      alive_refresh(vec![PathBuf::from("/r/vol")], true),
+      at(60_001),
+    );
+    let effects = drain(&mut core);
+    assert_eq!(
+      refresh_requests(&effects),
+      0,
+      "the tick-raced completion is PUBLISHED, not discarded-and-re-armed: {effects:?}"
+    );
+    let state = core.scopes.get(&scope).expect("scope is live");
+    assert!(
+      state.mounts_authoritative,
+      "and it installed its table: a cadence witnesses no transition to distrust"
+    );
+    assert_eq!(
+      state.mount_table,
+      vec![PathBuf::from("/r/vol")],
+      "the rows the tick-raced read carried are the ones that installed"
+    );
+  }
+
+  /// The half of `refresh_stale` a coalescing tick must NOT touch: a LOSS
+  /// condemnation stands, and a tick riding the same in-flight read cannot
+  /// absolve it. The loss window may have carried a mount transition, so its
+  /// snapshot is suspect no matter how many ticks agree it is due.
+  #[test]
+  fn a_tick_never_absolves_a_loss_condemned_refresh() {
+    let (mut core, scope) = live_fanotify();
+    core.on_timeout(at(30_000));
+    assert_eq!(
+      refresh_requests(&drain(&mut core)),
+      1,
+      "the due tick arms one refresh"
+    );
+    // A loss overlaps the in-flight read: condemned.
+    core.on_root_overflow(scope, at(30_500));
+    let _ = drain(&mut core);
+    // A tick rides the same read afterwards. It must change nothing.
+    core.on_timeout(at(60_000));
+    let _ = drain(&mut core);
+
+    core.on_mounts_refreshed(
+      scope,
+      alive_refresh(vec![PathBuf::from("/r/vol")], true),
+      at(60_001),
+    );
+    let effects = drain(&mut core);
+    assert_eq!(
+      refresh_requests(&effects),
+      1,
+      "the loss-condemned completion is still discarded and re-armed: {effects:?}"
+    );
+    let state = core.scopes.get(&scope).expect("scope is live");
+    assert!(
+      !state.mounts_authoritative,
+      "a superseded snapshot restores no authority"
+    );
+    assert!(
+      state.mount_table.is_empty(),
+      "and its rows never install: a stale read may predate the lost window, so \
+       the table it carries proves nothing: {:?}",
+      state.mount_table
     );
   }
 
@@ -11775,6 +13261,9 @@ mod kernel_recursive_fanotify {
         authoritative: true,
         root: RootLiveness::Missing,
         root_mnt_id: None,
+        root_incarnation: None,
+        namespace_transitions: None,
+        overflowed: false,
       },
       at(30_001),
     );
@@ -11826,6 +13315,9 @@ mod kernel_recursive_fanotify {
         authoritative: true,
         root: RootLiveness::Missing,
         root_mnt_id: None,
+        root_incarnation: None,
+        namespace_transitions: None,
+        overflowed: false,
       },
       at(30_001),
     );
@@ -12090,6 +13582,9 @@ mod kernel_recursive_fanotify {
         authoritative: true,
         root: RootLiveness::Missing,
         root_mnt_id: None,
+        root_incarnation: None,
+        namespace_transitions: None,
+        overflowed: false,
       },
       at(60_001),
     );
@@ -12142,6 +13637,9 @@ mod kernel_recursive_fanotify {
         authoritative: true,
         root: RootLiveness::Unreadable,
         root_mnt_id: None,
+        root_incarnation: None,
+        namespace_transitions: None,
+        overflowed: false,
       },
       at(31_000),
     );
@@ -12181,10 +13679,13 @@ mod kernel_recursive_fanotify {
     core.on_mounts_refreshed(
       scope,
       MountRefresh {
-        mounts: vec![PathBuf::from("/r/stale-vol")],
+        mounts: vec![bare("/r/stale-vol")],
         authoritative: true,
         root: RootLiveness::Present(crate::os::RootIdentity::new(1, 1)),
         root_mnt_id: None,
+        root_incarnation: None,
+        namespace_transitions: None,
+        overflowed: false,
       },
       at(31_000),
     );
@@ -12199,17 +13700,378 @@ mod kernel_recursive_fanotify {
       "the superseded snapshot does not restore authority"
     );
     assert!(
-      !state.mounts.iter().any(|m| m == Path::new("/r/stale-vol")),
+      !state
+        .mount_table
+        .iter()
+        .any(|m| m == Path::new("/r/stale-vol")),
       "the superseded mount-set is discarded, not installed"
     );
   }
 
-  /// A kernel-recursive scope adopts a changed frame but does NOT reconcile: its one
-  /// superblock mark covers the whole subtree, so the descent frame is inert (no
-  /// per-directory coverage to rebuild). A same-object re-mount that moves the frame
-  /// must not emit a spurious rescan — the replay is a descending-scope concern only.
+  /// The whole-root recovery epochs requested in `effects`, in order.
+  fn recoveries(effects: &[Effect], scope: ScopeId) -> Vec<u64> {
+    effects
+      .iter()
+      .filter_map(|e| match e {
+        Effect::RecoverRoot { scope: s, epoch } if *s == scope => Some(*epoch),
+        _ => None,
+      })
+      .collect()
+  }
+
+  /// A table change under a FANOTIFY root reseeds the source's FID map BEFORE the
+  /// consumer is told to re-read, and the order is the whole point.
+  ///
+  /// A `FAN_MARK_FILESYSTEM` mark covers the superblock, but the reader admits
+  /// events by directory-FID membership in a map seeded by a walk that STOPS at
+  /// every mount boundary. Ground a departed mount revealed was therefore never
+  /// walked: the map holds no handle for anything there, and every event under it
+  /// decodes as outside-root and is dropped with no loss signal. A `Rescan`
+  /// emitted first would have the consumer enumerate that subtree once and then
+  /// never hear about it again — a silence dressed as coverage.
   #[test]
-  fn a_kernel_recursive_frame_change_adopts_but_never_reconciles() {
+  fn a_mount_change_reseeds_a_fanotify_root_before_it_covers() {
+    let (mut core, scope) = live_fanotify();
+    core.on_mounts_refreshed(
+      scope,
+      alive_refresh(vec![PathBuf::from("/r/vol")], true),
+      at(1),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).is_empty(),
+      "nothing is covered while the source is still blind to the revealed ground: {effects:?}"
+    );
+    let epoch = match recoveries(&effects, scope).as_slice() {
+      [epoch] => *epoch,
+      other => panic!("exactly one whole-root reseed is asked for, got {other:?}: {effects:?}"),
+    };
+
+    // The reseed lands: the map can see the tree again, so now the consumer is
+    // told to re-read it.
+    core.on_root_recovered(
+      scope,
+      epoch,
+      crate::os::RootRecovery::Reseeded,
+      Vec::new(),
+      at(2),
+    );
+    let effects = drain(&mut core);
+    let emitted = emits(&effects);
+    assert_eq!(
+      emitted.len(),
+      1,
+      "the completed reseed covers the root exactly once: {effects:?}"
+    );
+    assert!(emitted[0].kind().is_rescan());
+    assert_eq!(emitted[0].location(), &loc(&[]));
+    assert!(
+      recoveries(&effects, scope).is_empty(),
+      "and asks for no second walk: {effects:?}"
+    );
+  }
+
+  /// A reply whose epoch is no longer the scope's is DROPPED whole. The walk runs
+  /// on the source's own reader thread while the world can move under it, and a map rebuilt
+  /// over the root this scope watched a moment ago says nothing about the root it
+  /// watches now — the replace has already covered that one.
+  #[test]
+  fn a_stale_recovery_reply_is_dropped() {
+    let (mut core, scope) = live_fanotify();
+    core.on_mounts_refreshed(
+      scope,
+      alive_refresh(vec![PathBuf::from("/r/vol")], true),
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let [epoch] = recoveries(&effects, scope)[..] else {
+      panic!("the change asks for a reseed: {effects:?}");
+    };
+
+    // The world moves out from under the outstanding walk.
+    core.on_root_replaced(
+      scope,
+      RootMeta {
+        root: PathBuf::from("/r"),
+        root_dev: 1,
+        root_mnt_id: None,
+        mounts: Vec::new(),
+        identity: crate::os::RootIdentity::new(1, 5),
+        ancestors: Vec::new(),
+        backend: BackendKind::Fanotify,
+      },
+      at(2),
+    );
+    let _ = drain(&mut core);
+
+    core.on_root_recovered(
+      scope,
+      epoch,
+      crate::os::RootRecovery::Reseeded,
+      Vec::new(),
+      at(3),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).is_empty(),
+      "a walk of a world that ended covers nothing: {effects:?}"
+    );
+    assert!(
+      recoveries(&effects, scope).is_empty(),
+      "and starts nothing: {effects:?}"
+    );
+  }
+
+  /// A completion carries the mount boundaries ITS walk stopped at, and the next
+  /// authoritative sample puts them to the table (#74).
+  ///
+  /// The walk is the only thing that knows where it stopped, and a boundary the
+  /// table no longer carries was hiding ground no walk read and no sample ever
+  /// listed — the one shape a row-to-row diff cannot see, since neither sample
+  /// held it.
+  #[test]
+  fn a_fanotify_recovery_completion_carries_its_honored_boundaries() {
+    let (mut core, scope) = live_fanotify();
+    core.on_mounts_refreshed(
+      scope,
+      alive_refresh(vec![PathBuf::from("/r/vol")], true),
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let [epoch] = recoveries(&effects, scope)[..] else {
+      panic!("the change asks for a reseed: {effects:?}");
+    };
+
+    // The reseed walk stopped at a mount below the one in the table, and its
+    // completion is what says so.
+    core.on_root_recovered(
+      scope,
+      epoch,
+      crate::os::RootRecovery::Reseeded,
+      vec![PathBuf::from("/r/vol/inner")],
+      at(2),
+    );
+    let _ = drain(&mut core);
+
+    // An unchanged table, so the rows say nothing — and the boundary says
+    // everything: no row carries it, so the mount is gone and the ground it hid
+    // was read by nothing.
+    core.on_mounts_refreshed(
+      scope,
+      alive_refresh(vec![PathBuf::from("/r/vol")], true),
+      at(3),
+    );
+    let effects = drain(&mut core);
+    assert_eq!(
+      recoveries(&effects, scope).len(),
+      1,
+      "the boundary the table cannot find costs one whole-root cover: {effects:?}"
+    );
+  }
+
+  /// A completion whose epoch is stale drops its boundaries WITH it (#74).
+  ///
+  /// They are that walk's questions about that walk's tree. Kept past the world
+  /// they were asked in, a location no sample of the new world will ever hold
+  /// covers the root once for a walk this scope has already left behind.
+  #[test]
+  fn a_stale_in_band_recovery_drops_its_honored_boundaries() {
+    let (mut core, scope) = live_fanotify();
+    core.on_mounts_refreshed(
+      scope,
+      alive_refresh(vec![PathBuf::from("/r/vol")], true),
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let [first] = recoveries(&effects, scope)[..] else {
+      panic!("the change asks for a reseed: {effects:?}");
+    };
+    core.on_root_recovered(
+      scope,
+      first,
+      crate::os::RootRecovery::Reseeded,
+      Vec::new(),
+      at(2),
+    );
+    let _ = drain(&mut core);
+
+    // The table moves again, so a second walk is asked for and the first one's
+    // epoch is no longer this scope's.
+    core.on_mounts_refreshed(
+      scope,
+      alive_refresh(vec![PathBuf::from("/r/vol2")], true),
+      at(3),
+    );
+    let effects = drain(&mut core);
+    let [second] = recoveries(&effects, scope)[..] else {
+      panic!("the second change asks for a reseed: {effects:?}");
+    };
+    assert_ne!(first, second, "each request stamps its own epoch");
+
+    core.on_root_recovered(
+      scope,
+      first,
+      crate::os::RootRecovery::Reseeded,
+      vec![PathBuf::from("/r/ghost")],
+      at(4),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).is_empty(),
+      "a walk of a world that ended covers nothing: {effects:?}"
+    );
+    assert!(
+      core
+        .scopes
+        .get(&scope)
+        .expect("scope lives")
+        .honored_boundaries
+        .is_empty(),
+      "and asks nothing of the world that replaced it"
+    );
+
+    // Non-vacuity: the live walk completes, and the sample after it finds
+    // nothing to answer.
+    core.on_root_recovered(
+      scope,
+      second,
+      crate::os::RootRecovery::Reseeded,
+      Vec::new(),
+      at(5),
+    );
+    let _ = drain(&mut core);
+    core.on_mounts_refreshed(
+      scope,
+      alive_refresh(vec![PathBuf::from("/r/vol2")], true),
+      at(6),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      recoveries(&effects, scope).is_empty(),
+      "an unchanged table with no boundary owing covers nothing: {effects:?}"
+    );
+  }
+
+  /// A fire arriving while a recovery is in flight runs EXACTLY ONE more when it
+  /// lands, however many arrived. The in-flight walk may have descended past the
+  /// ground the newer change touched, so its map cannot be trusted to have seen
+  /// it; stacking one walk per fire would let a churning table hold the source's
+  /// reader thread for as long as the churn lasts.
+  #[test]
+  fn a_fire_during_a_recovery_runs_exactly_one_more_after_it() {
+    let (mut core, scope) = live_fanotify();
+    core.on_mounts_refreshed(
+      scope,
+      alive_refresh(vec![PathBuf::from("/r/vol")], true),
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let [first] = recoveries(&effects, scope)[..] else {
+      panic!("the change asks for a reseed: {effects:?}");
+    };
+
+    // Two more changes while the walk is out: both coalesce.
+    for (tick, table) in [
+      (2, vec![PathBuf::from("/r/vol"), PathBuf::from("/r/two")]),
+      (3, Vec::new()),
+    ] {
+      core.on_mounts_refreshed(scope, alive_refresh(table, true), at(tick));
+      let effects = drain(&mut core);
+      assert!(
+        recoveries(&effects, scope).is_empty() && emits(&effects).is_empty(),
+        "a fire during a walk neither stacks a walk nor covers early: {effects:?}"
+      );
+    }
+
+    // The first walk lands: it covers, and exactly one follow-up runs.
+    core.on_root_recovered(
+      scope,
+      first,
+      crate::os::RootRecovery::Reseeded,
+      Vec::new(),
+      at(4),
+    );
+    let effects = drain(&mut core);
+    assert_eq!(
+      emits(&effects).len(),
+      1,
+      "the first walk covers: {effects:?}"
+    );
+    let [second] = recoveries(&effects, scope)[..] else {
+      panic!("one follow-up walk for the changes it may have missed: {effects:?}");
+    };
+    assert_ne!(second, first, "the follow-up carries its own epoch");
+
+    // And the follow-up settles it: one more cover, and no third walk.
+    core.on_root_recovered(
+      scope,
+      second,
+      crate::os::RootRecovery::Reseeded,
+      Vec::new(),
+      at(5),
+    );
+    let effects = drain(&mut core);
+    assert_eq!(
+      emits(&effects).len(),
+      1,
+      "the follow-up covers once: {effects:?}"
+    );
+    assert!(
+      recoveries(&effects, scope).is_empty(),
+      "and the coalescing has settled: {effects:?}"
+    );
+  }
+
+  /// A root the reseed walk cannot reach at all is a root DEATH, and it takes the
+  /// same funnel a refresh's own liveness gate takes — the terminal `Removed`
+  /// plus `Rescan` and the stream teardown — rather than a cover for a tree that
+  /// is not there. A source whose map cannot be rebuilt has no trustworthy sight
+  /// of the root either way, and running on blind is the silent-loss shape this
+  /// stack exists to refuse.
+  #[test]
+  fn an_unreachable_root_during_the_reseed_dies() {
+    let (mut core, scope) = live_fanotify();
+    core.on_mounts_refreshed(
+      scope,
+      alive_refresh(vec![PathBuf::from("/r/vol")], true),
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let [epoch] = recoveries(&effects, scope)[..] else {
+      panic!("the change asks for a reseed: {effects:?}");
+    };
+
+    core.on_root_recovered(
+      scope,
+      epoch,
+      crate::os::RootRecovery::Unreachable,
+      Vec::new(),
+      at(2),
+    );
+    let effects = drain(&mut core);
+    let emitted = emits(&effects);
+    assert_eq!(emitted.len(), 2, "the death lifecycle, whole: {effects:?}");
+    assert!(emitted[0].kind().is_removed(), "a gone root is a Removed");
+    assert!(emitted[1].kind().is_rescan(), "root death is never silent");
+    assert!(
+      effects
+        .iter()
+        .any(|e| matches!(e, Effect::TeardownStream { scope: s } if *s == scope)),
+      "the dead root's stream is torn down: {effects:?}"
+    );
+  }
+
+  /// A kernel-recursive scope adopts a changed frame, and the change costs it one
+  /// whole-root RECOVERY rather than a descending replay.
+  ///
+  /// The frame itself is inert here — one superblock mark already covers the
+  /// subtree, so there is no per-directory coverage to rebuild — but a root that
+  /// moved to a different mount is a mount transition like any other (#74), and
+  /// this scope's sight of the tree is a FID map the transition may have left
+  /// holes in. So the effect is the reseed, and no `Rescan` is emitted until it
+  /// answers.
+  #[test]
+  fn a_kernel_recursive_frame_change_adopts_and_recovers_the_root() {
     let (mut core, scope) = live_fanotify();
     core
       .scopes
@@ -12223,13 +14085,22 @@ mod kernel_recursive_fanotify {
         authoritative: true,
         root: RootLiveness::Present(crate::os::RootIdentity::new(1, 1)),
         root_mnt_id: Some(77),
+        root_incarnation: None,
+        namespace_transitions: None,
+        overflowed: false,
       },
       at(1),
     );
     let effects = drain(&mut core);
     assert!(
-      effects.is_empty(),
-      "a kernel-recursive frame change triggers no reconcile: {effects:?}"
+      emits(&effects).is_empty(),
+      "nothing is covered before the source can see the tree again: {effects:?}"
+    );
+    assert!(
+      effects
+        .iter()
+        .any(|e| matches!(e, Effect::RecoverRoot { scope: s, .. } if *s == scope)),
+      "the frame move asks for a whole-root reseed: {effects:?}"
     );
     assert_eq!(
       core.scopes.get(&scope).expect("scope is live").root_mnt_id,
@@ -14381,6 +16252,9 @@ mod root_replaced {
         authoritative: true,
         root: RootLiveness::Present(crate::os::RootIdentity::new(1, 2)),
         root_mnt_id: None,
+        root_incarnation: None,
+        namespace_transitions: None,
+        overflowed: false,
       },
       at(2),
     );
@@ -14806,6 +16680,58 @@ mod root_widened {
     assert!(
       core.take_barrier_moves().is_empty(),
       "so nothing is queued for a retirement to act on"
+    );
+  }
+
+  /// A widen is the one world entry that seeds its own mount-change baseline, and
+  /// this is why (#74).
+  ///
+  /// The commit splices without domination: no covering `Rescan` is minted, and
+  /// the ADDED ground is read by the chain arm's cold enumerate, which declines
+  /// beneath every mount it finds there. So a lazy unmount racing that read leaves
+  /// ground the crawl declined and nothing re-read — and if the widened world's
+  /// FIRST authoritative refresh were merely the baseline, the post-departure
+  /// table would install as the truth and the window would be invisible forever.
+  ///
+  /// Seeding the baseline from the widen's own barrier read closes it: the mount
+  /// the barrier listed is absent from the first refresh, which is a difference,
+  /// which is one whole-root cover.
+  #[test]
+  fn a_mount_seeded_by_a_widen_and_gone_by_its_first_read_is_covered() {
+    let (mut core, scope, _root_watch, _boot) = live_at("/r/sub", 1, true);
+    widen(
+      &mut core,
+      scope,
+      RootMeta {
+        mounts: vec![super::bare("/r/vol")],
+        ..meta("/r", 9)
+      },
+      at(1),
+    );
+    let _ = drain(&mut core);
+
+    // The commit-armed refresh IS the widened world's first authoritative read,
+    // and the mount its own barrier listed is already gone from it.
+    core.on_mounts_refreshed(
+      scope,
+      MountRefresh {
+        root: RootLiveness::Present(crate::os::RootIdentity::new(1, 9)),
+        ..alive_refresh(Vec::new(), true)
+      },
+      at(2),
+    );
+    let effects = drain(&mut core);
+    let emitted = emits(&effects);
+    assert_eq!(
+      emitted.len(),
+      1,
+      "the widen window's departure is covered: {effects:?}"
+    );
+    assert!(emitted[0].kind().is_rescan());
+    assert_eq!(
+      emitted[0].location(),
+      &loc(&[]),
+      "coarsely, at the whole root: {emitted:?}"
     );
   }
 
@@ -15680,6 +17606,9 @@ mod root_widened {
         authoritative: true,
         root: RootLiveness::Present(crate::os::RootIdentity::new(1, 99)),
         root_mnt_id: None,
+        root_incarnation: None,
+        namespace_transitions: None,
+        overflowed: false,
       },
       at(3),
     );
@@ -16306,9 +18235,9 @@ mod exclusions {
   /// The root-liveness cadence is DISABLED here (`Duration::ZERO`, which the
   /// options layer offers for exactly this). Every cell in this suite reasons
   /// about the pairing deadline and about what the exclusion fence does or does
-  /// not arm, and a descending scope carries the liveness cadence as well — a
-  /// second deadline `poll_timeout` would report, saying nothing about either
-  /// subject and hiding the one being asserted.
+  /// not arm, and a descending scope carries the mount-sampling cadence as well
+  /// — a second deadline `poll_timeout` would report, saying nothing about
+  /// either subject and hiding the one being asserted.
   fn excluding(paths: &[&str]) -> DriverCore {
     DriverCore::new(WINDOW, Duration::ZERO, reserved_dir())
       .with_exclusions(paths.iter().map(PathBuf::from).collect())

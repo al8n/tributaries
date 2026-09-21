@@ -60,7 +60,7 @@ use super::{
   Admission, MemoBatch, classify,
   fid::{AbiMismatch, FANOTIFY_METADATA_VERSION, decode_events},
   map::{FidMap, SeedEntry},
-  source::ReseedContext,
+  source::{ReseedContext, SeedWalk},
 };
 
 /// What the reader shares with the handle side: the ordered queue, the
@@ -76,10 +76,90 @@ pub(crate) struct ReaderShared {
   pub(crate) stats: std::sync::Arc<BackendStatsShared>,
 }
 
-/// One control request. fanotify has no arm traffic, so shutdown is the only
-/// message.
+/// One control request. fanotify has no arm traffic; the two messages are the
+/// teardown and the whole-root reseed the core asks for when the mount table
+/// under the root changed (#74).
 pub(crate) enum Control {
   Shutdown,
+  /// Rebuild the FID map over the WHOLE root under `epoch` and answer IN BAND,
+  /// on the source's own ordered queue (#74).
+  ///
+  /// Served on the reader thread because the map lives there and nowhere else,
+  /// and served at a DRAINED read boundary: a walk never runs concurrently with
+  /// a decode of the same map, and the completion the core turns into a
+  /// whole-root `Rescan` must sit behind every event the kernel already held —
+  /// otherwise the consumer re-reads the tree and is then told about the world
+  /// as it was before the mount change. Nothing waits on it. The `epoch` travels
+  /// out and back, so a completion whose world ended is dropped by the core
+  /// rather than by a timeout, and a reader that exits without answering says so
+  /// through the stream's own end.
+  Reseed {
+    epoch: u64,
+  },
+}
+
+/// Drains every pending control message, RECORDING a requested reseed rather
+/// than running it, and answers whether a shutdown was among them.
+///
+/// One drain rather than one `try_recv`, because a `Reseed` sitting in front of a
+/// `Shutdown` would otherwise be taken off the queue and discarded by a
+/// shutdown-only match — leaving the request unanswered until the reader exited.
+/// Every message is looked at; teardown still wins, because the answer only says
+/// whether one was seen.
+///
+/// Recording rather than running IS the ordering. Control is serviced before and
+/// between reads, so a completion pushed from here would overtake exactly the
+/// events it has to follow; the caller runs the walk once the instance has been
+/// cut ([`ReseedBudget`]). The latest epoch wins, which costs nothing to argue —
+/// the core keeps one recovery in flight per scope.
+fn service_control(control: &mpsc::Receiver<Control>, pending_reseed: &mut Option<u64>) -> bool {
+  let mut shutdown = false;
+  while let Ok(message) = control.try_recv() {
+    match message {
+      Control::Shutdown => shutdown = true,
+      Control::Reseed { epoch } => *pending_reseed = Some(epoch),
+    }
+  }
+  shutdown
+}
+
+/// Rebuilds the map over the whole root for one [`Control::Reseed`], on the same
+/// retry-then-concede policy a post-loss reseed uses, and pushes the completion
+/// onto the source's own queue.
+///
+/// It does NOT signal a fatal on failure, and that is the one difference. A
+/// loss-driven reseed that goes blind has no other reporting path, so it
+/// escalates itself; this one was REQUESTED and the core is owed the verdict —
+/// which turns an unreachable root into the same death lifecycle a refresh's
+/// liveness gate reaches. Escalating here as well would race two terminals for
+/// one fact.
+///
+/// The boundaries this walk honored ride the completion instead of a separate
+/// [`Honored`](crate::os::SourceMessage::Honored): they are this walk's
+/// questions, so a completion the core drops for a stale epoch has to drop them
+/// with it — a world that ended takes its walk's questions with it.
+fn run_root_recovery<Q>(
+  map: &mut FidMap,
+  reseed: &ReseedContext,
+  stats: &BackendStatsShared,
+  epoch: u64,
+  mut send: Q,
+) where
+  Q: FnMut(crate::os::SourceMessage) -> bool,
+{
+  stats.record_reseed();
+  let started = std::time::Instant::now();
+  let walked = reseed_map(map, || reseed.walk());
+  stats.record_walk(walk_micros(started));
+  let (outcome, honored) = match walked {
+    ReseedOutcome::Reseeded { honored } => (crate::os::RootRecovery::Reseeded, honored),
+    ReseedOutcome::Blind => (crate::os::RootRecovery::Unreachable, Vec::new()),
+  };
+  let _ = send(crate::os::SourceMessage::Recovered {
+    epoch,
+    outcome,
+    honored,
+  });
 }
 
 /// Starts the reader thread. The fd, the wake eventfd, the seeded `FidMap`, and
@@ -137,62 +217,187 @@ fn run(
   // fanotify events are large (a metadata header plus variable-length FID
   // records with names); the 64 KiB default holds a dense read of them.
   let mut buf = vec![0u8; shared.buffer_bytes];
+  // The epoch of a requested whole-root reseed this lap still owes (#74).
+  let mut pending_reseed = None;
   loop {
     // Announce the intent to block, then re-check for shutdown before polling
     // (the lost-wakeup guard — see `WakeState`; a shutdown enqueued before the
     // fence is visible here).
     wake.arm_park();
-    if matches!(control.try_recv(), Ok(Control::Shutdown)) {
+    if service_control(control, &mut pending_reseed) {
       return;
     }
-    let event = wake.event_fd();
-    let mut fds = [
-      PollFd::new(fd, PollFlags::IN),
-      PollFd::new(&event, PollFlags::IN),
-    ];
-    match poll(&mut fds, None) {
-      Ok(_) => {}
-      Err(Errno::INTR) => {
-        wake.unpark();
-        continue;
+    // A requested reseed may not be answered while the kernel still holds events
+    // older than it, and an instance is drained by READING it, not by waiting on
+    // it: take the drain now rather than park on a `poll` that an idle tree
+    // never returns from.
+    let drain_now = if pending_reseed.is_some() {
+      wake.unpark();
+      true
+    } else {
+      let event = wake.event_fd();
+      let mut fds = [
+        PollFd::new(fd, PollFlags::IN),
+        PollFd::new(&event, PollFlags::IN),
+      ];
+      match poll(&mut fds, None) {
+        Ok(_) => {}
+        Err(Errno::INTR) => {
+          wake.unpark();
+          continue;
+        }
+        Err(err) => {
+          wake.unpark();
+          signal_fatal(shared, SourceError::ReadFailed { source: err.into() });
+          return;
+        }
       }
-      Err(err) => {
-        wake.unpark();
-        signal_fatal(shared, SourceError::ReadFailed { source: err.into() });
-        return;
-      }
-    }
-    let source_ready = fds[0].revents().contains(PollFlags::IN);
-    let event_ready = fds[1].revents().contains(PollFlags::IN);
-    wake.unpark();
+      let source_ready = fds[0].revents().contains(PollFlags::IN);
+      let event_ready = fds[1].revents().contains(PollFlags::IN);
+      wake.unpark();
 
-    if event_ready {
-      wake.drain();
-      if matches!(control.try_recv(), Ok(Control::Shutdown)) {
-        return;
+      if event_ready {
+        wake.drain();
+        if service_control(control, &mut pending_reseed) {
+          return;
+        }
       }
-    }
-    if source_ready {
-      match drain_events(fd, &mut buf, map, reseed, control, shared) {
-        DrainExit::Parked => {}
+      // A reseed that arrived on this wake still drains first, even when the
+      // instance was never signalled: the drain then costs one `EAGAIN` read and
+      // proves what the walk needs proven.
+      source_ready || pending_reseed.is_some()
+    };
+    if drain_now {
+      match drain_events(
+        fd,
+        &mut buf,
+        map,
+        reseed,
+        control,
+        shared,
+        &mut pending_reseed,
+      ) {
+        DrainExit::Parked | DrainExit::ReseedDue => {}
         DrainExit::Shutdown | DrainExit::Died => return,
       }
+    }
+    // The cut is complete: everything the kernel held when the walk was asked
+    // for is on the lane, either because the instance reached `EAGAIN` or
+    // because the byte debt priced at the request has been read out. Anything
+    // still resident arrived after the request and describes the world the walk
+    // is about to report, so the completion can only be read as covering ground
+    // the consumer has heard about. A budget exit leaves the fd readable, and
+    // the loop's own `poll` returns straight back into the drain.
+    if let Some(epoch) = pending_reseed.take() {
+      run_root_recovery(map, reseed, &shared.stats, epoch, |msg| {
+        shared.queue.try_send(msg).is_ok()
+      });
     }
   }
 }
 
-/// Why [`drain_events`] returned. The reader re-parks and polls only on
-/// [`Parked`](Self::Parked); [`Shutdown`](Self::Shutdown) and
+/// Why [`drain_events`] returned. The reader runs any recorded reseed and then
+/// re-parks and polls on [`Parked`](Self::Parked) and
+/// [`ReseedDue`](Self::ReseedDue); [`Shutdown`](Self::Shutdown) and
 /// [`Died`](Self::Died) both exit the reader thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DrainExit {
   /// The instance drained to `EAGAIN` (or a zero-length read): re-park and poll.
   Parked,
+  /// A recorded reseed's cut is complete while the instance is still readable
+  /// (#74): its walk owes the lane only what was queued when it was asked for,
+  /// and that debt is paid. The caller runs the walk and comes straight back —
+  /// the `poll` it re-enters returns at once on a readable fd — so the drain
+  /// continues with nothing lost and the completion sits behind exactly the
+  /// events it must follow.
+  ReseedDue,
   /// A `Shutdown` was observed between reads. Teardown takes PRIORITY over
   /// further draining, so the reader stops now rather than after `EAGAIN`.
   Shutdown,
   /// The stream died; the terminal `Fatal` was already signaled.
   Died,
+}
+
+/// The most buffer reads one recorded reseed spends cutting the instance when
+/// `FIONREAD` could not price it (#74).
+///
+/// Sized for the default `fanotify` queue (16384 events) at a realistic
+/// FID-plus-name record — a 24-byte metadata header, an fsid, an exported
+/// handle and a name — over the DEFAULT buffer: ⌈16384 × 300 / 65536⌉ ≈ 75
+/// reads, plus slack. A caller who shrinks `os_buffer_bytes` or raises the
+/// kernel's queue trades ordering for this bound rather than the other way
+/// round: the walk still runs, and what is left resident rides behind its
+/// completion.
+const RESEED_DRAIN_READS: u32 = 80;
+
+/// The most reads one reseed spends retiring a CREDIBLE byte debt. The debt
+/// bounds what the kernel said was queued, not how many reads clear it: a
+/// buffer far smaller than the records it carries, or a wrapped-small count
+/// under a still-filling queue, must not keep the walk waiting indefinitely.
+const MAX_RESEED_OWED_READS: u32 = 4096;
+
+/// The largest queued-byte count this reader will believe from `FIONREAD`.
+///
+/// The ioctl reports through a C `int`, so a queue past `i32::MAX` bytes wraps
+/// and the value stops describing the queue at all — and the widening to `u64`
+/// means a negative wrap arrives as a value near `u64::MAX` rather than as a
+/// negative number to reject, which is exactly what this bound catches. No
+/// credible fanotify queue comes near it.
+const MAX_CREDIBLE_QUEUE_BYTES: u64 = i32::MAX as u64;
+
+/// What a recorded reseed still owes the instance before its walk may run (#74).
+///
+/// The walk's completion is what the core turns into a whole-root `Rescan`, so
+/// it has to sit behind every event the kernel already held when the reseed was
+/// asked for — otherwise the consumer re-reads the tree and is only then told
+/// about the world as it was before the mount change. Waiting for the fd to go
+/// quiet would buy that ordering and give up progress: a producer that keeps it
+/// readable would hold the walk off for as long as it liked, leaving the ground
+/// a departed mount revealed uncovered and the recovery latched in flight.
+///
+/// So the queue is PRICED once, where the request is recorded, and each read is
+/// charged against that debt. Everything resident then precedes the completion
+/// (exact), while everything that arrives afterwards is the walk's own subject
+/// and may follow it (bounded). The read caps are the belt for a count that
+/// cannot be had or cannot be believed.
+struct ReseedBudget {
+  /// Bytes the instance held when the request was recorded, or `None` when
+  /// `FIONREAD` refused or answered beyond belief.
+  owed: Option<u64>,
+  /// Buffer reads taken since then.
+  reads: u32,
+}
+
+impl ReseedBudget {
+  /// Prices the queue from one `FIONREAD` answer.
+  fn taken(queued: Result<u64, Errno>) -> Self {
+    Self {
+      owed: match queued {
+        Ok(bytes) if bytes <= MAX_CREDIBLE_QUEUE_BYTES => Some(bytes),
+        Ok(_) | Err(_) => None,
+      },
+      reads: 0,
+    }
+  }
+
+  /// Whether the cut is complete and the walk may run.
+  fn spent(&self) -> bool {
+    match self.owed {
+      Some(owed) => owed == 0 || self.reads >= MAX_RESEED_OWED_READS,
+      None => self.reads >= RESEED_DRAIN_READS,
+    }
+  }
+
+  /// Charges one read of `bytes` against the debt. Saturating: one read can
+  /// deliver MORE than the remainder (records that arrived after the price fill
+  /// the same buffer), which completes the cut with that extra traffic already
+  /// forwarded in order.
+  fn charge(&mut self, bytes: usize) {
+    self.reads = self.reads.saturating_add(1);
+    if let Some(owed) = self.owed.as_mut() {
+      *owed = owed.saturating_sub(bytes as u64);
+    }
+  }
 }
 
 /// Reads the instance until `EAGAIN`, admitting and forwarding each buffer as one
@@ -203,12 +408,16 @@ enum DrainExit {
 /// the top of the loop, before the next read/decode, so a reseed or subtree walk
 /// from the PREVIOUS buffer has fully completed before it runs: a shutdown that
 /// lands mid-reseed quiesces cleanly at the next read boundary rather than
-/// interrupting the walk. fanotify has no arm traffic, so shutdown is the only
-/// control message. Returns [`DrainExit::Died`] when the stream died (fatal
-/// already signaled — a failed read, a foreign event-metadata ABI version, or a
-/// recovery that could not restore sight), [`DrainExit::Shutdown`] on a
-/// mid-drain shutdown, and [`DrainExit::Parked`] when the instance drained
-/// clean.
+/// interrupting the walk. A requested whole-root reseed ([`Control::Reseed`]) is
+/// only RECORDED at that boundary — it is run by the caller once this drain has
+/// reached `EAGAIN`, because its completion states a position on the lane and
+/// everything the kernel already held has to be ahead of it. Returns
+/// [`DrainExit::Died`] when the stream died (fatal already signaled — a failed
+/// read, a foreign event-metadata ABI version, or a recovery that could not
+/// restore sight), [`DrainExit::Shutdown`] on a mid-drain shutdown,
+/// [`DrainExit::ReseedDue`] when a recorded reseed's cut is complete while the
+/// instance is still readable, and [`DrainExit::Parked`] when the instance
+/// drained clean.
 fn drain_events(
   fd: &OwnedFd,
   buf: &mut [u8],
@@ -216,10 +425,63 @@ fn drain_events(
   reseed: &ReseedContext,
   control: &mpsc::Receiver<Control>,
   shared: &ReaderShared,
+  pending_reseed: &mut Option<u64>,
 ) -> DrainExit {
+  drain_events_with(
+    DrainSource {
+      fd,
+      fionread: |fd: &OwnedFd| rustix::io::ioctl_fionread(fd),
+    },
+    buf,
+    map,
+    reseed,
+    control,
+    shared,
+    pending_reseed,
+  )
+}
+
+/// The instance one drain reads, paired with the ioctl that prices its queue for
+/// a reseed's cut. The two travel together because they address the same
+/// descriptor, and the pairing is what lets a cell drive a cut against a price
+/// it chose — including the answer the ioctl refuses to give, which is the
+/// fallback cap's only path.
+struct DrainSource<'a, F>
+where
+  F: FnMut(&OwnedFd) -> Result<u64, Errno>,
+{
+  fd: &'a OwnedFd,
+  fionread: F,
+}
+
+/// [`drain_events`]'s body over an injectable [`DrainSource`].
+fn drain_events_with<F>(
+  mut source: DrainSource<'_, F>,
+  buf: &mut [u8],
+  map: &mut FidMap,
+  reseed: &ReseedContext,
+  control: &mpsc::Receiver<Control>,
+  shared: &ReaderShared,
+  pending_reseed: &mut Option<u64>,
+) -> DrainExit
+where
+  F: FnMut(&OwnedFd) -> Result<u64, Errno>,
+{
+  let fd = source.fd;
+  // A request already recorded when the drain begins is priced here; one that
+  // arrives at a control boundary below is priced where it lands.
+  let mut budget = pending_reseed.map(|_| ReseedBudget::taken((source.fionread)(fd)));
   loop {
-    if matches!(control.try_recv(), Ok(Control::Shutdown)) {
+    if service_control(control, pending_reseed) {
       return DrainExit::Shutdown;
+    }
+    if pending_reseed.is_some() && budget.is_none() {
+      budget = Some(ReseedBudget::taken((source.fionread)(fd)));
+    }
+    // Checked at the loop TOP, so the previous buffer has been decoded and
+    // forwarded before the walk that must follow it runs.
+    if budget.as_ref().is_some_and(ReseedBudget::spent) {
+      return DrainExit::ReseedDue;
     }
     let n = match rustix::io::read(fd, &mut *buf) {
       Ok(n) => n,
@@ -233,6 +495,9 @@ fn drain_events(
     };
     if n == 0 {
       return DrainExit::Parked;
+    }
+    if let Some(budget) = budget.as_mut() {
+      budget.charge(n);
     }
     let decoded = match decode_events(&buf[..n]) {
       Ok(decoded) => decoded,
@@ -320,8 +585,8 @@ fn process_decoded<R, S, Q>(
   mut send: Q,
 ) -> bool
 where
-  R: FnMut() -> std::io::Result<Vec<SeedEntry>>,
-  S: FnMut(&std::path::Path, &super::fid::Fid, Option<usize>) -> std::io::Result<Vec<SeedEntry>>,
+  R: FnMut() -> std::io::Result<SeedWalk>,
+  S: FnMut(&std::path::Path, &super::fid::Fid, Option<usize>) -> std::io::Result<SeedWalk>,
   Q: FnMut(crate::os::SourceMessage) -> bool,
 {
   let &BufferContext {
@@ -424,10 +689,18 @@ where
             // stays `None`.
             let budget = map.remaining_capacity();
             let started = std::time::Instant::now();
+            // The subtree walk is a walk like any other, so it accounts for where
+            // it stopped like any other (#74): a directory moved in from outside
+            // the root can carry submounts, and one that departs before any sample
+            // lists it leaves ground inside the moved subtree that nothing read.
+            let mut walked_boundaries = Vec::new();
             let outcome = seed_moved_in_subtree(map, &moved_fid, |subtree, subtree_fid| {
-              subtree_walk(subtree, subtree_fid, budget)
+              let walked = subtree_walk(subtree, subtree_fid, budget)?;
+              walked_boundaries.extend(walked.honored);
+              Ok(walked.entries)
             });
             stats.record_walk(walk_micros(started));
+            report_honored(walked_boundaries, &mut send);
             if matches!(outcome, SeedOutcome::Blind) {
               // The subtree could not be mapped from the path the map resolves it
               // to. Take the loss barrier rather than the terminal: a reseed both
@@ -534,35 +807,63 @@ fn reseed_after_loss<R, Q>(
   stats: &BackendStatsShared,
   reseed_walk: R,
   transport: &transport::TransportState,
-  send: Q,
+  mut send: Q,
 ) -> bool
 where
-  R: FnMut() -> std::io::Result<Vec<SeedEntry>>,
+  R: FnMut() -> std::io::Result<SeedWalk>,
   Q: FnMut(crate::os::SourceMessage) -> bool,
 {
   stats.record_reseed();
   let started = std::time::Instant::now();
   let outcome = reseed_map(map, reseed_walk);
   stats.record_walk(walk_micros(started));
-  if matches!(outcome, ReseedOutcome::Blind) {
-    transport::signal_fatal_once(
-      transport,
-      SourceError::ReadFailed {
-        source: reseed_blind_error(),
-      },
-      send,
-    );
-    return false;
+  match outcome {
+    ReseedOutcome::Blind => {
+      transport::signal_fatal_once(
+        transport,
+        SourceError::ReadFailed {
+          source: reseed_blind_error(),
+        },
+        &mut send,
+      );
+      false
+    }
+    // The rebuilt map stops at the same mount boundaries the old one did, and a
+    // boundary this walk honored may be gone before any sample ever lists it
+    // (#74). Reported in band, AHEAD of the `Overflow` this branch goes on to
+    // signal, so it cannot be reordered behind the cover it may itself cause.
+    ReseedOutcome::Reseeded { honored } => {
+      report_honored(honored, &mut send);
+      true
+    }
   }
-  true
+}
+
+/// Forwards one walk's honored mount boundaries on the source's own ordered queue
+/// (#74), and does nothing at all for a walk that honored none.
+///
+/// The empty case is the common one — a root with no submounts under it — and
+/// sending for it would put one message per walk on the lane to say nothing. The
+/// core's rule is the same either way: a boundary reported is checked against the
+/// next authoritative sample and costs a whole-root cover only when the table no
+/// longer carries it.
+fn report_honored<Q>(honored: Vec<std::path::PathBuf>, mut send: Q)
+where
+  Q: FnMut(crate::os::SourceMessage) -> bool,
+{
+  if !honored.is_empty() {
+    let _ = send(crate::os::SourceMessage::Honored(honored));
+  }
 }
 
 /// Whether a loss-triggered reseed restored the map's sight.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ReseedOutcome {
   /// The walk succeeded (on the first try or the single retry) and the map was
-  /// rebuilt.
-  Reseeded,
+  /// rebuilt, honoring the mount boundaries it carries (#74) — the walk's own
+  /// account of where it stopped, which the caller reports in band so the next
+  /// authoritative mount sample can ask whether those mounts are still there.
+  Reseeded { honored: Vec<std::path::PathBuf> },
   /// The walk failed twice: the map is stale and the source is blind. The caller
   /// escalates to the terminal `Fatal` rather than run on permanently.
   Blind,
@@ -576,12 +877,14 @@ enum ReseedOutcome {
 /// (a directory momentarily unreadable mid-walk) without killing the scope.
 fn reseed_map<W>(map: &mut FidMap, mut walk: W) -> ReseedOutcome
 where
-  W: FnMut() -> std::io::Result<Vec<SeedEntry>>,
+  W: FnMut() -> std::io::Result<SeedWalk>,
 {
   for _ in 0..2 {
-    if let Ok(entries) = walk() {
-      map.reseed(entries);
-      return ReseedOutcome::Reseeded;
+    if let Ok(walked) = walk() {
+      map.reseed(walked.entries);
+      return ReseedOutcome::Reseeded {
+        honored: walked.honored,
+      };
     }
   }
   ReseedOutcome::Blind

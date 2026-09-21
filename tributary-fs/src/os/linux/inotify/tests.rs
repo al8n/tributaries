@@ -532,6 +532,7 @@ mod smoke {
       parent: None,
       name: OsString::from(meta.root.as_os_str()),
       expected: None,
+      frame: crate::os::ScopeFrame::default(),
     });
     let wd = match reply.outcome {
       WatchOutcome::Installed(wd) => wd,
@@ -566,6 +567,7 @@ mod smoke {
       parent: None,
       name: OsString::from(meta.root.as_os_str()),
       expected: None,
+      frame: crate::os::ScopeFrame::default(),
     });
     let WatchOutcome::Installed(wd) = first.outcome else {
       panic!("first arm: {:?}", first.outcome);
@@ -575,6 +577,7 @@ mod smoke {
       parent: None,
       name: OsString::from(meta.root.as_os_str()),
       expected: None,
+      frame: crate::os::ScopeFrame::default(),
     });
     assert_eq!(second.outcome, WatchOutcome::Aliased(wd));
 
@@ -599,6 +602,7 @@ mod smoke {
       parent: None,
       name: OsString::from(meta.root.as_os_str()),
       expected: Some(ident(&meta.root)),
+      frame: crate::os::ScopeFrame::default(),
     });
     assert!(
       matches!(reply.outcome, WatchOutcome::Installed(_)),
@@ -633,6 +637,7 @@ mod smoke {
       parent: None,
       name: OsString::from(meta.root.as_os_str()),
       expected: Some(wrong),
+      frame: crate::os::ScopeFrame::default(),
     });
     assert_eq!(
       reply.outcome,
@@ -662,6 +667,7 @@ mod smoke {
       parent: None,
       name: OsString::from(meta.root.join("absent").as_os_str()),
       expected: None,
+      frame: crate::os::ScopeFrame::default(),
     });
     assert_eq!(
       reply.outcome,
@@ -686,6 +692,7 @@ mod smoke {
       parent: None,
       name: OsString::from(meta.root.as_os_str()),
       expected: None,
+      frame: crate::os::ScopeFrame::default(),
     });
     assert!(matches!(reply.outcome, WatchOutcome::Installed(_)));
 

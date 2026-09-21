@@ -227,6 +227,18 @@ async fn next_event(rig: &Rig) -> (ScopeId, Change) {
   (scope, change)
 }
 
+/// A table row with no identity at all — what every fake reports, and what a host
+/// with no mount ids answers. The driver cells only care WHERE a mount is.
+fn bare_mount(location: &str) -> crate::os::MountRow {
+  crate::os::MountRow {
+    location: PathBuf::from(location),
+    mnt_id: None,
+    parent_id: None,
+    mnt_id_unique: None,
+    dev: None,
+  }
+}
+
 fn loc(parts: &[&str]) -> Location {
   Location::from_segments(parts.iter().map(|p| Segment::new(*p)))
 }
@@ -1777,6 +1789,57 @@ async fn a_probe_declined_at_the_budget_reports_the_scope_unproven_and_renews() 
   );
 }
 
+/// A mount change under a FANOTIFY root reaches the source through the effect
+/// path, on the blocking pool, and its answer decides what the consumer hears
+/// (#74).
+///
+/// The fanotify source's sight is a FID map seeded by a walk that stops at every
+/// mount boundary, so ground a departed mount revealed is ground the map has
+/// never seen. The core therefore raises `Effect::RecoverRoot` rather than
+/// covering directly, and the driver executes it exactly as it executes the
+/// refresh that raised it — end to end, this is the observable that the walk was
+/// requested at all.
+///
+/// The UNREACHABLE answer is the verdict this cell drives, because it is the one
+/// with a terminal the driver can be watched to reach: a source whose map cannot
+/// be rebuilt has no trustworthy sight of the root, so the scope takes the same
+/// death lifecycle a refresh's own liveness gate takes and the registry entry is
+/// reclaimed.
+#[tokio::test(start_paused = true)]
+async fn a_mount_change_under_a_fanotify_root_walks_it_and_an_unreachable_walk_dies() {
+  let registry = RecordingRegistry::default();
+  let rig = rig_with(64, registry.clone());
+  rig.fs.spawn_backend(BackendKind::Fanotify);
+  // The mount is there at the spawn seed AND at the birth refresh, so the birth
+  // refresh installs it as the baseline rather than staging a departure.
+  rig.fs.seed_mounts(vec![bare_mount("/r/vol")]);
+  rig.fs.answer_refresh(vec![bare_mount("/r/vol")], true);
+  let scope = watch(&rig, "/r").await;
+  assert!(
+    rig.fs.recovery_requests().is_empty(),
+    "a table that has not moved asks for no walk"
+  );
+
+  // `umount -l /r/vol`, and the walk that follows cannot reach the root.
+  rig
+    .fs
+    .answer_root_recovery(crate::os::RootRecovery::Unreachable);
+  rig.fs.answer_refresh(Vec::new(), true);
+  rig.fs.send_lossy("/r");
+
+  settle(|| registry.dead() == [scope]).await;
+  assert_eq!(
+    rig.fs.recovery_requests(),
+    [PathBuf::from("/r")],
+    "the departure asked for exactly one whole-root walk"
+  );
+  assert_eq!(
+    registry.dead(),
+    [scope],
+    "a root the walk cannot reach takes the death path"
+  );
+}
+
 /// The refresh samples the root's identity AND its mount frame from ONE object, so
 /// a replaced/re-mounted root can never pair the OLD identity's verdict with a NEW
 /// object's frame (the mixed sample the atomic `statx` restructure closes). The fake
@@ -2174,11 +2237,18 @@ async fn spawn_seals_root_meta_before_the_stream_goes_live() {
 /// for its whole prefix from the first event on — even if the volume vanishes
 /// immediately after (its unmount travels in-band and is applied late, per
 /// the monotone rule); nothing can event before the seed exists.
+///
+/// The live table answers the same row the seed carried, because the mount IS
+/// still there: an authoritative read REPLACES the table
+/// (`install_mount_table`), so a fake whose
+/// birth refresh answered the default empty table would be staging a departure
+/// rather than the pre-existing submount this cell is about.
 #[tokio::test(start_paused = true)]
 async fn spawn_seed_carries_a_preexisting_submount() {
   let fs = FakeFs::new(1);
   fs.put("/r", FileKind::Dir, 1);
-  fs.seed_mounts(vec![PathBuf::from("/r/vol")]);
+  fs.seed_mounts(vec![bare_mount("/r/vol")]);
+  fs.answer_refresh(vec![bare_mount("/r/vol")], true);
   let (cmd_tx, cmd_rx) = async_channel::bounded(16);
   #[cfg(feature = "sync")]
   let (cleanup, cookie_wake) = cookie_ingress();
@@ -3526,6 +3596,7 @@ mod descending {
             name: Segment::new("r"),
             path: Arc::new(PathBuf::from(path)),
             expected: None,
+            frame: crate::os::ScopeFrame::default(),
           }],
         )
         .resolutions
@@ -10801,6 +10872,864 @@ mod descending {
     }
   }
 
+  /// Drains this rig's consumer channel for a bounded window, returning every
+  /// `(root, is_rescan, at_the_scope_root)` it yielded in order — the ordering
+  /// observable the mount cover's cut is about (#74).
+  ///
+  /// The LOCATION is carried apart from the root because a whole-root cover
+  /// re-enumerates and re-arms under it, and a child's own located `Rescan` is
+  /// rooted at the same place: counting by root alone would read the cover's
+  /// consequences as further covers.
+  async fn drained_stream(rig: &Rig) -> Vec<(PathBuf, bool, bool)> {
+    let mut seen = Vec::new();
+    for _ in 0..interpreted_rounds(60) {
+      while let Ok((_, root, change)) = rig.events.try_recv() {
+        seen.push((
+          root.as_path().to_path_buf(),
+          change.kind().is_rescan(),
+          change.location() == &loc(&[]),
+        ));
+      }
+      tokio::task::yield_now().await;
+      tokio::time::sleep(Duration::from_millis(10)).await;
+      std::thread::sleep(settle_round_slice());
+    }
+    seen
+  }
+
+  /// A batch the reader pushed BEFORE the mount sample is delivered before the
+  /// cover that sample stands (#74).
+  ///
+  /// The sample rides a liveness probe and lands on the operation queue, which
+  /// the run loop prefers, while the events it has to dominate travel on the
+  /// scope's own lane. So without a cut the older batch is still queued when the
+  /// refresh emits its whole-root `Rescan`, and is then delivered AFTER it —
+  /// naming ground the mount change has since hidden or replaced, with a table
+  /// that has stopped moving firing no second cover to correct it.
+  ///
+  /// The freeze is the staging, not decoration: it is what puts both the batch
+  /// and the refresh answer in flight at once, which is the whole window. With
+  /// the cut, the refresh waits in the driver's stash for a marker the reader
+  /// pushes BEHIND the batch, so the batch wins the lane and the cover follows.
+  ///
+  /// FAIL-ON-REVERT: apply the refresh where it lands and the root `Rescan`
+  /// precedes the `Created` below.
+  #[cfg(not(miri))]
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn a_batch_pushed_before_a_refresh_is_delivered_before_its_cover() {
+    let registry = GatedRegistry::default();
+    let fs = FakeFs::new(1);
+    fs.accept_cuts();
+    fs.seed_mounts(vec![bare_mount("/r/vol")]);
+    fs.answer_refresh(vec![bare_mount("/r/vol")], true);
+    let rig = inotify_rig_fs_registry(fs, 64, registry.clone());
+    rig.fs.put("/r/sub", FileKind::Dir, 2);
+    rig.fs.put("/b", FileKind::Dir, 9);
+    let scope = watch(&rig, "/r").await;
+    let root_watch = rig
+      .fs
+      .arms()
+      .first()
+      .cloned()
+      .expect("the birth root arm")
+      .0;
+    let _ = drained_stream(&rig).await;
+
+    // The tick's probe parks in the pool with the DEPARTURE as its answer.
+    let refresh = rig.fs.hold_refreshes();
+    tick_liveness(&rig, scope).await;
+    rig.fs.answer_refresh(Vec::new(), true);
+
+    // Freeze the loop inside a second scope's birth publication, so nothing is
+    // ingested while both the batch and the refresh answer land.
+    let frozen = registry.hold_scope_live();
+    let (born, _on_born) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Watch {
+        root: PathBuf::from("/b"),
+        options: crate::options::RootOptions::new(),
+        reply: born,
+      })
+      .await
+      .unwrap();
+    assert!(
+      settle(|| registry.scope_live_frozen()).await,
+      "staging: the loop is frozen inside the second scope's birth"
+    );
+
+    // Inside the freeze: the reader's batch onto the lane, the refresh answer
+    // onto the operation queue.
+    rig.fs.send_inotify_batch(
+      "/r",
+      vec![attributed(&[root_watch], IN_CREATE, b"under-vol.txt")],
+    );
+    refresh.release();
+    assert!(
+      settle(|| rig.fs.refreshes() >= 2).await,
+      "staging: the departure's refresh answered while the loop was frozen"
+    );
+
+    frozen.release();
+
+    let seen = drained_stream(&rig).await;
+    let ours: Vec<(bool, bool)> = seen
+      .iter()
+      .filter(|(root, _, _)| root.as_path() == Path::new("/r"))
+      .map(|(_, rescan, at_root)| (*rescan, *at_root))
+      .collect();
+    let created = ours
+      .iter()
+      .position(|(rescan, _)| !rescan)
+      .expect("the batch is delivered");
+    let cover = ours
+      .iter()
+      .position(|(rescan, at_root)| *rescan && *at_root)
+      .expect("the departure covers the root");
+    assert!(
+      created < cover,
+      "the batch the reader pushed before the sample precedes the cover: {ours:?}"
+    );
+  }
+
+  /// A handle that REFUSES the cut applies its refresh at once — the behaviour
+  /// every backend with no reader to cut keeps (#74).
+  ///
+  /// FSEvents has no descriptor to drain, Windows and the unsupported host carry
+  /// no such request, and a fanotify root publishes its cover through its own
+  /// in-band recovery completion instead. None of them may lose the cover for
+  /// want of a marker that is never coming.
+  #[cfg(not(miri))]
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_refresh_for_a_handle_that_refuses_the_cut_applies_at_once() {
+    let fs = FakeFs::new(1);
+    fs.seed_mounts(vec![bare_mount("/r/vol")]);
+    fs.answer_refresh(vec![bare_mount("/r/vol")], true);
+    let rig = inotify_rig_fs(fs);
+    rig.fs.put("/r/sub", FileKind::Dir, 2);
+    let scope = watch(&rig, "/r").await;
+    let _ = drained_stream(&rig).await;
+
+    rig.fs.answer_refresh(Vec::new(), true);
+    tick_liveness(&rig, scope).await;
+
+    let seen = drained_stream(&rig).await;
+    assert!(
+      seen
+        .iter()
+        .any(|(root, rescan, at_root)| *rescan && *at_root && root.as_path() == Path::new("/r")),
+      "the departure still covers a scope whose stream takes no cut: {seen:?}"
+    );
+  }
+
+  /// A refresh held for a cut that never lands is dropped with the stream that
+  /// was asked to cut, and the death is what the scope hears (#74).
+  ///
+  /// The hold is real — no cover is published while the marker is outstanding —
+  /// so nothing here is vacuous; what must not happen is the stash outliving the
+  /// lane it is keyed on and answering a later marker for a world that ended.
+  #[cfg(not(miri))]
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_stashed_refresh_dies_with_its_stream() {
+    let registry = RecordingRegistry::default();
+    let fs = FakeFs::new(1);
+    fs.accept_cuts();
+    fs.seed_mounts(vec![bare_mount("/r/vol")]);
+    fs.answer_refresh(vec![bare_mount("/r/vol")], true);
+    let rig = inotify_rig_fs_registry(fs, 64, registry.clone());
+    rig.fs.put("/r/sub", FileKind::Dir, 2);
+    let scope = watch(&rig, "/r").await;
+    let _ = drained_stream(&rig).await;
+
+    // The birth refresh is answered above; only now does the reader go quiet,
+    // so the departure below is the ONE reading left holding.
+    rig.fs.withhold_cuts();
+    rig.fs.answer_refresh(Vec::new(), true);
+    tick_liveness(&rig, scope).await;
+    let held = drained_stream(&rig).await;
+    assert!(
+      !held
+        .iter()
+        .any(|(root, rescan, at_root)| *rescan && *at_root && root.as_path() == Path::new("/r")),
+      "staging: the refresh is HELD — no cover while the cut is outstanding: {held:?}"
+    );
+
+    rig.fs.send_fatal("/r");
+    assert!(
+      settle(|| registry.dead() == [scope]).await,
+      "the stream's death is the scope's terminal, and the held refresh goes with it"
+    );
+  }
+
+  /// A helper for the cells below: the number of whole-root covers `/r`'s
+  /// scope was handed in what the stream yielded (#74).
+  #[cfg(not(miri))]
+  fn root_covers(seen: &[(PathBuf, bool, bool)], root: &str) -> usize {
+    seen
+      .iter()
+      .filter(|(seen_root, rescan, at_root)| {
+        *rescan && *at_root && seen_root.as_path() == Path::new(root)
+      })
+      .count()
+  }
+
+  /// The driver's count of refreshes held behind a lane cut right now (#74).
+  #[cfg(not(miri))]
+  async fn deferred_refreshes(rig: &Rig) -> usize {
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::DebugDeferredRefreshes { reply })
+      .await
+      .unwrap();
+    on_reply.await.expect("the driver replies")
+  }
+
+  /// The sequence `root`'s scope is waiting on, once it has asked for its
+  /// `requests`-th cut (#74).
+  ///
+  /// Settle-backed because a refresh is answered off the loop: the request is
+  /// made where the answer is stashed, so counting requests is how a cell waits
+  /// for the stash to exist without reaching into the driver.
+  #[cfg(not(miri))]
+  async fn awaited_cut(rig: &Rig, root: &str, requests: usize) -> u64 {
+    assert!(
+      settle(|| rig.fs.cut_requests(root).len() == requests).await,
+      "staging: the refresh is ordered behind a marker of its own"
+    );
+    *rig
+      .fs
+      .cut_requests(root)
+      .last()
+      .expect("the request just counted")
+  }
+
+  /// Watches `/r` with one mount under it and lets the BIRTH refresh complete
+  /// through a live cut, then goes quiet: every cell that must observe a HELD
+  /// refresh starts from a scope whose ordering is healthy, because a scope
+  /// that never answered its first marker would apply everything after it at
+  /// once and observe nothing (#74).
+  #[cfg(not(miri))]
+  async fn scope_with_a_healthy_cut(
+    rig: &Rig,
+    root: &str,
+    mounts: Vec<crate::os::MountRow>,
+  ) -> ScopeId {
+    rig.fs.answer_refresh(mounts, true);
+    let scope = watch(rig, root).await;
+    let _ = drained_stream(rig).await;
+    rig.fs.withhold_cuts();
+    scope
+  }
+
+  /// A newer refresh SUPERSEDES the one still held: the older sample is
+  /// dropped, never applied (#74).
+  ///
+  /// This is the bound on waiting for a reader, and it is the cut's HEALTH that
+  /// carries it rather than the snapshot: with a marker already outstanding the
+  /// ordering cannot be proven for the newer reading either, so that one lands
+  /// where it arrives — main's behaviour before the cut existed — and the older
+  /// one goes, because a newer sample is a newer verdict on the same question.
+  /// Nothing is lost by dropping it: the root-liveness gate runs first and
+  /// unconditionally on the newer one, so the death check a kernel-recursive
+  /// scope depends on is answered on every completion either way.
+  ///
+  /// Two mounts depart one after the other, so applying the held sample first
+  /// would announce the first departure and then the second; superseding
+  /// announces the world as it now is, ONCE, which is the coarse design's whole
+  /// promise. The third tick is what separates the two: a suite that applied
+  /// both would still be one cover behind at the end.
+  ///
+  /// FAIL-ON-REVERT: apply the held refresh ahead of the newer one and a second
+  /// cover appears.
+  #[cfg(not(miri))]
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_newer_refresh_supersedes_a_deferred_one() {
+    let fs = FakeFs::new(1);
+    fs.accept_cuts();
+    fs.seed_mounts(vec![bare_mount("/r/vol"), bare_mount("/r/vol2")]);
+    let rig = inotify_rig_fs(fs);
+    rig.fs.put("/r/sub", FileKind::Dir, 2);
+    let scope = scope_with_a_healthy_cut(
+      &rig,
+      "/r",
+      vec![bare_mount("/r/vol"), bare_mount("/r/vol2")],
+    )
+    .await;
+
+    // The first departure: held behind a cut nothing will answer.
+    rig.fs.answer_refresh(vec![bare_mount("/r/vol2")], true);
+    tick_liveness(&rig, scope).await;
+    let held = drained_stream(&rig).await;
+    assert_eq!(
+      root_covers(&held, "/r"),
+      0,
+      "staging: nothing is covered while the cut is outstanding: {held:?}"
+    );
+
+    // The second departure, one interval later. The reader has not answered,
+    // so THIS one lands at once and the held one is dropped.
+    rig.fs.answer_refresh(Vec::new(), true);
+    tick_liveness(&rig, scope).await;
+    let landed = drained_stream(&rig).await;
+    assert!(
+      root_covers(&landed, "/r") > 0,
+      "the newer reading lands where it arrives and covers the root: {landed:?}"
+    );
+
+    // And it is the newer reading that installed the baseline: a third sample
+    // of the same (now empty) table is no difference at all.
+    tick_liveness(&rig, scope).await;
+    let quiet = drained_stream(&rig).await;
+    assert_eq!(
+      root_covers(&quiet, "/r"),
+      0,
+      "the table stopped moving and so did the covers: {quiet:?}"
+    );
+  }
+
+  /// A marker naming a sequence this scope is not waiting on answers a question
+  /// that has since been replaced, and is ignored whole (#74).
+  ///
+  /// It must neither apply the held refresh nor discard it: the marker the
+  /// refresh IS waiting for is still coming, and a stash consumed by a stranger
+  /// would lose the cover it was holding.
+  ///
+  /// FAIL-ON-REVERT: apply on the scope alone and the cover lands on the first
+  /// marker below, before the reader ever cut its queue.
+  #[cfg(not(miri))]
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_stale_cut_seq_is_ignored() {
+    let fs = FakeFs::new(1);
+    fs.accept_cuts();
+    fs.seed_mounts(vec![bare_mount("/r/vol")]);
+    let rig = inotify_rig_fs(fs);
+    rig.fs.put("/r/sub", FileKind::Dir, 2);
+    let scope = scope_with_a_healthy_cut(&rig, "/r", vec![bare_mount("/r/vol")]).await;
+
+    rig.fs.answer_refresh(Vec::new(), true);
+    tick_liveness(&rig, scope).await;
+    let awaited = awaited_cut(&rig, "/r", 2).await;
+
+    assert!(
+      rig.fs.answer_cut("/r", awaited.wrapping_add(41)),
+      "staging: the stranger reaches the lane"
+    );
+    let strange = drained_stream(&rig).await;
+    assert_eq!(
+      root_covers(&strange, "/r"),
+      0,
+      "a sequence nobody is waiting on stands nothing: {strange:?}"
+    );
+
+    // The real marker still finds its refresh where it left it.
+    assert!(rig.fs.answer_cut("/r", awaited));
+    let seen = drained_stream(&rig).await;
+    assert!(
+      root_covers(&seen, "/r") > 0,
+      "and the cut it WAS waiting for covers the departure: {seen:?}"
+    );
+  }
+
+  /// A source loss drops the refresh held behind the cut, and the core arms a
+  /// fresh read instead (#74).
+  ///
+  /// A reader can discover an overflow and push it immediately ahead of the very
+  /// marker a refresh is waiting on. That snapshot was taken BEFORE the lost
+  /// window, so installing it as authoritative on the marker's arrival would
+  /// reopen device trust across ground nothing has re-read — and with the
+  /// deferral having already cleared the outstanding mark, the loss is what arms
+  /// the replacement read, so the pre-loss sample would be speaking for a window
+  /// the replacement has not reported on yet.
+  ///
+  /// FAIL-ON-REVERT: keep the stash across the overflow and the marker below
+  /// stands a second cover off a snapshot that predates the loss.
+  #[cfg(not(miri))]
+  #[tokio::test(flavor = "multi_thread")]
+  async fn an_overflow_drops_the_deferred_refresh_and_arms_a_fresh_one() {
+    let fs = FakeFs::new(1);
+    fs.accept_cuts();
+    fs.seed_mounts(vec![bare_mount("/r/vol")]);
+    let rig = inotify_rig_fs(fs);
+    rig.fs.put("/r/sub", FileKind::Dir, 2);
+    let scope = scope_with_a_healthy_cut(&rig, "/r", vec![bare_mount("/r/vol")]).await;
+
+    rig.fs.answer_refresh(Vec::new(), true);
+    tick_liveness(&rig, scope).await;
+    let awaited = awaited_cut(&rig, "/r", 2).await;
+    let held = drained_stream(&rig).await;
+    assert_eq!(
+      root_covers(&held, "/r"),
+      0,
+      "staging: the departure is held: {held:?}"
+    );
+
+    // The loss lands on the lane ahead of the marker, with the replacement read
+    // parked in the pool so only the loss can speak here.
+    let refreshes_before = rig.fs.refreshes();
+    let parked = rig.fs.hold_refreshes();
+    rig.fs.send_lossy("/r");
+    let after_loss = drained_stream(&rig).await;
+    assert!(
+      root_covers(&after_loss, "/r") > 0,
+      "the loss covers the root itself: {after_loss:?}"
+    );
+
+    assert!(rig.fs.answer_cut("/r", awaited));
+    let after_marker = drained_stream(&rig).await;
+    assert_eq!(
+      root_covers(&after_marker, "/r"),
+      0,
+      "and the marker finds nothing to stand: a snapshot older than the loss is \
+       no longer authoritative about anything: {after_marker:?}"
+    );
+
+    // The read the loss armed is real: it was dispatched and parked, not
+    // suppressed by a deferral that had already cleared the outstanding mark.
+    parked.release();
+    assert!(
+      settle(|| rig.fs.refreshes() > refreshes_before).await,
+      "the overflow armed a fresh refresh"
+    );
+  }
+
+  /// A cut nobody answered degrades the ORDERING and nothing else, and the next
+  /// marker to arrive restores it (#74).
+  ///
+  /// The degrade has to be self-correcting: a reader that was slow for one
+  /// interval must not leave the scope publishing unordered covers for the rest
+  /// of its life. So the debt is cleared by the SEQUENCE the marker carries,
+  /// whether or not the refresh it was holding is still there to apply — the
+  /// marker proves the reader is answering, which is the whole question.
+  ///
+  /// FAIL-ON-REVERT: clear the debt only when a marker matches a held refresh,
+  /// and the last departure below is covered the moment it is sampled, never
+  /// ordered behind anything again.
+  #[cfg(not(miri))]
+  #[tokio::test(flavor = "multi_thread")]
+  async fn an_unanswered_cut_degrades_to_immediate_apply_until_the_next_cut() {
+    let fs = FakeFs::new(1);
+    fs.accept_cuts();
+    fs.seed_mounts(vec![
+      bare_mount("/r/vol"),
+      bare_mount("/r/vol2"),
+      bare_mount("/r/vol3"),
+    ]);
+    let rig = inotify_rig_fs(fs);
+    rig.fs.put("/r/sub", FileKind::Dir, 2);
+    let scope = scope_with_a_healthy_cut(
+      &rig,
+      "/r",
+      vec![
+        bare_mount("/r/vol"),
+        bare_mount("/r/vol2"),
+        bare_mount("/r/vol3"),
+      ],
+    )
+    .await;
+
+    // Ordered: the first departure waits for a marker that never comes.
+    rig
+      .fs
+      .answer_refresh(vec![bare_mount("/r/vol2"), bare_mount("/r/vol3")], true);
+    tick_liveness(&rig, scope).await;
+    let stalled = awaited_cut(&rig, "/r", 2).await;
+    let held = drained_stream(&rig).await;
+    assert_eq!(
+      root_covers(&held, "/r"),
+      0,
+      "staging: ordered, and holding: {held:?}"
+    );
+
+    // Degraded: the reader is behind, so the next reading lands at once.
+    rig.fs.answer_refresh(vec![bare_mount("/r/vol3")], true);
+    tick_liveness(&rig, scope).await;
+    let degraded = drained_stream(&rig).await;
+    assert!(
+      root_covers(&degraded, "/r") > 0,
+      "the departure is covered where it lands rather than waiting on a reader \
+       that is not answering: {degraded:?}"
+    );
+
+    // The reader catches up. Its marker has no refresh left to apply — that one
+    // was superseded — but it proves the lane is answering again.
+    assert!(rig.fs.answer_cut("/r", stalled));
+    let caught_up = drained_stream(&rig).await;
+    assert_eq!(
+      root_covers(&caught_up, "/r"),
+      0,
+      "the late marker stands nothing of its own: {caught_up:?}"
+    );
+
+    // Ordered again: the last departure waits for its own marker.
+    rig.fs.answer_refresh(Vec::new(), true);
+    tick_liveness(&rig, scope).await;
+    let reordered = drained_stream(&rig).await;
+    assert_eq!(
+      root_covers(&reordered, "/r"),
+      0,
+      "ordering is restored, so this departure is held: {reordered:?}"
+    );
+    let awaited = awaited_cut(&rig, "/r", 3).await;
+    assert_ne!(awaited, stalled, "a fresh marker, not the stalled one");
+    assert!(rig.fs.answer_cut("/r", awaited));
+    let seen = drained_stream(&rig).await;
+    assert!(
+      root_covers(&seen, "/r") > 0,
+      "and it is that marker the cover follows: {seen:?}"
+    );
+  }
+
+  /// A root REPLACE drops the refresh held under the world it ended (#74).
+  ///
+  /// The snapshot was taken of the OLD root, and its first gate is a liveness
+  /// verdict compared against the scope's identity — which the commit has just
+  /// replaced. Applied against the successor it reads as a root that changed
+  /// object underneath the watch and tears down a healthy new world, with the
+  /// caller already holding `Ok` for it. Nothing about the marker distinguishes
+  /// the two worlds on its own: the replacement's lane takes the same sequence
+  /// the old one was asked for.
+  ///
+  /// FAIL-ON-REVERT: keep the stash across the commit and the marker below kills
+  /// the scope the replace just installed.
+  #[cfg(not(miri))]
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_replace_drops_the_deferred_refresh() {
+    let registry = RecordingRegistry::default();
+    let fs = FakeFs::new(1);
+    fs.accept_cuts();
+    fs.seed_mounts(vec![bare_mount("/r/vol")]);
+    let rig = inotify_rig_fs_registry(fs, 64, registry.clone());
+    rig.fs.put("/r/sub", FileKind::Dir, 2);
+    rig.fs.put("/r2", FileKind::Dir, 7);
+    let scope = scope_with_a_healthy_cut(&rig, "/r", vec![bare_mount("/r/vol")]).await;
+
+    rig.fs.answer_refresh(Vec::new(), true);
+    tick_liveness(&rig, scope).await;
+    let awaited = awaited_cut(&rig, "/r", 2).await;
+    assert_eq!(
+      deferred_refreshes(&rig).await,
+      1,
+      "staging: one refresh is held, under the world about to end"
+    );
+
+    // The successor's own birth refresh parks in the pool, so the count below
+    // reads the OLD world's stash alone.
+    let parked = rig.fs.hold_refreshes();
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Replace {
+        scope,
+        root: PathBuf::from("/r2"),
+        reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from("/r2")),
+        reply,
+      })
+      .await
+      .unwrap();
+    on_reply
+      .await
+      .expect("the driver replies")
+      .expect("the replacement installs");
+    assert_eq!(
+      deferred_refreshes(&rig).await,
+      0,
+      "the commit reclaimed the old world's held refresh"
+    );
+
+    // The old world's marker, arriving on the successor's lane with the very
+    // sequence the old one was waiting for.
+    assert!(rig.fs.answer_cut("/r2", awaited));
+    let _ = drained_stream(&rig).await;
+    assert!(
+      registry.dead().is_empty(),
+      "the replacement is alive: nothing from the world that ended spoke for it"
+    );
+    parked.release();
+  }
+
+  /// A same-transport WIDEN drops it too, and it is the only transition the lane
+  /// cannot see (#74).
+  ///
+  /// A widen keeps the stream, the lane and every marker already in flight; only
+  /// the scope's incarnation moves. So a stash checked against its lane alone
+  /// would be answered by the pre-widen marker and fed to the widened world,
+  /// whose root is a different object — the same false teardown a replace would
+  /// cause, reached without a single lane changing.
+  ///
+  /// FAIL-ON-REVERT: keep the stash across the commit and the marker below is
+  /// answered by the widened world with the narrow root's table.
+  #[cfg(not(miri))]
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_widen_drops_the_deferred_refresh() {
+    let registry = RecordingRegistry::default();
+    let fs = FakeFs::new(1);
+    fs.accept_cuts();
+    fs.seed_mounts(vec![bare_mount("/r/sub/vol")]);
+    let rig = inotify_rig_fs_registry(fs, 64, registry.clone());
+    rig.fs.put("/r/sub", FileKind::Dir, 2);
+    rig.fs.put("/r/sub/deep", FileKind::Dir, 3);
+    let scope = scope_with_a_healthy_cut(&rig, "/r/sub", vec![bare_mount("/r/sub/vol")]).await;
+
+    rig.fs.answer_refresh(Vec::new(), true);
+    tick_liveness(&rig, scope).await;
+    let awaited = awaited_cut(&rig, "/r/sub", 2).await;
+    assert_eq!(
+      deferred_refreshes(&rig).await,
+      1,
+      "staging: one refresh is held, under the narrow root"
+    );
+
+    // The widened root's own refresh parks in the pool, so the count below
+    // reads the narrow world's stash alone.
+    let parked = rig.fs.hold_refreshes();
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Replace {
+        scope,
+        root: PathBuf::from("/r"),
+        reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from("/r")),
+        reply,
+      })
+      .await
+      .unwrap();
+    on_reply
+      .await
+      .expect("the driver replies")
+      .expect("the widen commits");
+    assert_eq!(rig.fs.spawns(), 1, "staging: the widen kept the stream");
+    assert_eq!(
+      deferred_refreshes(&rig).await,
+      0,
+      "the widened world reclaimed the narrow one's held refresh"
+    );
+
+    // The marker the narrow root was waiting for, on the lane that survived it.
+    assert!(rig.fs.answer_cut("/r/sub", awaited));
+    let _ = drained_stream(&rig).await;
+    assert!(
+      registry.dead().is_empty(),
+      "the widened scope is alive: the world that ended took its snapshot with it"
+    );
+    parked.release();
+  }
+
+  /// An UNWATCH reclaims the refresh its scope was holding (#74).
+  ///
+  /// Scope ids are never reused and one snapshot carries every row path under
+  /// the root, so a held refresh left behind by a scope that ended would be a
+  /// bounded-but-large table retained for the driver's whole life, once per
+  /// watch/defer/unwatch cycle.
+  #[cfg(not(miri))]
+  #[tokio::test(flavor = "multi_thread")]
+  async fn an_unwatch_reclaims_the_deferred_refresh() {
+    let fs = FakeFs::new(1);
+    fs.accept_cuts();
+    fs.seed_mounts(vec![bare_mount("/r/vol")]);
+    let rig = inotify_rig_fs(fs);
+    rig.fs.put("/r/sub", FileKind::Dir, 2);
+    let scope = scope_with_a_healthy_cut(&rig, "/r", vec![bare_mount("/r/vol")]).await;
+
+    rig.fs.answer_refresh(Vec::new(), true);
+    tick_liveness(&rig, scope).await;
+    let _ = awaited_cut(&rig, "/r", 2).await;
+    assert_eq!(
+      deferred_refreshes(&rig).await,
+      1,
+      "staging: the scope is holding a refresh when the unwatch arrives"
+    );
+
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Unwatch {
+        scope,
+        reply: Some(reply),
+      })
+      .await
+      .unwrap();
+    assert!(on_reply.await.unwrap().is_torn(), "the scope tears down");
+    assert_eq!(
+      deferred_refreshes(&rig).await,
+      0,
+      "and takes its held refresh with it"
+    );
+  }
+
+  /// The same at the other end of the same funnel: a stream that DIED reclaims
+  /// it through the teardown its fatal raises (#74).
+  ///
+  /// Unwatch, root death and a stream fatal all end a scope through one effect,
+  /// and this is the path a caller never asked for — the one where nothing is
+  /// waiting on a reply to notice the state was left behind.
+  #[cfg(not(miri))]
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_teardown_reclaims_the_deferred_refresh() {
+    let registry = RecordingRegistry::default();
+    let fs = FakeFs::new(1);
+    fs.accept_cuts();
+    fs.seed_mounts(vec![bare_mount("/r/vol")]);
+    let rig = inotify_rig_fs_registry(fs, 64, registry.clone());
+    rig.fs.put("/r/sub", FileKind::Dir, 2);
+    let scope = scope_with_a_healthy_cut(&rig, "/r", vec![bare_mount("/r/vol")]).await;
+
+    rig.fs.answer_refresh(Vec::new(), true);
+    tick_liveness(&rig, scope).await;
+    let _ = awaited_cut(&rig, "/r", 2).await;
+    assert_eq!(
+      deferred_refreshes(&rig).await,
+      1,
+      "staging: the scope is holding a refresh when its stream dies"
+    );
+
+    rig.fs.send_fatal("/r");
+    assert!(
+      settle(|| registry.dead() == [scope]).await,
+      "the stream's death is the scope's terminal"
+    );
+    assert_eq!(
+      deferred_refreshes(&rig).await,
+      0,
+      "and the teardown it raised reclaimed the held refresh"
+    );
+  }
+
+  /// A replacement root whose PRE-ARM lands across its own mount is a failed
+  /// pre-arm, not a successful one (#74).
+  ///
+  /// The root re-mounts between the candidate stream's metadata capture and the
+  /// arm, so its `(dev, ino)` still match while its mount id moves — the one
+  /// shape that answers a ROOT arm with the mount-proved refusal. Read as a
+  /// success the replacement commits and publishes, its refusal then replays as
+  /// `Gone` and drops the root, and the caller is holding `Ok` for a scope that
+  /// is tearing down. The verdict here is the ordinary failed-pre-arm unwind:
+  /// `RootUnavailable`, the candidate retired, and the OLD world untouched and
+  /// still delivering.
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_foreign_replacement_pre_arm_answers_root_unavailable_and_publishes_nothing() {
+    let rig = inotify_rig_mnt(5);
+    rig.fs.put("/r/sub", FileKind::Dir, 2);
+    rig.fs.put("/r2", FileKind::Dir, 7);
+    let scope = watch(&rig, "/r").await;
+    let root_watch = rig
+      .fs
+      .arms()
+      .first()
+      .cloned()
+      .expect("the birth root arm")
+      .0;
+    let _ = drained_stream(&rig).await;
+
+    let prearm = rig.fs.hold_prearms();
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Replace {
+        scope,
+        root: PathBuf::from("/r2"),
+        reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from("/r2")),
+        reply,
+      })
+      .await
+      .unwrap();
+    assert!(
+      settle(|| rig.fs.prearm_entries() == 1).await,
+      "staging: the replacement is pre-armed and parked, its metadata already sealed"
+    );
+    // `mount --move` under the parked arm: the same object, another mount.
+    rig.fs.put_on_mount("/r2", FileKind::Dir, 7, 99);
+    prearm.release();
+
+    let err = on_reply
+      .await
+      .expect("the driver replies")
+      .expect_err("a root across its own mount is not covered");
+    assert!(
+      matches!(
+        err,
+        crate::error::ReplaceRootError::Source(SourceError::RootUnavailable { .. })
+      ),
+      "{err:?}"
+    );
+    assert!(
+      settle(|| rig.fs.shutdowns() == 1).await,
+      "the candidate stream is retired, never committed"
+    );
+
+    // The old world was never swapped out: it still delivers, at the old root.
+    rig.fs.send_inotify_batch(
+      "/r",
+      vec![attributed(&[root_watch], IN_CREATE, b"alive.txt")],
+    );
+    let (s, root, change) = next_rooted(&rig).await;
+    assert_eq!((s, root.as_path()), (scope, std::path::Path::new("/r")));
+    assert_eq!(change.location(), &loc(&["alive.txt"]));
+  }
+
+  /// The same verdict for the WIDEN pre-arm, which runs the same gate over the
+  /// live transport: the widened root is still a root, so a landing across its
+  /// mount aborts the widen window and answers `RootUnavailable` with nothing
+  /// installed (#74).
+  #[tokio::test(flavor = "multi_thread")]
+  async fn a_foreign_widen_pre_arm_answers_root_unavailable_and_installs_nothing() {
+    let rig = inotify_rig_mnt(5);
+    rig.fs.put("/r/sub", FileKind::Dir, 2);
+    rig.fs.put("/r/sub/deep", FileKind::Dir, 3);
+    let scope = watch(&rig, "/r/sub").await;
+    let sub_watch = rig
+      .fs
+      .arms()
+      .first()
+      .cloned()
+      .expect("the birth root arm")
+      .0;
+    let _ = drained_stream(&rig).await;
+
+    // The widen resolves on the scope's own frame (so it takes the same-fd
+    // route), and the mount moves while the pre-arm is parked.
+    let prearm = rig.fs.hold_prearms();
+    let (reply, on_reply) = futures_channel::oneshot::channel();
+    rig
+      .commands
+      .send(Command::Replace {
+        scope,
+        root: PathBuf::from("/r"),
+        reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from("/r")),
+        reply,
+      })
+      .await
+      .unwrap();
+    assert!(
+      settle(|| rig.fs.prearm_entries() == 1).await,
+      "staging: the widen is pre-armed and parked, its metadata already sealed"
+    );
+    rig.fs.put_on_mount("/r", FileKind::Dir, 1, 7);
+    prearm.release();
+
+    let err = on_reply
+      .await
+      .expect("the driver replies")
+      .expect_err("a widened root across its own mount is not covered");
+    assert!(
+      matches!(
+        err,
+        crate::error::ReplaceRootError::Source(SourceError::RootUnavailable { .. })
+      ),
+      "{err:?}"
+    );
+    assert_eq!(rig.fs.spawns(), 1, "no fallback spawn on a refused pre-arm");
+    assert_eq!(rig.fs.shutdowns(), 0);
+
+    rig.fs.send_inotify_batch(
+      "/r/sub",
+      vec![attributed(&[sub_watch], IN_CREATE, b"alive.txt")],
+    );
+    let (s, root, change) = next_rooted(&rig).await;
+    assert_eq!((s, root.as_path()), (scope, std::path::Path::new("/r/sub")));
+    assert_eq!(change.location(), &loc(&["alive.txt"]));
+  }
+
   /// The same-transport WIDEN (D2): a widening replace on the descending
   /// backend keeps the live stream — no spawn, no teardown, no lane swap, no
   /// covering Rescan — and the old subtree's coverage rides across
@@ -11573,7 +12502,7 @@ mod descending {
       rig.fs.put("/r/sub", FileKind::Dir, 11);
       let scope = watch(&rig, "/r/sub").await;
       // The widen target's meta resolves with a mount seeded at the old root.
-      rig.fs.seed_mounts(vec![PathBuf::from("/r/sub")]);
+      rig.fs.seed_mounts(vec![bare_mount("/r/sub")]);
 
       assert!(replace(&rig, scope, "/r").await.is_ok());
       settle(|| rig.fs.shutdowns() == 1).await;
@@ -11918,7 +12847,9 @@ mod descending {
       core.begin_widen_watch(scope, reserved);
       crate::driver::apply_source_message(
         &mut core,
+        &mut crate::driver::LivenessProbes::default(),
         scope,
+        0,
         crate::os::SourceMessage::Batch(crate::os::BatchPayload::detached(vec![
           crate::os::SourceEvent::Linux(RawLinuxEvent::Inotify {
             anchors: vec![reserved],
@@ -11955,7 +12886,14 @@ mod descending {
         .pop()
         .expect("a lossy empty batch elects an Overflow");
       assert!(matches!(overflow, crate::os::SourceMessage::Overflow(_)));
-      crate::driver::apply_source_message(&mut core, scope, overflow, &at);
+      crate::driver::apply_source_message(
+        &mut core,
+        &mut crate::driver::LivenessProbes::default(),
+        scope,
+        0,
+        overflow,
+        &at,
+      );
       assert_eq!(
         core.on_root_widened(scope, widen_meta("/q"), reserved, at()),
         WidenCommit::TaintedWindow(WidenTaint {
@@ -12411,11 +13349,20 @@ mod descending {
       let reserved = core.reserve_watch_id();
       core.begin_widen_watch(scope, reserved);
       for name in [b"a".as_slice(), b"b".as_slice(), b"c".as_slice()] {
-        crate::driver::apply_source_message(&mut core, scope, benign(root_watch, name), &at);
+        crate::driver::apply_source_message(
+          &mut core,
+          &mut crate::driver::LivenessProbes::default(),
+          scope,
+          0,
+          benign(root_watch, name),
+          &at,
+        );
       }
       crate::driver::apply_source_message(
         &mut core,
+        &mut crate::driver::LivenessProbes::default(),
         scope,
+        0,
         reserved_death(reserved, 0x0000_8000), // IN_IGNORED
         &at,
       );
@@ -12449,10 +13396,19 @@ mod descending {
       let (mut core, scope, root_watch) = unit_core_at("/q/sub");
       let reserved = core.reserve_watch_id();
       core.begin_widen_watch(scope, reserved);
-      crate::driver::apply_source_message(&mut core, scope, benign(root_watch, b"pre-death"), &at);
       crate::driver::apply_source_message(
         &mut core,
+        &mut crate::driver::LivenessProbes::default(),
         scope,
+        0,
+        benign(root_watch, b"pre-death"),
+        &at,
+      );
+      crate::driver::apply_source_message(
+        &mut core,
+        &mut crate::driver::LivenessProbes::default(),
+        scope,
+        0,
         reserved_death(reserved, 0x0000_0800), // IN_MOVE_SELF
         &at,
       );
@@ -12859,7 +13815,9 @@ mod descending {
       let (dead, dead_root) = spawn_root(&mut core, "/r", 1);
       crate::driver::apply_source_message(
         &mut core,
+        &mut crate::driver::LivenessProbes::default(),
         dead,
+        0,
         batch(vec![attributed(&[dead_root], IN_CREATE | IN_ISDIR, b"sub")]),
         &at,
       );
@@ -12890,7 +13848,9 @@ mod descending {
       // control op with no teardown.
       crate::driver::apply_source_message(
         &mut core,
+        &mut crate::driver::LivenessProbes::default(),
         live,
+        0,
         batch(vec![attributed(
           &[live_root],
           IN_CREATE | IN_ISDIR,
@@ -12903,7 +13863,9 @@ mod descending {
       // `TeardownStream(dead)`, the exact same-drain shape.
       crate::driver::apply_source_message(
         &mut core,
+        &mut crate::driver::LivenessProbes::default(),
         dead,
+        0,
         batch(vec![
           RawLinuxEvent::Inotify {
             anchors: vec![dead_child],
@@ -27597,6 +28559,10 @@ mod control_batch_publication_order {
       name: Segment::new("churn"),
       path: Arc::new(path.to_path_buf()),
       expected: None,
+      // The scope's descent frame rides every arm. This cell answers its own
+      // requests and never puts one to the fence, so an empty frame — both legs
+      // unknown, which refuses nothing — is the honest value.
+      frame: crate::os::ScopeFrame::default(),
     }
   }
 
@@ -29654,5 +30620,96 @@ mod abnormal_exit {
       settle(|| rig.fs.shutdowns() == 1).await,
       "and it completes once the wedge clears"
     );
+  }
+}
+
+/// The mask-miss leg of [`stat_sample`]: on a kernel whose `statx` answers no
+/// mount id, the sample is taken through an `O_PATH` pin instead, and it must
+/// answer the SAME object and the SAME mount id the single-`statx` leg answers
+/// where the bit exists.
+///
+/// Real syscalls on a real tree, so this runs on the ubuntu runners and in the
+/// container `unit` suite. It drives [`stat_sample_pinned`] DIRECTLY rather than
+/// forcing the process tier: the tier is a process-wide memo and the lib binary
+/// runs its cells in parallel, so a cell that flipped it would decide which leg
+/// every sibling's sample took.
+#[cfg(all(target_os = "linux", not(miri)))]
+mod mount_frame_sampling {
+  use super::*;
+
+  /// A unique real directory for one cell.
+  fn scratch(tag: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let dir = std::env::temp_dir()
+      .canonicalize()
+      .expect("canonicalize temp dir")
+      .join(format!(
+        "tributary-fs-frame-{}-{}-{}",
+        tag,
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed),
+      ));
+    std::fs::create_dir_all(&dir).expect("create scratch dir");
+    dir
+  }
+
+  /// The pinned sample answers a mount id on EVERY supported kernel, for every
+  /// object kind the enumerate can hand it — a directory, a regular file, and a
+  /// symlink, which `O_PATH | O_NOFOLLOW` must open AS the link rather than
+  /// following it, exactly as the `AT_SYMLINK_NOFOLLOW` leg does.
+  ///
+  /// MUTATION WITNESS (the pin follows the link): drop `OFlags::NOFOLLOW` from
+  /// `stat_sample_pinned` and this FAILS at `the pinned sample reaches the same
+  /// object` for the symlink, reporting the target file's kind and inode.
+  /// MUTATION WITNESS (the frame is dropped on the pinned leg): return `None` for
+  /// `frame` there and this FAILS at `every supported kernel answers a mount id
+  /// through fdinfo`.
+  #[test]
+  fn a_pinned_sample_answers_the_same_object_and_a_mount_id() {
+    let dir = scratch("pinned");
+    let file = dir.join("f");
+    std::fs::write(&file, b"x").expect("write the scratch file");
+    let link = dir.join("l");
+    std::os::unix::fs::symlink("f", &link).expect("create the scratch symlink");
+
+    for path in [dir.as_path(), file.as_path(), link.as_path()] {
+      let direct = stat_sample(path).expect("sample the path");
+      let pinned = stat_sample_pinned(path).expect("sample the path through a pin");
+      assert_eq!(
+        (pinned.kind, pinned.dev, pinned.ino),
+        (direct.kind, direct.dev, direct.ino),
+        "the pinned sample reaches the same object as the path sample: {}",
+        path.display()
+      );
+      assert!(
+        pinned.frame.is_some(),
+        "every supported kernel answers a mount id through fdinfo (3.15, below \
+         the 4.11 statx floor), so the pinned leg never degrades to a frameless \
+         sample: {}",
+        path.display()
+      );
+      if direct.frame.is_some() {
+        assert_eq!(
+          pinned.frame,
+          direct.frame,
+          "where this host ALSO has `STATX_MNT_ID`, the two tiers must report one \
+           id — they are one id space: {}",
+          path.display()
+        );
+      }
+    }
+
+    // A path that is not there fails the same way through either leg, so the
+    // enumerate's raced-away `Missing` keeps its meaning on the fdinfo tier.
+    let gone = dir.join("gone");
+    assert_eq!(
+      stat_sample_pinned(&gone).map(|sample| sample.ino),
+      Err(rustix::io::Errno::NOENT),
+      "the pin's own open carries the errno the statx would have, so NOENT is \
+       still a raced-away entry and never a laundered frameless sample"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
   }
 }

@@ -1,7 +1,8 @@
 use std::{cell::Cell, io, path::Path};
 
 use super::{
-  BufferContext, ReseedOutcome, SeedOutcome, process_decoded, reseed_map, seed_moved_in_subtree,
+  BufferContext, ReseedOutcome, SeedOutcome, SeedWalk, process_decoded, reseed_map,
+  seed_moved_in_subtree,
 };
 use crate::os::{
   BackendStatsShared, SourceMessage,
@@ -111,6 +112,8 @@ enum Sent {
   Batch(usize),
   Overflow,
   Fatal,
+  /// The mount boundaries a walk this call ran stopped at (#74), in report order.
+  Honored(Vec<std::path::PathBuf>),
 }
 
 /// Runs `process_decoded` over `decoded` against `map`, capturing what it forwards
@@ -136,16 +139,28 @@ fn run_process(
     || {
       reseeds.set(reseeds.get() + 1);
       match &reseed {
-        Some(entries) => Ok(entries.clone()),
+        Some(entries) => Ok(SeedWalk {
+          entries: entries.clone(),
+          honored: Vec::new(),
+        }),
         None => Err(io::Error::other("reseed walk fails")),
       }
     },
-    |_, _, _| Ok(Vec::new()),
+    |_, _, _| {
+      Ok(SeedWalk {
+        entries: Vec::new(),
+        honored: Vec::new(),
+      })
+    },
     |msg| {
       sent.borrow_mut().push(match msg {
         SourceMessage::Batch(payload) => Sent::Batch(payload.events.len()),
         SourceMessage::Overflow(_) => Sent::Overflow,
         SourceMessage::Fatal(_) => Sent::Fatal,
+        SourceMessage::Honored(paths) => Sent::Honored(paths),
+        SourceMessage::Cut { .. } | SourceMessage::Recovered { .. } => {
+          unreachable!("this seam drives no whole-root request")
+        }
       });
       true
     },
@@ -174,7 +189,12 @@ fn run_process_with_exclusions(
       fence: excluding(exclusions),
     },
     || Ok(one_entry_walk()),
-    |_, _, _| Ok(Vec::new()),
+    |_, _, _| {
+      Ok(SeedWalk {
+        entries: Vec::new(),
+        honored: Vec::new(),
+      })
+    },
     |msg| {
       if let SourceMessage::Batch(payload) = msg {
         for ev in payload.events {
@@ -218,14 +238,20 @@ fn run_process_with_subtree(
     || {
       reseeds.set(reseeds.get() + 1);
       match &reseed {
-        Some(entries) => Ok(entries.clone()),
+        Some(entries) => Ok(SeedWalk {
+          entries: entries.clone(),
+          honored: Vec::new(),
+        }),
         None => Err(io::Error::other("reseed walk fails")),
       }
     },
     |_, _, _| {
       walks.set(walks.get() + 1);
       match &subtree {
-        Some(entries) => Ok(entries.clone()),
+        Some(entries) => Ok(SeedWalk {
+          entries: entries.clone(),
+          honored: Vec::new(),
+        }),
         None => Err(io::Error::from(io::ErrorKind::NotFound)),
       }
     },
@@ -234,6 +260,10 @@ fn run_process_with_subtree(
         SourceMessage::Batch(payload) => Sent::Batch(payload.events.len()),
         SourceMessage::Overflow(_) => Sent::Overflow,
         SourceMessage::Fatal(_) => Sent::Fatal,
+        SourceMessage::Honored(paths) => Sent::Honored(paths),
+        SourceMessage::Cut { .. } | SourceMessage::Recovered { .. } => {
+          unreachable!("this seam drives no whole-root request")
+        }
       });
       true
     },
@@ -259,8 +289,20 @@ fn move_in_under_sub() -> RawFanotifyEvent {
   }
 }
 
-fn one_entry_walk() -> Vec<SeedEntry> {
-  vec![SeedEntry::root(fid(1), Path::new("/root"))]
+fn one_entry_walk() -> SeedWalk {
+  SeedWalk {
+    entries: vec![SeedEntry::root(fid(1), Path::new("/root"))],
+    honored: Vec::new(),
+  }
+}
+
+/// The same walk, stopped at one mount boundary — the shape a root with a
+/// submount under it produces, and the one the core is owed a report for.
+fn walk_honoring(boundary: &str) -> SeedWalk {
+  SeedWalk {
+    honored: vec![std::path::PathBuf::from(boundary)],
+    ..one_entry_walk()
+  }
 }
 
 /// A seeded map with `/root` and its child `/root/sub` (fid 2), the parent a
@@ -280,8 +322,36 @@ fn seeded_with_sub() -> FidMap {
 fn first_walk_success_reseeds() {
   let mut map = FidMap::new();
   let outcome = reseed_map(&mut map, || Ok(one_entry_walk()));
-  assert_eq!(outcome, ReseedOutcome::Reseeded);
+  assert_eq!(
+    outcome,
+    ReseedOutcome::Reseeded {
+      honored: Vec::new()
+    }
+  );
   assert_eq!(map.dir_count(), 1, "the map was rebuilt from the walk");
+}
+
+/// A walk that stopped at a mount boundary carries WHERE out with it (#74): the
+/// rebuilt map is the answer to "can the source see", and the honored locations
+/// are the answer to "where does its sight end" — the caller reports them in band
+/// so the next authoritative mount sample can ask whether those mounts are still
+/// there.
+#[test]
+fn a_reseed_carries_the_boundaries_its_walk_honored() {
+  let mut map = FidMap::new();
+  let outcome = reseed_map(&mut map, || Ok(walk_honoring("/root/vol")));
+  assert_eq!(
+    outcome,
+    ReseedOutcome::Reseeded {
+      honored: vec![std::path::PathBuf::from("/root/vol")]
+    },
+    "the boundary the walk stopped at rides the outcome, not just the map"
+  );
+  assert_eq!(
+    map.dir_count(),
+    1,
+    "and the map is rebuilt as it always was"
+  );
 }
 
 /// A transient failure is absorbed by the single immediate retry: fail once,
@@ -299,7 +369,12 @@ fn retry_absorbs_a_transient_failure() {
       Ok(one_entry_walk())
     }
   });
-  assert_eq!(outcome, ReseedOutcome::Reseeded);
+  assert_eq!(
+    outcome,
+    ReseedOutcome::Reseeded {
+      honored: Vec::new()
+    }
+  );
   assert_eq!(calls.get(), 2, "the retry ran exactly once");
   assert_eq!(map.dir_count(), 1);
 }
@@ -314,7 +389,7 @@ fn double_failure_is_blind() {
   let calls = Cell::new(0u32);
   let outcome = reseed_map(&mut map, || {
     calls.set(calls.get() + 1);
-    Err::<Vec<SeedEntry>, io::Error>(io::Error::other("still failing"))
+    Err::<SeedWalk, io::Error>(io::Error::other("still failing"))
   });
   assert_eq!(outcome, ReseedOutcome::Blind);
   assert_eq!(
@@ -526,7 +601,7 @@ fn lossy_buffer_forwards_only_the_overflow_after_reseeding() {
     events: vec![modify_under(fid(2), b"f")],
     lossy: true,
   };
-  let (sent, alive, reseeds) = run_process(&mut map, decoded, Some(one_entry_walk()));
+  let (sent, alive, reseeds) = run_process(&mut map, decoded, Some(one_entry_walk().entries));
   assert!(alive, "a reseeded loss keeps the stream live");
   assert_eq!(reseeds, 1, "the loss reseeded the map before signaling");
   assert_eq!(
@@ -561,7 +636,7 @@ fn merged_multi_structural_event_takes_the_barrier_and_reseeds() {
     events: vec![modify_under(fid(2), b"before"), merged],
     lossy: false,
   };
-  let (sent, alive, reseeds) = run_process(&mut map, decoded, Some(one_entry_walk()));
+  let (sent, alive, reseeds) = run_process(&mut map, decoded, Some(one_entry_walk().entries));
   assert!(
     alive,
     "the ambiguous merge reseeds and keeps the stream live"
@@ -610,7 +685,7 @@ fn merged_rename_delete_takes_the_barrier_and_reseeds() {
     events: vec![modify_under(fid(2), b"before"), merged],
     lossy: false,
   };
-  let (sent, alive, reseeds) = run_process(&mut map, decoded, Some(one_entry_walk()));
+  let (sent, alive, reseeds) = run_process(&mut map, decoded, Some(one_entry_walk().entries));
   assert!(
     alive,
     "the ambiguous rename+delete reseeds and keeps the stream live"
@@ -662,7 +737,7 @@ fn merged_rename_self_hidden_in_root_target_takes_the_barrier_and_reseeds() {
     events: vec![modify_under(fid(2), b"before"), merged],
     lossy: false,
   };
-  let (sent, alive, reseeds) = run_process(&mut map, decoded, Some(one_entry_walk()));
+  let (sent, alive, reseeds) = run_process(&mut map, decoded, Some(one_entry_walk().entries));
   assert!(
     alive,
     "the ambiguous merge reseeds and keeps the stream live"
@@ -702,7 +777,7 @@ fn lossy_dir_delete_reseed_prunes_the_stale_subtree() {
     events: Vec::new(),
     lossy: true,
   };
-  let (sent, alive, reseeds) = run_process(&mut map, decoded, Some(one_entry_walk()));
+  let (sent, alive, reseeds) = run_process(&mut map, decoded, Some(one_entry_walk().entries));
   assert!(alive, "a reseeded loss keeps the stream live");
   assert_eq!(reseeds, 1, "the loss reseeded the map");
   assert_eq!(
@@ -728,7 +803,7 @@ fn clean_buffer_forwards_the_batch_and_never_reseeds() {
     events: vec![modify_under(fid(2), b"f"), modify_under(fid(1), b"g")],
     lossy: false,
   };
-  let (sent, alive, reseeds) = run_process(&mut map, decoded, Some(one_entry_walk()));
+  let (sent, alive, reseeds) = run_process(&mut map, decoded, Some(one_entry_walk().entries));
   assert!(alive);
   assert_eq!(reseeds, 0, "a clean buffer never triggers a reseed");
   assert_eq!(
@@ -760,7 +835,7 @@ fn classified_lossy_event_takes_the_barrier_and_reseeds() {
     events: vec![modify_under(fid(2), b"f"), dir_create_no_target],
     lossy: false,
   };
-  let (sent, alive, reseeds) = run_process(&mut map, decoded, Some(one_entry_walk()));
+  let (sent, alive, reseeds) = run_process(&mut map, decoded, Some(one_entry_walk().entries));
   assert!(alive, "a reseeded classified loss keeps the stream live");
   assert_eq!(
     reseeds, 1,
@@ -786,7 +861,7 @@ fn foreign_event_is_dropped_from_a_clean_batch() {
     ],
     lossy: false,
   };
-  let (sent, alive, reseeds) = run_process(&mut map, decoded, Some(one_entry_walk()));
+  let (sent, alive, reseeds) = run_process(&mut map, decoded, Some(one_entry_walk().entries));
   assert!(alive);
   assert_eq!(reseeds, 0, "a dropped foreign event is not a loss");
   assert_eq!(
@@ -959,7 +1034,7 @@ fn a_move_in_walk_that_cannot_find_its_subtree_is_loss_not_death() {
     lossy: false,
   };
   let (sent, alive, reseeds, walks) =
-    run_process_with_subtree(&mut map, decoded, Some(one_entry_walk()), None);
+    run_process_with_subtree(&mut map, decoded, Some(one_entry_walk().entries), None);
 
   assert!(
     alive,
@@ -1041,7 +1116,12 @@ fn dfid_name_dot_root_delete_reaches_root_death_at_the_reader() {
       fence: unfenced(),
     },
     || Ok(one_entry_walk()),
-    |_, _, _| Ok(Vec::new()),
+    |_, _, _| {
+      Ok(SeedWalk {
+        entries: Vec::new(),
+        honored: Vec::new(),
+      })
+    },
     |msg| {
       if let SourceMessage::Batch(payload) = msg {
         for ev in payload.events {
@@ -1114,17 +1194,24 @@ mod exclusion_fence {
       || Ok(one_entry_walk()),
       |_, subtree_fid, _| {
         walks.set(walks.get() + 1);
-        Ok(vec![SeedEntry::child(
-          fid(6),
-          subtree_fid.clone(),
-          std::ffi::OsString::from("deep"),
-        )])
+        Ok(SeedWalk {
+          entries: vec![SeedEntry::child(
+            fid(6),
+            subtree_fid.clone(),
+            std::ffi::OsString::from("deep"),
+          )],
+          honored: Vec::new(),
+        })
       },
       |msg| {
         sent.borrow_mut().push(match &msg {
           SourceMessage::Batch(payload) => Sent::Batch(payload.events.len()),
           SourceMessage::Overflow(_) => Sent::Overflow,
           SourceMessage::Fatal(_) => Sent::Fatal,
+          SourceMessage::Honored(paths) => Sent::Honored(paths.clone()),
+          SourceMessage::Cut { .. } | SourceMessage::Recovered { .. } => {
+            unreachable!("this seam drives no whole-root request")
+          }
         });
         if let SourceMessage::Batch(payload) = msg {
           for ev in payload.events {
@@ -1891,9 +1978,17 @@ mod exclusion_fence {
 mod liveness {
   use std::{sync::mpsc, time::Duration};
 
-  use super::super::{Control, DrainExit, ReaderShared, ReseedContext, drain_events};
+  use super::super::{
+    Control, DrainExit, DrainSource, RESEED_DRAIN_READS, ReaderShared, ReseedContext, drain_events,
+    drain_events_with, run_root_recovery,
+  };
   use crate::os::{
-    BackendStatsShared, SourceMessage, linux::fanotify::map::FidMap, transport::TransportState,
+    BackendStatsShared, SourceMessage,
+    linux::fanotify::{
+      fid::FAN_MODIFY,
+      map::{FidMap, SeedEntry},
+    },
+    transport::TransportState,
   };
 
   /// An always-readable fd that never returns `EAGAIN`, standing in for a source
@@ -1909,10 +2004,22 @@ mod liveness {
     ReaderShared,
     async_channel::Receiver<crate::os::SourceMessage>,
   ) {
+    reader_shared_budget(8)
+  }
+
+  /// The same over a chosen transport budget: a cell that drives many buffers
+  /// through one drain needs a permit for each, or the forwarding protocol's own
+  /// degrade would be what ended the run rather than the bound under test.
+  fn reader_shared_budget(
+    budget: usize,
+  ) -> (
+    ReaderShared,
+    async_channel::Receiver<crate::os::SourceMessage>,
+  ) {
     let (tx, rx) = async_channel::unbounded();
     let shared = ReaderShared {
       queue: tx,
-      transport: TransportState::new(8),
+      transport: TransportState::new(budget),
       buffer_bytes: 64 * 1024,
       stats: std::sync::Arc::new(BackendStatsShared::default()),
     };
@@ -1938,7 +2045,7 @@ mod liveness {
 
     let (done_tx, done_rx) = mpsc::channel();
     let worker = std::thread::spawn(move || {
-      let exit = drain_events(&fd, &mut buf, &mut map, &reseed, &rx, &shared);
+      let exit = drain_events(&fd, &mut buf, &mut map, &reseed, &rx, &shared, &mut None);
       let _ = done_tx.send(exit);
     });
     let exit = done_rx
@@ -1983,7 +2090,7 @@ mod liveness {
 
     let (done_tx, done_rx) = mpsc::channel();
     let worker = std::thread::spawn(move || {
-      let exit = drain_events(&fd, &mut buf, &mut map, &reseed, &rx, &shared);
+      let exit = drain_events(&fd, &mut buf, &mut map, &reseed, &rx, &shared, &mut None);
       let _ = done_tx.send(exit);
     });
     let exit = done_rx
@@ -2005,5 +2112,181 @@ mod liveness {
       queue_rx.try_recv().is_err(),
       "and the only thing: the source is done, not covered and continuing"
     );
+  }
+
+  /// A recorded reseed's walk runs at a BOUNDED cut, never at global quiescence
+  /// (#74).
+  ///
+  /// The walk's completion is what the core turns into a whole-root `Rescan`, so
+  /// it must follow every event the kernel held when the mount change was
+  /// sampled — but waiting for the instance to go quiet makes that ordering
+  /// hostage to the producer: a tree under sustained churn keeps the fd readable,
+  /// the drain never returns, the walk never runs, the recovery stays latched in
+  /// flight, and the ground a departed mount revealed is never covered at all.
+  ///
+  /// So the queue is PRICED where the request is recorded and each read is
+  /// charged against that debt. Both halves are driven here against a source that
+  /// is still readable at the exit — which is the whole point, and what a drain
+  /// that ran to `EAGAIN` could never show: the priced cut reads exactly what was
+  /// owed, and the cut whose price the ioctl refused ends at the flat cap.
+  ///
+  /// MUTATION WITNESS: drop the budget check and both halves read the socket dry,
+  /// returning `Parked` with nothing left.
+  #[test]
+  fn a_reseed_under_sustained_traffic_runs_within_the_read_budget() {
+    let event = super::dfid_name_event(FAN_MODIFY, FSID_ROOT, 1, b"root-handle", b"f.txt");
+
+    // Priced: three buffers were resident when the request was recorded, and the
+    // producer has kept nine more coming since.
+    let owed = 3 * event.len();
+    let (exit, pending, left) = cut_under_traffic(&event, 12, Ok(owed as u64));
+    assert_eq!(exit, DrainExit::ReseedDue);
+    assert_eq!(pending, Some(9), "the request is still the caller's to run");
+    assert_eq!(
+      left, 9,
+      "exactly what was owed is read out, and what arrived after the price is \
+       left for the drain that follows the walk"
+    );
+
+    // Unpriced: the ioctl answers nothing, so the flat cap is the cut.
+    let overfull = RESEED_DRAIN_READS as usize + 10;
+    let (exit, pending, left) = cut_under_traffic(&event, overfull, Err(rustix::io::Errno::NOTTY));
+    assert_eq!(exit, DrainExit::ReseedDue);
+    assert_eq!(pending, Some(9));
+    assert_eq!(
+      left, 10,
+      "a queue nobody could price still ends its cut, at the cap"
+    );
+  }
+
+  /// Drives one recorded reseed's cut against a source prefilled with
+  /// `prefilled` copies of `event` and priced by `price`, returning the drain's
+  /// exit, the request it left recorded, and how many whole events the source
+  /// still held afterwards.
+  ///
+  /// A socket pair stands in for the instance: it yields one buffer per read
+  /// (the buffer is sized to one event), it answers `EAGAIN` rather than EOF when
+  /// it runs dry — its write end is held open for exactly that reason — and its
+  /// remainder can be counted, which is what turns "the cut was bounded" into a
+  /// number.
+  fn cut_under_traffic(
+    event: &[u8],
+    prefilled: usize,
+    price: Result<u64, rustix::io::Errno>,
+  ) -> (DrainExit, Option<u64>, usize) {
+    use std::{io::Write, os::fd::OwnedFd, path::Path};
+
+    let (source, mut producer) = std::os::unix::net::UnixStream::pair().expect("a socket pair");
+    for _ in 0..prefilled {
+      producer
+        .write_all(event)
+        .expect("the prefill fits the buffer");
+    }
+    source
+      .set_nonblocking(true)
+      .expect("the instance is non-blocking");
+    let fd = OwnedFd::from(source);
+
+    let mut map = FidMap::new();
+    map.seed([SeedEntry::root(
+      super::wire_fid(FSID_ROOT, 1, b"root-handle"),
+      Path::new("/root"),
+    )]);
+    let (shared, _queue_rx) = reader_shared_budget(prefilled + 1);
+    let reseed = ReseedContext::for_test(std::path::PathBuf::from("/root"));
+    let (_tx, rx) = mpsc::channel::<Control>();
+    let mut buf = vec![0u8; event.len()];
+    let mut pending = Some(9);
+
+    let exit = drain_events_with(
+      DrainSource {
+        fd: &fd,
+        fionread: |_: &OwnedFd| price,
+      },
+      &mut buf,
+      &mut map,
+      &reseed,
+      &rx,
+      &shared,
+      &mut pending,
+    );
+
+    let mut tail = vec![0u8; event.len()];
+    let mut left = 0;
+    while let Ok(read) = rustix::io::read(&fd, &mut tail) {
+      if read == 0 {
+        break;
+      }
+      left += 1;
+    }
+    (exit, pending, left)
+  }
+
+  /// The fsid every event and map entry in [`cut_under_traffic`] shares.
+  const FSID_ROOT: [u8; 8] = [3; 8];
+
+  /// A requested whole-root reseed is RECORDED at a control boundary and
+  /// completed IN BAND afterwards, never pushed from the boundary itself (#74).
+  ///
+  /// The completion is what the core turns into a whole-root `Rescan`, so it has
+  /// to sit behind every event the kernel already held — otherwise the consumer
+  /// re-reads the tree and is only then told about the world as it was before
+  /// the mount change, with a table that has stopped moving firing no second
+  /// cover to correct it. Control is serviced BEFORE and BETWEEN reads by
+  /// design, so the boundary is exactly where the completion may not be sent;
+  /// the fd here never returns `EAGAIN`, which makes "still holding events" the
+  /// standing condition rather than a race.
+  ///
+  /// MUTATION WITNESS: run the walk inside `service_control` and the queue below
+  /// carries the completion while the fd is still full.
+  #[test]
+  fn a_reseed_request_completes_in_band_after_the_walk() {
+    let fd = never_eagain_fd();
+    let (tx, rx) = mpsc::channel();
+    tx.send(Control::Reseed { epoch: 7 })
+      .expect("enqueue the reseed");
+    tx.send(Control::Shutdown).expect("enqueue shutdown");
+    let (shared, queue_rx) = reader_shared();
+    let reseed = ReseedContext::for_test(std::path::PathBuf::from("/nonexistent"));
+    let mut map = FidMap::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut pending = None;
+
+    let exit = drain_events(&fd, &mut buf, &mut map, &reseed, &rx, &shared, &mut pending);
+    assert_eq!(exit, DrainExit::Shutdown);
+    assert_eq!(
+      pending,
+      Some(7),
+      "the request is taken off the channel and held, not discarded"
+    );
+    assert!(
+      queue_rx.try_recv().is_err(),
+      "and NOTHING is published from the control boundary, with the fd still holding events"
+    );
+
+    // Past the drain — here, the caller's own site — the walk runs and its
+    // verdict rides the queue.
+    run_root_recovery(&mut map, &reseed, &shared.stats, 7, |msg| {
+      shared.queue.try_send(msg).is_ok()
+    });
+    match queue_rx.try_recv() {
+      Ok(SourceMessage::Recovered {
+        epoch,
+        outcome,
+        honored,
+      }) => {
+        assert_eq!(
+          epoch, 7,
+          "the completion carries the epoch it was asked for"
+        );
+        assert_eq!(
+          outcome,
+          crate::os::RootRecovery::Unreachable,
+          "an unwalkable root is blindness, and blind is what the core is told"
+        );
+        assert!(honored.is_empty(), "a walk that failed honored nothing");
+      }
+      other => panic!("the completion rides the source queue: {other:?}"),
+    }
   }
 }
