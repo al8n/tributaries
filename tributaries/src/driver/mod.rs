@@ -2928,6 +2928,21 @@ impl From<WatchError> for ReconcileStop {
   }
 }
 
+/// Who stands the ONE covering [`Rescan`](crate::EventKind::Rescan) a regaining root owes —
+/// the single decision [`Owner::reconcile_coverage`] cannot make for itself.
+#[derive(Clone, Copy)]
+enum RegainCover {
+  /// The caller mints a root-level `Rescan` of its own the moment the reconcile returns — a
+  /// widen or replace commit's re-point instruction, or the in-place rollback's dominating one
+  /// — and THAT event is the episode's cover. It is minted after the edge, which is the order a
+  /// regain requires, and it is calibrated on the ledger the commit is about to install; a
+  /// second `Rescan` stood here would carry the pre-commit stamp instead and could sort behind
+  /// the very events it was meant to dominate.
+  Caller,
+  /// Nothing else is coming: the reconcile parks the covering `Rescan` itself.
+  Reconcile,
+}
+
 /// Which arm of [`Owner::replace_racing_close`]'s race resolved, carrying only OWNED data out of the
 /// `select` so both borrows it takes (`&self.closes`, `&mut self.source`) are released before the
 /// winner is used — the same discipline [`SyncStep`] keeps.
@@ -4066,6 +4081,20 @@ where
           // (`Cleanup::DropOrphan` → purged).
           Ok(()) => {
             self.unclaimed.insert(sub);
+            // The subscription is committed under its root, so whatever coverage state that
+            // root is in is now this subscriber's state too. A newcomer under a root with an
+            // OPEN episode is owed its `CoverageLost` at once: the owed-edge check otherwise
+            // runs only when something is delivered to it
+            // ([`deliver_owed_coverage`](Self::deliver_owed_coverage)), and on a quiet root
+            // nothing ever is — the consumer would trust coverage the watch cannot prove, for
+            // as long as the episode lasts.
+            //
+            // After the `unclaimed` insert, not before the reply: a full channel parks through
+            // [`park_rescan`](Self::park_rescan), which suppresses a grant still in flight only
+            // for a subscription already recorded there. The order costs nothing — the owner
+            // awaits nothing between the send and here, so no event for `sub` can overtake the
+            // edge.
+            self.deliver_owed_coverage(sub);
           }
           // The receiver was already gone the instant we sent: the grant bounced back — defuse it (so
           // its own `Drop` enqueues nothing) and orphan the subscription here through the SAME unified
@@ -4718,6 +4747,12 @@ where
             // resolve their pending syncs `Dominated`, WITHOUT retiring the root (it stays live at
             // `only_key`). `replace` preserves the handle, so the subsumer still keys the sole root's
             // subscribers by `handle` — exactly the coordinate `rescan_live_root` enumerates.
+            //
+            // The retarget and its rollback both opened and armed the root, so the source's
+            // coverage answer may have moved with no event on the stream to read it on: it is
+            // re-read here and the edge it owes precedes the dominating `Rescan` below, which
+            // is this regain's cover.
+            self.reconcile_coverage(handle, RegainCover::Caller);
             self.rescan_live_root(handle);
             let salvage = self.subsumer.abort_watch(&outcome);
             self.retire_salvage(salvage);
@@ -4965,6 +5000,15 @@ where
     let salvage = self.filters.install(sub, filter);
     self.retire_salvage(salvage);
     self.register_debounce(sub, debounce);
+    // The commit moved the source's coverage without putting anything on the root's stream,
+    // so the state is re-read HERE and whatever edge it owes is published ahead of the
+    // re-point `Rescan`s below — which are this regain's cover
+    // ([`reconcile_coverage`](Self::reconcile_coverage)). AFTER the commit, never before it:
+    // on the release-and-rearm path the wider handle is fresh and not yet recorded, so a
+    // reconcile ahead of `commit_watch` would find no cohort to tell while moving the state
+    // anyway. After it, the cohort is the widened one — every re-pointed subscription and the
+    // newcomer — at the widened key.
+    self.reconcile_coverage(handle, RegainCover::Caller);
     let mut rescans = Vec::with_capacity(repointed.len());
     for &moved in repointed {
       // The re-point Rescan re-enumerates the whole subscription, so it dominates any
@@ -6304,13 +6348,32 @@ where
     self.dominate_syncs_of_root(root);
   }
 
-  /// Reconciles the source's root-coverage STATE for the root this event came from,
-  /// delivering the [`CoverageLost`](crate::EventKind::CoverageLost) /
-  /// [`CoverageRegained`](crate::EventKind::CoverageRegained) transition each edge owes —
-  /// and reports whether the event itself was the episode's own instruction, which this
-  /// consumed.
+  /// Reconciles the source's root-coverage STATE for `root`, delivering the
+  /// [`CoverageLost`](crate::EventKind::CoverageLost) /
+  /// [`CoverageRegained`](crate::EventKind::CoverageRegained) transition each edge owes, and
+  /// reports whether the root's episode was OPEN across the reconcile (before it or after it).
   ///
-  /// # Why the state is read here, on an event, and never on a clock
+  /// # Every root-level event is a reconcile point, minted ones included
+  ///
+  /// An arriving source event is the ordinary one
+  /// ([`reconcile_event_coverage`](Self::reconcile_event_coverage)), but it is not the only one:
+  /// the owner MINTS root-level `Rescan`s of its own — a widen or replace commit's re-point
+  /// instruction, the in-place rollback's dominating one — and a commit that opened, read and
+  /// armed a root moves the source's answer without putting anything on the root's stream. A
+  /// same-descriptor widen is the case that bites: the handle is PRESERVED, so nothing removes it
+  /// from [`coverage_lost`](Self::coverage_lost), the owed-edge check reads its own unchanged
+  /// state and owes nothing, and a subscriber already told Lost takes the widen `Rescan` and
+  /// stays Lost for as long as the root is quiet. So the state is re-read here, ahead of every
+  /// root-level event the owner mints, and the edge it publishes precedes that event.
+  ///
+  /// It is deliberately NOT called from [`rescan_live_root`](Self::rescan_live_root) — the regain
+  /// arm below calls THAT — nor from
+  /// [`retire_root_with_terminal_rescan`](Self::retire_root_with_terminal_rescan), whose root is
+  /// being retired and whose coverage record is dropped a line later: a regain published there
+  /// would tell a consumer its coverage is proven one statement before the terminal `Rescan`
+  /// saying the root is gone.
+  ///
+  /// # Why the state is read on an event, and never on a clock
   ///
   /// [`Source::coverage`](crate::Source::coverage) is a synchronous read of a state the
   /// source already holds, and the seam requires a source whose coverage can lapse to put
@@ -6331,11 +6394,10 @@ where
   /// A `Rescan` BELOW the root is a different loss and is delivered as usual, and a dead
   /// root's terminal signal never reaches here at all ([`retire_if_dead`](Self::retire_if_dead)
   /// runs first).
-  fn reconcile_coverage(&mut self, event: &SourceEvent<C, S::Handle>) -> bool
+  fn reconcile_coverage(&mut self, root: S::Handle, cover: RegainCover) -> bool
   where
-    C: Clone + PartialEq,
+    C: Clone,
   {
-    let root = event.handle();
     let unproven = self.source.coverage(root).is_unproven();
     let was_lost = self.coverage_lost.contains(&root);
     match (unproven, was_lost) {
@@ -6349,12 +6411,26 @@ where
         // THE ONE covering `Rescan` the episode owes, parked durably for every subscriber
         // of the root exactly as a terminal loss parks its own — a full channel cannot
         // drop it, so the re-enumeration that closes the unproven window is never the
-        // thing that goes missing.
-        self.rescan_live_root(root);
+        // thing that goes missing. A caller that is about to mint one of its own takes
+        // that duty over ([`RegainCover`]).
+        if matches!(cover, RegainCover::Reconcile) {
+          self.rescan_live_root(root);
+        }
       }
       _ => {}
     }
-    if !(unproven || was_lost) || !event.kind().is_rescan() {
+    unproven || was_lost
+  }
+
+  /// [`reconcile_coverage`](Self::reconcile_coverage) for an ARRIVING source event, reporting
+  /// whether the event itself was the open episode's own repeated instruction — which the
+  /// caller then consumes.
+  fn reconcile_event_coverage(&mut self, event: &SourceEvent<C, S::Handle>) -> bool
+  where
+    C: Clone + PartialEq,
+  {
+    let root = event.handle();
+    if !self.reconcile_coverage(root, RegainCover::Reconcile) || !event.kind().is_rescan() {
       return false;
     }
     self
@@ -7286,7 +7362,7 @@ where
     // an event that IS the unproven episode's repeated instruction is consumed here
     // rather than delivered (see `reconcile_coverage`). The settle clock is still ticked
     // for the consumed one, exactly as the dead-root arm above ticks it.
-    if self.reconcile_coverage(event) {
+    if self.reconcile_event_coverage(event) {
       self.drain_coalescer_due();
       return;
     }

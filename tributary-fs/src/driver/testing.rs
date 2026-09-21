@@ -2389,6 +2389,14 @@ type Transitions = (Vec<(ScopeId, PathBuf, BackendKind)>, Vec<ScopeId>);
 #[derive(Clone, Default)]
 pub(crate) struct RecordingRegistry {
   state: Arc<Mutex<Transitions>>,
+  /// The coverage state each scope was last REPORTED at — what a real registry stores for
+  /// [`Watcher::coverage`](crate::Watcher::coverage) to read back.
+  coverage: Arc<Mutex<std::collections::BTreeMap<ScopeId, bool>>>,
+  /// Freezes the owner loop inside the next PROVEN coverage report, so a test can observe
+  /// what the driver has and has not done while that registry write is still in flight.
+  /// The gate blocks the owner-loop thread, so a test that arms it needs a multi-worker
+  /// runtime.
+  coverage_hold: Arc<Mutex<Option<HoldGate>>>,
 }
 
 impl RecordingRegistry {
@@ -2398,6 +2406,20 @@ impl RecordingRegistry {
 
   pub(crate) fn dead(&self) -> Vec<ScopeId> {
     self.state.lock().unwrap().1.clone()
+  }
+
+  /// Whether `scope`'s coverage last read UNPROVEN, or [`None`] when nothing was ever
+  /// reported for it.
+  pub(crate) fn unproven_of(&self, scope: ScopeId) -> Option<bool> {
+    self.coverage.lock().unwrap().get(&scope).copied()
+  }
+
+  /// Freezes the next PROVEN coverage report until the returned gate is released.
+  /// [`HoldRelease::captured`] counts the reports that bound to it.
+  pub(crate) fn hold_next_proven(&self) -> HoldRelease {
+    let gate: HoldGate = Arc::new((Mutex::new(true), Condvar::new(), AtomicUsize::new(0)));
+    *self.coverage_hold.lock().unwrap() = Some(Arc::clone(&gate));
+    HoldRelease { gate }
   }
 }
 
@@ -2421,6 +2443,25 @@ impl ScopeRegistry for RecordingRegistry {
 
   fn scope_dead(&self, scope: ScopeId) {
     self.state.lock().unwrap().1.push(scope);
+  }
+
+  fn scope_coverage(&self, scope: ScopeId, unproven: bool) {
+    let gate = if unproven {
+      None
+    } else {
+      self.coverage_hold.lock().unwrap().clone()
+    };
+    if let Some(gate) = gate {
+      // The bound-to-THIS-gate ack, taken before the park, exactly as the filesystem
+      // fake's own holds take theirs.
+      gate.2.fetch_add(1, Ordering::SeqCst);
+      let (held, cvar, _) = &*gate;
+      let mut parked = held.lock().unwrap();
+      while *parked {
+        parked = cvar.wait(parked).unwrap();
+      }
+    }
+    self.coverage.lock().unwrap().insert(scope, unproven);
   }
 
   fn final_root_conflict(

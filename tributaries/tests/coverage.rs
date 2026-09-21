@@ -25,8 +25,8 @@ use std::{
 };
 
 use tributaries::{
-  Armed, Coverage, Epoch, Event, EventKind, Location, RootGlobs, Source, SourceEvent, Tributaries,
-  TributariesOptions, WatchError, WatchOptions,
+  Armed, Coverage, Epoch, Event, EventKind, FaultKind, Location, RootGlobs, Source, SourceEvent,
+  SourceFault, Tributaries, TributariesOptions, WatchError, WatchOptions,
 };
 
 /// The one root every cell watches, in the umbrella's `OsString` component space.
@@ -61,6 +61,10 @@ struct Probe {
   roots: HashMap<u32, Vec<OsString>>,
   /// The answer [`Source::coverage`] gives for every live root of this source.
   unproven: Arc<AtomicBool>,
+  /// Whether this source can widen a root IN PLACE. The two widen shapes reach the same
+  /// commit by different routes — a preserved handle, or a released one and a fresh arm — and
+  /// only a source that says yes here takes the first.
+  in_place_widen: bool,
   events: async_channel::Receiver<Step>,
 }
 
@@ -84,6 +88,20 @@ impl Source<OsString> for Probe {
 
   fn disarm(&mut self, handle: u32) {
     self.roots.remove(&handle);
+  }
+
+  /// The in-place retarget: the handle is PRESERVED and only its key moves, which is what
+  /// leaves the umbrella with no source event to re-read the coverage state on.
+  async fn replace(
+    &mut self,
+    handle: u32,
+    new_key: &[OsString],
+  ) -> Result<Armed<OsString, u32>, WatchError> {
+    if !self.in_place_widen || !self.roots.contains_key(&handle) {
+      return Err(WatchError::source(SourceFault::new(FaultKind::Unsupported)));
+    }
+    self.roots.insert(handle, new_key.to_vec());
+    Ok(Armed::new(handle, new_key.to_vec()))
   }
 
   async fn next(&mut self) -> Option<SourceEvent<OsString, u32>> {
@@ -177,12 +195,25 @@ fn assemble_with(
   Tributaries<OsString, (), agnostic_lite::tokio::TokioRuntime, u32>,
   Pen,
 ) {
+  assemble_widening(options, false)
+}
+
+/// The same rig with the source's widen shape chosen: in place on a preserved handle, or
+/// release-and-rearm onto a fresh one.
+fn assemble_widening(
+  options: TributariesOptions,
+  in_place_widen: bool,
+) -> (
+  Tributaries<OsString, (), agnostic_lite::tokio::TokioRuntime, u32>,
+  Pen,
+) {
   let (tx, rx) = async_channel::unbounded();
   let unproven = Arc::new(AtomicBool::new(false));
   let source = Probe {
     next_handle: 0,
     roots: HashMap::new(),
     unproven: Arc::clone(&unproven),
+    in_place_widen,
     events: rx,
   };
   let watcher =
@@ -437,6 +468,163 @@ async fn a_refused_regain_still_precedes_its_covering_rescan() {
     covering.kind(),
     &EventKind::Rescan,
     "and its covering `Rescan` follows it, never the other way round"
+  );
+
+  watcher.close().await.expect("the owner closes");
+}
+
+/// A WORLD START is a reconcile point of its own. A wider watch subsumes a root whose
+/// episode is open; the commit re-arms that ground and the source can prove it again, but
+/// nothing lands on the root's stream to read the state on. The re-pointed subscriber is
+/// still told `CoverageRegained` — and told it BEFORE the widen's own `Rescan`, which is
+/// the episode's cover.
+///
+/// This is the release-and-rearm shape: the subsumed root is disarmed and a wider one is
+/// armed in its place.
+#[tokio::test(flavor = "current_thread")]
+async fn a_widen_of_a_lost_root_regains_before_its_rescan() {
+  let (mut watcher, pen) = assemble_widening(TributariesOptions::new(), false);
+  let narrow = watcher
+    .watch(child_key("a"), (), WatchOptions::new())
+    .await
+    .expect("the narrow root arms");
+
+  pen.set_unproven(true);
+  pen.push(child_key("a"), EventKind::Rescan).await;
+  let lost = next_event(&mut watcher, "the losing transition").await;
+  assert_eq!(lost.subscription(), narrow);
+  assert_eq!(
+    lost.kind(),
+    &EventKind::CoverageLost,
+    "staging: the subscriber holds an OPEN episode when the widen commits"
+  );
+
+  // The widen's own arm is the proof: the wider root was opened and armed, so the source
+  // can account for this ground again.
+  pen.set_unproven(false);
+  let _wide = watcher
+    .watch(root_key(), (), WatchOptions::new())
+    .await
+    .expect("the wider root subsumes it");
+
+  let regained = next_event(&mut watcher, "the regaining transition at the widen").await;
+  assert_eq!(regained.subscription(), narrow);
+  assert_eq!(
+    regained.kind(),
+    &EventKind::CoverageRegained,
+    "the commit moved the state, and the edge is published for it"
+  );
+  assert_eq!(regained.key(), child_key("a").as_slice());
+  let repoint = next_event(&mut watcher, "the widen's re-point rescan").await;
+  assert_eq!(repoint.subscription(), narrow);
+  assert_eq!(
+    repoint.kind(),
+    &EventKind::Rescan,
+    "and the widen's own `Rescan` is this regain's cover, never ahead of it"
+  );
+
+  watcher.close().await.expect("the owner closes");
+}
+
+/// The same law on the IN-PLACE shape, which is the one that had no reconcile point at all:
+/// the handle is preserved, so no root leaves the lost set and no fresh arm re-reads the
+/// state. Without the reconcile at the commit the subscriber takes the widen `Rescan` and
+/// stays `CoverageLost` for as long as the root is quiet — which, on a root nothing is
+/// changing, is forever.
+#[tokio::test(flavor = "current_thread")]
+async fn a_replace_of_a_lost_root_regains_before_its_rescan() {
+  let (mut watcher, pen) = assemble_widening(TributariesOptions::new(), true);
+  let narrow = watcher
+    .watch(child_key("a"), (), WatchOptions::new())
+    .await
+    .expect("the narrow root arms");
+
+  pen.set_unproven(true);
+  pen.push(child_key("a"), EventKind::Rescan).await;
+  let lost = next_event(&mut watcher, "the losing transition").await;
+  assert_eq!(lost.subscription(), narrow);
+  assert_eq!(
+    lost.kind(),
+    &EventKind::CoverageLost,
+    "staging: the subscriber holds an OPEN episode when the retarget commits"
+  );
+
+  pen.set_unproven(false);
+  let _wide = watcher
+    .watch(root_key(), (), WatchOptions::new())
+    .await
+    .expect("the sole root is retargeted in place");
+
+  let regained = next_event(&mut watcher, "the regaining transition at the retarget").await;
+  assert_eq!(regained.subscription(), narrow);
+  assert_eq!(
+    regained.kind(),
+    &EventKind::CoverageRegained,
+    "a preserved handle still gets its state re-read at the commit"
+  );
+  assert_eq!(regained.key(), child_key("a").as_slice());
+  let repoint = next_event(&mut watcher, "the retarget's re-point rescan").await;
+  assert_eq!(repoint.subscription(), narrow);
+  assert_eq!(
+    repoint.kind(),
+    &EventKind::Rescan,
+    "with the retarget's own `Rescan` behind it"
+  );
+
+  watcher.close().await.expect("the owner closes");
+}
+
+/// A subscription that JOINS an open episode is owed its `CoverageLost` at once. The owed
+/// edge is otherwise checked only when something is delivered to that subscriber, and a
+/// root whose coverage cannot be proven is exactly the root nothing is arriving for — so a
+/// newcomer would trust coverage the watch has withdrawn, indefinitely.
+#[tokio::test(flavor = "current_thread")]
+async fn a_watch_joining_an_open_episode_is_told_lost_first() {
+  let (mut watcher, pen) = assemble();
+  let first = watcher
+    .watch(root_key(), (), WatchOptions::new())
+    .await
+    .expect("the root arms");
+
+  pen.set_unproven(true);
+  pen.root_rescan().await;
+  let lost = next_event(&mut watcher, "the losing transition").await;
+  assert_eq!(lost.subscription(), first);
+  assert_eq!(lost.kind(), &EventKind::CoverageLost, "staging");
+
+  // A covered newcomer under the same root. NOTHING is pushed on the source stream after
+  // it: the episode's state is all the owner has to go on.
+  let joiner = watcher
+    .watch(child_key("joiner"), (), WatchOptions::new())
+    .await
+    .expect("the covered newcomer commits");
+
+  let told = next_event(&mut watcher, "the newcomer's losing transition").await;
+  assert_eq!(told.subscription(), joiner);
+  assert_eq!(
+    told.kind(),
+    &EventKind::CoverageLost,
+    "a watch committed under a lost root is told so before anything else"
+  );
+  assert_eq!(
+    told.key(),
+    child_key("joiner").as_slice(),
+    "at its OWN key — the statement is about the ground it owns"
+  );
+
+  // And it is a genuine episode for the newcomer, not a one-off notice: the regain reaches
+  // it too, ahead of the covering `Rescan`.
+  pen.set_unproven(false);
+  pen.root_rescan().await;
+  let mut regained = 0_usize;
+  for _ in 0..2 {
+    let event = next_event(&mut watcher, "a regaining transition").await;
+    assert_eq!(event.kind(), &EventKind::CoverageRegained);
+    regained += 1;
+  }
+  assert_eq!(
+    regained, 2,
+    "both subscribers held the episode, both are told"
   );
 
   watcher.close().await.expect("the owner closes");

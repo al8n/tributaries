@@ -42,6 +42,13 @@ All notable changes to this workspace are documented here. The format is based o
   that follows it cancel to nothing instead of replaying a pair of edges that described no
   picture it ever held.
 
+  Every root-level event is a reconcile point, including the ones the umbrella MINTS for
+  itself: a widen or replace commit re-reads the source's answer and publishes whatever edge
+  it owes ahead of its own covering `Rescan`, so a same-descriptor widen — which preserves
+  the handle and puts nothing on the root's stream — can no longer leave a subscriber
+  `CoverageLost` on a root that is quiet. A subscription that JOINS an open episode is told
+  `CoverageLost` as it commits, rather than at the next event that happens to reach it.
+
 - **`tributaries`** — **`Source::list(handle, globs)`**, the enumeration half of the
   binding seam: a stream of each entry's located key — in the same component space events
   are keyed in — paired with the `Metadata` (`EntryKind`, size, modification time) the

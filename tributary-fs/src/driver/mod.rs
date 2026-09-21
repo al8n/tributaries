@@ -5619,6 +5619,14 @@ impl<F: FsOps> Drop for CookieRegistry<F> {
   }
 }
 
+/// One replace or widen resolution and the caller it is owed to, decided by a commit and
+/// held until that commit's effects have been flushed — see `settled_replaces` in the run
+/// loop, which is the only place these are parked and sent.
+type SettledReplace = (
+  futures_channel::oneshot::Sender<Result<(), crate::error::ReplaceRootError>>,
+  Result<(), crate::error::ReplaceRootError>,
+);
+
 /// One in-flight root replacement: the reservation the commit releases, the
 /// caller's reply, and which of the two replace shapes is running (`mode`).
 struct ReplaceState<H> {
@@ -12221,6 +12229,21 @@ pub(crate) async fn run<R, F>(
   // exit is driven by the COMMAND channel, and this receiver merely pends.
   let (unwind_tx, unwind_rx) = async_channel::unbounded::<ScopeId>();
 
+  // Replace and widen resolutions waiting for the effect flush that follows their commit.
+  //
+  // A commit's registry writes — the root swap, and above all the
+  // [`Effect::Coverage`] that CLOSES the episode the old root left open — ride the core's
+  // effect queue, which is flushed at the loop top and once more behind a resolved widen.
+  // Sending the caller's `Ok` from the commit site itself would resolve it ahead of those
+  // writes, so a caller that reads the registry the instant its replace succeeds could still
+  // see the OLD root's unproven coverage and hold an episode nothing will reopen — on a quiet
+  // root, forever. So the resolution is parked here and sent below, after the flush.
+  //
+  // It is never left owed: every site that parks one is inside the op-result arm or the
+  // catch-up resolver, neither of which breaks the loop, and the drain sits above every
+  // `continue` — so the reply leaves on this pass or the next one.
+  let mut settled_replaces: Vec<SettledReplace> = Vec::new();
+
   let close_reply = loop {
     #[cfg(feature = "sync")]
     drain_barrier_moves::<R, F>(&mut core, &mut cookies, &op_tx, &now);
@@ -12294,6 +12317,7 @@ pub(crate) async fn run<R, F>(
       &source_taps,
       &mut streams.replace_states,
       &mut unwatch_replies,
+      &mut settled_replaces,
       &mut parked_cookies,
       &mut cookies,
       &registry,
@@ -12314,6 +12338,7 @@ pub(crate) async fn run<R, F>(
       &source_taps,
       &mut streams.replace_states,
       &mut unwatch_replies,
+      &mut settled_replaces,
       &registry,
       &mut probes,
       &now,
@@ -12376,6 +12401,14 @@ pub(crate) async fn run<R, F>(
         &registry,
         &now,
       );
+    }
+
+    // Every effect a parked resolution was waiting on has now been executed — both the
+    // loop-top flush and the resolved widen's own — so the caller may be told, and whatever
+    // it reads out of the registry on hearing `Ok` is the committed world
+    // ([`settled_replaces`]).
+    for (reply, resolution) in settled_replaces.drain(..) {
+      let _ = reply.send(resolution);
     }
 
     // Service any cookie-unlink retries now due, opportunistically at the loop
@@ -13024,7 +13057,11 @@ pub(crate) async fn run<R, F>(
                 // after the registry overwrite (commit) has already made the
                 // new coverage visible, so the path is covered continuously.
                 drop(replace.reservation);
-                let _ = replace.reply.send(outcome.map(|_| ()));
+                // PARKED, not sent: the commit's own effects — the coverage episode it
+                // closed above all — are still on the core's queue, and the caller must
+                // not hear `Ok` before they have reached the registry
+                // ([`settled_replaces`]).
+                settled_replaces.push((replace.reply, outcome.map(|_| ())));
                 continue;
               }
               // Descending: arm the new root on the NEW transport first; the
@@ -13412,7 +13449,9 @@ pub(crate) async fn run<R, F>(
             }
           }
           drop(replace.reservation);
-          let _ = replace.reply.send(outcome.map(|_| ()));
+          // PARKED for the reason the kernel-recursive commit above parks its own
+          // ([`settled_replaces`]).
+          settled_replaces.push((replace.reply, outcome.map(|_| ())));
         }
         OpResult::ReplaceMeta { scope, result } => {
           if !streams.replace_states.contains_key(&scope) {
@@ -16700,6 +16739,11 @@ impl SourceSnapshot {
 /// unread behind an already-resolved `Ok`. (The non-commit resolutions
 /// enqueue no core effects today; reporting them too costs one no-op flush
 /// per widen and keeps the contract robust if they ever do.)
+///
+/// The caller's own resolution is not sent here but PARKED on `settled`, so that
+/// same flush goes in front of it: the commit closes the old root's coverage
+/// episode through that queue, and a caller told `Ok` first could read the
+/// registry and still find its root unproven.
 #[allow(clippy::too_many_arguments)]
 fn resolve_widen_catchups<R, F>(
   core: &mut DriverCore,
@@ -16717,6 +16761,7 @@ fn resolve_widen_catchups<R, F>(
     ScopeId,
     Vec<(futures_channel::oneshot::Sender<UnwatchAck>, UnwatchAck)>,
   >,
+  settled: &mut Vec<SettledReplace>,
   #[cfg(feature = "sync")] parked_cookies: &mut BTreeMap<FenceId, ParkedCookie>,
   #[cfg(feature = "sync")] cookies: &mut CookieRegistry<F>,
   registry: &impl ScopeRegistry,
@@ -16921,7 +16966,12 @@ where
       resolve_unwatch_waiters(unwatch_replies, scope);
     }
     drop(replace.reservation);
-    let _ = replace.reply.send(resolution);
+    // PARKED rather than sent: a committed widen's own effects — the closed coverage
+    // episode among them — are enqueued by the commit just above and flushed by the caller
+    // on the strength of the `true` this returns, so the caller sends this resolution
+    // AFTER that flush. The non-commit resolutions ride along for uniformity; they enqueue
+    // nothing, and the flush they wait behind is the one the commit already owes.
+    settled.push((replace.reply, resolution));
   }
   resolved_any
 }

@@ -1221,6 +1221,114 @@ async fn replace_root(
   on_reply.await.expect("the driver replies")
 }
 
+/// A replace's `Ok` reaches the caller only after the commit's own registry writes have
+/// been executed — the [`Effect::Coverage`] that CLOSES the episode the old root left open
+/// above all.
+///
+/// What acts on that `Ok` is a caller that then READS the registry, and the umbrella is
+/// exactly one: it re-samples the root's coverage at its own widen commit, which on a root
+/// nothing is changing is the only chance it gets. A reply sent ahead of the flush hands it
+/// the old root's unproven answer, and the episode stays open with nothing left to reopen
+/// it.
+///
+/// The order is observed by FREEZING the owner loop inside that registry write and asking
+/// whether the caller has been told: a plain read after the reply would prove nothing,
+/// because on one thread the owner runs on to its own next park — flush included — before
+/// the woken caller gets to look.
+///
+/// Revert witness: send the resolution at the commit site instead of parking it for the
+/// flush, and the reply is already in the caller's hand while the write below is still
+/// frozen.
+///
+/// not(miri): the probe budget that opens the episode is `MAX_LIVENESS_PROBES` real parked
+/// threads, a native fact rather than one an interpreter can decide. The frozen write
+/// blocks the owner's thread, so the runtime needs a worker the test itself can run on.
+#[cfg(not(miri))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replace_reply_follows_the_commits_registry_writes() {
+  let registry = RecordingRegistry::default();
+  // Disjoint roots, so the replacement takes the general STREAM replace. The interval is
+  // long enough that the only tick in this cell is the one it forces itself.
+  let mut roots: Vec<String> = (0..MAX_LIVENESS_PROBES)
+    .map(|index| format!("/f{index}"))
+    .collect();
+  roots.push("/old".to_owned());
+  roots.push("/new".to_owned());
+  let rig = ticking_rig_over(Duration::from_secs(3600), registry.clone(), &roots);
+
+  let scope = watch(&rig, "/old").await;
+  let mut fillers = Vec::with_capacity(MAX_LIVENESS_PROBES);
+  for root in &roots[..MAX_LIVENESS_PROBES] {
+    fillers.push(watch(&rig, root.as_str()).await);
+  }
+  assert!(
+    settle_probes(&rig, 0).await,
+    "staging: every birth refresh answered, so each root is publicly live with no probe \
+     of its own outstanding"
+  );
+
+  // Fill the budget: one forced tick per filler, each probe parking on the held gate
+  // before the next is dispatched, so the forced tick below finds no slot at all and the
+  // core opens an episode for `/old`.
+  let gate = rig.fs.hold_refreshes();
+  for &filler in &fillers {
+    tick_liveness(&rig, filler).await;
+  }
+  assert!(
+    settle_probes_within(&rig, 600, MAX_LIVENESS_PROBES).await,
+    "staging: the probe budget fills"
+  );
+
+  tick_liveness(&rig, scope).await;
+  assert_eq!(
+    registry.unproven_of(scope),
+    Some(true),
+    "staging: nothing is proving the root's liveness, and the registry says so"
+  );
+
+  // Free the budget again so the replacement's own refresh is dispatched rather than
+  // declined — a decline would queue a SECOND coverage report behind the commit's.
+  gate.release();
+  assert!(
+    settle_probes_within(&rig, 600, 0).await,
+    "staging: the parked probes answer and the budget frees"
+  );
+
+  // The commit's coverage write is frozen the moment it runs, so "has the caller been
+  // told yet" is a question with a stable answer.
+  let write = registry.hold_next_proven();
+  let (reply, mut on_reply) = futures_channel::oneshot::channel();
+  rig
+    .commands
+    .send(Command::Replace {
+      scope,
+      root: PathBuf::from("/new"),
+      reservation: crate::watcher::ReservationGuard::detached_for_tests(PathBuf::from("/new")),
+      reply,
+    })
+    .await
+    .unwrap();
+  assert!(
+    settle_within(600, || write.captured() == 1).await,
+    "staging: the commit closed the episode and the owner is parked inside that write"
+  );
+  assert!(
+    matches!(on_reply.try_recv(), Ok(None)),
+    "the caller is NOT told while the commit's registry write is still in flight"
+  );
+
+  write.release();
+  on_reply
+    .await
+    .expect("the driver replies")
+    .expect("the replacement commits");
+  assert_eq!(
+    registry.unproven_of(scope),
+    Some(false),
+    "and what it reads once told is the committed world: the episode is closed"
+  );
+}
+
 /// A replacement root is probed immediately, and the retiring root's late answer
 /// is DROPPED rather than read as the replacement's verdict.
 ///
