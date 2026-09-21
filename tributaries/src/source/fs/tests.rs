@@ -2473,3 +2473,541 @@ mod the_invalid_uid_sentinel {
     );
   }
 }
+
+/// [`super::Walk::absorb`] must never match, yield, or descend an entry `read_dir` handed
+/// back whose name is not valid UTF-8: `prune`/`include` are TEXT patterns, and matching
+/// them against a LOSSY rendering would decide the entry on words the tree does not hold.
+/// The watch side makes the identical refusal (`tributary-fs`'s `on_enumerated` drops such
+/// an entry and marks the listing lossy); the walk instead says it out loud, once, as the
+/// directory's own incompleteness — while a genuine UTF-8 sibling the same `include`
+/// pattern admits stays admitted.
+///
+/// The entries are synthesized in memory rather than written to a real directory: a local
+/// filesystem that itself requires valid UTF-8 names (APFS) could never produce the entry
+/// `read_dir` is meant to hand back here, so exercising the refusal has to start one layer
+/// in, at what `read_dir` returns rather than at the syscall that would have to write it.
+///
+/// Unix-only because building a non-UTF-8 name needs the byte-oriented path namespace
+/// (`OsStrExt::from_bytes`), which does not exist on Windows.
+#[cfg(unix)]
+#[test]
+fn absorb_refuses_a_non_utf8_leaf_an_include_pattern_would_match_lossily() {
+  use std::{
+    ffi::{OsStr, OsString},
+    os::unix::ffi::OsStrExt,
+    path::PathBuf,
+    sync::Arc,
+  };
+
+  use crate::{EntryKind, Glob, ListError, Metadata, RootGlobs, event::path_components};
+
+  let dir = PathBuf::from("/root");
+  let bad_leaf = OsStr::from_bytes(b"a\xff.txt");
+  let entries = vec![
+    (
+      OsString::from("kept.txt"),
+      Metadata::new(EntryKind::File, 1),
+    ),
+    (bad_leaf.to_owned(), Metadata::new(EntryKind::File, 1)),
+  ];
+
+  let globs = RootGlobs::new().with_include([Glob::new("*.txt").expect("a pattern")]);
+  let mut walk = super::Walk {
+    blocking: Arc::new(|_| unreachable!("absorb never touches the blocking spawner")),
+    prune: globs.prune().to_vec(),
+    include: globs.include().map(<[Glob]>::to_vec),
+    cover: None,
+    seed: None,
+    stack: Vec::new(),
+    ready: Default::default(),
+  };
+  let mut pending = std::collections::VecDeque::new();
+
+  walk.absorb(&dir, "", &mut pending, entries);
+
+  assert!(
+    pending.is_empty(),
+    "no directory was read here; nothing is descendable"
+  );
+  assert_eq!(
+    walk.ready.len(),
+    2,
+    "the UTF-8 sibling and the one refusal, nothing else: {:?}",
+    walk.ready
+  );
+
+  let kept_admitted = walk
+    .ready
+    .iter()
+    .any(|item| matches!(item, Ok((key, _)) if key.last() == Some(&OsString::from("kept.txt"))));
+  assert!(
+    kept_admitted,
+    "the UTF-8 sibling is still admitted: {:?}",
+    walk.ready
+  );
+
+  let refusals: Vec<_> = walk
+    .ready
+    .iter()
+    .filter_map(|item| match item {
+      Err(ListError::Io { key, source }) => Some((key, source)),
+      _ => None,
+    })
+    .collect();
+  assert_eq!(
+    refusals.len(),
+    1,
+    "exactly one `Io` refusal for the unrepresentable leaf: {:?}",
+    walk.ready
+  );
+  let (key, source) = refusals[0];
+  assert_eq!(
+    key,
+    &path_components(&dir),
+    "the refusal's key is the directory being listed, not the unrepresentable entry"
+  );
+  assert_eq!(
+    source.kind(),
+    std::io::ErrorKind::InvalidData,
+    "the refusal is InvalidData, not a real read failure: {source}"
+  );
+}
+
+/// The directory half of the same refusal: a name that is not valid UTF-8 is refused
+/// before `prune` is ever consulted, so a `prune` pattern that would NOT have matched the
+/// entry's lossy rendering makes no difference — the entry is still neither descended nor
+/// yielded, and its child never reaches the listing at all.
+#[cfg(unix)]
+#[test]
+fn absorb_refuses_a_non_utf8_directory_a_prune_pattern_would_not_match_lossily() {
+  use std::{ffi::OsStr, os::unix::ffi::OsStrExt, path::PathBuf, sync::Arc};
+
+  use crate::{EntryKind, Glob, ListError, Metadata, RootGlobs, event::path_components};
+
+  let dir = PathBuf::from("/root");
+  let bad_dir = OsStr::from_bytes(b"n\xffdir");
+  let entries = vec![(bad_dir.to_owned(), Metadata::new(EntryKind::Dir, 0))];
+
+  // `skip` cannot match `n\xFFdir`'s lossy rendering under any glob semantics, so this
+  // entry is refused for being unnameable, never for being pruned.
+  let globs = RootGlobs::new().with_prune([Glob::new("skip").expect("a pattern")]);
+  let mut walk = super::Walk {
+    blocking: Arc::new(|_| unreachable!("absorb never touches the blocking spawner")),
+    prune: globs.prune().to_vec(),
+    include: globs.include().map(<[Glob]>::to_vec),
+    cover: None,
+    seed: None,
+    stack: Vec::new(),
+    ready: Default::default(),
+  };
+  let mut pending = std::collections::VecDeque::new();
+
+  walk.absorb(&dir, "", &mut pending, entries);
+
+  assert!(
+    pending.is_empty(),
+    "the unnameable directory is never descended, so its child can never surface: {pending:?}"
+  );
+  assert_eq!(
+    walk.ready.len(),
+    1,
+    "exactly one item: the refusal, and nothing admitted: {:?}",
+    walk.ready
+  );
+  match &walk.ready[0] {
+    Err(ListError::Io { key, source }) => {
+      assert_eq!(
+        key,
+        &path_components(&dir),
+        "the refusal's key is the directory being listed"
+      );
+      assert_eq!(
+        source.kind(),
+        std::io::ErrorKind::InvalidData,
+        "the refusal is InvalidData, not a real read failure: {source}"
+      );
+    }
+    other => panic!("expected a single `Io` refusal, got {other:?}"),
+  }
+}
+
+/// The LISTING's containment and its bounds, over real trees.
+///
+/// Unix-only because the guarantees under test are the descriptor-relative ones: the
+/// non-unix fallback states a weaker rule (a no-follow check immediately before the read),
+/// and asserting the stronger one there would assert something the platform does not give.
+///
+/// not(miri): a descriptor-relative walk is raw `openat`/`getdents`/`statx`, which an
+/// interpreter has no filesystem to answer — the safe-code invariants the walk itself owns
+/// are pinned by the `absorb` cells above, which touch no descriptor.
+#[cfg(all(unix, not(miri)))]
+mod listing {
+  use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+    sync::{
+      Arc,
+      atomic::{AtomicUsize, Ordering},
+    },
+  };
+
+  use super::super::{
+    BlockingSpawner, BoundRoot, LIST_CHUNK, MAX_LIST_DEPTH, ObjectId, Walk, key_to_path,
+  };
+  use crate::{EntryKind, Glob, ListError, ListItem, RootGlobs, event::path_components};
+
+  /// One temp tree, canonicalized so its keys are the ones a watch would spell.
+  fn tree() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::Builder::new()
+      .prefix("tributaries-listing-")
+      .tempdir()
+      .expect("create temp dir");
+    let canonical = dir.path().canonicalize().expect("canonicalize the root");
+    (dir, canonical)
+  }
+
+  /// Every blocking job on a thread of its own, counted — the walk never reads a directory
+  /// on the task that drives it.
+  fn spawner(jobs: &Arc<AtomicUsize>) -> BlockingSpawner {
+    let jobs = Arc::clone(jobs);
+    Arc::new(move |job: Box<dyn FnOnce() + Send>| {
+      jobs.fetch_add(1, Ordering::Relaxed);
+      // Detached on purpose: the walk's own oneshot is the join, and a dropped stream
+      // leaves the job to close what it holds where it stands.
+      let _ = std::thread::spawn(job);
+    })
+  }
+
+  /// Drives the walk item by item, reporting what it yielded and the HIGH-WATER of its own
+  /// buffer — the observable that says a chunk job handed back at most [`LIST_CHUNK`]
+  /// entries, whatever the directory's width.
+  async fn drive(walk: Walk) -> (Vec<ListItem<OsString>>, usize) {
+    let mut walk = walk;
+    let mut items = Vec::new();
+    let mut buffered = 0usize;
+    loop {
+      match walk.step().await {
+        None => return (items, buffered),
+        Some((item, next)) => {
+          items.push(item);
+          walk = next;
+          buffered = buffered.max(walk.ready.len());
+        }
+      }
+    }
+  }
+
+  /// The listing of `from` under `root` with `globs`, and its buffer high-water.
+  async fn list(
+    root: &Path,
+    from: &[OsString],
+    globs: &RootGlobs,
+  ) -> (Vec<ListItem<OsString>>, usize) {
+    let jobs = Arc::new(AtomicUsize::new(0));
+    drive(Walk::new(bound(root), from, globs, None, spawner(&jobs))).await
+  }
+
+  /// The root as the lister receives it: its path plus the object identity the registry
+  /// holds for it, read here off the directory that is actually there.
+  fn bound(root: &Path) -> Option<BoundRoot> {
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = std::fs::metadata(root).expect("stat the root");
+    Some((root.to_path_buf(), (meta.dev(), u128::from(meta.ino()))))
+  }
+
+  /// A root that is never opened, so its identity is never read: the cells that use it are
+  /// refused before the walk reaches a syscall.
+  const UNOPENED: ObjectId = (0, 0);
+
+  /// The last component of an admitted item's key.
+  fn leaf(item: &ListItem<OsString>) -> Option<(OsString, EntryKind)> {
+    match item {
+      Ok((key, metadata)) => key.last().cloned().map(|name| (name, metadata.kind())),
+      Err(_) => None,
+    }
+  }
+
+  /// A key that is not a key UNDER the root is covered by no armed root, so it answers the
+  /// same `UnknownRoot` an unwatched key does — rather than being joined onto the root and
+  /// walked, which is how `..` and an absolute component leave the tree entirely.
+  ///
+  /// Revert witness: fold the suffix onto the root with `Path::join` and the `..` case
+  /// enumerates the root's PARENT while every key it yields still reads as being inside the
+  /// watch.
+  #[test]
+  fn a_start_key_that_is_not_a_plain_name_is_one_unknown_root() {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+    fn refused(suffix: &[&OsStr], globs: &RootGlobs) -> bool {
+      let root = PathBuf::from("/root");
+      let mut from = path_components(&root);
+      from.extend(suffix.iter().map(|part| (*part).to_owned()));
+      let jobs = Arc::new(AtomicUsize::new(0));
+      let walk = Walk::new(Some((root, UNOPENED)), &from, globs, None, spawner(&jobs));
+      walk.seed.is_none()
+        && walk.ready.len() == 1
+        && matches!(walk.ready.front(), Some(Err(ListError::UnknownRoot)))
+    }
+
+    let plain = RootGlobs::new();
+    let pruned = RootGlobs::new().with_prune([Glob::new("skip").expect("a pattern")]);
+
+    assert!(refused(&[OsStr::new("..")], &plain), "a parent component");
+    assert!(
+      refused(&[OsStr::new("/abs")], &plain),
+      "an absolute component"
+    );
+    assert!(
+      refused(&[OsStr::new("a/b")], &plain),
+      "an embedded separator"
+    );
+    assert!(refused(&[OsStr::new("")], &plain), "an empty segment");
+    assert!(
+      refused(&[OsStr::from_bytes(b"n\xffame")], &plain),
+      "a name no pattern can be matched against"
+    );
+    assert!(
+      refused(&[OsStr::new("skip")], &pruned),
+      "ground the root's own words refuse to enter"
+    );
+    assert!(
+      refused(&[OsStr::new("skip"), OsStr::new("under")], &pruned),
+      "and every directory prefix of the start, not only its last segment"
+    );
+
+    let root = PathBuf::from("/root");
+    let mut inside = path_components(&root);
+    inside.push(OsString::from("sub"));
+    let jobs = Arc::new(AtomicUsize::new(0));
+    let walk = Walk::new(
+      Some((root, UNOPENED)),
+      &inside,
+      &plain,
+      None,
+      spawner(&jobs),
+    );
+    assert!(
+      walk.ready.is_empty() && walk.seed.is_some(),
+      "staging: a plain name under the root is not refused"
+    );
+  }
+
+  /// A symbolic link at the START is refused by the kernel, not followed: the walk opens
+  /// with no-follow semantics, so the listing is one `Io` item for that key and nothing at
+  /// all is enumerated. Following it is how a listing reports another tree's content under
+  /// keys that read as being inside this watch.
+  #[tokio::test]
+  async fn a_symlinked_start_is_one_io_item_and_lists_nothing() {
+    let (_guard, root) = tree();
+    std::fs::create_dir(root.join("real")).expect("create the real directory");
+    std::fs::write(root.join("real").join("inside.txt"), b"x").expect("write");
+    std::os::unix::fs::symlink(root.join("real"), root.join("link")).expect("link");
+
+    let mut from = path_components(&root);
+    from.push(OsString::from("link"));
+    let (items, _) = list(&root, &from, &RootGlobs::new()).await;
+
+    assert_eq!(items.len(), 1, "exactly one item: {items:?}");
+    match &items[0] {
+      Err(ListError::Io { key, .. }) => assert_eq!(
+        key,
+        &path_components(&root.join("link")),
+        "keyed at the link the walk refused to open"
+      ),
+      other => panic!("expected one `Io` refusal, got {other:?}"),
+    }
+  }
+
+  /// A symbolic link BELOW the start is reported as itself and never descended: it is an
+  /// entry of the tree, and what it points at is not.
+  #[tokio::test]
+  async fn a_symlinked_directory_is_reported_and_never_descended() {
+    let (_guard, root) = tree();
+    std::fs::create_dir(root.join("real")).expect("create the real directory");
+    std::fs::write(root.join("real").join("inside.txt"), b"x").expect("write");
+    std::os::unix::fs::symlink(root.join("real"), root.join("link")).expect("link");
+
+    let (items, _) = list(&root, &path_components(&root), &RootGlobs::new()).await;
+
+    let kinds: Vec<_> = items.iter().filter_map(leaf).collect();
+    assert!(
+      kinds.contains(&(OsString::from("link"), EntryKind::Symlink)),
+      "the link is reported as what it is: {kinds:?}"
+    );
+    assert!(
+      kinds.contains(&(OsString::from("real"), EntryKind::Dir)),
+      "staging: the real directory IS descended: {kinds:?}"
+    );
+    let under_link = path_components(&root.join("link").join("inside.txt"));
+    assert!(
+      !items
+        .iter()
+        .any(|item| matches!(item, Ok((key, _)) if *key == under_link)),
+      "and nothing is ever reported through it: {items:?}"
+    );
+    assert_eq!(
+      items
+        .iter()
+        .filter_map(leaf)
+        .filter(|(name, _)| name == "inside.txt")
+        .count(),
+      1,
+      "the one real file is listed once, under the real directory: {items:?}"
+    );
+  }
+
+  /// A directory wider than one chunk is yielded IN FULL while no single blocking job hands
+  /// back more than [`LIST_CHUNK`] entries — so the walk's memory follows the chunk and the
+  /// depth, never the width a directory happens to have.
+  ///
+  /// Revert witness: collect the whole directory in the job and the buffer high-water is
+  /// the entry count itself.
+  #[tokio::test]
+  async fn a_wide_directory_is_yielded_in_bounded_chunks() {
+    let (_guard, root) = tree();
+    let width = LIST_CHUNK * 3 + 1;
+    for index in 0..width {
+      std::fs::write(root.join(std::format!("f{index}")), b"x").expect("write");
+    }
+
+    let jobs = Arc::new(AtomicUsize::new(0));
+    let (items, buffered) = drive(Walk::new(
+      bound(&root),
+      &path_components(&root),
+      &RootGlobs::new(),
+      None,
+      spawner(&jobs),
+    ))
+    .await;
+
+    assert_eq!(
+      items.iter().filter(|item| item.is_ok()).count(),
+      width,
+      "every entry is yielded: {} of {width}",
+      items.len()
+    );
+    assert!(
+      buffered < LIST_CHUNK,
+      "and no job handed back more than one chunk: {buffered} buffered at once"
+    );
+    assert!(
+      jobs.load(Ordering::Relaxed) >= width / LIST_CHUNK,
+      "which takes a job per chunk, not one for the directory"
+    );
+  }
+
+  /// A tree deeper than the ceiling stops there with one `Io` item for the directory that
+  /// was not descended: the walk holds an open directory per level, so the ceiling is a
+  /// descriptor budget, and it is stated rather than silently truncating.
+  #[tokio::test]
+  async fn a_tree_past_the_depth_ceiling_stops_with_one_io_item() {
+    let (_guard, root) = tree();
+    let mut deepest = root.clone();
+    for _ in 0..(MAX_LIST_DEPTH + 2) {
+      deepest.push("d");
+    }
+    std::fs::create_dir_all(&deepest).expect("create the deep tree");
+
+    let (items, _) = list(&root, &path_components(&root), &RootGlobs::new()).await;
+
+    let refusals: Vec<_> = items
+      .iter()
+      .filter_map(|item| match item {
+        Err(ListError::Io { key, .. }) => Some(key.clone()),
+        _ => None,
+      })
+      .collect();
+    assert_eq!(
+      refusals.len(),
+      1,
+      "exactly one key says the listing stops there: {items:?}"
+    );
+    assert_eq!(
+      items.iter().filter(|item| item.is_ok()).count(),
+      MAX_LIST_DEPTH,
+      "and everything above it was listed: {items:?}"
+    );
+    let stopped = key_to_path(&refusals[0]);
+    assert_eq!(
+      stopped
+        .strip_prefix(&root)
+        .expect("the key is under the root")
+        .components()
+        .count(),
+      MAX_LIST_DEPTH,
+      "at the ceiling itself: {}",
+      stopped.display()
+    );
+  }
+
+  /// A listing is bound to the root's OBJECT, not to its path. A root directory renamed
+  /// away and re-created under the same name opens cleanly and holds an unrelated tree —
+  /// one the event stream says nothing about — so the listing answers the same
+  /// `UnknownRoot` an unwatched key gets.
+  ///
+  /// Revert witness: drop the identity compare and the walk enumerates the stranger's
+  /// entries under the watched root's keys, which a consumer would seed its picture from
+  /// and then never hear about again.
+  #[tokio::test]
+  async fn a_root_replaced_before_the_listing_is_one_unknown_root() {
+    let (_guard, root) = tree();
+    let watched = root.join("watched");
+    std::fs::create_dir(&watched).expect("create the watched root");
+    std::fs::write(watched.join("inside.txt"), b"x").expect("write");
+    // What the registry holds: the object the watch was armed on.
+    let armed = bound(&watched);
+
+    std::fs::rename(&watched, root.join("moved")).expect("rename the root away");
+    std::fs::create_dir(&watched).expect("a new directory under the old name");
+    std::fs::write(watched.join("stranger.txt"), b"x").expect("write");
+
+    let jobs = Arc::new(AtomicUsize::new(0));
+    let (items, _) = drive(Walk::new(
+      armed,
+      &path_components(&watched),
+      &RootGlobs::new(),
+      None,
+      spawner(&jobs),
+    ))
+    .await;
+
+    assert_eq!(items.len(), 1, "exactly one item: {items:?}");
+    assert!(
+      matches!(items.first(), Some(Err(ListError::UnknownRoot))),
+      "and it says the armed root no longer names that directory: {items:?}"
+    );
+  }
+
+  /// The converse, and why the test is identity rather than the path: a root reached
+  /// THROUGH a symlinked ancestor still opens the registered object, so it IS the root and
+  /// lists normally. A path comparison would refuse it.
+  #[tokio::test]
+  async fn a_root_reached_through_a_symlinked_parent_lists_normally() {
+    let (_guard, root) = tree();
+    let real = root.join("real");
+    std::fs::create_dir(&real).expect("create the real parent");
+    std::fs::create_dir(real.join("watched")).expect("create the watched root");
+    std::fs::write(real.join("watched").join("inside.txt"), b"x").expect("write");
+    std::os::unix::fs::symlink(&real, root.join("link")).expect("link the parent");
+
+    let identity = bound(&real.join("watched")).expect("the root is there").1;
+    let through_link = root.join("link").join("watched");
+    let jobs = Arc::new(AtomicUsize::new(0));
+    let (items, _) = drive(Walk::new(
+      Some((through_link.clone(), identity)),
+      &path_components(&through_link),
+      &RootGlobs::new(),
+      None,
+      spawner(&jobs),
+    ))
+    .await;
+
+    let listed: Vec<_> = items.iter().filter_map(leaf).collect();
+    assert_eq!(
+      listed,
+      vec![(OsString::from("inside.txt"), EntryKind::File)],
+      "the registered object is listed however the path reached it: {items:?}"
+    );
+  }
+}

@@ -193,6 +193,7 @@ fn reservations_collide_on_object_identity() {
         ancestors: Vec::new().into(),
         backend: BackendKind::FsEvents,
         stats: None,
+        coverage: Coverage::Proven,
       },
     );
   let err = Reservation::take(&roots, PathBuf::from("/live/root"), Some(id), None)
@@ -243,6 +244,7 @@ async fn backend_stats_is_fanotify_only_and_gated() {
         ancestors: Vec::new().into(),
         backend: BackendKind::FsEvents,
         stats: None,
+        coverage: Coverage::Proven,
       },
     );
     set.entries.insert(
@@ -253,6 +255,7 @@ async fn backend_stats_is_fanotify_only_and_gated() {
         ancestors: Vec::new().into(),
         backend: BackendKind::Fanotify,
         stats: Some(Arc::clone(&shared)),
+        coverage: Coverage::Proven,
       },
     );
   }
@@ -1993,6 +1996,61 @@ async fn foreign_backend_is_a_typed_spawn_error() {
   let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The registry MIRRORS the core's coverage and never writes it: a scope
+/// re-registered by a root replace or a widen keeps the state the core last
+/// published, so a commit cannot promote a root the core is still failing to
+/// prove — while a scope the registry has never held starts proven, as a birth
+/// does.
+///
+/// Revert witness: reset the field on re-registration and a replace of an
+/// unproven root answers `Proven` while the core's episode stays open, with the
+/// next refused tick publishing nothing to correct it.
+#[test]
+fn a_re_registered_live_root_keeps_its_published_coverage() {
+  fn entry(path: &str, ino: u128) -> RootEntry {
+    RootEntry {
+      path: Arc::new(PathBuf::from(path)),
+      identity: RootIdentity::new(1, ino),
+      ancestors: Vec::new().into(),
+      backend: crate::os::BackendKind::FsEvents,
+      stats: None,
+      coverage: Coverage::Proven,
+    }
+  }
+
+  let mut set = RootSet::default();
+  let scope = ScopeId::new(core::num::NonZeroU64::new(3).unwrap());
+  set.insert_live(scope, entry("/a/b", 10));
+  set
+    .entries
+    .get_mut(&scope)
+    .expect("the scope is live")
+    .coverage = Coverage::Unproven;
+
+  set.insert_live(scope, entry("/a", 11));
+  assert_eq!(
+    set.entries.get(&scope).map(|held| held.coverage),
+    Some(Coverage::Unproven),
+    "the widened registration carries the core's published state across"
+  );
+  assert!(
+    set.live_by_path.contains_key(std::path::Path::new("/a")),
+    "while the rest of the entry IS replaced: the new root is indexed"
+  );
+  assert!(
+    !set.live_by_path.contains_key(std::path::Path::new("/a/b")),
+    "and the retired spelling is gone"
+  );
+
+  let fresh = ScopeId::new(core::num::NonZeroU64::new(4).unwrap());
+  set.insert_live(fresh, entry("/c", 12));
+  assert_eq!(
+    set.entries.get(&fresh).map(|held| held.coverage),
+    Some(Coverage::Proven),
+    "a scope the registry never held is born proven"
+  );
+}
+
 /// The replace exemption: a reservation (and the live-set check under it)
 /// excludes exactly ONE scope — the root being replaced — so widening onto
 /// an ancestor of ONLY that root reserves cleanly, while any OTHER live
@@ -2012,6 +2070,7 @@ fn reservation_exemption_excludes_exactly_the_replaced_scope() {
         ancestors: vec![RootIdentity::new(1, 1)].into(),
         backend: crate::os::BackendKind::FsEvents,
         stats: None,
+        coverage: Coverage::Proven,
       },
     );
     set.insert_live(
@@ -2022,6 +2081,7 @@ fn reservation_exemption_excludes_exactly_the_replaced_scope() {
         ancestors: vec![RootIdentity::new(1, 2)].into(),
         backend: crate::os::BackendKind::FsEvents,
         stats: None,
+        coverage: Coverage::Proven,
       },
     );
   }
@@ -2080,6 +2140,7 @@ fn final_root_conflict_exemption_mirrors_the_reservation() {
         ancestors: vec![RootIdentity::new(1, 1)].into(),
         backend: crate::os::BackendKind::FsEvents,
         stats: None,
+        coverage: Coverage::Proven,
       },
     );
   }

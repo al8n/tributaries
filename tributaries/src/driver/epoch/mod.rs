@@ -172,6 +172,21 @@ impl EpochLedger {
     rescan
   }
 
+  /// `sub`'s current high-water stamp — the epoch of the last delivery it was given,
+  /// or [`Epoch::START`] when it has had none.
+  ///
+  /// Read by a delivery that must be ORDERED with the subscription's stream without
+  /// moving it: the root-coverage transitions, which are statements about the watch
+  /// rather than changes under it. Minting them a fresh dominating stamp would make a
+  /// notice dominate a `Rescan` still parked for the same subscription — and that
+  /// `Rescan`, delivered afterwards at its own lower epoch, would no longer dominate
+  /// everything before it. Tying the high-water keeps both true: the notice is dominated
+  /// by nothing it should dominate, and it dominates nothing.
+  #[inline]
+  pub(crate) fn current(&self, sub: Subscription) -> Epoch {
+    self.high_water.get(&sub).copied().unwrap_or(Epoch::START)
+  }
+
   /// Fans one raw event out to its covering, filter-admitting subscribers (design
   /// §5/§7) and stamps each delivery in that subscriber's own monotone epoch space
   /// (design §8).

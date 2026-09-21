@@ -17,7 +17,7 @@ default = ["fs"]
 # re-exports, the pure-fs constructor and runtime aliases). Off, the crate is the
 # generic core over `tributary-proto` alone — a custom-`Source` consumer skips the
 # whole fs stack.
-fs = ["dep:tributary-fs"]
+fs = ["dep:tributary-fs", "dep:rustix"]
 # Runtime features are orthogonal to `fs`: they gate the async driver's
 # `Tokio*`/`Smol*` aliases and forward the runtime into `tributary-fs` only when the
 # fs binding is enabled too (the weak `?` dependency). The sans-I/O engines need no
@@ -98,6 +98,20 @@ tributary-proto = { version = "0.2", path = "../tributary-proto", features = [
 [target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
 getrandom = { version = "0.3", optional = true }
 
+# The listing walk's traversal, and nothing else. A walk that re-opens a queued PATH can be
+# sent out of the tree it was asked about by a rename that puts a symbolic link where a
+# directory was, so every descent is DESCRIPTOR-RELATIVE (`openat`/`statat`, no-follow) with
+# one reader per open level — none of which `std` has a door to. Enabled by the `fs` feature
+# alone, on unix alone: the non-unix fallback is std's own `read_dir`, and a consumer with
+# no fs binding pulls nothing. The floor mirrors `tributary-fs`'s, because one major cannot
+# hold two versions and a minimal-versions lockfile has to resolve a single rustix for the
+# whole workspace.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.3", default-features = false, features = [
+  "fs",
+  "std",
+], optional = true }
+
 [dev-dependencies]
 # Mirror a real consumer's manifest: the indexer-shaped integration suite
 # (`tests/indexer_shaped.rs`) names `tributary_fs::Watcher` + a concrete
@@ -128,6 +142,12 @@ tokio = { version = "1.30", features = ["macros", "rt-multi-thread", "time", "te
 [[test]]
 name = "umbrella"
 required-features = ["fs", "tokio"]
+
+# The coverage-transition laws: an in-memory `Source` whose coverage state the cells
+# flip, so no `fs` binding and no kernel backend is involved — only a runtime.
+[[test]]
+name = "coverage"
+required-features = ["tokio"]
 
 # The custom-source proof: it binds its own `Source` over the `tributary-fs`
 # DEV-dependency, so it deliberately does NOT require `fs` — it must keep compiling

@@ -72,6 +72,18 @@ fn drain(core: &mut DriverCore) -> Vec<Effect> {
   out
 }
 
+/// The root-coverage states one drain published, in order — `true` for a root whose
+/// liveness became unproven, `false` for one proven again.
+fn coverage_publishes(effects: &[Effect]) -> Vec<bool> {
+  effects
+    .iter()
+    .filter_map(|effect| match effect {
+      Effect::Coverage { unproven, .. } => Some(*unproven),
+      _ => None,
+    })
+    .collect()
+}
+
 fn emits(effects: &[Effect]) -> Vec<&Change> {
   effects
     .iter()
@@ -1421,6 +1433,7 @@ fn identity_minting_respects_devices_and_mounts() {
     refresh_stale: false,
     budget_recovered: false,
     budget_report_owed: false,
+    coverage_unproven: false,
     lag: LagState::Normal,
     park: Park::default(),
     resume_poisoned: false,
@@ -1469,6 +1482,7 @@ fn blind_mount_table_refuses_event_side_trust() {
     refresh_stale: false,
     budget_recovered: false,
     budget_report_owed: false,
+    coverage_unproven: false,
     lag: LagState::Normal,
     park: Park::default(),
     resume_poisoned: false,
@@ -3239,6 +3253,7 @@ mod lowering {
       refresh_stale: false,
       budget_recovered: false,
       budget_report_owed: false,
+      coverage_unproven: false,
       lag: LagState::Normal,
       park: Park::default(),
       resume_poisoned: false,
@@ -14809,6 +14824,43 @@ mod root_widened {
     );
   }
 
+  /// The widen is a world start too: the splice ran because the widened root was
+  /// opened, read and pre-armed, which closes an episode the OLD root left open —
+  /// and the latches reset with it, so the next refused tick is a second episode
+  /// rather than a continuation of a retired one.
+  ///
+  /// Revert witness: leave the episode open and the registry, re-registered at
+  /// the widened root, reports a liveness the core is still not proving.
+  #[test]
+  fn a_widen_commit_closes_an_open_coverage_episode() {
+    let (mut core, scope, _root_watch, _boot) = live_at("/r/sub", 1, true);
+
+    core.on_refresh_declined(scope, at(1), DeclineReason::BudgetFull);
+    let lost = drain(&mut core);
+    assert_eq!(
+      coverage_publishes(&lost),
+      vec![true],
+      "staging: the episode is open: {lost:?}"
+    );
+    core.on_delivery(scope, Delivery::Accepted, at(2));
+
+    let _reserved = widen(&mut core, scope, meta("/r", 9), at(3));
+    let spliced = drain(&mut core);
+    assert_eq!(
+      coverage_publishes(&spliced),
+      vec![false],
+      "the commit closes the episode, exactly once: {spliced:?}"
+    );
+
+    core.on_refresh_declined(scope, at(4), DeclineReason::BudgetFull);
+    let again = drain(&mut core);
+    assert_eq!(
+      coverage_publishes(&again),
+      vec![true],
+      "and a refusal after it opens a second, honest episode: {again:?}"
+    );
+  }
+
   #[test]
   fn the_commit_splices_the_world_without_domination() {
     let (mut core, scope, root_watch, _boot) = live_at("/r/sub", 1, true);
@@ -21957,6 +22009,172 @@ mod include {
       located(&changes),
       vec![loc(&["clips"])],
       "no file is admitted, and the directory is not a file: {changes:?}"
+    );
+  }
+}
+
+/// The root-coverage TRANSITIONS: the state a consumer reads through
+/// [`Watcher::coverage`](crate::Watcher::coverage), and the two edges that move it.
+mod coverage_transitions {
+  use super::*;
+
+  /// The coverage STATE moves once per EPISODE, at each edge, however many
+  /// instructions the episode itself stands.
+  ///
+  /// The per-tick `Rescan` is the rate-bounded report a consumer of the direct
+  /// fs stream needs; the transition is the fact underneath it, and a consumer
+  /// that reads the fact must not be told it twice for one window. The
+  /// REGAINING edge is the load-bearing half: nothing else about a probe that
+  /// finally answers reaches the stream, so without the covering `Rescan` this
+  /// edge stands, a consumer that stopped trusting the root would have no
+  /// event on which to ask whether it may trust it again.
+  ///
+  /// Revert witnesses: publish on every refused tick and the second decline
+  /// reports a transition that transitions nothing; drop the regain's
+  /// instruction and the last drain carries no `Rescan` at all.
+  #[test]
+  fn a_probe_budget_episode_publishes_one_transition_per_edge() {
+    let (mut core, scope) = live_core();
+
+    core.on_refresh_declined(scope, at(1), DeclineReason::BudgetFull);
+    let stood = drain(&mut core);
+    assert_eq!(
+      coverage_publishes(&stood),
+      vec![true],
+      "the first refused tick publishes the lost edge, once: {stood:?}"
+    );
+    core.on_delivery(scope, Delivery::Accepted, at(2));
+
+    core.on_refresh_declined(scope, at(3), DeclineReason::BudgetFull);
+    let renewed = drain(&mut core);
+    assert!(
+      coverage_publishes(&renewed).is_empty(),
+      "a later tick of the SAME episode publishes nothing — the state did not \
+       move, only the report was renewed: {renewed:?}"
+    );
+    assert!(
+      emits(&renewed)
+        .iter()
+        .any(|change| change.kind().is_rescan()),
+      "staging: while the instruction itself is still renewed: {renewed:?}"
+    );
+    core.on_delivery(scope, Delivery::Accepted, at(4));
+
+    core.on_mounts_refreshed(scope, alive_refresh(Vec::new(), true), at(5));
+    let regained = drain(&mut core);
+    assert_eq!(
+      coverage_publishes(&regained),
+      vec![false],
+      "the probe that answers publishes the regained edge, once: {regained:?}"
+    );
+    let closing = emits(&regained);
+    assert!(
+      closing.len() == 1 && closing[0].kind().is_rescan(),
+      "and stands the ONE covering `Rescan` that closes the unproven window: \
+       {regained:?}"
+    );
+
+    core.on_delivery(scope, Delivery::Accepted, at(6));
+    core.on_refresh_declined(scope, at(7), DeclineReason::BudgetFull);
+    let again = drain(&mut core);
+    assert_eq!(
+      coverage_publishes(&again),
+      vec![true],
+      "a root that loses coverage again after regaining it says so again: \
+       {again:?}"
+    );
+  }
+
+  /// A probe that answers with the root GONE regained nothing: the death is
+  /// terminal, and the transition would tell a consumer to trust a root that
+  /// is about to be retired underneath it.
+  #[test]
+  fn a_dead_root_publishes_no_regain() {
+    let (mut core, scope) = live_core();
+    core.on_refresh_declined(scope, at(1), DeclineReason::BudgetFull);
+    let _ = drain(&mut core);
+
+    let mut gone = alive_refresh(Vec::new(), true);
+    gone.root = RootLiveness::Missing;
+    core.on_mounts_refreshed(scope, gone, at(2));
+    let dead = drain(&mut core);
+    assert!(
+      coverage_publishes(&dead).is_empty(),
+      "the death funnel owns this outcome, not the transition: {dead:?}"
+    );
+  }
+
+  /// A kernel-recursive replacement for `/r`'s live scope, on the same device.
+  fn replacement(root: &str, ino: u128) -> RootMeta {
+    RootMeta {
+      root: PathBuf::from(root),
+      root_dev: 1,
+      root_mnt_id: None,
+      mounts: Vec::new(),
+      identity: crate::os::RootIdentity::new(1, ino),
+      ancestors: Vec::new(),
+      backend: BackendKind::FsEvents,
+    }
+  }
+
+  /// A WORLD START closes an open episode, because opening, reading and arming
+  /// the new root is the same proof a completed probe carries — and it closes it
+  /// AHEAD of the covering `Rescan` the same commit mints, which is the regain's
+  /// own instruction: a consumer reads the state when that arrives.
+  ///
+  /// The latches go with it, so the swap is not a licence to stay silent: the
+  /// very next refused tick opens a second episode and stands its own
+  /// instruction.
+  ///
+  /// Revert witnesses: leave the episode open and the swap publishes nothing
+  /// while the registry claims a liveness the core never proved; push the edge
+  /// after the drain and it reaches the consumer behind its own `Rescan`.
+  #[test]
+  fn a_world_swap_closes_the_episode_before_its_covering_rescan() {
+    let (mut core, scope) = live_core();
+
+    core.on_refresh_declined(scope, at(1), DeclineReason::BudgetFull);
+    let lost = drain(&mut core);
+    assert_eq!(
+      coverage_publishes(&lost),
+      vec![true],
+      "staging: the episode is open: {lost:?}"
+    );
+    core.on_delivery(scope, Delivery::Accepted, at(2));
+
+    core.on_root_replaced(scope, replacement("/r2", 7), at(3));
+    let swapped = drain(&mut core);
+    assert_eq!(
+      coverage_publishes(&swapped),
+      vec![false],
+      "the commit closes the episode, exactly once: {swapped:?}"
+    );
+    let edge = swapped
+      .iter()
+      .position(|effect| matches!(effect, Effect::Coverage { .. }))
+      .expect("the commit published the closing edge");
+    let instruction = swapped
+      .iter()
+      .position(|effect| matches!(effect, Effect::Emit { change, .. } if change.kind().is_rescan()))
+      .expect("the commit stands its covering Rescan");
+    assert!(
+      edge < instruction,
+      "and the state reaches the registry BEFORE the event a consumer reads it \
+       on: {swapped:?}"
+    );
+
+    core.on_delivery(scope, Delivery::Accepted, at(4));
+    core.on_refresh_declined(scope, at(5), DeclineReason::BudgetFull);
+    let again = drain(&mut core);
+    assert_eq!(
+      coverage_publishes(&again),
+      vec![true],
+      "a refusal right after the swap is a second, honest episode: {again:?}"
+    );
+    assert!(
+      emits(&again).iter().any(|change| change.kind().is_rescan()),
+      "with an instruction of its own, because the swap reset the latches: \
+       {again:?}"
     );
   }
 }

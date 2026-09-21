@@ -17,7 +17,7 @@
 
 use core::ops::Deref;
 
-use crate::subsume::Shared;
+use crate::{options::RootGlobs, subsume::Shared};
 
 #[cfg(test)]
 mod tests;
@@ -60,6 +60,11 @@ impl<V> Deref for Snapshot<V> {
     &self.value
   }
 }
+
+/// The armed root covering a key, as [`WatchView::root_covering`] answers it: the root's
+/// handle, the words it was armed with, and the cover its source has ACTUALLY retained
+/// (`None` for full coverage).
+pub(crate) type RootCover<C, H> = (H, RootGlobs, Option<Vec<Vec<C>>>);
 
 /// A cheap `Clone + Send + Sync` wait-free read handle over the last committed
 /// watch-set (design §5).
@@ -113,6 +118,32 @@ where
   #[must_use]
   pub fn is_watched(&self, key: &[C]) -> bool {
     self.shared.load().covers.get_ancestor(key).is_some()
+  }
+
+  /// The ARMED ROOT covering `key` — its handle, the words it was armed with, and the
+  /// cover the source has ACTUALLY retained for it — or `None` when no armed root does.
+  ///
+  /// The root plane, not the live-subscription plane: it answers what actually backs
+  /// `key` in the source, which is what an enumeration has to run against. Crate-internal
+  /// because the handle is the source's capability and the umbrella's own door
+  /// ([`Tributaries::list`](crate::Tributaries::list)) is what a consumer needs it for.
+  ///
+  /// The retained cover rides along because the armed root's KEY is a geometric claim
+  /// while the cover is the real one: a root pruned back to its survivors still answers
+  /// here for every key under its original span, and the ground it no longer backs has no
+  /// delivery behind it. `None` is full coverage; `Some(prefixes)` is exactly what the
+  /// source holds.
+  #[inline]
+  pub(crate) fn root_covering(&self, key: &[C]) -> Option<RootCover<C, H>>
+  where
+    H: Copy,
+  {
+    self
+      .shared
+      .load()
+      .roots
+      .get_ancestor(key)
+      .map(|root| (root.handle, root.globs.clone(), root.retained_cover.clone()))
   }
 
   /// Whether `key` is watched by an **exact armed root** (not merely covered by an

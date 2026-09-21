@@ -382,6 +382,27 @@ impl Glob {
     &self.inner.source
   }
 
+  /// Whether `path` — a root-relative path, `/`-joined and without a leading
+  /// separator — matches THIS pattern.
+  ///
+  /// The single-pattern twin of [`Globs::is_match`], and it answers on exactly
+  /// the same terms: `path` is folded to NFC on the way in (so a pattern spelled
+  /// one way matches a filesystem that spells the same name the other — see the
+  /// [module docs](self)), and the EMPTY path never matches, because it names
+  /// the root itself, which no pattern may ever cover.
+  ///
+  /// A caller matching ONE pattern needs this rather than a one-element
+  /// [`Globs`]: building a set to ask about a single word compiles a union
+  /// automaton for it and allocates the set's own storage, which is pure cost
+  /// when the answer is a single pattern's.
+  #[cfg_attr(not(tarpaulin), inline)]
+  pub fn is_match(&self, path: &str) -> bool {
+    if path.is_empty() {
+      return false;
+    }
+    self.matches_nfc(&nfc(path))
+  }
+
   /// Whether this ONE pattern matches an ALREADY-NFC candidate.
   ///
   /// The normalization is the caller's ([`Globs`] does it once for a whole set

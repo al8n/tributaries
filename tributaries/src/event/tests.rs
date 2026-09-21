@@ -142,3 +142,65 @@ fn rescan_at_a_descendant_does_not_reach_the_ancestor_key() {
     "a Rescan re-enumerates below its key, never above it"
   );
 }
+
+/// The two root-coverage arms name themselves, answer their own predicates, and are told
+/// apart from a change by ONE question — the one a consumer applying deltas to an index
+/// asks first.
+#[test]
+fn the_coverage_transitions_are_a_state_not_a_change() {
+  for (kind, name) in [
+    (EventKind::<OsString>::CoverageLost, "coverage_lost"),
+    (EventKind::<OsString>::CoverageRegained, "coverage_regained"),
+  ] {
+    assert_eq!(kind.as_str(), name);
+    assert_eq!(kind.to_string(), name);
+    assert!(
+      kind.is_coverage_transition(),
+      "{name} is a statement about the watch"
+    );
+    assert!(
+      !kind.is_rescan() && !kind.is_created() && !kind.is_modified() && !kind.is_removed(),
+      "{name} is not a change at the event's key"
+    );
+    assert_eq!(kind.moved_from(), None, "{name} names no second endpoint");
+  }
+  assert!(EventKind::<OsString>::CoverageLost.is_coverage_lost());
+  assert!(!EventKind::<OsString>::CoverageLost.is_coverage_regained());
+  assert!(EventKind::<OsString>::CoverageRegained.is_coverage_regained());
+  assert!(!EventKind::<OsString>::CoverageRegained.is_coverage_lost());
+  assert!(
+    !EventKind::<OsString>::Rescan.is_coverage_transition(),
+    "a Rescan is a loss, not a transition: it says re-enumerate, not stop trusting"
+  );
+}
+
+/// A transition REACHES everything below its key, the way a `Rescan` does and an ordinary
+/// delta does not: it says the watch behind this subscription stopped (or resumed) being
+/// able to account for its whole subtree, so every object a consumer tracks under it is
+/// implicated.
+#[test]
+fn a_coverage_transition_reaches_the_whole_subtree() {
+  for kind in [EventKind::CoverageLost, EventKind::CoverageRegained] {
+    let transition = ev("/a/b", kind.clone());
+    assert!(
+      transition.is_coverage_transition(),
+      "staging: the delivery carries the transition"
+    );
+    assert!(
+      transition.reaches(&key("/a/b")),
+      "{kind} reaches its own key"
+    );
+    assert!(
+      transition.reaches(&key("/a/b/deep/file")),
+      "{kind} reaches everything below it"
+    );
+    assert!(
+      !transition.reaches(&key("/a")),
+      "{kind} says nothing about ground above the key it names"
+    );
+    assert!(
+      !transition.reaches(&key("/z")),
+      "{kind} says nothing about another subtree"
+    );
+  }
+}

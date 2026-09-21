@@ -1679,6 +1679,8 @@ impl Harness {
       needs_rescan: ParkedRescans::new(),
       suppressed_rescan: ParkedRescans::new(),
       unclaimed: std::collections::HashSet::new(),
+      coverage_lost: std::collections::HashSet::new(),
+      coverage_told: std::collections::HashSet::new(),
       flush_cursor: None,
       #[cfg(test)]
       last_flush_visited: 0,
@@ -9376,6 +9378,8 @@ impl OwnerU64 {
       needs_rescan: ParkedRescans::new(),
       suppressed_rescan: ParkedRescans::new(),
       unclaimed: std::collections::HashSet::new(),
+      coverage_lost: std::collections::HashSet::new(),
+      coverage_told: std::collections::HashSet::new(),
       flush_cursor: None,
       #[cfg(test)]
       last_flush_visited: 0,
@@ -13692,6 +13696,8 @@ impl<V: Clone> OwnerOverValue<V> {
       needs_rescan: ParkedRescans::new(),
       suppressed_rescan: ParkedRescans::new(),
       unclaimed: std::collections::HashSet::new(),
+      coverage_lost: std::collections::HashSet::new(),
+      coverage_told: std::collections::HashSet::new(),
       flush_cursor: None,
       #[cfg(test)]
       last_flush_visited: 0,
@@ -15347,6 +15353,8 @@ impl OwnerOverHostileKeys {
       needs_rescan: ParkedRescans::new(),
       suppressed_rescan: ParkedRescans::new(),
       unclaimed: std::collections::HashSet::new(),
+      coverage_lost: std::collections::HashSet::new(),
+      coverage_told: std::collections::HashSet::new(),
       flush_cursor: None,
       #[cfg(test)]
       last_flush_visited: 0,
@@ -17298,6 +17306,8 @@ async fn release_marks_handle_logically_dead_immediately_even_with_transport_pen
     needs_rescan: ParkedRescans::new(),
     suppressed_rescan: ParkedRescans::new(),
     unclaimed: std::collections::HashSet::new(),
+    coverage_lost: std::collections::HashSet::new(),
+    coverage_told: std::collections::HashSet::new(),
     flush_cursor: None,
     #[cfg(test)]
     last_flush_visited: 0,
@@ -17479,6 +17489,8 @@ async fn unclaimed_orphans_parked_rescan_is_suppressed_by_state_in_the_run_loop(
     needs_rescan: ParkedRescans::new(),
     suppressed_rescan: ParkedRescans::new(),
     unclaimed: std::collections::HashSet::new(),
+    coverage_lost: std::collections::HashSet::new(),
+    coverage_told: std::collections::HashSet::new(),
     flush_cursor: None,
     #[cfg(test)]
     last_flush_visited: 0,
