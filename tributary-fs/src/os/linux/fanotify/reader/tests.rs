@@ -158,6 +158,9 @@ fn run_process(
         SourceMessage::Overflow(_) => Sent::Overflow,
         SourceMessage::Fatal(_) => Sent::Fatal,
         SourceMessage::Honored(paths) => Sent::Honored(paths),
+        SourceMessage::Cut { .. } | SourceMessage::Recovered { .. } => {
+          unreachable!("this seam drives no whole-root request")
+        }
       });
       true
     },
@@ -258,6 +261,9 @@ fn run_process_with_subtree(
         SourceMessage::Overflow(_) => Sent::Overflow,
         SourceMessage::Fatal(_) => Sent::Fatal,
         SourceMessage::Honored(paths) => Sent::Honored(paths),
+        SourceMessage::Cut { .. } | SourceMessage::Recovered { .. } => {
+          unreachable!("this seam drives no whole-root request")
+        }
       });
       true
     },
@@ -1203,6 +1209,9 @@ mod exclusion_fence {
           SourceMessage::Overflow(_) => Sent::Overflow,
           SourceMessage::Fatal(_) => Sent::Fatal,
           SourceMessage::Honored(paths) => Sent::Honored(paths.clone()),
+          SourceMessage::Cut { .. } | SourceMessage::Recovered { .. } => {
+            unreachable!("this seam drives no whole-root request")
+          }
         });
         if let SourceMessage::Batch(payload) = msg {
           for ev in payload.events {
@@ -1969,7 +1978,9 @@ mod exclusion_fence {
 mod liveness {
   use std::{sync::mpsc, time::Duration};
 
-  use super::super::{Control, DrainExit, ReaderShared, ReseedContext, drain_events};
+  use super::super::{
+    Control, DrainExit, ReaderShared, ReseedContext, drain_events, run_root_recovery,
+  };
   use crate::os::{
     BackendStatsShared, SourceMessage, linux::fanotify::map::FidMap, transport::TransportState,
   };
@@ -2016,7 +2027,7 @@ mod liveness {
 
     let (done_tx, done_rx) = mpsc::channel();
     let worker = std::thread::spawn(move || {
-      let exit = drain_events(&fd, &mut buf, &mut map, &reseed, &rx, &shared);
+      let exit = drain_events(&fd, &mut buf, &mut map, &reseed, &rx, &shared, &mut None);
       let _ = done_tx.send(exit);
     });
     let exit = done_rx
@@ -2061,7 +2072,7 @@ mod liveness {
 
     let (done_tx, done_rx) = mpsc::channel();
     let worker = std::thread::spawn(move || {
-      let exit = drain_events(&fd, &mut buf, &mut map, &reseed, &rx, &shared);
+      let exit = drain_events(&fd, &mut buf, &mut map, &reseed, &rx, &shared, &mut None);
       let _ = done_tx.send(exit);
     });
     let exit = done_rx
@@ -2083,5 +2094,70 @@ mod liveness {
       queue_rx.try_recv().is_err(),
       "and the only thing: the source is done, not covered and continuing"
     );
+  }
+
+  /// A requested whole-root reseed is RECORDED at a control boundary and
+  /// completed IN BAND afterwards, never pushed from the boundary itself (#74).
+  ///
+  /// The completion is what the core turns into a whole-root `Rescan`, so it has
+  /// to sit behind every event the kernel already held — otherwise the consumer
+  /// re-reads the tree and is only then told about the world as it was before
+  /// the mount change, with a table that has stopped moving firing no second
+  /// cover to correct it. Control is serviced BEFORE and BETWEEN reads by
+  /// design, so the boundary is exactly where the completion may not be sent;
+  /// the fd here never returns `EAGAIN`, which makes "still holding events" the
+  /// standing condition rather than a race.
+  ///
+  /// MUTATION WITNESS: run the walk inside `service_control` and the queue below
+  /// carries the completion while the fd is still full.
+  #[test]
+  fn a_reseed_request_completes_in_band_after_the_walk() {
+    let fd = never_eagain_fd();
+    let (tx, rx) = mpsc::channel();
+    tx.send(Control::Reseed { epoch: 7 })
+      .expect("enqueue the reseed");
+    tx.send(Control::Shutdown).expect("enqueue shutdown");
+    let (shared, queue_rx) = reader_shared();
+    let reseed = ReseedContext::for_test(std::path::PathBuf::from("/nonexistent"));
+    let mut map = FidMap::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut pending = None;
+
+    let exit = drain_events(&fd, &mut buf, &mut map, &reseed, &rx, &shared, &mut pending);
+    assert_eq!(exit, DrainExit::Shutdown);
+    assert_eq!(
+      pending,
+      Some(7),
+      "the request is taken off the channel and held, not discarded"
+    );
+    assert!(
+      queue_rx.try_recv().is_err(),
+      "and NOTHING is published from the control boundary, with the fd still holding events"
+    );
+
+    // Past the drain — here, the caller's own site — the walk runs and its
+    // verdict rides the queue.
+    run_root_recovery(&mut map, &reseed, &shared.stats, 7, |msg| {
+      shared.queue.try_send(msg).is_ok()
+    });
+    match queue_rx.try_recv() {
+      Ok(SourceMessage::Recovered {
+        epoch,
+        outcome,
+        honored,
+      }) => {
+        assert_eq!(
+          epoch, 7,
+          "the completion carries the epoch it was asked for"
+        );
+        assert_eq!(
+          outcome,
+          crate::os::RootRecovery::Unreachable,
+          "an unwalkable root is blindness, and blind is what the core is told"
+        );
+        assert!(honored.is_empty(), "a walk that failed honored nothing");
+      }
+      other => panic!("the completion rides the source queue: {other:?}"),
+    }
   }
 }

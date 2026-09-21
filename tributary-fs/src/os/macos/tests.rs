@@ -58,6 +58,11 @@ fn recv_until(
       }
       Ok(SourceMessage::Overflow(_ack)) => overflow = true,
       Ok(SourceMessage::Fatal(err)) => panic!("stream died: {err}"),
+      // A mac source cuts no lane and rebuilds no map (#74): its whole-root
+      // cover is main's, published straight off the mount refresh.
+      Ok(SourceMessage::Cut { .. } | SourceMessage::Recovered { .. }) => {
+        unreachable!("an FSEvents stream answers no lane request")
+      }
       Err(async_channel::TryRecvError::Empty) => thread::sleep(Duration::from_millis(10)),
       Err(async_channel::TryRecvError::Closed) => break,
     }
@@ -670,6 +675,11 @@ fn over_budget_batches_signal_one_inband_overflow() {
       Ok(SourceMessage::Overflow(ack)) => break ack,
       Ok(SourceMessage::Batch(_)) => {}
       Ok(SourceMessage::Fatal(err)) => panic!("stream died: {err}"),
+      // A mac source cuts no lane and rebuilds no map (#74): its whole-root
+      // cover is main's, published straight off the mount refresh.
+      Ok(SourceMessage::Cut { .. } | SourceMessage::Recovered { .. }) => {
+        unreachable!("an FSEvents stream answers no lane request")
+      }
       Err(_) => {
         assert!(
           Instant::now() < end,
@@ -702,6 +712,9 @@ fn over_budget_batches_signal_one_inband_overflow() {
         last_was_overflow = true;
       }
       SourceMessage::Fatal(err) => panic!("stream died: {err}"),
+      SourceMessage::Cut { .. } | SourceMessage::Recovered { .. } => {
+        unreachable!("an FSEvents stream answers no lane request")
+      }
     }
   }
 
@@ -719,6 +732,11 @@ fn over_budget_batches_signal_one_inband_overflow() {
       Ok(SourceMessage::Overflow(_)) => break,
       Ok(SourceMessage::Batch(_)) => {}
       Ok(SourceMessage::Fatal(err)) => panic!("stream died: {err}"),
+      // A mac source cuts no lane and rebuilds no map (#74): its whole-root
+      // cover is main's, published straight off the mount refresh.
+      Ok(SourceMessage::Cut { .. } | SourceMessage::Recovered { .. }) => {
+        unreachable!("an FSEvents stream answers no lane request")
+      }
       Err(_) => {
         assert!(
           Instant::now() < end,

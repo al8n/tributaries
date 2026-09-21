@@ -4957,15 +4957,18 @@ mod descending {
     );
   }
 
-  /// And the scope's OWN ROOT reports nothing either, however the refusal was
-  /// decided. A boundary is a mount STRICTLY UNDER the root — a location with a
-  /// row in a table read under it — and the root's own location has none, so
-  /// recording it would hand every later sample a question whose only possible
-  /// answer is "gone" and buy a whole-root cover for a root that is already
-  /// taking the death path.
+  /// The scope's OWN ROOT reports nothing, however the refusal was decided: it
+  /// takes the DEATH path instead.
   ///
-  /// FAIL-ON-REVERT: record the boundary for the root watch too and the set
-  /// below holds `/r`.
+  /// A boundary is a mount STRICTLY UNDER the root — a location with a row in a
+  /// table read under it — and the root's own location has none, so a boundary
+  /// recorded for it could only ever be answered "gone". What a foreign ROOT
+  /// says is that this transport cannot cover this root at all, which is the
+  /// verdict `Gone` reaches: the scope ends here, and the set it was keeping
+  /// ends with it.
+  ///
+  /// The recording guard is therefore belt to the death's braces — the set is
+  /// read below for whatever survives — and the death is what this pins.
   #[test]
   fn a_foreign_root_arm_records_no_boundary() {
     let (mut core, scope, req, root_watch) = live_descending_mnt(42);
@@ -4980,14 +4983,18 @@ mod descending {
       crate::os::linux::WatchOutcome::Foreign,
     );
     let _ = drain(&mut core);
-    assert!(
-      core
-        .scopes
-        .get(&scope)
-        .expect("the scope outlives its root's refusal")
-        .honored_boundaries
-        .is_empty(),
+    let held = core
+      .scopes
+      .get(&scope)
+      .map_or(0, |state| state.honored_boundaries.len());
+    assert_eq!(
+      held, 0,
       "the root's own location is no boundary under itself"
+    );
+    assert!(
+      !core.scopes.contains_key(&scope),
+      "and a root this transport cannot cover takes the death path, exactly as \
+       `Gone` does"
     );
   }
 
@@ -13689,7 +13696,13 @@ mod kernel_recursive_fanotify {
 
     // The reseed lands: the map can see the tree again, so now the consumer is
     // told to re-read it.
-    core.on_root_recovered(scope, epoch, crate::os::RootRecovery::Reseeded, at(2));
+    core.on_root_recovered(
+      scope,
+      epoch,
+      crate::os::RootRecovery::Reseeded,
+      Vec::new(),
+      at(2),
+    );
     let effects = drain(&mut core);
     let emitted = emits(&effects);
     assert_eq!(
@@ -13706,7 +13719,7 @@ mod kernel_recursive_fanotify {
   }
 
   /// A reply whose epoch is no longer the scope's is DROPPED whole. The walk runs
-  /// on the blocking pool while the world can move under it, and a map rebuilt
+  /// on the source's own reader thread while the world can move under it, and a map rebuilt
   /// over the root this scope watched a moment ago says nothing about the root it
   /// watches now — the replace has already covered that one.
   #[test]
@@ -13738,7 +13751,13 @@ mod kernel_recursive_fanotify {
     );
     let _ = drain(&mut core);
 
-    core.on_root_recovered(scope, epoch, crate::os::RootRecovery::Reseeded, at(3));
+    core.on_root_recovered(
+      scope,
+      epoch,
+      crate::os::RootRecovery::Reseeded,
+      Vec::new(),
+      at(3),
+    );
     let effects = drain(&mut core);
     assert!(
       emits(&effects).is_empty(),
@@ -13750,11 +13769,141 @@ mod kernel_recursive_fanotify {
     );
   }
 
+  /// A completion carries the mount boundaries ITS walk stopped at, and the next
+  /// authoritative sample puts them to the table (#74).
+  ///
+  /// The walk is the only thing that knows where it stopped, and a boundary the
+  /// table no longer carries was hiding ground no walk read and no sample ever
+  /// listed — the one shape a row-to-row diff cannot see, since neither sample
+  /// held it.
+  #[test]
+  fn a_fanotify_recovery_completion_carries_its_honored_boundaries() {
+    let (mut core, scope) = live_fanotify();
+    core.on_mounts_refreshed(
+      scope,
+      alive_refresh(vec![PathBuf::from("/r/vol")], true),
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let [epoch] = recoveries(&effects, scope)[..] else {
+      panic!("the change asks for a reseed: {effects:?}");
+    };
+
+    // The reseed walk stopped at a mount below the one in the table, and its
+    // completion is what says so.
+    core.on_root_recovered(
+      scope,
+      epoch,
+      crate::os::RootRecovery::Reseeded,
+      vec![PathBuf::from("/r/vol/inner")],
+      at(2),
+    );
+    let _ = drain(&mut core);
+
+    // An unchanged table, so the rows say nothing — and the boundary says
+    // everything: no row carries it, so the mount is gone and the ground it hid
+    // was read by nothing.
+    core.on_mounts_refreshed(
+      scope,
+      alive_refresh(vec![PathBuf::from("/r/vol")], true),
+      at(3),
+    );
+    let effects = drain(&mut core);
+    assert_eq!(
+      recoveries(&effects, scope).len(),
+      1,
+      "the boundary the table cannot find costs one whole-root cover: {effects:?}"
+    );
+  }
+
+  /// A completion whose epoch is stale drops its boundaries WITH it (#74).
+  ///
+  /// They are that walk's questions about that walk's tree. Kept past the world
+  /// they were asked in, a location no sample of the new world will ever hold
+  /// covers the root once for a walk this scope has already left behind.
+  #[test]
+  fn a_stale_in_band_recovery_drops_its_honored_boundaries() {
+    let (mut core, scope) = live_fanotify();
+    core.on_mounts_refreshed(
+      scope,
+      alive_refresh(vec![PathBuf::from("/r/vol")], true),
+      at(1),
+    );
+    let effects = drain(&mut core);
+    let [first] = recoveries(&effects, scope)[..] else {
+      panic!("the change asks for a reseed: {effects:?}");
+    };
+    core.on_root_recovered(
+      scope,
+      first,
+      crate::os::RootRecovery::Reseeded,
+      Vec::new(),
+      at(2),
+    );
+    let _ = drain(&mut core);
+
+    // The table moves again, so a second walk is asked for and the first one's
+    // epoch is no longer this scope's.
+    core.on_mounts_refreshed(
+      scope,
+      alive_refresh(vec![PathBuf::from("/r/vol2")], true),
+      at(3),
+    );
+    let effects = drain(&mut core);
+    let [second] = recoveries(&effects, scope)[..] else {
+      panic!("the second change asks for a reseed: {effects:?}");
+    };
+    assert_ne!(first, second, "each request stamps its own epoch");
+
+    core.on_root_recovered(
+      scope,
+      first,
+      crate::os::RootRecovery::Reseeded,
+      vec![PathBuf::from("/r/ghost")],
+      at(4),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      emits(&effects).is_empty(),
+      "a walk of a world that ended covers nothing: {effects:?}"
+    );
+    assert!(
+      core
+        .scopes
+        .get(&scope)
+        .expect("scope lives")
+        .honored_boundaries
+        .is_empty(),
+      "and asks nothing of the world that replaced it"
+    );
+
+    // Non-vacuity: the live walk completes, and the sample after it finds
+    // nothing to answer.
+    core.on_root_recovered(
+      scope,
+      second,
+      crate::os::RootRecovery::Reseeded,
+      Vec::new(),
+      at(5),
+    );
+    let _ = drain(&mut core);
+    core.on_mounts_refreshed(
+      scope,
+      alive_refresh(vec![PathBuf::from("/r/vol2")], true),
+      at(6),
+    );
+    let effects = drain(&mut core);
+    assert!(
+      recoveries(&effects, scope).is_empty(),
+      "an unchanged table with no boundary owing covers nothing: {effects:?}"
+    );
+  }
+
   /// A fire arriving while a recovery is in flight runs EXACTLY ONE more when it
   /// lands, however many arrived. The in-flight walk may have descended past the
   /// ground the newer change touched, so its map cannot be trusted to have seen
-  /// it; stacking one walk per fire would let a churning table hold the blocking
-  /// pool for as long as the churn lasts.
+  /// it; stacking one walk per fire would let a churning table hold the source's
+  /// reader thread for as long as the churn lasts.
   #[test]
   fn a_fire_during_a_recovery_runs_exactly_one_more_after_it() {
     let (mut core, scope) = live_fanotify();
@@ -13782,7 +13931,13 @@ mod kernel_recursive_fanotify {
     }
 
     // The first walk lands: it covers, and exactly one follow-up runs.
-    core.on_root_recovered(scope, first, crate::os::RootRecovery::Reseeded, at(4));
+    core.on_root_recovered(
+      scope,
+      first,
+      crate::os::RootRecovery::Reseeded,
+      Vec::new(),
+      at(4),
+    );
     let effects = drain(&mut core);
     assert_eq!(
       emits(&effects).len(),
@@ -13795,7 +13950,13 @@ mod kernel_recursive_fanotify {
     assert_ne!(second, first, "the follow-up carries its own epoch");
 
     // And the follow-up settles it: one more cover, and no third walk.
-    core.on_root_recovered(scope, second, crate::os::RootRecovery::Reseeded, at(5));
+    core.on_root_recovered(
+      scope,
+      second,
+      crate::os::RootRecovery::Reseeded,
+      Vec::new(),
+      at(5),
+    );
     let effects = drain(&mut core);
     assert_eq!(
       emits(&effects).len(),
@@ -13827,7 +13988,13 @@ mod kernel_recursive_fanotify {
       panic!("the change asks for a reseed: {effects:?}");
     };
 
-    core.on_root_recovered(scope, epoch, crate::os::RootRecovery::Unreachable, at(2));
+    core.on_root_recovered(
+      scope,
+      epoch,
+      crate::os::RootRecovery::Unreachable,
+      Vec::new(),
+      at(2),
+    );
     let effects = drain(&mut core);
     let emitted = emits(&effects);
     assert_eq!(emitted.len(), 2, "the death lifecycle, whole: {effects:?}");

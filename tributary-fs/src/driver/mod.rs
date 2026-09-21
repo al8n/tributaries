@@ -7493,21 +7493,6 @@ pub(crate) trait FsOps: Clone + Send + Sync + 'static {
   /// timer or effect.
   fn refresh_mounts(&self, root: &Path) -> MountRefresh;
 
-  /// Rebuilds `scope`'s source-side sight of the WHOLE root (blocking), for the
-  /// coarse mount-change cover (#74).
-  ///
-  /// Only the fanotify backend has anything to do here: its sight is a FID map
-  /// seeded by a walk that stops at mount boundaries, so ground a departed mount
-  /// revealed is ground the map has never seen. Every other backend's coverage is
-  /// a kernel-side mark or a per-directory re-arm the Monitor drives itself, so
-  /// the default answers
-  /// [`Reseeded`](crate::os::RootRecovery::Reseeded) — there was nothing to
-  /// rebuild, and the cover may proceed.
-  fn recover_root(&self, scope: ScopeId) -> crate::os::RootRecovery {
-    let _ = scope;
-    crate::os::RootRecovery::Reseeded
-  }
-
   /// Attaches the arm/disarm port of `scope`'s freshly spawned source under
   /// its transport `generation` (the delivery lane), so the descending
   /// executors can route to its reader AND recognize a control batch left
@@ -7731,6 +7716,43 @@ pub(crate) trait SourceControl: Send + 'static {
     ScopePort::Inert
   }
 
+  /// Asks this source's reader to CUT its lane at `seq` (#74): drain everything
+  /// the kernel has already committed onto the queue, then push
+  /// [`SourceMessage::Cut`] behind it. Answers whether the request was
+  /// delivered.
+  ///
+  /// `false` is the honest answer wherever the ordering it establishes is not
+  /// this door's to give: a reader already gone, and every backend whose
+  /// whole-root cover is not published straight off the mount refresh —
+  /// fanotify, whose cover rides its own in-band recovery completion; FSEvents,
+  /// which has no descriptor to drain and no reader to ask; Windows;
+  /// unsupported. A refused cut makes the driver apply the refresh at once,
+  /// which is what it always did.
+  fn cut(&self, seq: u64) -> bool {
+    let _ = seq;
+    false
+  }
+
+  /// Asks this source to rebuild its sight of the WHOLE root under `epoch` and
+  /// answer IN BAND, on this source's own queue (#74). Answers whether the
+  /// request was delivered.
+  ///
+  /// Only the fanotify backend has anything to rebuild: its sight is a FID map
+  /// seeded by a walk that stops at mount boundaries, so ground a departed mount
+  /// revealed is ground the map has never seen. Every other backend covers
+  /// through a kernel-side mark or a per-directory re-arm the Monitor drives
+  /// itself and answers `false` — there was nothing to rebuild, and the driver
+  /// completes the recovery inline so the cover may proceed.
+  ///
+  /// The request is a send and a wake; nothing waits on it. The walk runs on the
+  /// source's own reader thread, between reads, and its completion arrives as
+  /// [`SourceMessage::Recovered`] behind every event the kernel held when it
+  /// began.
+  fn recover(&self, epoch: u64) -> bool {
+    let _ = epoch;
+    false
+  }
+
   /// The source's live stats handle, `Some` only for a fanotify source (every
   /// other backend has no pollable internals — design §4.9). The driver threads
   /// it into the registry so [`Watcher::backend_stats`](crate::Watcher::backend_stats)
@@ -7758,6 +7780,16 @@ impl SourceControl for SourceHandle {
   #[cfg(all(target_os = "linux", not(miri)))]
   fn scope_port(&self) -> ScopePort {
     SourceHandle::scope_port(self)
+  }
+
+  #[cfg(all(target_os = "linux", not(miri)))]
+  fn cut(&self, seq: u64) -> bool {
+    SourceHandle::cut(self, seq)
+  }
+
+  #[cfg(all(target_os = "linux", not(miri)))]
+  fn recover(&self, epoch: u64) -> bool {
+    SourceHandle::recover(self, epoch)
   }
 
   #[cfg(all(target_os = "linux", not(miri)))]
@@ -10675,24 +10707,6 @@ impl FsOps for RealFs {
     }
   }
 
-  /// Reseeds the scope's fanotify FID map over the whole root, through the
-  /// recovery port its spawn attached. A scope with no attached port answers
-  /// `Reseeded`: it is an inotify or a torn-down scope, and there is no map.
-  ///
-  /// No generation fence here, unlike the arm path. An arm names an old world's
-  /// PATH and must not install on a replacement's fd; a reseed names no object at
-  /// all — it asks the source that is live right now to re-walk the root it is
-  /// live on, which is never the wrong thing to do. The core's own epoch is what
-  /// decides whether the ANSWER still means anything.
-  #[cfg(all(target_os = "linux", not(miri)))]
-  fn recover_root(&self, scope: ScopeId) -> crate::os::RootRecovery {
-    let port = match self.ports.read().unwrap().get(&scope) {
-      Some((_, ScopePort::Fanotify(port))) => port.clone(),
-      _ => return crate::os::RootRecovery::Reseeded,
-    };
-    port.recover()
-  }
-
   #[cfg(all(target_os = "linux", not(miri)))]
   fn attach_scope(&self, scope: ScopeId, port: ScopePort, generation: u64) {
     self
@@ -11948,15 +11962,6 @@ enum OpResult<H> {
     generation: u64,
     refresh: MountRefresh,
   },
-  /// One [`Effect::RecoverRoot`] finished: the fanotify source's FID map was
-  /// rebuilt over the whole root, or the walk could not reach it. The `epoch` is
-  /// echoed back untouched so the core can drop a reply from a world that ended
-  /// while the walk ran.
-  RootRecovered {
-    scope: ScopeId,
-    epoch: u64,
-    outcome: crate::os::RootRecovery,
-  },
   TornDown {
     scope: ScopeId,
   },
@@ -12278,6 +12283,11 @@ pub(crate) async fn run<R, F>(
   // the replace commit's covering Rescan) — its end marker is not a death.
   let mut lanes: BTreeMap<ScopeId, u64> = BTreeMap::new();
   let mut next_lane: u64 = 0;
+  // Mount refreshes held behind a cut of their scope's lane (#74), one per
+  // scope at most. Emptied by the marker they are waiting for, by a newer
+  // refresh, and by the end of the stream that was asked to cut.
+  let mut pending_refreshes: BTreeMap<ScopeId, PendingRefresh> = BTreeMap::new();
+  let mut next_cut_seq: u64 = 0;
   // Off-loop work that owns — or is about to own — a native stream: spawns
   // dispatched to the blocking pool but not yet returned, teardowns handed to
   // `reaper` but not yet confirmed. Close quiesces BOTH alongside the live
@@ -12648,6 +12658,7 @@ pub(crate) async fn run<R, F>(
             &lanes,
             &mut streams.replace_states,
             &streams.handles,
+            &mut pending_refreshes,
             item,
             &now,
           );
@@ -12950,6 +12961,7 @@ pub(crate) async fn run<R, F>(
         &lanes,
         &mut streams.replace_states,
         &streams.handles,
+        &mut pending_refreshes,
         item,
         &now,
       );
@@ -13440,14 +13452,17 @@ pub(crate) async fn run<R, F>(
             // a world it no longer watches (its liveness verdict above all), and
             // an answer for a torn-down scope has nothing left to feed.
             if probes.retire(scope, generation) {
-              core.on_mounts_refreshed(scope, refresh, now());
+              apply_or_stash_refresh::<F>(
+                &mut core,
+                &mut pending_refreshes,
+                &mut next_cut_seq,
+                &streams.handles,
+                scope,
+                refresh,
+                &now,
+              );
             }
           }
-          OpResult::RootRecovered {
-            scope,
-            epoch,
-            outcome,
-          } => core.on_root_recovered(scope, epoch, outcome, now()),
           OpResult::WatchInstalled {
             watch,
             attempt,
@@ -14733,7 +14748,7 @@ pub(crate) async fn run<R, F>(
       },
       msg = os.next() => {
         if let Some(item) = msg {
-          ingest_source_item::<F>(&mut core, &lanes, &mut streams.replace_states, &streams.handles, item, &now);
+          ingest_source_item::<F>(&mut core, &lanes, &mut streams.replace_states, &streams.handles, &mut pending_refreshes, item, &now);
         }
       },
     }
@@ -14919,14 +14934,6 @@ pub(crate) async fn run<R, F>(
               core.on_mounts_refreshed(scope, refresh, now());
             }
           }
-          // A recovery that landed inside the close sweep: the scope is ending,
-          // so its cover is moot, but the reply still has to be consumed off the
-          // queue like every other terminal.
-          Ok(OpResult::RootRecovered {
-            scope,
-            epoch,
-            outcome,
-          }) => core.on_root_recovered(scope, epoch, outcome, now()),
           // A spawn that raced the close: the stream is live but has no owner —
           // tear it down INSIDE the close accounting (the handle's Drop is only
           // the backstop past the grace) and hold the close reply for its
@@ -15125,6 +15132,7 @@ pub(crate) async fn run<R, F>(
         &lanes,
         &mut streams.replace_states,
         &streams.handles,
+        &mut pending_refreshes,
         item,
         &now,
       );
@@ -16730,12 +16738,70 @@ const fn root_arm_outcome(outcome: WatchOutcome) -> WatchOutcome {
   }
 }
 
+/// One mount refresh held back until the scope's source lane has been CUT
+/// (#74) — the cover it may stand must not overtake events the reader pushed
+/// before the sample was taken — paired with the marker sequence it waits for.
+///
+/// The sequence is minted once per accepted cut and never reused, which is also
+/// what carries the WORLD: a marker from a lane a replace has retired never
+/// reaches the driver (the ingest fence drops it) and could not match this
+/// sequence if it did, so a refresh left waiting on a retired lane's cut is
+/// applied by the next refresh instead of answered by a stranger.
+type PendingRefresh = (u64, MountRefresh);
+
+/// Applies one mount refresh, or STASHES it behind a cut of the scope's source
+/// lane (#74).
+///
+/// The cover a refresh can stand is a whole-root `Rescan`, and the refresh
+/// arrives on the operation queue while the events it must dominate travel on
+/// the scope's own lane — so without the cut a batch the reader pushed BEFORE
+/// the mount sample can be ingested after the cover, naming ground the change
+/// has since hidden, with a stable table firing no later cover to correct it.
+///
+/// At most ONE refresh is ever held, and a newer one applies the held refresh
+/// first, in arrival order. That is what bounds the wait on a reader: a cut that
+/// has not been answered within a liveness interval costs the ORDERING and
+/// nothing else — the refresh still lands, exactly as it did before the cut
+/// existed. It has to, because a refresh is not only a cover: its first gate is
+/// the root-liveness verdict, and on a kernel-recursive backend that gate is the
+/// scope's only root-death check.
+fn apply_or_stash_refresh<F: FsOps>(
+  core: &mut DriverCore,
+  pending: &mut BTreeMap<ScopeId, PendingRefresh>,
+  next_seq: &mut u64,
+  handles: &BTreeMap<ScopeId, F::Handle>,
+  scope: ScopeId,
+  refresh: MountRefresh,
+  now: &impl Fn() -> Instant,
+) {
+  if let Some((_, held)) = pending.remove(&scope) {
+    core.on_mounts_refreshed(scope, held, now());
+  }
+  let seq = *next_seq;
+  // A stream with no reader to cut applies at once and is unchanged from what it
+  // always did: FSEvents has no descriptor to drain, Windows and the unsupported
+  // host have no such request, the fanotify source publishes its cover through
+  // its own in-band recovery completion, which already orders it — and a scope
+  // whose stream has ended has no lane for a marker to arrive on at all.
+  if !handles.get(&scope).is_some_and(|handle| handle.cut(seq)) {
+    core.on_mounts_refreshed(scope, refresh, now());
+    return;
+  }
+  *next_seq = next_seq.wrapping_add(1);
+  // The probe is over even though its verdict is not read yet: the core must be
+  // free to arm the NEXT refresh, because that refresh is what bounds how long
+  // this one may wait on a reader.
+  core.on_refresh_deferred(scope);
+  pending.insert(scope, (seq, refresh));
+}
+
 /// Applies one source-lane message to the core — the ONE body both the run
 /// loop's source arm and the widen commit's lane drain use, so the two can
 /// never diverge. (The lane's `None` end marker is a stream artifact, not a
 /// channel message, so only the arm can see it and it stays there.)
 fn apply_source_message(
   core: &mut DriverCore,
+  pending_refreshes: &mut BTreeMap<ScopeId, PendingRefresh>,
   scope: ScopeId,
   msg: SourceMessage,
   now: &impl Fn() -> Instant,
@@ -16762,13 +16828,45 @@ fn apply_source_message(
       drop(ack);
       core.on_root_overflow(scope, now());
     }
-    SourceMessage::Fatal(_) => core.on_source_fatal(scope, now()),
+    SourceMessage::Fatal(_) => {
+      // The cut this scope may be waiting on will never be answered, and the
+      // refresh behind it is moot: the death below is the terminal verdict for
+      // the whole scope, and it dominates any cover the refresh could have
+      // asked for.
+      pending_refreshes.remove(&scope);
+      core.on_source_fatal(scope, now());
+    }
     // Where one of this source's walks stopped (#74). It carries no coverage
     // consequence of its own — nothing is delivered, nothing is lost — so it
     // needs neither barrier nor drain; the core simply remembers the locations
     // until its next authoritative mount sample can check them.
     #[cfg(all(target_os = "linux", not(miri)))]
     SourceMessage::Honored(paths) => core.on_boundaries_honored(scope, paths),
+    // The cut landed (#74): everything this reader had to say about the world
+    // before the mount change is behind us on this lane, so the refresh held for
+    // it applies HERE — its cover cannot overtake what it must dominate. A
+    // marker whose sequence is not the one being waited on answers a question
+    // that has since been replaced, and leaves the stash for its own.
+    #[cfg(any(all(target_os = "linux", not(miri)), test))]
+    SourceMessage::Cut { seq } => {
+      if pending_refreshes
+        .get(&scope)
+        .is_some_and(|(awaited, _)| *awaited == seq)
+      {
+        let (_, held) = pending_refreshes.remove(&scope).expect("just checked");
+        core.on_mounts_refreshed(scope, held, now());
+      }
+    }
+    // One requested whole-root recovery finished (#74), in band and therefore
+    // behind every event the kernel held when its walk began. The core decides
+    // whether the epoch still names this world; the boundaries the walk honored
+    // ride with it and are dropped by the same verdict.
+    #[cfg(any(all(target_os = "linux", not(miri)), test))]
+    SourceMessage::Recovered {
+      epoch,
+      outcome,
+      honored,
+    } => core.on_root_recovered(scope, epoch, outcome, honored, now()),
   }
 }
 
@@ -16782,6 +16880,7 @@ fn ingest_source_item<F: FsOps>(
   lanes: &BTreeMap<ScopeId, u64>,
   replace_states: &mut BTreeMap<ScopeId, ReplaceState<F::Handle>>,
   handles: &BTreeMap<ScopeId, F::Handle>,
+  pending_refreshes: &mut BTreeMap<ScopeId, PendingRefresh>,
   item: (ScopeId, u64, Option<SourceMessage>),
   now: &impl Fn() -> Instant,
 ) {
@@ -16796,7 +16895,7 @@ fn ingest_source_item<F: FsOps>(
   }
   match msg {
     Some(msg) => {
-      apply_source_message(core, scope, msg, now);
+      apply_source_message(core, pending_refreshes, scope, msg, now);
       // The catch-up ledger: one prefix message consumed in the arm's own
       // frame — delivered, tainted, or funneled exactly as any other.
       // Saturating: post-snapshot arrivals are transport-concurrent with
@@ -16819,6 +16918,11 @@ fn ingest_source_item<F: FsOps>(
     // the disconnect can arrive). The end marker fires only after the queue
     // yielded everything it held.
     None => {
+      // A cut this stream was asked for can no longer land, so a refresh held
+      // for it would sit here for the life of the driver. It is moot either way:
+      // a dead stream funnels below, and a retired one belongs to a world that
+      // has ended (#74).
+      pending_refreshes.remove(&scope);
       if handles.contains_key(&scope) {
         core.on_source_fatal(scope, now());
       }
@@ -18613,20 +18717,29 @@ fn execute_effects<R, F>(
         }
       }
       Effect::RecoverRoot { scope, epoch } => {
-        // On the blocking pool, exactly like the refresh it follows: the reseed
-        // is a full descent of the root, served by the source's reader thread,
-        // and this job waits for it. Droppable at close — the scope's cover dies
-        // with the scope, and the walk itself is the source's own business.
-        let ops = ops.clone();
-        let tx = op_tx.clone();
-        R::spawn_blocking_detach(move || {
-          let outcome = ops.recover_root(scope);
-          let _ = tx.try_send(OpResult::RootRecovered {
+        // A send and a wake, on this task, with nothing waiting: the walk runs
+        // on the source's own reader thread and its completion rides that
+        // source's ordered lane, behind every event the kernel held when it
+        // began. That ordering is the whole point of the round trip — a reply on
+        // the operation queue would let the cover overtake the batches it has to
+        // follow — and it costs no pool thread to get.
+        //
+        // Nothing to rebuild (every backend but fanotify) or nobody left to ask
+        // (a stream already gone) completes it HERE. Leaving it unanswered would
+        // latch the scope's recovery in flight for good, and every later mount
+        // change would coalesce onto a walk that is never going to finish.
+        if !handles
+          .get(&scope)
+          .is_some_and(|handle| handle.recover(epoch))
+        {
+          core.on_root_recovered(
             scope,
             epoch,
-            outcome,
-          });
-        });
+            crate::os::RootRecovery::Reseeded,
+            Vec::new(),
+            now(),
+          );
+        }
       }
       Effect::Emit {
         scope,

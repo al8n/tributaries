@@ -177,6 +177,19 @@
 //! completion — telling the consumer to re-read a subtree the source is still
 //! blind to would buy it one listing and then permanent silence.
 //!
+//! A cover is also ORDERED against the stream it covers, and that is a driver
+//! obligation rather than one of this module's. A mount sample is taken off a
+//! liveness probe, not off the source's queue, so a batch its reader pushed
+//! before the sample can still be waiting to be ingested when the cover is
+//! published — and delivered after it, naming ground the mount change has since
+//! hidden, with a stable table firing no second cover to correct it. So the
+//! driver CUTS the scope's lane first: the reader forwards everything the kernel
+//! already holds, pushes a marker behind it, and the refresh is fed to
+//! [`on_mounts_refreshed`](DriverCore::on_mounts_refreshed) only when that marker
+//! comes back up the lane. The fanotify profile needs no separate cut, because
+//! its cover already rides the reseed's own in-band completion. A backend with no
+//! reader to cut applies at once, exactly as it always did.
+//!
 //! # Why it is coarse
 //!
 //! There is no census of the boundaries under a root and no ledger keyed on them.
@@ -529,12 +542,17 @@ pub(crate) enum Effect {
   /// nothing more about it. So the reseed runs FIRST and the `Rescan` is emitted
   /// on its completion.
   ///
-  /// `epoch` is what makes the reply judgeable. The walk runs on the blocking
-  /// pool while the world can move under it (a root replace, a widen), so the
-  /// core stamps each request and drops a reply whose stamp is no longer the
-  /// scope's current one. One recovery is in flight per scope at a time; a fire
+  /// `epoch` is what makes the completion judgeable. The walk runs on the
+  /// source's own reader thread while the world can move under it (a root
+  /// replace, a widen), so the core stamps each request and drops a completion
+  /// whose stamp is no longer the scope's current one — the boundaries that walk
+  /// honored with it. One recovery is in flight per scope at a time; a fire
   /// during one is coalesced onto a single follow-up
   /// ([`ScopeState::recovery_dirty`]).
+  ///
+  /// The completion travels IN BAND, on the scope's own source queue, which is
+  /// what orders the `Rescan` it stands behind every event the kernel held when
+  /// the walk began — the same ordering a descending scope buys with a lane cut.
   RecoverRoot {
     /// The scope whose whole-root sight is being rebuilt.
     scope: ScopeId,
@@ -5768,6 +5786,25 @@ impl DriverCore {
     }
   }
 
+  /// One mount refresh answered but HELD BACK (#74): the driver is ordering its
+  /// verdict behind a cut of the scope's source lane, so nothing the reading
+  /// says may be read yet — but the probe itself is over.
+  ///
+  /// Clears exactly what a completion's own prologue clears, and nothing else:
+  /// the budget episode that left this root's liveness unproven has ended (a
+  /// later decline is a fresh one), and no refresh is outstanding. Without the
+  /// second of those, [`arm_refresh`](Self::arm_refresh) would go on believing a
+  /// read was in flight and arm no further one — and since it is the NEXT
+  /// refresh that bounds how long a held one may wait, a reader that never
+  /// answered its cut would wedge this scope's sampling for good. Liveness, the
+  /// table and the frame all stay unread until the marker lands.
+  pub(crate) fn on_refresh_deferred(&mut self, scope: ScopeId) {
+    if let Some(state) = self.scopes.get_mut(&scope) {
+      state.budget_recovered = false;
+      state.refresh_pending = false;
+    }
+  }
+
   /// Feeds one mount-table refresh result: updates device trust AND checks the
   /// root's liveness (folded into the same refresh — a kernel-recursive backend
   /// gets no in-tree unmount signal, so this cadence is its root-death check).
@@ -6141,7 +6178,7 @@ impl DriverCore {
     );
     // Exactly one walk at a time, and exactly one follow-up however many fires
     // arrive during it: a reseed is a full descent of the root, and stacking them
-    // would let a churning table hold the blocking pool indefinitely.
+    // would let a churning table hold the source's reader thread indefinitely.
     if state.recovery_in_flight {
       state.recovery_dirty = true;
       return;
@@ -6164,12 +6201,15 @@ impl DriverCore {
   /// A reply whose `epoch` is no longer the scope's is dropped whole: the world
   /// moved (the root was replaced or widened) while the walk ran, so the map it
   /// rebuilt describes a root this scope no longer watches, and the swap has
-  /// already covered the new one.
+  /// already covered the new one. The boundaries that walk honored are dropped
+  /// with it, and for the same reason: they are questions about a tree this
+  /// scope has left.
   pub(crate) fn on_root_recovered(
     &mut self,
     scope: ScopeId,
     epoch: u64,
     outcome: RootRecovery,
+    honored: Vec<PathBuf>,
     now: Instant,
   ) {
     let Some(state) = self.scopes.get_mut(&scope) else {
@@ -6179,6 +6219,14 @@ impl DriverCore {
       return;
     }
     state.recovery_in_flight = false;
+    // The walk's own account of where it stopped, taken only once the epoch has
+    // vouched for the world it describes (#74). A boundary still mounted enters
+    // the next sample's rows and needs no further memory; one that is gone was
+    // hiding ground this walk did not read, and the next authoritative sample
+    // answers it with a cover.
+    for boundary in honored {
+      record_honored_boundary(state, boundary);
+    }
     if matches!(outcome, RootRecovery::Unreachable) {
       // The walk could not reach the root at all. That is a root death and takes
       // the SAME funnel a refresh's death gate takes — terminal `Removed`/`Rescan`
@@ -9556,9 +9604,9 @@ fn seed_table_fingerprint(state: &mut ScopeState, mut rows: Vec<crate::os::Mount
 /// this scope no longer watches.
 ///
 /// The epoch BUMPS rather than resets, and that is what makes an in-flight reseed
-/// safe to abandon: its reply carries the old stamp, so it is dropped instead of
-/// covering the new world off a walk of the old one. Nothing is cancelled — the
-/// walk finishes on the blocking pool and its answer is discarded.
+/// safe to abandon: its completion carries the old stamp, so it is dropped instead
+/// of covering the new world off a walk of the old one. Nothing is cancelled — the
+/// walk finishes on the reader thread and its answer is discarded.
 fn retire_root_recovery(state: &mut ScopeState) {
   state.table_fingerprint = None;
   state.honored_boundaries.clear();

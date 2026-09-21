@@ -101,6 +101,18 @@ pub(crate) enum Control {
     ops: Vec<ControlOp>,
     reply: BatchReply,
   },
+  /// CUT this reader's lane at `seq` (#74): forward everything the kernel has
+  /// already committed, then push [`SourceMessage::Cut`] behind it.
+  ///
+  /// No reply channel, and that is the point. What the requester needs is not
+  /// "the reader saw this" but a POSITION on the source's queue, which only the
+  /// queue itself can state — so the marker IS the answer. A request no reader
+  /// survives to serve is answered by the stream's own end instead.
+  ///
+  /// [`SourceMessage::Cut`]: crate::os::SourceMessage::Cut
+  Cut {
+    seq: u64,
+  },
   Shutdown,
 }
 
@@ -790,6 +802,19 @@ fn drain_control(
         // mid-cut), exit as if the terminal `Shutdown` had been observed here.
         reply.answer(replies);
         if preempted || cut_exits {
+          return true;
+        }
+      }
+      // The mount-change cover's cut (#74), on the SAME primitive an arm batch's
+      // reply edge rides — the records the kernel had committed reach the lane
+      // first, and the marker goes behind them. Pushed even when the cut demands
+      // the exit: it either follows the covering loss an unprovable cut signals
+      // (so the cover it orders is still behind everything older) or follows the
+      // terminal the death signalled, which the driver reads first.
+      Ok(Control::Cut { seq }) => {
+        let cut_exits = cut_kernel_queue(instance, shared, buf, wake);
+        let _ = shared.queue.try_send(crate::os::SourceMessage::Cut { seq });
+        if cut_exits {
           return true;
         }
       }

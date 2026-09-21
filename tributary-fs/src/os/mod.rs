@@ -864,13 +864,11 @@ pub(crate) enum ScopePort {
   /// A live inotify reader's control port.
   #[cfg(all(target_os = "linux", not(miri)))]
   Inotify(linux::ControlPort),
-  /// A live fanotify reader's recovery port. The kernel-recursive source carries
-  /// no ARM traffic, but it does carry the one request the coarse mount-change
-  /// cover needs of it: rebuild the FID map over the whole root (#74).
-  #[cfg(all(target_os = "linux", not(miri)))]
-  Fanotify(linux::RecoveryPort),
-  /// No control traffic is possible (a source with nothing to arm and no map to
-  /// reseed, or a fake).
+  /// No arm traffic is possible (a kernel-recursive source, or a fake). The one
+  /// request a kernel-recursive reader does serve — rebuild the whole-root map
+  /// for the coarse mount-change cover (#74) — travels through the stream
+  /// HANDLE the driver already holds rather than a detached port, because its
+  /// answer rides the source's own ordered queue instead of a reply channel.
   Inert,
 }
 

@@ -1485,53 +1485,20 @@ impl SourceHandle {
 }
 
 impl SourceHandle {
-  /// The clonable port a whole-root recovery is requested through — the control
-  /// channel plus the wake that makes the reader look at it.
+  /// Requests one whole-root reseed under `epoch` and RETURNS: the walk runs on
+  /// the reader thread and answers on this source's own ordered queue (#74).
   ///
-  /// Handed to the driver at attach, exactly as the inotify source hands over its
-  /// arm port, so the request never needs the (non-clonable, teardown-owning)
-  /// handle itself.
-  pub(crate) fn recovery_port(&self) -> RecoveryPort {
-    RecoveryPort {
-      control: self.control.clone(),
-      wake: Arc::clone(&self.wake),
-    }
-  }
-}
-
-/// The clonable port one whole-root FID-map reseed is requested through (#74).
-///
-/// `Debug` because [`ScopePort`](crate::os::ScopePort) derives it and carries this
-/// variant: a port with no `Debug` form makes the whole seam underivable on Linux
-/// while every other host still compiles.
-#[derive(Debug, Clone)]
-pub(crate) struct RecoveryPort {
-  control: mpsc::Sender<Control>,
-  wake: Arc<WakeState>,
-}
-
-impl RecoveryPort {
-  /// Requests one whole-root reseed and BLOCKS until the reader has done it.
-  ///
-  /// Called on the driver's blocking pool. Blocking is the point: the core may
-  /// not tell the consumer to re-read until the source can see the ground it will
-  /// read, so the answer has to be waited for somewhere, and the pool is the one
-  /// place in the driver where waiting costs nothing but a thread.
-  ///
-  /// Every failure is [`RootRecovery::Unreachable`](crate::os::RootRecovery::Unreachable)
-  /// and none of them is guessed at: a reader already gone refuses the send, and a
-  /// reader that dies mid-request drops the reply sender, which ends the wait. A
-  /// source whose sight cannot be rebuilt is blind, and blind is what the core is
-  /// told.
-  pub(crate) fn recover(&self) -> crate::os::RootRecovery {
-    let (reply, answer) = mpsc::sync_channel(1);
-    if self.control.send(Control::Reseed { reply }).is_err() {
-      return crate::os::RootRecovery::Unreachable;
+  /// Nothing blocks and no pool thread is spent, because the answer the core
+  /// needs is a POSITION on that queue and no reply channel can state one. A
+  /// reader already gone refuses the send and this answers `false`, which the
+  /// driver completes inline rather than leaving the scope's recovery in flight
+  /// for good.
+  pub(crate) fn request_recovery(&self, epoch: u64) -> bool {
+    if self.control.send(Control::Reseed { epoch }).is_err() {
+      return false;
     }
     self.wake.wake();
-    answer
-      .recv()
-      .unwrap_or(crate::os::RootRecovery::Unreachable)
+    true
   }
 }
 

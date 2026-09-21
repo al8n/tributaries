@@ -82,6 +82,11 @@ mod barrier {
         SourceMessage::Honored(boundaries) => {
           unreachable!("an inotify reader walks no tree: {boundaries:?}")
         }
+        // Nor does it answer a lane request on this seam: the cut is a reply-edge
+        // primitive the reader drives itself (#74).
+        SourceMessage::Cut { .. } | SourceMessage::Recovered { .. } => {
+          unreachable!("this seam answers no lane request")
+        }
         SourceMessage::Fatal(_) => unreachable!("no fatal on this path"),
       });
       true
@@ -115,6 +120,11 @@ mod barrier {
         // one and never reports one.
         SourceMessage::Honored(boundaries) => {
           unreachable!("an inotify reader walks no tree: {boundaries:?}")
+        }
+        // Nor does it answer a lane request on this seam: the cut is a reply-edge
+        // primitive the reader drives itself (#74).
+        SourceMessage::Cut { .. } | SourceMessage::Recovered { .. } => {
+          unreachable!("this seam answers no lane request")
         }
         SourceMessage::Fatal(_) => unreachable!("no fatal on this path"),
       });
@@ -1075,6 +1085,11 @@ mod rebuild {
         SourceMessage::Honored(boundaries) => {
           unreachable!("an inotify reader walks no tree: {boundaries:?}")
         }
+        // Nor does it answer a lane request on this seam: the cut is a reply-edge
+        // primitive the reader drives itself (#74).
+        SourceMessage::Cut { .. } | SourceMessage::Recovered { .. } => {
+          unreachable!("this seam answers no lane request")
+        }
         SourceMessage::Fatal(_) => unreachable!("no fatal on this path"),
       });
     }
@@ -1537,6 +1552,7 @@ mod queue_cut {
   enum Sent {
     Batch(usize),
     Overflow,
+    Cut(u64),
   }
 
   fn drained(rx: &async_channel::Receiver<SourceMessage>) -> Vec<Sent> {
@@ -1545,16 +1561,62 @@ mod queue_cut {
       sent.push(match msg {
         SourceMessage::Batch(payload) => Sent::Batch(payload.events.len()),
         SourceMessage::Overflow(_) => Sent::Overflow,
+        SourceMessage::Cut { seq } => Sent::Cut(seq),
         // inotify DESCENDS, and it runs no walk of its own: its boundaries are
         // observed by the core's enumerate fence, so this reader never honors
         // one and never reports one.
         SourceMessage::Honored(boundaries) => {
           unreachable!("an inotify reader walks no tree: {boundaries:?}")
         }
+        // Nor does it keep a map to rebuild: the whole-root recovery is the
+        // kernel-recursive profile's.
+        SourceMessage::Recovered { epoch, .. } => {
+          unreachable!("an inotify reader reseeds nothing: {epoch}")
+        }
         SourceMessage::Fatal(err) => panic!("no fatal on this path: {err:?}"),
       });
     }
     sent
+  }
+
+  /// The mount-change cover's cut is answered only AFTER the fd is drained
+  /// (#74): the records the kernel had queued reach the lane first, and the
+  /// marker goes behind them.
+  ///
+  /// That order is the whole meaning of the marker. The driver holds the scope's
+  /// mount refresh until this marker comes back and only then publishes the
+  /// whole-root `Rescan`, so a marker that outran the queue would put the cover
+  /// ahead of events describing the world before the mount change — which is the
+  /// ordering the cut exists to establish.
+  ///
+  /// MUTATION WITNESS: push the marker without the cut and the staged records
+  /// are still kernel-resident here, so the drain below is the marker alone.
+  #[test]
+  fn a_cut_is_answered_after_the_fd_is_drained() {
+    let mut instance = instance();
+    let (shared, queue_rx) = reader_shared();
+    let dir = scratch("mount-cut");
+    let wake = WakeState::new().expect("wake state");
+    let (tx, rx) = mpsc::channel();
+
+    let armed = arm_batch(&tx, watch(1), &dir);
+    let mut buf = vec![0u8; 64 * 1024];
+    assert!(!drain_control(&mut instance, &shared, &rx, &wake, &mut buf));
+    armed.recv_timeout(Duration::from_secs(5)).expect("armed");
+    assert!(drained(&queue_rx).is_empty(), "arming forwards nothing");
+
+    // Records the reader has NOT read, then the cut.
+    flood(&dir, 8);
+    tx.send(Control::Cut { seq: 42 }).expect("enqueue the cut");
+    assert!(!drain_control(&mut instance, &shared, &rx, &wake, &mut buf));
+
+    let sent = drained(&queue_rx);
+    let (last, ahead) = sent.split_last().expect("the cut is answered");
+    assert_eq!(*last, Sent::Cut(42), "the marker is the LAST thing sent");
+    assert!(
+      !ahead.is_empty() && ahead.iter().all(|s| matches!(s, Sent::Batch(_))),
+      "and the staged records rode the cut ahead of it: {sent:?}"
+    );
   }
 
   /// The kernel's queue ceiling for this host, or `None` when the value is
@@ -2335,6 +2397,9 @@ mod queue_cut {
           // one and never reports one.
           SourceMessage::Honored(boundaries) => {
             unreachable!("an inotify reader walks no tree: {boundaries:?}")
+          }
+          SourceMessage::Cut { .. } | SourceMessage::Recovered { .. } => {
+            unreachable!("this seam answers no lane request")
           }
           SourceMessage::Fatal(err) => panic!("no fatal on this path: {err:?}"),
         });

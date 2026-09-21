@@ -73,6 +73,11 @@ impl Model {
       // loses, so this model records nothing for it.
       #[cfg(all(target_os = "linux", not(miri)))]
       SourceMessage::Honored(_) => {}
+      // Nor do the mount-cover markers (#74): each states a POSITION on this
+      // queue, which is what the ordering they buy is made of, and neither
+      // carries a delivery or a loss for the dedup to place.
+      #[cfg(any(all(target_os = "linux", not(miri)), test))]
+      SourceMessage::Cut { .. } | SourceMessage::Recovered { .. } => {}
     }
     true
   }
@@ -348,6 +353,46 @@ fn ack_drop_rearms_the_dedup() {
   );
   forward_batch(&transport, Vec::new(), true, |msg| model.send(msg));
   assert_eq!(model.queue.len(), 1, "the next loss signals afresh");
+}
+
+/// A mount-cover marker is not a queue POSITION the dedup reasons about (#74).
+///
+/// Neither marker delivers anything and neither loses anything: the cut states
+/// how far the reader's forwarding had reached, and the recovery completion
+/// states that a walk finished. So a marker between two losses must leave the
+/// first loss's run intact — unlike a `Batch`, which ends it — or one mount
+/// change would hand the scope a second covering `Rescan` for nothing.
+#[test]
+fn a_mount_cover_marker_does_not_break_the_loss_run() {
+  let transport = TransportState::new(4);
+  let mut model = Model::default();
+  forward_batch(&transport, Vec::new(), true, |msg| model.send(msg));
+  assert!(transport.overflow_pending());
+
+  // Both markers ride the queue between the two losses.
+  assert!(model.send(SourceMessage::Cut { seq: 1 }));
+  assert!(model.send(SourceMessage::Recovered {
+    epoch: 1,
+    outcome: crate::os::RootRecovery::Reseeded,
+    honored: Vec::new(),
+  }));
+  forward_batch(&transport, Vec::new(), true, |msg| model.send(msg));
+  assert_eq!(
+    model.queue.len(),
+    3,
+    "the second loss still dedups onto the pending signal: only the markers were added"
+  );
+
+  while model.step_driver() {}
+  assert_eq!(
+    model
+      .processed
+      .iter()
+      .filter(|(_, kind)| *kind == Kind::Overflow)
+      .count(),
+    1,
+    "and neither marker recorded a position of its own"
+  );
 }
 
 /// The position-aware dedup's core guarantee: a `Batch` enqueued between two

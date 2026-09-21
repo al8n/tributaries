@@ -359,6 +359,39 @@ pub(crate) enum SourceMessage<E> {
   /// the same gate.
   #[cfg(all(target_os = "linux", not(miri)))]
   Honored(Vec<std::path::PathBuf>),
+  /// This source's answer to one CUT of its lane (#74), carrying the
+  /// requester's `seq` back.
+  ///
+  /// A marker, not a signal: nothing is delivered and nothing is lost. What it
+  /// states is a POSITION — every event the kernel had committed when the reader
+  /// serviced the cut is already behind it on this queue — and that is the one
+  /// thing no driver-side drain can establish, because control is serviced
+  /// before and between reads by design. A cover ordered behind this marker
+  /// therefore dominates every event describing the world before the change it
+  /// covers, and the only events that can follow it are ones the kernel had not
+  /// yet produced.
+  ///
+  /// Compiled for the shapes that can CONSTRUCT one: the inotify reader — the
+  /// only source whose covers are published straight off the refresh — and the
+  /// driver's own fakes.
+  #[cfg(any(all(target_os = "linux", not(miri)), test))]
+  Cut { seq: u64 },
+  /// One requested whole-root recovery finished (#74): the source's map was
+  /// rebuilt over the whole root, or the root could not be reached at all, and
+  /// these are the mount boundaries that walk stopped at.
+  ///
+  /// It rides this queue for the same reason the cut does, and on this profile
+  /// it IS the cut: the reader answers only once its instance has drained, so
+  /// the cover the completion stands is ordered behind every event the kernel
+  /// held when the walk began. The boundaries travel WITH it rather than
+  /// separately, so a completion the core drops for a stale epoch drops them
+  /// too — a world that ended takes its walk's questions with it.
+  #[cfg(any(all(target_os = "linux", not(miri)), test))]
+  Recovered {
+    epoch: u64,
+    outcome: super::RootRecovery,
+    honored: Vec<std::path::PathBuf>,
+  },
 }
 
 /// The driver's receiving end of a source's messages.

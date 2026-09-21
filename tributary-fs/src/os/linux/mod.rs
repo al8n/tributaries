@@ -113,8 +113,6 @@ use rustix::fs::OFlags;
 use tributary_proto::WatchId;
 
 pub(crate) use fanotify::AdmittedEvent;
-#[cfg(all(target_os = "linux", not(miri)))]
-pub(crate) use fanotify::RecoveryPort;
 pub(crate) use inotify::decode::RawInotifyEvent;
 use inotify::table::WdTable;
 
@@ -2082,13 +2080,38 @@ impl SourceHandle {
     }
   }
 
-  /// The clonable control port: the inotify arm/disarm channel, or the fanotify
-  /// reader's whole-root RECOVERY channel (a kernel-recursive source has no
-  /// per-directory arming, but its FID map still has to be reseedable).
+  /// The clonable arm/disarm port: the inotify control channel. The
+  /// kernel-recursive source has no per-directory arming and carries no arm
+  /// traffic at all — the one request its reader does serve travels through
+  /// [`recover`](Self::recover), on the handle the driver already holds.
   pub(crate) fn scope_port(&self) -> super::ScopePort {
     match self {
       Self::Inotify(handle) => super::ScopePort::Inotify(handle.port()),
-      Self::Fanotify(handle) => super::ScopePort::Fanotify(handle.recovery_port()),
+      Self::Fanotify(_) => super::ScopePort::Inert,
+    }
+  }
+
+  /// Cuts the source's lane at `seq` (#74): the reader drains everything the
+  /// kernel has committed onto the queue and pushes the marker behind it.
+  ///
+  /// Inotify only, and not because fanotify's reader could not do it: on that
+  /// profile a mount-change cover is never published off the refresh at all —
+  /// it rides the in-band recovery completion, which is already the cut. Asking
+  /// for a second one would wake a parked reader once per liveness interval to
+  /// establish an ordering nothing consumes.
+  pub(crate) fn cut(&self, seq: u64) -> bool {
+    match self {
+      Self::Inotify(handle) => handle.cut(seq),
+      Self::Fanotify(_) => false,
+    }
+  }
+
+  /// Asks the source to rebuild its whole-root sight under `epoch` and answer on
+  /// its own queue (#74). Fanotify only: nothing else keeps a map.
+  pub(crate) fn recover(&self, epoch: u64) -> bool {
+    match self {
+      Self::Inotify(_) => false,
+      Self::Fanotify(handle) => handle.request_recovery(epoch),
     }
   }
 
@@ -2466,6 +2489,23 @@ mod inotify_source {
       let _ = self.batch(vec![ControlOp::Disarm(anchor)]);
     }
 
+    /// Asks the reader to CUT its lane at `seq` (#74), answering whether the
+    /// request reached it. Enqueue-then-wake, exactly as
+    /// [`dispatch`](Self::dispatch): the message lands before the park flag is
+    /// read, so a reader about to block cannot miss it.
+    ///
+    /// Nothing waits here. The reader answers on the source's own queue, which
+    /// is the whole point: the cut's meaning is a POSITION on that queue, and a
+    /// reply channel could only say that the reader had reached the request,
+    /// never that the driver had ingested everything ahead of it.
+    pub(crate) fn cut(&self, seq: u64) -> bool {
+      if self.control.send(Control::Cut { seq }).is_err() {
+        return false;
+      }
+      self.wake.wake_if_parked();
+      true
+    }
+
     /// A port onto an explicit control channel, standing in for a live source's
     /// so a test can play the reader — including by dying like one.
     #[cfg(all(test, target_os = "linux", not(miri)))]
@@ -2563,6 +2603,11 @@ mod inotify_source {
     /// A clonable arm/disarm port onto this source's reader.
     pub(crate) fn port(&self) -> ControlPort {
       self.port.clone()
+    }
+
+    /// Cuts the reader's lane at `seq`. See [`ControlPort::cut`].
+    pub(crate) fn cut(&self, seq: u64) -> bool {
+      self.port.cut(seq)
     }
 
     /// Installs (or aliases) a kernel watch. See [`ControlPort::add_watch`].

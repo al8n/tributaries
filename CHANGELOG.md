@@ -818,7 +818,12 @@ domination `Rescan` is stood — and nothing else in either crate behaves differ
   ceilings and only the rows strictly under the root are retained, so a namespace
   with a huge mount table no longer allocates its whole representation once per due
   scope; a reading past either ceiling is refused whole and answered with one
-  whole-root `Rescan`, never truncated and never trusted.
+  whole-root `Rescan`, never truncated and never trusted. The cover is also
+  ORDERED against the stream it covers: the sample is taken off a liveness probe
+  rather than off the source's queue, so the driver first CUTS the scope's lane —
+  the reader forwards everything the kernel already holds and pushes a marker
+  behind it — and the `Rescan` is published only once that marker comes back,
+  never ahead of a batch that describes the world before the change.
 
 - **`tributaries`** — a caller-visible **sync barrier** (#23): `Tributaries::sync(sub,
   timeout)` resolves once every change made under the subscription's key BEFORE the

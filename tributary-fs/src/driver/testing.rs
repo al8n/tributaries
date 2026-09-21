@@ -98,9 +98,18 @@ struct FakeState {
   /// against a root the scope has replaced.
   refresh_roots: Mutex<Vec<PathBuf>>,
   refresh_answer: Mutex<Option<(Vec<crate::os::MountRow>, bool)>>,
-  /// The scopes a whole-root recovery has been requested for, in request order —
+  /// The roots a whole-root recovery has been requested of, in request order —
   /// the observable that a cover REQUESTED the reseed before it emitted anything.
-  recoveries: Mutex<Vec<ScopeId>>,
+  recovery_requests: Mutex<Vec<PathBuf>>,
+  /// Whether this fake's streams accept a lane CUT (#74). Off by default: a
+  /// backend with no reader to cut applies its mount refresh at once, which is
+  /// what every cell written before the cut existed observes.
+  cuts_accepted: AtomicBool,
+  /// Whether an ACCEPTED cut is then left unanswered — the reader that took the
+  /// request and never got back to it. The one staging under which a refresh is
+  /// observably HELD, and therefore the one under which the bounds on holding it
+  /// can be driven at all (#74).
+  cuts_withheld: AtomicBool,
   /// What every subsequent recovery answers. `None` is the default a source with
   /// a healthy map gives.
   recovery_answer: Mutex<Option<crate::os::RootRecovery>>,
@@ -363,6 +372,24 @@ impl FakeState {
   fn note_reclaim_thread(&self) {
     *self.reclaim_thread.lock().unwrap() = std::thread::current().name().map(str::to_owned);
   }
+
+  /// Pushes one marker onto `root`'s newest lane, BEHIND everything already
+  /// queued there, and answers whether a lane was there to take it. The reader's
+  /// half of a cut and of a recovery request (#74): both answer in band, so the
+  /// fake answers them the same way.
+  ///
+  /// The send runs outside the map's lock — a queue send must never hold a lock
+  /// a concurrent spawn also takes.
+  fn push_to_lane(&self, root: &Path, msg: SourceMessage) -> bool {
+    let sender = self
+      .sources
+      .lock()
+      .unwrap()
+      .get(root)
+      .and_then(|spawned| spawned.last())
+      .map(|source| source.sender.clone());
+    sender.is_some_and(|sender| sender.try_send(msg).is_ok())
+  }
 }
 
 impl Default for FakeState {
@@ -375,7 +402,9 @@ impl Default for FakeState {
       refreshes: AtomicUsize::new(0),
       refresh_roots: Mutex::default(),
       refresh_answer: Mutex::default(),
-      recoveries: Mutex::default(),
+      recovery_requests: Mutex::default(),
+      cuts_accepted: AtomicBool::new(false),
+      cuts_withheld: AtomicBool::new(false),
       recovery_answer: Mutex::default(),
       root_liveness: Mutex::default(),
       spawn_mounts: Mutex::default(),
@@ -732,9 +761,23 @@ impl FakeFs {
     *self.state.recovery_answer.lock().unwrap() = Some(outcome);
   }
 
-  /// The scopes a whole-root recovery has been requested for, in request order.
-  pub(crate) fn recovery_requests(&self) -> Vec<ScopeId> {
-    self.state.recoveries.lock().unwrap().clone()
+  /// The roots a whole-root recovery has been requested of, in request order.
+  pub(crate) fn recovery_requests(&self) -> Vec<PathBuf> {
+    self.state.recovery_requests.lock().unwrap().clone()
+  }
+
+  /// Makes every stream of this fake ACCEPT a lane cut (#74), so a mount refresh
+  /// is held until the marker the driver asked for comes back up the lane — the
+  /// descending backends' behaviour, modelled.
+  pub(crate) fn accept_cuts(&self) {
+    self.state.cuts_accepted.store(true, Ordering::SeqCst);
+  }
+
+  /// Makes every accepted cut go UNANSWERED (#74): the request is taken and no
+  /// marker ever comes back, which is how a cell holds a refresh in the driver's
+  /// stash long enough to drive what may empty it.
+  pub(crate) fn withhold_cuts(&self) {
+    self.state.cuts_withheld.store(true, Ordering::SeqCst);
   }
 
   /// Forces every subsequent refresh to report `liveness` as the root's state,
@@ -1626,12 +1669,59 @@ impl HoldRelease {
 
 pub(crate) struct FakeHandle {
   state: Arc<FakeState>,
+  /// The root this stream was spawned for — the fake's stand-in for the reader
+  /// thread a cut or a recovery request reaches, since both answer on the
+  /// source's own lane rather than through a reply.
+  root: PathBuf,
   shut: bool,
 }
 
 impl SourceControl for FakeHandle {
   fn resume_token(&self) -> Option<crate::os::ResumeToken> {
     *self.state.resume_token.lock().unwrap()
+  }
+
+  /// The reader's cut, modelled exactly where it matters: the marker is pushed
+  /// onto this source's lane BEHIND everything already queued on it, which is
+  /// the ordering a real reader buys by draining its fd first (#74).
+  ///
+  /// Opt-in, so every cell written before the cut existed keeps the
+  /// apply-at-once behaviour a backend with no reader to cut still has.
+  fn cut(&self, seq: u64) -> bool {
+    if !self.state.cuts_accepted.load(Ordering::SeqCst) {
+      return false;
+    }
+    if self.state.cuts_withheld.load(Ordering::SeqCst) {
+      return true;
+    }
+    self
+      .state
+      .push_to_lane(&self.root, SourceMessage::Cut { seq })
+  }
+
+  /// The whole-root recovery, answered IN BAND like the real reader's: the
+  /// request is recorded and its completion rides this source's lane (#74).
+  fn recover(&self, epoch: u64) -> bool {
+    self
+      .state
+      .recovery_requests
+      .lock()
+      .unwrap()
+      .push(self.root.clone());
+    let outcome = self
+      .state
+      .recovery_answer
+      .lock()
+      .unwrap()
+      .unwrap_or(crate::os::RootRecovery::Reseeded);
+    self.state.push_to_lane(
+      &self.root,
+      SourceMessage::Recovered {
+        epoch,
+        outcome,
+        honored: Vec::new(),
+      },
+    )
   }
 
   fn shutdown(mut self) -> crate::os::Quiesce {
@@ -1853,6 +1943,7 @@ impl FsOps for FakeFs {
         err,
         FakeHandle {
           state: Arc::clone(&self.state),
+          root: root.clone(),
           shut: false,
         },
       ));
@@ -1893,6 +1984,7 @@ impl FsOps for FakeFs {
     Ok(SpawnedSource {
       handle: FakeHandle {
         state: Arc::clone(&self.state),
+        root: root.clone(),
         shut: false,
       },
       receiver,
@@ -1966,16 +2058,6 @@ impl FsOps for FakeFs {
       namespace_transitions: None,
       overflowed: false,
     }
-  }
-
-  fn recover_root(&self, scope: ScopeId) -> crate::os::RootRecovery {
-    self.state.recoveries.lock().unwrap().push(scope);
-    self
-      .state
-      .recovery_answer
-      .lock()
-      .unwrap()
-      .unwrap_or(crate::os::RootRecovery::Reseeded)
   }
 
   fn attach_scope(&self, scope: ScopeId, _port: crate::os::ScopePort, generation: u64) {
