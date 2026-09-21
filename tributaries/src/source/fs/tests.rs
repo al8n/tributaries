@@ -2645,7 +2645,9 @@ mod listing {
     },
   };
 
-  use super::super::{BlockingSpawner, LIST_CHUNK, MAX_LIST_DEPTH, Walk, key_to_path};
+  use super::super::{
+    BlockingSpawner, BoundRoot, LIST_CHUNK, MAX_LIST_DEPTH, ObjectId, Walk, key_to_path,
+  };
   use crate::{EntryKind, Glob, ListError, ListItem, RootGlobs, event::path_components};
 
   /// One temp tree, canonicalized so its keys are the ones a watch would spell.
@@ -2696,14 +2698,21 @@ mod listing {
     globs: &RootGlobs,
   ) -> (Vec<ListItem<OsString>>, usize) {
     let jobs = Arc::new(AtomicUsize::new(0));
-    drive(Walk::new(
-      Some(root.to_path_buf()),
-      from,
-      globs,
-      spawner(&jobs),
-    ))
-    .await
+    drive(Walk::new(bound(root), from, globs, spawner(&jobs))).await
   }
+
+  /// The root as the lister receives it: its path plus the object identity the registry
+  /// holds for it, read here off the directory that is actually there.
+  fn bound(root: &Path) -> Option<BoundRoot> {
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = std::fs::metadata(root).expect("stat the root");
+    Some((root.to_path_buf(), (meta.dev(), u128::from(meta.ino()))))
+  }
+
+  /// A root that is never opened, so its identity is never read: the cells that use it are
+  /// refused before the walk reaches a syscall.
+  const UNOPENED: ObjectId = (0, 0);
 
   /// The last component of an admitted item's key.
   fn leaf(item: &ListItem<OsString>) -> Option<(OsString, EntryKind)> {
@@ -2729,7 +2738,7 @@ mod listing {
       let mut from = path_components(&root);
       from.extend(suffix.iter().map(|part| (*part).to_owned()));
       let jobs = Arc::new(AtomicUsize::new(0));
-      let walk = Walk::new(Some(root), &from, globs, spawner(&jobs));
+      let walk = Walk::new(Some((root, UNOPENED)), &from, globs, spawner(&jobs));
       walk.seed.is_none()
         && walk.ready.len() == 1
         && matches!(walk.ready.front(), Some(Err(ListError::UnknownRoot)))
@@ -2765,7 +2774,7 @@ mod listing {
     let mut inside = path_components(&root);
     inside.push(OsString::from("sub"));
     let jobs = Arc::new(AtomicUsize::new(0));
-    let walk = Walk::new(Some(root), &inside, &plain, spawner(&jobs));
+    let walk = Walk::new(Some((root, UNOPENED)), &inside, &plain, spawner(&jobs));
     assert!(
       walk.ready.is_empty() && walk.seed.is_some(),
       "staging: a plain name under the root is not refused"
@@ -2852,7 +2861,7 @@ mod listing {
 
     let jobs = Arc::new(AtomicUsize::new(0));
     let (items, buffered) = drive(Walk::new(
-      Some(root.clone()),
+      bound(&root),
       &path_components(&root),
       &RootGlobs::new(),
       spawner(&jobs),
@@ -2916,6 +2925,74 @@ mod listing {
       MAX_LIST_DEPTH,
       "at the ceiling itself: {}",
       stopped.display()
+    );
+  }
+
+  /// A listing is bound to the root's OBJECT, not to its path. A root directory renamed
+  /// away and re-created under the same name opens cleanly and holds an unrelated tree —
+  /// one the event stream says nothing about — so the listing answers the same
+  /// `UnknownRoot` an unwatched key gets.
+  ///
+  /// Revert witness: drop the identity compare and the walk enumerates the stranger's
+  /// entries under the watched root's keys, which a consumer would seed its picture from
+  /// and then never hear about again.
+  #[tokio::test]
+  async fn a_root_replaced_before_the_listing_is_one_unknown_root() {
+    let (_guard, root) = tree();
+    let watched = root.join("watched");
+    std::fs::create_dir(&watched).expect("create the watched root");
+    std::fs::write(watched.join("inside.txt"), b"x").expect("write");
+    // What the registry holds: the object the watch was armed on.
+    let armed = bound(&watched);
+
+    std::fs::rename(&watched, root.join("moved")).expect("rename the root away");
+    std::fs::create_dir(&watched).expect("a new directory under the old name");
+    std::fs::write(watched.join("stranger.txt"), b"x").expect("write");
+
+    let jobs = Arc::new(AtomicUsize::new(0));
+    let (items, _) = drive(Walk::new(
+      armed,
+      &path_components(&watched),
+      &RootGlobs::new(),
+      spawner(&jobs),
+    ))
+    .await;
+
+    assert_eq!(items.len(), 1, "exactly one item: {items:?}");
+    assert!(
+      matches!(items.first(), Some(Err(ListError::UnknownRoot))),
+      "and it says the armed root no longer names that directory: {items:?}"
+    );
+  }
+
+  /// The converse, and why the test is identity rather than the path: a root reached
+  /// THROUGH a symlinked ancestor still opens the registered object, so it IS the root and
+  /// lists normally. A path comparison would refuse it.
+  #[tokio::test]
+  async fn a_root_reached_through_a_symlinked_parent_lists_normally() {
+    let (_guard, root) = tree();
+    let real = root.join("real");
+    std::fs::create_dir(&real).expect("create the real parent");
+    std::fs::create_dir(real.join("watched")).expect("create the watched root");
+    std::fs::write(real.join("watched").join("inside.txt"), b"x").expect("write");
+    std::os::unix::fs::symlink(&real, root.join("link")).expect("link the parent");
+
+    let identity = bound(&real.join("watched")).expect("the root is there").1;
+    let through_link = root.join("link").join("watched");
+    let jobs = Arc::new(AtomicUsize::new(0));
+    let (items, _) = drive(Walk::new(
+      Some((through_link.clone(), identity)),
+      &path_components(&through_link),
+      &RootGlobs::new(),
+      spawner(&jobs),
+    ))
+    .await;
+
+    let listed: Vec<_> = items.iter().filter_map(leaf).collect();
+    assert_eq!(
+      listed,
+      vec![(OsString::from("inside.txt"), EntryKind::File)],
+      "the registered object is listed however the path reached it: {items:?}"
     );
   }
 }

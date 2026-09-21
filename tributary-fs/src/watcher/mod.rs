@@ -131,6 +131,36 @@ impl RootView {
   pub fn coverage(&self, root: RootHandle) -> Option<Coverage> {
     coverage_in(self.instance, &self.roots, root)
   }
+
+  /// The `(device, inode)` of the directory `root` is BOUND to — the identity the spawn
+  /// barrier read and every later commit re-records, which is a property of the OBJECT and
+  /// not of the path.
+  ///
+  /// A walk that reaches the root by its path alone can be handed a different tree: a root
+  /// directory renamed away and re-created under the same name, or an ancestor replaced by
+  /// a symbolic link, both open cleanly, and the entries the walk then reports name ground
+  /// the event stream does not cover. Comparing the opened directory against this is what
+  /// binds an enumeration to the root its events come from — and a path that reaches the
+  /// registered object through a symlinked ancestor IS the root, which no path comparison
+  /// could say.
+  ///
+  /// A pair rather than a named type: the identity is the watcher's own business, and a
+  /// caller needs only to compare it with a `stat` of its own.
+  ///
+  /// [`None`] for a handle this watcher did not issue, exactly as every other query here.
+  #[inline]
+  pub fn root_identity(&self, root: RootHandle) -> Option<(u64, u128)> {
+    if root.instance() != self.instance {
+      return None;
+    }
+    self
+      .roots
+      .read()
+      .unwrap_or_else(PoisonError::into_inner)
+      .entries
+      .get(&root.scope())
+      .map(|entry| (entry.identity.dev(), entry.identity.ino()))
+  }
 }
 
 /// The ONE read behind [`Watcher::root_path`] and [`RootView::root_path`], so the two

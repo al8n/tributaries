@@ -261,10 +261,8 @@ impl FsLister {
     from: &[OsString],
     globs: &RootGlobs,
   ) -> impl Stream<Item = ListItem<OsString>> + Send + use<> {
-    futures_util::stream::unfold(
-      Walk::new(view.root_path(root), from, globs, blocking),
-      Walk::step,
-    )
+    let bound = view.root_path(root).zip(view.root_identity(root));
+    futures_util::stream::unfold(Walk::new(bound, from, globs, blocking), Walk::step)
   }
 }
 
@@ -297,6 +295,18 @@ const MAX_LIST_DEPTH: usize = 64;
 /// read in pieces this size: memory is bounded by the depth and this number, never by how
 /// many entries a single directory holds.
 const LIST_CHUNK: usize = 256;
+
+/// One filesystem object's identity: its `(device, inode)` pair, in the widths the root
+/// registry records them in.
+type ObjectId = (u64, u128);
+
+/// A root as a listing receives it: the path to open, and the object that path must
+/// resolve to for the walk to be about the armed root at all.
+type BoundRoot = (PathBuf, ObjectId);
+
+/// A walk's unopened start: its bound root, the validated plain names leading down to the
+/// starting key, and that key's root-relative text.
+type Seed = (PathBuf, ObjectId, Vec<OsString>, String);
 
 /// The blocking-job spawner a [`FsSource`] hands its listing reads to — the shape the
 /// lower watcher's own pool handle has, captured once from the runtime at construction.
@@ -360,12 +370,13 @@ struct Walk {
   prune: Vec<Glob>,
   /// The file narrowing, matched against a file's last segment. `None` is unengaged.
   include: Option<Vec<Glob>>,
-  /// The start still to be opened: the root's path and the validated plain names that
-  /// lead down to the starting key, with the root-relative text of that key.
+  /// The start still to be opened: the root's path, the object identity that path must
+  /// resolve to, and the validated plain names that lead down to the starting key, with
+  /// the root-relative text of that key.
   ///
   /// The open is deferred to the first step because it is a syscall per component, and
   /// every syscall this walk makes belongs on the blocking pool.
-  seed: Option<(PathBuf, Vec<OsString>, String)>,
+  seed: Option<Seed>,
   /// The open directories of the current descent, outermost first.
   stack: Vec<Level>,
   /// Items read and not yet yielded — at most one chunk, plus the refusals it produced.
@@ -382,7 +393,7 @@ impl Walk {
   /// outside the root is refused rather than re-rooted — a walk that quietly changed which
   /// tree it was about would report entries the watch behind the root can never mention.
   fn new(
-    root: Option<PathBuf>,
+    bound: Option<BoundRoot>,
     from: &[OsString],
     globs: &RootGlobs,
     blocking: BlockingSpawner,
@@ -390,10 +401,10 @@ impl Walk {
     let prune = globs.prune().to_vec();
     let mut seed = None;
     let mut ready = VecDeque::new();
-    match root.map(|root| (path_components(&root), root)) {
-      Some((root_key, root)) if from.starts_with(&root_key) => {
+    match bound.map(|(root, identity)| (path_components(&root), root, identity)) {
+      Some((root_key, root, identity)) if from.starts_with(&root_key) => {
         match Self::start_below(&from[root_key.len()..], &prune) {
-          Some((names, at)) => seed = Some((root, names, at)),
+          Some((names, at)) => seed = Some((root, identity, names, at)),
           // A suffix that is not a plain name under the root, or that starts on ground the
           // root's own words refuse: a key that is not a key under this root is covered by
           // no armed root, which is the same answer an unwatched key gets.
@@ -459,12 +470,17 @@ impl Walk {
       if let Some(item) = self.ready.pop_front() {
         return Some((item, self));
       }
-      if let Some((root, names, at)) = self.seed.take() {
+      if let Some((root, identity, names, at)) = self.seed.take() {
         let start = names
           .iter()
           .fold(root.clone(), |path, name| path.join(name));
-        match Self::open_start(&self.blocking, root, names).await {
-          Ok(dir) => self.stack.push(Level::new(dir, start, at, 0)),
+        match Self::open_start(&self.blocking, root, identity, names).await {
+          Ok(Start::Opened(dir)) => self.stack.push(Level::new(dir, start, at, 0)),
+          // The path opened, but not onto the object the root is armed on: the armed root
+          // no longer names that directory, so nothing under it is ground this watch
+          // covers — the same answer an unwatched key gets, and never a walk of a tree the
+          // event stream says nothing about.
+          Ok(Start::NotTheRoot) => self.ready.push_back(Err(ListError::UnknownRoot)),
           // A symbolic link anywhere on the way down — the starting key itself
           // included — is refused by the kernel rather than followed, and arrives here as
           // the one `Io` item that key can honestly be.
@@ -622,11 +638,12 @@ impl Walk {
   async fn open_start(
     blocking: &BlockingSpawner,
     root: PathBuf,
+    identity: ObjectId,
     names: Vec<OsString>,
-  ) -> Result<OpenDir, std::io::Error> {
+  ) -> Result<Start, std::io::Error> {
     let (tx, rx) = futures_channel::oneshot::channel();
     (*blocking)(Box::new(move || {
-      let _ = tx.send(open_start_blocking(&root, &names));
+      let _ = tx.send(open_start_blocking(&root, identity, &names));
     }));
     rx.await.unwrap_or_else(|_| Err(job_answered_nothing()))
   }
@@ -689,15 +706,40 @@ fn job_answered_nothing() -> std::io::Error {
   std::io::Error::other("the listing's blocking job answered nothing")
 }
 
-/// Opens the root without following a final symbolic link, then walks down to the starting
-/// key one descriptor-relative open at a time. Each parent closes as its child opens, so
-/// reaching the start costs one open directory however deep it sits.
-fn open_start_blocking(root: &Path, names: &[OsString]) -> Result<OpenDir, std::io::Error> {
+/// What opening the walk's starting directory produced.
+enum Start {
+  /// The registered root's own object, opened, with the start reached below it.
+  Opened(OpenDir),
+  /// The root's path opened onto a DIFFERENT object than the one the root is armed on.
+  NotTheRoot,
+}
+
+/// Opens the root without following a final symbolic link, CHECKS that what opened is the
+/// object the root is armed on, then walks down to the starting key one
+/// descriptor-relative open at a time. Each parent closes as its child opens, so reaching
+/// the start costs one open directory however deep it sits.
+///
+/// The identity check is the root's alone, and that is enough: everything below it is
+/// reached through the descriptor of the directory it was read from, so binding the first
+/// descriptor binds the whole walk. `O_NOFOLLOW` guards only a final symbolic link, which
+/// leaves two ways for a path to name the wrong tree — the root renamed away and
+/// re-created, and an ancestor replaced by a symbolic link — and both are exactly a
+/// different object under the same path. The converse case is why the test is identity and
+/// not the path: a root reached THROUGH a symlinked ancestor that still opens the
+/// registered object IS the root, and is listed.
+fn open_start_blocking(
+  root: &Path,
+  identity: ObjectId,
+  names: &[OsString],
+) -> Result<Start, std::io::Error> {
   let mut dir = OpenDir::open_root(root)?;
+  if !dir.is(identity)? {
+    return Ok(Start::NotTheRoot);
+  }
   for name in names {
     dir = dir.open_child(name)?;
   }
-  Ok(dir)
+  Ok(Start::Opened(dir))
 }
 
 /// One open directory of a unix listing: the descriptor every `openat`/`statat` beneath it
@@ -750,6 +792,13 @@ impl OpenDir {
   fn over(fd: std::os::fd::OwnedFd) -> Result<Self, std::io::Error> {
     let reader = rustix::fs::Dir::read_from(&fd)?;
     Ok(Self { fd, reader })
+  }
+
+  /// Whether this open directory IS the object `identity` names — read off the DESCRIPTOR,
+  /// so nothing can move under the answer between the test and the reads that follow it.
+  fn is(&self, identity: ObjectId) -> Result<bool, std::io::Error> {
+    let stat = rustix::fs::fstat(&self.fd)?;
+    Ok(object_identity(stat.st_dev, stat.st_ino) == Some(identity))
   }
 
   /// Reads at most `limit` entries with the metadata `statat` reads for each WITHOUT
@@ -807,6 +856,21 @@ fn metadata_of(stat: &rustix::fs::Stat) -> Metadata {
   }
 }
 
+/// A `stat`'s device-and-inode pair in the widths the root registry records it in, or
+/// `None` for a pair that does not fit them — which cannot be the registry's value either,
+/// so it compares as the mismatch it is.
+///
+/// Generic over the two field types for the reason [`since_epoch`] is: they are not the
+/// same everywhere, and one body covers every unix.
+#[cfg(unix)]
+fn object_identity<D, I>(dev: D, ino: I) -> Option<ObjectId>
+where
+  u64: TryFrom<D>,
+  u128: TryFrom<I>,
+{
+  Some((u64::try_from(dev).ok()?, u128::try_from(ino).ok()?))
+}
+
 /// A `stat`'s seconds-and-nanoseconds pair as an offset from the epoch, or `None` for a
 /// time before it — which is the same answer a source that cannot read a time gives.
 ///
@@ -843,6 +907,14 @@ impl OpenDir {
 
   fn open_child(&self, name: &OsString) -> Result<Self, std::io::Error> {
     Self::over(self.path.join(name))
+  }
+
+  /// The identity check is SKIPPED off unix: `std` gives this walk no descriptor to stat,
+  /// and a second path lookup would answer about whatever the path names now rather than
+  /// about what was opened. Recorded as a residual on the platform whose backends are
+  /// deferred, alongside the no-follow residual above.
+  fn is(&self, _identity: ObjectId) -> Result<bool, std::io::Error> {
+    Ok(true)
   }
 
   fn over(path: PathBuf) -> Result<Self, std::io::Error> {
