@@ -823,7 +823,24 @@ domination `Rescan` is stood — and nothing else in either crate behaves differ
   rather than off the source's queue, so the driver first CUTS the scope's lane —
   the reader forwards everything the kernel already holds and pushes a marker
   behind it — and the `Rescan` is published only once that marker comes back,
-  never ahead of a batch that describes the world before the change.
+  never ahead of a batch that describes the world before the change. A reading
+  held for a marker is bound to the world it was taken in — its lane, the
+  scope's incarnation and the sequence it waits for — and is dropped rather
+  than applied at every transition that ends that world (a replace or widen
+  commit, a source loss, a stream fatal, an unwatch, a teardown), so a snapshot
+  of a root the scope has left can neither tear down the healthy world that
+  replaced it nor reopen device trust across a lost window. A reader that does
+  not answer within a liveness interval costs the ORDERING and nothing else:
+  the next reading lands where it arrives, the one still held is superseded
+  rather than applied behind it — a newer sample is a newer verdict on the same
+  question, root-death included — and the next marker to reach the lane
+  restores the ordering. A held reading still arms the liveness deadline, so a
+  birth refresh handed to a reader that then goes quiet cannot leave a scope
+  with nothing outstanding and no tick to produce the next one. And a fanotify
+  root's whole-root reseed now runs at a BOUNDED cut — the bytes its instance
+  held when the recovery was asked for, priced once and charged against every
+  read — so a tree under sustained churn can no longer hold the walk off
+  indefinitely and leave the ground a departed mount revealed uncovered.
 
 - **`tributaries`** — a caller-visible **sync barrier** (#23): `Tributaries::sync(sub,
   timeout)` resolves once every change made under the subscription's key BEFORE the

@@ -109,9 +109,9 @@ pub(crate) enum Control {
 ///
 /// Recording rather than running IS the ordering. Control is serviced before and
 /// between reads, so a completion pushed from here would overtake exactly the
-/// events it has to follow; the caller runs the walk once the instance has
-/// drained. The latest epoch wins, which costs nothing to argue — the core keeps
-/// one recovery in flight per scope.
+/// events it has to follow; the caller runs the walk once the instance has been
+/// cut ([`ReseedBudget`]). The latest epoch wins, which costs nothing to argue —
+/// the core keeps one recovery in flight per scope.
 fn service_control(control: &mpsc::Receiver<Control>, pending_reseed: &mut Option<u64>) -> bool {
   let mut shutdown = false;
   while let Ok(message) = control.try_recv() {
@@ -277,13 +277,17 @@ fn run(
         shared,
         &mut pending_reseed,
       ) {
-        DrainExit::Parked => {}
+        DrainExit::Parked | DrainExit::ReseedDue => {}
         DrainExit::Shutdown | DrainExit::Died => return,
       }
     }
-    // The instance is at `EAGAIN`, so everything the kernel held when the walk
-    // was asked for is already on the lane and the completion can only be read
-    // as covering ground the consumer has heard about.
+    // The cut is complete: everything the kernel held when the walk was asked
+    // for is on the lane, either because the instance reached `EAGAIN` or
+    // because the byte debt priced at the request has been read out. Anything
+    // still resident arrived after the request and describes the world the walk
+    // is about to report, so the completion can only be read as covering ground
+    // the consumer has heard about. A budget exit leaves the fd readable, and
+    // the loop's own `poll` returns straight back into the drain.
     if let Some(epoch) = pending_reseed.take() {
       run_root_recovery(map, reseed, &shared.stats, epoch, |msg| {
         shared.queue.try_send(msg).is_ok()
@@ -292,18 +296,108 @@ fn run(
   }
 }
 
-/// Why [`drain_events`] returned. The reader re-parks and polls only on
-/// [`Parked`](Self::Parked); [`Shutdown`](Self::Shutdown) and
+/// Why [`drain_events`] returned. The reader runs any recorded reseed and then
+/// re-parks and polls on [`Parked`](Self::Parked) and
+/// [`ReseedDue`](Self::ReseedDue); [`Shutdown`](Self::Shutdown) and
 /// [`Died`](Self::Died) both exit the reader thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DrainExit {
   /// The instance drained to `EAGAIN` (or a zero-length read): re-park and poll.
   Parked,
+  /// A recorded reseed's cut is complete while the instance is still readable
+  /// (#74): its walk owes the lane only what was queued when it was asked for,
+  /// and that debt is paid. The caller runs the walk and comes straight back —
+  /// the `poll` it re-enters returns at once on a readable fd — so the drain
+  /// continues with nothing lost and the completion sits behind exactly the
+  /// events it must follow.
+  ReseedDue,
   /// A `Shutdown` was observed between reads. Teardown takes PRIORITY over
   /// further draining, so the reader stops now rather than after `EAGAIN`.
   Shutdown,
   /// The stream died; the terminal `Fatal` was already signaled.
   Died,
+}
+
+/// The most buffer reads one recorded reseed spends cutting the instance when
+/// `FIONREAD` could not price it (#74).
+///
+/// Sized for the default `fanotify` queue (16384 events) at a realistic
+/// FID-plus-name record — a 24-byte metadata header, an fsid, an exported
+/// handle and a name — over the DEFAULT buffer: ⌈16384 × 300 / 65536⌉ ≈ 75
+/// reads, plus slack. A caller who shrinks `os_buffer_bytes` or raises the
+/// kernel's queue trades ordering for this bound rather than the other way
+/// round: the walk still runs, and what is left resident rides behind its
+/// completion.
+const RESEED_DRAIN_READS: u32 = 80;
+
+/// The most reads one reseed spends retiring a CREDIBLE byte debt. The debt
+/// bounds what the kernel said was queued, not how many reads clear it: a
+/// buffer far smaller than the records it carries, or a wrapped-small count
+/// under a still-filling queue, must not keep the walk waiting indefinitely.
+const MAX_RESEED_OWED_READS: u32 = 4096;
+
+/// The largest queued-byte count this reader will believe from `FIONREAD`.
+///
+/// The ioctl reports through a C `int`, so a queue past `i32::MAX` bytes wraps
+/// and the value stops describing the queue at all — and the widening to `u64`
+/// means a negative wrap arrives as a value near `u64::MAX` rather than as a
+/// negative number to reject, which is exactly what this bound catches. No
+/// credible fanotify queue comes near it.
+const MAX_CREDIBLE_QUEUE_BYTES: u64 = i32::MAX as u64;
+
+/// What a recorded reseed still owes the instance before its walk may run (#74).
+///
+/// The walk's completion is what the core turns into a whole-root `Rescan`, so
+/// it has to sit behind every event the kernel already held when the reseed was
+/// asked for — otherwise the consumer re-reads the tree and is only then told
+/// about the world as it was before the mount change. Waiting for the fd to go
+/// quiet would buy that ordering and give up progress: a producer that keeps it
+/// readable would hold the walk off for as long as it liked, leaving the ground
+/// a departed mount revealed uncovered and the recovery latched in flight.
+///
+/// So the queue is PRICED once, where the request is recorded, and each read is
+/// charged against that debt. Everything resident then precedes the completion
+/// (exact), while everything that arrives afterwards is the walk's own subject
+/// and may follow it (bounded). The read caps are the belt for a count that
+/// cannot be had or cannot be believed.
+struct ReseedBudget {
+  /// Bytes the instance held when the request was recorded, or `None` when
+  /// `FIONREAD` refused or answered beyond belief.
+  owed: Option<u64>,
+  /// Buffer reads taken since then.
+  reads: u32,
+}
+
+impl ReseedBudget {
+  /// Prices the queue from one `FIONREAD` answer.
+  fn taken(queued: Result<u64, Errno>) -> Self {
+    Self {
+      owed: match queued {
+        Ok(bytes) if bytes <= MAX_CREDIBLE_QUEUE_BYTES => Some(bytes),
+        Ok(_) | Err(_) => None,
+      },
+      reads: 0,
+    }
+  }
+
+  /// Whether the cut is complete and the walk may run.
+  fn spent(&self) -> bool {
+    match self.owed {
+      Some(owed) => owed == 0 || self.reads >= MAX_RESEED_OWED_READS,
+      None => self.reads >= RESEED_DRAIN_READS,
+    }
+  }
+
+  /// Charges one read of `bytes` against the debt. Saturating: one read can
+  /// deliver MORE than the remainder (records that arrived after the price fill
+  /// the same buffer), which completes the cut with that extra traffic already
+  /// forwarded in order.
+  fn charge(&mut self, bytes: usize) {
+    self.reads = self.reads.saturating_add(1);
+    if let Some(owed) = self.owed.as_mut() {
+      *owed = owed.saturating_sub(bytes as u64);
+    }
+  }
 }
 
 /// Reads the instance until `EAGAIN`, admitting and forwarding each buffer as one
@@ -320,8 +414,10 @@ enum DrainExit {
 /// everything the kernel already held has to be ahead of it. Returns
 /// [`DrainExit::Died`] when the stream died (fatal already signaled — a failed
 /// read, a foreign event-metadata ABI version, or a recovery that could not
-/// restore sight), [`DrainExit::Shutdown`] on a mid-drain shutdown, and
-/// [`DrainExit::Parked`] when the instance drained clean.
+/// restore sight), [`DrainExit::Shutdown`] on a mid-drain shutdown,
+/// [`DrainExit::ReseedDue`] when a recorded reseed's cut is complete while the
+/// instance is still readable, and [`DrainExit::Parked`] when the instance
+/// drained clean.
 fn drain_events(
   fd: &OwnedFd,
   buf: &mut [u8],
@@ -331,9 +427,61 @@ fn drain_events(
   shared: &ReaderShared,
   pending_reseed: &mut Option<u64>,
 ) -> DrainExit {
+  drain_events_with(
+    DrainSource {
+      fd,
+      fionread: |fd: &OwnedFd| rustix::io::ioctl_fionread(fd),
+    },
+    buf,
+    map,
+    reseed,
+    control,
+    shared,
+    pending_reseed,
+  )
+}
+
+/// The instance one drain reads, paired with the ioctl that prices its queue for
+/// a reseed's cut. The two travel together because they address the same
+/// descriptor, and the pairing is what lets a cell drive a cut against a price
+/// it chose — including the answer the ioctl refuses to give, which is the
+/// fallback cap's only path.
+struct DrainSource<'a, F>
+where
+  F: FnMut(&OwnedFd) -> Result<u64, Errno>,
+{
+  fd: &'a OwnedFd,
+  fionread: F,
+}
+
+/// [`drain_events`]'s body over an injectable [`DrainSource`].
+fn drain_events_with<F>(
+  mut source: DrainSource<'_, F>,
+  buf: &mut [u8],
+  map: &mut FidMap,
+  reseed: &ReseedContext,
+  control: &mpsc::Receiver<Control>,
+  shared: &ReaderShared,
+  pending_reseed: &mut Option<u64>,
+) -> DrainExit
+where
+  F: FnMut(&OwnedFd) -> Result<u64, Errno>,
+{
+  let fd = source.fd;
+  // A request already recorded when the drain begins is priced here; one that
+  // arrives at a control boundary below is priced where it lands.
+  let mut budget = pending_reseed.map(|_| ReseedBudget::taken((source.fionread)(fd)));
   loop {
     if service_control(control, pending_reseed) {
       return DrainExit::Shutdown;
+    }
+    if pending_reseed.is_some() && budget.is_none() {
+      budget = Some(ReseedBudget::taken((source.fionread)(fd)));
+    }
+    // Checked at the loop TOP, so the previous buffer has been decoded and
+    // forwarded before the walk that must follow it runs.
+    if budget.as_ref().is_some_and(ReseedBudget::spent) {
+      return DrainExit::ReseedDue;
     }
     let n = match rustix::io::read(fd, &mut *buf) {
       Ok(n) => n,
@@ -347,6 +495,9 @@ fn drain_events(
     };
     if n == 0 {
       return DrainExit::Parked;
+    }
+    if let Some(budget) = budget.as_mut() {
+      budget.charge(n);
     }
     let decoded = match decode_events(&buf[..n]) {
       Ok(decoded) => decoded,

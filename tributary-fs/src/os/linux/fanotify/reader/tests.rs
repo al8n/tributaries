@@ -1979,10 +1979,16 @@ mod liveness {
   use std::{sync::mpsc, time::Duration};
 
   use super::super::{
-    Control, DrainExit, ReaderShared, ReseedContext, drain_events, run_root_recovery,
+    Control, DrainExit, DrainSource, RESEED_DRAIN_READS, ReaderShared, ReseedContext, drain_events,
+    drain_events_with, run_root_recovery,
   };
   use crate::os::{
-    BackendStatsShared, SourceMessage, linux::fanotify::map::FidMap, transport::TransportState,
+    BackendStatsShared, SourceMessage,
+    linux::fanotify::{
+      fid::FAN_MODIFY,
+      map::{FidMap, SeedEntry},
+    },
+    transport::TransportState,
   };
 
   /// An always-readable fd that never returns `EAGAIN`, standing in for a source
@@ -1998,10 +2004,22 @@ mod liveness {
     ReaderShared,
     async_channel::Receiver<crate::os::SourceMessage>,
   ) {
+    reader_shared_budget(8)
+  }
+
+  /// The same over a chosen transport budget: a cell that drives many buffers
+  /// through one drain needs a permit for each, or the forwarding protocol's own
+  /// degrade would be what ended the run rather than the bound under test.
+  fn reader_shared_budget(
+    budget: usize,
+  ) -> (
+    ReaderShared,
+    async_channel::Receiver<crate::os::SourceMessage>,
+  ) {
     let (tx, rx) = async_channel::unbounded();
     let shared = ReaderShared {
       queue: tx,
-      transport: TransportState::new(8),
+      transport: TransportState::new(budget),
       buffer_bytes: 64 * 1024,
       stats: std::sync::Arc::new(BackendStatsShared::default()),
     };
@@ -2095,6 +2113,117 @@ mod liveness {
       "and the only thing: the source is done, not covered and continuing"
     );
   }
+
+  /// A recorded reseed's walk runs at a BOUNDED cut, never at global quiescence
+  /// (#74).
+  ///
+  /// The walk's completion is what the core turns into a whole-root `Rescan`, so
+  /// it must follow every event the kernel held when the mount change was
+  /// sampled — but waiting for the instance to go quiet makes that ordering
+  /// hostage to the producer: a tree under sustained churn keeps the fd readable,
+  /// the drain never returns, the walk never runs, the recovery stays latched in
+  /// flight, and the ground a departed mount revealed is never covered at all.
+  ///
+  /// So the queue is PRICED where the request is recorded and each read is
+  /// charged against that debt. Both halves are driven here against a source that
+  /// is still readable at the exit — which is the whole point, and what a drain
+  /// that ran to `EAGAIN` could never show: the priced cut reads exactly what was
+  /// owed, and the cut whose price the ioctl refused ends at the flat cap.
+  ///
+  /// MUTATION WITNESS: drop the budget check and both halves read the socket dry,
+  /// returning `Parked` with nothing left.
+  #[test]
+  fn a_reseed_under_sustained_traffic_runs_within_the_read_budget() {
+    let event = super::dfid_name_event(FAN_MODIFY, FSID_ROOT, 1, b"root-handle", b"f.txt");
+
+    // Priced: three buffers were resident when the request was recorded, and the
+    // producer has kept nine more coming since.
+    let owed = 3 * event.len();
+    let (exit, pending, left) = cut_under_traffic(&event, 12, Ok(owed as u64));
+    assert_eq!(exit, DrainExit::ReseedDue);
+    assert_eq!(pending, Some(9), "the request is still the caller's to run");
+    assert_eq!(
+      left, 9,
+      "exactly what was owed is read out, and what arrived after the price is \
+       left for the drain that follows the walk"
+    );
+
+    // Unpriced: the ioctl answers nothing, so the flat cap is the cut.
+    let overfull = RESEED_DRAIN_READS as usize + 10;
+    let (exit, pending, left) = cut_under_traffic(&event, overfull, Err(rustix::io::Errno::NOTTY));
+    assert_eq!(exit, DrainExit::ReseedDue);
+    assert_eq!(pending, Some(9));
+    assert_eq!(
+      left, 10,
+      "a queue nobody could price still ends its cut, at the cap"
+    );
+  }
+
+  /// Drives one recorded reseed's cut against a source prefilled with
+  /// `prefilled` copies of `event` and priced by `price`, returning the drain's
+  /// exit, the request it left recorded, and how many whole events the source
+  /// still held afterwards.
+  ///
+  /// A socket pair stands in for the instance: it yields one buffer per read
+  /// (the buffer is sized to one event), it answers `EAGAIN` rather than EOF when
+  /// it runs dry — its write end is held open for exactly that reason — and its
+  /// remainder can be counted, which is what turns "the cut was bounded" into a
+  /// number.
+  fn cut_under_traffic(
+    event: &[u8],
+    prefilled: usize,
+    price: Result<u64, rustix::io::Errno>,
+  ) -> (DrainExit, Option<u64>, usize) {
+    use std::{io::Write, os::fd::OwnedFd, path::Path};
+
+    let (source, mut producer) = std::os::unix::net::UnixStream::pair().expect("a socket pair");
+    for _ in 0..prefilled {
+      producer
+        .write_all(event)
+        .expect("the prefill fits the buffer");
+    }
+    source
+      .set_nonblocking(true)
+      .expect("the instance is non-blocking");
+    let fd = OwnedFd::from(source);
+
+    let mut map = FidMap::new();
+    map.seed([SeedEntry::root(
+      super::wire_fid(FSID_ROOT, 1, b"root-handle"),
+      Path::new("/root"),
+    )]);
+    let (shared, _queue_rx) = reader_shared_budget(prefilled + 1);
+    let reseed = ReseedContext::for_test(std::path::PathBuf::from("/root"));
+    let (_tx, rx) = mpsc::channel::<Control>();
+    let mut buf = vec![0u8; event.len()];
+    let mut pending = Some(9);
+
+    let exit = drain_events_with(
+      DrainSource {
+        fd: &fd,
+        fionread: |_: &OwnedFd| price,
+      },
+      &mut buf,
+      &mut map,
+      &reseed,
+      &rx,
+      &shared,
+      &mut pending,
+    );
+
+    let mut tail = vec![0u8; event.len()];
+    let mut left = 0;
+    while let Ok(read) = rustix::io::read(&fd, &mut tail) {
+      if read == 0 {
+        break;
+      }
+      left += 1;
+    }
+    (exit, pending, left)
+  }
+
+  /// The fsid every event and map entry in [`cut_under_traffic`] shares.
+  const FSID_ROOT: [u8; 8] = [3; 8];
 
   /// A requested whole-root reseed is RECORDED at a control boundary and
   /// completed IN BAND afterwards, never pushed from the boundary itself (#74).
